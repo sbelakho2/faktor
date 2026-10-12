@@ -190,23 +190,28 @@ data class VerificationSummary(
     val owed: Int,
     val recordStatus: String?,
     /**
-     * True only when a served record proves the FULL criterion set with no
-     * failed check: the top-level summary may then render VERIFIED. A
-     * missing record is never verified.
+     * True only when the strict proof is verified AND a served record proves
+     * the FULL criterion set with no failed check: the top-level summary may
+     * then render VERIFIED. A missing record or an unverified/unavailable
+     * proof is never verified.
      */
     val verified: Boolean = false,
     val reviewer: String? = null,
     val tree: String? = null,
     val publishedCommit: String? = null,
-    val remotePrHead: String? = null
+    val remotePrHead: String? = null,
+    /** The strict-proof refusal when the proof read/serve is unavailable. */
+    val proofUnavailable: String? = null
 ) {
     /**
      * The bounded top-level summary line: VERIFIED plus the proof facts the
      * daemon serves (criteria/checks/review/tree/published commit/remote PR
-     * head); otherwise the plain status. Cost is appended by the panel from
-     * the durable spend block.
+     * head); an unavailable strict proof keeps its refusal text; otherwise
+     * the plain status. Cost is appended by the panel from the durable spend
+     * block.
      */
     fun summaryText(): String {
+        proofUnavailable?.let { return "VERIFICATION UNAVAILABLE — " + it }
         if (!verified) return status
         val bits = ArrayList<String>()
         bits.add("VERIFIED")
@@ -545,7 +550,7 @@ object TaskTree {
             children = children,
             blockers = children.mapNotNull { blockerRow(it) },
             taskBlockers = task?.blockers ?: emptyList(),
-            verification = verification(verification, taskVerification, task),
+            verification = verification(verification, taskVerification, task, proof, proofUnavailable),
             evidence = evidence(task, taskVerification),
             spend = spend(usage, task),
             tournament = tournament?.let { tournamentView(it) },
@@ -1258,7 +1263,9 @@ object TaskTree {
     private fun verification(
         verification: NativeVerificationView?,
         taskVerification: NativeTaskVerification?,
-        task: NativeTaskView?
+        task: NativeTaskView?,
+        proof: NativeTaskProof?,
+        proofUnavailable: String?
     ): VerificationSummary {
         var passed = 0
         var total = 0
@@ -1278,13 +1285,26 @@ object TaskTree {
             owed > 0 -> "pending"
             else -> task?.state ?: "unknown"
         }
-        val verified = topRecord != null &&
+        // Fail-closed like `proof()`: a refused read wins over any cached
+        // proof, and only the strict `verified` proof state may confirm.
+        val proofRefusal = when {
+            proofUnavailable != null -> proofUnavailable
+            proof != null && proof.proofState == "unavailable" ->
+                proof.proofStateReason?.takeIf { it.isNotEmpty() }
+                    ?: "the serving daemon reports the proof unavailable"
+            else -> null
+        }
+        val recordVerified = topRecord != null &&
             topRecord.status.equals("passed", ignoreCase = true) &&
             total > 0 &&
             passed == total &&
             failed == 0
+        val verified = recordVerified &&
+            proofRefusal == null &&
+            proof != null &&
+            proof.proofState == "verified"
         return VerificationSummary(
-            status = status,
+            status = if (proofRefusal != null) "unavailable" else status,
             criteriaPassed = passed,
             criteriaTotal = total,
             failedChecks = failed,
@@ -1294,7 +1314,8 @@ object TaskTree {
             reviewer = topRecord?.reviewer?.takeIf { it.isNotEmpty() },
             tree = topRecord?.verifiedSnapshot?.takeIf { it.isNotEmpty() },
             publishedCommit = topRecord?.candidateProof?.publishedCommit?.takeIf { it.isNotEmpty() },
-            remotePrHead = topRecord?.candidateProof?.remotePrHead?.takeIf { it.isNotEmpty() }
+            remotePrHead = topRecord?.candidateProof?.remotePrHead?.takeIf { it.isNotEmpty() },
+            proofUnavailable = proofRefusal
         )
     }
 

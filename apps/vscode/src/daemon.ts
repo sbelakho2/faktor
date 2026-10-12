@@ -115,6 +115,14 @@ export interface DaemonOptions {
   readonly startupTimeoutMs?: number;
   readonly env?: NodeJS.ProcessEnv;
   /**
+   * Bounded cancellation for `Cancel startup`: an already-aborted signal
+   * refuses before spawn; an abort during the startup handshake (or the
+   * release-pid resolution that follows) stops the just-spawned child through
+   * the owned kill path and rejects with [DaemonStartCancelledError]. An
+   * abort after the handle resolves cannot cancel a running daemon.
+   */
+  readonly signal?: AbortSignal;
+  /**
    * Test/embedder seam: resolve the RELEASE process id for a startup port.
    * When set it replaces the platform port probe (the announced handshake
    * pid and the live-child fallback still apply); when absent the default
@@ -202,11 +210,31 @@ export function missingDaemonMessage(): string {
 }
 
 /**
- * The machine/application-scoped value of one `faktor.*` setting. Only the
- * global (user/machine) value is ever returned; a workspace or
- * workspace-folder value is IGNORED and reported as a typed refusal so the
- * caller can surface exactly why a repository-supplied value had no effect.
+ * A typed cancellation of the in-flight start attempt. Stable `code` for
+ * assertions; the caller treats it as an explicit operator outcome, not a
+ * failure to report.
  */
+export class DaemonStartCancelledError extends Error {
+  readonly code = 'start_cancelled';
+
+  constructor(detail = 'the daemon start was cancelled') {
+    super(detail);
+    this.name = 'DaemonStartCancelledError';
+  }
+}
+
+/** True for any typed start cancellation crossing a module boundary. */
+export function isDaemonStartCancelled(error: unknown): boolean {
+  if (error instanceof DaemonStartCancelledError) {
+    return true;
+  }
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'start_cancelled'
+  );
+}
+
 export interface DaemonSettingScopes<T> {
   readonly globalValue?: T;
   readonly workspaceValue?: T;
@@ -223,30 +251,64 @@ export interface DaemonSettingOutcome<T> {
   readonly refusal: DaemonSettingRefusal | null;
 }
 
+/**
+ * The typed refusal for a workspace/workspace-folder value of one `faktor.*`
+ * setting: the value is never trusted, and callers that would WRITE the
+ * machine-scoped value refuse loudly instead of writing a value the effective
+ * configuration would ignore (D11).
+ */
+export function workspaceScopedSettingRefusal<T>(
+  key: string,
+  scopes: DaemonSettingScopes<T> | undefined,
+): DaemonSettingRefusal | null {
+  const workspace = scopes?.workspaceValue;
+  const workspaceFolder = scopes?.workspaceFolderValue;
+  if (workspace === undefined && workspaceFolder === undefined) {
+    return null;
+  }
+  const where =
+    workspace !== undefined && workspaceFolder !== undefined
+      ? 'workspace and workspace-folder scope'
+      : workspace !== undefined
+        ? 'workspace scope'
+        : 'workspace-folder scope';
+  return {
+    code: 'workspace_scoped_setting_refused',
+    message:
+      `${key} is set at ${where}; workspace-scoped daemon settings are never trusted and were ` +
+      'ignored. Set it at machine/user scope.',
+  };
+}
+
 export function machineScopedSetting<T>(
   key: string,
   scopes: DaemonSettingScopes<T> | undefined,
   fallback: T,
 ): DaemonSettingOutcome<T> {
-  const workspace = scopes?.workspaceValue;
-  const workspaceFolder = scopes?.workspaceFolderValue;
-  let refusal: DaemonSettingRefusal | null = null;
-  if (workspace !== undefined || workspaceFolder !== undefined) {
-    const where =
-      workspace !== undefined && workspaceFolder !== undefined
-        ? 'workspace and workspace-folder scope'
-        : workspace !== undefined
-          ? 'workspace scope'
-          : 'workspace-folder scope';
-    refusal = {
-      code: 'workspace_scoped_setting_refused',
-      message:
-        `${key} is set at ${where}; workspace-scoped daemon settings are never trusted and were ` +
-        'ignored. Set it at machine/user scope.',
-    };
-  }
+  const refusal = workspaceScopedSettingRefusal(key, scopes);
   const value = scopes?.globalValue !== undefined ? scopes.globalValue : fallback;
   return { value, refusal };
+}
+
+/**
+ * The ONE machine-scoped write adapter: validate the effective scopes first
+ * (a workspace/workspace-folder value refuses typed and NOTHING is written),
+ * then write exactly ONCE through the injected `write` (the extension wires
+ * `ConfigurationTarget.Global`). Returns the refusal and whether a write
+ * happened, so callers can report both truthfully.
+ */
+export async function applyMachineScopedWrite<T>(
+  key: string,
+  scopes: DaemonSettingScopes<T> | undefined,
+  value: T,
+  write: (key: string, value: T) => Promise<void>,
+): Promise<{ readonly refusal: DaemonSettingRefusal | null; readonly written: boolean }> {
+  const refusal = workspaceScopedSettingRefusal(key, scopes);
+  if (refusal !== null) {
+    return { refusal, written: false };
+  }
+  await write(key, value);
+  return { refusal: null, written: true };
 }
 
 /** Where the resolved executable came from (never a workspace). */
@@ -363,7 +425,7 @@ export function binaryTrust(resolved: ResolvedDaemon): BinaryTrust {
       state: 'unverified',
       source: resolved.source,
       detail:
-        `no signed checksum record exists at ${record}; the resolved path must be confirmed before start`,
+        `no checksum record exists at ${record}; the resolved path must be confirmed before start`,
     };
   }
   let expected: string | null = null;
@@ -453,6 +515,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 }
 
 async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
+  const signal = options.signal;
+  if (signal?.aborted === true) {
+    throw new DaemonStartCancelledError('the daemon start was cancelled before it began');
+  }
   if (activeHandle) {
     if (await activeHandle.alive()) {
       return activeHandle;
@@ -477,10 +543,32 @@ async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
   const stderr = new BoundedTail(STDERR_TAIL_BYTES);
   child.stderr?.setEncoding('utf8');
   child.stderr?.on('data', (chunk: string) => stderr.push(chunk));
-  const handshake = await readStartupHandshake(
-    child,
-    options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
-  );
+  // Cancellation owns the just-spawned child through the SAME kill path as
+  // every other teardown (SIGTERM, escalating SIGKILL): the listener stops the
+  // child the moment the signal fires, and the checks below refuse before a
+  // handle is ever published.
+  let cancelled = false;
+  const onAbort = (): void => {
+    cancelled = true;
+    stopChild(child);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  let handshake: LaunchHandshake;
+  try {
+    handshake = await readStartupHandshake(
+      child,
+      options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
+      signal,
+    );
+  } catch (error) {
+    // The handshake path already stopped the child on timeout/exit/abort.
+    signal?.removeEventListener('abort', onAbort);
+    throw error;
+  }
+  if (signal?.aborted || cancelled) {
+    signal?.removeEventListener('abort', onAbort);
+    throw new DaemonStartCancelledError();
+  }
   const port = handshake.port;
   let stopped = false;
   let stopping: Promise<void> | null = null;
@@ -531,6 +619,7 @@ async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
     currentPid = announced?.pid ?? probed ?? null;
   } catch (error) {
     // The resolution seam failed loudly: never leak the spawned launcher.
+    signal?.removeEventListener('abort', onAbort);
     stopChild(child);
     throw error;
   }
@@ -582,6 +671,25 @@ async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
     }
     return null;
   };
+
+  if (signal?.aborted || cancelled) {
+    // Cancelled before the handle was published: nothing may be returned.
+    // The direct child was already stopped by the abort listener; a
+    // probe/announcement-resolved RELEASE pid is only signalled after passing
+    // the SAME health-identity verification stop() demands (a recycled or
+    // unverified pid is never killed).
+    signal?.removeEventListener('abort', onAbort);
+    stopChild(child);
+    const childPid = normalizePid(child.pid);
+    if (currentPid !== null && currentPid !== childPid && processAlive(currentPid)) {
+      const refusal = await verifyStopTarget(currentPid);
+      if (refusal === null) {
+        killPid(currentPid, 'SIGTERM');
+      }
+    }
+    throw new DaemonStartCancelledError();
+  }
+  signal?.removeEventListener('abort', onAbort);
 
   const handle: DaemonHandle = {
     port,
@@ -845,11 +953,17 @@ interface LaunchHandshake {
  * the time the startup line resolves; the listener is simply left attached
  * (with a bounded buffer) instead of being torn down.
  */
-function readStartupHandshake(child: ChildProcess, timeoutMs: number): Promise<LaunchHandshake> {
+function readStartupHandshake(
+  child: ChildProcess,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<LaunchHandshake> {
   return new Promise<LaunchHandshake>((resolvePort, reject) => {
     let buffer = '';
     let settled = false;
     let announcement: ReleaseAnnouncement | null = null;
+    const onAbort = (): void =>
+      finish(new DaemonStartCancelledError('the daemon start was cancelled while starting up'));
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
@@ -863,6 +977,7 @@ function readStartupHandshake(child: ChildProcess, timeoutMs: number): Promise<L
       }
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       if (err) {
         reject(err);
         stopChild(child);
@@ -870,6 +985,11 @@ function readStartupHandshake(child: ChildProcess, timeoutMs: number): Promise<L
         resolvePort({ port, announcement: () => announcement });
       }
     };
+    if (signal?.aborted === true) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
     child.on('error', (err) => finish(err));
     child.on('exit', (code, signal) => {
       if (!settled) {

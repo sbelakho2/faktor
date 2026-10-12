@@ -31,10 +31,13 @@ import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.indexCoverageLabel
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
+import dev.faktor.shared.NativeTaskView
+import dev.faktor.shared.NativeSessionSummary
 import java.math.BigInteger
 import java.nio.file.Path
 import java.util.UUID
 import java.awt.BorderLayout
+import java.awt.CardLayout
 import java.awt.FlowLayout
 import java.awt.GridLayout
 import java.util.concurrent.CountDownLatch
@@ -43,10 +46,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.swing.BorderFactory
+import javax.swing.ButtonGroup
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComponent
-import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
@@ -54,8 +57,6 @@ import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JOptionPane
 import javax.swing.JPanel
-import javax.swing.JScrollPane
-import javax.swing.JSplitPane
 import javax.swing.JTabbedPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
@@ -67,6 +68,39 @@ private const val MAX_TRANSCRIPT_LINES = 4000
 private const val MAX_TRANSCRIPT_CHARS = 400_000
 private const val MAX_EVIDENCE_PREVIEW_CHARS = 4000
 private const val MAX_CHILD_USAGE_FETCHES = 12
+
+/**
+ * One completion-contract FINISH LEVEL of the four-level selector. The wire
+ * mapping is EXACT and hierarchical: every later level explicitly includes
+ * the earlier actions, exactly like the VS Code finish-level radio group.
+ */
+internal enum class FinishLevel(
+    private val includeCommit: Boolean,
+    private val includePush: Boolean,
+    private val includePr: Boolean,
+    private val labelText: String
+) {
+    LOCAL(false, false, false, "Local — leave changes here (nothing requested)"),
+    COMMIT(true, false, false, "Commit — includes local changes, commits when verified"),
+    PUSH(true, true, false, "Push — includes commit, pushes when verified"),
+    PR(true, true, true, "PR — includes push, opens a pull request when verified");
+
+    /**
+     * The exact [NativeCompletionContract] of this level. LOCAL requests no
+     * conditional step at all: the daemon's default path (no contract sent),
+     * mirrored by [completionContractFromControls] returning null.
+     */
+    fun contract(): NativeCompletionContract? =
+        if (this == LOCAL) null else NativeCompletionContract(includeCommit, includePush, includePr)
+
+    /** The visible label (the earlier actions are named explicitly). */
+    fun label(): String = labelText
+}
+
+/** One Inspect detail option: the selector label + its single surface. */
+private data class InspectDetail(val label: String, val view: java.awt.Component)
+
+private fun inspectDetail(label: String, view: java.awt.Component) = InspectDetail(label, view)
 
 class FaktorChatPanel(
     private val service: FaktorFrontendService,
@@ -176,42 +210,75 @@ class FaktorChatPanel(
 
     private val attachments = AttachmentsPanel(workspaceRoot)
 
+    // The per-run budget of the options sheet (Task mode only): empty uses
+    // the machine/run defaults; a served value must parse exactly like the
+    // agent budget controls (positive decimal integer, no larger than the
+    // money domain), else the start refuses loudly.
+    private val budgetTokensField = JTextField(24)
+
+    private val budgetCostField = JTextField(24)
+
     // Audit 29: bounded local pending-upload state. A failed start keeps the
     // already-uploaded ids; the retry resolves them first and uploads only
     // the absent attachments (parity with the VS Code pending envelope).
     private val pendingAttachmentRetry = PendingAttachmentRetry()
 
-    // The composer's run options (finish actions): one disclosure next to
-    // the composer carries them. The submitted contract is tracked so the
-    // tree can report durable step provenance. The labels stay one word so
-    // they never clip at 240px; the tooltip carries the nuance.
-    internal val completionCommit = JCheckBox("Commit").apply {
-        toolTipText = "Commit the change set once the run is verified"
+    // The composer's run options: ONE disclosure next to the composer opens
+    // the bounded, scrollable Task options sheet (contract + finish level +
+    // per-run budget + attachments). The submitted contract is tracked so the
+    // tree can report durable step provenance.
+    internal val completionLevels: List<FaktorToggleButton> = FinishLevel.values().map { level ->
+        FaktorToggleButton(level.label()).apply {
+            toolTipText = level.label()
+        }
     }
 
-    internal val completionPush = JCheckBox("Push").apply {
-        toolTipText = "Push the committed head to its remote"
-    }
-
-    internal val completionPr = JCheckBox("Create PR").apply {
-        toolTipText = "Open a pull request for the committed head"
-    }
+    private val completionGroup = ButtonGroup()
 
     private var submittedCompletion: NativeCompletionContract? = null
 
     private val startTaskButton = primaryButton("Run task")
 
-    private val runOptionsToggle = secondaryButton("Run options ▾")
+    private val taskOptionsButton = FaktorToggleButton("Task options ▸")
 
-    private val runOptionsBody = JPanel(BorderLayout())
+    // Task/Ask mode (design addition, named for the two paths the ONE
+    // composer already has): Task sends the contract/criteria/attachments/
+    // budget with the goal; Ask sends the plain prompt and NEVER attaches a
+    // completion contract or finish actions.
+    private val taskModeButton = FaktorToggleButton("Task")
+
+    private val askModeButton = FaktorToggleButton("Ask")
+
+    private val modeGroup = ButtonGroup()
+
+    private val runSummaryArea = JTextArea(3, 24)
+
+    // T22: a requested PR finish step blocked by the missing canonical SCM
+    // integration surfaces the EXACT copy with one action pointing at the
+    // same Diagnostics setup guidance card. Hidden otherwise; PR success is
+    // never inferred.
+    private val prSetupHeadline = sectionHeader("Pull request integration unavailable")
+
+    private val prSetupCopy =
+        wrappedMutedLabel("Configure the native SCM integration; no PR success is inferred.")
+
+    private val prSetupButton = secondaryButton("Open setup guidance")
+
+    private val prSetupBody = pageColumn(gap = Spacing.XS, padding = 0)
+
+    private val inspectRunsButton = secondaryButton("Inspect")
+
+    private val sessionChooserModel = DefaultComboBoxModel<NativeSessionSummary>()
+
+    private val sessionChooser = JComboBox(sessionChooserModel)
+
+    private val openSessionButton = secondaryButton("Open")
 
     private val runsModel = DefaultComboBoxModel<NativeTaskRun>()
 
     private val runsCombo = JComboBox(runsModel)
 
     private val cancelRunButton = secondaryButton("Cancel run")
-
-    private val taskArea = JTextArea(4, 32)
 
     /**
      * The agent-control input resolver, invoked ON the EDT by
@@ -237,7 +304,28 @@ class FaktorChatPanel(
 
     private val boardPanel = BoardPanel()
 
-    private val permissionsPanel = PermissionsPanel()
+    /**
+     * The per-request approval reply gate shared by BOTH decision surfaces
+     * (the Work attention card above the composer and the Inspect -> Agents
+     * -> Approvals list): one reply per request id, whoever clicked first.
+     */
+    private val approvalGate = ApprovalReplyGate()
+
+    private val permissionsPanel = PermissionsPanel(approvalGate)
+
+    /**
+     * The bounded Work attention card: the live pending request set directly
+     * above the composer, hidden while nothing is pending. Shares the card
+     * renderer and the reply gate with [permissionsPanel].
+     */
+    private val workApprovalCard = WorkApprovalCard(approvalGate)
+
+    /**
+     * Test/embedding seam: observes the once-per-request approval
+     * announcements. The production announcement rides the card's accessible
+     * visible-data channel; no approval path ever requests focus.
+     */
+    internal var approvalAnnounceObserver: ((String) -> Unit)? = null
 
     private val terminalPanel = TerminalPanel()
 
@@ -281,9 +369,18 @@ class FaktorChatPanel(
     /** Inspect: Overview / Plan / Changes / Verification / Agents. */
     private val inspectTabs = FaktorTabbedPane()
 
+    // The single selected detail surface per Inspect tab (I01): the selector
+    // row swaps ONE visible detail; the selection is keyed by tab title so a
+    // refresh/snapshot never resets it. Declared before init: buildLayout()
+    // registers every selector through it.
+    private val inspectSelection = HashMap<String, String>()
+
     private val contentHost = JPanel(BorderLayout())
 
     private val utilityHeader = WrappedLabel("")
+
+    /** The wrapping utilities toolbar row (built by [buildLayout]). */
+    private lateinit var utilityToolbar: JPanel
 
     private var utilityShown = false
 
@@ -354,22 +451,47 @@ class FaktorChatPanel(
                 startTaskFromControls()
             }
         })
+        // Escape closes the Task options sheet (returning focus to the exact
+        // trigger); it NEVER cancels a run.
+        input.inputMap.put(
+            javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0),
+            "faktor.closeOptions"
+        )
+        input.actionMap.put("faktor.closeOptions", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(event: java.awt.event.ActionEvent?) {
+                if (taskOptionsSheetOpen()) closeTaskOptionsSheet()
+            }
+        })
 
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, Spacing.XS))
+        // The utilities toolbar WRAPS at narrow host widths (ActionRowPanel
+        // pattern) instead of revealing overflow through a horizontal
+        // scrollbar: at 240px every primary control (New session, Refresh,
+        // the session chooser) stays visible, and the secondary utilities
+        // live under More. No horizontal-scroll fallback exists.
+        val toolbar = wrapRow(FaktorMark(), newSessionButton, refreshButton)
         toolbar.isOpaque = true
         toolbar.background = panelSurface()
-        // The toolbar row keeps its preferred single-row height; the enclosing
-        // scroll pane reveals overflow horizontally at 240px instead of
-        // clipping controls out of reach.
-        toolbar.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
-        toolbar.add(FaktorMark())
-        toolbar.add(newSessionButton)
-        toolbar.add(refreshButton)
-        val settingsButton = secondaryButton("Settings")
-        settingsButton.addActionListener { showUtility("Settings", settingsPanel) }
-        toolbar.add(settingsButton)
+        toolbar.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
+            BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
+        )
+        // The session chooser sits between Refresh and More: a bounded
+        // listing of the durable sessions (title + served state; a missing
+        // value stays missing) whose Open reuses the exact HistoryPanel open
+        // path. It refreshes with every snapshot.
+        sessionChooser.toolTipText = "Open a durable session"
+        sessionChooser.maximumRowCount = 12
+        sessionChooser.minimumSize = java.awt.Dimension(140, sessionChooser.minimumSize.height)
+        sessionChooser.renderer = SessionChooserRenderer()
+        toolbar.add(sessionChooser)
+        openSessionButton.toolTipText = "Open the selected durable session"
+        openSessionButton.addActionListener { openSelectedSession() }
+        toolbar.add(openSessionButton)
         val moreButton = secondaryButton("More ▾")
         val moreMenu = JPopupMenu()
+        val settingsItem = JMenuItem("Settings")
+        settingsItem.addActionListener { showUtility("Settings", settingsPanel) }
+        moreMenu.add(settingsItem)
         val usageItem = JMenuItem("Usage")
         usageItem.addActionListener { showUtility("Usage", usagePanel) }
         moreMenu.add(usageItem)
@@ -383,23 +505,42 @@ class FaktorChatPanel(
         moreMenu.add(serviceStopItem)
         moreButton.addActionListener { moreMenu.show(moreButton, 0, moreButton.height) }
         toolbar.add(moreButton)
-        val toolbarScroll = JScrollPane(
-            toolbar,
-            javax.swing.ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER,
-            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
-        )
-        toolbarScroll.border = BorderFactory.createMatteBorder(
-            0, 0, 1, 0, FaktorTheme.separator()
-        )
-        toolbarScroll.viewport.isOpaque = false
-        toolbarScroll.horizontalScrollBar.unitIncrement = 16
+        utilityToolbar = toolbar
 
         buildWorkPlane()
         inspectTabs.removeAll()
-        inspectTabs.addTab("Overview", stackViews(overviewPanel, blockersPanel, terminalPanel))
-        inspectTabs.addTab("Plan", stackViews(treePanel, tournamentPanel))
+        inspectTabs.addTab(
+            "Overview",
+            selectorTab(
+                "Overview",
+                listOf(
+                    inspectDetail("Overview", overviewPanel),
+                    inspectDetail("Blockers", blockersPanel),
+                    inspectDetail("Terminal", terminalPanel)
+                )
+            )
+        )
+        inspectTabs.addTab(
+            "Plan",
+            selectorTab(
+                "Plan",
+                listOf(
+                    inspectDetail("Plan", treePanel),
+                    inspectDetail("Compare approaches", tournamentPanel)
+                )
+            )
+        )
         inspectTabs.addTab("Changes", changesPanel)
-        inspectTabs.addTab("Verification", stackViews(verificationPanel, navigator))
+        inspectTabs.addTab(
+            "Verification",
+            selectorTab(
+                "Verification",
+                listOf(
+                    inspectDetail("Verification", verificationPanel),
+                    inspectDetail("Evidence", navigator)
+                )
+            )
+        )
         agentsTabs.removeAll()
         agentsTabs.addTab("Roster", agentsPanel)
         agentsTabs.addTab("Approvals", permissionsPanel)
@@ -412,93 +553,329 @@ class FaktorChatPanel(
         tabs.addTab("Inspect", inspectTabs)
         tabs.addTab("History", historyPanel)
 
-        add(toolbarScroll, BorderLayout.NORTH)
+        add(toolbar, BorderLayout.NORTH)
         add(contentHost, BorderLayout.CENTER)
         contentHost.removeAll()
         contentHost.add(tabs, BorderLayout.CENTER)
     }
 
     /**
-     * The Work surface: conversation + current run + ONE composer. The
-     * composer carries the task goal and, behind the Run options disclosure,
-     * the acceptance criteria, attachments and finish actions. Ask keeps the
-     * plain-prompt path reachable from the same composer.
+     * The Work surface: conversation (or the Task options sheet) + the run
+     * summary strip + ONE composer. The composer carries the goal and the
+     * Task/Ask mode; the bounded options sheet carries the acceptance
+     * criteria, the finish level, the engineering-contract rows, the per-run
+     * budget and the attachments.
      */
     private fun buildWorkPlane() {
         val transcriptBody = JPanel(BorderLayout())
         transcriptBody.isOpaque = false
         transcriptBody.add(insetScroll(transcript), BorderLayout.CENTER)
-        workPlane.add(card("Conversation", transcriptBody), BorderLayout.CENTER)
+        val conversation = card("Conversation", transcriptBody)
+        // The center host swaps ONE visible surface: the conversation or the
+        // bounded Task options sheet (never a blocking modal dialog).
+        val centerHost = JPanel(CardLayout())
+        centerHost.isOpaque = false
+        centerHost.add(conversation, "conversation")
+        centerHost.add(taskOptionsSheet(), "options")
+        (centerHost.layout as CardLayout).show(centerHost, "conversation")
+        optionsSheetHost = centerHost
+        workPlane.add(centerHost, BorderLayout.CENTER)
 
         val south = pageColumn(gap = Spacing.S, padding = 0)
         south.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.M, Spacing.M, Spacing.M)
 
-        // Current run: the selected run, its bounded readout and Cancel run.
-        taskArea.isEditable = false
-        taskArea.font = uiPanelFont()
+        // The run summary strip: the served goal/phase/candidate boundary of
+        // the current run, its state and named steps, with Inspect (the
+        // Overview tab) and the scoped Cancel run action. Missing values stay
+        // missing; nothing is invented.
+        runSummaryArea.isEditable = false
+        runSummaryArea.lineWrap = true
+        runSummaryArea.wrapStyleWord = true
+        runSummaryArea.font = uiPanelFont()
         val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
         runsBody.add(runsCombo)
-        runsBody.add(insetScroll(taskArea))
-        runsBody.add(actionRow(cancelRunButton))
+        runsBody.add(insetScroll(runSummaryArea))
+        // T22: the blocked-PR surface (exact copy + one action pointing at
+        // the Diagnostics setup guidance). Hidden until the daemon serves
+        // the typed SCM-not-configured blocker on the requested PR step.
+        prSetupBody.add(prSetupHeadline)
+        prSetupBody.add(prSetupCopy)
+        prSetupButton.addActionListener {
+            showUtility("Diagnostics", diagnosticsPanel)
+            diagnosticsPanel.revealSetupGuidance()
+        }
+        prSetupBody.add(actionRow(prSetupButton))
+        prSetupBody.isVisible = false
+        runsBody.add(prSetupBody)
+        inspectRunsButton.toolTipText = "Open the Overview detail of the current run"
+        inspectRunsButton.addActionListener { inspectCurrentRun() }
+        cancelRunButton.toolTipText = "Cancel the selected task run"
+        runsBody.add(actionRow(inspectRunsButton, cancelRunButton))
         south.add(card("Current run", runsBody))
 
-        // The composer: one input, Run task / Ask / Abort, and the run-options
-        // disclosure next to it.
+        // The bounded Work attention card sits ABOVE the composer (hidden
+        // while nothing is pending): the live pending request set with its
+        // per-request Allow/Deny/Details, sharing the Approvals list renderer
+        // and the per-id reply gate.
+        south.add(workApprovalCard)
+
+        // The composer: one input, Run task / Ask / Abort, the Task/Ask mode
+        // control (design addition) and the Task options trigger that opens
+        // the bounded sheet in the conversation area.
+        taskOptionsButton.addActionListener { toggleTaskOptionsSheet() }
+        modeGroup.add(taskModeButton)
+        modeGroup.add(askModeButton)
+        taskModeButton.isSelected = true
+        taskModeButton.toolTipText =
+            "Task mode: Run task sends the goal with criteria, contract, finish actions and attachments"
+        askModeButton.toolTipText =
+            "Ask mode (design addition): Run task/Ctrl+Enter sends the plain prompt, no contract"
+        val modeRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.XS, 0))
+        modeRow.isOpaque = false
+        modeRow.add(sectionHeader("Mode", muted = true))
+        modeRow.add(taskModeButton)
+        modeRow.add(askModeButton)
+        val actions = actionRow(startTaskButton, sendButton, abortButton, taskOptionsButton)
+        val composerBody = pageColumn(gap = Spacing.S, padding = 0)
+        composerBody.add(focusAccentScroll(input))
+        composerBody.add(modeRow)
+        composerBody.add(actions)
+        south.add(card("Ask Faktor", composerBody))
+        workPlane.add(south, BorderLayout.SOUTH)
+    }
+
+    /**
+     * The bounded Task options sheet: a header with an explicit Back plus a
+     * scrollable body ([pageScroll] tracks the 240px viewport width), so no
+     * blocking modal dialog is ever required and every field stays reachable.
+     * The composer (and the draft inside it) stays below the sheet.
+     */
+    private fun taskOptionsSheet(): JPanel {
+        val sheet = JPanel(BorderLayout())
+        optionsSheetPanel = sheet
+        sheet.background = panelSurface()
+        val backButton = secondaryButton("Back")
+        backButton.toolTipText = "Return to the conversation (Escape closes the sheet)"
+        backButton.addActionListener { closeTaskOptionsSheet() }
+        taskOptionsBackButton = backButton
+        val headerRow = JPanel(BorderLayout(Spacing.S, 0))
+        headerRow.isOpaque = true
+        headerRow.background = panelSurface()
+        headerRow.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
+            BorderFactory.createEmptyBorder(Spacing.S, Spacing.M, Spacing.S, Spacing.M)
+        )
+        val backRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, 0))
+        backRow.isOpaque = false
+        backRow.add(backButton)
+        headerRow.add(backRow, BorderLayout.WEST)
+        headerRow.add(sectionHeader("Task options"), BorderLayout.CENTER)
+        sheet.add(headerRow, BorderLayout.NORTH)
+        sheet.add(pageScroll(taskOptionsBody()), BorderLayout.CENTER)
+        val escape = javax.swing.KeyStroke.getKeyStroke(
+            java.awt.event.KeyEvent.VK_ESCAPE,
+            0
+        )
+        sheet.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).put(
+            escape, "faktor.closeOptions"
+        )
+        sheet.actionMap.put(
+            "faktor.closeOptions",
+            object : javax.swing.AbstractAction() {
+                override fun actionPerformed(event: java.awt.event.ActionEvent?) {
+                    closeTaskOptionsSheet()
+                }
+            }
+        )
+        return sheet
+    }
+
+    /**
+     * The one options body (reused by the sheet): acceptance criteria, the
+     * four-level finish selector, the contract rows, the per-run budget and
+     * the attachments.
+     */
+    private fun taskOptionsBody(): JPanel {
         criteriaField.toolTipText = "Optional: acceptance criteria, comma separated"
-        val optionsBody = pageColumn(gap = Spacing.S, padding = 0)
+        val finishBox = JPanel(GridLayout(FinishLevel.values().size, 1, Spacing.XS, Spacing.XS))
+        finishBox.isOpaque = false
+        for (button in completionLevels) {
+            completionGroup.add(button)
+            finishBox.add(button)
+        }
+        completionLevels.first().isSelected = true
+        budgetTokensField.toolTipText =
+            "max_tokens for this run: a positive integer; empty uses the run default"
+        budgetCostField.toolTipText =
+            "max_cost_micro for this run: a positive decimal integer; empty uses the run default"
+        val budgetGrid = FormGrid()
+        budgetGrid.row("max tokens", budgetTokensField)
+        budgetGrid.row("max cost (microUSD)", budgetCostField)
+        val optionsBody = pageColumn(gap = Spacing.S, padding = Spacing.S)
         optionsBody.add(FormGrid().row("Acceptance criteria (comma separated)", criteriaField).build())
-        val contractBox = JPanel(GridLayout(3, 1, Spacing.XS, Spacing.XS))
-        contractBox.isOpaque = false
-        contractBox.add(completionCommit)
-        contractBox.add(completionPush)
-        contractBox.add(completionPr)
         optionsBody.add(sectionHeader("Finish when done", muted = true))
-        optionsBody.add(contractBox)
+        optionsBody.add(finishBox)
         for ((label, field, hint) in contractEditors()) {
             field.toolTipText = hint
             optionsBody.add(
                 FormGrid().row(label, focusAccentScroll(field)).build()
             )
         }
+        optionsBody.add(sectionHeader("Per-run budget (empty = machine/run defaults)", muted = true))
+        optionsBody.add(budgetGrid.build())
         optionsBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
         optionsBody.add(attachments)
-        runOptionsBody.isOpaque = false
-        runOptionsBody.add(optionsBody, BorderLayout.CENTER)
-        runOptionsBody.isVisible = false
-        runOptionsToggle.addActionListener {
-            runOptionsBody.isVisible = runOptionsToggle.isSelected
-            runOptionsToggle.text =
-                if (runOptionsToggle.isSelected) "Run options ▴" else "Run options ▾"
-            revalidate()
-            repaint()
-        }
-        val actions = actionRow(startTaskButton, sendButton, abortButton, runOptionsToggle)
-        val composerBody = pageColumn(gap = Spacing.S, padding = 0)
-        composerBody.add(focusAccentScroll(input))
-        composerBody.add(actions)
-        composerBody.add(runOptionsBody)
-        south.add(card("Ask Faktor", composerBody))
-        workPlane.add(south, BorderLayout.SOUTH)
+        return optionsBody
     }
 
-    /** One vertical stack of view panels: each keeps its own scroll. */
-    private fun stackViews(vararg views: JComponent): JPanel {
+    private var optionsSheetHost: JPanel? = null
+
+    private var optionsSheetPanel: JPanel? = null
+
+    private var taskOptionsBackButton: JButton? = null
+
+    private var optionsSheetReturnFocus: java.awt.Component? = null
+
+    private fun toggleTaskOptionsSheet() {
+        if (taskOptionsSheetOpen()) {
+            closeTaskOptionsSheet()
+        } else {
+            // Escape/Back returns focus to the exact trigger that opened the
+            // sheet (the composer input keeps its draft meanwhile).
+            optionsSheetReturnFocus = input.isFocusOwner.let { if (it) input else null }
+            showTaskOptionsSheet()
+        }
+    }
+
+    private fun showTaskOptionsSheet() {
+        val host = optionsSheetHost ?: return
+        taskOptionsButton.isSelected = true
+        taskOptionsButton.text = "Task options ▾"
+        (host.layout as CardLayout).show(host, "options")
+        host.revalidate()
+        host.repaint()
+    }
+
+    private fun closeTaskOptionsSheet() {
+        val host = optionsSheetHost ?: return
+        taskOptionsButton.isSelected = false
+        taskOptionsButton.text = "Task options ▸"
+        (host.layout as CardLayout).show(host, "conversation")
+        val focus = optionsSheetReturnFocus ?: taskOptionsButton
+        optionsSheetReturnFocus = null
+        host.revalidate()
+        host.repaint()
+        focus.requestFocusInWindow()
+    }
+
+    /** True while the Task options sheet is the visible Work center surface. */
+    private fun taskOptionsSheetOpen(): Boolean = optionsSheetPanel?.isVisible == true
+
+    /** True while the Task options sheet hosts the Work center. */
+    internal fun taskOptionsOpenForTest(): Boolean = taskOptionsSheetOpen()
+
+    /**
+     * One Inspect tab as ONE selected detail surface: a compact selector row
+     * of [FaktorToggleButton]s (the existing pattern) above a card host that
+     * shows exactly the selected detail. No stacked equal splits: the
+     * non-selected details are simply not in the visible layout, so the
+     * selected surface gets the whole tab body.
+     */
+    private fun selectorTab(title: String, details: List<InspectDetail>): JPanel {
         val host = JPanel(BorderLayout())
-        if (views.size == 1) {
-            host.add(views[0], BorderLayout.CENTER)
-            return host
+        val cards = CardLayout()
+        val cardHost = JPanel(cards)
+        for ((index, detail) in details.withIndex()) {
+            cardHost.add(detail.view, index.toString())
         }
-        // Nested equal splits: the outer split holds the first view against
-        // the rest, each level weighting its top view 1/(remaining count).
-        fun build(index: Int): JComponent {
-            if (index == views.size - 1) return views[index]
-            val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, views[index], build(index + 1))
-            split.resizeWeight = 1.0 / (views.size - index)
-            split.isContinuousLayout = true
-            return split
+        cards.first(cardHost)
+        val selector = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.XS, 0))
+        selector.isOpaque = false
+        selector.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.M, Spacing.XS, Spacing.M)
+        val group = ButtonGroup()
+        for ((index, detail) in details.withIndex()) {
+            val button = FaktorToggleButton(detail.label).apply {
+                isSelected = index == 0
+                addActionListener {
+                    cards.show(cardHost, index.toString())
+                    inspectSelection[title] = detail.label
+                    host.revalidate()
+                    host.repaint()
+                }
+            }
+            group.add(button)
+            selector.add(button)
         }
-        host.add(build(0), BorderLayout.CENTER)
+        inspectSelection[title] = details.first().label
+        host.add(selector, BorderLayout.NORTH)
+        host.add(cardHost, BorderLayout.CENTER)
         return host
+    }
+
+    /** The selector button labels of one Inspect tab. */
+    internal fun inspectDetailLabelsForTest(tabTitle: String): List<String> {
+        val selector = inspectSelectorFor(tabTitle) ?: return emptyList()
+        return selector.components.filterIsInstance<JToggleButton>().map { it.text }
+    }
+
+    /**
+     * Clicks one selector option by label; true when a button matched. The
+     * selection goes through the ButtonGroup model (a headless test cannot
+     * fire the real ActionEvent), then the button's own action runs.
+     */
+    internal fun selectInspectDetailForTest(tabTitle: String, label: String): Boolean {
+        val selector = inspectSelectorFor(tabTitle) ?: return false
+        for (button in selector.components.filterIsInstance<JToggleButton>()) {
+            if (button.text == label) {
+                button.isSelected = true
+                button.actionListeners.forEach { listener ->
+                    listener.actionPerformed(
+                        java.awt.event.ActionEvent(
+                            button,
+                            java.awt.event.ActionEvent.ACTION_PERFORMED,
+                            button.actionCommand
+                        )
+                    )
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    /** The selected detail label of one Inspect tab. */
+    internal fun selectedInspectDetailForTest(tabTitle: String): String =
+        inspectSelection[tabTitle] ?: ""
+
+    /** The number of detail surfaces visible in one Inspect tab (must be 1). */
+    internal fun visibleInspectDetailCountForTest(tabTitle: String): Int {
+        val cardHost = inspectCardHostFor(tabTitle) ?: return -1
+        return cardHost.components.count { it.isVisible }
+    }
+
+    private fun inspectSelectorFor(tabTitle: String): JPanel? {
+        val container = inspectTabContainer(tabTitle) ?: return null
+        for (child in container.components) {
+            if (child is JPanel && child.layout is FlowLayout) return child
+        }
+        return null
+    }
+
+    private fun inspectCardHostFor(tabTitle: String): JPanel? {
+        val container = inspectTabContainer(tabTitle) ?: return null
+        for (child in container.components) {
+            if (child is JPanel && child.layout is CardLayout) return child
+        }
+        return null
+    }
+
+    private fun inspectTabContainer(tabTitle: String): java.awt.Container? {
+        for (i in 0 until inspectTabs.tabCount) {
+            if (inspectTabs.getTitleAt(i) == tabTitle) {
+                return inspectTabs.getComponentAt(i) as? java.awt.Container
+            }
+        }
+        return null
     }
 
     /**
@@ -679,16 +1056,20 @@ class FaktorChatPanel(
         return result.get()
     }
 
-    /** The checked Task-mode contract, or null for today's default path. */
-    internal fun completionContractFromControls(): NativeCompletionContract? {
-        if (!completionCommit.isSelected && !completionPush.isSelected && !completionPr.isSelected) {
-            return null
-        }
-        return NativeCompletionContract(
-            includeCommit = completionCommit.isSelected,
-            includePush = completionPush.isSelected,
-            includePr = completionPr.isSelected
-        )
+    /**
+     * The exact contract of the selected finish level, or null for the
+     * DEFAULT path (Local — no conditional step requested), mirroring the
+     * legacy "no contract is sent" semantics. The selector is a required
+     * four-level group: its selection can never produce a non-hierarchical
+     * combination (PR then Local simply selects Local and retains nothing).
+     */
+    internal fun completionContractFromControls(): NativeCompletionContract? =
+        selectedFinishLevel().contract()
+
+    /** The one selected finish level (Local is the default path). */
+    internal fun selectedFinishLevel(): FinishLevel {
+        val index = completionLevels.indexOfFirst { it.isSelected }
+        return FinishLevel.values()[if (index < 0) 0 else index]
     }
 
     /** The four line-based editors of the Acceptance & contract disclosure. */
@@ -774,9 +1155,45 @@ class FaktorChatPanel(
 
     /** The completion contract is per task start: reset after a success ack. */
     private fun resetCompletionControls() {
-        completionCommit.isSelected = false
-        completionPush.isSelected = false
-        completionPr.isSelected = false
+        completionLevels.first().isSelected = true
+    }
+
+    /**
+     * The per-run budget of the options sheet: empty fields are the
+     * machine/run defaults (null); an authored value must parse exactly like
+     * the agent budget controls (positive decimal integer within the money
+     * domain), else the start refuses loudly instead of silently dropping an
+     * operator-authored bound.
+     */
+    private fun parseBudgetField(field: JTextField, label: String): Pair<BigInteger?, String?> {
+        val raw = field.text.trim()
+        if (raw.isEmpty()) return Pair(null, null)
+        val parsed = MicroMoney.parseDecimal(raw)
+        if (parsed == null || parsed.signum() <= 0) {
+            return Pair(
+                null,
+                "$label \"$raw\": enter a positive decimal integer no larger than " +
+                    MicroMoney.I64_MAX
+            )
+        }
+        return Pair(parsed, null)
+    }
+
+    private fun requireBudgetControls(): Pair<BudgetCapture, String?> {
+        val cost = parseBudgetField(budgetCostField, "max_cost_micro")
+        cost.second?.let { return Pair(BudgetCapture(null, null), it) }
+        val tokens = parseBudgetField(budgetTokensField, "max_tokens")
+        tokens.second?.let { return Pair(BudgetCapture(null, null), it) }
+        val tokenCount = tokens.first?.let { value ->
+            if (value > BigInteger.valueOf(Long.MAX_VALUE)) {
+                return Pair(
+                    BudgetCapture(null, null),
+                    "max_tokens \"${budgetTokensField.text.trim()}\": no larger than ${Long.MAX_VALUE}"
+                )
+            }
+            value.toLong()
+        }
+        return Pair(BudgetCapture(tokenCount, cost.first), null)
     }
 
     /**
@@ -809,18 +1226,54 @@ class FaktorChatPanel(
      * never enqueue a second start. The ONE per-submission id is the durable
      * idempotency identity the daemon replays after a lost response.
      */
+    /** The selected composer mode (design addition; Task is the default). */
+    internal fun askModeSelected(): Boolean = askModeButton.isSelected
+
+    /**
+     * Clicks the Task/Ask mode toggle like the operator. The selection goes
+     * through the ButtonGroup model (a headless test cannot fire the real
+     * ActionEvent), then the button's own action runs.
+     */
+    internal fun selectModeForTest(ask: Boolean) {
+        val button = if (ask) askModeButton else taskModeButton
+        button.isSelected = true
+        button.actionListeners.forEach { listener ->
+            listener.actionPerformed(
+                java.awt.event.ActionEvent(
+                    button,
+                    java.awt.event.ActionEvent.ACTION_PERFORMED,
+                    button.actionCommand
+                )
+            )
+        }
+    }
+
+    /** The Run task / Ctrl+Enter dispatch, selected mode included. */
     private fun startTaskFromControls() {
         val goal = input.text.trim()
         if (goal.isEmpty()) {
             appendSystem("the composer is empty; describe what Faktor should do")
             return
         }
+        if (askModeSelected()) {
+            // Ask mode: the plain prompt only. The completion contract, the
+            // contract rows, the finish level, the criteria, the per-run
+            // budget and the attachments are NEVER attached.
+            sendPrompt()
+            return
+        }
         // The authored contract rows are captured (and bounded) BEFORE the
         // in-flight claim: an oversized/malformed editor refuses the START
         // loudly, exactly like the daemon's typed 400, instead of silently
-        // dropping a constraint the operator stated.
+        // dropping a constraint the operator stated. The per-run budget is
+        // validated the same way.
         val contractRows = contractRowsCapture()
         contractRows.second?.let { reason ->
+            appendSystem("task start refused: $reason")
+            return
+        }
+        val budget = requireBudgetControls()
+        budget.second?.let { reason ->
             appendSystem("task start refused: $reason")
             return
         }
@@ -829,7 +1282,7 @@ class FaktorChatPanel(
             return
         }
         val draft = try {
-            captureTaskStartDraft(goal, contractRows.first)
+            captureTaskStartDraft(goal, contractRows.first, budget.first)
         } catch (e: Throwable) {
             startInFlight.set(false)
             throw e
@@ -864,7 +1317,8 @@ class FaktorChatPanel(
 
     private fun captureTaskStartDraft(
         goal: String,
-        contractRows: NativeContractRows?
+        contractRows: NativeContractRows?,
+        budget: BudgetCapture
     ): TaskStartDraft {
         val criteria = criteriaField.text.split(',')
             .map { it.trim() }
@@ -876,7 +1330,9 @@ class FaktorChatPanel(
             files = attachments.files(),
             binaries = attachments.binaryAttachments(),
             completionContract = completionContractFromControls(),
-            contractRows = contractRows
+            contractRows = contractRows,
+            budgetTokens = budget.tokens,
+            budgetMaxCostMicro = budget.maxCostMicro
         )
     }
 
@@ -929,6 +1385,8 @@ class FaktorChatPanel(
             val started = service.startTaskRun(
                 draft.goal,
                 draft.criteria,
+                maxTokens = draft.budgetTokens,
+                maxCostMicro = draft.budgetMaxCostMicro,
                 mutationMode = draft.mutationMode,
                 files = if (plan.pathFiles.isEmpty()) null else plan.pathFiles,
                 attachments = if (binary.isEmpty()) null else binary,
@@ -981,6 +1439,8 @@ class FaktorChatPanel(
             if (succeededStart) {
                 resetCompletionControls()
                 resetContractRowControls()
+                budgetTokensField.text = ""
+                budgetCostField.text = ""
             }
         }
         refreshTaskRunsBlocking()
@@ -1353,11 +1813,17 @@ class FaktorChatPanel(
                     appendSystem(model?.grantDisabledReason ?: "grant credits is not permitted")
                     return
                 }
-                val amountRaw = JOptionPane.showInputDialog(
-                    this@FaktorChatPanel,
-                    "Credit grant amount in microUSD (integer > 0, exact)",
-                    "1000000"
-                ) ?: return
+                // The dialog is a Swing mutation: it resolves ON the host UI
+                // thread even when this listener is driven from a worker
+                // callback that is not the EDT (audit: native dialogs never
+                // run on a worker thread).
+                val amountRaw = onEdtValue {
+                    JOptionPane.showInputDialog(
+                        this@FaktorChatPanel,
+                        "Credit grant amount in microUSD (integer > 0, exact)",
+                        "1000000"
+                    )
+                } ?: return
                 // Exact money: a plain positive decimal within i64::MAX; a
                 // junk or out-of-range amount is refused loudly, never rounded.
                 val amount = MicroMoney.parseDecimal(amountRaw.trim())
@@ -1519,6 +1985,18 @@ class FaktorChatPanel(
                 runAsync("refresh permissions") { refreshPermissionsBlocking() }
             }
         })
+        workApprovalCard.setListener(object : WorkApprovalCard.Listener {
+            override fun onReply(permission: NativePermissionEntry, decision: String) {
+                runControl("permission ${permission.id} $decision") {
+                    replyPermissionBlocking(permission, decision)
+                }
+            }
+
+            override fun onRefresh() {
+                runAsync("refresh permissions") { refreshPermissionsBlocking() }
+            }
+        })
+        workApprovalCard.announcementSink = { text -> approvalAnnounceObserver?.invoke(text) }
         terminalPanel.setListener(object : TerminalPanel.Listener {
             override fun onRefresh() {
                 runAsync("refresh terminals") { refreshTerminalsBlocking() }
@@ -1627,6 +2105,29 @@ class FaktorChatPanel(
             override fun onRefresh() {
                 runAsync("refresh") { refreshAllBlocking() }
             }
+
+            override fun onWaitForReconnect() {
+                // T27 `Wait`: the reconnect loop keeps retrying from the last
+                // valid journal position; waiting changes nothing and skips
+                // nothing.
+                appendSystem(
+                    "live updates: still reconnecting; the last valid journal position is kept"
+                )
+            }
+
+            override fun onRefreshFromSnapshot() {
+                // T28 `Refresh from snapshot`: re-read the durable state
+                // without touching the stream cursor; the blocked position is
+                // never skipped.
+                runAsync("refresh from snapshot") {
+                    refreshAllBlocking()
+                    onEdt {
+                        appendSystem(
+                            "refreshed from the durable snapshot; the last journal position is kept"
+                        )
+                    }
+                }
+            }
         })
     }
 
@@ -1644,13 +2145,26 @@ class FaktorChatPanel(
         // spawn after a Stop (the service aborts internally too).
         onEdt { startButton.isEnabled = false }
         runAsync("start daemon") {
+            onEdt { diagnosticsPanel.setReadiness("waiting", "starting the service") }
             try {
                 val health = service.start()
                 onEdt {
                     setControlsEnabled(true)
+                    diagnosticsPanel.setReadiness("ready", "version ${health.version}")
                     appendSystem("daemon ready: version ${health.version}")
                 }
                 newSessionFromControls(provider, model)
+            } catch (e: Throwable) {
+                // The readiness wait ended without a ready service (resolver
+                // refusal, spawn failure or readiness timeout): the typed
+                // reason stays visible instead of a fabricated "ready".
+                onEdt {
+                    diagnosticsPanel.setReadiness(
+                        "timeout",
+                        e.message ?: e.javaClass.simpleName
+                    )
+                }
+                throw e
             } finally {
                 onEdt { startButton.isEnabled = true }
             }
@@ -1789,10 +2303,14 @@ class FaktorChatPanel(
     /**
      * Resolve one live pending permission. The reply carries the OWNING
      * session id from the entry ([NativePermissionEntry.sessionId]) — never
-     * the panel's current session, which may not be the owner. The daemon's
-     * typed 409 refusals (unknown/expired/already resolved, or a live waiter
-     * owned by another session) are surfaced explicitly in the transcript and
-     * the permissions panel; a refused reply is never retried blindly.
+     * the panel's current session, which may not be the owner. The shared
+     * [approvalGate] claimed the request id BEFORE the reply left the UI, so
+     * a duplicate click could never emit a second reply; every exit path
+     * releases it exactly once. The daemon's typed 409 refusals
+     * (unknown/expired/already resolved, or a live waiter owned by another
+     * session) are surfaced on BOTH decision surfaces (Work attention card
+     * and Approvals list) with the typed reason, the request stays visible
+     * and is never retried implicitly.
      */
     private fun replyPermissionBlocking(permission: NativePermissionEntry, decision: String) {
         var refusal: String? = null
@@ -1802,6 +2320,10 @@ class FaktorChatPanel(
         } catch (e: NativeApiException) {
             refusal = NativePermissionReplyRefusal.describe(e, permission.id)
                 ?: "permission reply refused (status ${e.status} ${e.code}: ${e.detail})"
+        } finally {
+            // The typed result arrived (success or refusal): release the
+            // per-request gate on every path before refreshing.
+            approvalGate.finish(permission.id)
         }
         val text = refusal
         // Re-read the authority BEFORE recording the refusal so the refreshed
@@ -1818,7 +2340,8 @@ class FaktorChatPanel(
             if (text != null) {
                 onEdt {
                     appendSystem(text)
-                    permissionsPanel.setReplyRefusal(text)
+                    permissionsPanel.setReplyRefusal(permission.id, text)
+                    workApprovalCard.setReplyRefusal(permission.id, text)
                 }
             }
         }
@@ -1829,7 +2352,10 @@ class FaktorChatPanel(
         if (!service.isRunning() || service.currentSessionId() == null) return
         try {
             val permissions = service.permissions()
-            onEdt { permissionsPanel.update(permissions) }
+            onEdt {
+                permissionsPanel.update(permissions)
+                workApprovalCard.update(permissions)
+            }
         } catch (e: NativeApiException) {
             onEdt {
                 permissionsPanel.setUnavailable(
@@ -1918,6 +2444,7 @@ class FaktorChatPanel(
             val cursor = service.streamCursor()
             onEdt { historyPanel.update(sessions, current) }
             onEdt { diagnosticsPanel.setConnection(daemon, stream, cursor, current) }
+            onEdt { syncSessionChooser(sessions, current) }
         } catch (e: NativeApiException) {
             onEdt {
                 historyPanel.setUnavailable("history read refused (status ${e.status} ${e.code})")
@@ -1931,9 +2458,124 @@ class FaktorChatPanel(
         }
     }
 
+    /**
+     * The toolbar session chooser: the durable listing (title + served state,
+     * never a fabricated date) with the current session kept selected across
+     * snapshots when it is still served.
+     */
+    private fun syncSessionChooser(
+        sessions: List<NativeSessionSummary>,
+        currentId: String?
+    ) {
+        val selectedId = (sessionChooser.selectedItem as? NativeSessionSummary)?.id
+        val previousCount = sessionChooserModel.size
+        sessionChooserModel.removeAllElements()
+        for (session in sessions) sessionChooserModel.addElement(session)
+        val preferred = selectedId ?: currentId
+        if (preferred != null) {
+            for (i in 0 until sessionChooserModel.size) {
+                if (sessionChooserModel.getElementAt(i).id == preferred) {
+                    sessionChooser.selectedIndex = i
+                    break
+                }
+            }
+        }
+        if (sessionChooser.selectedIndex < 0 && sessionChooserModel.size > 0) {
+            sessionChooser.selectedIndex = 0
+        }
+        updateSessionChooserState(previousCount)
+    }
+
+    private fun updateSessionChooserState(previousCount: Int) {
+        sessionChooser.isEnabled = service.isRunning() && sessionChooserModel.size > 0
+        openSessionButton.isEnabled =
+            service.isRunning() && (sessionChooser.selectedItem as? NativeSessionSummary) != null
+        if (previousCount != sessionChooserModel.size) {
+            sessionChooser.revalidate()
+            sessionChooser.repaint()
+        }
+    }
+
+    /** The one-row rendering of a durable session: title · served state. */
+    private inner class SessionChooserRenderer : javax.swing.DefaultListCellRenderer() {
+        override fun getListCellRendererComponent(
+            listComponent: javax.swing.JList<*>?,
+            value: Any?,
+            index: Int,
+            selected: Boolean,
+            focus: Boolean
+        ): java.awt.Component {
+            super.getListCellRendererComponent(listComponent, value, index, selected, focus)
+            val session = value as? NativeSessionSummary ?: return this
+            val title = session.title.trim().ifEmpty { "Untitled conversation" }
+            text = bound(title, 40) + " · " + session.state
+            toolTipText = "$title · ${session.state}"
+            return this
+        }
+    }
+
+    /**
+     * Opens the chooser's selection through the exact HistoryPanel open path:
+     * `useSession` -> `resetSessionView` -> `watchSession(sessionId, 0)`, then
+     * a full refresh. The draft survives (only session-owned views reset).
+     */
+    private fun openSelectedSession() {
+        val session = sessionChooser.selectedItem as? NativeSessionSummary
+        if (session == null) {
+            appendSystem("select a durable session first")
+            return
+        }
+        if (session.id == service.currentSessionId()) {
+            appendSystem("session ${session.id} is already open")
+            return
+        }
+        runAsync("open session ${session.id}") {
+            service.useSession(session.id)
+            resetSessionView()
+            service.watchSession(session.id, 0)
+            onEdt { appendSystem("session ${session.id} opened from the session chooser") }
+            refreshAllBlocking()
+        }
+    }
+
+    /**
+     * The run summary strip's Inspect action: selects the Overview tab of the
+     * Inspect cluster (never a new surface).
+     */
+    private fun inspectCurrentRun() {
+        for (i in 0 until tabs.tabCount) {
+            if (tabs.getTitleAt(i) == "Inspect") {
+                tabs.selectedIndex = i
+                break
+            }
+        }
+        selectNestedTitle(inspectTabs, "Overview")
+        appendSystem("inspecting the current run in Overview")
+    }
+
     private fun refreshStatusBlocking() {
         val projection = service.projection()
         onEdt { diagnosticsPanel.applyProjection(projection) }
+        updateDaemonTrust()
+    }
+
+    /**
+     * The Diagnostics trust row: the resolved executable and the daemon's own
+     * checksum decision (D14 exact wording — "signed" is never used for the
+     * bare `.sha256` record). A never-resolved binary stays `—`.
+     */
+    private fun updateDaemonTrust() {
+        val resolved = service.lastDaemonTrust()
+        onEdt {
+            if (resolved == null) {
+                diagnosticsPanel.setTrust("—", null)
+            } else {
+                diagnosticsPanel.setTrust(
+                    daemonTrustLabel(resolved.trust),
+                    resolved.executable.toString()
+                )
+            }
+        }
     }
 
     /**
@@ -1946,13 +2588,17 @@ class FaktorChatPanel(
         if (!service.isRunning() || service.currentSessionId() == null) return
         try {
             val response = service.indexCoverage()
-            onEdt { diagnosticsPanel.setIndex(indexCoverageLabel(response.snapshot)) }
+            onEdt { diagnosticsPanel.setIndexCoverage(coverageValue(indexCoverageLabel(response.snapshot))) }
         } catch (e: NativeApiException) {
-            onEdt { diagnosticsPanel.setIndex("index: refused (${e.status} ${e.code})") }
+            onEdt { diagnosticsPanel.setIndexCoverage("refused (${e.status} ${e.code})") }
         } catch (e: Exception) {
-            onEdt { diagnosticsPanel.setIndex("index: read failed") }
+            onEdt { diagnosticsPanel.setIndexCoverage("read failed") }
         }
     }
+
+    /** Strips the legacy `index: ` prefix from one coverage label. */
+    private fun coverageValue(label: String): String =
+        if (label.startsWith("index: ")) label.substring("index: ".length) else label
 
     private fun refreshMessagesBlocking() {
         val page = service.messages(limit = 50)
@@ -1974,34 +2620,86 @@ class FaktorChatPanel(
             emptyList<dev.faktor.shared.NativeTaskView>()
         }
         onEdt {
+            // Preserve the selected run across an async refresh when the same
+            // logical run is still served (a newer snapshot must not jump the
+            // selection back to the first row).
+            val selectedRunId = (runsCombo.selectedItem as? NativeTaskRun)?.runId
             runsModel.removeAllElements()
             for (run in runs) runsModel.addElement(run)
-            if (runs.isEmpty()) {
-                taskArea.text = "no task runs"
-            } else {
-                val sb = StringBuilder()
-                for (run in runs) {
-                    sb.append(run.runId).append(" [").append(run.mode).append("] ")
-                        .append(run.state).append(" goal=").append(run.goal ?: "-")
-                        .append('\n')
-                }
-                for (view in views) {
-                    sb.append("task: ").append(view.state).append(" goal=").append(view.goal)
-                        .append(" changed=").append(view.changedFiles.size)
-                        .append(" tests=").append(view.testsRun.size)
-                        .append(" failed=").append(view.testsFailed.size)
-                    val budget = view.budget
-                    if (budget != null) {
-                        sb.append(" tokens=").append(budget.spentTokens ?: 0)
-                            .append('/').append(budget.maxTokens ?: 0)
-                            .append(" costMicro=").append(budget.spentCostMicro)
-                            .append('/').append(budget.maxCostMicro ?: 0)
-                    }
-                    sb.append('\n')
-                }
-                taskArea.text = sb.toString()
+            if (selectedRunId != null) {
+                val index = runs.indexOfFirst { it.runId == selectedRunId }
+                if (index >= 0) runsCombo.selectedIndex = index
             }
+            applyRunSummary(views.firstOrNull())
         }
+    }
+
+    /**
+     * The current-run strip: the served summary plus the T22 blocked-PR
+     * surface. When the daemon serves the typed SCM-not-configured blocker
+     * on the requested PR step, the notice (with its setup-guidance action)
+     * becomes visible; PR success is never inferred from anything else.
+     */
+    private fun applyRunSummary(view: NativeTaskView?) {
+        runSummaryArea.text = runSummaryText(view)
+        prSetupBody.isVisible = prScmSetupBlocked(view)
+        prSetupBody.revalidate()
+        prSetupBody.repaint()
+    }
+
+    /**
+     * The compact run summary strip: only what the daemon actually served —
+     * goal, phase, the candidate boundary (the completion gate's requested
+     * steps), the state and the named steps (plan first, else completion
+     * steps, else milestones). A missing member stays missing; no "-"/"0"
+     * placeholder is ever invented.
+     */
+    private fun runSummaryText(view: NativeTaskView?): String {
+        if (view == null) return "no task run served"
+        val summary = StringBuilder()
+        fun line(text: String) {
+            if (summary.isNotEmpty()) summary.append('\n')
+            summary.append(text)
+        }
+        view.goal.takeIf { it.isNotEmpty() }?.let { line("goal: $it") }
+        view.phase?.takeIf { it.isNotEmpty() }?.let { line("phase: $it") }
+        val boundary = candidateBoundary(view)
+        if (boundary.isNotEmpty()) line("candidate boundary: $boundary")
+        line("state: ${view.state}")
+        val steps = namedSteps(view)
+        if (steps.isNotEmpty()) {
+            line("steps: " + steps.joinToString(", ") { "${it.first}=${it.second}" })
+        }
+        return summary.toString()
+    }
+
+    /**
+     * The candidate boundary of one run: the durable completion contract's
+     * requested steps when the daemon serves one, else the milestones that
+     * are DONE vs still open. Empty when nothing is served (stays missing).
+     */
+    private fun candidateBoundary(view: NativeTaskView): String {
+        val completion = view.completion
+        if (completion != null) {
+            val requested = completion.contract.requestedSteps()
+            if (requested.isNotEmpty()) return requested.joinToString(",")
+        }
+        val done = view.milestones.completed
+        val open = view.milestones.open
+        if (done.isEmpty() && open.isEmpty()) return ""
+        return "${done.size} done, ${open.size} open"
+    }
+
+    private fun namedSteps(view: NativeTaskView): List<Pair<String, String>> {
+        if (view.plan.isNotEmpty()) {
+            return view.plan.map { Pair(it.summary, it.state) }
+        }
+        val completion = view.completion
+        if (completion != null && completion.steps.isNotEmpty()) {
+            return completion.steps.map { Pair(it.step, it.status) }
+        }
+        return view.milestones.completed.map { Pair(it, "done") } +
+            view.milestones.open.map { Pair(it, "open") }
     }
 
     private fun refreshAgentsBlocking() {
@@ -2282,7 +2980,7 @@ class FaktorChatPanel(
                 navigator.showRetrieval(
                     evidenceId,
                     "id=${meta.id} retained=${meta.backingRetained} " +
-                        "backingLen=${meta.backingLen ?: 0} " +
+                        "backingLen=${meta.backingLen ?: "-"} " +
                         "selector=${retrieval.selectorJson} " +
                         "truncated=${retrieval.truncatedByPolicy}\n" + preview,
                     retrieval.byteLen,
@@ -2352,6 +3050,16 @@ class FaktorChatPanel(
     override fun onDaemonStatus(status: String, detail: String?) {
         onEdt {
             diagnosticsPanel.setDaemon("daemon: $status" + (if (detail == null) "" else " ($detail)"))
+            diagnosticsPanel.setService(status, detail)
+            when (status) {
+                "starting" -> diagnosticsPanel.setReadiness("waiting", detail)
+                "running" -> {
+                    diagnosticsPanel.setReadiness("ready", detail)
+                    updateDaemonTrust()
+                }
+                "failed" -> diagnosticsPanel.setReadiness("timeout", detail)
+                else -> {}
+            }
         }
     }
 
@@ -2361,6 +3069,15 @@ class FaktorChatPanel(
             diagnosticsPanel.setConnection(
                 service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
             )
+            when (status) {
+                // T27: a transient reconnect is in progress; the cursor never
+                // moves past the last delivered frame.
+                "retrying" -> diagnosticsPanel.setStreamRecovery(StreamRecoveryState.RECONNECTING)
+                // T28 is latched by onStreamBlocked with its typed detail; a
+                // recovered/healthy status leaves it behind.
+                "connecting", "open" -> diagnosticsPanel.setStreamRecovery(StreamRecoveryState.NONE)
+                else -> Unit
+            }
         }
     }
 
@@ -2368,7 +3085,12 @@ class FaktorChatPanel(
         onEdt {
             // Stable durable-stream block: the stream stopped reconnecting and
             // the cursor did not move past the offending event. Surface the
-            // typed class and the explicit recovery affordances.
+            // typed class, the T28 copy and the explicit recovery affordances
+            // (reconnect / refresh from snapshot; nothing is skipped).
+            diagnosticsPanel.setStreamRecovery(
+                StreamRecoveryState.PAUSED,
+                "${block.kind} at cursor ${block.cursor}: ${block.detail}"
+            )
             appendSystem("stream blocked (${block.kind}) at cursor ${block.cursor}: ${block.detail}")
             appendSystem("recovery: ${block.recovery.joinToString(" / ")}")
         }
@@ -2498,7 +3220,7 @@ class FaktorChatPanel(
         criteriaField.text = criteria
     }
 
-    /** Fills the Acceptance & contract editors and expands the disclosure. */
+    /** Fills the Acceptance & contract editors and opens the options sheet. */
     internal fun setContractFieldsForTest(
         constraints: String,
         invariants: String,
@@ -2509,10 +3231,52 @@ class FaktorChatPanel(
         invariantField.text = invariants
         riskField.text = risks
         obligationField.text = obligations
-        runOptionsToggle.isSelected = true
-        runOptionsBody.isVisible = true
-        runOptionsToggle.text = "Run options ▴"
+        if (!taskOptionsSheetOpen()) toggleTaskOptionsSheet()
     }
+
+    /**
+     * Selects one finish level by its ordinal; true when it was accepted.
+     * A headless test cannot fire the real ActionEvent (the component has no
+     * displayable peer), so selection goes through the ButtonGroup model
+     * exactly like a click's model step.
+     */
+    internal fun selectFinishLevelForTest(level: FinishLevel): Boolean {
+        val index = level.ordinal
+        if (index !in completionLevels.indices) return false
+        completionLevels[index].isSelected = true
+        return completionLevels[index].isSelected
+    }
+
+    /** The visible finish-level label of the one selected level. */
+    internal fun selectedFinishLevelLabelForTest(): String = selectedFinishLevel().label()
+
+    /** Opens the Task options sheet exactly like the trigger click. */
+    internal fun openTaskOptionsForTest() {
+        if (!taskOptionsSheetOpen()) toggleTaskOptionsSheet()
+    }
+
+    /** Clicks the sheet's explicit Back exactly like the trigger. */
+    internal fun backTaskOptionsForTest() {
+        taskOptionsBackButton?.doClick()
+    }
+
+    /** Clicks the Task options trigger (opens or closes the sheet). */
+    internal fun toggleTaskOptionsForTest(): String {
+        taskOptionsButton.doClick()
+        return taskOptionsButton.text
+    }
+
+    /** Dispatches the exact Escape action bound in the composer/sheet. */
+    internal fun triggerEscapeForTest() {
+        val escape = javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0)
+        val key: String = input.inputMap.get(escape) as? String ?: return
+        input.actionMap.get(key)?.actionPerformed(
+            java.awt.event.ActionEvent(input, java.awt.event.ActionEvent.ACTION_PERFORMED, key)
+        )
+    }
+
+    /** The bounded sheet surface (host-matrix width/scroll check). */
+    internal fun taskOptionsSheetForTest(): JComponent? = optionsSheetPanel
 
     /** The four editor rows as the capture sees them (smoke assertions). */
     internal fun contractEditorsForTest(): List<String> = listOf(
@@ -2521,6 +3285,54 @@ class FaktorChatPanel(
         riskField.text,
         obligationField.text
     )
+
+    /** The per-run budget editors as the capture sees them. */
+    internal fun setBudgetFieldsForTest(tokens: String, cost: String) {
+        budgetTokensField.text = tokens
+        budgetCostField.text = cost
+    }
+
+    internal fun runSummaryTextForTest(): String = runSummaryArea.text
+
+    /** Clicks the run summary strip's Inspect action. */
+    internal fun inspectRunForTest() {
+        inspectRunsButton.doClick()
+    }
+
+    /** True when the Inspect cluster is selected with the Overview view. */
+    internal fun overviewSelectedForTest(): Boolean =
+        tabs.getTitleAt(tabs.selectedIndex) == "Inspect" &&
+            inspectTabs.getTitleAt(inspectTabs.selectedIndex) == "Overview"
+
+    /** The chooser's rendered labels (lists served sessions; "" rows only). */
+    internal fun sessionChooserLabelsForTest(): List<String> =
+        (0 until sessionChooserModel.size).map { index ->
+            val session = sessionChooserModel.getElementAt(index)
+            val title = session.title.trim().ifEmpty { "Untitled conversation" }
+            bound(title, 40) + " · " + session.state
+        }
+
+    internal fun sessionChooserCountForTest(): Int = sessionChooserModel.size
+
+    internal fun sessionChooserOpenEnabledForTest(): Boolean = openSessionButton.isEnabled
+
+    /** Selects one served session in the chooser; false when not served. */
+    internal fun selectSessionForTest(sessionId: String): Boolean {
+        for (i in 0 until sessionChooserModel.size) {
+            if (sessionChooserModel.getElementAt(i).id == sessionId) {
+                sessionChooser.selectedIndex = i
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Clicking Open on the chooser selection (the real open path). */
+    internal fun openSelectedSessionForTest() {
+        openSessionButton.doClick()
+    }
+
+    internal fun currentSessionIdForTest(): String? = service.currentSessionId()
 
     internal fun attachmentsView(): AttachmentsPanel = attachments
 
@@ -2563,6 +3375,41 @@ class FaktorChatPanel(
     }
 
     internal fun permissionsView(): PermissionsPanel = permissionsPanel
+
+    /** The bounded Work approval attention card (host-matrix/smoke hook). */
+    internal fun workApprovalView(): WorkApprovalCard = workApprovalCard
+
+    /** The wrapping utilities toolbar row (host-matrix/smoke hook). */
+    internal fun utilitiesToolbarForTest(): java.awt.Component = utilityToolbar
+
+    /** The shared per-request approval reply gate (smoke hook). */
+    internal fun approvalGateForTest(): ApprovalReplyGate = approvalGate
+
+    /** Applies one pending-approval snapshot to BOTH decision surfaces. */
+    internal fun updatePendingApprovalsForTest(list: List<NativePermissionEntry>) {
+        onEdtValue {
+            permissionsPanel.update(list)
+            workApprovalCard.update(list)
+        }
+    }
+
+    /** The once-per-request approval announcements (smoke hook). */
+    internal fun approvalAnnouncementsForTest(): List<String> =
+        workApprovalCard.announcementsForTest()
+
+    /** Applies one served task view to the current-run strip (T22 smoke). */
+    internal fun applyRunSummaryForTest(view: NativeTaskView?) {
+        onEdtValue { applyRunSummary(view) }
+    }
+
+    internal fun prSetupNoticeVisibleForTest(): Boolean = prSetupBody.isVisible
+
+    /** T22 headline / copy / action as rendered (verbatim copy pin). */
+    internal fun prSetupCopyForTest(): Triple<String, String, String> =
+        Triple(prSetupHeadline.fullText, prSetupCopy.fullText, prSetupButton.text)
+
+    /** The Diagnostics readiness value as the panel renders it. */
+    internal fun diagnosticsReadinessForTest(): String = diagnosticsPanel.readinessText()
 
     internal fun taskTreeView(): TaskTreePanel = treePanel
 
@@ -2629,23 +3476,24 @@ class FaktorChatPanel(
         sendButton.isEnabled = running
         abortButton.isEnabled = running
         cancelRunButton.isEnabled = running
+        updateSessionChooserState(sessionChooserModel.size)
         setStartControlsEnabled(running)
     }
 
     /**
      * The start-surface controls (Start task, New session, the completion
-     * contract): disabled while a start is in flight, so a pending submission
-     * cannot be mutated or duplicated from the UI. Attachment/goal edits are
-     * additionally ignored by design: the in-flight request rides the
-     * immutable captured draft.
+     * level, the Task/Ask mode): disabled while a start is in flight, so a
+     * pending submission cannot be mutated or duplicated from the UI.
+     * Attachment/goal edits are additionally ignored by design: the in-flight
+     * request rides the immutable captured draft.
      */
     private fun setStartControlsEnabled(enabled: Boolean) {
         val effective = enabled && service.isRunning() && !startInFlight.get()
         startTaskButton.isEnabled = effective
         newSessionButton.isEnabled = effective
-        completionCommit.isEnabled = effective
-        completionPush.isEnabled = effective
-        completionPr.isEnabled = effective
+        for (button in completionLevels) button.isEnabled = effective
+        taskModeButton.isEnabled = effective
+        askModeButton.isEnabled = effective
     }
 
     /**
@@ -2763,7 +3611,12 @@ class FaktorChatPanel(
             changesPanel.update(emptyList(), emptyList())
             blockersPanel.update(emptyList(), emptyList())
             permissionsPanel.update(emptyList())
+            workApprovalCard.update(emptyList())
             agentsPanel.update(emptyList(), null)
+            // The run summary strip is session-owned: a stale run summary must
+            // never look like it belongs to the newly opened session.
+            runSummaryArea.text = ""
+            prSetupBody.isVisible = false
             // Session-scoped identities and tracked targets never cross a
             // switch: a stale completion contract or tournament id would be
             // rendered (and acted on) as if it belonged to the new session.
@@ -2776,6 +3629,17 @@ class FaktorChatPanel(
         }
     }
 }
+
+/**
+ * The parsed per-run budget of the Task options sheet: `tokens` is the
+ * exact `max_tokens` (null = the run default), `maxCostMicro` the exact
+ * `max_cost_micro` (null = the run default). Both are captured immutably with
+ * the rest of the submission.
+ */
+private data class BudgetCapture(
+    val tokens: Long?,
+    val maxCostMicro: BigInteger?
+)
 
 /**
  * The immutable description of ONE logical task start, captured from the
@@ -2791,7 +3655,10 @@ private data class TaskStartDraft(
     val binaries: List<PendingBinaryAttachment>,
     val completionContract: NativeCompletionContract?,
     /** The bounded user-authored engineering-contract rows (null = none). */
-    val contractRows: NativeContractRows?
+    val contractRows: NativeContractRows?,
+    /** The per-run budget (null members = the machine/run defaults). */
+    val budgetTokens: Long?,
+    val budgetMaxCostMicro: BigInteger?
 ) {
     /** Exact-draft comparison of a retry against the retained submission. */
     fun sameDraftAs(other: TaskStartDraft): Boolean =
@@ -2801,6 +3668,8 @@ private data class TaskStartDraft(
             files == other.files &&
             completionContract == other.completionContract &&
             contractRows == other.contractRows &&
+            budgetTokens == other.budgetTokens &&
+            budgetMaxCostMicro == other.budgetMaxCostMicro &&
             binaries.size == other.binaries.size &&
             binaries.indices.all { index ->
                 val mine = binaries[index]
@@ -2893,6 +3762,28 @@ object FaktorFrontendApp {
             frame.isVisible = true
             panel.startDaemon()
         }
+    }
+}
+
+/**
+ * The stable machine code of the daemon's explicit configuration blocker
+ * (`crates/orchestrator/src/completion_steps.rs:NATIVE_PR_SCM_NOT_CONFIGURED`)
+ * recorded when a task's completion contract requests the native PR step but
+ * no canonical SCM provider is wired. It is the ONLY signal the T22 surface
+ * accepts: no other PR failure is ever read as a missing-SCM configuration.
+ */
+internal const val NATIVE_PR_SCM_NOT_CONFIGURED = "native_pr_scm_not_configured"
+
+/**
+ * True when the requested PR finish step is blocked by the daemon's typed
+ * SCM-not-configured code. A missing read (or any other failure) stays
+ * false — PR success is never inferred and a cause is never fabricated.
+ */
+internal fun prScmSetupBlocked(view: NativeTaskView?): Boolean {
+    val steps = view?.completion?.steps ?: return false
+    return steps.any { step ->
+        step.step.equals("pr", ignoreCase = true) &&
+            step.detail.contains(NATIVE_PR_SCM_NOT_CONFIGURED)
     }
 }
 

@@ -25,13 +25,13 @@
       "environment": "mac-os-x-aarch64-jvm17-f9f93b9e02d24",
       "digests": {
         "task-tree": "15d6024a6a5d1cc4d815372d62b0c5791460ecbd212ee93d6b33ea2e5695b078",
-        "blockers": "d5a322a78ede181679451701ea309fa6997efae985b2a69bcac75499b98accd2",
-        "tournament": "40edbc240556eff6e6566146e58b9acec7c6798f75574354b7c247a4e860a3bd",
-        "permissions": "6f937185f157a3d23beee91158addc0e0afaf36a49b41ac59e87be19d5ba58a4",
-        "terminal": "d4d0137e48fcee939c401b0804d37c67e11d45a1296a1229a1795897e9c4e8c6",
-        "evidence": "a9019db97f66e8a66d624575fcb45e8e6a35d23d953032eb4e52ee8e18fd2743",
-        "settings": "1bc17c30d6a7a2b3379afbb3b574143676e268bd09e667ec712efc60e121d5d8",
-        "history": "2aa560b7454f7ad5d0b1db409605abf430f08c56d1ad861991c35c01e931e917"
+        "blockers": "b18794c6e738fed42de16be7685cba680b03cb2085208926f99a21239f0ff23a",
+        "tournament": "2393da0ecb56f2a8d9eb7b81c40700146b2c0ebdbc6eff2243456cd1ca864cc2",
+        "permissions": "55536b059a2b566708b7a7c3cfadee0c4bea9901656e555a9412b01809c901c3",
+        "terminal": "c3c981641ef549e71549153f09c28be088f2780f1dea5f65026dc6bd0e32a424",
+        "evidence": "beea22dc9dc0962a593f26bdca6d29189cd1cf3874156250822402ca0bbc86f1",
+        "settings": "62dba04eaf102476fc6a85a185d9a6c52d1ab9c29d081f8bfbbcc42c516ec94e",
+        "history": "0f88fea424ee7f7e48608e85132bfeccb56c095fc5c59e7aa7f9aaa9309863d4"
       }
     }
   }

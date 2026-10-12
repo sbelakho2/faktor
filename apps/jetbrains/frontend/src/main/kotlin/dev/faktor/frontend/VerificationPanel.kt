@@ -219,20 +219,46 @@ class VerificationPanel : JPanel(BorderLayout()) {
         body.add(wrappedMutedLabel("${row.requirement} criterion · ${row.bindingKind}$binding"))
         row.verdictReason?.let { body.add(wrappedMutedLabel(bound(it, 240))) }
         if (row.evidenceRefs.isNotEmpty()) {
-            val evidenceRow = JPanel(BorderLayout())
-            evidenceRow.isOpaque = false
-            evidenceRow.alignmentX = Component.LEFT_ALIGNMENT
-            for (ref in row.evidenceRefs) {
-                val button = secondaryButton(ref.label.ifBlank { "Evidence" })
+            val buttons = row.evidenceRefs.map { ref ->
+                val label = ref.label.ifBlank { "Evidence" }
+                // Narrow-host fix: a long served label is bounded on the
+                // button (the full label stays the tooltip) so the wrapping
+                // full-width evidence row never clips at 240px.
+                val button = secondaryButton(bound(label, 32))
+                button.toolTipText = label
+                button.putClientProperty(EVIDENCE_ID_PROPERTY, ref.id?.toString() ?: ref.label)
                 button.addActionListener { listener?.onEvidenceSelected(ref) }
-                evidenceRow.add(button, BorderLayout.WEST)
+                button
             }
+            val evidenceRow = actionRow(*buttons.toTypedArray())
+            evidenceRow.alignmentX = Component.LEFT_ALIGNMENT
             body.add(evidenceRow)
         }
         return card(null, body, hgap = Spacing.S, vgap = Spacing.S)
     }
 
     fun criterionCount(): Int = criterionCount
+
+    /** The evidence ids of every rendered criterion evidence button (smoke). */
+    fun evidenceButtonIds(): List<String> {
+        val out = ArrayList<String>()
+        collectEvidenceIds(criteriaColumn, out)
+        return out
+    }
+
+    private fun collectEvidenceIds(component: Component, out: MutableList<String>) {
+        if (component is javax.swing.AbstractButton) {
+            val id = component.getClientProperty(EVIDENCE_ID_PROPERTY) as? String
+            if (id != null) out.add(id)
+        }
+        if (component is java.awt.Container) {
+            for (child in component.components) collectEvidenceIds(child, out)
+        }
+    }
+
+    private companion object {
+        const val EVIDENCE_ID_PROPERTY = "faktor.evidenceId"
+    }
 
     fun summaryText(): String = summary.fullText
 

@@ -21,6 +21,8 @@
     "onCommand:faktor.refresh",
     "onCommand:faktor.controlPlaneSignIn",
     "onCommand:faktor.controlPlaneSignOut",
+    "onCommand:faktor.switchSession",
+    "onCommand:faktor.locateDaemon",
     "onView:faktor.chat"
   ],
   "main": "out/extension.js",
@@ -75,6 +77,16 @@
       {
         "command": "faktor.reconnectStream",
         "title": "Diagnostics: Reconnect Event Stream",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.switchSession",
+        "title": "Switch Conversation",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.locateDaemon",
+        "title": "Locate daemon…",
         "category": "Faktor"
       }
     ],

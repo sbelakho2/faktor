@@ -394,7 +394,12 @@ steps:
       FAKTOR_SOAK_LANE: soak-smoke
       # Bounded even though the first (cold) release build dominates: a
       # non-positive budget is refused, a zero-test run fails the step, and a
-      # failed convergence metric fails the lane.
+      # failed convergence metric fails the lane. On emulated/VM runners the
+      # effective campaign wall budget is derived from same-run controls
+      # (bounded calibration workload through this same harness + the
+      # sampler's realtime-vs-monotonic span), max(product, factor*product),
+      # capped at FAKTOR_SOAK_WALL_CAP_SECONDS; the product budget stays a
+      # floor and an over-budget/non-converging campaign still fails.
       FAKTOR_SOAK_MAX_WALL_SECONDS: "3600"
       FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "3300"
     volumes:

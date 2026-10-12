@@ -456,6 +456,13 @@ export interface NativeSessionSummary {
   readonly provider: string;
   readonly model: string;
   readonly state: string;
+  /**
+   * The durable creation time the listing serves additively. `null` on a
+   * daemon that predates the field (or on a listing row whose durable row
+   * could not be read): the History surface renders an honest absence and
+   * NEVER fabricates a date.
+   */
+  readonly createdMs: number | null;
 }
 
 /** One per-MIME entry of the daemon-advertised attachment limits. */
@@ -1545,12 +1552,20 @@ export function validateSessionList(json: Json): NativeSessionSummary[] {
 
 function validateSessionSummary(object: JsonObject, path: string): NativeSessionSummary {
   checkResponseKeys(object, path, ['id', 'title', 'provider', 'model', 'state']);
+  // `created_ms` is ADDITIVE on the listing route (a daemon that predates it
+  // serves none): absent = an honest null, present = exact epoch-ms
+  // validation. A malformed present value is a loud protocol failure.
+  const createdMs =
+    Object.prototype.hasOwnProperty.call(object, 'created_ms')
+      ? epochMsValue(object.created_ms as Json, `${path}.created_ms`)
+      : null;
   return {
     id: fString(object, 'id', path),
     title: fString(object, 'title', path),
     provider: fString(object, 'provider', path),
     model: fString(object, 'model', path),
     state: fString(object, 'state', path),
+    createdMs,
   };
 }
 

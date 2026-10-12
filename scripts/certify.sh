@@ -225,6 +225,7 @@ context_registry_list() {
 canonical_gate_commands() {
     printf '%s\n' \
         'cargo fmt --check' \
+        'cargo check --workspace --exclude faktor-tests-fault' \
         'cargo check --workspace --all-features' \
         'cargo clippy --workspace --all-targets --all-features -- -D warnings' \
         'cargo test --workspace --all-features'

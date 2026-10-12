@@ -113,6 +113,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'boardRefused', token, reason });
   }
 
+  /**
+   * The result of ONE approval-card reply, correlated by the request id:
+   * the panel releases that request's in-flight lock and, on a refusal,
+   * keeps the request visible with the exact reason. `ok: true` means the
+   * daemon accepted the reply (the pending snapshot drops the row); the
+   * panel never retries implicitly.
+   */
+  postPermissionResult(permissionId: string, ok: boolean, reason: string | null = null): void {
+    this.post({ type: 'permissionResult', permissionId, ok, reason });
+  }
+
   /** One transient notice line (last error, control ack, ...). */
   postNotice(level: 'info' | 'error', message: string): void {
     this.post({ type: 'notice', level, message });
@@ -147,6 +158,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'streamBlocked', reason, cursor });
   }
 
+  /**
+   * T27/T28 presentation input: an explicit reconnect is in flight
+   * (`recovering: true`), so the panel shows the T27 row until the stream
+   * opens (or blocks again). The cursor-preservation semantics are unchanged.
+   */
+  postStreamRecovery(recovering: boolean): void {
+    this.post({ type: 'streamRecovery', recovering: recovering === true });
+  }
+
   focus(): void {
     void vscode.commands.executeCommand('faktor.chat.focus');
   }
@@ -165,6 +185,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const boardUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'board-state.js'),
+    );
+    const historyUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'history-state.js'),
     );
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.css'),
@@ -187,13 +210,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <title>Faktor</title>
 </head>
 <body>
-<div id="app" class="inspect-collapsed">
+<div id="app">
   <header>
     <span id="brand">Faktor</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
-    <button id="btn-inspect" class="toggle" type="button" aria-expanded="false" title="Show run details, agents, coordination and evidence">Inspect</button>
+    <nav id="nav-switcher" class="nav-switcher" role="tablist" aria-label="Faktor views">
+      <button id="nav-work" class="nav-tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="work-panel">Work</button>
+      <button id="nav-inspect" class="nav-tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-panel">Inspect</button>
+      <button id="nav-history" class="nav-tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-panel">History</button>
+    </nav>
     <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="true" title="Diagnostics and service controls" aria-label="Diagnostics and service controls">⋯</button>
   </header>
   <section id="diagnostics" class="card diagnostics" hidden>
@@ -201,8 +228,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <section id="meta">
       <div class="meta-row"><span class="meta-key">Session</span><span id="session-title">none</span></div>
       <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">service stopped</span></div>
-      <div class="meta-row"><span class="meta-key">Live updates</span><span id="stream-status">stopped</span></div>
       <div class="meta-row"><span class="meta-key">Service</span><span id="daemon-url">—</span></div>
+      <div class="meta-row"><span class="meta-key">Readiness</span><span id="readiness-label">not requested</span></div>
+      <div class="meta-row"><span class="meta-key">Live updates</span><span id="stream-status">stopped</span></div>
+      <div class="meta-row"><span class="meta-key">Index coverage</span><span id="index-coverage">not reported</span></div>
+      <div class="meta-row"><span class="meta-key">Trust</span><span id="trust-label">—</span></div>
+    </section>
+    <section id="diagnostics-preflight" class="preflight diag-preflight" hidden aria-label="Preflight state">
+      <div class="preflight-head">
+        <span id="diag-preflight-dot" class="dot dot-stopped" aria-hidden="true"></span>
+        <span id="diag-preflight-label" class="preflight-label">—</span>
+      </div>
+      <p id="diag-preflight-copy" class="preflight-copy muted"></p>
+      <div id="diag-preflight-detail" class="muted preflight-detail" hidden></div>
+      <div id="diag-preflight-actions" class="composer-actions preflight-actions"></div>
     </section>
     <div class="composer-actions">
       <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
@@ -210,13 +249,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="btn-start" class="secondary" type="button" title="Start the Faktor service">Start</button>
     </div>
     <div id="stream-cursor" class="muted" hidden></div>
+    <section id="sandbox-setup" class="setup-card" aria-labelledby="sandbox-setup-title">
+      <h3 id="sandbox-setup-title">Shell execution needs a decision</h3>
+      <p id="sandbox-setup-copy" class="muted">The secure default remains fail-closed on this platform.</p>
+      <button id="btn-open-sandbox-guidance" type="button">Open setup guidance</button>
+      <div id="sandbox-guidance" class="sandbox-guidance" hidden>
+        <p id="sandbox-guidance-text" class="muted">Run this on the machine that hosts the Faktor service. The service records the choice and applies it to agent shell and verification children; this panel cannot change shell execution policy.</p>
+        <div class="setup-command">
+          <code id="sandbox-command">faktor sandbox choose</code>
+          <button id="btn-copy-sandbox-command" class="secondary" type="button" aria-label="Copy command faktor sandbox choose">Copy command</button>
+        </div>
+        <div id="sandbox-copy-status" class="muted" role="status" aria-live="polite"></div>
+      </div>
+    </section>
   </section>
-  <section id="stream-recovery" class="card" hidden>
-    <h2>Live updates paused</h2>
+  <section id="stream-recovery" class="card" hidden aria-labelledby="stream-recovery-title">
+    <h2 id="stream-recovery-title">Live updates paused</h2>
+    <p id="stream-recovery-copy" class="recovery-copy">The client cannot read the next durable event. Nothing is skipped.</p>
     <div id="stream-recovery-reason" class="warn" role="alert"></div>
     <div class="composer-actions">
       <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good position after the Faktor service is upgraded">Reconnect</button>
       <button id="btn-refresh-snapshot" class="secondary" type="button" title="Re-read the durable state (the blocked position is not skipped)">Refresh from snapshot</button>
+      <button id="btn-wait-stream" class="secondary" type="button" title="Keep waiting; the last valid journal position is kept" hidden>Wait</button>
+      <button id="btn-refresh-reconnecting" class="secondary" type="button" title="Re-read the durable state (the position is not skipped)" hidden>Refresh</button>
     </div>
     <details class="technical-disclosure">
       <summary>Technical details</summary>
@@ -224,6 +279,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </details>
   </section>
   <section id="notices" aria-live="polite"></section>
+  <main id="work-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-work">
   <section id="task-card" class="card run-card" hidden>
     <h2>Current run</h2>
     <div class="run-strip">
@@ -238,11 +294,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
     <h2 id="permission-card-title">Faktor needs your approval</h2>
+    <div id="permission-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     <ul id="permission-list" class="permission-list" aria-label="Pending permission requests"></ul>
   </section>
   <section id="transcript-card" class="card transcript-card">
     <h2 id="transcript-title">Conversation</h2>
     <section id="welcome" class="welcome">
+      <section id="preflight-card" class="preflight" aria-labelledby="preflight-label" hidden>
+        <div class="preflight-head">
+          <span id="preflight-dot" class="dot dot-stopped" aria-hidden="true"></span>
+          <h3 id="preflight-label" class="preflight-label">Faktor is stopped</h3>
+        </div>
+        <p id="preflight-copy" class="preflight-copy muted">Start the service when you are ready.</p>
+        <div id="preflight-path-row" class="preflight-meta" hidden>
+          <span class="preflight-key">Executable</span>
+          <code id="preflight-path" class="preflight-path"></code>
+        </div>
+        <div id="preflight-trust-row" class="preflight-meta" hidden>
+          <span class="preflight-key">Trust</span>
+          <span id="preflight-trust" class="preflight-trust"></span>
+        </div>
+        <div id="preflight-detail" class="muted preflight-detail" hidden></div>
+        <div id="preflight-actions" class="composer-actions preflight-actions"></div>
+      </section>
       <div class="welcome-mark" aria-hidden="true">
         <svg viewBox="0 0 5 5" width="36" height="36" class="pixel pixel-done">
           <rect class="pixel-body" x="1" y="0" width="3" height="5"></rect>
@@ -303,33 +377,83 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="btn-new-task" class="secondary" type="button">New task…</button>
     </div>
   </form>
-  <section id="inspect-card" class="card">
-    <h2>Inspect</h2>
-    <div id="task-completion" class="completion"></div>
-    <div id="cockpit" class="cockpit"></div>
-  </section>
-  <section id="agents-card" class="card" hidden>
-    <h2>Agents</h2>
-    <ul id="agent-list"></ul>
-  </section>
-  <section id="board-card" class="card">
-    <h2>Board</h2>
-    <div id="board-header" class="muted">board: not read yet</div>
-    <ul id="board-posts" class="board-posts" aria-label="Coordination board posts"></ul>
-    <form id="board-post" class="board-composer">
-      <label for="board-subject" class="composer-label">Subject</label>
-      <input id="board-subject" type="text" maxlength="512" autocomplete="off" />
-      <label for="board-body" class="composer-label">Body</label>
-      <textarea id="board-body" rows="2" maxlength="16384"></textarea>
-      <div id="board-draft-notice" class="muted" role="status" hidden></div>
-      <div class="composer-actions">
-        <button id="btn-board-read" type="button">Read board</button>
-        <button id="btn-board-post" type="submit">Post</button>
+  </main>
+  <section id="inspect-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-inspect" hidden>
+    <div class="inspect-nav">
+      <div id="inspect-tabs" class="tablist" role="tablist" aria-label="Inspect subviews">
+        <button id="subtab-overview" class="tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="inspect-subpanel-overview">Overview</button>
+        <button id="subtab-plan" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-subpanel-plan">Plan</button>
+        <button id="subtab-changes" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-subpanel-changes">Changes</button>
+        <button id="subtab-verification" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-subpanel-verification">Verification</button>
+        <button id="subtab-agents" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-subpanel-agents">Agents</button>
       </div>
-    </form>
+      <div id="inspect-breadcrumb" class="inspect-breadcrumb" aria-label="Current scope">
+        <span id="inspect-breadcrumb-path" class="inspect-breadcrumb-path">Inspect / Overview</span>
+        <span id="inspect-breadcrumb-scope" class="muted"></span>
+        <details id="inspect-breadcrumb-diagnostics" class="technical-disclosure breadcrumb-diagnostics">
+          <summary>Advanced diagnostics</summary>
+          <div id="inspect-breadcrumb-diagnostics-body" class="muted"></div>
+        </details>
+      </div>
+    </div>
+    <div id="inspect-subpanel-overview" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-overview">
+      <section id="inspect-card" class="card">
+        <div id="task-completion" class="completion"></div>
+        <div id="cockpit" class="cockpit"></div>
+      </section>
+    </div>
+    <div id="inspect-subpanel-plan" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-plan" hidden></div>
+    <div id="inspect-subpanel-changes" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-changes" hidden>
+      <section id="changes-card" class="card">
+        <h2>Changes</h2>
+        <ul id="changes-list" class="changes-list" aria-label="Changed paths served for this run"></ul>
+        <div id="changes-empty" class="muted"></div>
+      </section>
+    </div>
+    <div id="inspect-subpanel-verification" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-verification" hidden></div>
+    <div id="inspect-subpanel-agents" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-agents" hidden>
+      <section id="agents-card" class="card" hidden>
+        <h2>Agents</h2>
+        <ul id="agent-list"></ul>
+      </section>
+      <section id="board-card" class="card" hidden>
+        <h2>Board</h2>
+        <div id="board-header" class="muted">board: not read yet</div>
+        <ul id="board-posts" class="board-posts" aria-label="Coordination board posts"></ul>
+        <form id="board-post" class="board-composer">
+          <label for="board-subject" class="composer-label">Subject</label>
+          <input id="board-subject" type="text" maxlength="512" autocomplete="off" />
+          <label for="board-body" class="composer-label">Body</label>
+          <textarea id="board-body" rows="2" maxlength="16384"></textarea>
+          <div id="board-draft-notice" class="muted" role="status" hidden></div>
+          <div class="composer-actions">
+            <button id="btn-board-read" type="button">Read board</button>
+            <button id="btn-board-post" type="submit">Post</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </section>
+  <section id="history-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-history" hidden>
+    <section id="history-card" class="card">
+      <h2>History</h2>
+      <div id="history-controls" class="history-controls">
+        <input id="history-search" type="search" placeholder="Search conversation titles" aria-label="Search conversations by title" autocomplete="off" maxlength="200" spellcheck="false" />
+        <button id="btn-history-refresh" class="secondary" type="button" title="Re-read the durable conversation list">Refresh</button>
+      </div>
+      <div id="history-status" class="muted" role="status"></div>
+      <ul id="history-list" class="history-list" aria-label="Durable conversations"></ul>
+      <div id="history-note" class="muted"></div>
+      <section id="history-unavailable" class="history-unavailable" hidden>
+        <h3 id="history-unavailable-label" class="history-unavailable-label" role="alert">History unavailable</h3>
+        <p id="history-unavailable-copy" class="muted">The conversation list could not be read.</p>
+        <button id="btn-history-refresh-unavailable" type="button">Refresh history</button>
+      </section>
+    </section>
   </section>
 </div>
 <script nonce="${nonce}" src="${boardUri}"></script>
+<script nonce="${nonce}" src="${historyUri}"></script>
 <script nonce="${nonce}" src="${composerUri}"></script>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

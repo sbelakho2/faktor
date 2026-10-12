@@ -27,6 +27,30 @@
 #     `FAKTOR_SOAK_DATA_DIR` and `FAKTOR_SOAK_METRICS_FILE` are exported to
 #     each test process so the convergence-aware workload can honor them.
 #
+# LOAD-AWARE WALL BUDGET (churn/realtime convergence campaigns): the
+# documented product budget (`FAKTOR_SOAK_MAX_WALL_SECONDS`) assumes the
+# documented product runner. Emulated (Rosetta/VM) runners stretch wall
+# clock, so the campaign budget is derived from same-run controls instead
+# of trusting the constant:
+#   * CONTROL: a BOUNDED calibration workload run through the SAME harness
+#     invocation path before the campaign — the same cargo command with the
+#     test filters normalized to `soak_convergence_churn` and
+#     `FAKTOR_SOAK_CALIBRATION_TURNS` set, so the real runtime/store
+#     executes a fixed number of churn turns and prints its own monotonic
+#     cost. The measured cost over the documented product nominal
+#     (`FAKTOR_SOAK_CALIBRATION_NOMINAL_MS`) is the runner's emulation
+#     factor.
+#   * RUN-WIDE INTEGRITY: the bounded convergence sampler records BOTH the
+#     harness accounting clock (`t`) and `CLOCK_MONOTONIC` (`mono_ms`) for
+#     every tick, so a realtime step during the campaign (VM suspend,
+#     emulated clock stretch) is measured across the campaign itself.
+#   * DERIVATION: `effective = min(max(product, factor * product), cap)`
+#     with `factor = min(max(work_factor, clock_factor), FAKTOR_SOAK_MAX_WALL_FACTOR)`
+#     and the documented hard ceiling `FAKTOR_SOAK_WALL_CAP_SECONDS`. The
+#     product budget is a floor, never shrunk; the duration target stays the
+#     requirement; a campaign over even the derived budget still fails, and
+#     every convergence metric keeps its teeth.
+#
 # QUIESCENT CONVERGENCE (mandatory in churn/realtime): when the workload has
 # quiesced the driver samples the subject process tree and the soak data dir
 # with bounded samplers (`scripts/certification/soak-convergence.py sample`)
@@ -58,6 +82,17 @@
 #   FAKTOR_SOAK_CONVERGENCE         required|off (default required for
 #                                   churn/realtime, off otherwise)
 #   FAKTOR_SOAK_LANE                lane id recorded in soak.json (default soak)
+#   FAKTOR_SOAK_CALIBRATION         auto|off (default auto): run the bounded
+#                                   calibration workload through the same
+#                                   harness when a convergence campaign
+#                                   selects the faktor-tests-soak workload
+#   FAKTOR_SOAK_CALIBRATION_TURNS   default 64 (bounded fixed calibration work)
+#   FAKTOR_SOAK_CALIBRATION_NOMINAL_MS default 2000 (documented product-runner
+#                                   reference cost of the calibration turns)
+#   FAKTOR_SOAK_MAX_WALL_FACTOR     default 8 (documented runner-slowness
+#                                   allowance on the product wall budget)
+#   FAKTOR_SOAK_WALL_CAP_SECONDS    default 172800 (documented hard ceiling on
+#                                   the derived campaign wall budget)
 #   FAKTOR_SOAK_DATA_DIR            workload data dir sampled after quiescence
 #   FAKTOR_SOAK_METRICS_FILE        workload runtime-metrics JSONL stream
 #   FAKTOR_SOAK_CONVERGENCE_SAMPLES explicit sampler stream override (selftest)
@@ -76,6 +111,9 @@
 #   bash scripts/soak.sh [--mode smoke|long|churn|realtime]
 #                        [--groups soak,fault,perf] [--churn-seconds N]
 #                        [--realtime-seconds N] [--convergence required|off]
+#                        [--calibration auto|off] [--calibration-turns N]
+#                        [--calibration-nominal-ms N] [--max-wall-factor N]
+#                        [--wall-cap-seconds N]
 #                        [--lane L] [--sample-interval S] [--max-samples N]
 #                        [--scale N] [--max-rounds N] [--max-wall-seconds N]
 #                        [--test-timeout-seconds N] [--cargo-bin PATH]
@@ -101,6 +139,11 @@ CHURN_SECONDS_RAW="${FAKTOR_SOAK_CHURN_SECONDS:-1800}"
 REALTIME_SECONDS_RAW="${FAKTOR_SOAK_REALTIME_SECONDS:-43200}"
 CONVERGENCE_RAW="${FAKTOR_SOAK_CONVERGENCE:-}"
 LANE="${FAKTOR_SOAK_LANE:-soak}"
+CALIBRATION_RAW="${FAKTOR_SOAK_CALIBRATION:-auto}"
+CAL_TURNS_RAW="${FAKTOR_SOAK_CALIBRATION_TURNS:-64}"
+CAL_NOMINAL_MS_RAW="${FAKTOR_SOAK_CALIBRATION_NOMINAL_MS:-2000}"
+MAX_WALL_FACTOR_RAW="${FAKTOR_SOAK_MAX_WALL_FACTOR:-8}"
+WALL_CAP_SECONDS_RAW="${FAKTOR_SOAK_WALL_CAP_SECONDS:-172800}"
 SAMPLE_INTERVAL_RAW="${FAKTOR_SOAK_SAMPLE_INTERVAL:-1}"
 MAX_SAMPLES_RAW="${FAKTOR_SOAK_MAX_SAMPLES:-100000}"
 PYTHON_BIN="${FAKTOR_SOAK_PYTHON:-python3}"
@@ -138,7 +181,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
   --selftest) SELFTEST=1; shift ;;
   --print-plan) PRINT_PLAN=1; shift ;;
-  --mode | --groups | --scale | --max-rounds | --max-wall-seconds | --test-timeout-seconds | --cargo-bin | --out-dir | --churn-seconds | --realtime-seconds | --convergence | --lane | --sample-interval | --max-samples | --python-bin)
+  --mode | --groups | --scale | --max-rounds | --max-wall-seconds | --test-timeout-seconds | --cargo-bin | --out-dir | --churn-seconds | --realtime-seconds | --convergence | --lane | --sample-interval | --max-samples | --python-bin | --calibration | --calibration-turns | --calibration-nominal-ms | --max-wall-factor | --wall-cap-seconds)
     [ "$#" -ge 2 ] || die_usage "$1 needs a value"
     case "$1" in
     --mode) MODE="$2" ;;
@@ -156,6 +199,11 @@ while [ "$#" -gt 0 ]; do
     --sample-interval) SAMPLE_INTERVAL_RAW="$2" ;;
     --max-samples) MAX_SAMPLES_RAW="$2" ;;
     --python-bin) PYTHON_BIN="$2" ;;
+    --calibration) CALIBRATION_RAW="$2" ;;
+    --calibration-turns) CAL_TURNS_RAW="$2" ;;
+    --calibration-nominal-ms) CAL_NOMINAL_MS_RAW="$2" ;;
+    --max-wall-factor) MAX_WALL_FACTOR_RAW="$2" ;;
+    --wall-cap-seconds) WALL_CAP_SECONDS_RAW="$2" ;;
     esac
     shift 2
     ;;
@@ -304,7 +352,7 @@ write_record() { # status reason started finished duration executed passed faile
   TMP_OUT="$OUT_FILE.tmp.$$"
   local target_clamped_json=false
   [ "${TARGET_CLAMPED:-0}" = "1" ] && target_clamped_json=true
-  printf '{"schema":"faktor-soak/v1","lane":"%s","status":"%s","reason":"%s","mode":"%s","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s,"target_seconds":%s,"target_clamped":%s,"scale_requested":%s,"scale_effective":%s,"max_scale":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"rounds_capped":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"bounded":true,"executed_total":%s,"passed_total":%s,"failed_total":%s,"convergence_required":%s,"convergence":%s,"groups":%s,"logs":%s}\n' \
+  printf '{"schema":"faktor-soak/v1","lane":"%s","status":"%s","reason":"%s","mode":"%s","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s,"target_seconds":%s,"target_clamped":%s,"scale_requested":%s,"scale_effective":%s,"max_scale":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"rounds_capped":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"wall_budget_seconds":%s,"wall_budget_product_seconds":%s,"wall_budget_factor":%s,"wall_budget_work_factor":%s,"wall_budget_clock_factor":%s,"wall_budget_cap_seconds":%s,"wall_budget_calibration_ms":%s,"calibration":"%s","bounded":true,"executed_total":%s,"passed_total":%s,"failed_total":%s,"convergence_required":%s,"convergence":%s,"groups":%s,"logs":%s}\n' \
     "$(json_escape "$LANE")" "$(json_escape "$status")" "$(json_escape "$reason")" "$(json_escape "$MODE")" \
     "$(json_escape "$COMMIT")" "$(json_escape "$TREE")" \
     "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" \
@@ -313,6 +361,9 @@ write_record() { # status reason started finished duration executed passed faile
     "${SCALE_REQUESTED:-0}" "${SCALE_EFFECTIVE:-0}" "${MAX_SCALE:-0}" "$scale_clamped_json" \
     "${ROUNDS:-0}" "${MAX_ROUNDS:-0}" "$rounds_capped_json" \
     "${MAX_WALL:-0}" "${TEST_TIMEOUT:-0}" \
+    "${EFFECTIVE_WALL:-$MAX_WALL}" "${MAX_WALL:-0}" "${WALL_BUDGET_FACTOR:-1}" \
+    "${WALL_BUDGET_WORK_FACTOR:-1}" "${WALL_BUDGET_CLOCK_FACTOR:-1}" \
+    "${WALL_BUDGET_CAP:-$MAX_WALL}" "${CAL_MS:-0}" "$(json_escape "${CAL_STATUS:-not-run}")" \
     "$executed" "$passed" "$failed" "${CONVERGENCE_REQUIRED:-false}" "$convergence_json" "$groups_json" "$logs_json" >"$TMP_OUT"
   mv "$TMP_OUT" "$OUT_FILE"
   echo "soak: recorded $OUT_FILE (status=$status reason=${reason:-none})"
@@ -334,16 +385,117 @@ parse_counts() { # log -> "executed passed failed"
 # churn/realtime modes are REAL wall-clock targets: a successful round that
 # finished before the target extends the campaign (bounded by MAX_ROUNDS)
 # instead of ending early. `round`/`start_epoch`/`TARGET_SECONDS` are visible
-# through bash dynamic scoping.
+# through bash dynamic scoping. The elapsed accounting uses the workload's
+# clock class (CLOCK_MONOTONIC, see budget_elapsed) so a realtime clock step
+# on an emulated/VM runner cannot prematurely end the campaign; the reported
+# campaign duration stays realtime and is judged by the load-aware budget.
 maybe_extend_rounds() {
   local mode="${1:-$MODE}"
   if [ "$mode" != churn ] && [ "$mode" != realtime ]; then
     return 0
   fi
-  local elapsed=$(($(date +%s) - start_epoch))
+  local elapsed
+  elapsed="$(budget_elapsed)"
   if [ "$elapsed" -lt "$TARGET_SECONDS" ] && [ "$round" -lt "$MAX_ROUNDS" ]; then
     ROUNDS=$((ROUNDS + 1))
   fi
+}
+
+# Elapsed seconds of CAMPAIGN WORK for internal budget enforcement. When
+# convergence is required the campaign measures in the workload's own clock
+# class (CLOCK_MONOTONIC) — the same class the per-invocation `timeout` and
+# the workload's real-time target use — so an emulated/VM realtime step is
+# not mistaken for spent work. Non-convergence modes (no python contract)
+# keep realtime. The final reported duration and the duration band stay
+# realtime against the load-aware budget.
+budget_elapsed() {
+  if [ -n "${START_MONO:-}" ]; then
+    local now
+    if now="$("$PYTHON_BIN" -c 'import time; print(int(time.monotonic()))' 2>/dev/null)"; then
+      printf '%s' "$((now - START_MONO))"
+      return 0
+    fi
+  fi
+  printf '%s' "$(( $(date +%s) - start_epoch ))"
+}
+
+# ------------------------------------------------------- load-aware budget
+# `soak-convergence.py budget` is the single implementation of the budget
+# algebra: effective = min(max(product, factor * product), cap) with
+# factor = min(max(work, clock), max_factor). `work` comes from the bounded
+# calibration workload this run executed through the same harness; `clock`
+# from the sampler's realtime-vs-monotonic span over the campaign itself.
+derive_wall_budget() { # [--with-samples]
+  local -a args=(budget --product-seconds "$MAX_WALL" --nominal-ms "$CAL_NOMINAL_MS"
+    --max-factor "$MAX_WALL_FACTOR" --cap-seconds "$WALL_CAP_SECONDS")
+  if [ -n "$CAL_MS" ]; then
+    args+=(--calibration-ms "$CAL_MS")
+  fi
+  if [ "${1:-}" = "--with-samples" ] && [ -n "${convergence_samples:-}" ] && [ -s "$convergence_samples" ]; then
+    args+=(--samples "$convergence_samples")
+  fi
+  "$PYTHON_BIN" "$CONVERGENCE_PY" "${args[@]}"
+}
+
+budget_field() { # json key
+  printf '%s' "$1" | sed -n "s/.*\"$2\": *\([0-9][0-9]*\).*/\1/p"
+}
+
+# Derives and installs the effective campaign wall budget (and the
+# per-invocation bound scaled by the same measured factor, never above the
+# documented cap). A refusal here is a typed failure: the controls exist and
+# a missing derivation would silently degrade to the fixed product budget.
+apply_wall_budget() { # args forwarded to derive_wall_budget
+  local json factor effective work clock
+  json="$(derive_wall_budget "$@" 2>/dev/null)" || return 1
+  factor="$(budget_field "$json" factor)"
+  effective="$(budget_field "$json" effective_seconds)"
+  work="$(budget_field "$json" work_factor)"
+  clock="$(budget_field "$json" clock_factor)"
+  if [ -z "$factor" ] || [ -z "$effective" ] || [ -z "$work" ] || [ -z "$clock" ]; then
+    return 1
+  fi
+  WALL_BUDGET_FACTOR="$factor"
+  WALL_BUDGET_WORK_FACTOR="$work"
+  WALL_BUDGET_CLOCK_FACTOR="$clock"
+  EFFECTIVE_WALL="$effective"
+  EFFECTIVE_TEST_TIMEOUT="$(awk -v t="$TEST_TIMEOUT" -v f="$factor" -v cap="$WALL_BUDGET_CAP" \
+    'BEGIN { b = t * f; if (b > cap) b = cap; if (b < t) b = t; print b }')"
+  return 0
+}
+
+# The calibration control only exists for campaigns that select the
+# convergence-aware `faktor-tests-soak` workload through custom cargo args.
+calibration_selected() {
+  [ "${#CARGO_ARGS[@]}" -gt 0 ] || return 1
+  local arg
+  for arg in "${CARGO_ARGS[@]}"; do
+    case "$arg" in
+    faktor-tests-soak | -p=faktor-tests-soak | --package=faktor-tests-soak) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# The same custom command with test filters normalized to the bounded
+# calibration workload (which is the churn test running a fixed turn count
+# with FAKTOR_SOAK_CALIBRATION_TURNS set).
+calibration_args() {
+  local arg skip=0
+  for arg in "${CARGO_ARGS[@]}"; do
+    if [ "$skip" -eq 1 ]; then
+      skip=0
+      continue
+    fi
+    case "$arg" in
+    --exact | --skip)
+      skip=1
+      continue
+      ;;
+    esac
+    printf '%s\n' "$arg"
+  done
+  printf '%s\n' --exact soak_convergence_churn
 }
 
 run_campaign() {
@@ -368,6 +520,7 @@ run_campaign() {
   local executed_total=0 passed_total=0 failed_total=0
   local rounds=1 round=1 rc=0 reason=""
   local sampler_pid="" convergence_samples=""
+  local START_MONO=""
   local SUBJECT_PIDFILE="" SOAK_DATA_DIR=""
 
   # ------------------------------------------------------- convergence setup
@@ -407,7 +560,10 @@ run_campaign() {
         # process tree + data dir every tick, writes one final quiescent
         # sample + final scan on SIGTERM. Launched directly (not behind
         # `timeout`) so the driver's SIGTERM reaches the python process and
-        # its own --duration/--max-samples caps keep it bounded regardless.
+        # its own monotonic --duration/--max-samples caps keep it bounded
+        # regardless. The duration bound is the documented hard cap (never
+        # the smaller product budget): the derived load-aware budget may
+        # legitimately run up to the cap, and the sampler must span it.
         "$PYTHON_BIN" "$CONVERGENCE_PY" sample \
           --out "$convergence_samples" \
           --pidfile "$SUBJECT_PIDFILE" \
@@ -415,7 +571,7 @@ run_campaign() {
           --data-dir "$SOAK_DATA_DIR" \
           --final-scan "$LOG_DIR/convergence-final.json" \
           --interval "$SAMPLE_INTERVAL" \
-          --duration "$MAX_WALL" \
+          --duration "$WALL_BUDGET_CAP" \
           --max-samples "$MAX_SAMPLES" \
           ${FAKTOR_SOAK_PROBE_URL:+--probe-url "$FAKTOR_SOAK_PROBE_URL"} \
           >"$LOG_DIR/convergence-sampler.log" 2>&1 &
@@ -426,15 +582,85 @@ run_campaign() {
     CONVERGENCE_REQUIRED=false
   fi
 
+  # Internal budget accounting clock (see budget_elapsed): monotonic when
+  # convergence is required. Python is guaranteed present at this point (its
+  # absence already set rc=1 above).
+  if [ "$rc" -eq 0 ] && [ "$CONVERGENCE" = required ]; then
+    START_MONO="$("$PYTHON_BIN" -c 'import time; print(int(time.monotonic()))' 2>/dev/null || true)"
+  fi
+
+  # ------------------------------------------------- load-aware calibration
+  # BOUNDED CONTROL through the same harness: the same custom cargo command
+  # with its test filters normalized to `soak_convergence_churn` and
+  # FAKTOR_SOAK_CALIBRATION_TURNS set, so the real runtime/store executes a
+  # fixed number of churn turns and prints its own monotonic cost. The
+  # measured cost over the documented product nominal is this runner's
+  # emulation factor (the run-wide clock factor is derived later from the
+  # sampler's same-run realtime-vs-monotonic span). A selected control that
+  # produces no measurement is a typed failure, never a silent skip.
+  local CAL_LOG="" CAL_RC=0 CAL_OUT=""
+  if [ "$rc" -eq 0 ] && [ "$CONVERGENCE" = required ] && [ "$CALIBRATION" = auto ]; then
+    if calibration_selected; then
+      local cal_args_saved=("${CARGO_ARGS[@]}")
+      local -a cal_args=()
+      while IFS= read -r cal_arg; do
+        cal_args+=("$cal_arg")
+      done < <(calibration_args)
+      CARGO_ARGS=("${cal_args[@]}")
+      CALIBRATION_ACTIVE=1
+      CAL_LOG="$LOG_DIR/calibration.log"
+      CAL_OUT="$LOG_DIR/calibration.json"
+      rm -f "$CAL_OUT"
+      run_command "cargo test ${CARGO_ARGS[*]}" "$CAL_LOG"
+      CAL_RC=$?
+      CALIBRATION_ACTIVE=0
+      CARGO_ARGS=("${cal_args_saved[@]}")
+      LOG_JSON="${LOG_JSON}\"$(json_escape "$CAL_LOG")\","
+      # The calibration workload writes its measurement to the env-pointed
+      # file (libtest captures test stderr); the log line stays a fallback
+      # for manual runs and the fake-cargo selftest world.
+      if [ -s "$CAL_OUT" ]; then
+        CAL_MS="$(budget_field "$(cat "$CAL_OUT")" elapsed_ms)"
+      fi
+      if [ -z "$CAL_MS" ]; then
+        local cal_line
+        cal_line="$(grep -o 'soak calibration: turns=[0-9]* elapsed_ms=[0-9]*' "$CAL_LOG" 2>/dev/null | tail -n 1)"
+        CAL_MS="$(printf '%s' "$cal_line" | sed -n 's/.*elapsed_ms=\([0-9][0-9]*\)$/\1/p')"
+      fi
+      if [ -z "$CAL_MS" ]; then
+        CAL_STATUS="failed"
+        reason="calibration-failed: no bounded calibration measurement in $CAL_LOG (rc=$CAL_RC)"
+        rc=1
+      elif [ "$CAL_RC" -ne 0 ]; then
+        CAL_STATUS="failed"
+        reason="calibration-failed: bounded calibration workload rc=$CAL_RC"
+        rc=1
+      else
+        CAL_STATUS="measured"
+      fi
+    else
+      CAL_STATUS="not-applicable"
+    fi
+  elif [ "$CALIBRATION" = off ]; then
+    CAL_STATUS="off"
+  fi
+  if [ "$rc" -eq 0 ] && [ "$CONVERGENCE" = required ]; then
+    if ! apply_wall_budget; then
+      reason="calibration-failed: load-aware wall budget derivation refused"
+      rc=1
+    else
+      echo "soak: load-aware wall budget product=${MAX_WALL}s factor=x${WALL_BUDGET_FACTOR} (work=x${WALL_BUDGET_WORK_FACTOR} clock=x${WALL_BUDGET_CLOCK_FACTOR}) effective=${EFFECTIVE_WALL}s cap=${WALL_BUDGET_CAP}s calibration=${CAL_STATUS}" >&2
+    fi
+  fi
+
   if [ "$rc" -eq 0 ]; then
   if [ "${#CARGO_ARGS[@]}" -gt 0 ]; then
     # Custom cargo args mode: one logical command, repeated per round.
     local cmd="cargo test ${CARGO_ARGS[*]}"
     local exec_count=0 pass_count=0 fail_count=0
     while [ "$round" -le "$ROUNDS" ]; do
-      now_epoch="$(date +%s)"
-      if [ $((now_epoch - start_epoch)) -ge "$MAX_WALL" ]; then
-        reason="wall-budget: campaign exceeded ${MAX_WALL}s before round $round"
+      if [ "$(budget_elapsed)" -ge "$EFFECTIVE_WALL" ]; then
+        reason="wall-budget: campaign exceeded the ${EFFECTIVE_WALL}s load-aware budget before round $round (product ${MAX_WALL}s)"
         rc=1
         break
       fi
@@ -449,7 +675,7 @@ run_campaign() {
       failed_total=$((failed_total + fail_count))
       LOG_JSON="${LOG_JSON}\"$(json_escape "$log")\","
       if [ "$group_rc" -eq 124 ]; then
-        reason="wall-budget: round $round exceeded the ${MAX_WALL}s budget ($cmd)"
+        reason="wall-budget: round $round exceeded the ${EFFECTIVE_WALL}s load-aware budget ($cmd)"
         rc=1
         break
       fi
@@ -471,9 +697,8 @@ run_campaign() {
     local group cmd log group_rc counts exec_count pass_count fail_count
     local old_ifs="$IFS"
     while [ "$round" -le "$ROUNDS" ]; do
-      now_epoch="$(date +%s)"
-      if [ $((now_epoch - start_epoch)) -ge "$MAX_WALL" ]; then
-        reason="wall-budget: campaign exceeded ${MAX_WALL}s before round $round"
+      if [ "$(budget_elapsed)" -ge "$EFFECTIVE_WALL" ]; then
+        reason="wall-budget: campaign exceeded the ${EFFECTIVE_WALL}s load-aware budget before round $round (product ${MAX_WALL}s)"
         rc=1
         break
       fi
@@ -492,7 +717,7 @@ run_campaign() {
         LOG_JSON="${LOG_JSON}\"$(json_escape "$log")\","
         GROUP_JSON="${GROUP_JSON}{\"name\":\"$(json_escape "$group")\",\"command\":\"$(json_escape "$cmd")\",\"log\":\"$(json_escape "$log")\",\"round\":$round,\"executed\":$exec_count,\"passed\":$pass_count,\"failed\":$fail_count},"
         if [ "$group_rc" -eq 124 ]; then
-          reason="wall-budget: round $round group $group exceeded the ${MAX_WALL}s budget"
+          reason="wall-budget: round $round group $group exceeded the ${EFFECTIVE_WALL}s load-aware budget"
           rc=1
           break
         fi
@@ -532,6 +757,22 @@ run_campaign() {
   fi
   [ -z "$SUBJECT_PIDFILE" ] || rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
 
+  # --------------------------------------------------- load-aware budget
+  # The sampler's stream is complete now, so re-derive the budget WITH the
+  # run-wide control: `t` vs `mono_ms` over the campaign itself catches a
+  # realtime clock step that occurred while the campaign ran (the bounded
+  # calibration measures the fixed-work slowdown before it). Only the
+  # runner-derived edge moves: the product budget stays the floor and a
+  # campaign over even the derived budget still fails.
+  if [ "$CONVERGENCE" = required ] && [ "$rc" -eq 0 ]; then
+    if apply_wall_budget --with-samples; then
+      echo "soak: load-aware wall budget product=${MAX_WALL}s factor=x${WALL_BUDGET_FACTOR} (work=x${WALL_BUDGET_WORK_FACTOR} clock=x${WALL_BUDGET_CLOCK_FACTOR}) effective=${EFFECTIVE_WALL}s cap=${WALL_BUDGET_CAP}s" >&2
+    else
+      reason="calibration-failed: load-aware wall budget derivation refused"
+      rc=1
+    fi
+  fi
+
   finished="$(iso_now)"
   now_epoch="$(date +%s)"
   duration=$((now_epoch - start_epoch))
@@ -539,8 +780,8 @@ run_campaign() {
     reason="no-op: campaign executed 0 tests"
     rc=1
   fi
-  if [ "$rc" -eq 0 ] && [ "$duration" -gt "$MAX_WALL" ]; then
-    reason="wall-budget: campaign ran ${duration}s over the ${MAX_WALL}s budget"
+  if [ "$rc" -eq 0 ] && [ "$duration" -gt "$EFFECTIVE_WALL" ]; then
+    reason="wall-budget: campaign ran ${duration}s over the ${EFFECTIVE_WALL}s load-aware budget (product ${MAX_WALL}s, factor x${WALL_BUDGET_FACTOR}, cap ${WALL_BUDGET_CAP}s)"
     rc=1
   fi
   if [ "$CONVERGENCE" = required ]; then
@@ -553,7 +794,7 @@ run_campaign() {
       --commit "$COMMIT" --tree "$TREE" \
       --elapsed-seconds "$duration" \
       --target-seconds "$TARGET_SECONDS" \
-      --max-seconds "$MAX_WALL" \
+      --max-seconds "$EFFECTIVE_WALL" \
       --out "$OUT_DIR/soak-convergence.json" \
       >"$LOG_DIR/convergence-check.stdout" 2>&1 || conv_rc=$?
     if [ -f "$OUT_DIR/soak-convergence.json" ]; then
@@ -593,28 +834,40 @@ run_command() {
     # shellcheck disable=SC2206 # word splitting is intentional for catalog commands
     argv=("$CARGO_BIN" test ${cmd#cargo test })
   fi
-  echo "soak: round=$round $cmd" >&2
-  # Per-invocation bound: the smaller of the test timeout and what is left of
-  # the wall budget. The budget is thus enforced WITHIN a round, not only
-  # between rounds (smoke mode runs a single round). A missing `timeout`
-  # binary is refused up front, so this branch always bounds the process.
-  local remaining=$((MAX_WALL - ($(date +%s) - start_epoch)))
+  if [ "${CALIBRATION_ACTIVE:-0}" = "1" ]; then
+    echo "soak: calibration $cmd" >&2
+  else
+    echo "soak: round=$round $cmd" >&2
+  fi
+  # Per-invocation bound: the smaller of the (load-aware) test timeout and
+  # what is left of the (load-aware) wall budget. The budget is thus
+  # enforced WITHIN a round, not only between rounds (smoke mode runs a
+  # single round). A missing `timeout` binary is refused up front, so this
+  # branch always bounds the process. Remaining work time is measured in the
+  # workload's clock class (budget_elapsed).
+  local remaining=$((EFFECTIVE_WALL - $(budget_elapsed)))
   if [ "$remaining" -le 0 ]; then
     echo "soak: wall budget exhausted before: $cmd" >&2
     : >"$log"
     return 124
   fi
-  local bound="$TEST_TIMEOUT"
+  local bound="$EFFECTIVE_TEST_TIMEOUT"
   if [ "$bound" -gt "$remaining" ]; then
     bound="$remaining"
   fi
-  echo "soak: bound=${bound}s (test-timeout=${TEST_TIMEOUT}s remaining-wall=${remaining}s)" >&2
+  echo "soak: bound=${bound}s (test-timeout=${EFFECTIVE_TEST_TIMEOUT}s remaining-wall=${remaining}s)" >&2
   # Scale-/convergence-awareness hook: the effective multiplier, mode, real
-  # target and the convergence paths are visible to the test processes.
+  # target and the convergence paths are visible to the test processes. The
+  # bounded calibration workload is selected by its turn count (fixed work).
   local target_left=0
   if [ "$CONVERGENCE" = required ]; then
-    target_left=$((TARGET_SECONDS - ($(date +%s) - start_epoch)))
+    target_left=$((TARGET_SECONDS - $(budget_elapsed)))
     [ "$target_left" -ge 1 ] || target_left=1
+  fi
+  local calibration_env=""
+  if [ "${CALIBRATION_ACTIVE:-0}" = "1" ]; then
+    calibration_env="FAKTOR_SOAK_CALIBRATION_TURNS=$CAL_TURNS FAKTOR_SOAK_CALIBRATION_OUT=${CAL_OUT:-}"
+    echo "soak: calibration bound=${bound}s (turns=${CAL_TURNS})" >&2
   fi
   #
   # With convergence required the command runs as a background job so its
@@ -622,7 +875,9 @@ run_command() {
   # pipeline exit status is preserved (wait returns the job's status).
   if [ "$CONVERGENCE" = required ] && [ -n "$SUBJECT_PIDFILE" ]; then
     rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
-    FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
+    # shellcheck disable=SC2086 # calibration_env is a fixed VAR=VALUE word list
+    env $calibration_env \
+      FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
       FAKTOR_SOAK_TARGET_SECONDS="$target_left" \
       FAKTOR_SOAK_DATA_DIR="$SOAK_DATA_DIR" \
       FAKTOR_SOAK_METRICS_FILE="$WORKLOAD_METRICS" \
@@ -635,7 +890,9 @@ run_command() {
     rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
     return "$subject_rc"
   fi
-  FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
+  # shellcheck disable=SC2086 # calibration_env is a fixed VAR=VALUE word list
+  env $calibration_env \
+    FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
     FAKTOR_SOAK_TARGET_SECONDS="$target_left" \
     "$TIMEOUT_BIN" "$bound" "${argv[@]}" 2>&1 | tee "$log"
   return "${PIPESTATUS[0]}"
@@ -650,12 +907,27 @@ selftest() {
 #!/bin/sh
 printf '%s\n' "$*" >>"${FAKE_CARGO_LOG:-/dev/null}"
 printf 'FAKTOR_SOAK_SCALE=%s FAKTOR_SOAK_MODE=%s\n' "${FAKTOR_SOAK_SCALE:-unset}" "${FAKTOR_SOAK_MODE:-unset}" >>"${FAKE_CARGO_LOG:-/dev/null}"
+# Bounded calibration workload mode (the real driver selects it by exporting
+# FAKTOR_SOAK_CALIBRATION_TURNS to the same command): print the fixed-work
+# monotonic cost the driver parses. FAKE_CARGO_CAL_MS simulates a slow runner.
+if [ -n "${FAKTOR_SOAK_CALIBRATION_TURNS:-}" ]; then
+  printf 'soak calibration: turns=%s elapsed_ms=%s\n' "${FAKTOR_SOAK_CALIBRATION_TURNS}" "${FAKE_CARGO_CAL_MS:-2000}"
+  if [ -n "${FAKTOR_SOAK_CALIBRATION_OUT:-}" ]; then
+    printf '{"elapsed_ms":%s,"schema":"faktor-soak-calibration/v1","turns":%s}\n' \
+      "${FAKE_CARGO_CAL_MS:-2000}" "${FAKTOR_SOAK_CALIBRATION_TURNS}" >"$FAKTOR_SOAK_CALIBRATION_OUT"
+  fi
+  exit 0
+fi
 # Fake convergence metrics: `metrics-good` writes a converging world,
 # `metrics-bad` writes a leaky one. The loops are bounded (12 samples/round).
+# FAKE_CARGO_CLOCK_STRETCH stretches each sample's realtime `t` relative to
+# its CLOCK_MONOTONIC `mono_ms`: the run-wide control the driver derives the
+# load-aware budget from (an emulated runner's clock step, selftest only).
 emit_convergence() {
   world="$1"
   samples="${FAKTOR_SOAK_CONVERGENCE_SAMPLES:-}"
   work="${FAKTOR_SOAK_METRICS_FILE:-}"
+  stretch="${FAKE_CARGO_CLOCK_STRETCH:-1}"
   i=0
   while [ "$i" -lt 12 ]; do
     if [ "$world" = good ]; then
@@ -667,8 +939,8 @@ emit_convergence() {
       wal=$((1048576 + i * 8388608)); temp=3; cas=$((i * 40))
       wq=5; rq=5; bg=5; lat=$((100 + i * 20000)); ok=false; final=false
     fi
-    [ -n "$samples" ] && printf '{"t":%s,"rss_kb":%s,"fds":%s,"children":%s,"orphans":0,"wal_bytes":%s,"temp_files":%s,"cas_blobs":50,"cas_unreachable":%s,"probe_ok":true,"final":%s}\n' \
-      "$((i * 1000))" "$rss" "$fds" "$children" "$wal" "$temp" "$cas" "$final" >>"$samples"
+    [ -n "$samples" ] && printf '{"t":%s,"mono_ms":%s,"rss_kb":%s,"fds":%s,"children":%s,"orphans":0,"wal_bytes":%s,"temp_files":%s,"cas_blobs":50,"cas_unreachable":%s,"probe_ok":true,"final":%s}\n' \
+      "$((i * 1000 * stretch))" "$((i * 1000))" "$rss" "$fds" "$children" "$wal" "$temp" "$cas" "$final" >>"$samples"
     [ -n "$work" ] && printf '{"t":%s,"writer_queue":%s,"reader_queue":%s,"background_tasks":%s,"journal_us":%s,"index_us":%s}\n' \
       "$((i * 1000))" "$wq" "$rq" "$bg" "$lat" "$lat" >>"$work"
     i=$((i + 1))
@@ -683,12 +955,12 @@ sleep) printf 'running 2 tests\n'; sleep 30 ;;
 metrics-good)
   printf 'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
   emit_convergence good
-  sleep 0.3
+  sleep "${FAKE_CARGO_SLEEP:-0.3}"
   ;;
 metrics-bad)
   printf 'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
   emit_convergence bad
-  sleep 2.5
+  sleep "${FAKE_CARGO_SLEEP:-2.5}"
   ;;
 esac
 exit 0
@@ -706,6 +978,22 @@ SHIM
     PATH="$tmp:$PATH"
     export PATH
   fi
+  # Emulation-like slowdown seam (selftest only, exactly the wall-accounting
+  # stretch a VM suspend / emulated runner imposes): the driver's `date +%s`
+  # reads advance by FAKE_DATE_SCALE while CLOCK_MONOTONIC does not. The
+  # budget derivation must absorb it; nothing else is faked (the real
+  # python sampler and the real budget tool run).
+  mkdir -p "$tmp/fakebin"
+  cat >"$tmp/fakebin/date" <<'SHIM'
+#!/bin/sh
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_SCALE:-}" ]; then
+  real="$(/bin/date +%s)"
+  printf '%s\n' "$((real * FAKE_DATE_SCALE))"
+else
+  exec /bin/date "$@"
+fi
+SHIM
+  chmod +x "$tmp/fakebin/date"
 
   field() { # file key
     grep -o "\"$2\":[^,}]*" "$1" 2>/dev/null | head -n 1 | sed 's/^[^:]*://' | tr -d '"'
@@ -853,11 +1141,72 @@ SHIM
   check "failed metrics named in soak.json" "$(contains "$out/soak.json" 'rss_bounded' && contains "$out/soak.json" 'reconnect_correct' && echo 0 || echo 1)"
   check "failed lane never records passed status" "$([ "$(field "$out/soak.json" status)" = failed ] && echo 0 || echo 1)"
 
+  # 12. load-aware budget, fixed-work control: the bounded calibration
+  # workload reports 4x the documented nominal (an emulated runner) and the
+  # driver's wall accounting is stretched 4x by an injected clock shim; the
+  # campaign runs LONGER than the fixed product budget and must still pass,
+  # with every convergence metric unconverged-free and the factor recorded.
+  out="$tmp/out-stretch"
+  conv_samples="$tmp/stretch-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-stretch.log" FAKE_CARGO_MODE=metrics-good \
+  FAKE_CARGO_CAL_MS=8000 FAKE_CARGO_SLEEP=4 \
+  FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    PATH="$tmp/fakebin:$PATH" FAKE_DATE_SCALE=4 \
+    bash "$SELF" --mode churn --churn-seconds 2 --max-wall-seconds 12 \
+    --test-timeout-seconds 30 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/stretch.stdout" 2>"$tmp/stretch.stderr"
+  rc=$?
+  check "stretched runner passes via the load-aware budget" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+  check "calibration measured and recorded" "$(contains "$out/soak.json" '"calibration":"measured"' && echo 0 || echo 1)"
+  check "measured factor recorded" "$([ "$(field "$out/soak.json" wall_budget_factor)" = 4 ] && echo 0 || echo 1)"
+  check "derived budget recorded" "$([ "$(field "$out/soak.json" wall_budget_seconds)" = 48 ] && echo 0 || echo 1)"
+  check "campaign really exceeded the fixed product budget" \
+    "$(awk -v d="$(field "$out/soak.json" duration_seconds)" -v p=12 'BEGIN { exit !(d > p) }' && echo 0 || echo 1)"
+  check "stretched campaign convergence passed" "$(contains "$out/soak-convergence.json" '"status": "passed"' && echo 0 || echo 1)"
+
+  # 13. the derivation has teeth: the run-wide clock control (sampler t vs
+  # mono_ms, stretched 4x) widens the budget, but a campaign stretched far
+  # past even the derived budget still fails as a wall-budget breach.
+  out="$tmp/out-stretch-over"
+  conv_samples="$tmp/over-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-over.log" FAKE_CARGO_MODE=metrics-good \
+  FAKE_CARGO_CLOCK_STRETCH=4 FAKE_CARGO_SLEEP=4 \
+  FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    PATH="$tmp/fakebin:$PATH" FAKE_DATE_SCALE=24 \
+    bash "$SELF" --mode churn --churn-seconds 2 --max-wall-seconds 12 \
+    --test-timeout-seconds 30 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/over.stdout" 2>"$tmp/over.stderr"
+  rc=$?
+  check "a campaign past the derived budget still fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "over-budget reason recorded" "$(contains "$out/soak.json" 'wall-budget' && echo 0 || echo 1)"
+  check "over-budget run never records passed" "$([ "$(field "$out/soak.json" status)" = failed ] && echo 0 || echo 1)"
+  check "run-wide clock factor was recorded" "$([ "$(field "$out/soak.json" wall_budget_clock_factor)" = 4 ] && echo 0 || echo 1)"
+
+  # 14. the invariants keep their teeth under an active adapted budget: a
+  # non-converging campaign (leaky metrics) fails even though the load-aware
+  # budget and the wall stretch are in force.
+  out="$tmp/out-stretch-bad"
+  conv_samples="$tmp/stretch-bad-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-stretch-bad.log" FAKE_CARGO_MODE=metrics-bad \
+  FAKE_CARGO_CAL_MS=8000 FAKE_CARGO_SLEEP=2 \
+  FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    PATH="$tmp/fakebin:$PATH" FAKE_DATE_SCALE=4 \
+    bash "$SELF" --mode churn --churn-seconds 2 --max-wall-seconds 12 \
+    --test-timeout-seconds 30 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/stretch-bad.stdout" 2>"$tmp/stretch-bad.stderr"
+  rc=$?
+  check "non-converging campaign fails under the adapted budget" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "adapted-budget failure is convergence-failed" "$(contains "$out/soak.json" 'convergence-failed' && echo 0 || echo 1)"
+  check "adapted budget was active in the failed run" "$([ "$(field "$out/soak.json" wall_budget_seconds)" = 48 ] && echo 0 || echo 1)"
+
   if [ "$failures" -gt 0 ]; then
     echo "soak selftest: FAIL ($failures case(s))" >&2
     return 1
   fi
-  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals; convergence metric algebra pass/fail/missing/duration; churn integration passes only on all-metrics-converged evidence)"
+  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals; convergence metric algebra pass/fail/missing/duration; churn integration passes only on all-metrics-converged evidence; load-aware budget: same-run controls widen it under injected wall-clock stretch, the derived budget and convergence invariants keep their teeth)"
   return 0
 }
 
@@ -917,6 +1266,29 @@ if [ "$CONVERGENCE" = required ]; then
     exit 2
   fi
 fi
+case "$CALIBRATION_RAW" in
+auto | off) CALIBRATION="$CALIBRATION_RAW" ;;
+*)
+  echo "soak: FAKTOR_SOAK_CALIBRATION must be auto|off (got '$CALIBRATION_RAW')" >&2
+  exit 2
+  ;;
+esac
+if ! is_nonneg_integer "$CAL_TURNS_RAW" || [ "$CAL_TURNS_RAW" -lt 1 ]; then
+  echo "soak: FAKTOR_SOAK_CALIBRATION_TURNS must be a positive integer (got '$CAL_TURNS_RAW')" >&2
+  exit 2
+fi
+if ! is_nonneg_integer "$CAL_NOMINAL_MS_RAW" || [ "$CAL_NOMINAL_MS_RAW" -lt 1 ]; then
+  echo "soak: FAKTOR_SOAK_CALIBRATION_NOMINAL_MS must be a positive integer (got '$CAL_NOMINAL_MS_RAW')" >&2
+  exit 2
+fi
+if ! is_nonneg_integer "$MAX_WALL_FACTOR_RAW" || [ "$MAX_WALL_FACTOR_RAW" -lt 1 ]; then
+  echo "soak: FAKTOR_SOAK_MAX_WALL_FACTOR must be a positive integer (got '$MAX_WALL_FACTOR_RAW')" >&2
+  exit 2
+fi
+if ! is_nonneg_integer "$WALL_CAP_SECONDS_RAW" || [ "$WALL_CAP_SECONDS_RAW" -lt 1 ]; then
+  echo "soak: FAKTOR_SOAK_WALL_CAP_SECONDS must be a positive integer (got '$WALL_CAP_SECONDS_RAW')" >&2
+  exit 2
+fi
 SAMPLE_INTERVAL="$SAMPLE_INTERVAL_RAW"
 MAX_SAMPLES="$MAX_SAMPLES_RAW"
 
@@ -965,6 +1337,21 @@ MAX_SCALE="$MAX_SCALE_RAW"
 MAX_ROUNDS="$MAX_ROUNDS_RAW"
 MAX_WALL="$MAX_WALL_RAW"
 TEST_TIMEOUT="$TEST_TIMEOUT_RAW"
+CAL_TURNS="$CAL_TURNS_RAW"
+CAL_NOMINAL_MS="$CAL_NOMINAL_MS_RAW"
+MAX_WALL_FACTOR="$MAX_WALL_FACTOR_RAW"
+WALL_CAP_SECONDS="$WALL_CAP_SECONDS_RAW"
+# Load-aware budget state (see the LOAD-AWARE WALL BUDGET header note). The
+# product values are what soak.json records as the documented budget; the
+# effective values are what the campaign is actually bounded by.
+EFFECTIVE_WALL="$MAX_WALL"
+EFFECTIVE_TEST_TIMEOUT="$TEST_TIMEOUT"
+WALL_BUDGET_FACTOR=1
+WALL_BUDGET_WORK_FACTOR=1
+WALL_BUDGET_CLOCK_FACTOR=1
+WALL_BUDGET_CAP="$(awk -v p="$MAX_WALL" -v f="$MAX_WALL_FACTOR" -v c="$WALL_CAP_SECONDS" 'BEGIN { cap = p * f; if (cap > c) cap = c; if (cap < p) cap = p; print cap }')"
+CAL_MS=""
+CAL_STATUS="not-run"
 SCALE_REQUESTED="$SCALE_RAW"
 SCALE_EFFECTIVE=0
 SCALE_CLAMPED=0

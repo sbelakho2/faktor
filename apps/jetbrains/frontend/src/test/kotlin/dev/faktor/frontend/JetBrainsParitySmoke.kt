@@ -64,6 +64,21 @@ object JetBrainsParitySmoke {
         step("task mode: composer contract + strict request bodies") {
             taskModeCanned()
         }
+        step("finish levels: four-level selector maps exactly to the completion contract") {
+            finishLevelsExact()
+        }
+        step("Task/Ask mode: Ask never attaches a contract, Task always does") {
+            modeDispatchStep()
+        }
+        step("Task options sheet: bounded, scrollable, draft-preserving, Escape never starts") {
+            optionsSheetStep()
+        }
+        step("run summary strip: Inspect opens Overview and missing values stay missing") {
+            runSummaryStep()
+        }
+        step("inspect selector: one detail surface per tab, selection survives a refresh") {
+            inspectSelectorStep()
+        }
         step("agent tree: blockers, presentation, pixel identity") {
             agentTreeCanned()
         }
@@ -301,18 +316,337 @@ object JetBrainsParitySmoke {
                 panel.closeUtilityForTest()
             }
             assertEquals(null, panel.completionContractFromControls())
-            panel.completionCommit.isSelected = true
-            panel.completionPr.isSelected = true
+            // The required four-level finish selector maps EXACTLY to the
+            // hierarchical completion contract; PR then Local never retains
+            // a later flag and no toggle can produce an invalid combination.
+            panel.selectFinishLevelForTest(FinishLevel.PR)
             assertEquals(
-                NativeCompletionContract(includeCommit = true, includePush = false, includePr = true),
+                NativeCompletionContract(true, true, true),
                 panel.completionContractFromControls()
+            )
+            panel.selectFinishLevelForTest(FinishLevel.PUSH)
+            assertEquals(
+                NativeCompletionContract(true, true, false),
+                panel.completionContractFromControls()
+            )
+            panel.selectFinishLevelForTest(FinishLevel.COMMIT)
+            assertEquals(
+                NativeCompletionContract(true, false, false),
+                panel.completionContractFromControls()
+            )
+            panel.selectFinishLevelForTest(FinishLevel.LOCAL)
+            assertEquals(null, panel.completionContractFromControls())
+            panel.selectFinishLevelForTest(FinishLevel.PR)
+            panel.selectFinishLevelForTest(FinishLevel.LOCAL)
+            assertEquals(
+                null,
+                panel.completionContractFromControls(),
+                "PR then Local must not retain the later flags"
             )
         } finally {
             panel.shutdown()
         }
     }
 
-    // --------------------------------------------------------- 3. agent tree
+    // -------------------------------------------------------- finish levels
+
+    /**
+     * The four finish levels are one required selector: every level produces
+     * its exact contract, the visible label names the included earlier
+     * actions, and no toggle order ever yields a non-hierarchical contract.
+     */
+    private fun finishLevelsExact() {
+        val panel = FaktorChatPanel(
+            FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Paths.get(System.getProperty("java.io.tmpdir"), "faktor-finish-levels")
+            )
+        )
+        try {
+            assertEquals("Local — leave changes here (nothing requested)", panel.selectedFinishLevelLabelForTest())
+            assertEquals(null, panel.completionContractFromControls())
+            panel.selectFinishLevelForTest(FinishLevel.COMMIT)
+            assertEquals(
+                "Commit — includes local changes, commits when verified",
+                panel.selectedFinishLevelLabelForTest()
+            )
+            assertEquals(
+                NativeCompletionContract(true, false, false),
+                panel.completionContractFromControls()
+            )
+            panel.selectFinishLevelForTest(FinishLevel.PUSH)
+            assertTrue(
+                panel.selectedFinishLevelLabelForTest().startsWith("Push — includes commit"),
+                panel.selectedFinishLevelLabelForTest()
+            )
+            assertEquals(
+                NativeCompletionContract(true, true, false),
+                panel.completionContractFromControls()
+            )
+            panel.selectFinishLevelForTest(FinishLevel.PR)
+            assertTrue(
+                panel.selectedFinishLevelLabelForTest().startsWith("PR — includes push"),
+                panel.selectedFinishLevelLabelForTest()
+            )
+            assertEquals(
+                NativeCompletionContract(true, true, true),
+                panel.completionContractFromControls()
+            )
+            // Adversarial: every order revisits earlier levels and the maps
+            // stay exact; a later flag never survives a backward selection.
+            for (level in listOf(
+                FinishLevel.LOCAL, FinishLevel.PR, FinishLevel.COMMIT, FinishLevel.PR,
+                FinishLevel.PUSH, FinishLevel.LOCAL, FinishLevel.PUSH, FinishLevel.COMMIT,
+                FinishLevel.LOCAL
+            )) {
+                panel.selectFinishLevelForTest(level)
+                assertEquals(
+                    level.contract(),
+                    panel.completionContractFromControls(),
+                    "level $level must map exactly"
+                )
+            }
+        } finally {
+            panel.shutdown()
+        }
+    }
+
+    // ------------------------------------------------------- Task/Ask mode
+
+    /**
+     * Task mode sends the goal with the contract; Ask mode sends the plain
+     * prompt and NEVER attaches a completion contract or finish action. Both
+     * are asserted on the request bodies the real start path emitted.
+     */
+    private fun modeDispatchStep() {
+        val harness = startTaskHarness { _, response ->
+            response.json(200, TASK_RUN_STARTED_JSON)
+        }
+        try {
+            harness.daemon.on("POST", "/native/session/7/prompt") { _, response ->
+                response.json(200, "{\"op_id\":\"op-1\",\"accepted\":true,\"queued\":false}")
+            }
+            val panel = harness.panel
+            panel.setTaskFieldsForTest("mode goal", "mode criterion")
+            panel.selectFinishLevelForTest(FinishLevel.PR)
+            panel.submitTaskForTest()
+            await("Task-mode start routed") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 1
+            }
+            val taskBody = harness.daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+            assertTrue(
+                taskBody.contains(
+                    "\"completion_contract\":{\"include_commit\":true,\"include_push\":true," +
+                        "\"include_pr\":true}"
+                ),
+                "Task mode must attach the selected finish level: $taskBody"
+            )
+            await("Task-mode start completes") {
+                panel.transcriptTextForTest().contains("run-9 started")
+            }
+            // The mode selector is the explicit control (design addition).
+            val runsBeforeAsk = harness.daemon.requestCount("POST", "/native/session/7/task-runs")
+            val promptsBeforeAsk = harness.daemon.requestCount("POST", "/native/session/7/prompt")
+            panel.selectModeForTest(ask = true)
+            assertTrue(panel.askModeSelected(), "the Ask toggle must select Ask mode")
+            panel.submitTaskForTest()
+            await("Ask-mode prompt routed") {
+                harness.daemon.requestCount("POST", "/native/session/7/prompt") > promptsBeforeAsk
+            }
+            val promptBody = harness.daemon.lastRequest("POST", "/native/session/7/prompt")!!.body
+            assertTrue(!promptBody.contains("completion_contract"), promptBody)
+            assertTrue(!promptBody.contains("include_commit"), promptBody)
+            assertTrue(!promptBody.contains("include_push"), promptBody)
+            assertTrue(!promptBody.contains("include_pr"), promptBody)
+            assertTrue(!promptBody.contains("max_tokens"), promptBody)
+            assertTrue(!promptBody.contains("max_cost_micro"), promptBody)
+            assertTrue(!promptBody.contains("criteria"), promptBody)
+            assertEquals(
+                runsBeforeAsk,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "Ask mode must never start a task run"
+            )
+            // Adversarial: NO task start AFTER the Ask submission may carry a
+            // completion contract, no matter what level the Task-mode control
+            // held before (the Ask path must not inherit it).
+            val askBodies = synchronized(harness.daemon.requests) {
+                harness.daemon.requests
+                    .dropWhile { it.path != "/native/session/7/prompt" }
+                    .filter { it.method == "POST" && it.path == "/native/session/7/task-runs" }
+                    .map { it.body }
+            }
+            assertTrue(
+                askBodies.isEmpty(),
+                "no task start may follow an Ask submission: $askBodies"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    // ------------------------------------------------------ options sheet
+
+    /**
+     * The Task options sheet is a bounded, scrollable, headless-drivable
+     * surface: opening/Back preserves the draft and the contract rows, the
+     * per-run budget rides the start, Escape closes without starting, and
+     * nothing is a blocking modal dialog.
+     */
+    private fun optionsSheetStep() {
+        val harness = startTaskHarness()
+        try {
+            val panel = harness.panel
+            panel.setTaskFieldsForTest("options sheet goal", "one, two")
+            panel.setContractFieldsForTest("stay valid", "", "", "")
+            assertTrue(panel.taskOptionsOpenForTest(), "openTaskOptionsForTest must open the sheet")
+            assertEquals("stay valid", panel.contractEditorsForTest()[0])
+            // Back preserves the draft and the contract rows.
+            panel.backTaskOptionsForTest()
+            assertTrue(!panel.taskOptionsOpenForTest(), "Back must close the sheet")
+            assertEquals("options sheet goal", panel.goalTextForTest())
+            assertEquals("stay valid", panel.contractEditorsForTest()[0])
+            // Reopen and select PR; Apply (the trigger) keeps everything.
+            panel.openTaskOptionsForTest()
+            panel.selectFinishLevelForTest(FinishLevel.PR)
+            panel.setBudgetFieldsForTest("5000", "250000")
+            panel.toggleTaskOptionsForTest()
+            assertTrue(!panel.taskOptionsOpenForTest(), "the trigger closes the sheet")
+            assertEquals("options sheet goal", panel.goalTextForTest())
+            assertEquals(
+                NativeCompletionContract(true, true, true),
+                panel.completionContractFromControls()
+            )
+            // Escape closes the sheet and NEVER starts a run.
+            panel.toggleTaskOptionsForTest()
+            assertTrue(panel.taskOptionsOpenForTest())
+            panel.triggerEscapeForTest()
+            assertTrue(!panel.taskOptionsOpenForTest(), "Escape must close the sheet")
+            assertEquals(
+                0,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "Escape must never start a run"
+            )
+            assertEquals("options sheet goal", panel.goalTextForTest(), "the draft survives Escape")
+            // The authored per-run budget rides the REAL start request.
+            panel.submitTaskForTest()
+            await("budget-bound start routed") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") >= 1
+            }
+            val body = harness.daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+            assertTrue(body.contains("\"max_tokens\":5000"), "the per-run token bound rides the start: $body")
+            assertTrue(
+                body.contains("\"max_cost_micro\":250000"),
+                "the per-run cost bound rides the start: $body"
+            )
+            assertTrue(
+                body.contains("\"completion_contract\":{\"include_commit\":true,\"include_push\":true," +
+                    "\"include_pr\":true}"),
+                body
+            )
+            assertTrue(
+                body.contains("\"constraints\":[\"stay valid\"]"),
+                "the authored contract rows ride the same start: $body"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    // ------------------------------------------------------ run summary
+
+    /**
+     * The run summary strip shows the served goal/phase/state and named
+     * steps; the candidate boundary comes from the served completion gate.
+     * Inspect selects the Inspect cluster's Overview tab; opening another
+     * session resets the strip.
+     */
+    private fun runSummaryStep() {
+        val harness = startTaskHarness()
+        try {
+            val panel = harness.panel
+            panel.refreshNowForTest()
+            val summary = panel.runSummaryTextForTest()
+            assertTrue(summary.startsWith("goal: parity goal"), "the served goal must lead: $summary")
+            assertTrue(summary.contains("phase: building"), "the served phase must render: $summary")
+            assertTrue(summary.contains("state: "), "the served state must render: $summary")
+            assertTrue(
+                summary.contains("candidate boundary: commit,push"),
+                "the served completion contract must name the candidate boundary: $summary"
+            )
+            assertTrue(
+                summary.contains("steps: first=done, second=running"),
+                "the named plan steps must render with their states: $summary"
+            )
+            panel.inspectRunForTest()
+            assertTrue(
+                panel.overviewSelectedForTest(),
+                "Inspect must select the Inspect cluster's Overview view"
+            )
+            // The toolbar session chooser lists every served session with its
+            // served title + state (never a fabricated date) and keeps the
+            // current session selected.
+            assertEquals(2, panel.sessionChooserCountForTest())
+            assertEquals(
+                listOf("parity · ready", "older · ended"),
+                panel.sessionChooserLabelsForTest()
+            )
+            assertTrue(panel.sessionChooserOpenEnabledForTest(), "a selection must enable Open")
+            // The strip is session-owned: opening another session resets it.
+            assertTrue(panel.selectSessionForTest("8"), "the served session 8 must be selectable")
+            panel.openSelectedSessionForTest()
+            await("session switch resets the run summary") {
+                panel.currentSessionIdForTest() == "8" &&
+                    panel.runSummaryTextForTest().isEmpty()
+            }
+        } finally {
+            harness.close()
+        }
+    }
+
+    // ------------------------------------------------------ inspect selector
+
+    /**
+     * Every Inspect selector tab shows exactly ONE detail surface; switching
+     * options swaps the visible surface, and the selection survives an async
+     * refresh (a full refresh cycle re-renders every panel and must not reset
+     * the chosen detail).
+     */
+    private fun inspectSelectorStep() {
+        val harness = startTaskHarness()
+        try {
+            val panel = harness.panel
+            assertEquals(
+                listOf("Overview", "Blockers", "Terminal"),
+                panel.inspectDetailLabelsForTest("Overview")
+            )
+            assertEquals(
+                listOf("Plan", "Compare approaches"),
+                panel.inspectDetailLabelsForTest("Plan")
+            )
+            assertEquals(
+                listOf("Verification", "Evidence"),
+                panel.inspectDetailLabelsForTest("Verification")
+            )
+            for (tab in listOf("Overview", "Plan", "Verification")) {
+                assertEquals(
+                    1,
+                    panel.visibleInspectDetailCountForTest(tab),
+                    "exactly one detail surface must be visible in $tab"
+                )
+            }
+            assertTrue(panel.selectInspectDetailForTest("Overview", "Blockers"))
+            assertTrue(panel.selectInspectDetailForTest("Plan", "Compare approaches"))
+            // A full async refresh re-renders every panel; the selected
+            // detail must survive it.
+            panel.refreshNowForTest()
+            assertEquals("Blockers", panel.selectedInspectDetailForTest("Overview"))
+            assertEquals("Compare approaches", panel.selectedInspectDetailForTest("Plan"))
+            assertEquals(1, panel.visibleInspectDetailCountForTest("Overview"))
+            assertEquals(1, panel.visibleInspectDetailCountForTest("Plan"))
+        } finally {
+            harness.close()
+        }
+    }
 
     private fun agentTreeCanned() {
         val agents = parseNativeAgents(PARITY_AGENTS_JSON)
@@ -393,8 +727,9 @@ object JetBrainsParitySmoke {
             "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
             NativeRequests.permissionReply(permission.sessionId, permission.id, "allow")
         )
-        // A typed 409 refusal is recorded as an explicit panel state, and a
-        // later clean view clears it.
+        // A typed 409 refusal is recorded as an explicit per-request state;
+        // the request stays visible with its reason, and the refusal is only
+        // pruned once the request is no longer pending.
         panel.setReplyRefusal("permission 7 is unknown, expired or already resolved (409 conflict)")
         assertTrue(
             panel.refusalText()!!.contains("409 conflict"),
@@ -402,6 +737,11 @@ object JetBrainsParitySmoke {
         )
         assertTrue(panel.headerText().contains("last reply refused"), panel.headerText())
         panel.update(permissions)
+        assertTrue(
+            panel.refusalText()!!.contains("409 conflict"),
+            "a still-pending request keeps its refusal reason"
+        )
+        panel.update(emptyList())
         assertEquals(null, panel.refusalText())
         assertEquals(false, panel.headerText().contains("refused"), panel.headerText())
     }
@@ -753,6 +1093,12 @@ object JetBrainsParitySmoke {
                     "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"deny\"}",
                     daemon.lastRequest("POST", "/native/permission/reply")!!.body
                 )
+                // The per-request in-flight gate releases only on the typed
+                // result; the next submit must wait for it (a second click
+                // while pending is refused by construction).
+                await("permission reply gate released") {
+                    !chat.permissionsView().isReplyPendingForTest("7")
+                }
                 // Typed 409 conflict (unknown/expired/already resolved) is
                 // surfaced as an explicit panel state (naming the exact id),
                 // never retried.
@@ -773,6 +1119,9 @@ object JetBrainsParitySmoke {
                     daemon.requestCount("POST", "/native/permission/reply"),
                     "a typed 409 conflict is never retried"
                 )
+                await("permission reply gate released after the conflict") {
+                    !chat.permissionsView().isReplyPendingForTest("7")
+                }
                 // Typed 409 permission_session_mismatch is surfaced too.
                 chat.permissionsView().submitReply("deny")
                 await("typed session mismatch surfaced") {
@@ -821,7 +1170,7 @@ object JetBrainsParitySmoke {
                 // contract + the attachment set; the served task view then
                 // carries acceptance criteria.
                 chat.settingsView().selectMutationMode("shadow")
-                chat.completionCommit.isSelected = true
+                chat.selectFinishLevelForTest(FinishLevel.COMMIT)
                 // Audit 13: an ordinary workspace SOURCE file stays on the
                 // workspace-relative `files` vocabulary and is never uploaded
                 // (no blind uploads): the absolute pick is relativized
@@ -1440,7 +1789,7 @@ object JetBrainsParitySmoke {
             // and a completion contract toggle must not reach the in-flight
             // request, and the submit itself must not enqueue a second start.
             panel.setTaskFieldsForTest("edited while pending", "c2")
-            panel.completionCommit.isSelected = true
+            panel.selectFinishLevelForTest(FinishLevel.PR)
             val late = Files.createTempFile(harness.workspace, "faktor-single-flight-late-", ".rs")
             Files.write(late, "fn main() {}".toByteArray())
             panel.attachmentsView().addFiles(listOf(late.toString()))
@@ -1881,6 +2230,9 @@ object JetBrainsParitySmoke {
         "{\"id\":\"step-1\",\"summary\":\"first\",\"state\":\"done\",\"depends_on\":[]}," +
         "{\"id\":\"step-2\",\"summary\":\"second\",\"state\":\"running\"," +
         "\"depends_on\":[\"step-1\"]}]," +
+        "\"completion\":{\"contract\":{\"include_commit\":true,\"include_push\":true," +
+        "\"include_pr\":false}," +
+        "\"steps\":[{\"step\":\"commit\",\"status\":\"pending\",\"detail\":\"\"}]}," +
         "\"blockers\":[],\"evidenceRefs\":[],\"phase\":\"building\"}]"
 
     private const val TASK_VERIFICATION_JSON =

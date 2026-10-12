@@ -91,8 +91,82 @@ object JetBrainsHostMatrixSmoke {
         return host
     }
 
+    /**
+     * The bounded Task options sheet as its own matrix host: opened on the
+     * Work center surface (replacing the conversation, never a modal dialog)
+     * with the per-run budget authored, so the 240px width check proves the
+     * scrollable sheet stays inside the tool window.
+     */
+    private fun freshTaskOptionsSheetPane(): JComponent {
+        val service = FaktorFrontendService(
+            java.nio.file.Paths.get("unused-binary"),
+            Files.createTempDirectory("faktor-host-matrix-options-")
+        )
+        val panel = FaktorChatPanel(service)
+        taskPanels.add(panel)
+        panel.setContractFieldsForTest("stay valid", "always true", "drift", "proof")
+        panel.setBudgetFieldsForTest("5000", "250000")
+        panel.openTaskOptionsForTest()
+        requireTrue(
+            panel.taskOptionsOpenForTest(),
+            "the Task options sheet must open for the host matrix"
+        )
+        val host = javax.swing.JPanel(java.awt.BorderLayout())
+        host.background = panelSurface()
+        host.add(panel.taskComposerPaneForTest(), java.awt.BorderLayout.CENTER)
+        return host
+    }
+
+    /**
+     * The bounded Work approval attention card with one live request: the
+     * host renders only the card (it hides itself while nothing is pending).
+     */
+    private fun freshWorkApprovalPane(): JComponent {
+        val service = FaktorFrontendService(
+            java.nio.file.Paths.get("unused-binary"),
+            Files.createTempDirectory("faktor-host-matrix-approval-")
+        )
+        val panel = FaktorChatPanel(service)
+        taskPanels.add(panel)
+        panel.updatePendingApprovalsForTest(
+            listOf(
+                dev.faktor.shared.NativePermissionEntry(
+                    "7", "9", "shell", "{\"tool\":\"bash\"}"
+                )
+            )
+        )
+        val host = javax.swing.JPanel(java.awt.BorderLayout())
+        host.background = panelSurface()
+        host.add(panel.workApprovalView(), java.awt.BorderLayout.CENTER)
+        return host
+    }
+
+    /** The wrapping utilities toolbar row as its own matrix host. */
+    private fun freshToolbarPane(): JComponent {
+        val service = FaktorFrontendService(
+            java.nio.file.Paths.get("unused-binary"),
+            Files.createTempDirectory("faktor-host-matrix-toolbar-")
+        )
+        val panel = FaktorChatPanel(service)
+        taskPanels.add(panel)
+        val host = javax.swing.JPanel(java.awt.BorderLayout())
+        host.background = panelSurface()
+        host.add(panel.utilitiesToolbarForTest(), java.awt.BorderLayout.NORTH)
+        // A section caption so the theme legibility probe has real text (the
+        // row itself is buttons + a chooser; the production row sits under
+        // the panel header).
+        val caption = javax.swing.JPanel(java.awt.BorderLayout())
+        caption.background = panelSurface()
+        caption.add(sectionHeader("Utilities"), java.awt.BorderLayout.NORTH)
+        host.add(caption, java.awt.BorderLayout.CENTER)
+        return host
+    }
+
     private val panelFactories: List<Pair<String, () -> JComponent>> = listOf(
         "task" to { freshTaskComposerPane() },
+        "task-options" to { freshTaskOptionsSheetPane() },
+        "work-approval" to { freshWorkApprovalPane() },
+        "toolbar" to { freshToolbarPane() },
         "task-tree" to { cannedTaskTreePanel() },
         "plan" to { cannedTaskTreePanel() },
         "overview" to { cannedOverviewPanel() },
@@ -238,6 +312,104 @@ object JetBrainsHostMatrixSmoke {
                 }
             }
         }
+        // The Task options sheet must stay INSIDE the 240px tool window (the
+        // bounded, scrollable sheet is the I02 requirement; a sheet wider
+        // than its host would clip the fields out of reach).
+        check("width/task-options-sheet/240") {
+            val service = FaktorFrontendService(
+                java.nio.file.Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-host-matrix-options-width-")
+            )
+            val chat = FaktorChatPanel(service)
+            taskPanels.add(chat)
+            chat.openTaskOptionsForTest()
+            ParityAwt.layout(chat, 240, 600)
+            val sheet = chat.taskOptionsSheetForTest()
+                ?: throw AssertionError("the Task options sheet must exist")
+            requireTrue(
+                sheet.width <= 240,
+                "the Task options sheet must stay within 240px (width=${sheet.width})"
+            )
+            requireTrue(
+                sheet.components.any { it is javax.swing.JScrollPane },
+                "the Task options sheet must carry a bounded scrollable body"
+            )
+        }
+        // I05/I09: the Work approval card renders inside the 240px tool
+        // window and sits ABOVE the composer (a pending approval is an
+        // attention event, not a destination).
+        check("width/work-approval/240") {
+            val service = FaktorFrontendService(
+                java.nio.file.Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-host-matrix-approval-width-")
+            )
+            val chat = FaktorChatPanel(service)
+            taskPanels.add(chat)
+            chat.updatePendingApprovalsForTest(
+                listOf(
+                    dev.faktor.shared.NativePermissionEntry(
+                        "7", "9", "shell", "{\"tool\":\"bash\"}"
+                    )
+                )
+            )
+            ParityAwt.layout(chat, 240, 600)
+            val card = chat.workApprovalView()
+            requireTrue(card.isVisible, "the Work approval card must be visible while pending")
+            requireTrue(card.width <= 240, "the Work approval card exceeds 240px (${card.width})")
+            val buttons = card.replyButtonsForTest("7")
+                ?: throw AssertionError("the Work approval card must render request 7")
+            requireTrue(buttons.first.width > 0, "the Allow button must have real width")
+            requireTrue(buttons.second.width > 0, "the Deny button must have real width")
+            // Above the composer in the Work south column.
+            val south = chat.workPlaneForTest().getComponent(1) as java.awt.Container
+            val cardIndex = south.components.indexOfFirst { it === card }
+            val composerIndex = south.components.size - 1
+            requireTrue(
+                cardIndex in 0 until composerIndex,
+                "the approval card must sit above the composer (card=$cardIndex of ${south.components.size})"
+            )
+        }
+        // I09: the utilities toolbar WRAPS at 240px — no horizontal-scroll
+        // fallback, every control inside the host width and the primaries
+        // (New session / Refresh / session chooser) visible.
+        check("width/toolbar/240") {
+            val service = FaktorFrontendService(
+                java.nio.file.Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-host-matrix-toolbar-width-")
+            )
+            val chat = FaktorChatPanel(service)
+            taskPanels.add(chat)
+            ParityAwt.layout(chat, 240, 600)
+            val toolbar = chat.utilitiesToolbarForTest() as java.awt.Container
+            requireTrue(
+                !containsScrollPane(toolbar),
+                "the toolbar must not carry a horizontal-scroll fallback"
+            )
+            requireTrue(toolbar.width <= 240, "toolbar width ${toolbar.width} exceeds 240")
+            val rows = wrappedRowCount(toolbar)
+            requireTrue(rows >= 2, "the toolbar must wrap at 240px (rows=$rows)")
+            for (child in toolbar.components) {
+                if (!child.isVisible) continue
+                requireTrue(
+                    child.x + child.width <= 240,
+                    "'${child.javaClass.simpleName}' escapes the 240px host"
+                )
+            }
+            val labels = toolbar.components.mapNotNull {
+                when (it) {
+                    is javax.swing.JButton -> it.text
+                    is javax.swing.JComboBox<*> -> "session chooser"
+                    else -> null
+                }
+            }
+            requireTrue(labels.contains("New session"), "New session must stay visible: $labels")
+            requireTrue(labels.contains("Refresh"), "Refresh must stay visible: $labels")
+            requireTrue(labels.contains("session chooser"), "the chooser must stay visible: $labels")
+            requireTrue(
+                !labels.contains("Settings"),
+                "the Settings utility must live under More, not in the row: $labels"
+            )
+        }
     }
 
     // ------------------------------------------------------------------ zoom
@@ -366,6 +538,7 @@ object JetBrainsHostMatrixSmoke {
         dir.mkdirs()
         val affected = listOf(
             "task" to { freshTaskComposerPane() },
+            "task-options" to { freshTaskOptionsSheetPane() },
             "task-tree" to { cannedTaskTreePanel() },
             "plan" to { cannedTaskTreePanel() },
             "overview" to { cannedOverviewPanel() },
@@ -745,8 +918,27 @@ object JetBrainsHostMatrixSmoke {
         }
     }
 
-    private fun collectFocusable(component: Component): List<Component> {
-        val out = ArrayList<Component>()
+    /** True when the subtree contains a scroll pane (no-scroll guard). */
+    private fun containsScrollPane(component: Component): Boolean {
+        if (component is javax.swing.JScrollPane) return true
+        if (component is Container) {
+            for (child in component.components) {
+                if (containsScrollPane(child)) return true
+            }
+        }
+        return false
+    }
+
+    /** The distinct row Y positions of a wrapping row (wrap proof). */
+    private fun wrappedRowCount(container: Container): Int {
+        val ys = LinkedHashSet<Int>()
+        for (child in container.components) {
+            if (child.isVisible) ys.add(child.y)
+        }
+        return ys.size
+    }
+
+    private fun collectFocusable(component: Component): List<Component> {        val out = ArrayList<Component>()
         fun walk(c: Component) {
             if (c.isFocusable && c.isEnabled && c.isVisible) {
                 out.add(c)

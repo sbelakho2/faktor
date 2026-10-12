@@ -525,12 +525,13 @@ internal object ParityMatrix {
                             panel.tabTitles().toString()
                         )
                         assertEquals(null, panel.completionContractFromControls())
-                        panel.completionCommit.isSelected = true
-                        panel.completionPr.isSelected = true
+                        panel.selectFinishLevelForTest(FinishLevel.PR)
                         assertEquals(
-                            NativeCompletionContract(true, false, true),
+                            NativeCompletionContract(true, true, true),
                             panel.completionContractFromControls()
                         )
+                        panel.selectFinishLevelForTest(FinishLevel.LOCAL)
+                        assertEquals(null, panel.completionContractFromControls())
                     } finally {
                         panel.shutdown()
                     }

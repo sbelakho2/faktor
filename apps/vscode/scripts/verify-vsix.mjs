@@ -102,6 +102,8 @@ const PANEL_MARKERS = [
   'retrieveEvidence',
   'boardRead',
   'boardPost',
+  'openSession',
+  'refreshHistory',
 ];
 
 const DEFAULT_MIN_MEDIA_FILES = 4;

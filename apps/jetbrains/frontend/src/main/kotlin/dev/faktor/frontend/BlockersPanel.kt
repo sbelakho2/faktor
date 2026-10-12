@@ -205,25 +205,13 @@ class BlockersPanel : JPanel(BorderLayout()) {
         return card
     }
 
-    /** Human decision headline: what the agent wants to do, and to what. */
-    private fun permissionHeadline(permission: NativePermissionEntry): String {
-        val kind = permission.capability.lowercase()
-        val what = when {
-            kind.contains("shell") || kind.contains("execute") -> "Run a shell command"
-            kind.contains("write") -> "Write files in this workspace"
-            kind.contains("read") -> "Read files in this workspace"
-            kind.contains("network") -> "Use the network"
-            kind.contains("browser") -> "Control the browser"
-            kind.contains("git") || kind.contains("scm") -> "Run Git operations"
-            kind.contains("mcp") -> "Call an external tool service"
-            else -> "Use ${permission.capability}"
-        }
-        val target = Regex("\"(?:tool|path|command|destination)\"\\s*:\\s*\"([^\"]+)\"")
-            .find(permission.detail)
-            ?.groupValues
-            ?.get(1)
-        return if (target.isNullOrEmpty()) what else "$what: $target"
-    }
+    /**
+     * Human decision headline: what the agent wants to do, and to what.
+     * Delegates to the ONE shared approval renderer (ApprovalCards.kt) so no
+     * surface can drift into different wording.
+     */
+    private fun permissionHeadline(permission: NativePermissionEntry): String =
+        approvalHeadlineOf(permission)
 
     private fun permissionCard(permission: NativePermissionEntry): JPanel {
         // Decision-first wording (UI audit): the headline says WHAT the
