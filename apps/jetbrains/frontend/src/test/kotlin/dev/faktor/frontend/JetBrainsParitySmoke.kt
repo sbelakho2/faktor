@@ -566,7 +566,15 @@ object JetBrainsParitySmoke {
             val panel = harness.panel
             panel.refreshNowForTest()
             val summary = panel.runSummaryTextForTest()
-            assertTrue(summary.startsWith("goal: parity goal"), "the served goal must lead: $summary")
+            // T09: the served task-run state `Running` leads the strip with
+            // the exact label+copy before the served run facts.
+            assertTrue(
+                summary.startsWith(
+                    RunStateCopy.RUNNING_LABEL + "\n" + RunStateCopy.RUNNING_COPY + "\n"
+                ),
+                "the served Running state must lead with the exact T09 banner: $summary"
+            )
+            assertTrue(summary.contains("goal: parity goal"), "the served goal must render: $summary")
             assertTrue(summary.contains("phase: building"), "the served phase must render: $summary")
             assertTrue(summary.contains("state: "), "the served state must render: $summary")
             assertTrue(
@@ -1845,12 +1853,32 @@ object JetBrainsParitySmoke {
             await("transport failure surfaced") {
                 panel.transcriptTextForTest().contains("transport failure")
             }
-            assertTrue(panel.startTaskEnabledForTest(), "the start control re-enables on failure")
+            // T08: the retained submission after the lost response renders the
+            // exact label+copy; the retry control (Run task) is the enabled
+            // affordance the action points at, and no T07 banner bleeds in.
+            await("the strip renders the T08 response-unavailable state") {
+                panel.runSummaryTextForTest()
+                    .contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL)
+            }
+            val lostStrip = panel.runSummaryTextForTest()
+            assertTrue(
+                lostStrip.contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_COPY),
+                lostStrip
+            )
+            assertTrue(
+                !lostStrip.contains(RunStateCopy.STARTING_LABEL),
+                "T08 is not a start in flight: $lostStrip"
+            )
+            assertTrue(panel.startTaskEnabledForTest(), "the retry control must be enabled")
             assertEquals("transport goal", panel.goalTextForTest(), "the draft survives the failure")
             assertEquals(1, panel.attachmentsCountForTest(), "attachments survive the failure")
             panel.submitTaskForTest()
             await("the retained submission is accepted") {
                 panel.transcriptTextForTest().contains("run-9 started")
+            }
+            await("T08 clears once the retry resolves the same logical start") {
+                !panel.runSummaryTextForTest()
+                    .contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL)
             }
             val bodies = taskStartBodies(harness.daemon)
             assertEquals(2, bodies.size, "exactly one retry reached the daemon")
@@ -1880,6 +1908,15 @@ object JetBrainsParitySmoke {
             panel.setTaskFieldsForTest("captured goal", "c1")
             panel.submitTaskForTest()
             assertTrue(entered.await(10, TimeUnit.SECONDS), "the start request must reach the daemon")
+            // T07: while the captured draft is being admitted once, the strip
+            // renders the exact label+copy (the `Wait` action has no control
+            // here, so it never renders as one).
+            await("the strip renders the T07 starting state") {
+                panel.runSummaryTextForTest().contains(RunStateCopy.STARTING_LABEL)
+            }
+            val startingStrip = panel.runSummaryTextForTest()
+            assertTrue(startingStrip.contains(RunStateCopy.STARTING_COPY), startingStrip)
+            assertTrue(!startingStrip.contains(RunStateCopy.STARTING_ACTION), startingStrip)
             val inFlight = harness.daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
             // Edits while pending: a new goal, new criteria, a new attachment
             // and a completion contract toggle must not reach the in-flight
@@ -1893,6 +1930,13 @@ object JetBrainsParitySmoke {
             release.countDown()
             await("the captured submission completes") {
                 panel.transcriptTextForTest().contains("run-9 started")
+            }
+            // T07 ends with the result; the served Running state takes over.
+            await("T07 clears once the start resolves") {
+                !panel.runSummaryTextForTest().contains(RunStateCopy.STARTING_LABEL)
+            }
+            await("the served Running state replaces the start banner") {
+                panel.runStatusBannerForTest()?.label == RunStateCopy.RUNNING_LABEL
             }
             assertTrue(inFlight.contains("\"goal\":\"captured goal\""), inFlight)
             assertTrue(inFlight.contains("\"criteria\":[\"c1\"]"), inFlight)

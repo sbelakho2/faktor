@@ -739,7 +739,6 @@ const MEASURE_SCRIPT = `(() => {
     const inControls = el.closest('.agent-controls') !== null;
     const secondary = inControls || el.classList.contains('attachment-remove');
     const primary = el.tagName === 'BUTTON' && !secondary;
-    const inNav = el.closest('#nav-switcher') !== null;
     out.push({
       name: name + (el.id ? '' : (el.className ? '.' + String(el.className).split(' ')[0] : '')),
       tag: el.tagName,
@@ -747,7 +746,7 @@ const MEASURE_SCRIPT = `(() => {
       h: Math.round(rect.height * 100) / 100,
       primary,
     });
-    boxes.push({ name, x: rect.x, y: rect.y, w: rect.width, h: rect.height, primary, inNav });
+    boxes.push({ name, x: rect.x, y: rect.y, w: rect.width, h: rect.height, primary });
   }
   return {
     controls: out,
@@ -759,15 +758,14 @@ const MEASURE_SCRIPT = `(() => {
 
 // VAL-ZOOM spill scan: any element whose box leaves the CSS-pixel budget while
 // its own scroll containers cannot clip it is clipped content (a title, a
-// label, an action). The view tablist (#nav-switcher, role="tablist") is
-// navigation chrome rather than a main action surface and is covered by the
-// base width tiers; the zoom leg asserts the surfaces around it. Elements
-// inside an explicit horizontal scroller are contained and allowed.
+// label, an action). The view tablist (#nav-switcher, role="tablist") reflows
+// to wrapped min-content rows below the compact range, so it is asserted here
+// like every other surface. Elements inside an explicit horizontal scroller
+// are contained and allowed.
 const ZOOM_SPILL_SCRIPT = `(() => {
   const iw = window.innerWidth;
   const spills = [];
   for (const el of document.querySelectorAll('body *')) {
-    if (el.closest('#nav-switcher')) continue;
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
     if (r.right <= iw + 0.5 && r.x >= -0.5) continue;
@@ -854,7 +852,7 @@ function writeHarnessPage(html, prefix) {
  * Fail-closed layout assertions for one measured page. `targets` enables the
  * >= 24x24 / 28x28 control-size checks; `documentOverflow` checks the page
  * scrollWidth; `primaryVisible` requires every primary decision control
- * outside the #nav-switcher tablist to sit fully inside the viewport (the
+ * (the view tablist included) to sit fully inside the viewport (the
  * VAL-ZOOM "primary decisions remain visible" observable).
  */
 function assertLayout(result, context, failures, { targets = true, primaryVisible = false, documentOverflow = true } = {}) {
@@ -875,7 +873,7 @@ function assertLayout(result, context, failures, { targets = true, primaryVisibl
   }
   if (primaryVisible) {
     for (const box of result.boxes) {
-      if (!box.primary || box.inNav) {
+      if (!box.primary) {
         continue;
       }
       if (box.w <= 0 || box.x < -0.5 || box.x + box.w > result.innerWidth + 0.5) {
@@ -1062,10 +1060,10 @@ export async function runHarness(args) {
       // VAL-ZOOM leg: IDE UI scale 150%/200% shrinks the CSS-pixel budget the
       // webview sees (viewport width / zoom, floored at 120px), so the layout
       // is measured at that reduced width. The document scrollWidth is not the
-      // right probe when the role=tablist view switcher alone exceeds the
-      // floor (navigation chrome, covered by the base width tiers), so this
-      // leg asserts the main action surfaces instead: no uncontained element
-      // spills past the budget and every primary decision stays visible.
+      // right probe at the floor (wrapped rows are intended), so this leg
+      // asserts the surfaces directly: no uncontained element — the reflowing
+      // view switcher included — spills past the budget, and every primary
+      // decision stays visible.
       for (const theme of themeNames) {
         const themeUrl = pageUrls.get(theme);
         for (const zoom of ZOOMS) {

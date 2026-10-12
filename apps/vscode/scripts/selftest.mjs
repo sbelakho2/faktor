@@ -7766,6 +7766,7 @@ function webviewSnapshot(agents) {
     workspaceName: null,
     runs: [],
     activeRunId: null,
+    proofTaskState: null,
     agents,
     permissions: [],
     task: null,
@@ -12994,6 +12995,560 @@ async function preflightTests() {
   });
 }
 
+// ------------------- approved-state copy (T06-T09, T11/T12, T19, T21, T25/T26)
+
+function readyPreflightView() {
+  return pf.derivePreflight(
+    preflightInput({
+      daemon: 'running',
+      readiness: 'ready',
+      resolution: resolvedFixture,
+      trust: verifiedTrustFixture,
+    }),
+  );
+}
+
+function runTaskFixture(state) {
+  return {
+    state,
+    goal: 'close the audit',
+    completed: [],
+    open: [],
+    testsRun: [],
+    testsFailed: [],
+    phase: null,
+    completion: null,
+  };
+}
+
+async function approvedStateCopyTests() {
+  await test('T06 ready composer strip renders the exact label and copy from the served ready preflight', () => {
+    const ready = readyPreflightView();
+    assertEqual(ready.state, 'ready');
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: ready,
+      machineState: 'idle',
+    });
+    const { dom } = harness;
+    const strip = dom.document.getElementById('composer-state');
+    assertEqual(strip.hidden, false, 'the ready row renders in the composer strip');
+    assertEqual(dom.document.getElementById('composer-state-label').textContent, 'Ready');
+    assertEqual(
+      dom.document.getElementById('composer-state-copy').textContent,
+      'Describe a task or ask a question.',
+    );
+    assertEqual(dom.document.getElementById('composer-state-glyph').textContent, '\u2713');
+    // The useful action is the EXISTING Run task control: the strip itself
+    // adds no button.
+    assertEqual(
+      dom.document.getElementById('composer-state').children.filter((child) => child.tagName === 'button')
+        .length,
+      0,
+      'the state strip never duplicates the Run task control',
+    );
+    // Negative: an unready preflight renders nothing new.
+    const stopped = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: pf.T01_STOPPED,
+      machineState: 'idle',
+    });
+    assertEqual(stopped.dom.document.getElementById('composer-state').hidden, true);
+    // Negative: an active run keeps the idle Ready row out of the composer.
+    const busy = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: ready,
+      machineState: 'running',
+      busy: true,
+      activeRunId: 'r1',
+    });
+    assertEqual(busy.dom.document.getElementById('composer-state').hidden, true);
+    // The host has not published a preflight view: nothing is fabricated.
+    const unpublished = runChatWebview(webviewSnapshot([]));
+    assertEqual(unpublished.dom.document.getElementById('composer-state').hidden, true);
+  });
+
+  await test('T07 starting strip renders during the single-flight admission and never twice', () => {
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: readyPreflightView(),
+      machineState: 'idle',
+    });
+    const { dom, posted } = harness;
+    assertEqual(
+      dom.document.getElementById('composer-state-label').textContent,
+      'Ready',
+      'the idle composer starts in the ready row',
+    );
+    dom.document.getElementById('goal').value = 'admit this once';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    // A second submit while the first is in flight is ignored (single-flight).
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const sendGoals = posted.filter((entry) => entry.type === 'sendGoal');
+    assertEqual(sendGoals.length, 1, 'exactly one sendGoal is admitted');
+    assertEqual(sendGoals[0].goal, 'admit this once');
+    assertEqual(dom.document.getElementById('composer-state').hidden, false);
+    assertEqual(
+      dom.document.getElementById('composer-state-label').textContent,
+      'Starting the run',
+    );
+    assertEqual(
+      dom.document.getElementById('composer-state-copy').textContent,
+      'Your captured draft is being admitted once.',
+    );
+    assertEqual(dom.document.getElementById('composer-state-glyph').textContent, '\u2026');
+    // The outcome releases the lock and the strip leaves the starting row.
+    harness.deliver({ type: 'startResult', goal: 'admit this once', ok: true });
+    assert(
+      dom.document.getElementById('composer-state-label').textContent !== 'Starting the run',
+      'the starting row ends with the explicit result',
+    );
+  });
+
+  await test('T08 start response unavailable keeps the kept draft strip until the next submission', () => {
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: readyPreflightView(),
+      machineState: 'idle',
+    });
+    const { dom } = harness;
+    dom.document.getElementById('goal').value = 'keep my draft';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    harness.deliver({ type: 'startResult', goal: 'keep my draft', ok: false, retryable: true });
+    assertEqual(dom.document.getElementById('composer-state').hidden, false);
+    assertEqual(
+      dom.document.getElementById('composer-state-label').textContent,
+      'Start response unavailable',
+    );
+    assertEqual(
+      dom.document.getElementById('composer-state-copy').textContent,
+      'The draft was kept. Retry checks the same logical submission.',
+    );
+    assertEqual(dom.document.getElementById('goal').value, 'keep my draft', 'the draft is kept');
+    // The useful action is the EXISTING Review and retry control of the
+    // user-error projection; the strip adds no duplicate button.
+    harness.deliver({
+      type: 'userError',
+      error: ue.projectError({ kind: 'run_failure', message: 'lost the response' }),
+    });
+    const notices = dom.document.getElementById('notices');
+    const retry = findFake(
+      notices,
+      (node) => node.tagName === 'button' && node.textContent === 'Review and retry',
+    );
+    assert(retry, 'the existing Review and retry control renders');
+    retry.click();
+    assertEqual(dom.document.activeElement, dom.document.getElementById('goal'));
+    // A durable start clears the kept-draft row; the next result decides anew.
+    harness.deliver({ type: 'startResult', goal: 'keep my draft', ok: true });
+    assert(
+      dom.document.getElementById('composer-state-label').textContent !== 'Start response unavailable',
+      'a durable start leaves the unavailable row',
+    );
+    // Negative: a fresh panel without a failed start renders no T08 copy.
+    const fresh = runChatWebview(webviewSnapshot([]));
+    assertEqual(fresh.dom.document.getElementById('composer-state').hidden, true);
+    // Negative: a typed refusal (`retryable: false`) keeps the draft but is
+    // NOT the unavailable-response state — no T08 copy renders.
+    const refused = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: readyPreflightView(),
+      machineState: 'idle',
+    });
+    refused.dom.document.getElementById('goal').value = 'fix the contract';
+    refused.dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    refused.deliver({
+      type: 'startResult',
+      goal: 'fix the contract',
+      ok: false,
+      retryable: false,
+    });
+    assertEqual(
+      refused.dom.document.getElementById('goal').value,
+      'fix the contract',
+      'the refusal keeps the draft',
+    );
+    assert(
+      refused.dom.document.getElementById('composer-state-label').textContent !==
+        'Start response unavailable',
+      'a typed refusal is not the unavailable-response state',
+    );
+  });
+
+  await test('T11 needs your input renders only from the served needs_user_input machine state', () => {
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: readyPreflightView(),
+      machineState: 'needs_user_input',
+    });
+    const { dom } = harness;
+    assertEqual(dom.document.getElementById('composer-state').hidden, false);
+    assertEqual(dom.document.getElementById('composer-state-label').textContent, 'Needs your input');
+    assertEqual(
+      dom.document.getElementById('composer-state-copy').textContent,
+      'The run is waiting for a decision or clarification.',
+    );
+    // The composer IS the reply surface: the strip adds no Reply control.
+    assertEqual(
+      dom.document.getElementById('composer-state').children.filter((child) => child.tagName === 'button')
+        .length,
+      0,
+      'the needs-input strip never duplicates the composer reply surface',
+    );
+    // Negative: another served machine state renders nothing new.
+    const idle = runChatWebview({
+      ...webviewSnapshot([]),
+      preflight: readyPreflightView(),
+      machineState: 'idle',
+    });
+    assert(
+      idle.dom.document.getElementById('composer-state-label').textContent !== 'Needs your input',
+    );
+  });
+
+  await test('T12 checking renders only from the proof body embedded task state', () => {
+    // The served wire value: `GET /native/tasks/{id}/proof` body `task.state`
+    // (proof_tests.rs proves `verifying` is served), projected exactly as the
+    // host patches `proofTaskState`.
+    const proofTaskStateOf = (state) =>
+      nc.validateTaskProof(taskProofJson({ task: { ...taskProofJson().task, state } })).task
+        .state;
+    const assertChecking = (state) => {
+      const snapshot = webviewSnapshot([]);
+      snapshot.proofTaskState = proofTaskStateOf(state);
+      snapshot.task = runTaskFixture('running');
+      const { dom } = runChatWebview(snapshot);
+      const strip = dom.document.getElementById('run-state');
+      assertEqual(strip.hidden, false, `${state}: the T12 strip renders`);
+      assertEqual(
+        dom.document.getElementById('run-state-label').textContent,
+        'Checking the change',
+        `${state} label`,
+      );
+      assertEqual(
+        dom.document.getElementById('run-state-copy').textContent,
+        'Required results remain attached to this candidate.',
+        `${state} copy`,
+      );
+      assertEqual(dom.document.getElementById('run-state-glyph').textContent, '\u2026', `${state} glyph`);
+      // The useful actions are the EXISTING controls: Inspect, Cancel run and
+      // the conversation; the strip renders no duplicate buttons.
+      assertEqual(
+        strip.children.filter((child) => child.tagName === 'button').length,
+        0,
+        `${state}: no duplicate action buttons`,
+      );
+    };
+    assertChecking('verifying');
+    assertChecking('needs_verification');
+    // Negative: a proof absent or carrying a non-verifying task state renders
+    // nothing extra — a VERIFIED / terminal / running proof state is never
+    // re-labelled "Checking the change" (nor run-cancelled/run-failed, which
+    // only the durable task-run rows serve).
+    const prohibited = {
+      'Checking the change': 'T12',
+      'Run cancelled': 'T25',
+      'Run failed': 'T26',
+    };
+    for (const state of [null, 'verified_complete', 'failed', 'cancelled', 'running', 'done']) {
+      const snapshot = webviewSnapshot([]);
+      snapshot.proofTaskState = state;
+      snapshot.task = runTaskFixture('running');
+      const { dom } = runChatWebview(snapshot);
+      const label = dom.document.getElementById('run-state-label').textContent;
+      assert(
+        !Object.prototype.hasOwnProperty.call(prohibited, label),
+        `proof task state ${String(state)} must not render ${prohibited[label]}`,
+      );
+    }
+  });
+
+  await test('T25/T26/T09 render from the newest durable task-run row, and T12 outranks a running row', () => {
+    const runRow = (state, runId = 'r1') => ({
+      taskId: '3',
+      runId,
+      mode: 'in_session',
+      state,
+      goal: 'close the audit',
+      model: null,
+    });
+    const assertRow = (state, label, copy, glyph) => {
+      const snapshot = webviewSnapshot([]);
+      snapshot.task = runTaskFixture('running');
+      snapshot.runs = [runRow(state)];
+      const { dom } = runChatWebview(snapshot);
+      const strip = dom.document.getElementById('run-state');
+      assertEqual(strip.hidden, false, `${state}: the run strip renders`);
+      assertEqual(dom.document.getElementById('run-state-label').textContent, label, `${state} label`);
+      assertEqual(dom.document.getElementById('run-state-copy').textContent, copy, `${state} copy`);
+      assertEqual(dom.document.getElementById('run-state-glyph').textContent, glyph, `${state} glyph`);
+      // The useful actions are the EXISTING controls: Inspect, Cancel run and
+      // the conversation; the strip renders no duplicate buttons.
+      assertEqual(
+        strip.children.filter((child) => child.tagName === 'button').length,
+        0,
+        `${state}: no duplicate action buttons`,
+      );
+    };
+    assertRow(
+      'Cancelled',
+      'Run cancelled',
+      'Cancellation is a terminal run outcome, not verification success.',
+      '\u2298',
+    );
+    assertRow(
+      'Failed',
+      'Run failed',
+      'The result and reason remain available for inspection.',
+      '\u2717',
+    );
+    assertRow('Running', 'Running', 'The candidate is separate from your workspace.', '\u25b6');
+    // The FIRST row is the newest one: a later Running row never overrides a
+    // newest Cancelled row.
+    const newestFirst = webviewSnapshot([]);
+    newestFirst.task = runTaskFixture('running');
+    newestFirst.runs = [runRow('Cancelled', 'r2'), runRow('Running', 'r1')];
+    const firstHarness = runChatWebview(newestFirst);
+    assertEqual(
+      firstHarness.dom.document.getElementById('run-state-label').textContent,
+      'Run cancelled',
+      'the newest (first) task-run row decides',
+    );
+    // A verifying proof outranks the still-running row (the run row of a
+    // verifying task is served as Running): T12 is reachable in practice.
+    const checking = webviewSnapshot([]);
+    checking.task = runTaskFixture('running');
+    checking.runs = [runRow('Running')];
+    checking.proofTaskState = 'verifying';
+    const checkingHarness = runChatWebview(checking);
+    assertEqual(
+      checkingHarness.dom.document.getElementById('run-state-label').textContent,
+      'Checking the change',
+      'T12 outranks T09 while the run row still reads Running',
+    );
+    // A terminal row outranks a stale verifying proof state.
+    const terminal = webviewSnapshot([]);
+    terminal.task = runTaskFixture('running');
+    terminal.runs = [runRow('Failed')];
+    terminal.proofTaskState = 'verifying';
+    const terminalHarness = runChatWebview(terminal);
+    assertEqual(
+      terminalHarness.dom.document.getElementById('run-state-label').textContent,
+      'Run failed',
+      'the terminal run row outranks the proof state',
+    );
+    // A session tag `running` with no task-run rows keeps only T09.
+    const tagOnly = webviewSnapshot([]);
+    tagOnly.task = runTaskFixture('running');
+    const tagHarness = runChatWebview(tagOnly);
+    assertEqual(tagOnly.runs.length, 0, 'no task-run rows are served');
+    assertEqual(tagHarness.dom.document.getElementById('run-state').hidden, false);
+    assertEqual(tagHarness.dom.document.getElementById('run-state-label').textContent, 'Running');
+    assertEqual(
+      tagHarness.dom.document.getElementById('run-state-copy').textContent,
+      'The candidate is separate from your workspace.',
+    );
+    // No rows, no proof and no running tag: nothing renders.
+    const none = webviewSnapshot([]);
+    none.task = runTaskFixture('done');
+    const noneHarness = runChatWebview(none);
+    assertEqual(noneHarness.dom.document.getElementById('run-state').hidden, true);
+    // Adversarial: a malformed newest row (null / non-string state) renders
+    // nothing and never throws.
+    const malformed = webviewSnapshot([]);
+    malformed.task = runTaskFixture('done');
+    malformed.runs = [null, { state: 7 }];
+    const malformedHarness = runChatWebview(malformed);
+    assertEqual(malformedHarness.dom.document.getElementById('run-state').hidden, true);
+    // No task at all and no served run condition: nothing renders.
+    const empty = runChatWebview(webviewSnapshot([]));
+    assertEqual(empty.dom.document.getElementById('run-state').hidden, true);
+  });
+
+  await test('negative: the collapsed session tag alone can never render T12/T25/T26', () => {
+    // The collapsed tag source (`GET /native/session/{id}/tasks`) serves only
+    // `running | in_progress | done | idle`; none of those may be mapped to
+    // the proof/terminal rows. With no task-run rows and no proof, the tag is
+    // the ONLY run source.
+    const prohibited = {
+      'Checking the change': 'T12',
+      'Run cancelled': 'T25',
+      'Run failed': 'T26',
+    };
+    for (const tag of ['running', 'in_progress', 'done', 'idle']) {
+      const snapshot = webviewSnapshot([]);
+      snapshot.task = runTaskFixture(tag);
+      assertEqual(snapshot.runs.length, 0);
+      assertEqual(snapshot.proofTaskState, null);
+      const { dom } = runChatWebview(snapshot);
+      const strip = dom.document.getElementById('run-state');
+      const label = dom.document.getElementById('run-state-label').textContent;
+      assert(
+        !Object.prototype.hasOwnProperty.call(prohibited, label),
+        `tag ${tag}: the collapsed tag alone must never render ${prohibited[label]}`,
+      );
+      if (tag === 'running') {
+        assertEqual(strip.hidden, false, 'the tag `running` may keep only T09');
+        assertEqual(label, 'Running');
+      } else {
+        assertEqual(strip.hidden, true, `tag ${tag}: nothing renders`);
+      }
+    }
+  });
+
+  await test('T19 workspace changed renders the exact label and copy beside the pinned Conflict facts', () => {
+    const integrationSection = (view) =>
+      cp.cockpitSections(view).find((section) => section.key === 'integration');
+    const conflict = integrationSection(
+      proofCockpitWith(
+        nc.validateTaskProof(
+          taskProofJson({
+            integration: {
+              present: true,
+              inFlight: true,
+              runId: 'run-3',
+              finalSnapshotHash: '',
+              landedSnapshot: null,
+              integratedFileCount: 0,
+              conflictCount: 2,
+              txn: null,
+            },
+          }),
+        ),
+      ),
+    );
+    // The pinned Conflict state/fact strings stay intact.
+    assert(conflict.lines[0].startsWith('! Conflict \u2014 2'), conflict.lines[0]);
+    assert(
+      conflict.lines.some((line) => line.includes('conflictCount 2')),
+      JSON.stringify(conflict.lines),
+    );
+    // The T19 label + copy render as their own lines.
+    assert(conflict.lines.includes('! Workspace changed'), JSON.stringify(conflict.lines));
+    assert(
+      conflict.lines.includes('The current workspace no longer matches the integration basis.'),
+      JSON.stringify(conflict.lines),
+    );
+    // Negative: a landed integration (no conflict) renders nothing new.
+    const landed = integrationSection(proofCockpitWith(nc.validateTaskProof(taskProofJson())));
+    assert(
+      !landed.lines.some((line) => line.includes('Workspace changed')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      !landed.lines.some((line) => line.includes('no longer matches the integration basis')),
+      JSON.stringify(landed.lines),
+    );
+  });
+
+  await test('T21 finish action pending renders only when a requested step lacks a succeeded durable result', () => {
+    const completionTask = (completion) => ({
+      goal: 'ship it',
+      state: 'running',
+      completed: [],
+      open: [],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: null,
+      acceptanceCriteria: [],
+      plan: [],
+      blockers: [],
+      evidenceRefs: [],
+      phase: null,
+      progress: null,
+      completion,
+    });
+    const completionSection = (task) => {
+      const view = cp.buildCockpit({
+        task,
+        agents: [],
+        verification: null,
+        usage: null,
+        taskVerification: null,
+      });
+      return cp.cockpitSections(view).find((entry) => entry.key === 'completion');
+    };
+    const pending = completionSection(
+      completionTask({
+        includeCommit: true,
+        includePush: false,
+        includePr: true,
+        steps: [
+          { step: 'commit', status: 'pending', detail: 'awaiting the gate' },
+          { step: 'pr', status: 'pending', detail: null },
+        ],
+        source: 'derived',
+        reason: null,
+      }),
+    );
+    assert(pending.lines.includes('! Finish action pending'), JSON.stringify(pending.lines));
+    assert(
+      pending.lines.includes('A requested action lacks a succeeded durable result.'),
+      JSON.stringify(pending.lines),
+    );
+    // The pinned contract rows keep their positions (the state lines append).
+    assert(pending.lines[0].includes('commit, pr'), pending.lines[0]);
+    assert(pending.lines[1].includes('[pending] commit'), pending.lines[1]);
+    // A requested step with no durable row at all is pending too.
+    const missingRow = completionSection(
+      completionTask({
+        includeCommit: true,
+        includePush: false,
+        includePr: false,
+        steps: [],
+        source: 'daemon',
+        reason: null,
+      }),
+    );
+    assert(
+      missingRow.lines.includes('! Finish action pending'),
+      JSON.stringify(missingRow.lines),
+    );
+    // Negative: every requested step succeeded — no pending state.
+    const succeeded = completionSection(
+      completionTask({
+        includeCommit: true,
+        includePush: true,
+        includePr: true,
+        steps: [
+          { step: 'commit', status: 'succeeded', detail: 'abc' },
+          { step: 'push', status: 'succeeded', detail: 'origin' },
+          { step: 'pr', status: 'succeeded', detail: 'pr-1' },
+        ],
+        source: 'daemon',
+        reason: null,
+      }),
+    );
+    assert(
+      !succeeded.lines.some((line) => line.includes('Finish action pending')),
+      JSON.stringify(succeeded.lines),
+    );
+    // Negative: no requested action at all — nothing to be pending.
+    const none = completionSection(
+      completionTask({
+        includeCommit: false,
+        includePush: false,
+        includePr: false,
+        steps: [{ step: 'commit', status: 'pending', detail: null }],
+        source: 'daemon',
+        reason: null,
+      }),
+    );
+    assert(
+      !none.lines.some((line) => line.includes('Finish action pending')),
+      JSON.stringify(none.lines),
+    );
+    // Negative: no contract renders nothing new.
+    const bare = completionSection(completionTask(null));
+    assert(!bare.present, 'no completion contract: the section stays empty');
+    assert(
+      !bare.lines.some((line) => line.includes('Finish action pending')),
+      JSON.stringify(bare.lines),
+    );
+  });
+}
+
 async function readinessTests() {
   await test('readiness never succeeds before ready:true; the deadline is a typed timeout', async () => {
     let attempts = 0;
@@ -14225,6 +14780,7 @@ async function main() {
   await daemonTests();
   await daemonCancelTests();
   await preflightTests();
+  await approvedStateCopyTests();
   await readinessTests();
   await shadowDefaultTests();
   await completionContractTests();

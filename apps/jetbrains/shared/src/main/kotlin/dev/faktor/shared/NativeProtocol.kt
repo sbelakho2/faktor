@@ -1269,6 +1269,14 @@ data class NativeTaskProof(
     val taskId: String,
     val proofState: String,
     val proofStateReason: String?,
+    /**
+     * The served `task.state` of the proof's `task` member (the durable
+     * TaskState label; `verifying` / `needs_verification` drive T12).
+     * Additive: an absent or JSON-null task member stays null — never a
+     * fabricated state; a present-but-unreadable member refuses typed like
+     * its sibling proof members.
+     */
+    val taskState: String? = null,
     val criteriaPassed: Int,
     val criteriaTotal: Int,
     val criteriaFailed: Int,
@@ -2519,6 +2527,18 @@ private fun reviewerText(v: JsonView): String? {
 private fun parseLandedEquals(v: JsonView): Boolean? =
     v.optionalField("landedEqualsVerified")?.let { it.bool() }
 
+/**
+ * The additive `task` member of the strict proof payload: its served `state`
+ * when the daemon serves a task member, null when the member is absent or
+ * JSON null. A present-but-unreadable member (wrong-typed `task`, or a
+ * missing/wrong-typed `state`) refuses typed like every sibling proof member
+ * — a malformed task is never silently treated as absent.
+ */
+private fun parseProofTaskState(v: JsonView): String? {
+    val task = v.optionalField("task") ?: return null
+    return task.field("state").string()
+}
+
 private fun parseIntegrationTxn(v: JsonView): NativeIntegrationTxn = NativeIntegrationTxn(
     txnId = v.field("txnId").string(),
     phase = v.field("phase").string()
@@ -2567,6 +2587,7 @@ fun parseNativeTaskProof(json: String): NativeTaskProof {
         taskId = v.field("taskId").string(),
         proofState = v.field("proofState").string(),
         proofStateReason = v.optionalField("proofStateReason")?.let { jsonText(it) },
+        taskState = parseProofTaskState(v),
         criteriaPassed = criteria.field("passed").int(),
         criteriaTotal = criteria.field("total").int(),
         criteriaFailed = criteria.field("failed").int(),

@@ -14,7 +14,9 @@ import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeCompletionStepStatus
 import dev.faktor.shared.NativeContractRows
+import dev.faktor.shared.NativeTaskCompletion
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeEvidenceRetrieval
@@ -1203,6 +1205,496 @@ object FrontendSmoke {
             } finally {
                 panel.shutdown()
             }
+        }
+
+        step("run-state copy: T06-T26 exact labels render only under their served conditions") {
+            // Verbatim transcription guards: the state-matrix copy is exact.
+            assertEquals("Ready", RunStateCopy.READY_LABEL)
+            assertEquals("Describe a task or ask a question.", RunStateCopy.READY_COPY)
+            assertEquals("Run task", RunStateCopy.READY_ACTION)
+            assertEquals("Starting the run", RunStateCopy.STARTING_LABEL)
+            assertEquals("Your captured draft is being admitted once.", RunStateCopy.STARTING_COPY)
+            assertEquals("Wait", RunStateCopy.STARTING_ACTION)
+            assertEquals(
+                "Start response unavailable",
+                RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL
+            )
+            assertEquals(
+                "The draft was kept. Retry checks the same logical submission.",
+                RunStateCopy.START_RESPONSE_UNAVAILABLE_COPY
+            )
+            assertEquals("Review and retry", RunStateCopy.START_RESPONSE_UNAVAILABLE_ACTION)
+            assertEquals("Running", RunStateCopy.RUNNING_LABEL)
+            assertEquals("The candidate is separate from your workspace.", RunStateCopy.RUNNING_COPY)
+            assertEquals("Inspect / Stop current run", RunStateCopy.RUNNING_ACTION)
+            assertEquals("Needs your input", RunStateCopy.NEEDS_INPUT_LABEL)
+            assertEquals(
+                "The run is waiting for a decision or clarification.",
+                RunStateCopy.NEEDS_INPUT_COPY
+            )
+            assertEquals("Reply in composer", RunStateCopy.NEEDS_INPUT_ACTION)
+            assertEquals("Workspace changed", RunStateCopy.WORKSPACE_CHANGED_LABEL)
+            assertEquals(
+                "The current workspace no longer matches the integration basis.",
+                RunStateCopy.WORKSPACE_CHANGED_COPY
+            )
+            assertEquals("Inspect conflict", RunStateCopy.WORKSPACE_CHANGED_ACTION)
+            assertEquals("Finish action pending", RunStateCopy.FINISH_ACTION_PENDING_LABEL)
+            assertEquals(
+                "A requested action lacks a succeeded durable result.",
+                RunStateCopy.FINISH_ACTION_PENDING_COPY
+            )
+            assertEquals("View finish actions", RunStateCopy.FINISH_ACTION_PENDING_ACTION)
+            assertEquals("Run cancelled", RunStateCopy.RUN_CANCELLED_LABEL)
+            assertEquals(
+                "Cancellation is a terminal run outcome, not verification success.",
+                RunStateCopy.RUN_CANCELLED_COPY
+            )
+            assertEquals(
+                "Review recorded work / New task",
+                RunStateCopy.RUN_CANCELLED_ACTION
+            )
+            assertEquals("Run failed", RunStateCopy.RUN_FAILED_LABEL)
+            assertEquals(
+                "The result and reason remain available for inspection.",
+                RunStateCopy.RUN_FAILED_COPY
+            )
+            assertEquals("Inspect result", RunStateCopy.RUN_FAILED_ACTION)
+            assertEquals("Checking the change", RunStateCopy.CHECKING_LABEL)
+            assertEquals(
+                "Required results remain attached to this candidate.",
+                RunStateCopy.CHECKING_COPY
+            )
+            assertEquals("Inspect verification", RunStateCopy.CHECKING_ACTION)
+
+            // T07/T08: the client start lifecycle, fresher than any served
+            // snapshot. T07 `Wait` has no affordance: label+copy only, so the
+            // action never renders (null in the model).
+            val starting = runStateViewForStart(inFlight = true, submissionRetained = false)
+                ?: fail("a start in flight must be the T07 state")
+            assertEquals(RunStateCopy.STARTING_LABEL, starting.label)
+            assertEquals(RunStateCopy.STARTING_COPY, starting.copy)
+            assertEquals(null, starting.action)
+            assertEquals(null, runStateViewForStart(inFlight = false, submissionRetained = false))
+            val lost = runStateViewForStart(inFlight = false, submissionRetained = true)
+                ?: fail("a retained submission must be the T08 state")
+            assertEquals(RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL, lost.label)
+            assertEquals(RunStateCopy.START_RESPONSE_UNAVAILABLE_COPY, lost.copy)
+            assertEquals(RunStateCopy.START_RESPONSE_UNAVAILABLE_ACTION, lost.action)
+
+            // The served task-run state tags: only Running / Blocked / Failed /
+            // Cancelled map; Done / Pending / Unknown stay null (the strip
+            // then renders its served facts only).
+            assertEquals(
+                RunStateCopy.RUNNING_LABEL,
+                runStateViewForRunTag("Running")?.label
+            )
+            assertEquals(
+                RunStateCopy.NEEDS_INPUT_LABEL,
+                runStateViewForRunTag("Blocked")?.label
+            )
+            assertEquals(
+                RunStateCopy.RUN_FAILED_LABEL,
+                runStateViewForRunTag("Failed")?.label
+            )
+            assertEquals(
+                RunStateCopy.RUN_CANCELLED_LABEL,
+                runStateViewForRunTag("cancelled")?.label
+            )
+            for (tag in listOf("Done", "Pending", "Unknown", null)) {
+                assertEquals(null, runStateViewForRunTag(tag))
+            }
+
+            // T12: the proof's served `task.state` is the ONLY source of the
+            // checking state. `verifying` / `needs_verification` (the
+            // daemon's TaskState labels) map; every other served state — or
+            // none — stays null, never fabricated into a checking state.
+            for (state in listOf("verifying", "needs_verification")) {
+                val checking = runStateViewForProofTaskState(state)
+                    ?: fail("$state must render the T12 checking state")
+                assertEquals(RunStateCopy.CHECKING_LABEL, checking.label)
+                assertEquals(RunStateCopy.CHECKING_COPY, checking.copy)
+                assertEquals(RunStateCopy.CHECKING_ACTION, checking.action)
+            }
+            for (state in listOf(null, "", "running", "failed", "verified_complete")) {
+                assertEquals(null, runStateViewForProofTaskState(state))
+            }
+            // Precedence: the client start lifecycle wins; a settled or
+            // awaiting run tag (Failed / Cancelled / Blocked) outranks T12;
+            // T12 refines the collapsed Running tag; Done / Pending / Unknown
+            // carry no design state and let the proof's T12 render.
+            assertEquals(
+                RunStateCopy.STARTING_LABEL,
+                runStateViewForRun(true, false, "Running", "verifying")?.label
+            )
+            assertEquals(
+                RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL,
+                runStateViewForRun(false, true, "Running", "verifying")?.label
+            )
+            assertEquals(
+                RunStateCopy.RUN_FAILED_LABEL,
+                runStateViewForRun(false, false, "Failed", "verifying")?.label
+            )
+            assertEquals(
+                RunStateCopy.RUN_CANCELLED_LABEL,
+                runStateViewForRun(false, false, "Cancelled", "needs_verification")?.label
+            )
+            assertEquals(
+                RunStateCopy.NEEDS_INPUT_LABEL,
+                runStateViewForRun(false, false, "Blocked", "verifying")?.label
+            )
+            for (state in listOf("verifying", "needs_verification")) {
+                assertEquals(
+                    RunStateCopy.CHECKING_LABEL,
+                    runStateViewForRun(false, false, "Running", state)?.label
+                )
+                assertEquals(
+                    RunStateCopy.CHECKING_LABEL,
+                    runStateViewForRun(false, false, "Done", state)?.label
+                )
+            }
+            assertEquals(
+                RunStateCopy.RUNNING_LABEL,
+                runStateViewForRun(false, false, "Running", null)?.label
+            )
+            assertEquals(null, runStateViewForRun(false, false, "Done", null))
+            assertEquals(null, runStateViewForRun(false, false, null, null))
+            // Negative: the collapsed run tags ALONE never render T12 — with
+            // no served proof state behind them they keep their own design
+            // state (or none).
+            for (tag in listOf(
+                "Running",
+                "Blocked",
+                "Failed",
+                "Cancelled",
+                "Done",
+                "Pending",
+                "Unknown"
+            )) {
+                val tagOnly = runStateViewForRun(false, false, tag, null)
+                assertTrue(
+                    tagOnly == null || tagOnly.label != RunStateCopy.CHECKING_LABEL,
+                    "the run tag $tag alone must never render T12"
+                )
+            }
+
+            // The additive proof `task` member: `task.state` is parsed when
+            // served; an absent or JSON-null member stays null (nothing is
+            // fabricated) and a present-but-malformed member refuses typed
+            // like its sibling proof members.
+            val verifyingProof = parseNativeTaskProof(
+                TASK_PROOF_JSON.replace(
+                    "\"state\":\"verified_complete\"",
+                    "\"state\":\"verifying\""
+                )
+            )
+            assertEquals("verifying", verifyingProof.taskState)
+            assertEquals(
+                null,
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(Regex("\"task\":\\{.*?\\},"), "")
+                ).taskState,
+                "an absent task member must stay null"
+            )
+            assertEquals(
+                null,
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(Regex("\"task\":\\{.*?\\},"), "\"task\":null,")
+                ).taskState,
+                "a JSON-null task member must stay null"
+            )
+            var taskStateRefused = false
+            try {
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"state\":\"verified_complete\"",
+                        "\"state\":7"
+                    )
+                )
+            } catch (e: NativeProtocolException) {
+                taskStateRefused = true
+                assertTrue(
+                    e.path.contains("task.state"),
+                    "the typed refusal must name task.state: ${e.path}"
+                )
+            }
+            assertTrue(taskStateRefused, "a malformed task.state must refuse typed")
+            var taskMemberRefused = false
+            try {
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        Regex("\"task\":\\{.*?\\},"),
+                        "\"task\":\"verifying\","
+                    )
+                )
+            } catch (e: NativeProtocolException) {
+                taskMemberRefused = true
+            }
+            assertTrue(taskMemberRefused, "a non-object task member must refuse typed")
+
+            val service = FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-runstates-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                // T06: the real composer empty state renders the exact
+                // guidance and hides it as soon as a draft exists; the
+                // Task/Ask mode control and the options sheet stay intact.
+                val ready = panel.composerReadyForTest()
+                    ?: fail("the empty composer must render its ready guidance")
+                assertEquals(RunStateCopy.READY_LABEL, ready.first)
+                assertEquals(RunStateCopy.READY_COPY, ready.second)
+                val controls = panel.actionControlsForTest()
+                assertEquals(RunStateCopy.READY_ACTION, controls["runTask"])
+                assertEquals("Cancel run", controls["stopRun"])
+                assertEquals("Inspect", controls["inspect"])
+                assertEquals("New session", controls["newSession"])
+                panel.setTaskFieldsForTest("a draft", "")
+                assertEquals(null, panel.composerReadyForTest(), "a draft must end the ready state")
+                panel.setTaskFieldsForTest("", "")
+                assertEquals(
+                    RunStateCopy.READY_COPY,
+                    panel.composerReadyForTest()?.second,
+                    "clearing the draft restores the ready state"
+                )
+                assertEquals(false, panel.askModeSelected(), "Task mode stays the default")
+                panel.selectModeForTest(true)
+                assertEquals(true, panel.askModeSelected(), "the Ask mode control must keep working")
+                panel.selectModeForTest(false)
+                panel.openTaskOptionsForTest()
+                assertEquals(true, panel.taskOptionsOpenForTest())
+                panel.backTaskOptionsForTest()
+                assertEquals(false, panel.taskOptionsOpenForTest())
+
+                // The strip renders each served run state with its exact
+                // label+copy; states that are not served never bleed through.
+                val task = parseNativeTaskViews(TASK_JSON)[0]
+                panel.applyRunSummaryForTest(task, "Running")
+                val running = panel.runSummaryTextForTest()
+                assertTrue(
+                    running.startsWith(
+                        RunStateCopy.RUNNING_LABEL + "\n" + RunStateCopy.RUNNING_COPY
+                    ),
+                    running
+                )
+                assertTrue(running.contains("goal: ship it"), running)
+                assertEquals(
+                    RunStateCopy.RUNNING_LABEL,
+                    panel.runStatusBannerForTest()?.label
+                )
+                panel.applyRunSummaryForTest(task, "Blocked")
+                val blocked = panel.runSummaryTextForTest()
+                assertTrue(blocked.startsWith(RunStateCopy.NEEDS_INPUT_LABEL), blocked)
+                assertTrue(blocked.contains(RunStateCopy.NEEDS_INPUT_COPY), blocked)
+                assertTrue(
+                    !blocked.contains(RunStateCopy.RUNNING_COPY),
+                    "a Blocked run is not Running: $blocked"
+                )
+                panel.applyRunSummaryForTest(task, "Cancelled")
+                val cancelled = panel.runSummaryTextForTest()
+                assertTrue(cancelled.startsWith(RunStateCopy.RUN_CANCELLED_LABEL), cancelled)
+                assertTrue(cancelled.contains(RunStateCopy.RUN_CANCELLED_COPY), cancelled)
+                assertTrue(
+                    !cancelled.contains(RunStateCopy.RUN_CANCELLED_ACTION),
+                    "the T25 action has no control here, so it never renders: $cancelled"
+                )
+                panel.applyRunSummaryForTest(task, "Failed")
+                val failed = panel.runSummaryTextForTest()
+                assertTrue(failed.startsWith(RunStateCopy.RUN_FAILED_LABEL), failed)
+                assertTrue(failed.contains(RunStateCopy.RUN_FAILED_COPY), failed)
+                // Negative: a Done run carries no design run state at all.
+                panel.applyRunSummaryForTest(task, "Done")
+                val done = panel.runSummaryTextForTest()
+                for (label in listOf(
+                    RunStateCopy.RUNNING_LABEL,
+                    RunStateCopy.NEEDS_INPUT_LABEL,
+                    RunStateCopy.RUN_CANCELLED_LABEL,
+                    RunStateCopy.RUN_FAILED_LABEL,
+                    RunStateCopy.STARTING_LABEL,
+                    RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL
+                )) {
+                    assertTrue(!done.contains(label), "Done must not render '$label': $done")
+                }
+                assertTrue(done.contains("goal: ship it"), done)
+
+                // T12: the proof's served task state (verifying /
+                // needs_verification) refines the collapsed Running tag into
+                // the exact checking label+copy. The collapsed Running copy
+                // never bleeds in, the existing Inspect control stays the
+                // affordance (no button is invented) and the design action
+                // renders only through that existing control.
+                for (state in listOf("verifying", "needs_verification")) {
+                    val proof = parseNativeTaskProof(
+                        TASK_PROOF_JSON.replace(
+                            "\"state\":\"verified_complete\"",
+                            "\"state\":\"" + state + "\""
+                        )
+                    )
+                    assertEquals(state, proof.taskState)
+                    panel.applyRunSummaryForTest(task, "Running", proof.taskState)
+                    val checking = panel.runSummaryTextForTest()
+                    assertTrue(
+                        checking.startsWith(
+                            RunStateCopy.CHECKING_LABEL + "\n" + RunStateCopy.CHECKING_COPY
+                        ),
+                        "$state must render the exact T12 banner: $checking"
+                    )
+                    assertTrue(
+                        !checking.contains(RunStateCopy.RUNNING_COPY),
+                        "the collapsed Running copy must not bleed into T12: $checking"
+                    )
+                    assertEquals(
+                        RunStateCopy.CHECKING_LABEL,
+                        panel.runStatusBannerForTest()?.label
+                    )
+                    assertEquals(
+                        RunStateCopy.CHECKING_ACTION,
+                        panel.runStatusBannerForTest()?.action
+                    )
+                    assertEquals(
+                        "Inspect",
+                        panel.actionControlsForTest()["inspect"],
+                        "T12's affordance is the EXISTING Inspect control"
+                    )
+                }
+                // An absent/refused proof task state fabricates nothing: the
+                // served Running tag keeps leading the strip and the checking
+                // label never renders from the tag alone.
+                panel.applyRunSummaryForTest(task, "Running", null)
+                val tagOnlyStrip = panel.runSummaryTextForTest()
+                assertTrue(
+                    tagOnlyStrip.startsWith(
+                        RunStateCopy.RUNNING_LABEL + "\n" + RunStateCopy.RUNNING_COPY
+                    ),
+                    "without a served proof task state the tag keeps T09: $tagOnlyStrip"
+                )
+                assertTrue(
+                    !tagOnlyStrip.contains(RunStateCopy.CHECKING_LABEL),
+                    "the collapsed tag alone never renders T12: $tagOnlyStrip"
+                )
+
+                // T21: a requested finish action without a succeeded durable
+                // result renders the exact label+copy ON the completion row;
+                // an all-succeeded completion never renders it.
+                val pendingCompletion = task.copy(
+                    completion = NativeTaskCompletion(
+                        NativeCompletionContract(true, true, false),
+                        listOf(
+                            NativeCompletionStepStatus("commit", "pending", ""),
+                            NativeCompletionStepStatus("push", "succeeded", "pushed")
+                        )
+                    )
+                )
+                val pendingModel = TaskTree.build(task = pendingCompletion)
+                assertEquals(true, pendingModel.completion?.finishActionPending)
+                val overview = OverviewPanel()
+                overview.updateModel(pendingModel)
+                val finishRow = overview.summaryText("Finish actions")
+                assertTrue(
+                    finishRow.startsWith(
+                        RunStateCopy.FINISH_ACTION_PENDING_LABEL + " — " +
+                            RunStateCopy.FINISH_ACTION_PENDING_COPY
+                    ),
+                    finishRow
+                )
+                assertTrue(finishRow.contains("commit pending"), finishRow)
+                val doneCompletion = task.copy(
+                    completion = NativeTaskCompletion(
+                        NativeCompletionContract(true, true, false),
+                        listOf(
+                            NativeCompletionStepStatus("commit", "succeeded", "committed"),
+                            NativeCompletionStepStatus("push", "succeeded", "pushed")
+                        )
+                    )
+                )
+                val doneModel = TaskTree.build(task = doneCompletion)
+                assertEquals(false, doneModel.completion?.finishActionPending)
+                overview.updateModel(doneModel)
+                val doneRow = overview.summaryText("Finish actions")
+                assertTrue(
+                    !doneRow.contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
+                    doneRow
+                )
+                assertTrue(doneRow.contains("commit succeeded"), doneRow)
+                // The derived rows of a still-running contract are pending
+                // too; the durable gate-certified (done) rows are not.
+                assertEquals(
+                    true,
+                    TaskTree.build(
+                        task = task,
+                        submittedCompletion = NativeCompletionContract(true, false, false),
+                        runState = "running"
+                    ).completion?.finishActionPending
+                )
+                assertEquals(
+                    false,
+                    TaskTree.build(
+                        task = task,
+                        submittedCompletion = NativeCompletionContract(true, false, false),
+                        runState = "done"
+                    ).completion?.finishActionPending
+                )
+                // A requested step with NO row at all is pending as well.
+                assertEquals(
+                    true,
+                    TaskTree.build(
+                        task = task.copy(
+                            completion = NativeTaskCompletion(
+                                NativeCompletionContract(true, true, true),
+                                listOf(
+                                    NativeCompletionStepStatus("commit", "succeeded", "ok"),
+                                    NativeCompletionStepStatus("push", "unknown", "not certified")
+                                )
+                            )
+                        )
+                    ).completion?.finishActionPending
+                )
+            } finally {
+                panel.shutdown()
+            }
+
+            // T19: the conflict surfaces keep the pinned `! Conflict` fact
+            // and render the exact label+copy alongside it; the action has no
+            // control, so it never renders.
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val conflictedProof = parseNativeTaskProof(
+                TASK_PROOF_JSON.replace("\"conflictCount\":0", "\"conflictCount\":1")
+            )
+            val conflicted = TaskTree.build(task = task, proof = conflictedProof)
+            val conflictFacts = conflicted.proof?.integrationFacts()
+                ?: fail("conflicted proof view")
+            assertTrue(conflictFacts.contains("! Conflict"), conflictFacts.toString())
+            assertTrue(
+                conflictFacts.contains(RunStateCopy.WORKSPACE_CHANGED_LABEL),
+                conflictFacts.toString()
+            )
+            assertTrue(
+                conflictFacts.contains(RunStateCopy.WORKSPACE_CHANGED_COPY),
+                conflictFacts.toString()
+            )
+            assertTrue(
+                !conflictFacts.contains(RunStateCopy.WORKSPACE_CHANGED_ACTION),
+                "the T19 action has no affordance: $conflictFacts"
+            )
+            val overview = OverviewPanel()
+            overview.updateModel(conflicted)
+            val integrationRow = overview.summaryText("Integration")
+            assertTrue(integrationRow.contains("! Conflict"), integrationRow)
+            assertTrue(
+                integrationRow.contains(RunStateCopy.WORKSPACE_CHANGED_LABEL),
+                integrationRow
+            )
+            assertTrue(
+                integrationRow.contains(RunStateCopy.WORKSPACE_CHANGED_COPY),
+                integrationRow
+            )
+            // Negative: a clean served integration never renders the copy.
+            val clean = TaskTree.build(task = task, proof = parseNativeTaskProof(TASK_PROOF_JSON))
+            assertTrue(
+                !clean.proof!!.integrationFacts().contains(RunStateCopy.WORKSPACE_CHANGED_LABEL),
+                clean.proof!!.integrationFacts().toString()
+            )
         }
 
         step("history unavailable renders the T31 copy with its refresh action") {
@@ -2465,7 +2957,8 @@ object FrontendSmoke {
 
             // A served integration record with recorded conflicts renders the
             // distinct `Conflict` fact (never folded into landed/mismatch),
-            // exactly like the VS Code integration view.
+            // exactly like the VS Code integration view; T19's exact
+            // label+copy ride alongside the KEPT `! Conflict` fact.
             val conflictedModel = TaskTree.build(
                 task = task,
                 proof = parseNativeTaskProof(
@@ -2473,12 +2966,30 @@ object FrontendSmoke {
                 )
             )
             val conflicted = conflictedModel.proof ?: fail("conflicted proof view")
-            assertEquals(listOf("! Conflict"), conflicted.integrationFacts())
+            val conflictFacts = conflicted.integrationFacts()
+            assertEquals("! Conflict", conflictFacts[0])
+            assertEquals(
+                listOf(
+                    RunStateCopy.WORKSPACE_CHANGED_LABEL,
+                    RunStateCopy.WORKSPACE_CHANGED_COPY
+                ),
+                conflictFacts.drop(1)
+            )
             val conflictPanel = TaskTreePanel()
             conflictPanel.update(conflictedModel)
             val conflictChildren = childLabelsOf(conflictPanel, "goal/section:proof")
             assertTrue(
                 conflictChildren.contains("integration: ! Conflict"),
+                conflictChildren.toString()
+            )
+            assertTrue(
+                conflictChildren.contains("integration: " + RunStateCopy.WORKSPACE_CHANGED_LABEL),
+                conflictChildren.toString()
+            )
+            assertTrue(
+                conflictChildren.contains(
+                    "integration: " + RunStateCopy.WORKSPACE_CHANGED_COPY
+                ),
                 conflictChildren.toString()
             )
 

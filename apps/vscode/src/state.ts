@@ -502,6 +502,14 @@ export interface FaktorSnapshot {
   readonly workspaceName: string | null;
   readonly runs: readonly RunSummary[];
   readonly activeRunId: string | null;
+  /**
+   * The full durable task state embedded in the served proof
+   * (`GET /native/tasks/{id}/proof` body `task.state`, e.g. `verifying` /
+   * `needs_verification`): the only served source of the T12 run strip.
+   * Null when no proof is served or readable — the collapsed session tag
+   * (`running|in_progress|done|idle`) can never produce this value.
+   */
+  readonly proofTaskState: string | null;
   readonly agents: readonly AgentSummary[];
   /** The live pending permission requests of the active session. They are
    * the operation's ATTENTION gate: one approval card in the main flow, and
@@ -565,6 +573,7 @@ export function emptySnapshot(): FaktorSnapshot {
     workspaceName: null,
     runs: [],
     activeRunId: null,
+    proofTaskState: null,
     agents: [],
     task: null,
     verification: null,

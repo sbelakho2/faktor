@@ -58,6 +58,16 @@ exports.run = async function run() {
   if (!out) {
     throw new Error('FAKTOR_VSCODE_E2E_EVIDENCE is not set');
   }
+  // Synchronous and fsynced before `run` resolves: the record must be durable
+  // before the workbench tears this module down, otherwise a half-written
+  // file could be read as an unmeasurable control after a successful boot.
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, `${JSON.stringify(record, null, 2)}\n`);
+  const fd = fs.openSync(out, 'w');
+  try {
+    fs.writeSync(fd, `${JSON.stringify(record, null, 2)}\n`);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  progressStage('calibration-evidence-written', `status=${record.status} activation_error=${record.activation_error ? 'yes' : 'no'}`);
 };

@@ -128,8 +128,16 @@ function writeEvidence(status, error) {
     matrix,
     wrote_at: new Date().toISOString(),
   };
+  // Synchronous and fsynced: the verdict must be durable before the workbench
+  // tears the host down; a half-written record would be unreadable evidence.
   fs.mkdirSync(path.dirname(evidencePath), { recursive: true });
-  fs.writeFileSync(evidencePath, `${JSON.stringify(record, null, 2)}\n`);
+  const fd = fs.openSync(evidencePath, 'w');
+  try {
+    fs.writeSync(fd, `${JSON.stringify(record, null, 2)}\n`);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 // A host that dies mid-run must still leave the harness a record and must

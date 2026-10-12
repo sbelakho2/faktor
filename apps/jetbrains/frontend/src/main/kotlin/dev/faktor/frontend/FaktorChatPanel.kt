@@ -266,6 +266,29 @@ class FaktorChatPanel(
 
     private val runSummaryArea = JTextArea(3, 24)
 
+    // T06: the composer's ready/empty state — the exact design label+copy
+    // render while the composer holds no draft; the existing Run task control
+    // is the action. Typing hides the row (the state IS the empty composer).
+    private val composerReadyLabel = sectionHeader(RunStateCopy.READY_LABEL, muted = true)
+
+    private val composerHint = wrappedMutedLabel(RunStateCopy.READY_COPY)
+
+    private val composerReadyRow = wrapRow(composerReadyLabel, composerHint)
+
+    // The newest served task view + task-run state tag of the current run:
+    // the strip's retained authority across client-side start transitions
+    // (T07/T08 change without a fresh served snapshot).
+    private var currentRunView: NativeTaskView? = null
+
+    private var currentRunStateTag: String? = null
+
+    // The served proof task state of the current run (`GET
+    // /native/tasks/{id}/proof` -> `task.state`): the ONLY source of the T12
+    // checking state, which the session/task-run view collapses into
+    // `Running`. Null until a successful proof read serves it; a refused read
+    // clears it (a stale checking state is never kept).
+    private var currentProofTaskState: String? = null
+
     // T22: a requested PR finish step blocked by the missing canonical SCM
     // integration surfaces the EXACT copy with one action pointing at the
     // same Diagnostics setup guidance card. Hidden otherwise; PR success is
@@ -674,10 +697,35 @@ class FaktorChatPanel(
         val actions = actionRow(startTaskButton, sendButton, abortButton, taskOptionsButton)
         val composerBody = pageColumn(gap = Spacing.S, padding = 0)
         composerBody.add(focusAccentScroll(input))
+        // T06: the ready guidance appears exactly while the composer is
+        // empty; the listener tracks the real draft (including the clears a
+        // successful send performs), never a mirrored copy of it.
+        input.document.addDocumentListener(object : javax.swing.event.DocumentListener {
+            override fun insertUpdate(event: javax.swing.event.DocumentEvent?) {
+                updateComposerReady()
+            }
+
+            override fun removeUpdate(event: javax.swing.event.DocumentEvent?) {
+                updateComposerReady()
+            }
+
+            override fun changedUpdate(event: javax.swing.event.DocumentEvent?) {
+                // Attribute-only change: the draft text (and the state) is unchanged.
+            }
+        })
+        composerBody.add(composerReadyRow)
+        updateComposerReady()
         composerBody.add(modeRow)
         composerBody.add(actions)
         south.add(card("Ask Faktor", composerBody))
         workPlane.add(south, BorderLayout.SOUTH)
+    }
+
+    /** T06: the ready row shows exactly while the composer holds no draft. */
+    private fun updateComposerReady() {
+        composerReadyRow.isVisible = input.text.trim().isEmpty()
+        composerReadyRow.revalidate()
+        composerReadyRow.repaint()
     }
 
     /**
@@ -1343,6 +1391,10 @@ class FaktorChatPanel(
         // Disable the start surface for the whole flight; the retry click
         // cannot even reach the queue while a start is pending.
         onEdt { setStartControlsEnabled(false) }
+        // T07: the strip follows the start lifecycle immediately (the captured
+        // draft is being admitted once); the next worker refresh re-reads the
+        // served run row.
+        refreshRunSummaryForClientState()
         try {
             runAsync("start task") { runTaskStart(submission) }
         } catch (e: Throwable) {
@@ -1383,6 +1435,7 @@ class FaktorChatPanel(
                 setStartControlsEnabled(true)
                 appendSystem("session changed; the draft is kept")
             }
+            refreshRunSummaryForClientState()
             return
         }
         val draft = submission.draft
@@ -1479,6 +1532,9 @@ class FaktorChatPanel(
                 budgetCostField.text = ""
             }
         }
+        // T07 ends with the result; T08 (the retained submission after a lost
+        // response) renders until the retry resolves the same logical start.
+        refreshRunSummaryForClientState()
         refreshTaskRunsBlocking()
         refreshTaskTreeBlocking()
     }
@@ -2706,7 +2762,7 @@ class FaktorChatPanel(
                 val index = runs.indexOfFirst { it.runId == selectedRunId }
                 if (index >= 0) runsCombo.selectedIndex = index
             }
-            applyRunSummary(views.firstOrNull())
+            applyRunSummary(views.firstOrNull(), runs.firstOrNull()?.state)
         }
     }
 
@@ -2716,26 +2772,67 @@ class FaktorChatPanel(
      * on the requested PR step, the notice (with its setup-guidance action)
      * becomes visible; PR success is never inferred from anything else.
      */
-    private fun applyRunSummary(view: NativeTaskView?) {
-        runSummaryArea.text = runSummaryText(view)
+    private fun applyRunSummary(view: NativeTaskView?, runStateTag: String?) {
+        currentRunView = view
+        currentRunStateTag = runStateTag
+        runSummaryArea.text = runSummaryText(view, runStatusBanner())
         prSetupBody.isVisible = prScmSetupBlocked(view)
         prSetupBody.revalidate()
         prSetupBody.repaint()
     }
 
     /**
-     * The compact run summary strip: only what the daemon actually served —
-     * goal, phase, the candidate boundary (the completion gate's requested
-     * steps), the state and the named steps (plan first, else completion
-     * steps, else milestones). A missing member stays missing; no "-"/"0"
-     * placeholder is ever invented.
+     * The design run-status banner of the strip, in freshness order (see
+     * [runStateViewForRun]): the CLIENT start lifecycle (T07 in flight / T08
+     * response lost) wins over the served task-run state tag (T09 Running /
+     * T11 Blocked awaiting input / T25 Cancelled / T26 Failed); a settled or
+     * awaiting tag wins over the proof's T12 `Checking the change`
+     * (`verifying` / `needs_verification` in the strict proof payload), which
+     * in turn refines the collapsed `Running` tag. Done, Pending and Unknown
+     * carry no design state of their own, so the proof's T12 may fill them in;
+     * otherwise the strip renders its served facts only.
      */
-    private fun runSummaryText(view: NativeTaskView?): String {
-        if (view == null) return "no task run served"
+    private fun runStatusBanner(): RunStateView? =
+        runStateViewForRun(
+            startInFlight.get(),
+            pendingTaskSubmission != null,
+            currentRunStateTag,
+            currentProofTaskState
+        )
+
+    /**
+     * Re-renders the strip from the RETAINED run facts and the current
+     * client start state: T07/T08 change without a fresh served snapshot, so
+     * the strip must follow the start lifecycle immediately (the next
+     * refresh re-reads the served run row).
+     */
+    private fun refreshRunSummaryForClientState() {
+        onEdt {
+            runSummaryArea.text = runSummaryText(currentRunView, runStatusBanner())
+        }
+    }
+
+    /**
+     * The compact run summary strip: only what the daemon actually served —
+     * the design run-status banner first (when a state genuinely applies),
+     * then the goal, phase, the candidate boundary (the completion gate's
+     * requested steps), the state and the named steps (plan first, else
+     * completion steps, else milestones). A missing member stays missing; no
+     * "-"/"0" placeholder is ever invented.
+     */
+    private fun runSummaryText(view: NativeTaskView?, banner: RunStateView?): String {
         val summary = StringBuilder()
         fun line(text: String) {
             if (summary.isNotEmpty()) summary.append('\n')
             summary.append(text)
+        }
+        if (banner != null) {
+            line(banner.label)
+            line(banner.copy)
+        }
+        if (view == null) {
+            line("no task run served")
+            return summary.toString()
         }
         view.goal.takeIf { it.isNotEmpty() }?.let { line("goal: $it") }
         view.phase?.takeIf { it.isNotEmpty() }?.let { line("phase: $it") }
@@ -2997,6 +3094,10 @@ class FaktorChatPanel(
     }
 
     private fun refreshTaskTreeBlocking() {
+        // The session this whole read belongs to: a read that finishes after
+        // a session switch must never write its proof state into the freshly
+        // reset strip.
+        val sessionAtRead = service.currentSessionId()
         val projection = service.projection()
         var taskReadFailure: String? = null
         val task = try {
@@ -3046,6 +3147,10 @@ class FaktorChatPanel(
                 null
             }
         }
+        // T12: the proof's served `task.state` is the ONLY source of the
+        // checking state (the run tag collapses verifying/needs_verification
+        // into `Running`). A refused/absent read clears it — never retained.
+        val proofTaskState = proof?.taskState
         val sessionUsage = try {
             service.sessionUsage()
         } catch (e: Exception) {
@@ -3103,6 +3208,17 @@ class FaktorChatPanel(
             }
             changesPanel.update(changeReviewOf(projection, task, taskVerification, changeUnavailable))
             agentsPanel.update(currentAgents, model)
+            // T12: the proof read may refine the strip's collapsed Running
+            // tag (or be refused, clearing a stale checking state). A read of
+            // a session that is no longer current is dropped, and the strip
+            // is only re-rendered from retained served facts — a reset strip
+            // stays reset. The next applyRunSummary re-reads the state.
+            if (service.currentSessionId() == sessionAtRead) {
+                currentProofTaskState = proofTaskState
+                if (currentRunView != null || currentRunStateTag != null) {
+                    runSummaryArea.text = runSummaryText(currentRunView, runStatusBanner())
+                }
+            }
         }
     }
 
@@ -3665,10 +3781,42 @@ class FaktorChatPanel(
     internal fun approvalAnnouncementsForTest(): List<String> =
         workApprovalCard.announcementsForTest()
 
-    /** Applies one served task view to the current-run strip (T22 smoke). */
-    internal fun applyRunSummaryForTest(view: NativeTaskView?) {
-        onEdtValue { applyRunSummary(view) }
+    /** Applies one served task view + proof task state to the strip (T22/T12 smoke). */
+    internal fun applyRunSummaryForTest(
+        view: NativeTaskView?,
+        runStateTag: String? = null,
+        proofTaskState: String? = null
+    ) {
+        onEdtValue {
+            currentProofTaskState = proofTaskState
+            applyRunSummary(view, runStateTag)
+        }
     }
+
+    /** The run-status banner the strip currently renders (null = none). */
+    internal fun runStatusBannerForTest(): RunStateView? = onEdtValue { runStatusBanner() }
+
+    /**
+     * T06: the ready label + exact guidance copy while the composer holds no
+     * draft; null once a draft exists (the ready state is the empty composer).
+     */
+    internal fun composerReadyForTest(): Pair<String, String>? =
+        if (composerReadyRow.isVisible) {
+            Pair(composerReadyLabel.fullText, composerHint.fullText)
+        } else {
+            null
+        }
+
+    /**
+     * The EXISTING controls the design run-state actions point at (labels as
+     * rendered). No design action ever mints a new button.
+     */
+    internal fun actionControlsForTest(): Map<String, String> = mapOf(
+        "runTask" to startTaskButton.text,
+        "stopRun" to cancelRunButton.text,
+        "inspect" to inspectRunsButton.text,
+        "newSession" to newSessionButton.text
+    )
 
     internal fun prSetupNoticeVisibleForTest(): Boolean = prSetupBody.isVisible
 
@@ -3887,6 +4035,9 @@ class FaktorChatPanel(
             agentsPanel.update(emptyList(), null)
             // The run summary strip is session-owned: a stale run summary must
             // never look like it belongs to the newly opened session.
+            currentRunView = null
+            currentRunStateTag = null
+            currentProofTaskState = null
             runSummaryArea.text = ""
             prSetupBody.isVisible = false
             // Session-scoped identities and tracked targets never cross a

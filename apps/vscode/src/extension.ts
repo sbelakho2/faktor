@@ -1283,6 +1283,7 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
     sessionsUnavailable: null,
     runs: [],
     activeRunId: null,
+    proofTaskState: null,
     agents: [],
     permissions: [],
     task: null,
@@ -1789,6 +1790,10 @@ async function refresh(): Promise<void> {
       machineState: projectionValue?.state.machine ?? store.snapshot().machineState,
       machineLabel: projectionValue?.state.label ?? store.snapshot().machineLabel,
       task,
+      // T12's only served source: the proof body's own embedded task state
+      // (`verifying` / `needs_verification`). Absent/unreadable proof => null;
+      // it is never inferred from the collapsed session tag.
+      proofTaskState: proofRead.proof?.task?.state ?? null,
       verification: verificationView,
       usage: usageView,
       agents: agentSummaries,
@@ -2477,19 +2482,20 @@ async function startTask(
     // 5xx, 408/429, or the daemon's "submission id still in flight" 409)
     // keeps the logical submission retryable under the SAME submission id;
     // an explicit 4xx refusal ends it.
-    taskStartGate.settle(
-      submissionId,
-      submissionRetryable(failure) ? 'transport' : 'refused',
-    );
+    const retryable = submissionRetryable(failure);
+    taskStartGate.settle(submissionId, retryable ? 'transport' : 'refused');
     // NEVER clear before acceptance: the restore callback carries the
-    // original text back to the composer and rebuilds the draft.
-    chatProvider?.postSendMessageFailed(enriched, failure.message);
+    // original text back to the composer and rebuilds the draft. The
+    // retryable classification rides along so the composer shows T08
+    // `Start response unavailable` only when the retry is the SAME logical
+    // submission.
+    chatProvider?.postSendMessageFailed(enriched, failure.message, retryable);
   };
   const refuse = (message: string, enriched: PendingSubmission): void => {
     pendingSubmissionRetainer.retain(enriched);
     reportError(new Error(message), 'run_failure');
     taskStartGate.settle(submissionId, 'refused');
-    chatProvider?.postSendMessageFailed(enriched, message);
+    chatProvider?.postSendMessageFailed(enriched, message, false);
   };
   try {
     if (!active.client || !active.sessionId) {
@@ -2613,6 +2619,7 @@ async function startTask(
     chatProvider?.postSendMessageFailed(
       pending,
       error instanceof Error ? error.message : String(error),
+      true,
     );
   }
 }
