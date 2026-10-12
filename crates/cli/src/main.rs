@@ -3225,6 +3225,16 @@ pub(crate) async fn sessions(data_dir: PathBuf) {
 pub mod daemon;
 pub use daemon::*;
 
+/// The bin test target's attributed live-byte cap (CI pipeline 48 was
+/// OOM-killed with no attribution). Test-only: the production binary and
+/// the library keep the system allocator.
+#[cfg(test)]
+mod test_memory_guard;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_MEMORY_GUARD: test_memory_guard::GuardedAllocator = test_memory_guard::GuardedAllocator;
+
 #[cfg(test)]
 mod main_serve_tests;
 
