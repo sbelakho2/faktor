@@ -288,7 +288,7 @@ fun resolveChangeBasis(model: ChangeReviewModel, rowIndex: Int?): BasisResolutio
                 "the served source diff evidence \"${bound(raw, 120)}\" is not a valid evidence id"
             )
         val display = basis.candidateLabel ?: "candidate"
-        return BasisResolution.Single(parsed, "$display — source diff — evidence #$parsed (immutable)")
+        return BasisResolution.Single(parsed, "$display — source diff — evidence $parsed (immutable)")
     }
     val row = model.rows.getOrNull(rowIndex ?: -1)
     if (row != null) {
@@ -297,11 +297,11 @@ fun resolveChangeBasis(model: ChangeReviewModel, rowIndex: Int?): BasisResolutio
             return BasisResolution.Pair(
                 ids[0],
                 ids[1],
-                "${row.path} — evidence #${ids[0]} \u2194 evidence #${ids[1]} (immutable)"
+                "${row.path} — evidence ${ids[0]} \u2194 evidence ${ids[1]} (immutable)"
             )
         }
         if (ids.size == 1) {
-            return BasisResolution.Single(ids[0], "${row.path} — evidence #${ids[0]} (immutable)")
+            return BasisResolution.Single(ids[0], "${row.path} — evidence ${ids[0]} (immutable)")
         }
     }
     return BasisResolution.Unavailable
@@ -349,18 +349,18 @@ class ChangeReviewController(
         val retrieval = try {
             retrieve(evidenceId)
         } catch (e: NativeApiException) {
-            lastRefusal = "evidence #$evidenceId refused (status ${e.status} ${e.code}: ${e.detail})"
+            lastRefusal = "evidence $evidenceId refused (status ${e.status} ${e.code}: ${e.detail})"
             return null
         } catch (e: NativeProtocolException) {
-            lastRefusal = "evidence #$evidenceId refused: ${e.detail}"
+            lastRefusal = "evidence $evidenceId refused: ${e.detail}"
             return null
         } catch (e: Exception) {
-            lastRefusal = "evidence #$evidenceId read failed: ${e.message ?: e.javaClass.simpleName}"
+            lastRefusal = "evidence $evidenceId read failed: ${e.message ?: e.javaClass.simpleName}"
             return null
         }
         if (retrieval.id != evidenceId) {
             lastRefusal =
-                "evidence #$evidenceId refused: the runtime answered with evidence #${retrieval.id} " +
+                "evidence $evidenceId refused: the runtime answered with evidence ${retrieval.id} " +
                     "(a foreign artifact is never opened as this run's basis)"
             return null
         }
@@ -391,7 +391,7 @@ fun basisConflictFacts(previous: ChangeReviewModel?, current: ChangeReviewModel)
     }
     if (previous == null || previous.unavailable != null) {
         val basis = current.basis
-        val basisText = basis?.sourceDiffEvidenceId?.let { "source diff evidence #$it" }
+        val basisText = basis?.sourceDiffEvidenceId?.let { "source diff evidence $it" }
             ?: "no served source diff evidence"
         return listOf(
             "no prior served basis was captured; the current basis is $basisText " +
@@ -424,7 +424,7 @@ fun basisConflictFacts(previous: ChangeReviewModel?, current: ChangeReviewModel)
     }
     if (facts.isEmpty()) {
         val basis = current.basis
-        val basisText = basis?.sourceDiffEvidenceId?.let { "source diff evidence #$it" }
+        val basisText = basis?.sourceDiffEvidenceId?.let { "source diff evidence $it" }
             ?: "no served source diff evidence"
         facts.add("the served basis is unchanged: $basisText, ${plural(current.rows.size, "change")}")
     }

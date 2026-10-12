@@ -1810,6 +1810,26 @@ mod tests {
         assert!(live >= 6, "concurrent commits landed: {live}");
     }
 
+    /// Pin one fixture file's mtime. `doctor_probe` re-verifies the NEWEST
+    /// restore point and `list_backups` orders mtime-first (the monotonic name
+    /// sequence only breaks ties); a coarse/frozen-timestamp filesystem — the
+    /// emulated trusted lane can report every write of one test within a
+    /// single tick, and a clock step can invert freely — would otherwise let
+    /// a hand-written fixture name lose the ordering to the production-named
+    /// truthful point, so the newest-point claim under test would silently
+    /// stop holding. Pinning makes the fixture's ordering an explicit,
+    /// filesystem-independent observable condition; the tolerance is the
+    /// 10s spacing the caller applies, orders of magnitude beyond any real
+    /// filesystem timestamp granularity (<= 1s).
+    fn pin_mtime(point: &Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(point)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
     /// F11: `doctor_probe` re-verifies the newest restore point and reports a
     /// typed issue for missing-while-required, mislabeled and unopenable
     /// points (the CLI turns the issue into a loud line naming the database).
@@ -1822,6 +1842,13 @@ mod tests {
             .unwrap();
         require_migration_restore_point(&conn).unwrap();
 
+        // Explicit fixture clock (past, strictly spaced): each bad point below
+        // is pinned to be provably newer than every earlier point, so "doctor
+        // verifies the newest point" holds on any filesystem timestamp
+        // granularity or clock behavior under load.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let step = |i: u64| base + std::time::Duration::from_secs(10 * i);
+
         // Missing while the recorded policy requires one.
         let report = doctor_probe(&path, false).unwrap();
         let issue = report
@@ -1831,7 +1858,8 @@ mod tests {
 
         // A truthful pre-migration point verifies: content matches the claim.
         conn.execute_batch("PRAGMA user_version = 4").unwrap();
-        migration_backup(&conn, &path, 4).unwrap();
+        let truthful = migration_backup(&conn, &path, 4).unwrap();
+        pin_mtime(&truthful, step(1));
         let report = doctor_probe(&path, false).unwrap();
         assert_eq!(report.migration_restore_point_issue, None);
         assert_eq!(report.user_version, 4);
@@ -1840,6 +1868,12 @@ mod tests {
         // mislabeled and must fail verification.
         let mislabeled = backup_dir(&path).join("control-plane-pre-migration-v2-1-1.db");
         backup_to(&conn, &mislabeled).unwrap();
+        pin_mtime(&mislabeled, step(2));
+        assert_eq!(
+            latest_migration_backup(&path).unwrap().0,
+            mislabeled,
+            "fixture precondition: the mislabeled point is the newest"
+        );
         let report = doctor_probe(&path, false).unwrap();
         let issue = report
             .migration_restore_point_issue
@@ -1854,6 +1888,12 @@ mod tests {
                 .execute_batch("CREATE TABLE f (id TEXT PRIMARY KEY); PRAGMA user_version = 99;")
                 .unwrap();
         }
+        pin_mtime(&future, step(3));
+        assert_eq!(
+            latest_migration_backup(&path).unwrap().0,
+            future,
+            "fixture precondition: the future point is the newest"
+        );
         let report = doctor_probe(&path, false).unwrap();
         let issue = report
             .migration_restore_point_issue
@@ -1861,11 +1901,14 @@ mod tests {
         assert!(issue.contains("newer than the live schema"), "{issue}");
 
         // A corrupt point is unverifiable.
-        std::fs::write(
-            backup_dir(&path).join("control-plane-pre-migration-v1-1-2.db"),
-            b"not a database",
-        )
-        .unwrap();
+        let corrupt = backup_dir(&path).join("control-plane-pre-migration-v1-1-2.db");
+        std::fs::write(&corrupt, b"not a database").unwrap();
+        pin_mtime(&corrupt, step(4));
+        assert_eq!(
+            latest_migration_backup(&path).unwrap().0,
+            corrupt,
+            "fixture precondition: the corrupt point is the newest"
+        );
         let report = doctor_probe(&path, false).unwrap();
         let issue = report
             .migration_restore_point_issue
@@ -1874,5 +1917,41 @@ mod tests {
             issue.contains("integrity check failed") || issue.contains("cannot be reopened"),
             "{issue}"
         );
+    }
+
+    /// ADVERSARIAL (coarse/frozen-timestamp filesystem): when every point in
+    /// the directory shares ONE mtime tick, the doctor must fall back to the
+    /// monotonic production name sequence — verify the point the sequence
+    /// marks as newest, never silently accept an older truthful point — and a
+    /// sequence-newest MISLABELED point must still be flagged.
+    #[test]
+    fn doctor_flags_the_sequence_newest_bad_point_on_equal_mtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        let conn = open_db(&path);
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY); PRAGMA user_version = 4;")
+            .unwrap();
+        let truthful = migration_backup(&conn, &path, 4).unwrap();
+        let (ms, pid, seq) = backup_name_sequence(truthful.file_name().unwrap().to_str().unwrap());
+        // Production-shaped successor name: same ms/pid, far-ahead sequence.
+        let mislabeled = backup_dir(&path).join(format!(
+            "control-plane-pre-migration-v2-{ms}-{pid}-{}.db",
+            seq + 1_000
+        ));
+        backup_to(&conn, &mislabeled).unwrap();
+        let frozen = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for entry in std::fs::read_dir(backup_dir(&path)).unwrap().flatten() {
+            pin_mtime(&entry.path(), frozen);
+        }
+        assert_eq!(
+            latest_migration_backup(&path).unwrap().0,
+            mislabeled,
+            "equal mtimes: the monotonic name sequence names the newest point"
+        );
+        let report = doctor_probe(&path, false).unwrap();
+        let issue = report
+            .migration_restore_point_issue
+            .expect("the sequence-newest mislabeled point must be verified, not skipped");
+        assert!(issue.contains("mislabeled"), "{issue}");
     }
 }

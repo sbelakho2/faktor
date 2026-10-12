@@ -11,6 +11,7 @@
   "categories": [
     "Other"
   ],
+  "icon": "media/faktor-icon.png",
   "activationEvents": [
     "onCommand:faktor.startServer",
     "onCommand:faktor.stopServer",
@@ -185,7 +186,12 @@
             "minimum": 1000,
             "scope": "machine",
             "description": "How long to wait for the daemon startup line before failing (must exceed the bootstrap launcher's ~30 s launch window)."
-          },
+          }
+        }
+      },
+      {
+        "title": "Faktor: Control Plane",
+        "properties": {
           "faktor.controlPlaneEndpoint": {
             "type": "string",
             "default": "",

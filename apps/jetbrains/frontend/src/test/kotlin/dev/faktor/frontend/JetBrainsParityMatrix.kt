@@ -29,6 +29,7 @@ package dev.faktor.frontend
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeBillingTaskUsage
+import dev.faktor.shared.NativeCandidateProof
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeCreditBalance
 import dev.faktor.shared.NativeMessage
@@ -855,8 +856,37 @@ internal object ParityMatrix {
                 canned = {
                     // Observable: rows derive from served relationships only;
                     // the immutable basis resolves to the served source diff;
-                    // navigation is bounded; the exact I03 copy renders.
-                    val verification = parseNativeTaskVerification(PARITY_CRITERION_PROOF_JSON)
+                    // navigation is bounded; the exact I03 copy renders. The
+                    // served record is DERIVED here (the pinned fixture stays
+                    // byte-identical for the visual digest).
+                    val pinned = parseNativeTaskVerification(PARITY_CRITERION_PROOF_JSON)
+                    val pinnedRecord = pinned.records[0]
+                    val servedRecord = pinnedRecord.copy(
+                        changedFiles = listOf("src/a.rs"),
+                        candidateProof = NativeCandidateProof(
+                            taskRevision = null,
+                            baseManifestHash = null,
+                            candidateManifestHash = null,
+                            sourceDiffEvidence = "evidence:41",
+                            riskReportEvidence = null,
+                            accountingSnapshotDigest = null,
+                            runId = "run-9",
+                            runBaseSnapshot = null,
+                            candidateSnapshot = "tm1:cand",
+                            sourcesDigest = null,
+                            changedFilesDigest = "cf-1",
+                            publishedCommit = null,
+                            remotePrHead = null
+                        ),
+                        criteria = pinnedRecord.criteria.map { criterion ->
+                            if (criterion.criterionKey == "file criterion") {
+                                criterion.copy(evidence = "file:src/a.rs;evidence:41")
+                            } else {
+                                criterion
+                            }
+                        }
+                    )
+                    val verification = pinned.copy(records = listOf(servedRecord))
                     val task = parseNativeTaskViews(PARITY_TASK_JSON)[0]
                         .copy(changedFiles = listOf("src/a.rs", "src/b.kt"))
                     val model = changeReviewOf(null, task, verification)
@@ -873,7 +903,7 @@ internal object ParityMatrix {
                     val resolved = resolveChangeBasis(model, 0)
                     assertTrue(resolved is BasisResolution.Single, "served source diff first")
                     assertEquals(
-                        "candidate tm1:cand — source diff — evidence #41 (immutable)",
+                        "candidate tm1:cand — source diff — evidence 41 (immutable)",
                         (resolved as BasisResolution.Single).title
                     )
                     val panel = ChangesPanel()
@@ -1676,6 +1706,20 @@ internal fun cannedHistoryPanel(): HistoryPanel {
     return panel
 }
 
+/** The History conversations surface (the "conversations" host matrix entry). */
+internal fun cannedConversationsPanel(): HistoryPanel = cannedHistoryPanel()
+
+/** A populated outcomes ledger page (the "outcomes" host matrix entry). */
+internal fun cannedOutcomesPanel(): OutcomesPanel {
+    val panel = OutcomesPanel()
+    panel.setModel(
+        outcomesPanelModelOf(
+            parseProtocolOutcomesPage(JsonCodec.parse(PARITY_OUTCOMES_PAGE_JSON).view("outcomes"))
+        )
+    )
+    return panel
+}
+
 /** A populated agent roster with the served ownership/model/budget fields. */
 internal fun cannedAgentsPanel(): AgentsPanel {
     val panel = AgentsPanel()
@@ -1852,8 +1896,7 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
     "\"binding\":{\"kind\":\"integration_coverage\"," +
     "\"required_work_items\":[\"impl-a\",\"impl-b\"]}," +
     "\"origin\":\"project_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
-    "{\"criterionKey\":\"file criterion\",\"passed\":true," +
-    "\"evidence\":\"file:src/a.rs;evidence:41\"," +
+    "{\"criterionKey\":\"file criterion\",\"passed\":true,\"evidence\":\"file:src/a.rs\"," +
     "\"binding\":{\"kind\":\"file_state\",\"path\":\"src/a.rs\"," +
     "\"expected_digest\":\"digest-file\"}," +
     "\"origin\":\"verification_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
@@ -1874,10 +1917,8 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
     "{\"criterionKey\":\"legacy criterion\",\"passed\":true," +
     "\"evidence\":\"file:src/legacy.rs\"}" +
     "]," +
-    "\"checks\":[],\"changedFiles\":[{\"path\":\"src/a.rs\"}],\"unrelatedChanges\":[],\"reviewer\":null," +
-    "\"status\":\"passed\",\"startedMs\":11,\"completedMs\":22," +
-    "\"candidateProof\":{\"runId\":\"run-9\",\"candidateSnapshot\":\"tm1:cand\"," +
-    "\"sourceDiffEvidence\":\"evidence:41\",\"changedFilesDigest\":\"cf-1\"}" +
+    "\"checks\":[],\"changedFiles\":[],\"unrelatedChanges\":[],\"reviewer\":null," +
+    "\"status\":\"passed\",\"startedMs\":11,\"completedMs\":22" +
     "}]}"
 
 /**

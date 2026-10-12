@@ -182,7 +182,9 @@ object JetBrainsHostMatrixSmoke {
         "diagnostics" to { cannedDiagnosticsPanel() },
         "usage" to { cannedUsagePanel() },
         "settings" to { cannedSettingsPanel() },
-        "history" to { cannedHistoryPanel() }
+        "history" to { cannedHistoryPanel() },
+        "conversations" to { cannedConversationsPanel() },
+        "outcomes" to { cannedOutcomesPanel() }
     )
 
     @JvmStatic
@@ -554,7 +556,9 @@ object JetBrainsHostMatrixSmoke {
             "diagnostics" to { cannedDiagnosticsPanel() },
             "usage" to { cannedUsagePanel() },
             "settings" to { cannedSettingsPanel() },
-            "history" to { cannedHistoryPanel() }
+            "history" to { cannedHistoryPanel() },
+            "conversations" to { cannedConversationsPanel() },
+            "outcomes" to { cannedOutcomesPanel() }
         )
         for ((name, factory) in affected) {
             for (width in WIDTHS) {

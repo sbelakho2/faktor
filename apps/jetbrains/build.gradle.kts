@@ -64,6 +64,15 @@ subprojects {
         jvmToolchain(17)
         compilerOptions {
             jvmDefault.set(org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.NO_COMPATIBILITY)
+            // The host-matrix harness compiles the SAME Kotlin sources with
+            // kotlinc's default module name (`main`), so `internal` members
+            // get the `$main` JVM suffix. The Gradle default
+            // (`$dev_faktor_frontend`) made every internal test hook
+            // unresolvable when the matrix ran against the SHIPPED plugin
+            // JAR (NoSuchMethodError setContractFieldsForTest$main). Matching
+            // the module name keeps the shipped artifact and the harness in
+            // agreement.
+            moduleName.set("main")
         }
     }
 
