@@ -786,21 +786,50 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn overall_deadline_bounds_slow_stream() {
-        let dl = StreamDeadlines {
-            first_byte_ms: 10_000,
-            idle_ms: 500,
-            overall_ms: 300,
+        // Load-aware (same-run control), the same class as the adversarial
+        // `guarded_lines_overall_deadline_and_dead_state`: a fixed
+        // wall-clock bound races timer coalescing on a loaded host (one
+        // starved wake can service the pace and the overall timers
+        // together, and the biased select then reports `overall` before any
+        // line). The first item is immediate so liveness never rests on a
+        // single timer service; the overall bound is projected from this
+        // run's measured service of a nominal 80 ms pace sleep:
+        // max(300 ms floor, 8x measured), capped at the documented 60 s
+        // ceiling. The teeth are unchanged: the overall deadline still
+        // terminates the pacing stream and the typed `overall` error is
+        // asserted.
+        const NOMINAL_PACE_MS: u64 = 80;
+        const FLOOR_OVERALL_MS: u64 = 300;
+        const CEILING_MS: u64 = 60_000;
+        let control_ms = {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(NOMINAL_PACE_MS)).await;
+            start.elapsed().as_millis() as u64
         };
-        let lines = futures::stream::unfold(0u32, |i| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let pace_ms = control_ms.max(NOMINAL_PACE_MS);
+        let overall_ms = FLOOR_OVERALL_MS
+            .max(pace_ms.saturating_mul(8))
+            .min(CEILING_MS);
+        let dl = StreamDeadlines {
+            first_byte_ms: overall_ms.saturating_add(60_000),
+            idle_ms: overall_ms.saturating_add(60_000),
+            overall_ms,
+        };
+        let lines = futures::stream::unfold(0u32, move |i| async move {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pace_ms)).await;
+            }
             Some((Ok::<String, ProviderError>(format!("item {i}")), i + 1))
         });
         let mut s = Box::pin(guarded_lines(lines, dl, None));
         let mut items = 0usize;
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
-                .await
-                .expect("overall deadline must terminate")
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(overall_ms.saturating_add(5_000)),
+                s.next(),
+            )
+            .await
+            .expect("overall deadline must terminate")
             {
                 Some(Ok(_)) => items += 1,
                 Some(Err(e)) => {

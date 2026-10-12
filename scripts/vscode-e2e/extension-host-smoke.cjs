@@ -80,8 +80,11 @@ const matrix = {
   errors: [],
 };
 
+let finalVerdict = false;
+
 function writeEvidence(status, error) {
   if (!evidencePath) return;
+  if (status === 'passed' || status === 'failed') finalVerdict = true;
   const record = {
     schema: 'faktor-vscode-e2e-evidence/v2',
     status,
@@ -91,8 +94,33 @@ function writeEvidence(status, error) {
     matrix,
     wrote_at: new Date().toISOString(),
   };
+  fs.mkdirSync(path.dirname(evidencePath), { recursive: true });
   fs.writeFileSync(evidencePath, `${JSON.stringify(record, null, 2)}\n`);
 }
+
+// A host that dies mid-run must still leave the harness a record and must
+// never look like a pass: the lane fails every non-`passed` status. Write a
+// `running` marker as soon as this module is live, and turn a stray uncaught
+// error into a recorded failure instead of a host exit with no file. Once a
+// final verdict is recorded, shutdown-time noise (the workbench tears the
+// extension host down after the run and the extension's own `deactivate` can
+// throw a typed `Canceled` from a disposed webview) must NOT overwrite it:
+// the runner owns the exit code from then on.
+const fatal = (kind, error) => {
+  if (finalVerdict) {
+    console.error(`post-verdict ${kind} after the recorded verdict (ignored):`, error);
+    return;
+  }
+  try {
+    writeEvidence('failed', error);
+  } catch {
+    /* the evidence write itself failed; the console line below is the last resort */
+  }
+  console.error(`FATAL ${kind} in the extension-host test module:`, error);
+  process.exit(1);
+};
+process.on('uncaughtException', (error) => fatal('uncaught exception', error));
+process.on('unhandledRejection', (error) => fatal('unhandled rejection', error));
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -951,6 +979,7 @@ async function measureDisposalReopen(vscode, extensionUri, ChatViewProvider, sin
 }
 
 exports.run = async function run() {
+  writeEvidence('running', null);
   try {
     const vscode = require('vscode');
 

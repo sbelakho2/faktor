@@ -31,11 +31,16 @@
 #     are unavailable headlessly; the record names the strongest substitute
 #     that ran for each.
 #
-# Headless mechanics: the desktop VS Code workbench needs a display; on a
-# headless runner the script launches Electron with `--ozone-platform=headless
-# --disable-gpu` (plus `--headless`, which Chromium itself receives) so the
-# extension host runs without X. Running as root (`id -u` = 0) adds
-# `--no-sandbox` (Electron refuses to start as root otherwise).
+# Headless mechanics: the desktop VS Code workbench needs a display. When
+# `xvfb-run`/`Xvfb` are available (the pinned playwright image ships both)
+# every cell runs under a real Xvfb X display; otherwise Electron falls back
+# to `--ozone-platform=headless --headless --disable-gpu` (no X). Running as
+# root (`id -u` = 0) adds `--no-sandbox` (Electron refuses to start as root
+# otherwise). FAKTOR_VSCODE_E2E_XVFB=0 forces the headless-ozone fallback.
+# A cell that exits without evidence NEVER passes: the harness captures the
+# host stdout/stderr tail, the newest VS Code main/renderer/extension-host
+# log lines and any crash dumps into $cell_dir/failure-diagnostic.txt and
+# fails the lane with that diagnostic folded into the reason.
 #
 # PIN PROVENANCE (recorded 2026-10-02):
 #   curl https://update.code.visualstudio.com/api/update/linux-x64/stable/1.140.0
@@ -86,6 +91,14 @@ KEEP=0
 SELFTEST=0
 PRINT_PIN=0
 NO_SANDBOX=0
+# Real-X preference (see the headless mechanics note above): use Xvfb when it
+# is present unless explicitly disabled. The display transport is the only
+# difference; every matrix capability is asserted exactly as before.
+if [ "${FAKTOR_VSCODE_E2E_XVFB:-1}" = "1" ] && command -v xvfb-run >/dev/null 2>&1 && command -v Xvfb >/dev/null 2>&1; then
+  USE_XVFB=1
+else
+  USE_XVFB=0
+fi
 
 TARBALL_SOURCE="${FAKTOR_VSCODE_TARBALL:-}"
 EXPECTED_SHA="${FAKTOR_VSCODE_SHA256:-$VSCODE_SHA256}"
@@ -335,7 +348,13 @@ run_cli_checks() {
 
 # --------------------------------------------------------------- host launch
 host_launch_args() {
-  local args="--wait --headless --disable-gpu --ozone-platform=headless --disable-dev-shm-usage"
+  local args
+  if [ "$USE_XVFB" -eq 1 ]; then
+    # Xvfb provides the display; do not force Chromium's headless platform.
+    args="--wait --disable-gpu --disable-dev-shm-usage"
+  else
+    args="--wait --headless --disable-gpu --ozone-platform=headless --disable-dev-shm-usage"
+  fi
   if [ "$NO_SANDBOX" -eq 1 ] || [ "$(id -u)" -eq 0 ]; then
     args="$args --no-sandbox"
   fi
@@ -352,6 +371,39 @@ reap_cell() { # workdir
     [ "$pid" = "$$" ] && continue
     kill -9 "$pid" 2>/dev/null || true
   done
+}
+
+sanitize_one_line() { tr '\r\n' '  ' | tr -s ' ' | cut -c1-400; }
+
+# A host that exits without evidence must name its own cause. Capture rc, the
+# host stdout/stderr tail, the newest VS Code main/renderer/extension-host
+# logs and any crash dumps into $cell_dir/failure-diagnostic.txt (kept on
+# failure), and fold a bounded one-line summary into the lane reason. The
+# no-silent-pass rule is unchanged: this branch always fails the lane.
+host_failure_diagnostic() { # cell_dir rc
+  local cell_dir="$1" rc="$2" diag_file="$cell_dir/failure-diagnostic.txt" log_dir tail_line
+  {
+    echo "host rc=$rc (124/137 = timeout/kill; 0 without evidence = the host exited before the test module recorded any result)"
+    echo "--- stdout.log tail"
+    tail -n 40 "$cell_dir/stdout.log" 2>/dev/null || echo "(no stdout.log)"
+    log_dir="$(find "$cell_dir/user-data/logs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
+    if [ -n "$log_dir" ]; then
+      for f in main.log "window1/renderer.log" "window1/exthost.log" exthost.log; do
+        [ -f "$log_dir/$f" ] || continue
+        echo "--- $f tail"
+        tail -n 25 "$log_dir/$f"
+      done
+    else
+      echo "--- no VS Code logs under $cell_dir/user-data/logs"
+    fi
+    if [ -d "$cell_dir/user-data/crashdumps" ]; then
+      echo "--- crashdumps"
+      ls -l "$cell_dir/user-data/crashdumps" 2>/dev/null
+    fi
+  } >"$diag_file" 2>&1
+  tail_line="$(tail -n 25 "$cell_dir/stdout.log" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 3 | sanitize_one_line)"
+  [ -n "$tail_line" ] || tail_line="(host stdout empty)"
+  printf 'diagnostic=%s host-tail=%s' "$diag_file" "$tail_line"
 }
 
 run_extension_host() {
@@ -379,7 +431,8 @@ run_extension_host() {
   for spec in "${MATRIX_CELLS[@]}"; do
     IFS=: read -r cell dpr mode <<<"$spec"
     local cell_dir="$WORK_DIR/host-$cell"
-    mkdir -p "$cell_dir/user-data" "$cell_dir/extensions"
+    mkdir -p "$cell_dir/user-data" "$cell_dir/extensions" || fail "evidence-dir-unwritable: cell=$cell dir=$cell_dir"
+    [ -w "$cell_dir" ] || fail "evidence-dir-unwritable: cell=$cell dir=$cell_dir"
     local evidence="$cell_dir/evidence.json"
     rm -f "$evidence"
     local cdp_port
@@ -393,7 +446,14 @@ run_extension_host() {
     if [ "$dpr" != "1" ]; then
       args+=(--force-device-scale-factor="$dpr")
     fi
-    echo "vscode-e2e: cell $cell (mode=$mode dpr=$dpr cdp=$cdp_port) launching pinned Extension Host ($VSCODE_VERSION)" >&2
+    local display="ozone-headless"
+    [ "$USE_XVFB" -eq 1 ] && display="xvfb"
+    echo "vscode-e2e: cell $cell (mode=$mode dpr=$dpr cdp=$cdp_port display=$display) launching pinned Extension Host ($VSCODE_VERSION)" >&2
+
+    local -a timeout_cmd=(timeout -k 15 "$HOST_TIMEOUT")
+    if [ "$USE_XVFB" -eq 1 ]; then
+      timeout_cmd=(timeout -k 15 "$HOST_TIMEOUT" xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp")
+    fi
 
     local rc
     FAKTOR_VSCODE_E2E_EVIDENCE="$evidence" \
@@ -404,7 +464,7 @@ run_extension_host() {
       FAKTOR_VSCODE_E2E_CELL="$cell" \
       FAKTOR_VSCODE_E2E_EXPECT_DPR="$dpr" \
       FAKTOR_VSCODE_E2E_PACKAGE_MODE="$HOST_PACKAGE_MODE" \
-      timeout -k 15 "$HOST_TIMEOUT" "$CODE_BIN" "${args[@]}" \
+      "${timeout_cmd[@]}" "$CODE_BIN" "${args[@]}" \
       --user-data-dir "$cell_dir/user-data" \
       --extensions-dir "$cell_dir/extensions" \
       --extensionDevelopmentPath="$host_dir" \
@@ -413,7 +473,11 @@ run_extension_host() {
 
     if [ ! -s "$evidence" ]; then
       reap_cell "$cell_dir/user-data"
-      fail "extension-host-no-evidence: cell=$cell host rc=$rc and no evidence at $evidence (no silent pass)"
+      local host_diag
+      host_diag="$(host_failure_diagnostic "$cell_dir" "$rc")"
+      echo "vscode-e2e: cell $cell host failure diagnostic ($cell_dir/failure-diagnostic.txt):" >&2
+      sed -n '1,80p' "$cell_dir/failure-diagnostic.txt" >&2 2>/dev/null || true
+      fail "extension-host-no-evidence: cell=$cell host rc=$rc and no evidence at $evidence $host_diag (no silent pass)"
     fi
     local cell_status
     cell_status="$(node -e '
@@ -421,7 +485,8 @@ run_extension_host() {
       const e = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       const bad = (e.checks || []).filter((c) => !c.ok).map((c) => c.name);
       if (e.status !== "passed" || bad.length > 0) {
-        console.error("cell " + process.argv[2] + ": status=" + e.status + " failed=" + bad.join(","));
+        const err = e.error ? " error=" + String(e.error).split("\n")[0].slice(0, 300) : "";
+        console.error("cell " + process.argv[2] + ": status=" + e.status + " failed=" + bad.join(",") + err);
         process.exit(1);
       }
       process.stdout.write("ok");
@@ -509,6 +574,10 @@ args="$*"
 case "$args" in
 *--extensionTestsPath*)
   if [ "${FAKE_CODE_NO_EVIDENCE:-0}" = 1 ]; then exit 0; fi
+  if [ "${FAKE_CODE_RUNNING:-0}" = 1 ]; then
+    printf '{"status":"running","checks":[],"error":""}\n' >"${FAKTOR_VSCODE_E2E_EVIDENCE:?}"
+    exit 0
+  fi
   ext_dir=""
   prev=""
   for a in "$@"; do
@@ -597,6 +666,19 @@ selftest() {
   rc=$?
   check "missing host evidence fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
   check "missing evidence reason" "$(printf '%s' "$(reason_of "$out")" | grep -q '^extension-host-no-evidence' && echo 0 || echo 1)"
+  check "missing evidence captures diagnostic" "$(printf '%s' "$(reason_of "$out")" | grep -q 'failure-diagnostic.txt' && echo 0 || echo 1)"
+  check "missing evidence diagnostic file written" "$([ -s "$tmp/work-noev/host-full/failure-diagnostic.txt" ] && echo 0 || echo 1)"
+
+  # 3b. a host that starts the test module and dies before a verdict
+  #     ('running' evidence) fails the lane as well: the start marker is
+  #     diagnostics, never a silent pass.
+  out="$tmp/running.json"
+  FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" FAKE_CODE_RUNNING=1 \
+    bash "$SELF" --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-running" \
+    >"$tmp/running.stdout" 2>"$tmp/running.stderr"
+  rc=$?
+  check "running evidence fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "running evidence reason" "$(printf '%s' "$(reason_of "$out")" | grep -q 'extension-host-checks-failed.*status=running' && echo 0 || echo 1)"
 
   # 4. a failing host check fails the lane
   out="$tmp/failed-check.json"
@@ -631,7 +713,9 @@ selftest() {
   check "extension-host-smoke.cjs parses" "$?"
 
   # 8. --vsix packaged mode extracts the archive and runs the host matrix from
-  #    that tree (never silently from the dev checkout).
+  #    that tree (never silently from the dev checkout). The pinned CI image
+  #    ships no `unzip`, so when it is absent the case asserts the typed
+  #    fail-closed refusal instead of a silent downgrade.
   if command -v zip >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
     mkdir -p "$tmp/vsix-src/extension/out" "$tmp/vsix-src/extension/media"
     printf '{"name":"faktor","publisher":"faktor"}\n' >"$tmp/vsix-src/extension/package.json"
@@ -642,14 +726,24 @@ selftest() {
     else
       (cd "$tmp/vsix-src" && python3 -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); [z.write(p) for p in ["extension/package.json","extension/out/extension.js","extension/media/chat.css"]]; z.close()' "$tmp/fake.vsix")
     fi
-    out="$tmp/vsix.json"
-    FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
-      bash "$SELF" --vsix "$tmp/fake.vsix" --keep --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-vsix" \
-      >"$tmp/vsix.stdout" 2>"$tmp/vsix.stderr"
-    rc=$?
-    check "packaged vsix mode passes" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
-    check "packaged vsix mode recorded" "$(node -e 'process.exit(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).mode==="extension-host-vsix"?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
-    check "packaged vsix host used extracted tree" "$(grep -q 'vsix-extracted' "$tmp/work-vsix/host-full/evidence.json" && echo 0 || echo 1)"
+    if command -v unzip >/dev/null 2>&1; then
+      out="$tmp/vsix.json"
+      FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
+        bash "$SELF" --vsix "$tmp/fake.vsix" --keep --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-vsix" \
+        >"$tmp/vsix.stdout" 2>"$tmp/vsix.stderr"
+      rc=$?
+      check "packaged vsix mode passes" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+      check "packaged vsix mode recorded" "$(node -e 'process.exit(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).mode==="extension-host-vsix"?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
+      check "packaged vsix host used extracted tree" "$(grep -q 'vsix-extracted' "$tmp/work-vsix/host-full/evidence.json" && echo 0 || echo 1)"
+    else
+      out="$tmp/vsix-no-unzip.json"
+      FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
+        bash "$SELF" --vsix "$tmp/fake.vsix" --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-vsix-no-unzip" \
+        >"$tmp/vsix-no-unzip.stdout" 2>"$tmp/vsix-no-unzip.stderr"
+      rc=$?
+      check "vsix without unzip fails closed" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+      check "vsix missing unzip reason" "$(printf '%s' "$(reason_of "$out")" | grep -q '^vsix-extract-tool-missing' && echo 0 || echo 1)"
+    fi
   else
     echo "vscode-e2e selftest skip: packaged-vsix case needs zip or python3 to build a test archive"
   fi
@@ -679,7 +773,11 @@ if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 STARTED="$(iso_now)"
-mkdir -p "$WORK_DIR" "$CACHE_DIR"
+mkdir -p "$WORK_DIR" "$CACHE_DIR" || fail "work-dir-unwritable: $WORK_DIR / $CACHE_DIR"
+# Evidence/log paths must be absolute so a cell launched through
+# `xvfb-run`/`timeout` always points at the same directory the harness checks.
+WORK_DIR="$(cd "$WORK_DIR" && pwd)" || fail "work-dir-unusable: $WORK_DIR"
+CACHE_DIR="$(cd "$CACHE_DIR" && pwd)" || fail "cache-dir-unusable: $CACHE_DIR"
 
 if [ -n "$VSIX_PATH" ] && [ ! -f "$VSIX_PATH" ]; then
   fail "vsix-missing: $VSIX_PATH"

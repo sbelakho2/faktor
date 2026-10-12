@@ -313,24 +313,70 @@ fn guarded_lines_timeout_stages_are_individually_typed() {
 #[test]
 fn guarded_lines_overall_deadline_and_dead_state() {
     // A slow-but-alive stream is killed by the OVERALL deadline, not idle.
-    let lines = futures::stream::unfold(0u32, |i| async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        Some((Ok::<String, ProviderError>(format!("i{i}")), i + 1))
-    });
-    let dl = StreamDeadlines {
-        first_byte_ms: 5_000,
-        idle_ms: 5_000,
-        overall_ms: 90,
-    };
+    //
+    // Load-aware bounds (same-run control, matching the emulation-load
+    // hardening used by the pty/BOM campaigns): a fixed 90 ms wall-clock
+    // bound is a hard race on a loaded host — one starved wake can service
+    // the pace timer and the overall timer together, and the biased select
+    // then reports the overall timeout before the guard saw any line
+    // (observed: `at least one line before the overall deadline` on the
+    // loaded darwin lane). Measure how THIS run actually services a nominal
+    // 30 ms sleep and an immediate-item guard round trip, then scale the
+    // overall bound from that projection: `max(90 ms floor, 8x measured)`,
+    // capped at the documented 60 s test ceiling. The teeth are unchanged:
+    // the overall deadline still terminates a live, pacing stream mid-flight
+    // with the typed `overall` timeout, and the dead state after it is
+    // asserted exactly as before.
+    const NOMINAL_PACE_MS: u64 = 30;
+    const FLOOR_OVERALL_MS: u64 = 90;
+    const CEILING_MS: u64 = 60_000;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
+    let control_ms = rt.block_on(async {
+        let start = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(NOMINAL_PACE_MS)).await;
+        start.elapsed().as_millis() as u64
+    });
+    let gap_ms = rt.block_on(async {
+        let start = std::time::Instant::now();
+        let ready = futures::stream::once(async { Ok::<String, ProviderError>("c".into()) });
+        let dl = StreamDeadlines {
+            first_byte_ms: 60_000,
+            idle_ms: 60_000,
+            overall_ms: 0,
+        };
+        let mut s = Box::pin(guarded_lines(ready, dl, None));
+        assert!(s.next().await.is_some(), "control stream yields its item");
+        start.elapsed().as_millis() as u64
+    });
+    let pace_ms = control_ms.max(NOMINAL_PACE_MS);
+    let overall_ms = FLOOR_OVERALL_MS
+        .max(pace_ms.saturating_add(gap_ms).saturating_mul(8))
+        .min(CEILING_MS);
+    // The first line is delivered without any timer: liveness (>= 1 line
+    // before the overall deadline) must not itself rest on one timer
+    // service; only the paced continuation does. first-byte/idle sit well
+    // above the overall bound so the typed cause is unambiguously `overall`
+    // even if timers coalesce in one wake.
+    let lines = futures::stream::unfold(0u32, move |i| async move {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(pace_ms)).await;
+        }
+        Some((Ok::<String, ProviderError>(format!("i{i}")), i + 1))
+    });
+    let dl = StreamDeadlines {
+        first_byte_ms: overall_ms.saturating_add(60_000),
+        idle_ms: overall_ms.saturating_add(60_000),
+        overall_ms,
+    };
+    let outer = Duration::from_millis(overall_ms.saturating_add(5_000));
     rt.block_on(async move {
         let mut s = Box::pin(guarded_lines(lines, dl, None));
         let mut items = 0usize;
         loop {
-            match tokio::time::timeout(Duration::from_secs(3), s.next())
+            match tokio::time::timeout(outer, s.next())
                 .await
                 .expect("overall deadline terminates")
             {
