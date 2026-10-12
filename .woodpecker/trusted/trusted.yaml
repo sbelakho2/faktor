@@ -177,6 +177,13 @@ matrix:
 labels:
   platform: ${platform}
 
+# The declared platform is the CONTAINER platform too: linux/amd64 workflows
+# run genuine x86_64 containers (Rosetta on this arm64 host) instead of
+# silently inheriting the host architecture — lanes like vscode-e2e verify
+# the architecture they were scheduled for. darwin workflows run on the
+# local backend, where the platform field is inert.
+platform: ${platform}
+
 # push (any branch) and tag events are collaborator-authored: only these may
 # mount the trusted caches. pull_request never reaches this file.
 when:
