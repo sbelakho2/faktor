@@ -8696,7 +8696,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "crates/store/src/attachments.rs",
             "crates/session/src/child.rs",
             "crates/session/src/handle.rs",
-            "crates/store/src/migration.rs",
+            "crates/store/src/migration/mod.rs",
+            "crates/store/src/migration/legacy_import.rs",
+            "crates/store/src/migration/restore_points.rs",
+            "crates/store/src/migration/pruning.rs",
         ];
         let suffixes = [
             "unwrap_or_default()",

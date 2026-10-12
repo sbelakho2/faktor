@@ -3,15 +3,25 @@
 //
 // Renders the REAL media/chat.css + media/chat.js + media/composer-state.js +
 // media/board-state.js (and the REAL markup template from src/webview.ts) in
-// headless Chrome with a stubbed VS Code dark theme, then:
+// headless Chrome with a stubbed VS Code theme (dark and light), then:
 //
 //   --screenshots --prefix NAME   capture full-page PNGs per width under
 //                                 scripts/baselines/screenshots/
 //   --check                       measure every visible interactive control
 //                                 (>= 24x24 CSS px; primary buttons >= 28x28)
 //                                 and prove the keyboard focus ring exists and
-//                                 that pointer focus is suppressed. Exits
-//                                 nonzero on any failure.
+//                                 that pointer focus is suppressed. The full
+//                                 matrix runs under BOTH the dark and the
+//                                 light theme at 240/320/480/800, on the
+//                                 populated and the empty/preflight surface;
+//                                 a DPR leg (deviceScaleFactor 1.5 and 2.0)
+//                                 and the VAL-ZOOM reflow leg (IDE UI scale
+//                                 150%/200%, modelled as a reduced CSS-pixel
+//                                 budget) re-assert the same invariants.
+//                                 Exits nonzero on any failure.
+//   --theme dark|light|both       theme leg filter for --check (default both;
+//                                 screenshots stay dark unless light is
+//                                 selected explicitly).
 //
 // It drives Chrome over the DevTools protocol with Node's built-in WebSocket;
 // no npm dependencies. Usage is documented in scripts/render-webview.md.
