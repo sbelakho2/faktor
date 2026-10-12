@@ -159,6 +159,8 @@ const SCRIPT_ALLOWLIST = new Map(
       'Python publisher implementation pinned to the same canonical payload vector as publish-status.mjs (whose selftest runs in dogfood §2).',
     'scripts/certification/lane-marker.py':
       'Python lane-marker writer; its byte-for-byte agreement with the node/shell writers is proven by the lane-marker selftest inside evidence.mjs selftest (dogfood §2).',
+    'scripts/check-fault-seams.sh':
+      'static fault-seam checker executed directly by the PR static lane and the trusted static lane (sh scripts/check-fault-seams.sh); it is a lane command, not a dogfood-plan step.',
     'scripts/mutations/vscode-ts-loader.mjs':
       'node --experimental-loader shim referenced by the VS Code mutation gate commands in scripts/mutations/*.json, executed by check-invariants --mutations (dogfood §3).',
     'scripts/mutation-run.mjs':
@@ -193,6 +195,20 @@ const PANEL_HOST_ALIASES = new Map(
       host: 'task',
       reason: 'AttachmentsPanel is the attachment half of the Task composer pane rendered by the "task" matrix entry (taskComposerPaneForTest).',
     },
+  }),
+);
+
+// Host-matrix entries that render a surface OF the FaktorChatPanel container
+// rather than a standalone Panel class or a chat leaf tab. Each entry is
+// reviewed with a reason; an entry the matrix no longer renders is a gap.
+const HOST_MATRIX_COMPONENT_CLAIMS = new Map(
+  Object.entries({
+    'task-options':
+      'the bounded Task options sheet opened on the Work center surface by FaktorChatPanel; it is not a tab (it replaces the conversation until Back/Apply).',
+    'work-approval':
+      'the inline Work approval attention card rendered by FaktorChatPanel; the full request list remains the Agents/Approvals tab (permissions).',
+    toolbar:
+      'the wrapping utilities toolbar row owned by the FaktorChatPanel container, not a panel class or leaf tab.',
   }),
 );
 
@@ -611,8 +627,9 @@ function chatPanelLeafTabs(root) {
   return titles;
 }
 
-function panelGaps(root) {
+function panelGaps(root, options = {}) {
   const gaps = [];
+  const componentClaims = options.componentClaims ?? new Map();
   const classes = parsePanelClasses(root);
   const matrix = hostMatrixPanels(root);
   if (matrix === null) return ['missing-host-matrix: JetBrainsHostMatrixSmoke.kt has no panelFactories list'];
@@ -635,8 +652,13 @@ function panelGaps(root) {
     }
   }
   for (const entry of matrix) {
-    if (!claimed.has(entry)) {
+    if (!claimed.has(entry) && !componentClaims.has(entry)) {
       gaps.push(`stale-host-matrix-entry: the host matrix renders "${entry}" but no panel class or chat tab claims it`);
+    }
+  }
+  for (const entry of componentClaims.keys()) {
+    if (!matrixSet.has(entry)) {
+      gaps.push(`stale-host-matrix-claim: "${entry}" is reviewed as a container-surface host-matrix claim in scripts/dogfood.mjs but the matrix no longer renders it`);
     }
   }
   return gaps;
@@ -993,7 +1015,7 @@ export function analyze(root = ROOT, options = {}) {
     surface: 'JetBrains panels',
     items: panels.length + chatPanelLeafTabs(root).length,
     gate: 'JetBrainsHostMatrixSmoke panelFactories list + :frontend:smokeHostMatrixZip (§6)',
-    gaps: panelGaps(root),
+    gaps: panelGaps(root, { componentClaims: HOST_MATRIX_COMPONENT_CLAIMS }),
   });
 
   const testCrates = testCrateSurface(root);

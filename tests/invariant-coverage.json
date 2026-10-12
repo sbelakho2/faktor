@@ -1167,6 +1167,21 @@
    "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
    "reason": "cli.run is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
   },
+  "cli.sandbox": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.sandbox is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.sandbox.choose": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.sandbox.choose is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.sandbox.status": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.sandbox.status is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
   "cli.serve": {
    "class": "delegated",
    "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
@@ -1466,6 +1481,11 @@
    "class": "delegated",
    "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
    "reason": "native.get.native.usage is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.get.native.value-entitlements": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.value-entitlements is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.workers": {
    "class": "delegated",
@@ -1787,6 +1807,11 @@
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
    "reason": "vscode.command.faktor.control-plane-sign-out is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
   },
+  "vscode.command.faktor.locate-daemon": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.locate-daemon is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
   "vscode.command.faktor.new-task": {
    "class": "delegated",
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
@@ -1821,6 +1846,11 @@
    "class": "delegated",
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
    "reason": "vscode.command.faktor.stop-server is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.switch-session": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.switch-session is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
   },
   "vscode.configuration.properties": {
    "class": "delegated",
@@ -2111,6 +2141,11 @@
    "class": "delegated",
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
    "reason": "vscode.configuration.faktor-advanced is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor-control-plane": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor-control-plane is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
   }
  }
 }

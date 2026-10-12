@@ -381,7 +381,7 @@ class ChangesPanel : JPanel(BorderLayout()) {
             ?: "No candidate identity is served for this run."
         candidateBasis.fullText = when {
             basis?.sourceDiffEvidenceId != null ->
-                "source diff: evidence #${basis.sourceDiffEvidenceId} (immutable)"
+                "source diff: evidence ${basis.sourceDiffEvidenceId} (immutable)"
             basis?.sourceDiffEvidenceRaw != null ->
                 "source diff: served as \"${bound(basis.sourceDiffEvidenceRaw, 80)}\" (not an evidence id)"
             else -> "source diff: no immutable source diff evidence is served"

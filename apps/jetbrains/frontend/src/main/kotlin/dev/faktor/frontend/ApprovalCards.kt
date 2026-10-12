@@ -230,7 +230,7 @@ internal fun approvalRequestCard(
     val details = secondaryButton("Details")
     details.accessibleContext.accessibleName = "Details for approval request ${permission.id}"
     val disclosure = WrappedLabel(
-        "Request #${permission.id} · capability ${permission.capability} · " +
+        "Request ${permission.id} · capability ${permission.capability} · " +
             "conversation ${permission.sessionId}"
     )
     disclosure.font = monospacePanelFont()

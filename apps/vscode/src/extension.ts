@@ -201,7 +201,7 @@ const DEFAULT_CONTROL_PLANE_ENDPOINT = '';
 /** The last control-plane notice, so a repeated refusal never spams the chat. */
 let lastControlPlaneNotice: string | null = null;
 /** The last workspace-scope refusal, deduped like the control-plane notice. */
-let lastDaemonSettingNotice: string | null = null;
+let lastMachineSettingNotice: string | null = null;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -337,18 +337,18 @@ function config<T>(key: string, fallback: T): T {
 }
 
 /**
- * A daemon-affecting setting read MACHINE-SCOPED only: the global (user/
- * machine) value is returned and any workspace/workspace-folder value is
- * ignored and surfaced once as a typed refusal. The settings are declared
- * `"scope": "machine"` in package.json; this inspect-based gate is the
- * defence-in-depth that also reports a repo-supplied value instead of
- * silently ignoring it.
+ * A MACHINE-SCOPED setting read (daemon inputs and the non-secret optional
+ * control-plane coordinates): the global (user/machine) value is returned and
+ * any workspace/workspace-folder value is ignored and surfaced once as a
+ * typed refusal. The settings are declared `"scope": "machine"` in
+ * package.json; this inspect-based gate is the ONE defence-in-depth adapter
+ * that also reports a repo-supplied value instead of silently ignoring it.
  */
-function daemonSetting<T>(key: string, fallback: T): T {
+function machineSetting<T>(key: string, fallback: T): T {
   const inspected = vscode.workspace.getConfiguration('faktor').inspect<T>(key);
   const outcome = machineScopedSetting(key, inspected ?? undefined, fallback);
-  if (outcome.refusal !== null && outcome.refusal.message !== lastDaemonSettingNotice) {
-    lastDaemonSettingNotice = outcome.refusal.message;
+  if (outcome.refusal !== null && outcome.refusal.message !== lastMachineSettingNotice) {
+    lastMachineSettingNotice = outcome.refusal.message;
     chatProvider?.postNotice('error', outcome.refusal.message);
   }
   return outcome.value;
@@ -369,9 +369,9 @@ function workspaceRoot(context: vscode.ExtensionContext): string {
  * a missing daemon becomes the typed T02 state, never a fabricated path.
  */
 function refreshPreflightResolution(context: vscode.ExtensionContext): void {
-  const binaryPath = daemonSetting('binaryPath', '');
-  const dataDir = daemonSetting('dataDir', '');
-  const installRoot = daemonSetting('installRoot', '');
+  const binaryPath = machineSetting('binaryPath', '');
+  const dataDir = machineSetting('dataDir', '');
+  const installRoot = machineSetting('installRoot', '');
   try {
     const resolved = resolveDaemon({
       workspaceRoot: workspaceRoot(context),
@@ -521,8 +521,8 @@ function controlPlaneNotice(level: 'info' | 'error', text: string): void {
 
 function controlPlaneScope(): ControlPlaneScope | null {
   const scope: ControlPlaneScope = {
-    endpoint: config('controlPlaneEndpoint', ''),
-    organization: config('controlPlaneOrganization', ''),
+    endpoint: machineSetting('controlPlaneEndpoint', ''),
+    organization: machineSetting('controlPlaneOrganization', ''),
   };
   return controlPlaneScopeValid(scope) ? scope : null;
 }
@@ -551,7 +551,7 @@ function controlPlaneAuthSession(): ControlPlaneAuthSession | null {
   }
   const session: ControlPlaneAuthSession = {
     organization: scope.organization,
-    sessionId: config('controlPlaneAuthSession', ''),
+    sessionId: machineSetting('controlPlaneAuthSession', ''),
   };
   return controlPlaneAuthSessionValid(session) ? session : null;
 }
@@ -569,7 +569,7 @@ function legacyPlaintextSetting(): {
 } {
   return {
     read: () => {
-      const raw = config('controlToken', '');
+      const raw = machineSetting('controlToken', '');
       return typeof raw === 'string' && raw.length > 0 ? raw : null;
     },
     clear: async () => {
@@ -602,7 +602,7 @@ async function ensureControlPlaneScope(hasLegacy: boolean): Promise<ControlPlane
     title: 'Faktor: migrate control-plane credential',
     prompt:
       'Cloud control-plane endpoint the credential belongs to (required; there is no default endpoint)',
-    value: config('controlPlaneEndpoint', ''),
+    value: machineSetting('controlPlaneEndpoint', ''),
     ignoreFocusOut: true,
   });
   if (endpoint === undefined || endpoint.trim().length === 0) {
@@ -611,7 +611,7 @@ async function ensureControlPlaneScope(hasLegacy: boolean): Promise<ControlPlane
   const organization = await vscode.window.showInputBox({
     title: 'Faktor: migrate control-plane credential',
     prompt: 'Organization (or account) id the credential belongs to',
-    value: config('controlPlaneOrganization', ''),
+    value: machineSetting('controlPlaneOrganization', ''),
     ignoreFocusOut: true,
   });
   if (organization === undefined || organization.trim().length === 0) {
@@ -718,7 +718,7 @@ async function controlPlaneSignIn(context: vscode.ExtensionContext): Promise<voi
     prompt:
       'Auth-session id (non-secret; from the SSO callback or the bootstrap result). Needed so sign-out can revoke the ' +
       'server-side session; leave empty when unknown.',
-    value: config('controlPlaneAuthSession', ''),
+    value: machineSetting('controlPlaneAuthSession', ''),
     ignoreFocusOut: true,
   });
   if (sessionId === undefined) {
@@ -941,15 +941,15 @@ async function startServer(
   try {
     // Machine-scoped daemon inputs only: a workspace/workspace-folder value is
     // ignored and surfaced typed (never silently honoured).
-    const binaryPath = daemonSetting('binaryPath', '');
-    const dataDir = daemonSetting('dataDir', '');
-    const installRoot = daemonSetting('installRoot', '');
-    const extraArgs = daemonSetting<string[]>('extraArgs', []);
+    const binaryPath = machineSetting('binaryPath', '');
+    const dataDir = machineSetting('dataDir', '');
+    const installRoot = machineSetting('installRoot', '');
+    const extraArgs = machineSetting<string[]>('extraArgs', []);
     // The default exceeds the bootstrap launcher's ~30 s launch window: the
     // supervisor must not declare failure while the updater launcher may still
     // be bringing the release to readiness (and may still be adoptable). The
     // SAME bound is reused as the post-health readiness deadline.
-    const startupTimeoutMs = config('startupTimeoutMs', 45_000);
+    const startupTimeoutMs = machineSetting('startupTimeoutMs', 45_000);
     // Resolve FIRST and show exactly which executable would run. The
     // resolution never consults the workspace (no target/ lookup); a missing
     // daemon is the actionable refusal below.
@@ -1182,7 +1182,7 @@ async function locateDaemon(context: vscode.ExtensionContext): Promise<void> {
   };
   const refusalBefore = workspaceScopedSettingRefusal('faktor.binaryPath', inspectScopes());
   if (refusalBefore !== null) {
-    lastDaemonSettingNotice = refusalBefore.message;
+    lastMachineSettingNotice = refusalBefore.message;
     chatProvider?.postNotice('error', refusalBefore.message);
     void vscode.window.showErrorMessage(`Faktor: ${refusalBefore.message}`);
     return;
@@ -1217,7 +1217,7 @@ async function locateDaemon(context: vscode.ExtensionContext): Promise<void> {
       Promise.resolve(cfg.update(key, value, vscode.ConfigurationTarget.Global)),
   );
   if (result.refusal !== null) {
-    lastDaemonSettingNotice = result.refusal.message;
+    lastMachineSettingNotice = result.refusal.message;
     chatProvider?.postNotice('error', result.refusal.message);
     void vscode.window.showErrorMessage(`Faktor: ${result.refusal.message}`);
     return;

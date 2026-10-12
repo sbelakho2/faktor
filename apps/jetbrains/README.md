@@ -72,11 +72,11 @@ state the host warns about and requires the operator to confirm.
 | UI action | Endpoint |
 | --- | --- |
 | health / readiness | `GET /native/health`, `GET /native/ready` |
-| new session | `POST /session/create`, `GET /session/list` |
+| new session | `POST /native/session`, `GET /native/sessions` |
 | model catalog | `GET /models` |
-| send / abort a turn | `POST /session/prompt`, `POST /native/session/{id}/abort` |
+| send / abort a turn | `POST /native/session/{id}/prompt`, `POST /native/session/{id}/abort` |
 | status | `GET /session/{id}/projection`, `GET /native/session/{id}/tasks` |
-| transcript | `GET /native/messages`, SSE `GET /api/session/{id}/events?events_after=` |
+| transcript | `GET /native/messages`, SSE `GET /native/session/{id}/events?after=<cursor>` |
 | journal paging | `GET /native/events` (cursor twin of the SSE stream) |
 | task runs | `POST/GET /native/session/{id}/task-runs`, `POST .../{run_id}/cancel` |
 | agents | `GET /native/agents`, `POST /native/agents/{id}/{pause,resume,cancel,retry,steer,model,budget}` |
@@ -85,13 +85,29 @@ state the host warns about and requires the operator to confirm.
 | evidence | `GET /native/evidence/{id}`, `POST /native/evidence/{id}/retrieve` |
 | providers | `GET /native/providers` (registry view; `/models` catalog remains the fallback join) |
 | terminals | `GET /native/terminals?session={id}`, `GET /native/session/{id}/terminal/events`, `POST /native/session/{id}/terminal` (session-owned spawn), `GET /pty/{pty_id}/output` (snapshot) |
-| history / lifecycle | `GET /session/list`, start/stop/attach, `restart()` (session+cursor preserved), `reconnectStream()` (SSE cursor resume) |
+| history / lifecycle | `GET /native/sessions`, start/stop/attach, `restart()` (session+cursor preserved), `reconnectStream()` (SSE cursor resume) |
 | permissions | `GET /native/permissions?session={id}`, `POST /native/permission/reply` (strict `{session_id, permission_id, decision}`; typed 409 `conflict` / `permission_session_mismatch`) |
 
 SSE frames carry `event:`, `id:` (journal sequence = resume cursor) and one
-JSON `data:` line. Heartbeats are ignored but advance the cursor; oversized
-frames are dropped loudly and skipped; reconnects resume from the last
-delivered id with bounded exponential backoff.
+JSON `data:` line; the only frame schema this client understands is
+`faktor-native-event/v1`. Heartbeats are ignored and NEVER advance the
+durable cursor (even when a nonconforming server attaches an id), so a
+durable event can never be silently skipped below one. A durable-stream
+protocol violation — malformed frame, discriminator mismatch,
+impossible/backward cursor, oversized durable frame, unsupported frame
+version or the daemon's terminal `journal_read_failed` frame — is not
+transient: the stream lands in the stable `blocked` state at the offending
+cursor (no skip action, the cursor does not advance past it) and recovers
+only explicitly (`recoverFrom()` — refresh from snapshot / reconnect after a
+daemon upgrade / run doctor, or a new stream); transient disconnects
+reconnect with bounded exponential backoff from the last delivered frame id,
+never duplicating or skipping.
+
+Historical note (pre-native-route clients, retired): older clients used
+`POST /session/create`, `GET /session/list` and the
+`/api/session/{id}/events?events_after=` stream, treated heartbeats as
+cursor-advancing and dropped oversized frames with a skip; those shapes are
+no longer the contract.
 
 ## Verification
 

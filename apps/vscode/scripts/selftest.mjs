@@ -8385,8 +8385,8 @@ async function composerAttachmentTests() {
       : [pkg.contributes.configuration];
     assertDeepEqual(
       sections.map((section) => section.title),
-      ['Faktor', 'Faktor: Advanced'],
-      'the settings hierarchy is pinned: everyday settings first, advanced last',
+      ['Faktor', 'Faktor: Advanced', 'Faktor: Control Plane'],
+      'the settings hierarchy is pinned: run defaults first, machine service settings, then the optional control plane',
     );
     const props = Object.assign({}, ...sections.map((section) => section.properties ?? {}));
     const expected = {
@@ -10678,6 +10678,7 @@ async function packagedLayoutTests(dir) {
       'media/board-state.js',
       'media/history-state.js',
       'media/faktor.svg',
+      'media/faktor-icon.png',
     ]) {
       assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
     }
@@ -10708,6 +10709,7 @@ async function packagedLayoutTests(dir) {
         'chat.css',
         'chat.js',
         'composer-state.js',
+        'faktor-icon.png',
         'faktor.svg',
         'history-state.js',
       ],

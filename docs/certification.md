@@ -1424,13 +1424,25 @@ Normative semantics (recorded so behavior cannot drift):
 - `crates/orchestrator/src/completion_steps.rs` executes the requested steps
   in gate order once the drive settles: commit (clean tree => honest
   `Skipped` "nothing to commit"; unborn HEAD => `Skipped`), push (no remote
-  => `Skipped`; egress policy denial => typed refusal), then PR (executed
-  ONLY when the daemon has a configured `pr_command`; strict argv template
-  with no shell, `{branch}` required; unconfigured => `Skipped`). Success is
-  idempotent per `(task, revision)`, a failure stops everything after it and
-  records the remaining requested steps `Skipped` ("not attempted"), and
-  every outcome is written through the durable
-  `SessionHandle::set_completion_step_status` seam before the run settles.
+  => `Skipped`; egress policy denial => typed refusal), then PR. The native
+  PR step is certified ONLY through the canonical typed `faktor_scm`
+  `CompletionScm` reconciliation: the exact external-operation identity is
+  journaled durably before the remote call and the remote object id/version
+  after it, so a crash reconciles from the recorded identity instead of
+  re-creating the object. A contracted PR step with NO canonical SCM
+  configuration is an explicit configuration blocker
+  (`native_pr_scm_not_configured`, surfaced as `Pull request integration
+  unavailable`) — never a silent `Skipped` and never a rebuild without the
+  provider. Historical note (pre-native-SCM configs, retired): the generic
+  `pr_command`/`pr_program` expert command stays executable on the legacy
+  path but carries no reconciliation protocol, so a generic command success
+  is not native PR proof. Success is idempotent per `(task, revision)`, a
+  failure stops everything after it and records the remaining requested
+  steps `Skipped` ("not attempted"), and every outcome is written through the
+  durable `SessionHandle::set_completion_step_status` seam before the run
+  settles; a `Skipped` or absent step row is never success — the gate keeps
+  refusing `VerifiedComplete` until the requested step has a succeeding
+  durable row.
 
 Implementation map:
 

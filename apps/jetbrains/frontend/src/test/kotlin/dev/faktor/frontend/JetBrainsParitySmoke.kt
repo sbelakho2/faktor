@@ -1478,6 +1478,19 @@ object JetBrainsParitySmoke {
                 // the served source diff evidence and opens through the host
                 // seam (bytes, never a workspace file); Open claim selects
                 // the served criterion on the Verification surface.
+                //
+                // The earlier restart step left session 8 current: reopen the
+                // durable session 7 and wait for its served change facts
+                // before driving the surface (otherwise the session-switch
+                // refresh would race the assertions).
+                chat.historyView().select(0)
+                chat.historyView().submitOpen()
+                await("session 7 reopened for the change review") {
+                    service.currentSessionId() == "7"
+                }
+                await("the served change row lands") {
+                    chat.changesView().rowCount() == 1
+                }
                 val view = chat.changesView()
                 assertEquals(1, view.rowCount(), "one served change row")
                 val model = view.currentModel() ?: fail("the change model must be populated")
@@ -1490,14 +1503,29 @@ object JetBrainsParitySmoke {
                     "the served evidence ref must attach to the row"
                 )
                 assertEquals("candidate tm1:cand", model.basis?.candidateLabel)
-                view.clickOpen()
-                await("the immutable artifact opens through the host seam") {
-                    reviewHost.artifacts.size == 1
+                await("the served change facts are current") {
+                    chat.changesView().currentModel()?.basis?.sourceDiffEvidenceRaw == "evidence:41"
                 }
+                assertTrue(view.openEnabled(), "the open control must be live")
+                view.clickOpen()
+                val openDeadline = System.currentTimeMillis() + 10_000L
+                while (System.currentTimeMillis() < openDeadline &&
+                    reviewHost.artifacts.isEmpty()
+                ) {
+                    if (view.refusalText().isNotEmpty()) {
+                        fail("the immutable open was refused: ${view.refusalText()}")
+                    }
+                    Thread.sleep(25L)
+                }
+                assertEquals(
+                    1,
+                    reviewHost.artifacts.size,
+                    "the immutable artifact must open: refusal=${view.refusalText()}"
+                )
                 val artifact = reviewHost.artifacts[0]
                 assertEquals(41L, artifact.evidenceId)
                 assertEquals(
-                    "candidate tm1:cand — source diff — evidence #41 (immutable)",
+                    "candidate tm1:cand — source diff — evidence 41 (immutable)",
                     artifact.title
                 )
                 assertTrue(
@@ -2129,7 +2157,12 @@ object JetBrainsParitySmoke {
             )
         }
         daemon.on("GET", "/native/session/7/tasks/3/verification") { _, response ->
-            response.json(200, PARITY_CRITERION_PROOF_JSON)
+            // The change-review daemon row needs served relationships the
+            // pinned visual fixture cannot carry: an evidence ref attached to
+            // the file criterion and the candidate source-diff proof. The
+            // derived payload changes ONLY those additive members (binding
+            // kinds/references stay byte-identical for every other row).
+            response.json(200, PARITY_CHANGE_VERIFICATION_JSON)
         }
         daemon.on("GET", "/native/session/7/verification") { _, response ->
             response.json(200, VERIFICATION_JSON)
@@ -2269,6 +2302,29 @@ object JetBrainsParitySmoke {
     private const val TASK_RUNS_JSON = "[" +
         "{\"task_id\":3,\"run_id\":\"run-9\",\"mode\":\"in_session\",\"state\":\"Running\"," +
         "\"goal\":\"parity goal\",\"item_ids\":[\"main\"],\"model\":\"m\"}]"
+
+    /**
+     * The served task verification for the fake-daemon session: the pinned
+     * criterion-proof fixture plus two ADDITIVE change-review relationships
+     * (the file criterion's attached evidence ref and the candidate
+     * source-diff proof). The pinned visual fixture itself is never mutated,
+     * so its certified task-tree digest stays exact.
+     */
+    private val PARITY_CHANGE_VERIFICATION_JSON: String = PARITY_CRITERION_PROOF_JSON
+        .replace(
+            "\"evidence\":\"file:src/a.rs\"",
+            "\"evidence\":\"file:src/a.rs;evidence:41\""
+        )
+        .replace(
+            "\"changedFiles\":[]",
+            "\"changedFiles\":[{\"path\":\"src/a.rs\"}]"
+        )
+        .replace(
+            "\"completedMs\":22",
+            "\"completedMs\":22,\"candidateProof\":{\"runId\":\"run-9\"," +
+                "\"candidateSnapshot\":\"tm1:cand\",\"sourceDiffEvidence\":\"evidence:41\"," +
+                "\"changedFilesDigest\":\"cf-1\"}"
+        )
 
     private const val TASK_VIEWS_JSON = "[" +
         "{\"goal\":\"parity goal\",\"constraints\":[],\"state\":\"in_progress\"," +
@@ -2546,17 +2602,25 @@ private class TaskStartHarness(
 /**
  * The I03 host seam double for the fake-daemon suite: records the immutable
  * artifacts opened through the panel (bytes + immutable title only — the
- * seam has no path-taking method).
+ * seam has no path-taking method). Access is synchronized: the open runs on
+ * the panel worker while the suite polls from its own thread.
  */
 private class ParityReviewHost : ChangeReviewHost {
-    val artifacts = ArrayList<ImmutableArtifact>()
-    val diffs = ArrayList<Triple<String, ImmutableArtifact, ImmutableArtifact>>()
+    private val lock = Any()
+    private val artifactLog = ArrayList<ImmutableArtifact>()
+    private val diffLog = ArrayList<Triple<String, ImmutableArtifact, ImmutableArtifact>>()
+
+    val artifacts: List<ImmutableArtifact>
+        get() = synchronized(lock) { ArrayList(artifactLog) }
+
+    val diffs: List<Triple<String, ImmutableArtifact, ImmutableArtifact>>
+        get() = synchronized(lock) { ArrayList(diffLog) }
 
     override fun openArtifact(artifact: ImmutableArtifact) {
-        artifacts.add(artifact)
+        synchronized(lock) { artifactLog.add(artifact) }
     }
 
     override fun openDiff(title: String, left: ImmutableArtifact, right: ImmutableArtifact) {
-        diffs.add(Triple(title, left, right))
+        synchronized(lock) { diffLog.add(Triple(title, left, right)) }
     }
 }

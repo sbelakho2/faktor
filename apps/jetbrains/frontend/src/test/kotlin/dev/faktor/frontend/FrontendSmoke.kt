@@ -4041,14 +4041,14 @@ object FrontendSmoke {
             assertTrue(first is BasisResolution.Single, "the candidate source diff wins first")
             assertEquals(77L, (first as BasisResolution.Single).evidenceId)
             assertEquals(
-                "candidate tm1:cand — source diff — evidence #77 (immutable)",
+                "candidate tm1:cand — source diff — evidence 77 (immutable)",
                 first.title
             )
             // Without a served source diff, the selected path's refs resolve.
             val basisless = model.copy(basis = model.basis?.copy(sourceDiffEvidenceRaw = null, sourceDiffEvidenceId = null))
             val second = resolveChangeBasis(basisless, 0)
             assertEquals(41L, (second as BasisResolution.Single).evidenceId)
-            assertEquals("src/a.rs — evidence #41 (immutable)", second.title)
+            assertEquals("src/a.rs — evidence 41 (immutable)", second.title)
             // Two immutable artifacts for the same path: a true diff is allowed.
             val pairRow = model.rows[0].copy(
                 evidenceRefs = listOf(EvidenceRef(41L, "evidence:41"), EvidenceRef(42L, "evidence:42"))
@@ -4170,7 +4170,7 @@ object FrontendSmoke {
             assertEquals(ChangeOpenResult.Opened, controller.open(model, 0))
             assertEquals(1, host.artifacts.size)
             assertEquals(
-                "/etc/passwd — evidence #41 (immutable)",
+                "/etc/passwd — evidence 41 (immutable)",
                 host.artifacts[0].title,
                 "the path appears only in the immutable title, never as an open target"
             )
