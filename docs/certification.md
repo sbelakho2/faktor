@@ -1176,9 +1176,12 @@ fails with `unassigned`; an unconventional tag fails with
   the compiled webview provider HTML carries the strict CSP
   (`default-src 'none'`, nonce, `connect-src 'none'`) plus the composer and
   attachment surface (`#composer`, `#goal`, `#attachment-list`,
-  `#attachment-hint`, `#btn-attach`). On a headless runner it launches
-  Electron with `--ozone-platform=headless --disable-gpu` (and `--no-sandbox`
-  as root). Exact coverage is recorded in `target/certification/vscode-e2e.json`:
+  `#attachment-hint`, `#btn-attach`). On a headless runner it prefers a real
+  Xvfb display (the pinned image ships it; `FAKTOR_VSCODE_E2E_XVFB=0` selects
+  the `--ozone-platform=headless --disable-gpu` fallback, with `--no-sandbox`
+  as root). A host exit without an evidence file is always a failure and the
+  harness folds captured host stdout, VS Code main/renderer/exthost logs and
+  crashdumps into `failure-diagnostic.txt` (no silent pass). Exact coverage is recorded in `target/certification/vscode-e2e.json`:
   it does NOT prove rendered pixels/screenshots, a displayed workbench
   UI/WebviewView, or live daemon connectivity — the record carries that
   `does_not_prove` list verbatim. The lane runs on the digest-pinned
