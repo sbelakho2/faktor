@@ -32,6 +32,7 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use faktor_agent::wire_plan::plan_wire_turn;
 use faktor_agent::{RecoveryHint, Tool, ToolActivationSet, ToolOutcome, ToolRegistry, ToolRunCtx};
@@ -62,7 +63,8 @@ use serde_json::{json, Value};
 
 use super::{
     open_commerce_service, source_market_exposure, source_market_schema, source_market_tool,
-    CasArtifacts, SOURCE_MARKET_TEXT_MAX_BYTES, SOURCE_MARKET_TOOL,
+    CasArtifacts, SOURCE_MARKET_DEFAULT_DEADLINE_MS, SOURCE_MARKET_TEXT_MAX_BYTES,
+    SOURCE_MARKET_TOOL,
 };
 
 /// Pinned commerce schema budget (bytes) for one active `source_market`
@@ -675,13 +677,26 @@ fn certification_principal() -> faktor_commerce::jobs::CommercePrincipal {
 }
 
 fn run_tool(certified: &Certified, args: Value) -> Result<ToolOutcome, Error> {
+    run_tool_with_deadline(certified, args, SOURCE_MARKET_DEFAULT_DEADLINE_MS)
+}
+
+/// One tool call under an explicit caller deadline (milliseconds). The
+/// ordinary [`run_tool`] path keeps the product default deadline; the
+/// 500-line BOM calibration decides its deadline from a same-run control.
+fn run_tool_with_deadline(
+    certified: &Certified,
+    args: Value,
+    deadline_ms: u64,
+) -> Result<ToolOutcome, Error> {
     certified
         .counters
         .tool_invocations
         .fetch_add(1, Ordering::Relaxed);
+    let mut ctx = certification_ctx();
+    ctx.deadline_ms = deadline_ms;
     block_on(async {
         let tool = source_market_tool(certified.service.clone());
-        (tool.execute)(certification_ctx(), args).await
+        (tool.execute)(ctx, args).await
     })
 }
 
@@ -905,11 +920,37 @@ fn one_mouser_price_question_is_exactly_one_invocation_and_zero_model_calls() {
 // Test C: a 500-line BOM is one interaction, one job, one artifact
 // --------------------------------------------------------------------------
 
+/// The same-run control for the 500-line BOM: a small BOM drives the exact
+/// job/executor/store path (including the per-line durable commit), so its
+/// marginal per-line cost IS this runner's cost for one line.
+const BOM_CONTROL_LINES: usize = 8;
+
+/// Generous deadline for the control BOM: it only measures the runner.
+const BOM_CONTROL_DEADLINE_MS: u64 = 60_000;
+
+/// Documented allowance over the control's linear projection for the full
+/// BOM: steady emulation/VM slowness scales the per-line cost linearly and
+/// the same-run control measures it, so this multiple absorbs contention
+/// between the control and the run without masking a superlinear blowup.
+const BOM_SLOWDOWN_ALLOWANCE: u32 = 8;
+
+/// Ceiling on the load-aware deadline: a runner that cannot finish the BOM
+/// in this window is wedged, not merely slow.
+const BOM_DEADLINE_CEILING_MS: u64 = 300_000;
+
+/// Slack between the outer wall-clock measurement and the tool's own
+/// deadline clock: runtime/tool construction and scheduler hops on a
+/// contended runner happen outside the clock the tool starts when the
+/// acquisition begins. It covers that fixed setup only, never acquisition
+/// work.
+const BOM_DEADLINE_MEASUREMENT_SLACK_MS: u64 = 1_000;
+
 #[test]
 fn bom_500_lines_is_one_interaction_deterministic_job_and_cas_artifact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let certified = certified(dir.path(), "mouser", "0.003700", "{}");
-    let items: Vec<Value> = (0..MAX_BOM_LINES.min(500))
+    let bom_lines = MAX_BOM_LINES.min(500);
+    let items: Vec<Value> = (0..bom_lines)
         .map(|i| json!({"q": format!("STM32F407VGT6-{i:04}"), "qty": 100}))
         .collect();
     let args = json!({
@@ -920,7 +961,79 @@ fn bom_500_lines_is_one_interaction_deterministic_job_and_cas_artifact() {
         "detail": "compact"
     });
 
-    let outcome = run_tool(&certified, args.clone()).expect("bom tool call");
+    // The product budget is a wall-clock deadline and emulation/VM runners
+    // stretch wall clock by a large constant factor; measure the actual
+    // marginal per-line cost on THIS runner (same service, store, executor
+    // and durable per-line commit) with a same-run control and bound the
+    // full BOM against the measured linear projection instead of the fixed
+    // constant alone.
+    let control_items = args["items"].as_array().expect("bom items");
+    let control_pairs: Vec<(String, u64)> = control_items[..BOM_CONTROL_LINES]
+        .iter()
+        .map(|item| {
+            (
+                item["q"].as_str().expect("control q").to_string(),
+                item["qty"].as_u64().expect("control qty"),
+            )
+        })
+        .collect();
+    let control_refs: Vec<(&str, u64)> = control_pairs
+        .iter()
+        .map(|(q, qty)| (q.as_str(), *qty))
+        .collect();
+    let control_started = Instant::now();
+    let control = block_on(
+        certified.service.bom(
+            &certification_principal(),
+            &AcquireCtx::new().with_deadline(Duration::from_millis(BOM_CONTROL_DEADLINE_MS)),
+            faktor_commerce::SourceSet::named(vec![SourceId::new("mouser").expect("source")])
+                .expect("source set"),
+            FreshnessMode::Live,
+            DetailLevel::Compact,
+            Bom::from_pairs(&control_refs).expect("control bom"),
+        ),
+    )
+    .expect("control bom acquisition");
+    let control_elapsed = control_started.elapsed();
+    assert_eq!(
+        control.compact.status,
+        faktor_commerce::CompactStatus::Completed,
+        "the control BOM must complete on this runner"
+    );
+    let control_per_line = Duration::from_nanos(
+        u64::try_from(control_elapsed.as_nanos() / BOM_CONTROL_LINES as u128).unwrap_or(u64::MAX),
+    );
+    let projected_full = control_per_line * bom_lines as u32;
+    let product_budget = Duration::from_millis(SOURCE_MARKET_DEFAULT_DEADLINE_MS);
+    let load_aware = product_budget
+        .max(projected_full * BOM_SLOWDOWN_ALLOWANCE)
+        .min(Duration::from_millis(BOM_DEADLINE_CEILING_MS));
+
+    let started = Instant::now();
+    let outcome = run_tool_with_deadline(
+        &certified,
+        args.clone(),
+        u64::try_from(load_aware.as_millis()).unwrap_or(u64::MAX),
+    )
+    .expect("bom tool call");
+    let elapsed = started.elapsed();
+    let measurement_slack = Duration::from_millis(BOM_DEADLINE_MEASUREMENT_SLACK_MS);
+    assert!(
+        elapsed <= load_aware + measurement_slack,
+        "the full BOM must finish inside the load-aware deadline {load_aware:?} \
+         (control {control_elapsed:?} for {BOM_CONTROL_LINES} lines, elapsed {elapsed:?})"
+    );
+    // Product-budget teeth: on a runner whose control projects the full BOM
+    // inside the documented product budget (a normal runner), completion is
+    // asserted against that budget exactly as before; the calibration only
+    // widens the bound when the runner itself is stretched.
+    if projected_full <= product_budget {
+        assert!(
+            elapsed <= product_budget + measurement_slack,
+            "a runner projecting {projected_full:?} for the full BOM must complete it \
+             inside the documented product budget {product_budget:?} (elapsed {elapsed:?})"
+        );
+    }
     assert_eq!(
         certified.counters.tool_invocations(),
         1,

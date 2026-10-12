@@ -512,7 +512,7 @@ fn pty_script_corpus_matches_every_outcome() {
                 }
             }
             Check::SnapshotBounded => {
-                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
                 while pty.is_alive() && std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
                     let _ = pty.read_available();
@@ -535,7 +535,7 @@ fn pty_script_corpus_matches_every_outcome() {
                 );
             }
             Check::NaturalExit => {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
                 while pty.is_alive() {
                     assert!(
                         std::time::Instant::now() < deadline,
@@ -548,7 +548,7 @@ fn pty_script_corpus_matches_every_outcome() {
             Check::KillReaps => {
                 let pid = pty.pid() as libc::pid_t;
                 pty.shutdown();
-                wait_pid_gone(pid, Duration::from_secs(5), row.label);
+                wait_pid_gone(pid, crate::GROUP_EXTINCTION_CEILING, row.label);
             }
             Check::WriteAfterExitBounded => {
                 // A write to a master whose slave is gone may be accepted
@@ -621,8 +621,8 @@ fn timeout_kill_and_reap_census() {
         let mut pty = Pty::spawn(&sh_cfg(script)).unwrap();
         let pid = pty.pid() as libc::pid_t;
         pty.shutdown();
-        wait_pid_gone(pid, Duration::from_secs(5), label);
-        wait_group_gone(pid, Duration::from_secs(5), label);
+        wait_pid_gone(pid, crate::GROUP_EXTINCTION_CEILING, label);
+        wait_group_gone(pid, crate::GROUP_EXTINCTION_CEILING, label);
     }
 }
 
@@ -642,7 +642,7 @@ fn orphan_census_after_every_failure_path() {
     // 2. Natural exit: the reader reaps (kill(pid, 0) => ESRCH).
     let pty = Pty::spawn(&sh_cfg("true")).unwrap();
     let pid = pty.pid() as libc::pid_t;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
     while pid_alive(pid) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -655,13 +655,13 @@ fn orphan_census_after_every_failure_path() {
     let mut pty = Pty::spawn(&sh_cfg("sleep 300")).unwrap();
     let pid = pty.pid() as libc::pid_t;
     pty.shutdown();
-    wait_pid_gone(pid, Duration::from_secs(5), "explicit-shutdown");
-    wait_group_gone(pid, Duration::from_secs(5), "explicit-shutdown");
+    wait_pid_gone(pid, crate::GROUP_EXTINCTION_CEILING, "explicit-shutdown");
+    wait_group_gone(pid, crate::GROUP_EXTINCTION_CEILING, "explicit-shutdown");
 
     // 4. Drop: the emergency path still kills and reaps the group.
     let pid = {
         let pty = Pty::spawn(&sh_cfg("sleep 300")).unwrap();
         pty.pid() as libc::pid_t
     };
-    wait_pid_gone(pid, Duration::from_secs(5), "drop-path");
+    wait_pid_gone(pid, crate::GROUP_EXTINCTION_CEILING, "drop-path");
 }

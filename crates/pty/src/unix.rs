@@ -1005,8 +1005,9 @@ mod tests {
             assert!(pty.is_alive());
             pty.pid()
         };
-        // Dropped: the child group must be dead shortly after.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Dropped: the child group must be dead shortly after; the bound is
+        // the shared observable-extinction ceiling (never a shortened wait).
+        let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
         loop {
             if !group_alive(pid as libc::pid_t) {
                 break;
@@ -1030,7 +1031,7 @@ mod tests {
             pty.wait_for_contains("done", std::time::Duration::from_secs(10)),
             "child output arrives"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
         while pty.is_alive() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1044,7 +1045,7 @@ mod tests {
     /// Wait until `pid` is provably reaped (ESRCH): only then can the kernel
     /// recycle it, so only then is a remaining signal a pid-reuse hazard.
     fn wait_reaped(pid: libc::pid_t, what: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
         loop {
             // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
             let r = unsafe { libc::kill(pid, 0) };
@@ -1067,7 +1068,7 @@ mod tests {
 
     /// Wait until the recorded process group is fully gone.
     fn wait_group_gone(pid: libc::pid_t, what: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
         while group_alive(pid) || group_exists(pid) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1493,7 +1494,7 @@ mod tests {
         );
         pty.shutdown();
         assert!(pty.guardian.is_none(), "teardown releases the guardian");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
         // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         while unsafe { libc::kill(guardian_pid as libc::pid_t, 0) } == 0 {
             assert!(

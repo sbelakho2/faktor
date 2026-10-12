@@ -28,6 +28,10 @@ fn pid_gone(pid: u32) -> bool {
 
 /// Spawn a child that is its own process-group leader (`setsid`-equivalent
 /// via `process_group(0)`), so the guardian's group kill has a real target.
+/// A scripted fixture may hold more than one member depending on whether the
+/// host shell execs `sh -c "cmd"` in place or forks first (an environment
+/// detail, never product behavior), so every wait below is on the observable
+/// extinction, never on a fixed wall clock.
 fn spawn_own_group_child(script: &str) -> std::process::Child {
     use std::os::unix::process::CommandExt as _;
     std::process::Command::new("sh")
@@ -37,8 +41,20 @@ fn spawn_own_group_child(script: &str) -> std::process::Child {
         .expect("fixture child spawns")
 }
 
+/// Spawn a bare `sleep` as its own process-group leader: no shell layer, so
+/// the leader is provably the group's only member on every host and
+/// `kill(leader)` + reap extinguishes the group exactly.
+fn spawn_own_group_sleep() -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+    std::process::Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("fixture sleep spawns")
+}
+
 fn wait_group_dead(pid: u32, label: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + crate::GROUP_EXTINCTION_CEILING;
     while group_exists(pid) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -241,6 +257,10 @@ fn guardian_action_exit_codes_are_frozen() {
 /// is reaped.
 #[test]
 fn process_probe_boundaries_are_exact() {
+    // Serialized with the other process-spawning fixtures: on a slowed
+    // (emulated/VM) runner, concurrent fixture churn must never make a
+    // reaped pid's group observable again.
+    let _serial = crate::test_serial();
     assert_eq!(process_start_time(0), None, "pid 0 has no start time");
     assert!(!group_exists(0), "pgid 0 is never a group");
     assert_eq!(
@@ -268,7 +288,7 @@ fn process_probe_boundaries_are_exact() {
         "the never-assigned pid must be provably gone"
     );
 
-    let mut child = spawn_own_group_child("sleep 30");
+    let mut child = spawn_own_group_sleep();
     let pid = child.id();
     assert!(
         group_exists(pid),
