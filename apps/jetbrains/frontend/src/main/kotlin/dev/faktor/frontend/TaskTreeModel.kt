@@ -236,6 +236,186 @@ data class VerificationSummary(
     }
 }
 
+// ------------------------------------------------------------- run states
+
+/**
+ * The verbatim design-state copy of the run-status surfaces (state matrix
+ * contract). Every string is rendered exactly as written — never
+ * paraphrased. `ACTION` strings name the design action; a surface renders
+ * the action only when an EXISTING control carries it, and states whose
+ * action has no affordance render label+copy only (no button is invented).
+ */
+object RunStateCopy {
+    /** T06 — the composer ready/empty state. */
+    const val READY_LABEL = "Ready"
+    const val READY_COPY = "Describe a task or ask a question."
+    const val READY_ACTION = "Run task"
+
+    /** T07 — the captured draft is being admitted once. */
+    const val STARTING_LABEL = "Starting the run"
+    const val STARTING_COPY = "Your captured draft is being admitted once."
+    const val STARTING_ACTION = "Wait"
+
+    /** T08 — the start response was lost; the same submission is retried. */
+    const val START_RESPONSE_UNAVAILABLE_LABEL = "Start response unavailable"
+    const val START_RESPONSE_UNAVAILABLE_COPY =
+        "The draft was kept. Retry checks the same logical submission."
+    const val START_RESPONSE_UNAVAILABLE_ACTION = "Review and retry"
+
+    /** T09 — the run works on an isolated candidate. */
+    const val RUNNING_LABEL = "Running"
+    const val RUNNING_COPY = "The candidate is separate from your workspace."
+    const val RUNNING_ACTION = "Inspect / Stop current run"
+
+    /** T11 — the run awaits a decision or clarification. */
+    const val NEEDS_INPUT_LABEL = "Needs your input"
+    const val NEEDS_INPUT_COPY = "The run is waiting for a decision or clarification."
+    const val NEEDS_INPUT_ACTION = "Reply in composer"
+
+    /** T12 — the candidate is being checked with its required results attached. */
+    const val CHECKING_LABEL = "Checking the change"
+    const val CHECKING_COPY = "Required results remain attached to this candidate."
+    const val CHECKING_ACTION = "Inspect verification"
+
+    /** T19 — the workspace no longer matches the integration basis. */
+    const val WORKSPACE_CHANGED_LABEL = "Workspace changed"
+    const val WORKSPACE_CHANGED_COPY =
+        "The current workspace no longer matches the integration basis."
+    const val WORKSPACE_CHANGED_ACTION = "Inspect conflict"
+
+    /** T21 — a requested finish action lacks a succeeded durable result. */
+    const val FINISH_ACTION_PENDING_LABEL = "Finish action pending"
+    const val FINISH_ACTION_PENDING_COPY = "A requested action lacks a succeeded durable result."
+    const val FINISH_ACTION_PENDING_ACTION = "View finish actions"
+
+    /** T25 — cancellation is terminal, never verification success. */
+    const val RUN_CANCELLED_LABEL = "Run cancelled"
+    const val RUN_CANCELLED_COPY =
+        "Cancellation is a terminal run outcome, not verification success."
+    const val RUN_CANCELLED_ACTION = "Review recorded work / New task"
+
+    /** T26 — the failed result and reason stay inspectable. */
+    const val RUN_FAILED_LABEL = "Run failed"
+    const val RUN_FAILED_COPY = "The result and reason remain available for inspection."
+    const val RUN_FAILED_ACTION = "Inspect result"
+}
+
+/**
+ * One design run-status row: the exact state-matrix label with its
+ * supporting copy. `action` names the design action when an existing
+ * control serves it; null means the action has no affordance, so the
+ * surface renders label+copy only.
+ */
+data class RunStateView(
+    val label: String,
+    val copy: String,
+    val action: String? = null
+)
+
+/**
+ * The design run state of the CLIENT start lifecycle, fresher than any
+ * served snapshot: a captured start in flight is T07; a retained submission
+ * after a lost start response is T08. Not starting and nothing retained is
+ * no state (the strip falls through to the served run tag).
+ */
+fun runStateViewForStart(inFlight: Boolean, submissionRetained: Boolean): RunStateView? = when {
+    inFlight -> RunStateView(
+        RunStateCopy.STARTING_LABEL,
+        RunStateCopy.STARTING_COPY,
+        null
+    )
+    submissionRetained -> RunStateView(
+        RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL,
+        RunStateCopy.START_RESPONSE_UNAVAILABLE_COPY,
+        RunStateCopy.START_RESPONSE_UNAVAILABLE_ACTION
+    )
+    else -> null
+}
+
+/**
+ * The design run state of one served task-run state tag
+ * (`GET /native/session/{id}/task-runs`). The daemon serves exactly
+ * Done | Running | Pending | Blocked | Failed | Cancelled | Unknown:
+ * `Blocked` is produced ONLY by `AgentState::NeedsUserInput`
+ * (`session_run_state_tag` in the daemon's native agents projection), so it
+ * is the served awaiting-input condition (T11). Done / Pending / Unknown
+ * carry no design run state and stay null: the strip then renders its
+ * served facts only.
+ */
+fun runStateViewForRunTag(tag: String?): RunStateView? = when {
+    tag == null -> null
+    tag.equals("Running", ignoreCase = true) -> RunStateView(
+        RunStateCopy.RUNNING_LABEL,
+        RunStateCopy.RUNNING_COPY,
+        RunStateCopy.RUNNING_ACTION
+    )
+    tag.equals("Blocked", ignoreCase = true) -> RunStateView(
+        RunStateCopy.NEEDS_INPUT_LABEL,
+        RunStateCopy.NEEDS_INPUT_COPY,
+        RunStateCopy.NEEDS_INPUT_ACTION
+    )
+    tag.equals("Failed", ignoreCase = true) -> RunStateView(
+        RunStateCopy.RUN_FAILED_LABEL,
+        RunStateCopy.RUN_FAILED_COPY,
+        RunStateCopy.RUN_FAILED_ACTION
+    )
+    tag.equals("Cancelled", ignoreCase = true) -> RunStateView(
+        RunStateCopy.RUN_CANCELLED_LABEL,
+        RunStateCopy.RUN_CANCELLED_COPY,
+        RunStateCopy.RUN_CANCELLED_ACTION
+    )
+    else -> null
+}
+
+/**
+ * T12 from the proof's served task state
+ * (`GET /native/tasks/{id}/proof` -> `task.state`). `verifying` and
+ * `needs_verification` are the two checking states; the session/task-run
+ * view collapses both into its `Running` tag, so the proof read is what
+ * refines them into T12. Any other served state — or none — maps to null:
+ * the run tag already names it, and a missing state is never fabricated
+ * into a checking state.
+ */
+fun runStateViewForProofTaskState(proofTaskState: String?): RunStateView? = when {
+    proofTaskState.equals("verifying", ignoreCase = true) ||
+        proofTaskState.equals("needs_verification", ignoreCase = true) -> RunStateView(
+        RunStateCopy.CHECKING_LABEL,
+        RunStateCopy.CHECKING_COPY,
+        RunStateCopy.CHECKING_ACTION
+    )
+    else -> null
+}
+
+/**
+ * The design run state of the run summary strip, composed from every served
+ * source in honest precedence:
+ *
+ *  1. the CLIENT start lifecycle (T07 admitted once / T08 lost response) is
+ *     fresher than any served snapshot and always wins;
+ *  2. a run tag that already carries its own design state — T26 `Failed` /
+ *     T25 `Cancelled` settle the run, T11 `Blocked` awaits the operator —
+ *     outranks the proof's T12: a settled or awaiting run is not
+ *     "checking";
+ *  3. T12 `Checking the change` from the proof's served task state
+ *     (`verifying` / `needs_verification`) refines the collapsed `Running`
+ *     tag (and fills in the Done / Pending / Unknown tags, which carry no
+ *     design state of their own);
+ *  4. otherwise the tag's own design state (T09 `Running`) — or nothing.
+ */
+fun runStateViewForRun(
+    startInFlight: Boolean,
+    submissionRetained: Boolean,
+    runTag: String?,
+    proofTaskState: String?
+): RunStateView? {
+    runStateViewForStart(startInFlight, submissionRetained)?.let { return it }
+    val tagView = runStateViewForRunTag(runTag)
+    if (tagView != null && !"Running".equals(runTag, ignoreCase = true)) {
+        return tagView
+    }
+    return runStateViewForProofTaskState(proofTaskState) ?: tagView
+}
+
 /** One completion-contract step as the tree renders it. */
 data class CompletionStepView(
     val step: String,
@@ -260,7 +440,31 @@ data class CompletionView(
     val steps: List<CompletionStepView>,
     val source: String,
     val reason: String?
-)
+) {
+    /** The requested conditional steps of the contract, in gate order. */
+    fun requestedSteps(): List<String> {
+        val requested = ArrayList<String>()
+        if (includeCommit) requested.add("commit")
+        if (includePush) requested.add("push")
+        if (includePr) requested.add("pr")
+        return requested
+    }
+
+    /**
+     * T21: TRUE when a requested finish action lacks a succeeded durable
+     * result — the served/derived rows do not carry it as `succeeded`
+     * (`pending`/`unknown`/`missing`), or the requested step has no row at
+     * all. Only then does the surface render the exact T21 label+copy;
+     * an all-succeeded contract never renders it.
+     */
+    val finishActionPending: Boolean
+        get() = requestedSteps().any { step ->
+            steps.none { row ->
+                row.step.equals(step, ignoreCase = true) &&
+                    row.status.equals("succeeded", ignoreCase = true)
+            }
+        }
+}
 
 /** One durable completion step of the proof drill-down. */
 data class ProofStepView(
@@ -476,7 +680,14 @@ data class ProofView(
             if (!served.present) return listOf("○ Not integrated")
             val conflictCount = served.conflictCount
             if (conflictCount != null && conflictCount > 0L) {
-                return listOf("! Conflict")
+                // T19: the pinned `! Conflict` fact is KEPT and the exact
+                // label+copy ride alongside it; "Inspect conflict" has no
+                // control here, so no action is rendered.
+                return listOf(
+                    "! Conflict",
+                    RunStateCopy.WORKSPACE_CHANGED_LABEL,
+                    RunStateCopy.WORKSPACE_CHANGED_COPY
+                )
             }
             if (served.inFlight == true) return listOf("… Integrating")
         }

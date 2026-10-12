@@ -83,10 +83,84 @@
     },
   };
 
+  // The approved composer/run state copy (T06/T07/T08/T09/T11/T12/T25/T26).
+  // Every strip renders one glyph plus the exact mandated label and
+  // supporting copy; the useful action stays the EXISTING control (Run task,
+  // the approval card, Cancel run, the Inspect subviews, the kept draft and
+  // New task) — no duplicate action buttons are invented here.
+  var COMPOSER_STATES = {
+    ready: {
+      glyph: '\u2713',
+      label: 'Ready',
+      copy: 'Describe a task or ask a question.',
+    },
+    starting: {
+      glyph: '\u2026',
+      label: 'Starting the run',
+      copy: 'Your captured draft is being admitted once.',
+    },
+    startUnavailable: {
+      glyph: '!',
+      label: 'Start response unavailable',
+      copy: 'The draft was kept. Retry checks the same logical submission.',
+    },
+    needsInput: {
+      glyph: '!',
+      label: 'Needs your input',
+      copy: 'The run is waiting for a decision or clarification.',
+    },
+  };
+  var RUN_STATES = {
+    running: {
+      glyph: '\u25b6',
+      label: 'Running',
+      copy: 'The candidate is separate from your workspace.',
+    },
+    checking: {
+      glyph: '\u2026',
+      label: 'Checking the change',
+      copy: 'Required results remain attached to this candidate.',
+    },
+    cancelled: {
+      glyph: '\u2298',
+      label: 'Run cancelled',
+      copy: 'Cancellation is a terminal run outcome, not verification success.',
+    },
+    failed: {
+      glyph: '\u2717',
+      label: 'Run failed',
+      copy: 'The result and reason remain available for inspection.',
+    },
+  };
+  var COMPOSER_STATE_IDS = {
+    container: 'composer-state',
+    glyph: 'composer-state-glyph',
+    label: 'composer-state-label',
+    copy: 'composer-state-copy',
+  };
+  var RUN_STATE_IDS = {
+    container: 'run-state',
+    glyph: 'run-state-glyph',
+    label: 'run-state-label',
+    copy: 'run-state-copy',
+  };
+
   // One logical submission at a time. The flag gates the composer BEFORE the
   // post, so a double click / Enter+click race can never emit a second
   // sendGoal; it is released ONLY by an explicit host result.
   var submitting = false;
+  /**
+   * True after the host explicitly reported a RETRYABLE failed start
+   * (`startResult` ok false with `retryable: true`): the draft was kept and
+   * the retry checks the same logical submission. A typed refusal keeps the
+   * draft but never sets this row. Cleared by the next submission and by a
+   * durable start.
+   */
+  var startFailed = false;
+  /** The last served session agent state (`needs_user_input` = T11). */
+  var machineStateValue = 'unknown';
+  /** True while a non-terminal run is tracked (T06 stays for the idle panel). */
+  var runActive = false;
   /** True while a board post awaits its durable ack (double-click guard). */
   var boardPosting = false;
   /** The exact draft a board post submitted (token-correlated ack). */
@@ -1635,19 +1709,25 @@
     }
   }
 
-  function renderTask(task, view, agents) {
+  function renderTask(snapshot) {
+    var task = snapshot ? snapshot.task : null;
     var card = byId('task-card');
-    // No task, no run strip: an empty card full of em-dashes would be pure
-    // noise. The Inspect sections carry whatever metadata outlives the task.
-    if (!task) {
+    var spec = runStateSpec(snapshot);
+    // No task and no served run condition: an empty card full of em-dashes
+    // would be pure noise. The Inspect sections carry whatever metadata
+    // outlives the task. A served run condition (a terminal task-run row or
+    // the proof's embedded task state) still renders its own strip.
+    if (!task && spec === null) {
       card.hidden = true;
+      writeStateStrip(RUN_STATE_IDS, null);
       return;
     }
     card.hidden = false;
     renderRunStrip(task);
+    writeStateStrip(RUN_STATE_IDS, spec);
     renderTaskProgress(task);
     renderTaskTests(task);
-    renderTaskAgents(agents);
+    renderTaskAgents(snapshot ? snapshot.agents : null);
     setText('task-goal', task ? task.goal : '—');
     renderCompletion(task);
   }
@@ -1690,6 +1770,107 @@
     node.textContent = state.length > 0 ? state : '—';
     node.className = 'state-chip state-' + bucket;
     node.setAttribute('data-state', bucket);
+  }
+
+  /**
+   * One state strip: glyph + label + supporting copy, text-first (the glyph
+   * is never the only signal). A null spec hides the strip and leaves the
+   * last text in place; nothing is rendered for an unserved condition.
+   */
+  function writeStateStrip(ids, spec) {
+    var container = byId(ids.container);
+    if (!container) {
+      return;
+    }
+    container.hidden = spec === null;
+    if (spec === null) {
+      return;
+    }
+    // Same-value writes are skipped: an unchanged row must not re-announce
+    // itself through the strip's live region on every snapshot.
+    var glyph = byId(ids.glyph);
+    if (glyph && glyph.textContent !== spec.glyph) {
+      glyph.textContent = spec.glyph;
+    }
+    var label = byId(ids.label);
+    if (label && label.textContent !== spec.label) {
+      label.textContent = spec.label;
+    }
+    var copy = byId(ids.copy);
+    if (copy && copy.textContent !== spec.copy) {
+      copy.textContent = spec.copy;
+    }
+  }
+
+  /**
+   * The served run-state strip (T09/T12/T25/T26). Every source is genuinely
+   * served, and no source can fabricate a row:
+   *   - the newest durable task-run row (`snapshot.runs[0]`, the same row the
+   *     host reads the proof for): `cancelled` -> T25, `failed` -> T26,
+   *     `running` -> T09;
+   *   - the proof body's embedded full task state (`snapshot.proofTaskState`,
+   *     from `GET /native/tasks/{id}/proof`): `verifying` /
+   *     `needs_verification` -> T12, ahead of T09 because the run row of a
+   *     verifying task is still served as `running`;
+   *   - the collapsed session tag may keep T09 while it reads `running`.
+   * The collapsed session tag alone (`running|in_progress|done|idle`) can
+   * never render T12/T25/T26; any other served value renders nothing new —
+   * the chip above already names it. The useful actions stay the existing
+   * controls (Inspect, Cancel run, the conversation and New task).
+   */
+  function runStateSpec(snapshot) {
+    var runs = snapshot && Array.isArray(snapshot.runs) ? snapshot.runs : [];
+    var newest = runs.length > 0 ? runs[0] : null;
+    var runState =
+      newest && newest.state != null ? String(newest.state).trim().toLowerCase() : '';
+    if (runState === 'cancelled') {
+      return RUN_STATES.cancelled;
+    }
+    if (runState === 'failed') {
+      return RUN_STATES.failed;
+    }
+    var proofState = String(
+      snapshot && snapshot.proofTaskState != null ? snapshot.proofTaskState : '',
+    )
+      .trim()
+      .toLowerCase();
+    if (proofState === 'verifying' || proofState === 'needs_verification') {
+      return RUN_STATES.checking;
+    }
+    if (runState === 'running') {
+      return RUN_STATES.running;
+    }
+    var tag = String(
+      snapshot && snapshot.task && snapshot.task.state != null ? snapshot.task.state : '',
+    )
+      .trim()
+      .toLowerCase();
+    if (tag === 'running') {
+      return RUN_STATES.running;
+    }
+    return null;
+  }
+
+  /**
+   * The composer state strip (T06/T07/T08/T11). Precedence follows the
+   * served signals: an in-flight submission is being admitted once; a kept
+   * failed start stays until the next submission; a served
+   * `needs_user_input` machine state asks for a reply in the composer; the
+   * READY row renders only from the served ready preflight with no active
+   * run. Nothing renders when no served condition holds.
+   */
+  function renderComposerState() {
+    var spec = null;
+    if (submitting) {
+      spec = COMPOSER_STATES.starting;
+    } else if (startFailed) {
+      spec = COMPOSER_STATES.startUnavailable;
+    } else if (machineStateValue === 'needs_user_input') {
+      spec = COMPOSER_STATES.needsInput;
+    } else if (lastPreflight && lastPreflight.state === 'ready' && !runActive) {
+      spec = COMPOSER_STATES.ready;
+    }
+    writeStateStrip(COMPOSER_STATE_IDS, spec);
   }
 
   /** One compact chip in a run-meta slot; an empty value hides the slot. */
@@ -3693,6 +3874,11 @@
       renderAttachments();
     }
     currentSessionId = sessionId;
+    machineStateValue =
+      typeof snapshot.machineState === 'string' && snapshot.machineState.length > 0
+        ? snapshot.machineState
+        : 'unknown';
+    runActive = snapshot.busy === true || snapshot.activeRunId != null;
     streamStatusValue =
       typeof snapshot.streamStatus === 'string' && snapshot.streamStatus.length > 0
         ? snapshot.streamStatus
@@ -3709,8 +3895,9 @@
     setText('index-coverage', indexCoverageText(snapshot));
     renderComposerModel(snapshot.session);
     renderPreflight(snapshot.preflight);
+    renderComposerState();
     renderStreamRecovery(streamStatusValue);
-    renderTask(snapshot.task, snapshot.cockpit, snapshot.agents);
+    renderTask(snapshot);
     renderPermissions(snapshot.permissions);
     renderInspectContent(snapshot);
     renderBreadcrumb(snapshot);
@@ -3950,6 +4137,7 @@
       }
     }
     renderAttachments();
+    renderComposerState();
   }
 
   window.addEventListener('message', function (event) {
@@ -4004,8 +4192,14 @@
       }
     } else if (message.type === 'startResult') {
       // The explicit result releases the submitting lock on EVERY outcome.
-      setSubmitting(false);
+      // A failed start kept the draft: T08 `Start response unavailable`
+      // renders ONLY when the host classified the failure retryable (a lost
+      // response reuses the SAME logical submission); a typed refusal keeps
+      // the draft but ends that submission. The retry itself is always the
+      // OPERATOR's next Run task.
       var ok = message.ok === true;
+      startFailed = !ok && message.retryable === true;
+      setSubmitting(false);
       var goalNode = byId('goal');
       if (goalNode) {
         goalNode.value = composerPolicy.afterStart(goalNode.value, message.goal, ok);
@@ -4234,6 +4428,8 @@
       message.budgetCostMicro = budget.cost;
     }
     transcriptPinRequested = true;
+    // A new submission supersedes a kept failed start (T08 -> T07).
+    startFailed = false;
     setSubmitting(true);
     vscode.postMessage(message);
   }

@@ -1219,9 +1219,19 @@ fails with `unassigned`; an unconventional tag fails with
   `#attachment-hint`, `#btn-attach`). On a headless runner it prefers a real
   Xvfb display (the pinned image ships it; `FAKTOR_VSCODE_E2E_XVFB=0` selects
   the `--ozone-platform=headless --disable-gpu` fallback, with `--no-sandbox`
-  as root). A host exit without an evidence file is always a failure and the
-  harness folds captured host stdout, VS Code main/renderer/exthost logs and
-  crashdumps into `failure-diagnostic.txt` (no silent pass).
+  as root). The calibration control and every cell launch through ONE helper
+  from the same flag set, with `--verbose` so the app's own stdout/stderr
+  stays in the captured `stdout.log`. Each launch runs with a short-lived
+  runtime user-data dir under `TMPDIR`: VS Code's main-process IPC socket is
+  `<user-data-dir>/1.14-main.sock` and the Linux `sockaddr_un.sun_path` limit
+  is 107 bytes, so a deep workspace path (the CI checkout
+  `/woodpecker/src/github.com/sbelakho2/faktor/…/work/host-*`) makes the app
+  die in `claimInstance` with `listen EINVAL` and exit rc=0 before the test
+  module loads. An over-long TMPDIR is refused typed
+  (`runtime-dir-too-long`) before any host launch. A host exit without an
+  evidence file is always a failure and the harness folds captured host
+  stdout, VS Code main/renderer/exthost logs and crashdumps into
+  `failure-diagnostic.txt` (no silent pass).
   - **Load-aware host timeout (emulated/VM runners).** Emulated x64
     (Rosetta/VM) runners stretch Electron cold start and every in-host wait,
     so the per-cell `timeout` is derived from a same-run control instead of
@@ -1264,9 +1274,9 @@ fails with `unassigned`; an unconventional tag fails with
   lacks them and cannot start the Electron host). `bash scripts/vscode-e2e.sh
   --selftest` proves the pin-tamper, missing-evidence, running,
   calibration-timeout/bad-status, loaded-timeout derivation, cell
-  timeout/killed, policy, failed-check, wrong-version, CLI-only and
-  packaged-VSIX cases without network or a real Electron (Linux-only; run it
-  in the pinned image like the lane).
+  timeout/killed, policy, over-long-runtime refusal, failed-check,
+  wrong-version, CLI-only and packaged-VSIX cases without network or a real
+  Electron (Linux-only; run it in the pinned image like the lane).
 - **Windows visual baseline (`scripts/windows-visual-baseline.ps1`).** The
   `windows-visual-baseline` step runs on the self-hosted Windows agent and is
   part of `certificate-windows`. It FAILS when the pinned baseline has no

@@ -39,6 +39,15 @@
 # (no X). Running as
 # root (`id -u` = 0) adds `--no-sandbox` (Electron refuses to start as root
 # otherwise). FAKTOR_VSCODE_E2E_XVFB=0 forces the headless-ozone fallback.
+# Every launch runs with `--verbose` so the app's own stdout/stderr stays in
+# the captured stdout.log (the CLI otherwise detaches the app's stdio).
+# RUNTIME DIRS: VS Code's main-process IPC socket is <user-data-dir>/
+# 1.14-main.sock; Linux sockaddr_un.sun_path is capped at 107 bytes, so a
+# deep workspace (CI: /woodpecker/src/.../vscode-e2e/work/host-*) makes the
+# app die in claimInstance with `listen EINVAL` and exit rc=0 before the test
+# module loads. All host launches therefore use a short mktemp runtime dir
+# under TMPDIR (validated up front; over-long TMPDIR is a typed refusal) and
+# the harness reads the VS Code logs from that runtime user-data dir.
 # A cell that exits without evidence NEVER passes: the harness captures the
 # host stdout/stderr tail, the newest VS Code main/renderer/extension-host
 # log lines and any crash dumps into $cell_dir/failure-diagnostic.txt and
@@ -470,13 +479,20 @@ run_cli_checks() {
 }
 
 # --------------------------------------------------------------- host launch
+# SINGLE SOURCE OF TRUTH for the pinned-host flag set: the calibration control
+# and every matrix cell launch through launch_host below, which always builds
+# its command from these args (no divergent flag set anywhere). `--verbose`
+# keeps the app's own stdout/stderr attached to the capture file; without it
+# the VS Code CLI detaches the app's stdio and an early app exit leaves an
+# empty diagnostic. The sandbox flag is explicit per uid: root (or an explicit
+# --no-sandbox) gets --no-sandbox, non-root gets none.
 host_launch_args() {
   local args
   if [ "$USE_XVFB" -eq 1 ]; then
     # Xvfb provides the display; do not force Chromium's headless platform.
-    args="--wait --disable-gpu --disable-dev-shm-usage"
+    args="--wait --verbose --disable-gpu --disable-dev-shm-usage"
   else
-    args="--wait --headless --disable-gpu --ozone-platform=headless --disable-dev-shm-usage"
+    args="--wait --verbose --headless --disable-gpu --ozone-platform=headless --disable-dev-shm-usage"
   fi
   if [ "$NO_SANDBOX" -eq 1 ] || [ "$(id -u)" -eq 0 ]; then
     args="$args --no-sandbox"
@@ -486,6 +502,72 @@ host_launch_args() {
 
 pick_free_port() {
   node -e 'const net=require("node:net");const s=net.createServer();s.on("error",()=>process.exit(1));s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close();});' 2>/dev/null
+}
+
+# VS Code's main-process IPC socket lives at <user-data-dir>/1.14-main.sock and
+# the Linux sockaddr_un.sun_path limit is 107 bytes. A deep workspace (the CI
+# checkout is /woodpecker/src/github.com/sbelakho2/faktor/target/certification/
+# vscode-e2e/work/host-*) makes user-data-dir too long, the app dies right
+# after startup with `listen EINVAL` in claimInstance and exits rc=0 with no
+# host module and no evidence -- the calibration rc=0 mystery. Every launch
+# therefore uses a short-lived runtime dir under TMPDIR (only the path string
+# that reaches the socket matters, not where evidence/logs live). The cell dir
+# keeps evidence/progress/stdout logs; the VS Code logs live in the runtime
+# user-data dir and are read from there by host_failure_diagnostic. The socket
+# path is validated up front so an over-long TMPDIR is a typed refusal, never
+# another silent rc=0. Sets RUNTIME_DIR; never call it in a subshell, the
+# typed refusal must exit the whole harness.
+RUNTIME_DIR=""
+make_runtime_dir() { # cell_dir
+  local rt sock
+  RUNTIME_DIR=""
+  rt="$(mktemp -d "${TMPDIR:-/tmp}/fzk-vscode-e2e.XXXXXX")" || return 1
+  mkdir -p "$rt/user-data" "$rt/extensions" || {
+    rm -rf "$rt"
+    return 1
+  }
+  sock="$rt/user-data/1.14-main.sock"
+  if [ "${#sock}" -gt 107 ]; then
+    rm -rf "$rt"
+    fail "runtime-dir-too-long: VS Code IPC socket path is ${#sock} bytes (>107): $sock (set TMPDIR to a shorter path)"
+  fi
+  RUNTIME_DIR="$rt"
+  return 0
+}
+
+# Launches the pinned Electron host for one bounded run through the SAME flag
+# set (host_launch_args) and the SAME short runtime-dir/stdio capture path for
+# the calibration control and every matrix cell. Callers pass per-run env as
+# NAME=VALUE pairs, then `--`, then extra code args (CDP port, device scale
+# factor). The helper adds the shared env, the per-uid sandbox decision, the
+# display flag and the runtime user-data/extensions dirs: one launch path.
+launch_host() { # timeout_s logfile runtime_dir dev_path tests_path [NAME=VALUE...] -- [code args...]
+  local timeout_s="$1" log="$2" rt_dir="$3" dev_path="$4" tests_path="$5"
+  shift 5
+  local -a envp=(
+    FAKTOR_VSCODE_E2E_PACKAGE_MODE="$HOST_PACKAGE_MODE"
+  )
+  [ "$USE_XVFB" -eq 1 ] && envp+=(DISPLAY="$XVFB_DISPLAY")
+  local -a code_args=()
+  local arg seen_sep=0
+  for arg in "$@"; do
+    if [ "$seen_sep" -eq 0 ] && [ "$arg" = "--" ]; then
+      seen_sep=1
+      continue
+    fi
+    if [ "$seen_sep" -eq 0 ]; then
+      envp+=("$arg")
+    else
+      code_args+=("$arg")
+    fi
+  done
+  local -a args
+  # shellcheck disable=SC2206,SC2207 # args are a fixed internal word list
+  args=($(host_launch_args))
+  args+=("${code_args[@]}")
+  args+=(--user-data-dir "$rt_dir/user-data" --extensions-dir "$rt_dir/extensions" \
+    --extensionDevelopmentPath="$dev_path" --extensionTestsPath="$tests_path")
+  run_host_process "$timeout_s" "$log" env "${envp[@]}" "$CODE_BIN" "${args[@]}"
 }
 
 # ------------------------------------------------- child lifecycle + Xvfb
@@ -626,9 +708,10 @@ sanitize_one_line() { tr '\r\n' '  ' | tr -s ' ' | cut -c1-400; }
 # $cell_dir/failure-diagnostic.txt (kept on failure), and fold a bounded
 # one-line summary into the lane reason. The no-silent-pass rule is
 # unchanged: this branch always fails the lane.
-host_failure_diagnostic() { # cell_dir rc
+host_failure_diagnostic() { # cell_dir rc [user_data_dir]
   local cell_dir="$1"
   local rc="$2"
+  local user_data="${3:-$cell_dir/user-data}"
   local diag_file="$cell_dir/failure-diagnostic.txt"
   local log_dir tail_line last_stage
   {
@@ -637,9 +720,10 @@ host_failure_diagnostic() { # cell_dir rc
       echo "--- progress markers (last 30)"
       tail -n 30 "$cell_dir/progress.log"
     fi
-    echo "--- stdout.log tail"
+    echo "--- runtime user-data dir: $user_data (ipc socket $(( ${#user_data} + 15 )) bytes)"
+    echo "--- stdout.log tail (host stdout/stderr; --verbose keeps the app attached)"
     tail -n 40 "$cell_dir/stdout.log" 2>/dev/null || echo "(no stdout.log)"
-    log_dir="$(find "$cell_dir/user-data/logs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
+    log_dir="$(find "$user_data/logs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
     if [ -n "$log_dir" ]; then
       for f in main.log "window1/renderer.log" "window1/exthost.log" exthost.log; do
         [ -f "$log_dir/$f" ] || continue
@@ -647,12 +731,13 @@ host_failure_diagnostic() { # cell_dir rc
         tail -n 25 "$log_dir/$f"
       done
     else
-      echo "--- no VS Code logs under $cell_dir/user-data/logs"
+      echo "--- no VS Code logs under $user_data/logs"
     fi
-    if [ -d "$cell_dir/user-data/crashdumps" ]; then
-      echo "--- crashdumps"
-      ls -l "$cell_dir/user-data/crashdumps" 2>/dev/null
-    fi
+    for crashes in "$user_data/Crashpad" "$user_data/crashdumps"; do
+      [ -d "$crashes" ] || continue
+      echo "--- crash artifacts under $crashes"
+      find "$crashes" -type f 2>/dev/null | tail -n 20
+    done
   } >"$diag_file" 2>&1
   tail_line="$(tail -n 25 "$cell_dir/stdout.log" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 3 | sanitize_one_line)"
   [ -n "$tail_line" ] || tail_line="(host stdout empty)"
@@ -705,18 +790,17 @@ run_calibration() {
   fi
 
   local cal_dir="$WORK_DIR/host-calibration"
-  mkdir -p "$cal_dir/user-data" "$cal_dir/extensions" || fail "evidence-dir-unwritable: dir=$cal_dir"
+  mkdir -p "$cal_dir" || fail "evidence-dir-unwritable: dir=$cal_dir"
   [ -w "$cal_dir" ] || fail "evidence-dir-unwritable: dir=$cal_dir"
   local progress="$cal_dir/progress.log"
   : >"$progress"
   local evidence="$cal_dir/evidence.json"
   rm -f "$evidence"
+  make_runtime_dir "$cal_dir" || fail "runtime-dir-unavailable: mktemp failed under ${TMPDIR:-/tmp}"
+  local rt_dir="$RUNTIME_DIR"
 
   local display="ozone-headless"
   [ "$USE_XVFB" -eq 1 ] && display="xvfb"
-  local -a args
-  # shellcheck disable=SC2206,SC2207 # args are a fixed internal word list
-  args=($(host_launch_args))
   stage_line "$progress" calibration-start "display=$display bounded=${CALIBRATION_TIMEOUT}s"
   stage_line "$PROGRESS_RUN_LOG" calibration-start "display=$display bounded=${CALIBRATION_TIMEOUT}s"
 
@@ -732,33 +816,24 @@ run_calibration() {
 
   local start_ms
   start_ms="$(now_ms)" || fail "clock-unavailable: node wall-clock unavailable"
-  stage_line "$progress" electron-spawn "timeout=${CALIBRATION_TIMEOUT}s code=$CODE_BIN"
-
-  local -a envp=(
-    FAKTOR_VSCODE_E2E_EVIDENCE="$evidence"
-    FAKTOR_VSCODE_E2E_MATRIX="calibration"
-    FAKTOR_VSCODE_E2E_CELL="calibration"
-    FAKTOR_VSCODE_E2E_PROGRESS="$progress"
-    FAKTOR_VSCODE_E2E_PACKAGE_MODE="$HOST_PACKAGE_MODE"
-  )
-  [ "$USE_XVFB" -eq 1 ] && envp+=(DISPLAY="$XVFB_DISPLAY")
+  stage_line "$progress" electron-spawn "timeout=${CALIBRATION_TIMEOUT}s runtime=$rt_dir code=$CODE_BIN"
 
   local rc=0
-  run_host_process "$CALIBRATION_TIMEOUT" "$cal_dir/stdout.log" env "${envp[@]}" \
-    "$CODE_BIN" "${args[@]}" \
-    --user-data-dir "$cal_dir/user-data" \
-    --extensions-dir "$cal_dir/extensions" \
-    --extensionDevelopmentPath="$HOST_EXTENSION_DIR" \
-    --extensionTestsPath="$CALIBRATION_HOST" || rc=$?
+  launch_host "$CALIBRATION_TIMEOUT" "$cal_dir/stdout.log" "$rt_dir" \
+    "$HOST_EXTENSION_DIR" "$CALIBRATION_HOST" \
+    "FAKTOR_VSCODE_E2E_EVIDENCE=$evidence" \
+    "FAKTOR_VSCODE_E2E_MATRIX=calibration" \
+    "FAKTOR_VSCODE_E2E_CELL=calibration" \
+    "FAKTOR_VSCODE_E2E_PROGRESS=$progress" || rc=$?
   kill_xvfb
   local stage_at_exit
   stage_at_exit="$(last_stage_of "$progress")"
   stage_line "$progress" host-exit "rc=$rc"
 
   if [ ! -s "$evidence" ]; then
-    reap_cell "$cal_dir/user-data"
+    reap_cell "$rt_dir"
     local cal_diag
-    cal_diag="$(host_failure_diagnostic "$cal_dir" "$rc")"
+    cal_diag="$(host_failure_diagnostic "$cal_dir" "$rc" "$rt_dir/user-data")"
     echo "vscode-e2e: calibration host failure diagnostic ($cal_dir/failure-diagnostic.txt):" >&2
     sed -n '1,80p' "$cal_dir/failure-diagnostic.txt" >&2 2>/dev/null || true
     if [ "$rc" -eq 124 ]; then
@@ -814,6 +889,9 @@ run_calibration() {
     "$(json_escape "$activation_error")" "$(json_escape "$evidence")")"
   stage_line "$progress" calibration-done "control_ms=$control_ms control_s=$control_s wait_factor=$WAIT_FACTOR effective_timeout_s=$EFFECTIVE_HOST_TIMEOUT"
   stage_line "$PROGRESS_RUN_LOG" calibration-done "control_ms=$control_ms wait_factor=$WAIT_FACTOR effective_timeout_s=$EFFECTIVE_HOST_TIMEOUT cap=$HOST_TIMEOUT_CAP"
+  if [ "$KEEP" -eq 0 ]; then
+    rm -rf "$rt_dir"
+  fi
 }
 
 run_extension_host() {
@@ -831,23 +909,18 @@ run_extension_host() {
   for spec in "${MATRIX_CELLS[@]}"; do
     IFS=: read -r cell dpr mode <<<"$spec"
     local cell_dir="$WORK_DIR/host-$cell"
-    mkdir -p "$cell_dir/user-data" "$cell_dir/extensions" || fail "evidence-dir-unwritable: cell=$cell dir=$cell_dir"
+    mkdir -p "$cell_dir" || fail "evidence-dir-unwritable: cell=$cell dir=$cell_dir"
     [ -w "$cell_dir" ] || fail "evidence-dir-unwritable: cell=$cell dir=$cell_dir"
     local progress="$cell_dir/progress.log"
     : >"$progress"
     local evidence="$cell_dir/evidence.json"
     rm -f "$evidence"
+    make_runtime_dir "$cell_dir" || fail "runtime-dir-unavailable: cell=$cell mktemp failed under ${TMPDIR:-/tmp}"
+    local rt_dir="$RUNTIME_DIR"
     local cdp_port
     cdp_port="$(pick_free_port)" || fail "cdp-port-unavailable: no free loopback port for cell $cell"
     [ -n "$cdp_port" ] || fail "cdp-port-unavailable: no free loopback port for cell $cell"
 
-    local -a args
-    # shellcheck disable=SC2206,SC2207 # args are a fixed internal word list
-    args=($(host_launch_args))
-    args+=(--remote-debugging-port="$cdp_port" --remote-allow-origins='*')
-    if [ "$dpr" != "1" ]; then
-      args+=(--force-device-scale-factor="$dpr")
-    fi
     local display="ozone-headless"
     [ "$USE_XVFB" -eq 1 ] && display="xvfb"
     echo "vscode-e2e: cell $cell (mode=$mode dpr=$dpr cdp=$cdp_port display=$display) launching pinned Extension Host ($VSCODE_VERSION)" >&2
@@ -863,39 +936,36 @@ run_extension_host() {
       stage_line "$progress" xvfb-up "display=$XVFB_DISPLAY pid=$XVFB_PID"
     fi
 
-    stage_line "$progress" electron-spawn "timeout=${EFFECTIVE_HOST_TIMEOUT}s requested=${HOST_TIMEOUT}s control_ms=${CONTROL_MS:-unmeasured} wait_factor=$WAIT_FACTOR code=$CODE_BIN"
-    local -a envp=(
-      FAKTOR_VSCODE_E2E_EVIDENCE="$evidence"
-      FAKTOR_VSCODE_E2E_PIN_VERSION="$VSCODE_VERSION"
-      FAKTOR_VSCODE_E2E_PIN_COMMIT="$VSCODE_COMMIT"
-      FAKTOR_VSCODE_E2E_CDP_PORT="$cdp_port"
-      FAKTOR_VSCODE_E2E_MATRIX="$mode"
-      FAKTOR_VSCODE_E2E_CELL="$cell"
-      FAKTOR_VSCODE_E2E_EXPECT_DPR="$dpr"
-      FAKTOR_VSCODE_E2E_PACKAGE_MODE="$HOST_PACKAGE_MODE"
-      FAKTOR_VSCODE_E2E_PROGRESS="$progress"
-      FAKTOR_VSCODE_E2E_TIMEOUT_SECONDS="$EFFECTIVE_HOST_TIMEOUT"
-      FAKTOR_VSCODE_E2E_WAIT_FACTOR="$WAIT_FACTOR"
-      FAKTOR_VSCODE_E2E_CALIBRATION_MS="${CONTROL_MS:-0}"
-    )
-    [ "$USE_XVFB" -eq 1 ] && envp+=(DISPLAY="$XVFB_DISPLAY")
+    stage_line "$progress" electron-spawn "timeout=${EFFECTIVE_HOST_TIMEOUT}s requested=${HOST_TIMEOUT}s control_ms=${CONTROL_MS:-unmeasured} wait_factor=$WAIT_FACTOR runtime=$rt_dir code=$CODE_BIN"
+    local -a code_args=(--remote-debugging-port="$cdp_port" --remote-allow-origins='*')
+    if [ "$dpr" != "1" ]; then
+      code_args+=(--force-device-scale-factor="$dpr")
+    fi
 
     local rc=0
-    run_host_process "$EFFECTIVE_HOST_TIMEOUT" "$cell_dir/stdout.log" env "${envp[@]}" \
-      "$CODE_BIN" "${args[@]}" \
-      --user-data-dir "$cell_dir/user-data" \
-      --extensions-dir "$cell_dir/extensions" \
-      --extensionDevelopmentPath="$host_dir" \
-      --extensionTestsPath="$EXTENSION_HOST_SMOKE" || rc=$?
+    launch_host "$EFFECTIVE_HOST_TIMEOUT" "$cell_dir/stdout.log" "$rt_dir" \
+      "$host_dir" "$EXTENSION_HOST_SMOKE" \
+      "FAKTOR_VSCODE_E2E_EVIDENCE=$evidence" \
+      "FAKTOR_VSCODE_E2E_PIN_VERSION=$VSCODE_VERSION" \
+      "FAKTOR_VSCODE_E2E_PIN_COMMIT=$VSCODE_COMMIT" \
+      "FAKTOR_VSCODE_E2E_CDP_PORT=$cdp_port" \
+      "FAKTOR_VSCODE_E2E_MATRIX=$mode" \
+      "FAKTOR_VSCODE_E2E_CELL=$cell" \
+      "FAKTOR_VSCODE_E2E_EXPECT_DPR=$dpr" \
+      "FAKTOR_VSCODE_E2E_PROGRESS=$progress" \
+      "FAKTOR_VSCODE_E2E_TIMEOUT_SECONDS=$EFFECTIVE_HOST_TIMEOUT" \
+      "FAKTOR_VSCODE_E2E_WAIT_FACTOR=$WAIT_FACTOR" \
+      "FAKTOR_VSCODE_E2E_CALIBRATION_MS=${CONTROL_MS:-0}" \
+      -- "${code_args[@]}" || rc=$?
     kill_xvfb
     local stage_at_exit
     stage_at_exit="$(last_stage_of "$progress")"
     stage_line "$progress" host-exit "rc=$rc"
 
     if [ ! -s "$evidence" ]; then
-      reap_cell "$cell_dir/user-data"
+      reap_cell "$rt_dir"
       local host_diag
-      host_diag="$(host_failure_diagnostic "$cell_dir" "$rc")"
+      host_diag="$(host_failure_diagnostic "$cell_dir" "$rc" "$rt_dir/user-data")"
       echo "vscode-e2e: cell $cell host failure diagnostic ($cell_dir/failure-diagnostic.txt):" >&2
       sed -n '1,80p' "$cell_dir/failure-diagnostic.txt" >&2 2>/dev/null || true
       case "$rc" in
@@ -928,12 +998,15 @@ run_extension_host() {
       }
       process.stdout.write("ok");
     ' "$evidence" "$cell" 2>&1)" || {
-      reap_cell "$cell_dir/user-data"
+      reap_cell "$rt_dir"
       fail "extension-host-checks-failed: $cell_status"
     }
     evidence_files+=("$evidence")
     stage_line "$progress" verdict-passed "cell=$cell"
     echo "vscode-e2e: cell $cell checks passed" >&2
+    if [ "$KEEP" -eq 0 ]; then
+      rm -rf "$rt_dir"
+    fi
   done
 
   node -e '
@@ -1200,6 +1273,20 @@ selftest() {
   rc=$?
   check "invalid timeout policy fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
   check "invalid timeout policy typed reason" "$(printf '%s' "$(reason_of "$out")" | grep -q '^timeout-policy-invalid' && echo 0 || echo 1)"
+
+  # 3i. a runtime dir whose VS Code IPC socket path exceeds unix(7)'s
+  #     sockaddr_un limit is refused typed before any host launch. This is
+  #     the deep-CI-workspace class where the app died with `listen EINVAL`
+  #     and exited rc=0 with no evidence; it must never pass silently.
+  out="$tmp/long-runtime.json"
+  long_tmp="$tmp/$(printf 'p%.0s' $(seq 1 110))"
+  mkdir -p "$long_tmp"
+  TMPDIR="$long_tmp" FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
+    bash "$SELF" --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-long-runtime" \
+    >"$tmp/longrt.stdout" 2>"$tmp/longrt.stderr"
+  rc=$?
+  check "over-long runtime path fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "over-long runtime typed reason" "$(printf '%s' "$(reason_of "$out")" | grep -q '^runtime-dir-too-long' && echo 0 || echo 1)"
 
   # 4. a failing host check fails the lane
   out="$tmp/failed-check.json"

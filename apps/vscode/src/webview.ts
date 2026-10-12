@@ -93,10 +93,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /**
    * The result of one `sendGoal`: the built-in composer clears its draft
    * ONLY when `ok` is true and the textarea still holds the submitted goal
-   * (see media/composer-state.js).
+   * (see media/composer-state.js). A failed result carries its `retryable`
+   * classification: only a lost/unavailable start response reuses the SAME
+   * logical submission on retry (T08 `Start response unavailable`); a typed
+   * local refusal ends the submission and keeps only the draft.
    */
-  postStartResult(goal: string, ok: boolean): void {
-    this.post({ type: 'startResult', goal, ok });
+  postStartResult(goal: string, ok: boolean, retryable = false): void {
+    this.post(
+      ok ? { type: 'startResult', goal, ok: true } : { type: 'startResult', goal, ok: false, retryable },
+    );
   }
 
   /**
@@ -104,11 +109,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * text travels back verbatim through `startResult` with `ok: false`, so
    * the draft (and its completion contract) is kept for the retry and never
    * silently lost. The failure message itself was already surfaced through
-   * `postNotice`.
+   * `postNotice`. `retryable` mirrors the host gate: a transport-class loss
+   * keeps the logical submission id, a typed refusal ends it.
    */
-  postSendMessageFailed(pending: { readonly text: string }, error: string): void {
+  postSendMessageFailed(
+    pending: { readonly text: string },
+    error: string,
+    retryable: boolean,
+  ): void {
     console.error(`[faktor-chat] task start failed; the draft was kept: ${error}`);
-    this.post({ type: 'startResult', goal: pending.text, ok: false });
+    this.post({ type: 'startResult', goal: pending.text, ok: false, retryable });
   }
 
   /**
@@ -305,6 +315,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span class="spacer"></span>
       <button id="btn-cancel-run" class="secondary" type="button">Cancel run</button>
     </div>
+    <div id="run-state" class="state-strip run-state" role="status" hidden>
+      <span id="run-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
+      <span id="run-state-label" class="state-strip-label"></span>
+      <span id="run-state-copy" class="state-strip-copy muted"></span>
+    </div>
     <div id="task-goal" class="run-goal"></div>
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
@@ -393,6 +408,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <label for="contract-budget-cost" class="composer-label">Per-run cost budget — micro-USD, exact non-negative integer, empty uses the setting</label>
       <input id="contract-budget-cost" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 5000000" />
     </details>
+    <div id="composer-state" class="state-strip composer-state" role="status" hidden>
+      <span id="composer-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
+      <span id="composer-state-label" class="state-strip-label"></span>
+      <span id="composer-state-copy" class="state-strip-copy muted"></span>
+    </div>
     <div class="composer-actions">
       <button id="btn-send" class="primary-action" type="submit">Run task</button>
       <button id="btn-new-task" class="secondary" type="button">New task…</button>

@@ -735,6 +735,37 @@ button.toggle[aria-expanded='true'] {
   word-break: break-word;
 }
 
+/* The approved composer/run state strips: glyph + label + supporting copy,
+   text-first at every width (the glyph is never the only signal). */
+.state-strip {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  min-width: 0;
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+
+.state-strip-glyph {
+  flex: none;
+  font-weight: 600;
+}
+
+.state-strip-label {
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.state-strip-copy {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.run-state:not([hidden]) {
+  margin-top: var(--space-1);
+}
+
 .muted {
   opacity: 0.75;
 }
@@ -2051,12 +2082,16 @@ button.attachment-remove {
   .spacer {
     display: none;
   }
+  /* Below the compact range the three tabs wrap onto multiple rows
+     (min-content) instead of overflowing the ~120px effective budget. */
   #nav-switcher {
     order: 10;
     flex: 1 1 100%;
+    flex-wrap: wrap;
   }
   .nav-tab {
     flex: 1 1 auto;
+    min-width: min-content;
     text-align: center;
   }
   #meta,

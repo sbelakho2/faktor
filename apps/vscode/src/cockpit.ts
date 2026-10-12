@@ -727,6 +727,13 @@ export function proofIntegrationLines(proof: CockpitProofView | null): string[] 
               ? '\u2717'
               : '?';
   const lines = [`${glyph} ${stateText}`];
+  // T19: a served conflict count is the workspace-changed state. The
+  // mandated label + copy render as their own lines; the pinned `Conflict`
+  // state/fact strings above and below stay intact.
+  if (integration.state === 'conflict') {
+    lines.push('! Workspace changed');
+    lines.push('The current workspace no longer matches the integration basis.');
+  }
   const facts: (string | null)[] = [
     integration.runId === null ? null : `runId ${integration.runId}`,
     integration.finalSnapshotHash === null || integration.finalSnapshotHash.length === 0
@@ -2387,6 +2394,32 @@ function verificationVerdictOf(view: CockpitView): string {
   return 'Completion pending';
 }
 
+/**
+ * T21: true when a requested finish action lacks a succeeded durable
+ * result. Only served facts decide: a requested step is pending when its
+ * durable row is missing, or present with any status other than the
+ * daemon's `succeeded` outcome — a missing read is never success.
+ */
+function completionPending(completion: CockpitCompletionView | null): boolean {
+  if (completion === null) {
+    return false;
+  }
+  const requested: string[] = [
+    ...(completion.includeCommit ? ['commit'] : []),
+    ...(completion.includePush ? ['push'] : []),
+    ...(completion.includePr ? ['pr'] : []),
+  ];
+  if (requested.length === 0) {
+    return false;
+  }
+  return requested.some((step) => {
+    const row = completion.steps.find(
+      (entry) => entry.step.trim().toLowerCase() === step,
+    );
+    return row === undefined || row.status.trim().toLowerCase() !== 'succeeded';
+  });
+}
+
 /** The render plan of the persistent cockpit panel, in fixed order. */
 export function cockpitSections(view: CockpitView): CockpitSection[] {
   const sections: CockpitSection[] = [];
@@ -2537,33 +2570,43 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
         : ['none'],
     evidence: [],
   });
+  const completionLines =
+    view.completion === null
+      ? ['none (plain task; no conditional commit/push/PR steps)']
+      : [
+          `requested: ${
+            [
+              view.completion.includeCommit ? 'commit' : null,
+              view.completion.includePush ? 'push' : null,
+              view.completion.includePr ? 'pr' : null,
+            ]
+              .filter((step): step is string => step !== null)
+              .join(', ') || 'none'
+          }`,
+          ...view.completion.steps.slice(0, MAX_LINES).map(
+            (step) =>
+              `[${step.status}] ${step.step}${
+                step.detail !== null && step.detail.length > 0 ? ` — ${step.detail}` : ''
+              }`,
+          ),
+          `status source: ${view.completion.source}${
+            view.completion.reason !== null ? ` (${view.completion.reason})` : ''
+          }`,
+        ];
+  // T21: a requested finish action whose durable step row is missing or not
+  // `succeeded` is pending. The mandated label + copy render after the pinned
+  // contract rows; all-succeeded contracts render nothing new.
+  const completionTail = completionPending(view.completion)
+    ? ['! Finish action pending', 'A requested action lacks a succeeded durable result.']
+    : [];
   sections.push({
     key: 'completion',
     title: 'Completion contract',
     present: view.completion !== null,
-    lines:
-      view.completion === null
-        ? ['none (plain task; no conditional commit/push/PR steps)']
-        : [
-            `requested: ${
-              [
-                view.completion.includeCommit ? 'commit' : null,
-                view.completion.includePush ? 'push' : null,
-                view.completion.includePr ? 'pr' : null,
-              ]
-                .filter((step): step is string => step !== null)
-                .join(', ') || 'none'
-            }`,
-            ...view.completion.steps.slice(0, MAX_LINES).map(
-              (step) =>
-                `[${step.status}] ${step.step}${
-                  step.detail !== null && step.detail.length > 0 ? ` — ${step.detail}` : ''
-                }`,
-            ),
-            `status source: ${view.completion.source}${
-              view.completion.reason !== null ? ` (${view.completion.reason})` : ''
-            }`,
-          ].slice(0, MAX_LINES),
+    lines: [
+      ...completionLines.slice(0, MAX_LINES - completionTail.length),
+      ...completionTail,
+    ],
     evidence: [],
   });
   sections.push({

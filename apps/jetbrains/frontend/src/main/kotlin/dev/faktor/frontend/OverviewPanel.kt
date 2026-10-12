@@ -135,7 +135,16 @@ class OverviewPanel : JPanel(BorderLayout()) {
         rows["Finish actions"]?.fullText = if (completion == null) {
             "No finish actions recorded yet"
         } else {
-            completion.steps.joinToString(" · ") { "${it.step} ${it.status}" }
+            val stepRows = completion.steps.joinToString(" · ") { "${it.step} ${it.status}" }
+            if (completion.finishActionPending) {
+                // T21: the requested step lacks a succeeded durable result;
+                // the exact label+copy render on the completion row itself.
+                RunStateCopy.FINISH_ACTION_PENDING_LABEL + " — " +
+                    RunStateCopy.FINISH_ACTION_PENDING_COPY +
+                    (if (stepRows.isEmpty()) "" else " · " + stepRows)
+            } else {
+                stepRows
+            }
         }
         refreshChip()
     }
