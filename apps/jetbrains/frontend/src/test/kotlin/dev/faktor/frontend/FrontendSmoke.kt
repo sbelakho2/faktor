@@ -1037,6 +1037,52 @@ object FrontendSmoke {
             }
         }
 
+        step("I06: opening the tool window never starts the daemon implicitly") {
+            // Adversarial pin (VAL-HOST-5 / PROH-06 / F01 guard): the tool
+            // window content path only CONSTRUCTS the service + panel
+            // (FaktorToolWindowFactory createToolWindowContent does exactly
+            // that; the kotlinc smoke compiles without the IntelliJ-platform
+            // factory class). The resolver below is the service's start path:
+            // any future implicit start during/after panel construction
+            // resolves the daemon and fails this test.
+            val startCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val service = FaktorFrontendService(
+                { startCalls.incrementAndGet(); Paths.get("unused-binary") },
+                Files.createTempDirectory("faktor-no-implicit-start-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                assertEquals(
+                    0,
+                    startCalls.get(),
+                    "opening the tool window must not resolve/start the daemon"
+                )
+                assertEquals(false, service.isRunning(), "no daemon may be running after open")
+                assertEquals("stopped", service.daemonDescription())
+                // The UI shows the stopped state until an explicit Start: the
+                // start surface stays disabled and no readiness is claimed.
+                assertEquals(false, panel.startTaskEnabledForTest())
+                assertEquals(false, panel.newSessionEnabledForTest())
+                assertEquals("—", panel.diagnosticsReadinessForTest())
+                assertTrue(
+                    !panel.transcriptTextForTest().contains("daemon ready"),
+                    panel.transcriptTextForTest()
+                )
+                // ONLY the explicit Start service action reaches the start
+                // path (the worker is FIFO, so the refresh drains the start).
+                panel.startDaemon()
+                assertTrue(panel.refreshNowForTest(10_000L), "the start job must finish")
+                assertEquals(
+                    1,
+                    startCalls.get(),
+                    "the explicit Start service action must invoke the start path exactly once"
+                )
+                assertEquals(false, service.isRunning())
+            } finally {
+                panel.shutdown()
+            }
+        }
+
         step("diagnostics: trust wording, readiness and T27/T28 copy pins") {
             assertEquals(
                 "Matches recorded checksum",
@@ -2298,6 +2344,12 @@ object FrontendSmoke {
             assertTrue(summary.contains("remote head 22222222"), summary)
             assertTrue(summary.contains("PR pr-42"), summary)
             assertTrue(summary.contains("spend 12micro of 1000000micro"), summary)
+            // I04 / T18 / VAL-LAND-2: the integration domain renders as its
+            // own fact (text + glyph), never folded into the verdict.
+            assertEquals(
+                listOf("✓ Landed state matches verified state"),
+                view.integrationFacts()
+            )
             // Drill-down: each durable step + the gate verdict.
             val stepLines = view.stepLines()
             assertTrue(stepLines.any { it == "[succeeded] push — pushed to origin" }, stepLines.toString())
@@ -2306,6 +2358,11 @@ object FrontendSmoke {
             val panel = TaskTreePanel()
             panel.update(model)
             assertEquals(model, panel.model())
+            val proofChildren = childLabelsOf(panel, "goal/section:proof")
+            assertTrue(
+                proofChildren.contains("integration: ✓ Landed state matches verified state"),
+                proofChildren.toString()
+            )
 
             // An `unavailable` daemon verdict renders explicitly; the summary
             // NEVER carries the verified verdict.

@@ -693,6 +693,10 @@ const WORKFLOWS = {
       'static',
       'docs',
       { lane: 'vscode', requiredArtifacts: ['apps/vscode/faktor-ci.vsix'] },
+      // The required chromium render gate (.woodpecker/untrusted/pr.yaml
+      // `vscode-render`): the render-webview --check measurements run in a
+      // real headless Chromium from the digest-pinned Playwright image.
+      'vscode-render',
       'jetbrains-build',
       'jetbrains-smoke',
     ],
@@ -725,6 +729,16 @@ const WORKFLOWS = {
       'coding-benchmark',
       { lane: 'coding-benchmark-real-model', skippable: true },
       'supply-chain',
+      // The nightly UI smoke pair (no single image carries node+chromium and
+      // the JDK/Rust toolchain, and trusted lanes forbid unpinned apt):
+      // `ui-smoke-vscode` re-checks build + selftest + the chromium render
+      // check; `ui-smoke-jetbrains` proves the built plugin ZIP through the
+      // host matrix, recording target/certification/jetbrains-host-matrix.json.
+      'ui-smoke-vscode',
+      {
+        lane: 'ui-smoke-jetbrains',
+        requiredArtifacts: ['target/certification/jetbrains-host-matrix.json'],
+      },
     ],
   },
   // The Windows certificate lane (`.woodpecker/trusted/trusted.yaml`,

@@ -17,8 +17,9 @@
 //                                 a DPR leg (deviceScaleFactor 1.5 and 2.0)
 //                                 and the VAL-ZOOM reflow leg (IDE UI scale
 //                                 150%/200%, modelled as a reduced CSS-pixel
-//                                 budget) re-assert the same invariants.
-//                                 Exits nonzero on any failure.
+//                                 budget) extend the same fail-closed
+//                                 invariants to HiDPI rendering and IDE UI
+//                                 scale. Exits nonzero on any failure.
 //   --theme dark|light|both       theme leg filter for --check (default both;
 //                                 screenshots stay dark unless light is
 //                                 selected explicitly).
@@ -90,6 +91,58 @@ const THEME_CSS = `:root {
   --vscode-inputValidation-errorBackground: #5a1d1d;
   --vscode-inputValidation-errorBorder: #be1100;
 }`;
+
+// The VS Code light-theme counterpart over the same variable set: stock
+// "Light Modern" values where that theme defines the token, otherwise the
+// light fallback the theme registry resolves for a light theme
+// (disabledForeground, widget.shadow, toolbar.hoverBackground, editorWarning,
+// the testing icons and the input-validation colors).
+const LIGHT_THEME_CSS = `:root {
+  --vscode-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --vscode-font-size: 13px;
+  --vscode-editor-font-family: "SF Mono", Menlo, Consolas, monospace;
+  --vscode-foreground: #3b3b3b;
+  --vscode-descriptionForeground: #3b3b3b;
+  --vscode-disabledForeground: #61616180;
+  --vscode-sideBar-background: #f8f8f8;
+  --vscode-panel-border: #e5e5e5;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-background: #005fb8;
+  --vscode-button-hoverBackground: #0258a8;
+  --vscode-badge-background: #cccccc;
+  --vscode-badge-foreground: #3b3b3b;
+  --vscode-testing-iconPassed: #73c991;
+  --vscode-testing-iconFailed: #f14c4c;
+  --vscode-editorWarning-foreground: #bf8803;
+  --vscode-input-background: #ffffff;
+  --vscode-input-foreground: #3b3b3b;
+  --vscode-input-border: #cecece;
+  --vscode-focusBorder: #005fb8;
+  --vscode-textLink-foreground: #005fb8;
+  --vscode-textLink-activeForeground: #005fb8;
+  --vscode-textCodeBlock-background: #f8f8f8;
+  --vscode-textBlockQuote-background: #f8f8f8;
+  --vscode-editorWidget-background: #f8f8f8;
+  --vscode-toolbar-hoverBackground: #b8b8b850;
+  --vscode-widget-border: #e5e5e5;
+  --vscode-widget-shadow: rgba(0, 0, 0, 0.16);
+  --vscode-button-secondaryBackground: #e5e5e5;
+  --vscode-button-secondaryForeground: #3b3b3b;
+  --vscode-button-secondaryHoverBackground: #cccccc;
+  --vscode-inputValidation-infoBackground: #d6ecf2;
+  --vscode-inputValidation-infoBorder: #007acc;
+  --vscode-inputValidation-errorBackground: #f2dede;
+  --vscode-inputValidation-errorBorder: #be1100;
+}`;
+
+const THEMES = { dark: THEME_CSS, light: LIGHT_THEME_CSS };
+// DPR leg: deviceScaleFactor values emulated on top of every width.
+const DPRS = [1.5, 2.0];
+// VAL-ZOOM leg: IDE UI scale values. A zoomed webview sees fewer CSS pixels
+// for the same device width (viewport width / zoom), so the zoom is modelled
+// as a reduced CSS-pixel budget, floored at 120px.
+const ZOOMS = [1.5, 2.0];
+const ZOOM_MIN_WIDTH = 120;
 
 function chromeCandidates() {
   const names = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
@@ -487,7 +540,11 @@ function harnessSnapshot(empty = false, permissions = false) {
 }
 
 /** Strip the CSP + nonces, point the template at real files, inject stubs. */
-export function buildHarnessHtml(empty = false, attachments = false, permissions = false) {
+export function buildHarnessHtml(empty = false, attachments = false, permissions = false, theme = 'dark') {
+  const themeCss = THEMES[theme];
+  if (!themeCss) {
+    throw new Error(`unknown theme "${theme}" (expected dark or light)`);
+  }
   const webviewSource = readFileSync(join(ROOT, 'src', 'webview.ts'), 'utf8');
   const start = webviewSource.indexOf('<!DOCTYPE html>');
   const end = webviewSource.indexOf('</html>', start) + '</html>'.length;
@@ -510,7 +567,7 @@ export function buildHarnessHtml(empty = false, attachments = false, permissions
     }
     html = html.replace(placeholder, fileUrl(path));
   }
-  const theme = `<style id="faktor-harness-theme">${THEME_CSS}</style>`;
+  const themeStyle = `<style id="faktor-harness-theme">${themeCss}</style>`;
   const apiStub = `<script>window.__posted = []; window.acquireVsCodeApi = function () { return { postMessage: function (message) { window.__posted.push(message); } }; };</script>`;
   const snapshotJson = JSON.stringify(harnessSnapshot(empty, permissions)).replace(/</g, '\\u003c');
   // The attachment fixture exercises the compact attachment cards (ready and
@@ -527,7 +584,7 @@ export function buildHarnessHtml(empty = false, attachments = false, permissions
     window.postMessage({ type: 'snapshot', snapshot: ${snapshotJson} }, '*');${attachmentsScript}
     setTimeout(function () { window.__ready = true; }, 120);
   </script>`;
-  html = html.replace('</head>', `${theme}</head>`);
+  html = html.replace('</head>', `${themeStyle}</head>`);
   html = html.replace('<body>', `<body>${apiStub}`);
   html = html.replace('</body>', `${snapshotScript}</body>`);
   return html;
@@ -681,14 +738,16 @@ const MEASURE_SCRIPT = `(() => {
     if (el.type === 'checkbox' || el.type === 'radio') name = 'label-for-' + name;
     const inControls = el.closest('.agent-controls') !== null;
     const secondary = inControls || el.classList.contains('attachment-remove');
+    const primary = el.tagName === 'BUTTON' && !secondary;
+    const inNav = el.closest('#nav-switcher') !== null;
     out.push({
       name: name + (el.id ? '' : (el.className ? '.' + String(el.className).split(' ')[0] : '')),
       tag: el.tagName,
       w: Math.round(rect.width * 100) / 100,
       h: Math.round(rect.height * 100) / 100,
-      primary: el.tagName === 'BUTTON' && !secondary,
+      primary,
     });
-    boxes.push({ name, x: rect.x, y: rect.y, w: rect.width, h: rect.height });
+    boxes.push({ name, x: rect.x, y: rect.y, w: rect.width, h: rect.height, primary, inNav });
   }
   return {
     controls: out,
@@ -698,13 +757,44 @@ const MEASURE_SCRIPT = `(() => {
   };
 })()`;
 
-async function loadPage(cdp, url, width, height = 1000) {
+// VAL-ZOOM spill scan: any element whose box leaves the CSS-pixel budget while
+// its own scroll containers cannot clip it is clipped content (a title, a
+// label, an action). The view tablist (#nav-switcher, role="tablist") is
+// navigation chrome rather than a main action surface and is covered by the
+// base width tiers; the zoom leg asserts the surfaces around it. Elements
+// inside an explicit horizontal scroller are contained and allowed.
+const ZOOM_SPILL_SCRIPT = `(() => {
+  const iw = window.innerWidth;
+  const spills = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.closest('#nav-switcher')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (r.right <= iw + 0.5 && r.x >= -0.5) continue;
+    let p = el.parentElement;
+    let contained = false;
+    while (p) {
+      if (getComputedStyle(p).overflowX !== 'visible') {
+        contained = true;
+        break;
+      }
+      p = p.parentElement;
+    }
+    if (contained) continue;
+    const label = el.tagName
+      + (el.id ? '#' + el.id : el.className ? '.' + String(el.className).split(' ')[0] : '');
+    spills.push(label + ' (x ' + Math.round(r.x * 10) / 10 + ', right ' + Math.round(r.right * 10) / 10 + ' vs innerWidth ' + iw + ')');
+  }
+  return spills.slice(0, 10);
+})()`;
+
+async function loadPage(cdp, url, width, height = 1000, deviceScaleFactor = 1) {
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
   await cdp.send('Emulation.setDeviceMetricsOverride', {
     width,
     height,
-    deviceScaleFactor: 1,
+    deviceScaleFactor,
     mobile: false,
   });
   const loaded = cdp.waitFor('Page.loadEventFired');
@@ -752,6 +842,95 @@ async function openContractComposer(cdp, fill) {
   })()`);
 }
 
+/** Write one harness page and return its file: URL. */
+function writeHarnessPage(html, prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const path = join(dir, 'index.html');
+  writeFileSync(path, html);
+  return pathToFileURL(path).href;
+}
+
+/**
+ * Fail-closed layout assertions for one measured page. `targets` enables the
+ * >= 24x24 / 28x28 control-size checks; `documentOverflow` checks the page
+ * scrollWidth; `primaryVisible` requires every primary decision control
+ * outside the #nav-switcher tablist to sit fully inside the viewport (the
+ * VAL-ZOOM "primary decisions remain visible" observable).
+ */
+function assertLayout(result, context, failures, { targets = true, primaryVisible = false, documentOverflow = true } = {}) {
+  if (documentOverflow && result.scrollWidth > result.innerWidth + 1) {
+    failures.push(
+      `${context}: horizontal overflow (scrollWidth ${result.scrollWidth} > innerWidth ${result.innerWidth})`,
+    );
+  }
+  if (targets) {
+    for (const control of result.controls) {
+      const min = control.primary ? MAIN_MIN : OTHER_MIN;
+      if (control.w < min - 0.51 || control.h < min - 0.51) {
+        failures.push(
+          `${context}: ${control.name} is ${control.w}x${control.h} (needs >= ${min}x${min})`,
+        );
+      }
+    }
+  }
+  if (primaryVisible) {
+    for (const box of result.boxes) {
+      if (!box.primary || box.inNav) {
+        continue;
+      }
+      if (box.w <= 0 || box.x < -0.5 || box.x + box.w > result.innerWidth + 0.5) {
+        failures.push(
+          `${context}: primary decision ${box.name} is not visible (x ${Math.round(box.x * 100) / 100}, w ${Math.round(box.w * 100) / 100} vs innerWidth ${result.innerWidth})`,
+        );
+      }
+    }
+  }
+}
+
+/** Fresh load, Tab, then prove the keyboard focus ring renders. */
+async function checkKeyboardFocus(cdp, context, failures) {
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'rawKeyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+  });
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+  });
+  const focus = await cdp.evaluate(`(() => {
+    const el = document.activeElement;
+    const cs = getComputedStyle(el);
+    return {
+      tag: el.tagName, id: el.id, cls: String(el.className),
+      outlineStyle: cs.outlineStyle, outlineWidth: cs.outlineWidth,
+      outlineColor: cs.outlineColor, outlineOffset: cs.outlineOffset,
+    };
+  })()`);
+  if (focus.outlineStyle !== 'solid' || parseFloat(focus.outlineWidth) < 2) {
+    failures.push(
+      `${context}: keyboard focus ring missing on ${focus.tag}#${focus.id}: outline ${focus.outlineStyle} ${focus.outlineWidth}`,
+    );
+  }
+  return focus;
+}
+
+/** Fresh load, pointer click, then prove pointer focus does NOT ring. */
+async function checkPointerSuppression(cdp, context, failures) {
+  const refreshBox = await cdp.evaluate(`(() => {
+    const r = document.getElementById('nav-inspect').getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
+  const pointer = await cdp.evaluate(`(() => {
+    const el = document.activeElement;
+    const cs = getComputedStyle(el);
+    return { id: el.id, outlineStyle: cs.outlineStyle };
+  })()`);
+  if (pointer.outlineStyle !== 'none') {
+    failures.push(`${context}: pointer click on #nav-inspect left outline ${pointer.outlineStyle}`);
+  }
+  return pointer;
+}
+
 function parseArgs(argv) {
   const args = {
     check: false,
@@ -763,6 +942,7 @@ function parseArgs(argv) {
     finish: false,
     contract: false,
     error: false,
+    theme: 'both',
     prefix: 'shot',
     out: SHOT_DIR,
   };
@@ -776,6 +956,7 @@ function parseArgs(argv) {
     else if (argv[i] === '--finish') args.finish = true;
     else if (argv[i] === '--contract') args.contract = true;
     else if (argv[i] === '--error') args.error = true;
+    else if (argv[i] === '--theme') args.theme = argv[++i];
     else if (argv[i] === '--prefix') args.prefix = argv[++i];
     else if (argv[i] === '--out') args.out = argv[++i];
   }
@@ -787,115 +968,135 @@ export async function runHarness(args) {
   if (!chrome) {
     throw new Error('no chrome/chromium binary found on PATH');
   }
-  const html = buildHarnessHtml(
-    args.empty === true,
-    args.attachments === true,
-    args.permissions === true,
-  );
-  const pageDir = mkdtempSync(join(tmpdir(), 'faktor-render-page-'));
-  const pagePath = join(pageDir, 'index.html');
-  writeFileSync(pagePath, html);
-  const pageUrl = pathToFileURL(pagePath).href;
+  const requestedTheme = args.theme || 'both';
+  const themeNames = requestedTheme === 'both' ? ['dark', 'light'] : [requestedTheme];
+  for (const theme of themeNames) {
+    if (!THEMES[theme]) {
+      throw new Error(`unknown theme "${theme}" (expected dark, light or both)`);
+    }
+  }
+  // One page per theme. Screenshots keep the historical dark render unless
+  // --theme light was selected explicitly.
+  const pageUrls = new Map();
+  for (const theme of themeNames) {
+    const html = buildHarnessHtml(
+      args.empty === true,
+      args.attachments === true,
+      args.permissions === true,
+      theme,
+    );
+    pageUrls.set(theme, writeHarnessPage(html, 'faktor-render-page-'));
+  }
+  const pageUrl = pageUrls.get('dark') || pageUrls.get(themeNames[0]);
 
   const { child, pageWs } = await launchChrome(chrome);
   const cdp = await connect(pageWs);
   const failures = [];
   const measured = new Map();
+  let layouts = 0;
   try {
     if (args.check) {
-      for (const width of WIDTHS) {
-        await loadPage(cdp, pageUrl, width);
-        if (args.contract === true) {
-          await openContractComposer(cdp, false);
-        }
-        const result = await cdp.evaluate(MEASURE_SCRIPT);
-        const overflows = result.scrollWidth > result.innerWidth + 1;
-        if (overflows) {
-          failures.push(`${width}px: horizontal overflow (scrollWidth ${result.scrollWidth} > innerWidth ${result.innerWidth})`);
-        }
-        for (const control of result.controls) {
-          measured.set(control.name, control);
-          const min = control.primary ? MAIN_MIN : OTHER_MIN;
-          if (control.w < min - 0.51 || control.h < min - 0.51) {
-            failures.push(
-              `${width}px: ${control.name} is ${control.w}x${control.h} (needs >= ${min}x${min})`,
-            );
+      // Theme leg: the FULL populated-surface assertion set runs at every
+      // width under every selected theme.
+      for (const theme of themeNames) {
+        const themeUrl = pageUrls.get(theme);
+        for (const width of WIDTHS) {
+          await loadPage(cdp, themeUrl, width);
+          if (args.contract === true) {
+            await openContractComposer(cdp, false);
+          }
+          const result = await cdp.evaluate(MEASURE_SCRIPT);
+          layouts += 1;
+          assertLayout(result, `${theme}@${width}px`, failures);
+          for (const control of result.controls) {
+            measured.set(`${theme}/${control.name}`, control);
           }
         }
       }
       // The EMPTY state (welcome + preflight card visible) is its own layout:
-      // exercise the same widths so the narrow single-column rules and the
-      // preflight actions are measured, not hidden behind a populated
-      // transcript.
-      {
-        const emptyHtml = buildHarnessHtml(true, args.attachments === true, args.permissions === true);
-        const emptyDir = mkdtempSync(join(tmpdir(), 'faktor-render-page-empty-'));
-        const emptyPath = join(emptyDir, 'index.html');
-        writeFileSync(emptyPath, emptyHtml);
-        const emptyUrl = pathToFileURL(emptyPath).href;
+      // exercise the same widths under every theme so the narrow single-column
+      // rules and the preflight actions are measured, not hidden behind a
+      // populated transcript.
+      for (const theme of themeNames) {
+        const emptyUrl = writeHarnessPage(
+          buildHarnessHtml(true, args.attachments === true, args.permissions === true, theme),
+          'faktor-render-page-empty-',
+        );
         for (const width of WIDTHS) {
           await loadPage(cdp, emptyUrl, width);
           const result = await cdp.evaluate(MEASURE_SCRIPT);
-          const overflows = result.scrollWidth > result.innerWidth + 1;
-          if (overflows) {
-            failures.push(
-              `empty@${width}px: horizontal overflow (scrollWidth ${result.scrollWidth} > innerWidth ${result.innerWidth})`,
-            );
+          layouts += 1;
+          assertLayout(result, `${theme} empty@${width}px`, failures);
+        }
+      }
+      // Keyboard focus ring + pointer suppression: fresh load per theme,
+      // press Tab / click, then inspect the focused node.
+      const focusStates = [];
+      for (const theme of themeNames) {
+        const themeUrl = pageUrls.get(theme);
+        await loadPage(cdp, themeUrl, 480);
+        const focus = await checkKeyboardFocus(cdp, `${theme}@480px focus`, failures);
+        await loadPage(cdp, themeUrl, 480);
+        const pointer = await checkPointerSuppression(cdp, `${theme}@480px pointer`, failures);
+        focusStates.push({ theme, focus, pointer });
+      }
+      // DPR leg: the same overflow/target/focus invariants at device pixel
+      // ratios 1.5 and 2.0 (HiDPI rendering scales; the CSS layout stays
+      // width-driven).
+      for (const theme of themeNames) {
+        const themeUrl = pageUrls.get(theme);
+        for (const dpr of DPRS) {
+          const dprLabel = dpr.toFixed(1);
+          for (const width of WIDTHS) {
+            await loadPage(cdp, themeUrl, width, 1000, dpr);
+            const result = await cdp.evaluate(MEASURE_SCRIPT);
+            layouts += 1;
+            assertLayout(result, `${theme} dpr${dprLabel}@${width}px`, failures);
           }
-          for (const control of result.controls) {
-            const min = control.primary ? MAIN_MIN : OTHER_MIN;
-            if (control.w < min - 0.51 || control.h < min - 0.51) {
-              failures.push(
-                `empty@${width}px: ${control.name} is ${control.w}x${control.h} (needs >= ${min}x${min})`,
-              );
+          await loadPage(cdp, themeUrl, 480, 1000, dpr);
+          await checkKeyboardFocus(cdp, `${theme} dpr${dprLabel}@480px focus`, failures);
+          await loadPage(cdp, themeUrl, 480, 1000, dpr);
+          await checkPointerSuppression(cdp, `${theme} dpr${dprLabel}@480px pointer`, failures);
+        }
+      }
+      // VAL-ZOOM leg: IDE UI scale 150%/200% shrinks the CSS-pixel budget the
+      // webview sees (viewport width / zoom, floored at 120px), so the layout
+      // is measured at that reduced width. The document scrollWidth is not the
+      // right probe when the role=tablist view switcher alone exceeds the
+      // floor (navigation chrome, covered by the base width tiers), so this
+      // leg asserts the main action surfaces instead: no uncontained element
+      // spills past the budget and every primary decision stays visible.
+      for (const theme of themeNames) {
+        const themeUrl = pageUrls.get(theme);
+        for (const zoom of ZOOMS) {
+          for (const width of WIDTHS) {
+            const effective = Math.max(ZOOM_MIN_WIDTH, Math.floor(width / zoom));
+            await loadPage(cdp, themeUrl, effective);
+            const result = await cdp.evaluate(MEASURE_SCRIPT);
+            const context = `${theme} zoom${zoom * 100}@${effective}px`;
+            layouts += 1;
+            assertLayout(result, context, failures, {
+              targets: false,
+              primaryVisible: true,
+              documentOverflow: false,
+            });
+            const spills = await cdp.evaluate(ZOOM_SPILL_SCRIPT);
+            for (const spill of spills) {
+              failures.push(`${context}: ${spill} overflows the main action surfaces`);
             }
           }
         }
       }
-      // Keyboard focus ring: fresh load, press Tab, inspect the focused node.
-      await loadPage(cdp, pageUrl, 480);
-      await cdp.send('Input.dispatchKeyEvent', {
-        type: 'rawKeyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
-      });
-      await cdp.send('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
-      });
-      const focus = await cdp.evaluate(`(() => {
-        const el = document.activeElement;
-        const cs = getComputedStyle(el);
-        return {
-          tag: el.tagName, id: el.id, cls: String(el.className),
-          outlineStyle: cs.outlineStyle, outlineWidth: cs.outlineWidth,
-          outlineColor: cs.outlineColor, outlineOffset: cs.outlineOffset,
-        };
-      })()`);
-      if (focus.outlineStyle !== 'solid' || parseFloat(focus.outlineWidth) < 2) {
-        failures.push(
-          `keyboard focus ring missing on ${focus.tag}#${focus.id}: outline ${focus.outlineStyle} ${focus.outlineWidth}`,
-        );
-      }
-      // Pointer focus must NOT show the ring (suppression).
-      await loadPage(cdp, pageUrl, 480);
-      const refreshBox = await cdp.evaluate(`(() => {
-        const r = document.getElementById('nav-inspect').getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      })()`);
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
-      const pointer = await cdp.evaluate(`(() => {
-        const el = document.activeElement;
-        const cs = getComputedStyle(el);
-        return { id: el.id, outlineStyle: cs.outlineStyle };
-      })()`);
-      if (pointer.outlineStyle !== 'none') {
-        failures.push(`pointer click on #nav-inspect left outline ${pointer.outlineStyle}`);
-      }
+      console.log(`RENDER CHECK themes: ${themeNames.join(', ')}`);
+      console.log(`RENDER CHECK layouts asserted: ${layouts}`);
       console.log('RENDER CHECK measured controls (largest width):');
       for (const control of measured.values()) {
         console.log(`  ${control.primary ? 'primary' : 'other  '} ${control.name}: ${control.w}x${control.h}`);
       }
-      console.log(`RENDER CHECK focus: ${focus.tag}#${focus.id} outline ${focus.outlineWidth} ${focus.outlineStyle} ${focus.outlineColor} offset ${focus.outlineOffset}`);
-      console.log(`RENDER CHECK pointer suppression: outline ${pointer.outlineStyle}`);
+      for (const { theme, focus, pointer } of focusStates) {
+        console.log(`RENDER CHECK focus (${theme}): ${focus.tag}#${focus.id} outline ${focus.outlineWidth} ${focus.outlineStyle} ${focus.outlineColor} offset ${focus.outlineOffset}`);
+        console.log(`RENDER CHECK pointer suppression (${theme}): outline ${pointer.outlineStyle}`);
+      }
       if (failures.length > 0) {
         console.log('RENDER CHECK FAIL');
         for (const failure of failures) {

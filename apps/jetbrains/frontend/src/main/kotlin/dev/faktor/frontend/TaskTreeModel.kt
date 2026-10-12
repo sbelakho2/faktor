@@ -48,6 +48,12 @@ const val MAX_CRITERIA_PROOF_ROWS = 32
 /** Max label chars of one evidence ref (free text is kept but bounded). */
 const val MAX_EVIDENCE_LABEL = 300
 
+/**
+ * T15: the exact supporting sentence for a claim whose verdict is unavailable
+ * because no verdict is served (never rendered as a pass).
+ */
+const val NO_VERDICT_COPY = "No verdict is served for this claim."
+
 /** The visual tone of one criterion verdict (unavailable is distinct). */
 enum class CriterionVerdictTone {
     PASS,
@@ -96,6 +102,10 @@ data class CriterionProofRow(
             "fail" -> CriterionVerdictTone.FAIL
             else -> CriterionVerdictTone.UNAVAILABLE
         }
+
+    /** T15 exact copy when no verdict is served for this claim (else null). */
+    val noVerdictCopy: String?
+        get() = if (verdict == "unavailable") NO_VERDICT_COPY else null
 }
 
 /** A blocker action that applies to one blocked child. */
@@ -371,7 +381,12 @@ data class ProofView(
     val gateStatus: String?,
     val gateReason: String?,
     val steps: List<ProofStepView>,
-    val unavailable: List<ProofUnavailableView>
+    val unavailable: List<ProofUnavailableView>,
+    /**
+     * TRUE only for the synthetic view of a REFUSED proof read: no payload
+     * was fetched, so no integration fact may be claimed.
+     */
+    val readFailed: Boolean = false
 ) {
     val verified: Boolean get() = state == "verified"
 
@@ -419,6 +434,51 @@ data class ProofView(
         }
         lines.add("gate: " + (gateStatus ?: "none") + (gateReason?.let { " — " + it } ?: ""))
         return lines
+    }
+
+    /**
+     * The separate integration facts (I04 / VAL-LAND-2) the PARSED DTO can
+     * actually distinguish. This client's DTO does not carry the served
+     * `integration` block (present/inFlight/conflictCount/txn), so only the
+     * facts its parsed members serve render; every other case stays an
+     * explicit unavailable — never success, and never `Not integrated` by
+     * assumption beyond the served absence of a landed identity:
+     *
+     *  - `landedEqualsVerified` true/false -> landed / mismatch;
+     *  - the served in-flight integration-record marker -> integrating;
+     *  - no landed identity served -> `Not integrated` (the served
+     *    `trees.landed` is only set from an integration record's non-empty
+     *    landed snapshot, so no landed state exists for this candidate);
+     *  - a landed identity without a served comparison -> explicit
+     *    unavailable naming the missing member;
+     *  - a refused proof read -> explicit unavailable, no fact claimed.
+     *
+     * The served `conflictCount` is NOT a member of this DTO, so no Conflict
+     * fact is invented (reported to the contract gate).
+     */
+    fun integrationFacts(): List<String> {
+        if (readFailed) {
+            return listOf(
+                "? Integration unavailable — " + (reason ?: "the proof read was not fetched")
+            )
+        }
+        val inFlight = unavailable.any {
+            it.component == "integration_record" && it.kind == "unavailable"
+        }
+        return when {
+            landedEqualsVerified == true -> listOf("✓ Landed state matches verified state")
+            landedEqualsVerified == false -> listOf("✗ Mismatch")
+            inFlight -> listOf("… Integrating")
+            landedSnapshot == null -> listOf("○ Not integrated")
+            verifiedSnapshot == null -> listOf(
+                "? Landed state unavailable — the verified snapshot is not served, " +
+                    "so the landed state cannot be compared"
+            )
+            else -> listOf(
+                "? Landed state unavailable — the served proof does not compare the " +
+                    "landed and verified snapshots"
+            )
+        }
     }
 }
 
@@ -656,7 +716,8 @@ object TaskTree {
                 steps = emptyList(),
                 unavailable = listOf(
                     ProofUnavailableView("proof", "unavailable", proofUnavailable)
-                )
+                ),
+                readFailed = true
             )
         }
         if (proof == null) {

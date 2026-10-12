@@ -444,7 +444,14 @@ steps:
       - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
       - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
       - node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
-      - cd "$CI_WORKSPACE"
+      # Artifact branding gate: the packaged VSIX bytes must carry no legacy
+      # wordmark token; the scan exits non-zero on a hit, failing the lane.
+      - |
+        set -eu
+        rm -rf /tmp/faktor-brand-vsix && mkdir -p /tmp/faktor-brand-vsix
+        cp faktor-ci.vsix /tmp/faktor-brand-vsix/
+        cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-vsix
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -460,7 +467,11 @@ steps:
         node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
         node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
         node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+        set -eu
+        rm -rf /tmp/faktor-brand-vsix && mkdir -p /tmp/faktor-brand-vsix
+        cp faktor-ci.vsix /tmp/faktor-brand-vsix/
         cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-vsix
         CMDS
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
@@ -523,7 +534,17 @@ steps:
       # Validate wrapper jar + distribution sha256 + verification metadata + locks first.
       - bash ../../scripts/check-gradle-integrity.sh
       - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
-      - cd "$CI_WORKSPACE"
+      # Artifact branding gate: the packaged plugin ZIP bytes must carry no
+      # legacy wordmark token (the scan exits non-zero on a hit). The scan
+      # runs on a dedicated directory holding only that ZIP.
+      - |
+        set -eu
+        plugin_zip="$(find frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit)"
+        [ -n "$plugin_zip" ] || { echo "jetbrains-build: no plugin ZIP under frontend/build/distributions (fail closed)" >&2; exit 1; }
+        rm -rf /tmp/faktor-brand-jb && mkdir -p /tmp/faktor-brand-jb
+        cp "$plugin_zip" /tmp/faktor-brand-jb/
+        cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-jb
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -531,7 +552,13 @@ steps:
         cd apps/jetbrains
         bash ../../scripts/check-gradle-integrity.sh
         ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+        set -eu
+        plugin_zip="$(find frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit)"
+        [ -n "$plugin_zip" ] || { echo "jetbrains-build: no plugin ZIP under frontend/build/distributions (fail closed)" >&2; exit 1; }
+        rm -rf /tmp/faktor-brand-jb && mkdir -p /tmp/faktor-brand-jb
+        cp "$plugin_zip" /tmp/faktor-brand-jb/
         cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-jb
         CMDS
         )"
         artifact_path="$(find apps/jetbrains/frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit 2>/dev/null || true)"

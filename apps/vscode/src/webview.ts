@@ -309,6 +309,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
     <h2 id="permission-card-title">Faktor needs your approval</h2>
+    <p id="permission-supporting" class="muted">Review the action, target and stated reason.</p>
     <div id="permission-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     <ul id="permission-list" class="permission-list" aria-label="Pending permission requests"></ul>
   </section>
