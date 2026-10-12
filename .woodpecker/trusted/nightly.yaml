@@ -23,9 +23,11 @@
 # coding-benchmark outputs, the
 # coding-benchmark smoke, the
 # provider-key real-model run (recorded as an explicit skip unless keys are
-# supplied out-of-band — CI requires NO secrets by default), and the
+# supplied out-of-band — CI requires NO secrets by default), the
 # supply-chain evidence job (missing advisory tools stay loud recorded skips
-# inside target/certification/supply-chain-status.json).
+# inside target/certification/supply-chain-status.json), and the nightly UI
+# smoke lanes (`ui-smoke-vscode` real headless-chromium render check +
+# selftest; `ui-smoke-jetbrains` packaged-plugin host-matrix ZIP proof).
 #
 # Timeout: Woodpecker has no per-step timeout; the project pipeline timeout
 # applies. The 24h REAL-TIME soak lane needs a >= 25h budget, so raise it
@@ -66,6 +68,8 @@
 #   coding-benchmark                     faktor_lane_token_coding_benchmark
 #   coding-benchmark-real-model          faktor_lane_token_coding_benchmark_real_model
 #   supply-chain                         faktor_lane_token_supply_chain
+#   ui-smoke-vscode                      faktor_lane_token_ui_smoke_vscode
+#   ui-smoke-jetbrains                   faktor_lane_token_ui_smoke_jetbrains
 #
 # env var name = `faktor_lane_token_<lane>` with '-' -> '_' (the uppercase
 # FAKTOR_LANE_TOKEN_<LANE> form is also accepted). A lane step only receives
@@ -344,6 +348,150 @@ steps:
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane supply-chain --status passed \
           --out target/certification/lanes/supply-chain.json
+  # ------------------------------------------------------------------ UI smoke
+  # Nightly re-check of BOTH UI/UX hosts. Two lanes because the toolchains are
+  # disjoint and no lane image may run unpinned apt in a trusted workflow:
+  #   * ui-smoke-vscode runs on the SAME digest-pinned Playwright image as the
+  #     trusted `vscode-e2e` lane (node + real Chromium); the render check
+  #     resolves chrome with the fail-closed /ms-playwright glob and mirrors
+  #     the root `--no-sandbox` rule scripts/vscode-e2e.sh documents.
+  #   * ui-smoke-jetbrains runs on the digest-pinned Faktor CI image (JDK 17 +
+  #     kotlinc + git), bootstraps the pinned Rust toolchain through the
+  #     sha256-verified rustup-init (same contract as the trusted
+  #     jetbrains-smoke lane), then runs the packaged-plugin host matrix
+  #     (`:frontend:smokeHostMatrixZip`), which records
+  #     target/certification/jetbrains-host-matrix.json.
+  - name: ui-smoke-vscode
+    # Same digest as the trusted vscode-e2e lane; needs the Chromium runtime
+    # libraries the node:24 baseline does not ship.
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as the trusted vscode-e2e lane; chromium runtime included)
+    environment:
+      npm_config_cache: /woodpecker-cache/npm
+    volumes:
+      - faktor-nightly-npm-cache:/woodpecker-cache/npm
+    commands:
+      - cd apps/vscode
+      - npm ci
+      - npm run build
+      - node scripts/selftest.mjs
+      # Deterministic, fail-closed chrome discovery: the image ships Chromium
+      # at /ms-playwright/chromium-*/chrome-linux/chrome; render-webview.mjs
+      # consumes FAKTOR_CHROME. It has no chrome-flag surface, so a tiny
+      # wrapper adds `--no-sandbox` ONLY when the container runs as root
+      # (Chrome refuses to start as root without it).
+      - |
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        if [ -z "$chrome_bin" ]; then
+          echo "ui-smoke-vscode: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
+          exit 1
+        fi
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        if [ ! -x "$chrome_wrapper" ]; then
+          echo "ui-smoke-vscode: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
+          exit 1
+        fi
+        echo "ui-smoke-vscode: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
+        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
+      - cd "$CI_WORKSPACE"
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cd apps/vscode
+        npm ci
+        npm run build
+        node scripts/selftest.mjs
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        if [ -z "$chrome_bin" ]; then
+          echo "ui-smoke-vscode: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
+          exit 1
+        fi
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        if [ ! -x "$chrome_wrapper" ]; then
+          echo "ui-smoke-vscode: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
+          exit 1
+        fi
+        echo "ui-smoke-vscode: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
+        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
+        cd "$CI_WORKSPACE"
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane ui-smoke-vscode --status passed \
+          --out target/certification/lanes/ui-smoke-vscode.json
+  - name: ui-smoke-jetbrains
+    # Same digest-pinned Faktor CI image as the trusted jetbrains lanes
+    # (JDK 17 + kotlinc + git). pull:false: the image is produced by
+    # scripts/build-ci-image.sh and recorded in docker/faktor-ci/image-digest.txt;
+    # the trusted ci-image pre-step fails closed when it is absent.
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    pull: false
+    environment:
+      RUST_BACKTRACE: "1"
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-ui-smoke:/woodpecker-cache/target
+      - faktor-nightly-gradle-home:/root/.gradle
+    commands:
+      # Pinned Rust bootstrap, identical contract to the trusted jetbrains-smoke
+      # lane: verify the published rustup-init sha256, then derive the channel
+      # from rust-toolchain.toml (never a second hard-coded version).
+      - |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
+        printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
+        /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
+      - . "$HOME/.cargo/env"
+      # Bounded: only the CLI the smoke needs is built (debug), never the
+      # workspace; the Gradle task builds the plugin ZIP + host matrix proof.
+      # The cargo target dir is the step-local nightly cache, so the built CLI
+      # is copied to the workspace path the smoke receives via -PfaktorCliBin.
+      - CARGO_TARGET_DIR=/woodpecker-cache/target cargo build -p faktor-cli && mkdir -p target/debug && cp /woodpecker-cache/target/debug/faktor-cli target/debug/faktor-cli
+      - cd apps/jetbrains && ./gradlew --console=plain --no-daemon -PfaktorCliBin="$CI_WORKSPACE/target/debug/faktor-cli" :frontend:smokeHostMatrixZip
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
+        printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
+        /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
+        . "$HOME/.cargo/env"
+        CARGO_TARGET_DIR=/woodpecker-cache/target cargo build -p faktor-cli && mkdir -p target/debug && cp /woodpecker-cache/target/debug/faktor-cli target/debug/faktor-cli
+        cd apps/jetbrains && ./gradlew --console=plain --no-daemon -PfaktorCliBin="$CI_WORKSPACE/target/debug/faktor-cli" :frontend:smokeHostMatrixZip
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane ui-smoke-jetbrains --status passed \
+          --artifact target/certification/jetbrains-host-matrix.json \
+          --out target/certification/lanes/ui-smoke-jetbrains.json
   - name: certificate-nightly
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -356,6 +504,8 @@ steps:
       - coding-benchmark
       - coding-benchmark-real-model
       - supply-chain
+      - ui-smoke-vscode
+      - ui-smoke-jetbrains
     when:
       status: [success, failure]
     # Lane-bound auth verification (opt-in): map every registered lane token
@@ -372,6 +522,8 @@ steps:
     #   faktor_lane_token_coding_benchmark: { from_secret: faktor_lane_token_coding_benchmark }
     #   faktor_lane_token_coding_benchmark_real_model: { from_secret: faktor_lane_token_coding_benchmark_real_model }
     #   faktor_lane_token_supply_chain: { from_secret: faktor_lane_token_supply_chain }
+    #   faktor_lane_token_ui_smoke_vscode: { from_secret: faktor_lane_token_ui_smoke_vscode }
+    #   faktor_lane_token_ui_smoke_jetbrains: { from_secret: faktor_lane_token_ui_smoke_jetbrains }
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and assigned to a lane wired in this workflow

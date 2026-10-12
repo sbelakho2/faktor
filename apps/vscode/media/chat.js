@@ -598,6 +598,11 @@
     if (unavailable.length > 0) {
       line(card, 'unavailable: ' + unavailable.join(', '), 'warn criterion-unavailable');
     }
+    if (verdict === 'unavailable') {
+      // T15: a claim with no verdict says so explicitly; unavailable and
+      // refused stay distinct and a positive verdict is never rendered here.
+      line(card, 'No verdict is served for this claim.', 'warn criterion-no-verdict');
+    }
     block.appendChild(card);
   }
 
@@ -2059,10 +2064,61 @@
   }
 
   /**
+   * The daemon's typed configuration blocker recorded on a requested PR
+   * completion step (`crates/orchestrator/src/completion_steps.rs:
+   * NATIVE_PR_SCM_NOT_CONFIGURED`). It is the ONLY signal the T22 surface
+   * accepts: no other PR failure is read as a missing-SCM configuration,
+   * and PR success is never inferred.
+   */
+  var NATIVE_PR_SCM_NOT_CONFIGURED = 'native_pr_scm_not_configured';
+
+  /** True when the requested PR step is blocked by the typed SCM code. */
+  function prScmSetupBlocked(completion) {
+    var steps = completion && Array.isArray(completion.steps) ? completion.steps : [];
+    for (var i = 0; i < steps.length; i++) {
+      var step = steps[i] || {};
+      var kind = String(step.step == null ? '' : step.step).toLowerCase();
+      var detail = String(step.detail == null ? '' : step.detail);
+      if (kind === 'pr' && detail.indexOf(NATIVE_PR_SCM_NOT_CONFIGURED) !== -1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The T22 head of a requested PR finish step blocked by missing SCM config. */
+  function prScmSetupNode() {
+    var head = document.createElement('div');
+    head.className = 'completion-head warn pr-scm-setup-title';
+    head.textContent = 'Pull request integration unavailable';
+    var copy = document.createElement('div');
+    copy.className = 'muted pr-scm-setup-copy';
+    copy.textContent = 'Configure the native SCM integration; no PR success is inferred.';
+    var actions = document.createElement('div');
+    actions.className = 'composer-actions';
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Open setup guidance';
+    button.addEventListener('click', function () {
+      setDiagnosticsOpen(true);
+      setSandboxGuidanceOpen(true);
+    });
+    actions.appendChild(button);
+    var node = document.createElement('div');
+    node.className = 'pr-scm-setup';
+    node.appendChild(head);
+    node.appendChild(copy);
+    node.appendChild(actions);
+    return node;
+  }
+
+  /**
    * The durable completion-contract block. The step rows are exactly what
    * the host reports: `daemon` rows when the serving daemon exposes the
    * read, `derived` rows projected from the durable task-run state, or an
-   * explicit `unavailable` (never fabricated as success).
+   * explicit `unavailable` (never fabricated as success). A requested PR
+   * step blocked by the daemon's typed SCM-not-configured code carries the
+   * T22 notice with the exact copy and the Diagnostics guidance action.
    */
   function renderCompletion(task) {
     var node = byId('task-completion');
@@ -2083,6 +2139,9 @@
       var step = steps[i];
       var detail = step.detail ? ' — ' + String(step.detail) : '';
       line(node, '[' + String(step.status) + '] ' + String(step.step) + detail, 'muted');
+    }
+    if (prScmSetupBlocked(completion)) {
+      node.appendChild(prScmSetupNode());
     }
     if (completion.reason) {
       line(node, String(completion.reason), 'warn');

@@ -33,7 +33,8 @@ class OverviewPanel : JPanel(BorderLayout()) {
         summaryBody.add(stateChip)
         summaryBody.add(goalLabel)
         for (key in listOf(
-            "Phase", "Plan", "Agents", "Verification", "Acceptance criteria", "Spend", "Finish actions"
+            "Phase", "Plan", "Agents", "Verification", "Integration",
+            "Acceptance criteria", "Spend", "Finish actions"
         )) {
             val value = WrappedLabel("—")
             value.font = uiPanelFont()
@@ -106,6 +107,14 @@ class OverviewPanel : JPanel(BorderLayout()) {
                 (proof.reason?.takeIf { it.isNotEmpty() }?.let { " — " + it } ?: "")
             recordPassed -> "Candidate checks passed · " + verificationDetails
             else -> "Not verified yet · " + verificationDetails
+        }
+        // I04/VAL-LAND-2: the integration domain renders as its own fact row
+        // (text + glyph) from the served proof members only; a run with no
+        // proof keeps an explicit missing value, never a positive fact.
+        rows["Integration"]?.fullText = if (proof == null) {
+            "No integration facts are served for this run yet"
+        } else {
+            proof.integrationFacts().joinToString(" · ")
         }
         rows["Acceptance criteria"]?.fullText = if (model.acceptanceCriteria.isEmpty()) {
             "No acceptance criteria"

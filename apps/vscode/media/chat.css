@@ -1257,6 +1257,12 @@ button.chip-action:hover:not(:disabled) {
   color: var(--vscode-descriptionForeground);
 }
 
+.pr-scm-setup {
+  margin: var(--space-1) 0;
+  padding: var(--space-1) var(--space-2);
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+}
+
 #attachment-list {
   list-style: none;
   margin: 0;
@@ -1640,6 +1646,11 @@ button.attachment-remove {
 }
 
 .criterion-line-unavailable {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  font-style: italic;
+}
+
+.criterion-no-verdict {
   color: var(--vscode-editorWarning-foreground, #d29922);
   font-style: italic;
 }

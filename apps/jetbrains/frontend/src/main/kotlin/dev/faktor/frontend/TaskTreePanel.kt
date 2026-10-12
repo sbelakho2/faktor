@@ -447,6 +447,19 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             )
         )
         if (proof == null) return node
+        // I04/VAL-LAND-2: the integration domain as its own facts (text +
+        // glyph), derived only from served proof members; a fact this DTO
+        // cannot distinguish stays an explicit unavailable, never a success.
+        for (fact in proof.integrationFacts()) {
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(
+                        bound("integration: " + fact, 240),
+                        "proof:integration:" + bound(fact, 80)
+                    )
+                )
+            )
+        }
         proof.reviewer?.takeIf { it.isNotEmpty() }?.let {
             node.add(
                 DefaultMutableTreeNode(
@@ -733,6 +746,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         row.recordId?.let {
             text.append(" · record ").append(it).append(" [").append(row.recordStatus ?: "?").append("]")
         }
+        // T15: a claim with no served verdict carries the exact supporting
+        // sentence as text (the unavailable tone is never the only cue).
+        row.noVerdictCopy?.let { text.append(" · ").append(it) }
         row.verdictReason?.let { text.append(" · ").append(it) }
         if (row.unavailable.isNotEmpty()) {
             text.append(" · unavailable: ").append(row.unavailable.joinToString(", "))

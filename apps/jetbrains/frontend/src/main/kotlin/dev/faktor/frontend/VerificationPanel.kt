@@ -264,6 +264,9 @@ class VerificationPanel : JPanel(BorderLayout()) {
             mutedForeground()
         }
         body.add(title)
+        // T15: a claim with no served verdict carries the exact supporting
+        // sentence; the card never renders an unavailable claim as a pass.
+        row.noVerdictCopy?.let { body.add(wrappedMutedLabel(it)) }
         val binding = row.bindingReference?.let { " via $it" } ?: ""
         body.add(wrappedMutedLabel("${row.requirement} criterion · ${row.bindingKind}$binding"))
         row.verdictReason?.let { body.add(wrappedMutedLabel(bound(it, 240))) }

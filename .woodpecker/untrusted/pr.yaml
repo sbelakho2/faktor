@@ -18,8 +18,11 @@
 # The step set is deliberately reduced: the release `[perf]` budgets (and the
 # trusted/platform certificates) belong to the trusted project; a PR still
 # runs the full correctness set (fmt/clippy/check/test/doctor,
-# static+security+fuzz, docs-sync, VSIX build+verify, required chromium render
-# gate, JetBrains build+smoke) without a warm cache.
+# static+security+fuzz, docs-sync, VSIX build+verify, the `vscode-render`
+# chromium render gate, JetBrains build+smoke) without a warm cache. The
+# chromium render gate is a real lane (`vscode-render`, below, on the same
+# digest-pinned Playwright image as the trusted `vscode-e2e` lane), not a
+# comment-only claim.
 #
 # Bootstrap audit: this workflow contains NO `curl … | sh`-style step. The
 # one remaining toolchain bootstrap (JetBrains smoke) downloads the pinned
@@ -167,7 +170,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -198,7 +201,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
   - name: docs
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -225,7 +228,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
   - name: vscode
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
@@ -244,7 +247,15 @@ steps:
       - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
       - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
       - node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
-      - cd "$CI_WORKSPACE"
+      # Artifact branding gate: the packaged VSIX bytes (grep -a over the
+      # archive) must carry no legacy wordmark token; the scan exits non-zero
+      # on a hit, failing the lane.
+      - |
+        set -eu
+        rm -rf /tmp/faktor-brand-vsix && mkdir -p /tmp/faktor-brand-vsix
+        cp faktor-ci.vsix /tmp/faktor-brand-vsix/
+        cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-vsix
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -259,7 +270,11 @@ steps:
         node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
         node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
         node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+        set -eu
+        rm -rf /tmp/faktor-brand-vsix && mkdir -p /tmp/faktor-brand-vsix
+        cp faktor-ci.vsix /tmp/faktor-brand-vsix/
         cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-vsix
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
@@ -272,8 +287,92 @@ steps:
         artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
         artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
         artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
+  # Chromium render gate (the PR header used to name it while no lane ran it):
+  # builds the extension, then runs the render-webview --check measurements in
+  # a real headless Chromium. Image: the SAME digest-pinned Playwright image
+  # the trusted `vscode-e2e` lane uses (untested images are refused by
+  # `scripts/check-ci-image-pins.sh`; this image needs no volume and no apt).
+  # Chrome discovery is deterministic and fail-closed: the image ships
+  # chromium under /ms-playwright/chromium-*/chrome-linux/chrome; the lane
+  # resolves it with that shell glob, refuses an empty/unusable result, and
+  # exports FAKTOR_CHROME (render-webview.mjs honors it). render-webview.mjs
+  # has no chrome-flag surface, so a tiny wrapper adds `--no-sandbox` ONLY when
+  # the container runs as root — the same root rule scripts/vscode-e2e.sh
+  # documents for this image (`id -u` = 0 refuses to start Chrome otherwise).
+  - name: vscode-render
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as the trusted vscode-e2e lane; chromium runtime included)
+    commands:
+      - cd apps/vscode
+      - npm ci
+      - npm run build
+      - |
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        if [ -z "$chrome_bin" ]; then
+          echo "vscode-render: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
+          exit 1
+        fi
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        if [ ! -x "$chrome_wrapper" ]; then
+          echo "vscode-render: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
+          exit 1
+        fi
+        echo "vscode-render: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
+        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
+      - cd "$CI_WORKSPACE"
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cd apps/vscode
+        npm ci
+        npm run build
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        if [ -z "$chrome_bin" ]; then
+          echo "vscode-render: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
+          exit 1
+        fi
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        if [ ! -x "$chrome_wrapper" ]; then
+          echo "vscode-render: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
+          exit 1
+        fi
+        echo "vscode-render: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
+        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
+        cd "$CI_WORKSPACE"
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-render","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-render.json
   - name: jetbrains-build
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
     # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
@@ -286,7 +385,17 @@ steps:
       # Validate wrapper jar + distribution sha256 + verification metadata + locks first.
       - bash ../../scripts/check-gradle-integrity.sh
       - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
-      - cd "$CI_WORKSPACE"
+      # Artifact branding gate: the packaged plugin ZIP bytes must carry no
+      # legacy wordmark token (the scan exits non-zero on a hit). The scan
+      # runs on a dedicated directory holding only that ZIP.
+      - |
+        set -eu
+        plugin_zip="$(find frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit)"
+        [ -n "$plugin_zip" ] || { echo "jetbrains-build: no plugin ZIP under frontend/build/distributions (fail closed)" >&2; exit 1; }
+        rm -rf /tmp/faktor-brand-jb && mkdir -p /tmp/faktor-brand-jb
+        cp "$plugin_zip" /tmp/faktor-brand-jb/
+        cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-jb
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -294,7 +403,13 @@ steps:
         cd apps/jetbrains
         bash ../../scripts/check-gradle-integrity.sh
         ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+        set -eu
+        plugin_zip="$(find frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit)"
+        [ -n "$plugin_zip" ] || { echo "jetbrains-build: no plugin ZIP under frontend/build/distributions (fail closed)" >&2; exit 1; }
+        rm -rf /tmp/faktor-brand-jb && mkdir -p /tmp/faktor-brand-jb
+        cp "$plugin_zip" /tmp/faktor-brand-jb/
         cd "$CI_WORKSPACE"
+        bash scripts/branding-scan.sh --artifacts /tmp/faktor-brand-jb
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
@@ -312,7 +427,7 @@ steps:
           artifacts="[]"
           artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         fi
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
     image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
@@ -359,7 +474,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
   - name: certificate
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
@@ -370,6 +485,7 @@ steps:
       - static
       - docs
       - vscode
+      - vscode-render
       - jetbrains-build
       - jetbrains-smoke
     when:

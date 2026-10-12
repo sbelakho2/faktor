@@ -14,7 +14,11 @@
 //     the Swing focus traversal policy and every actionable button must be
 //     reachable and carry its SPACE keyboard binding. No MouseEvent is ever
 //     constructed or dispatched;
-//   * honest empty / loading / error / blocked / reconnect states.
+//   * honest empty / loading / error / blocked / reconnect states, one
+//     `state/<axis>/<panel>` check per panel and axis (the dogfood rule parses
+//     these names): empty for every panelFactories entry, loading for the
+//     not-read surfaces, error for the read-backed panels, plus the blocked
+//     and reconnect recovery surfaces.
 //
 // The result is written to target/certification/jetbrains-host-matrix.json
 // (`faktor-jetbrains-host-matrix/v1`), including the source ZIP sha256 and the
@@ -22,8 +26,13 @@
 // a source-classpath one.
 package dev.faktor.frontend
 
+import dev.faktor.backend.DaemonBinary
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
+import dev.faktor.shared.parseNativeBoardPage
+import dev.faktor.shared.parseNativeTaskVerification
+import dev.faktor.shared.parseNativeTerminalEventPage
+import dev.faktor.shared.parseNativeTerminalPage
 import java.awt.Color
 import java.awt.Component
 import java.awt.Container
@@ -694,6 +703,24 @@ object JetBrainsHostMatrixSmoke {
     // ---------------------------------------------------------------- states
 
     private fun stateChecks() {
+        emptyStateChecks()
+        loadingStateChecks()
+        errorStateChecks()
+        recoveryStateChecks()
+    }
+
+    // -------------------------------------------------------------- empty axis
+
+    /**
+     * `state/empty/<panel>` for every panelFactories entry. Each check renders
+     * the panel's real empty / not-read state and pins the exact copy the
+     * product actually renders today (an unwritten panel shows its explicit
+     * placeholder; no row, metric or draft is ever invented).
+     */
+    private fun emptyStateChecks() {
+        // Aggregate arm's-length render of every fresh panel (kept beside the
+        // granular state/empty/<panel> checks; the granular checks carry the
+        // per-panel copy).
         check("state/empty/panels") {
             val fresh: List<Pair<String, JComponent>> = listOf(
                 "task-tree" to TaskTreePanel(),
@@ -716,12 +743,363 @@ object JetBrainsHostMatrixSmoke {
                 requireTrue(stats.distinctColors >= 2, "$name empty state degenerate: $stats")
             }
         }
+        check("state/empty/task") {
+            val chat = newChatPanel("task-empty")
+            requireTrue(
+                chat.goalTextForTest().isEmpty(),
+                "the empty composer must not invent a goal draft"
+            )
+            requireTrue(
+                chat.attachmentsCountForTest() == 0,
+                "the empty composer must carry no attachments"
+            )
+            requireTrue(
+                textLines(chat).contains("Run task"),
+                "the empty composer must render its Run task action: ${textLines(chat)}"
+            )
+            requirePanelRenders("empty task composer", chat)
+        }
+        check("state/empty/task-options") {
+            val chat = newChatPanel("task-options-empty")
+            chat.openTaskOptionsForTest()
+            requireTrue(chat.taskOptionsOpenForTest(), "the Task options sheet must open")
+            requireTrue(
+                chat.contractEditorsForTest().all { it.isEmpty() },
+                "the empty options sheet must not invent contract rows: " +
+                    chat.contractEditorsForTest()
+            )
+            requireTrue(
+                chat.selectedFinishLevelLabelForTest() == FinishLevel.LOCAL.label(),
+                "the empty sheet defaults to the Local finish level: " +
+                    chat.selectedFinishLevelLabelForTest()
+            )
+            val sheet = chat.taskOptionsSheetForTest()
+                ?: throw AssertionError("the Task options sheet must exist")
+            val texts = textLines(sheet)
+            requireTrue(texts.contains("Task options"), "the sheet must be headed: $texts")
+            requireTrue(texts.contains("Back"), "the sheet must offer Back: $texts")
+            requirePanelRenders("empty task options sheet", sheet)
+        }
+        check("state/empty/work-approval") {
+            val chat = newChatPanel("work-approval-empty")
+            chat.updatePendingApprovalsForTest(emptyList())
+            val card = chat.workApprovalView()
+            requireTrue(card.count() == 0, "no request may be pending in the empty state")
+            requireTrue(
+                !card.isVisible,
+                "the Work approval card must hide itself while nothing is pending"
+            )
+            // The T10 card copy the surface renders when a request arrives.
+            requireTrue(card.headlineText() == APPROVAL_HEADLINE, "T10 headline copy")
+            requireTrue(card.supportingText() == APPROVAL_SUPPORTING, "T10 supporting copy")
+            requirePanelRenders("empty Work approval", chat)
+        }
+        check("state/empty/toolbar") {
+            val chat = newChatPanel("toolbar-empty")
+            requireTrue(
+                chat.sessionChooserCountForTest() == 0,
+                "the empty toolbar must serve no sessions"
+            )
+            val texts = textLines(chat.utilitiesToolbarForTest())
+            requireTrue(
+                texts.contains("New session") && texts.contains("Refresh"),
+                "the empty toolbar keeps its primary actions: $texts"
+            )
+            requirePanelRenders("empty utilities toolbar", chat)
+        }
+        check("state/empty/task-tree") { emptyTaskTreeState() }
+        check("state/empty/plan") { emptyTaskTreeState() }
+        check("state/empty/overview") {
+            val panel = OverviewPanel()
+            panel.updateModel(null)
+            val texts = textLines(panel)
+            requireTrue(
+                texts.contains("No run yet. Describe a task in the composer."),
+                "the empty overview must name the next action: $texts"
+            )
+            requireTrue(texts.contains("No run yet"), "the empty run chip must name itself: $texts")
+            requireTrue(
+                panel.summaryText("Phase") == "—" && panel.summaryText("Spend") == "—",
+                "missing overview values must stay missing"
+            )
+            requirePanelRenders("empty overview", panel)
+        }
+        // I03 exact empty copy (ChangeReview.CHANGES_EMPTY_COPY).
+        check("state/empty/changes") {
+            val panel = ChangesPanel()
+            requireTrue(
+                panel.emptyText() == CHANGES_EMPTY_COPY,
+                "the empty changes state must render '$CHANGES_EMPTY_COPY': ${panel.emptyText()}"
+            )
+            requireTrue(
+                panel.emptyText() == "No candidate changes are served for this run yet.",
+                "the I03 empty copy is exactly pinned"
+            )
+            requireTrue(
+                !panel.openEnabled(),
+                "no candidate changes means Open source diff stays disabled"
+            )
+            requireTrue(
+                panel.candidateText() == "No candidate identity is served for this run.",
+                "no candidate identity is invented: ${panel.candidateText()}"
+            )
+            requirePanelRenders("empty changes", panel)
+        }
+        check("state/empty/verification") {
+            val panel = VerificationPanel()
+            requireTrue(
+                panel.summaryText() == "No verification has been recorded yet.",
+                "the empty verification summary must be honest: ${panel.summaryText()}"
+            )
+            val texts = textLines(panel)
+            requireTrue(
+                texts.contains(
+                    "Criteria, checks and reviewer appear here once a run is verified."
+                ),
+                "the empty criteria column must explain itself: $texts"
+            )
+            requirePanelRenders("empty verification", panel)
+        }
+        check("state/empty/blockers") {
+            val panel = BlockersPanel()
+            panel.update(emptyList(), emptyList())
+            requireTrue(
+                panel.blockerCount() == 0 && panel.permissionCount() == 0,
+                "the empty blockers surface carries no rows"
+            )
+            val texts = textLines(panel)
+            for (copy in listOf(
+                "No blocked children.",
+                "No task-level blockers."
+            )) {
+                requireTrue(
+                    texts.contains(copy),
+                    "the empty blockers surface must render '$copy': $texts"
+                )
+            }
+            // The approvals section is deliberately omitted here (the cards
+            // live on the Inspect -> Agents -> Approvals surface), so the
+            // empty state never claims "no pending permissions".
+            requireTrue(
+                texts.none { it.contains("Pending permissions") },
+                "the empty surface omits the approvals section instead of claiming none: $texts"
+            )
+            requirePanelRenders("empty blockers", panel)
+        }
+        check("state/empty/tournament") {
+            val panel = TournamentPanel()
+            requireTrue(
+                panel.summariesText() == "No saved comparisons in this session yet.",
+                "the empty comparison listing must say so: ${panel.summariesText()}"
+            )
+            requireTrue(
+                panel.primaryText().contains("No approaches are being compared yet."),
+                "the empty tournament must not invent an approach: ${panel.primaryText()}"
+            )
+            requirePanelRenders("empty tournament", panel)
+        }
+        check("state/empty/permissions") {
+            val panel = PermissionsPanel()
+            requireTrue(
+                panel.count() == 0 && panel.available(),
+                "an empty (but available) approval list is not an error"
+            )
+            requireTrue(
+                panel.headerText().startsWith(APPROVAL_HEADLINE),
+                "the empty approvals list keeps the T10 headline: ${panel.headerText()}"
+            )
+            val texts = textLines(panel)
+            requireTrue(
+                texts.contains(APPROVAL_SUPPORTING),
+                "the T10 supporting copy renders on the approvals surface: $texts"
+            )
+            requireTrue(
+                texts.contains("No pending approvals. Requests appear here while an agent works."),
+                "the empty approvals placeholder must render: $texts"
+            )
+            requireTrue(
+                panel.detailText() ==
+                    "No pending approval requests. New requests appear here for review.",
+                "the empty request detail must render: ${panel.detailText()}"
+            )
+            requireTrue(!panel.allowEnabled(), "nothing pending means Allow stays disabled")
+            requirePanelRenders("empty permissions", panel)
+        }
+        check("state/empty/terminal") {
+            val panel = TerminalPanel()
+            panel.update(
+                parseNativeTerminalPage(
+                    "{\"sessionId\":\"7\",\"terminals\":[],\"unowned\":0,\"note\":\"\"}"
+                )
+            )
+            panel.setEvents(
+                parseNativeTerminalEventPage(
+                    "{\"sessionId\":\"7\",\"events\":[],\"hasMore\":false,\"nextCursor\":null}"
+                )
+            )
+            requireTrue(
+                panel.available() && panel.terminalCount() == 0,
+                "an empty (but available) terminal read is not an error"
+            )
+            requireTrue(
+                panel.eventsText() == "No lifetime events yet for this conversation.",
+                "the empty lifetime events must say so: ${panel.eventsText()}"
+            )
+            requireTrue(
+                panel.advancedText() == "No session-owned processes.",
+                "the empty process readout must say so: ${panel.advancedText()}"
+            )
+            requireTrue(
+                panel.outputText().isEmpty(),
+                "the empty terminal surface must not invent output"
+            )
+            requirePanelRenders("empty terminal", panel)
+        }
+        check("state/empty/evidence") {
+            val panel = EvidenceNavigatorPanel()
+            requireTrue(
+                panel.evidenceCount() == 0 && panel.messageCount() == 0,
+                "the empty navigator carries no evidence refs and no messages"
+            )
+            requireTrue(
+                panel.outputText().isEmpty() && panel.transcriptText().isEmpty(),
+                "nothing is fabricated before a retrieval"
+            )
+            requirePanelRenders("empty evidence", panel)
+        }
+        check("state/empty/board") {
+            val panel = BoardPanel()
+            panel.setBoard(parseNativeBoardPage(PARITY_BOARD_PAGE_JSON))
+            requireTrue(panel.available(), "an empty (but read) board is not an error")
+            requireTrue(
+                panel.headerText() == "coordination: 0 posts · 0 unread",
+                "the empty board header must count zero: ${panel.headerText()}"
+            )
+            requireTrue(
+                panel.postsText().isEmpty(),
+                "the empty board must not fabricate posts: ${panel.postsText()}"
+            )
+            requirePanelRenders("empty board", panel)
+        }
+        check("state/empty/agents") {
+            val panel = AgentsPanel()
+            panel.update(emptyList(), null)
+            requireTrue(panel.rosterText().isEmpty(), "the empty roster must render no rows")
+            requireTrue(
+                panel.advancedText() == "No agents yet. Rows appear here while a run works.",
+                "the empty roster placeholder must render: ${panel.advancedText()}"
+            )
+            requirePanelRenders("empty agents", panel)
+        }
+        check("state/empty/diagnostics") {
+            val panel = DiagnosticsPanel()
+            requireTrue(
+                panel.streamText() == "off",
+                "the pre-read live-update row must stay off: ${panel.streamText()}"
+            )
+            requireTrue(
+                panel.trustText() == "—",
+                "a never-resolved binary trust row stays missing: ${panel.trustText()}"
+            )
+            requireTrue(
+                panel.daemonText() == "—",
+                "an unread service row stays missing: ${panel.daemonText()}"
+            )
+            requirePanelRenders("empty diagnostics", panel)
+        }
+        check("state/empty/usage") {
+            val panel = UsagePanel()
+            requireTrue(panel.model() == null, "nothing is invented before the usage read")
+            val period = panel.periodText()
+            requireTrue(
+                period.contains("No period is served yet."),
+                "the empty usage period must say so: $period"
+            )
+            requireTrue(
+                period.contains("Tokens — not reported"),
+                "unreported tokens stay unreported: $period"
+            )
+            requirePanelRenders("empty usage", panel)
+        }
+        check("state/empty/settings") {
+            val panel = SettingsPanel()
+            requireTrue(panel.available(), "an unread settings surface is not an error")
+            requireTrue(panel.providerCount() == 0, "no provider is invented")
+            requireTrue(
+                panel.providerText() == "no providers served",
+                "the empty providers card must say so: ${panel.providerText()}"
+            )
+            requireTrue(
+                panel.daemonText() == "daemon: not started",
+                "the empty daemon card must say so: ${panel.daemonText()}"
+            )
+            requireTrue(
+                panel.statusText() == "providers: -",
+                "the unread settings status line must stay untracked: ${panel.statusText()}"
+            )
+            requirePanelRenders("empty settings", panel)
+        }
         check("state/empty/history") {
             val panel = HistoryPanel()
             panel.update(emptyList(), null)
             requireTrue(panel.count() == 0, "empty history must report zero sessions")
             requireTrue(!panel.openEnabled(), "empty history must not enable open")
+            requireTrue(
+                panel.statusText() == "prior work: 0 sessions",
+                "the empty history must count zero honestly: ${panel.statusText()}"
+            )
+            requirePanelRenders("empty history", panel)
         }
+        check("state/empty/conversations") {
+            val panel = HistoryPanel()
+            panel.update(emptyList(), null)
+            requireTrue(
+                panel.count() == 0 && !panel.openEnabled(),
+                "the conversations surface must render an empty listing honestly"
+            )
+            requireTrue(
+                panel.statusText() == "prior work: 0 sessions",
+                "the empty conversations listing counts zero: ${panel.statusText()}"
+            )
+            requirePanelRenders("empty conversations", panel)
+        }
+        check("state/empty/outcomes") {
+            val panel = OutcomesPanel()
+            requireTrue(
+                panel.model() == null,
+                "nothing is invented before the outcomes read"
+            )
+            val texts = textLines(panel)
+            requireTrue(
+                texts.contains("No local-cohort counters are served yet."),
+                "the empty cohort card must say so: $texts"
+            )
+            requireTrue(
+                texts.contains("No completed runs are served on this page yet."),
+                "the empty run list must say so: $texts"
+            )
+            requireTrue(panel.metricNames().isEmpty(), "no metric is invented")
+            requirePanelRenders("empty outcomes", panel)
+        }
+    }
+
+    /** The shared empty task-tree / plan state (same panel, two host entries). */
+    private fun emptyTaskTreeState() {
+        val panel = TaskTreePanel()
+        requireTrue(panel.model() == null, "no task model may exist before a run")
+        val root = panel.treeForTest().model.root as? javax.swing.tree.DefaultMutableTreeNode
+        val payload = root?.userObject as? TaskTreeNode
+        requireTrue(
+            payload?.label == "No task data yet. Start a task to populate the tree.",
+            "the empty tree must render its placeholder: ${payload?.label}"
+        )
+        requirePanelRenders("empty task tree", panel)
+    }
+
+    // ------------------------------------------------------------ loading axis
+
+    /** The not-read / connecting presentations that precede the first read. */
+    private fun loadingStateChecks() {
         check("state/loading/diagnostics") {
             val panel = DiagnosticsPanel()
             panel.setConnection("connecting to daemon", "connecting", 0L, null)
@@ -729,8 +1107,40 @@ object JetBrainsHostMatrixSmoke {
                 panel.streamText().contains("connecting"),
                 "loading diagnostics must render the connecting stream state"
             )
-            ParityAwt.layout(panel, 320, 600)
+            requireTrue(
+                textLines(panel).any { it.contains("connecting to daemon") },
+                "the loading service row must name the connecting daemon"
+            )
+            requirePanelRenders("loading diagnostics", panel)
         }
+        check("state/loading/outcomes") {
+            val panel = OutcomesPanel()
+            requireTrue(
+                panel.model() == null,
+                "the not-read outcomes state must not invent a model"
+            )
+            requireTrue(
+                textLines(panel).contains("outcomes: not read yet"),
+                "the loading outcomes surface must say it has not read yet"
+            )
+            requireTrue(
+                panel.metricNames().isEmpty() && !panel.olderEnabled(),
+                "no metric and no paging is offered before the read"
+            )
+            requirePanelRenders("loading outcomes", panel)
+        }
+    }
+
+    // -------------------------------------------------------------- error axis
+
+    /**
+     * `state/error/<panel>` for the read-backed panels: the panel's real
+     * refusal API drives the state and the exact mandated copy is pinned
+     * wherever the state has mandated text (T29 cost, T31 history, I03 diff).
+     */
+    private fun errorStateChecks() {
+        // Aggregate refusal render for the four panels with a direct typed
+        // refusal API (kept beside the granular state/error/<panel> checks).
         check("state/error/panels") {
             val permissions = PermissionsPanel()
             permissions.setUnavailable("permission route refused (status 503)")
@@ -749,9 +1159,323 @@ object JetBrainsHostMatrixSmoke {
             ParityAwt.layout(settings, 320, 600)
             ParityAwt.layout(history, 320, 600)
         }
+        check("state/error/permissions") {
+            val panel = PermissionsPanel()
+            panel.setUnavailable("permission route refused (status 503)")
+            requireTrue(!panel.available(), "the refused approval route must render unavailable")
+            requireTrue(
+                panel.headerText().contains("(unavailable)"),
+                "the refusal must be carried by the header text: ${panel.headerText()}"
+            )
+            requireTrue(
+                panel.detailText().contains("permission route refused (status 503)"),
+                "the refusal reason must stay visible: ${panel.detailText()}"
+            )
+            requireTrue(
+                textLines(panel).any { it.startsWith("Approvals unavailable:") },
+                "the refusal card must name itself: ${textLines(panel)}"
+            )
+            requirePanelRenders("error permissions", panel)
+        }
+        check("state/error/terminal") {
+            val panel = TerminalPanel()
+            panel.setUnavailable("terminal route refused (status 503)")
+            requireTrue(!panel.available(), "the refused terminal route must render unavailable")
+            requireTrue(
+                panel.headerText().contains("commands: unavailable"),
+                "the refusal must be carried by the header: ${panel.headerText()}"
+            )
+            requireTrue(
+                panel.eventsText() == "terminal route refused (status 503)" &&
+                    panel.outputText() == "terminal route refused (status 503)",
+                "the refusal reason must replace the stale panes, never an empty frame"
+            )
+            requirePanelRenders("error terminal", panel)
+        }
+        check("state/error/settings") {
+            val panel = SettingsPanel()
+            panel.setUnavailable("provider read failed (status 503)")
+            requireTrue(!panel.available(), "the refused provider read must render unavailable")
+            requireTrue(
+                panel.providerText() == "provider read failed (status 503)",
+                "the refusal reason must render in the providers card: ${panel.providerText()}"
+            )
+            requireTrue(
+                panel.statusText().contains("unavailable"),
+                "the refusal must be carried by the status line: ${panel.statusText()}"
+            )
+            requireTrue(
+                panel.providerCount() == 0 && panel.modelCount() == 0,
+                "a refused read must clear the offered providers and models"
+            )
+            requirePanelRenders("error settings", panel)
+        }
+        // T31 exact copy: HistoryPanel.setUnavailable renders the mandated card.
+        check("state/error/history") {
+            val panel = HistoryPanel()
+            panel.setUnavailable("history read refused (status 503)")
+            requireTrue(!panel.available(), "the refused history read must render unavailable")
+            requireTrue(
+                panel.unavailableHeadlineText() == "History unavailable",
+                "T31 label: ${panel.unavailableHeadlineText()}"
+            )
+            requireTrue(
+                panel.unavailableCopyText() == "The conversation list could not be read.",
+                "T31 copy: ${panel.unavailableCopyText()}"
+            )
+            requireTrue(
+                panel.refreshHistoryActionText() == "Refresh history",
+                "T31 action: ${panel.refreshHistoryActionText()}"
+            )
+            requireTrue(
+                panel.statusText().contains("history read refused (status 503)"),
+                "the refusal reason must stay visible: ${panel.statusText()}"
+            )
+            requirePanelRenders("error history", panel)
+        }
+        check("state/error/diagnostics") {
+            val panel = DiagnosticsPanel()
+            panel.setUnavailable("diagnostics read refused (status 503)")
+            requireTrue(!panel.available(), "the refused diagnostics read must render unavailable")
+            requireTrue(
+                panel.daemonText() == "unavailable",
+                "the refused service row must say unavailable: ${panel.daemonText()}"
+            )
+            requireTrue(
+                panel.streamText().contains("unavailable") &&
+                    panel.streamText().contains("diagnostics read refused (status 503)"),
+                "the refused stream row must carry the reason: ${panel.streamText()}"
+            )
+            requirePanelRenders("error diagnostics", panel)
+        }
+        // T29 exact copy: the refusal model carries no monetary value at all.
+        check("state/error/outcomes") {
+            val panel = OutcomesPanel()
+            panel.setModel(outcomesPanelModelOf(null, "outcomes read refused (status 503)"))
+            val model = panel.model() ?: throw AssertionError("the refusal model must be set")
+            requireTrue(model.state == "unavailable", "the refused read must be unavailable")
+            requireTrue(
+                panel.unavailableHeadlineText() == OUTCOMES_COST_UNAVAILABLE,
+                "T29 label: ${panel.unavailableHeadlineText()}"
+            )
+            requireTrue(
+                panel.unavailableCopyText() == OUTCOMES_COST_UNAVAILABLE_COPY,
+                "T29 copy: ${panel.unavailableCopyText()}"
+            )
+            requireTrue(
+                panel.viewDetailsText() == "View details",
+                "T29 action: ${panel.viewDetailsText()}"
+            )
+            requireTrue(!model.hasMonetaryValue(), "no monetary value may sit behind a refusal")
+            requireTrue(
+                textLines(panel).contains("outcomes: cost unavailable"),
+                "the refusal must be carried by the status line"
+            )
+            requirePanelRenders("error outcomes", panel)
+        }
+        // I03: the refused changes read and the exact Diff unavailable copy.
+        check("state/error/changes") {
+            val panel = ChangesPanel()
+            panel.setUnavailable("change read failed: task view read failed")
+            requireTrue(
+                panel.unavailableReason() == "change read failed: task view read failed",
+                "the refusal reason must be recorded: ${panel.unavailableReason()}"
+            )
+            requireTrue(
+                panel.unavailableHeadlineText() == CHANGES_UNAVAILABLE_LABEL,
+                "the refused changes headline: ${panel.unavailableHeadlineText()}"
+            )
+            panel.showDiffUnavailable()
+            requireTrue(
+                panel.diffUnavailableVisible(),
+                "the I03 Diff unavailable state must be selectable"
+            )
+            requireTrue(
+                panel.diffUnavailableLabelText() == DIFF_UNAVAILABLE_LABEL,
+                "I03 label: ${panel.diffUnavailableLabelText()}"
+            )
+            requireTrue(
+                panel.diffUnavailableCopyText() == DIFF_UNAVAILABLE_COPY,
+                "I03 copy: ${panel.diffUnavailableCopyText()}"
+            )
+            requireTrue(
+                panel.diffUnavailableCopyText() ==
+                    "The runtime does not serve an immutable candidate content read for this change.",
+                "the I03 copy is exactly pinned"
+            )
+            requirePanelRenders("error changes", panel)
+        }
+        // T15: a claim with no served verdict keeps its unavailable marker; a
+        // refused proof read discards the stale record (fail-closed) and the
+        // Plan surface names the refusal.
+        check("state/error/verification") {
+            val model = TaskTree.build(
+                taskVerification = parseNativeTaskVerification(PARITY_CRITERION_PROOF_JSON),
+                proofUnavailable = "proof read failed: corrupt_durable_state"
+            )
+            requireTrue(
+                model.verification.status == "unavailable",
+                "a refused proof read must drive verification unavailable"
+            )
+            requireTrue(
+                !model.verification.verified,
+                "a refused proof read must never render verified"
+            )
+            val panel = VerificationPanel()
+            panel.updateModel(model)
+            requireTrue(
+                panel.summaryText().startsWith("Not verified yet"),
+                "the refused proof must not present a verified summary: ${panel.summaryText()}"
+            )
+            val labels = panel.criterionLabels()
+            requireTrue(
+                labels.any { it.startsWith("[unavailable] unavailable criterion") },
+                "T15: the unavailable claim keeps its text-carried verdict: $labels"
+            )
+            requireTrue(
+                textLines(panel).contains("required criterion · unavailable"),
+                "the unavailable claim names its binding state: ${textLines(panel)}"
+            )
+            val plan = TaskTreePanel()
+            plan.update(model)
+            requireTrue(
+                textLines(plan).any { it.startsWith("VERIFICATION UNAVAILABLE") },
+                "the plan surface must name the refused verification read"
+            )
+            requirePanelRenders("error verification", panel)
+        }
+        check("state/error/evidence") {
+            val panel = EvidenceNavigatorPanel()
+            val ref = EvidenceRefs.parse("evidence:41")
+            panel.setEvidence(listOf(ref))
+            panel.selectEvidence(ref)
+            requireTrue(
+                panel.outputText().contains("selected evidence:41"),
+                "the selection must render before the refusal: ${panel.outputText()}"
+            )
+            panel.showError(41L, "evidence retrieve refused (status 404 not_found)")
+            requireTrue(
+                panel.outputText() == "evidence 41: evidence retrieve refused (status 404 not_found)",
+                "the retrieval refusal must render its exact reason: ${panel.outputText()}"
+            )
+            requireTrue(
+                panel.evidenceCount() == 1,
+                "the refusal must keep the served ref list, never drop it"
+            )
+            requirePanelRenders("error evidence", panel)
+        }
+        // T29 refusal + T30 billing-disabled refusal, both without fabricated
+        // numbers (the panel's real wording).
+        check("state/error/usage") {
+            val panel = UsagePanel()
+            panel.setUnavailable("usage read refused (status 503)")
+            requireTrue(
+                panel.model()!!.state == "unavailable",
+                "the refused usage read must render unavailable"
+            )
+            requireTrue(
+                panel.lines().any { it.startsWith("usage unavailable") },
+                "the refused state must carry its reason: ${panel.lines()}"
+            )
+            requireTrue(
+                panel.periodText().contains("Tokens — not reported"),
+                "a refused read must not fabricate numbers: ${panel.periodText()}"
+            )
+            requireTrue(!panel.grantEnabled(), "a refused billing surface never offers a grant")
+            panel.setUnavailable("billing is disabled in this installation", disabled = true)
+            requireTrue(
+                panel.model()!!.state == "disabled",
+                "the billing-disabled refusal must render disabled"
+            )
+            requireTrue(
+                panel.lines().any { it.startsWith("billing disabled locally") },
+                "T30: the disabled billing surface must name itself: ${panel.lines()}"
+            )
+            requireTrue(
+                panel.periodText().contains(
+                    "Billing is disabled locally; no period numbers are served."
+                ),
+                "no zero-dollar account is presented: ${panel.periodText()}"
+            )
+            requirePanelRenders("error usage", panel)
+        }
+        // The roster read can refuse; AgentsPanel has no refusal rendering
+        // today, so the honest panel observable is that a failed/unread
+        // roster fabricates nothing and keeps the explicit placeholder (the
+        // FaktorChatPanel refusal rides the transcript system line
+        // "error: refresh agents: <message>"). Reported with this run.
+        check("state/error/agents") {
+            val panel = AgentsPanel()
+            requireTrue(
+                panel.rosterText().isEmpty(),
+                "a failed roster read must not fabricate agent rows"
+            )
+            // The explicit empty replacement keeps the honest placeholder
+            // (the failure itself never swaps in invented rows).
+            panel.update(emptyList(), null)
+            requireTrue(panel.rosterText().isEmpty(), "no agent row may be invented")
+            requireTrue(
+                panel.advancedText() == "No agents yet. Rows appear here while a run works.",
+                "the failed/unread roster keeps the explicit empty placeholder: " +
+                    panel.advancedText()
+            )
+            requirePanelRenders("error agents", panel)
+        }
+    }
+
+    // ------------------------------------------------- blocked / reconnect axis
+
+    /** T10/T11-family blocked wording and the T27/T28 recovery surfaces. */
+    private fun recoveryStateChecks() {
         check("state/blocked/blockers") {
             val panel = cannedBlockersPanel()
             requireTrue(panel.blockerCount() >= 1, "blockers model must carry a blocked row")
+            // The served reasons render verbatim (a blocked child owes its
+            // reason, dependency and resolution as text, not a tone).
+            requireTrue(
+                panel.blockerReasonText("child-1") == "shell call needs approval",
+                "the permission blocker reason renders verbatim"
+            )
+            requireTrue(
+                panel.blockerReasonText("child-2") == "waiting on impl-a",
+                "the dependency blocker reason renders verbatim"
+            )
+            requireTrue(
+                panel.applicableActions().contains(BlockerAction.RESUME),
+                "a blocked row exposes its resolve action: ${panel.applicableActions()}"
+            )
+            // T10 family: the decision card names the action and target and
+            // carries Allow/Deny for THAT request.
+            val allow = panel.permissionActionButton("7", "allow")
+                ?: throw AssertionError("the pending permission card must render Allow")
+            val deny = panel.permissionActionButton("7", "deny")
+                ?: throw AssertionError("the pending permission card must render Deny")
+            requireTrue(
+                allow.text == "Allow" && allow.isEnabled,
+                "T10 Allow must attach to request 7"
+            )
+            requireTrue(
+                deny.text == "Deny" && deny.isEnabled,
+                "T10 Deny must attach to request 7"
+            )
+            val texts = textLines(panel)
+            requireTrue(
+                texts.any { it.contains("Run a shell command: bash") },
+                "the approval card names the action and target: $texts"
+            )
+            requireTrue(
+                texts.any { it.contains("child-1 [blocked/permission] shell call needs approval") },
+                "the blocked child card must render: $texts"
+            )
+            requireTrue(
+                texts.any { it.contains("resolution: allow the shell tool") },
+                "the served resolution must render: $texts"
+            )
+            requireTrue(
+                texts.contains("No task-level blockers."),
+                "the empty task-blocker section stays honest: $texts"
+            )
+            requirePanelRenders("blocked blockers", panel)
             val tree = cannedTaskTreePanel()
             ParityAwt.layout(tree, 320, 600)
             val stats = paint(tree, 320, 600)
@@ -761,13 +1485,136 @@ object JetBrainsHostMatrixSmoke {
             val panel = cannedDiagnosticsPanel()
             requireTrue(panel.restartEnabled(), "restart control must exist for reconnect")
             requireTrue(panel.reconnectEnabled(), "reconnect control must exist")
+            // T27 exact copy and actions.
+            panel.setStreamRecovery(StreamRecoveryState.RECONNECTING)
+            requireTrue(
+                panel.streamRecoveryState() == StreamRecoveryState.RECONNECTING,
+                "the transient reconnect state must be current"
+            )
+            requireTrue(
+                panel.recoveryHeadline() == RECONNECTING_HEADLINE,
+                "T27 label: ${panel.recoveryHeadline()}"
+            )
+            requireTrue(
+                panel.recoveryHeadline() == "Reconnecting live updates",
+                "T27 label is exactly pinned"
+            )
+            requireTrue(
+                panel.recoveryBody() == RECONNECTING_COPY,
+                "T27 copy: ${panel.recoveryBody()}"
+            )
+            requireTrue(
+                panel.recoveryBody() == "The last valid journal position is kept.",
+                "T27 copy is exactly pinned"
+            )
+            requireTrue(
+                panel.recoveryActions() == listOf("Wait", "Refresh"),
+                "T27 actions: ${panel.recoveryActions()}"
+            )
+            // T28 exact copy and actions (no skip-event control exists).
+            panel.setStreamRecovery(StreamRecoveryState.PAUSED, "event 42 is unreadable")
+            requireTrue(
+                panel.recoveryHeadline() == STREAM_PAUSED_HEADLINE,
+                "T28 label: ${panel.recoveryHeadline()}"
+            )
+            requireTrue(
+                panel.recoveryHeadline() == "Live updates paused",
+                "T28 label is exactly pinned"
+            )
+            requireTrue(
+                panel.recoveryBody() == STREAM_PAUSED_COPY,
+                "T28 copy: ${panel.recoveryBody()}"
+            )
+            requireTrue(
+                panel.recoveryBody() ==
+                    "The client cannot read the next durable event. Nothing is skipped.",
+                "T28 copy is exactly pinned"
+            )
+            requireTrue(
+                panel.recoveryActions() == listOf("Reconnect", "Refresh from snapshot"),
+                "T28 actions: ${panel.recoveryActions()}"
+            )
+            requireTrue(
+                panel.recoveryActions().none { it.contains("skip", ignoreCase = true) },
+                "no skip-event control may exist: ${panel.recoveryActions()}"
+            )
+            // D10/KEEP-10 trust wording rows, exactly.
+            panel.setTrust(
+                daemonTrustLabel(DaemonBinary.Trust.Verified("record matches")),
+                "/opt/faktor/bin/faktor-cli"
+            )
+            requireTrue(
+                panel.trustText().startsWith("Matches recorded checksum"),
+                "trust row: ${panel.trustText()}"
+            )
+            requireTrue(
+                panel.trustText().contains("/opt/faktor/bin/faktor-cli"),
+                "the resolved executable stays visible: ${panel.trustText()}"
+            )
+            panel.setTrust(daemonTrustLabel(DaemonBinary.Trust.Unverified("no record")), null)
+            requireTrue(
+                panel.trustText() == "No checksum record",
+                "trust row: ${panel.trustText()}"
+            )
+            panel.setTrust(daemonTrustLabel(DaemonBinary.Trust.Refused("mismatch")), null)
+            requireTrue(
+                panel.trustText() == "Checksum mismatch",
+                "trust row: ${panel.trustText()}"
+            )
+            requireTrue(
+                daemonTrustLabel(null) == "—",
+                "an unresolved trust state stays missing"
+            )
             panel.setConnection("stopped", "off", 0L, null)
             requireTrue(
                 panel.streamText().contains("off"),
                 "stopped connection must render honestly"
             )
-            ParityAwt.layout(panel, 320, 600)
+            requirePanelRenders("reconnect diagnostics", panel)
         }
+    }
+
+    /** A fresh FaktorChatPanel host for the Work-surface state checks. */
+    private fun newChatPanel(tag: String): FaktorChatPanel {
+        val service = FaktorFrontendService(
+            java.nio.file.Paths.get("unused-binary"),
+            Files.createTempDirectory("faktor-host-matrix-$tag-")
+        )
+        val panel = FaktorChatPanel(service)
+        taskPanels.add(panel)
+        return panel
+    }
+
+    /** Lays the panel out offscreen and requires a non-degenerate frame. */
+    private fun requirePanelRenders(name: String, panel: Component, width: Int = 320) {
+        ParityAwt.layout(panel, width, 600)
+        val stats = paint(panel, width, 600)
+        requireTrue(stats.distinctColors >= 2, "$name rendered a degenerate frame: $stats")
+    }
+
+    /**
+     * Every rendered text of the subtree: wrapped labels carry their full
+     * untruncated text, buttons and editors their exact content. Hidden
+     * children are included deliberately (Swing CardLayout keeps both cards
+     * in the tree); the checks pair this with the panel state accessor.
+     */
+    private fun textLines(component: Component): List<String> {
+        val out = ArrayList<String>()
+        fun walk(component: Component) {
+            when (component) {
+                is WrappedLabel -> if (component.fullText.isNotEmpty()) {
+                    out.add(component.fullText)
+                }
+                is AbstractButton -> component.text?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+                is JLabel -> component.text?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+                is JTextComponent -> if (component.text.isNotEmpty()) out.add(component.text)
+            }
+            if (component is Container) {
+                for (child in component.components) walk(child)
+            }
+        }
+        walk(component)
+        return out
     }
 
     // -------------------------------------------------------------- plumbing

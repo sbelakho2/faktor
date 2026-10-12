@@ -3861,6 +3861,93 @@ async function completionContractTests() {
     assert(empty && empty.present === false && empty.lines[0].includes('none'));
   });
 
+  await test('T22: a requested PR step blocked by SCM config renders the exact copy and the guidance action', () => {
+    // The daemon records the typed code on the blocked PR step
+    // (`crates/orchestrator/src/completion_steps.rs`); it is the ONLY signal
+    // the surface accepts — PR success is never inferred.
+    const blockedTask = {
+      goal: 'ship it',
+      state: 'running',
+      completed: [],
+      open: [],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: null,
+      acceptanceCriteria: [],
+      plan: [],
+      blockers: [],
+      evidenceRefs: [],
+      phase: null,
+      progress: null,
+      completion: {
+        includeCommit: true,
+        includePush: true,
+        includePr: true,
+        steps: [
+          { step: 'commit', status: 'succeeded', detail: 'committed abc' },
+          {
+            step: 'pr',
+            status: 'failed',
+            detail:
+              'native PR refused (native_pr_scm_not_configured): the completion contract requests a pull request but no SCM provider is configured',
+          },
+        ],
+        source: 'daemon',
+        reason: null,
+      },
+    };
+    const { dom, posted } = runChatWebview({
+      ...webviewSnapshot([]),
+      task: blockedTask,
+    });
+    const completionNode = dom.document.getElementById('task-completion');
+    const notice = findFake(completionNode, (node) =>
+      String(node.className).includes('pr-scm-setup'),
+    );
+    assert(notice, `the T22 notice must render: ${JSON.stringify(completionNode.children.map((child) => child.textContent))}`);
+    assert(
+      findFake(notice, (node) => node.textContent === 'Pull request integration unavailable'),
+      'the T22 label ships verbatim',
+    );
+    assert(
+      findFake(
+        notice,
+        (node) => node.textContent === 'Configure the native SCM integration; no PR success is inferred.',
+      ),
+      'the T22 copy ships verbatim',
+    );
+    const guidance = findFake(
+      notice,
+      (node) => node.tagName === 'button' && node.textContent === 'Open setup guidance',
+    );
+    assert(guidance, 'the T22 action must render');
+    // The action opens the existing Diagnostics setup guidance card locally;
+    // it posts nothing (no new host route is invented).
+    const before = posted.length;
+    guidance.click();
+    assertEqual(dom.document.getElementById('diagnostics').hidden, false, 'the diagnostics popover opens');
+    assertEqual(dom.document.getElementById('sandbox-guidance').hidden, false, 'the guidance card reveals');
+    assertEqual(posted.length, before, 'opening the guidance is a local reveal');
+    // A PR step without the typed code, or a non-PR step carrying the code,
+    // is never read as the missing-SCM configuration: nothing is fabricated.
+    for (const steps of [
+      [{ step: 'pr', status: 'failed', detail: 'the remote rejected the ref' }],
+      [{ step: 'commit', status: 'failed', detail: 'native_pr_scm_not_configured' }],
+    ]) {
+      const unblocked = runChatWebview({
+        ...webviewSnapshot([]),
+        task: { ...blockedTask, completion: { ...blockedTask.completion, steps } },
+      });
+      assert(
+        !findFake(unblocked.dom.document.getElementById('task-completion'), (node) =>
+          String(node.className).includes('pr-scm-setup'),
+        ),
+        'the T22 notice requires the exact PR step + typed code',
+      );
+    }
+  });
+
   await test('the built-in Task composer posts the checked contract and displays its statuses', () => {
     const contractTask = {
       goal: 'ship it',
@@ -7171,6 +7258,21 @@ async function acceptanceProofTests() {
     const unavailableText = fakeText(unavailableRow);
     assert(unavailableText.includes('UNAVAILABLE'), unavailableText);
     assert(unavailableText.includes('unavailable: requirement'), unavailableText);
+    // T15: a claim with no verdict carries the EXACT mandated sentence, and
+    // the pass row never renders it. Unavailable and refused stay distinct;
+    // a positive verdict is never rendered for an unavailable claim.
+    assert(
+      unavailableText.includes('No verdict is served for this claim.'),
+      unavailableText,
+    );
+    assert(
+      !fakeText(passRow).includes('No verdict is served for this claim.'),
+      'a passing claim never says no verdict is served',
+    );
+    assert(
+      !fakeText(failRow).includes('No verdict is served for this claim.'),
+      'a failed claim carries its verdict, not the no-verdict sentence',
+    );
     // The typed evidence ref stays clickable (retrieval goes to the host).
     const certified = findFake(cockpitNode, (node) => fakeText(node).includes('certified'));
     const button = findFake(
@@ -7938,6 +8040,17 @@ async function attentionWebviewTests() {
   });
 
   await test('approval copy: the authority reason is verbatim and a bare entry fabricates none', () => {
+    // T10 (I05): the card headline is followed by the EXACT supporting copy
+    // the contract mandates, adjacent to the headline, exactly as the
+    // JetBrains approval card renders it.
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(markup.includes('id="permission-card-title">Faktor needs your approval</h2>'), 'T10 headline ships verbatim');
+    assert(
+      /<h2 id="permission-card-title">Faktor needs your approval<\/h2>\s*<p id="permission-supporting" class="muted">Review the action, target and stated reason\.<\/p>/.test(
+        markup,
+      ),
+      'the T10 supporting copy sits next to the card headline',
+    );
     const withReason = runChatWebview({
       ...webviewSnapshot([]),
       permissions: [
