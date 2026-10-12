@@ -28,6 +28,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseMotionAdapter
 import java.awt.font.FontRenderContext
+import javax.swing.AbstractButton
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.JButton
@@ -965,42 +966,75 @@ internal class FormGrid {
 }
 
 /** One horizontal action row on the shared spacing scale. */
-internal fun actionRow(vararg buttons: JButton): JPanel {
-    val panel = ActionRowPanel()
+internal fun actionRow(vararg buttons: AbstractButton): JPanel = wrapRow(*buttons)
+
+/**
+ * One left-aligned row of mixed controls (buttons, choosers, marks) that
+ * WRAPS when the host narrows (240px tool window) instead of clipping the
+ * trailing controls out of reach — no horizontal scroll pane fallback, so a
+ * primary control can never be scrolled out of view. The preferred height is
+ * computed for the width the host layout assigns (`FlowLayout` performs the
+ * actual wrapping) and a width change that alters the row count revalidates
+ * the parent so the reserved height follows.
+ */
+internal fun wrapRow(vararg components: Component): JPanel {
+    val panel = WrapRowPanel()
     panel.layout = java.awt.FlowLayout(java.awt.FlowLayout.LEFT, Spacing.S, Spacing.XS)
     panel.isOpaque = false
-    for (button in buttons) panel.add(button)
+    for (component in components) panel.add(component)
     return panel
 }
 
-/**
- * A left-aligned button row that WRAPS when the host narrows (240px tool
- * window) instead of clipping the trailing controls out of reach. The
- * preferred height is computed for the width the page layout assigns —
- * `FlowLayout` performs the actual row wrapping — so the column reserves the
- * wrapped rows' full height.
- */
-private class ActionRowPanel : JPanel() {
-    override fun getPreferredSize(): Dimension {
-        val natural = super.getPreferredSize()
-        val target = if (width > 0) width else parent?.width ?: 0
-        if (target <= 0 || natural.width <= target) return natural
-        val layout = layout as? java.awt.FlowLayout ?: return natural
-        val rowHeight = (natural.height - 2 * layout.vgap).coerceAtLeast(1)
+internal class WrapRowPanel : JPanel() {
+
+    /** The wrapped row count the last bounds assignment produced. */
+    private var renderedRows = 0
+
+    /**
+     * The number of FlowLayout rows [natural] needs inside [target] width.
+     * Pure arithmetic over the child preferred widths so it is stable under
+     * repeated layout passes (layout managers may call preferredSize before
+     * the width is assigned).
+     */
+    private fun rowsFor(natural: Dimension, target: Int): Int {
+        if (target <= 0 || natural.width <= target) return 1
+        val flow = layout as? java.awt.FlowLayout ?: return 1
         var rows = 1
         var x = insets.left
         for (child in components) {
             if (!child.isVisible) continue
             val childWidth = child.preferredSize.width
             if (x > insets.left &&
-                x + childWidth + layout.hgap > target - insets.right
+                x + childWidth + flow.hgap > target - insets.right
             ) {
                 rows++
                 x = insets.left
             }
-            x += childWidth + layout.hgap
+            x += childWidth + flow.hgap
         }
-        return Dimension(natural.width, natural.height + (rows - 1) * (rowHeight + layout.vgap))
+        return rows
+    }
+
+    override fun getPreferredSize(): Dimension {
+        val natural = super.getPreferredSize()
+        val target = if (width > 0) width else parent?.width ?: 0
+        val rows = rowsFor(natural, target)
+        if (rows <= 1) return natural
+        val flow = layout as? java.awt.FlowLayout ?: return natural
+        val rowHeight = (natural.height - 2 * flow.vgap).coerceAtLeast(1)
+        return Dimension(natural.width, natural.height + (rows - 1) * (rowHeight + flow.vgap))
+    }
+
+    override fun setBounds(x: Int, y: Int, w: Int, h: Int) {
+        super.setBounds(x, y, w, h)
+        val rows = rowsFor(super.getPreferredSize(), w)
+        if (rows != renderedRows) {
+            renderedRows = rows
+            if (w > 0) {
+                revalidate()
+                parent?.revalidate()
+            }
+        }
     }
 }
 

@@ -1,20 +1,28 @@
 // Pending approvals, rendered contextually: every pending permission is a
 // "Faktor needs your approval" card whose headline names the requesting
-// action and target, whose Allow/Deny buttons attach to THAT request, and
-// whose Details disclosure carries the reply handle (request id), the owning
-// session and the capability key. There is deliberately no standalone
-// Permissions destination: the cards live next to the agents that asked.
-// Pure presentation: the decision is delivered to a Listener; an unavailable
-// route is recorded truthfully (never rendered as "no permissions").
+// action and target, whose subline carries the authority reason (or the
+// exact fallback plus the exact payload), and whose Allow/Deny buttons attach
+// to THAT request. The card builder, the reply gating and the refusal
+// handling are SHARED with the bounded Work attention card
+// (ApprovalCards.kt), so the two surfaces can never diverge. There is
+// deliberately no standalone Permissions destination: the cards live next to
+// the agents that asked. Pure presentation: the decision is delivered to a
+// Listener; an unavailable route is recorded truthfully (never rendered as
+// "no permissions").
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativePermissionEntry
 import java.awt.BorderLayout
-import java.util.LinkedHashMap
 import javax.swing.JButton
 import javax.swing.JPanel
 
-class PermissionsPanel : JPanel(BorderLayout()) {
+class PermissionsPanel(
+    /**
+     * The per-request in-flight gate shared with the Work attention card:
+     * one reply per request id, whichever surface the click came from.
+     */
+    private val gate: ApprovalReplyGate = ApprovalReplyGate()
+) : JPanel(BorderLayout()) {
 
     interface Listener {
         fun onPermissionReply(permission: NativePermissionEntry, decision: String)
@@ -22,13 +30,14 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         fun onRefresh()
     }
 
-    private val header = WrappedLabel("Faktor needs your approval")
+    private val header = WrappedLabel(APPROVAL_HEADLINE)
 
     private val cards = ScrollableColumn()
 
     private val refreshButton = secondaryButton("Refresh approvals")
 
-    private val buttons = LinkedHashMap<String, Pair<JButton, JButton>>()
+    /** Per-request rendered controls (rebuilt by [render], keyed by id). */
+    private val cardsById = LinkedHashMap<String, ApprovalRequestCard>()
 
     private var listener: Listener? = null
 
@@ -38,8 +47,8 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     private var reason: String? = null
 
-    /** The last typed reply refusal (409 conflict / session mismatch), if any. */
-    private var refusal: String? = null
+    /** Per-request typed reply refusals, pruned to still-pending ids. */
+    private val refusals = LinkedHashMap<String, String>()
 
     private var selectedId: String? = null
 
@@ -52,6 +61,10 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         detailBody.isOpaque = false
         detailBody.add(insetScroll(detailArea), BorderLayout.CENTER)
         val body = pageColumn()
+        val supporting = wrappedMutedLabel(APPROVAL_SUPPORTING)
+        supporting.accessibleContext.accessibleName = APPROVAL_SUPPORTING
+        body.add(supporting)
+        body.add(vSpace(Spacing.M))
         body.add(card("Pending requests", cards))
         body.add(vSpace(Spacing.M))
         body.add(card("Request details", detailBody))
@@ -70,8 +83,8 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     fun update(permissionList: List<NativePermissionEntry>) {
         available = true
         reason = null
-        refusal = null
         permissions = permissionList
+        pruneRefusals()
         if (selectedId == null || permissionList.none { it.id == selectedId }) {
             selectedId = permissionList.firstOrNull()?.id
         }
@@ -82,7 +95,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     fun setUnavailable(detailText: String) {
         available = false
         reason = detailText
-        refusal = null
+        refusals.clear()
         permissions = emptyList()
         selectedId = null
         render()
@@ -91,16 +104,22 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     /**
      * One reply was refused with the daemon's typed 409 (unknown/expired/
      * already resolved, or a waiter owned by another session). The pending
-     * cards are kept and the refusal is recorded explicitly — never retried
-     * behind the operator's back.
+     * card is kept, re-enabled and shows the refusal reason; the reply is
+     * never retried behind the operator's back.
      */
-    fun setReplyRefusal(detailText: String) {
-        refusal = detailText
+    fun setReplyRefusal(permissionId: String, detailText: String) {
+        refusals[permissionId] = detailText
         render()
     }
 
-    /** The last typed reply refusal, or null when the last view was clean. */
-    fun refusalText(): String? = refusal
+    /** Convenience for the selected request (test/compat call sites). */
+    fun setReplyRefusal(detailText: String) {
+        val id = selectedId ?: permissions.firstOrNull()?.id ?: return
+        setReplyRefusal(id, detailText)
+    }
+
+    /** The last typed reply refusal, or null when none is recorded. */
+    fun refusalText(): String? = refusals.values.lastOrNull()
 
     fun count(): Int = permissions.size
 
@@ -115,9 +134,12 @@ class PermissionsPanel : JPanel(BorderLayout()) {
             "capability=${permission.capability} detail=${bound(permission.detail, 120)}"
     }
 
-    fun allowEnabled(): Boolean = available && selected() != null
+    fun allowEnabled(): Boolean = available && selectedCard()?.allowButton?.isEnabled == true
 
-    fun denyEnabled(): Boolean = available && selected() != null
+    fun denyEnabled(): Boolean = available && selectedCard()?.denyButton?.isEnabled == true
+
+    /** True while a reply for [permissionId] is in flight (test seam). */
+    fun isReplyPendingForTest(permissionId: String): Boolean = gate.pending(permissionId)
 
     fun headerText(): String = header.fullText
 
@@ -135,20 +157,35 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     fun submitReply(decision: String) {
         val permission = selected() ?: return
         if (!available) return
-        listener?.onPermissionReply(permission, decision)
+        val card = selectedCard() ?: return
+        val button = if (decision == "allow") card.allowButton else card.denyButton
+        if (!button.isEnabled) return
+        button.doClick()
     }
 
     /** Test hook: clicks the Allow/Deny button attached to one request card. */
     internal fun clickCard(permissionId: String, decision: String): Boolean {
-        val pair = buttons[permissionId] ?: return false
-        val button = if (decision == "allow") pair.first else pair.second
+        val card = cardsById[permissionId] ?: return false
+        val button = if (decision == "allow") card.allowButton else card.denyButton
         if (!button.isEnabled) return false
         button.doClick()
         return true
     }
 
+    private fun selectedCard(): ApprovalRequestCard? {
+        val permission = selected() ?: return null
+        return cardsById[permission.id]
+    }
+
+    private fun pruneRefusals() {
+        val live = HashSet<String>()
+        for (permission in permissions) live.add(permission.id)
+        val stale = refusals.keys.filter { !live.contains(it) }
+        for (id in stale) refusals.remove(id)
+    }
+
     private fun render() {
-        buttons.clear()
+        cardsById.clear()
         cards.removeAll()
         if (!available) {
             cards.add(mutedLabel("Approvals unavailable: " + (reason ?: "unknown")))
@@ -161,83 +198,34 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         } else {
             for (permission in permissions) {
                 cards.add(vSpace(Spacing.S))
-                cards.add(permissionCard(permission))
+                val card = approvalRequestCard(
+                    permission = permission,
+                    gate = gate,
+                    onReply = { decision -> listener?.onPermissionReply(permission, decision) },
+                    onSelect = {
+                        selectedId = permission.id
+                        detailArea.text = detailsText(permission)
+                    }
+                )
+                cardsById[permission.id] = card
+                cards.add(
+                    card("Request #${permission.id}", card.body, hgap = Spacing.S, vgap = Spacing.S)
+                )
             }
             detailArea.text = detailText()
         }
         refreshButton.isEnabled = available
+        val refused = refusals.isNotEmpty()
         val suffix = when {
             !available -> " (unavailable)"
-            refusal != null -> " (last reply refused)"
+            refused -> " (last reply refused)"
             else -> " — " + plural(permissions.size, "pending request")
         }
-        header.text = "Faktor needs your approval" + suffix
+        header.text = APPROVAL_HEADLINE + suffix
         cards.revalidate()
         cards.repaint()
         revalidate()
         repaint()
-    }
-
-    private fun permissionCard(permission: NativePermissionEntry): JPanel {
-        val body = pageColumn(gap = Spacing.XS, padding = 0)
-        val headline = WrappedLabel(permissionHeadline(permission))
-        headline.font = sectionTitleFont()
-        headline.foreground = textForeground()
-        body.add(headline)
-        if (permission.detail.isNotEmpty()) {
-            body.add(wrappedMutedLabel(bound(permission.detail, 240)))
-        }
-        val details = WrappedLabel(detailsText(permission))
-        details.font = monospacePanelFont()
-        details.foreground = mutedForeground()
-        // The details disclosure starts closed: the card leads with the human
-        // request, and the request id / session / capability open on demand
-        // (the Request details card mirrors the selected request).
-        details.isVisible = false
-        val detailsToggle = secondaryButton("Details")
-        detailsToggle.addActionListener {
-            details.isVisible = !details.isVisible
-            detailsToggle.text = if (details.isVisible) "Hide details" else "Details"
-            selectedId = permission.id
-            detailArea.text = detailsText(permission)
-            revalidate()
-            repaint()
-        }
-        val allow = primaryButton("Allow")
-        allow.addActionListener {
-            if (available) listener?.onPermissionReply(permission, "allow")
-        }
-        val deny = secondaryButton("Deny")
-        deny.addActionListener {
-            if (available) listener?.onPermissionReply(permission, "deny")
-        }
-        buttons[permission.id] = Pair(allow, deny)
-        allow.isEnabled = available
-        deny.isEnabled = available
-        val actions = actionRow(allow, deny, detailsToggle)
-        body.add(actions)
-        body.add(details)
-        return card("Request #${permission.id}", body, hgap = Spacing.S, vgap = Spacing.S)
-    }
-
-    /** Human decision headline: what the agent wants to do, and to what. */
-    private fun permissionHeadline(permission: NativePermissionEntry): String {
-        val kind = permission.capability.lowercase()
-        val what = when {
-            kind.contains("shell") || kind.contains("execute") -> "Run a shell command"
-            kind.contains("write") -> "Write files in this workspace"
-            kind.contains("read") -> "Read files in this workspace"
-            kind.contains("network") -> "Use the network"
-            kind.contains("browser") -> "Control the browser"
-            kind.contains("git") || kind.contains("scm") -> "Run Git operations"
-            kind.contains("mcp") -> "Call an external tool service"
-            else -> "Use " + permission.capability
-        }
-        val target = Regex("\"(?:tool|path|command|destination)\"\\s*:\\s*\"([^\"]+)\"")
-            .find(permission.detail)
-            ?.groupValues
-            ?.get(1)
-        return if (target.isNullOrEmpty()) what else "$what: $target"
     }
 
     private fun detailsText(permission: NativePermissionEntry): String =

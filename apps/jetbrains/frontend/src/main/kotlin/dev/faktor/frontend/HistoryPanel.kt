@@ -92,6 +92,20 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     private val refreshButton = secondaryButton("Refresh")
 
+    /** T31 copy (state matrix, verbatim). */
+    private val unavailableHeadline = sectionHeader("History unavailable")
+
+    private val unavailableCopy = wrappedMutedLabel("The conversation list could not be read.")
+
+    private val unavailableDetail = wrappedMutedLabel("")
+
+    private val refreshHistoryButton = secondaryButton("Refresh history")
+
+    /** The card body swaps ONE visible surface: list or unavailable state. */
+    private val contentCards = JPanel(java.awt.CardLayout())
+
+    private val contentLayout = contentCards.layout as java.awt.CardLayout
+
     private var listener: Listener? = null
 
     private var available = true
@@ -109,6 +123,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
         list.addListSelectionListener { updateButtons() }
         openButton.addActionListener { submitOpen() }
         refreshButton.addActionListener { listener?.onRefresh() }
+        refreshHistoryButton.addActionListener { listener?.onRefresh() }
         searchField.toolTipText = "Filter prior work by title"
         searchField.document.addDocumentListener(
             object : javax.swing.event.DocumentListener {
@@ -117,19 +132,33 @@ class HistoryPanel : JPanel(BorderLayout()) {
                 override fun changedUpdate(e: javax.swing.event.DocumentEvent?) = applyFilter()
             }
         )
-        val searchRow = JPanel(BorderLayout(Spacing.S, 0))
-        searchRow.isOpaque = false
-        searchRow.add(mutedLabel("Search"), BorderLayout.WEST)
-        searchRow.add(searchField, BorderLayout.CENTER)
-        val sessionsBody = JPanel(BorderLayout(0, Spacing.S))
-        sessionsBody.isOpaque = false
-        sessionsBody.add(searchRow, BorderLayout.NORTH)
-        sessionsBody.add(insetScroll(list), BorderLayout.CENTER)
-        sessionsBody.add(actionRow(openButton, refreshButton), BorderLayout.SOUTH)
+        // Narrow-host fix: the label sits ABOVE the field (no fixed key
+        // column that could squeeze the input at 240px).
+        val searchRow = pageColumn(gap = Spacing.XS, padding = 0)
+        searchRow.add(mutedLabel("Search"))
+        searchRow.add(searchField)
+        val listContent = JPanel(BorderLayout(0, Spacing.S))
+        listContent.isOpaque = false
+        listContent.add(searchRow, BorderLayout.NORTH)
+        listContent.add(insetScroll(list), BorderLayout.CENTER)
+        val listActions = actionRow(openButton, refreshButton)
+        listContent.add(listActions, BorderLayout.SOUTH)
+        val unavailableBody = pageColumn(gap = Spacing.XS, padding = 0)
+        unavailableBody.add(unavailableHeadline)
+        unavailableBody.add(unavailableCopy)
+        unavailableBody.add(unavailableDetail)
+        unavailableBody.add(vSpace(Spacing.XS))
+        unavailableBody.add(actionRow(refreshHistoryButton))
+        contentCards.isOpaque = false
+        contentCards.add(listContent, "list")
+        contentCards.add(unavailableBody, "unavailable")
+        val sessionsBody = pageColumn(gap = Spacing.S, padding = 0)
+        sessionsBody.add(contentCards)
         val body = pageColumn()
         body.add(card("Prior work", sessionsBody))
         add(panelHeader(status), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
+        contentLayout.show(contentCards, "list")
         updateButtons()
     }
 
@@ -145,14 +174,22 @@ class HistoryPanel : JPanel(BorderLayout()) {
         val selectedId = list.selectedValue?.id
         all.clear()
         all.addAll(sessions)
+        contentLayout.show(contentCards, "list")
         applyFilter(selectedId)
+        revalidate()
+        repaint()
     }
 
     fun setUnavailable(detailText: String) {
         available = false
         reason = detailText
         model.clear()
+        unavailableDetail.fullText = detailText
+        unavailableDetail.foreground = mutedForeground()
+        contentLayout.show(contentCards, "unavailable")
         updateButtons()
+        revalidate()
+        repaint()
     }
 
     /** One bounded human row: title · time · outcome. */
@@ -186,6 +223,16 @@ class HistoryPanel : JPanel(BorderLayout()) {
     fun openEnabled(): Boolean = openButton.isEnabled
 
     fun statusText(): String = status.fullText
+
+    /** T31 surface observables (smoke copy pins). */
+    fun unavailableHeadlineText(): String = unavailableHeadline.fullText
+
+    fun unavailableCopyText(): String = unavailableCopy.fullText
+
+    fun refreshHistoryActionText(): String = refreshHistoryButton.text
+
+    /** The T31 refresh control (smoke click hook). */
+    internal fun refreshHistoryButtonForTest(): javax.swing.JButton = refreshHistoryButton
 
     fun filterText(): String = searchField.text.trim()
 

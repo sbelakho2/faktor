@@ -1,5 +1,10 @@
 # JetBrains split-mode bridge (Faktor)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../docs/assets/brand/faktor-lockup-accent.svg">
+  <img src="../../docs/assets/brand/faktor-lockup-ink.svg" alt="Faktor" width="300">
+</picture>
+
 The JetBrains side of the Faktor split-mode design. The daemon is the
 `faktor-cli` binary launched as `serve --port 0`; this tree owns the
 process lifecycle, the auth channel, the protocol clients, and a real

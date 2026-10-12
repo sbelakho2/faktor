@@ -23,6 +23,7 @@ import * as dm from '../src/daemon.ts';
 import * as lf from '../src/lifecycleFence.ts';
 import * as ts from '../src/taskStart.ts';
 import * as wb from '../src/workspaceBinding.ts';
+import * as ss from '../src/sessionSwitch.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import * as contract from '../src/contract.ts';
@@ -30,8 +31,11 @@ import * as cpa from '../src/controlPlaneAuth.ts';
 import * as mn from '../src/money.ts';
 import * as dt from '../src/displayText.ts';
 import * as ue from '../src/errors.ts';
+import * as pf from '../src/preflight.ts';
+import * as rd from '../src/readiness.ts';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
+import historyPolicy from '../media/history-state.js';
 import {
   chmodSync,
   existsSync,
@@ -6122,7 +6126,7 @@ async function cockpitTests() {
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
       sections.map((section) => section.key),
-      ['acceptance', 'proof', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+      ['acceptance', 'proof', 'integration', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
     );
     const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
     assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
@@ -6142,11 +6146,12 @@ async function cockpitTests() {
     assert(byKey.phase.present && byKey.phase.lines[0].includes('implementation'));
     assert(byKey.blockers.present && byKey.blockers.lines[0].includes('waiting on analysis'));
     assert(byKey.verification.present && byKey.verification.lines[0].includes('status passed'));
-    // The top-level summary renders VERIFIED only from a served record that
-    // proves the full criterion set, and carries the served review/tree/
-    // commit/remote-head/cost facts alongside criteria and checks.
+    // The record-derived verdict is CANDIDATE evidence: a passing record
+    // renders `Candidate checks passed` — never VERIFIED (only the strict
+    // proof read may render that), with the served review/tree/commit/
+    // remote-head/cost facts alongside criteria and checks.
     assert(
-      byKey.verification.lines[1].startsWith('VERIFIED') &&
+      byKey.verification.lines[1].startsWith('Candidate checks passed') &&
         byKey.verification.lines[1].includes('criteria 1/1') &&
         byKey.verification.lines[1].includes('checks failed 0') &&
         byKey.verification.lines[1].includes('review review-bot') &&
@@ -6155,6 +6160,10 @@ async function cockpitTests() {
         byKey.verification.lines[1].includes('head refs/9') &&
         byKey.verification.lines[1].includes('cost 12\u00b5$'),
       JSON.stringify(byKey.verification.lines),
+    );
+    assert(
+      !byKey.verification.lines.some((line) => /(^|\W)VERIFIED(\W|$)/.test(line)),
+      `the record-derived verification block must never print VERIFIED: ${JSON.stringify(byKey.verification.lines)}`,
     );
     assert(
       byKey.acceptance.lines.some((line) => line.includes('commit abcdef12')),
@@ -7537,6 +7546,23 @@ function canonicalDomSnapshot() {
       actions: [],
     },
   ];
+  // The preflight/readiness card and its Diagnostics mirror (I06): the pin
+  // covers the exact T01 state, the resolved path and the D10 trust wording.
+  snapshot.preflight = pf.derivePreflight({
+    workspaceOpen: true,
+    daemon: 'stopped',
+    startingAttempt: false,
+    resolution: { executable: '/opt/faktor/bin/faktor-cli', source: 'binaryPath-setting' },
+    trust: {
+      state: 'verified',
+      source: 'binaryPath-setting',
+      detail: 'sha256 aaaa matches the checksum record /opt/faktor/bin/faktor-cli.sha256',
+    },
+    resolveError: null,
+    readiness: 'idle',
+    readinessDetail: null,
+    failureDetail: null,
+  });
   return snapshot;
 }
 
@@ -7552,6 +7578,8 @@ function webviewSnapshot(agents) {
     machineState: 'idle',
     machineLabel: 'Idle',
     sessions: [clone(sessionSummaryJson)],
+    sessionsUnavailable: null,
+    workspaceName: null,
     runs: [],
     activeRunId: null,
     agents,
@@ -7571,14 +7599,16 @@ function webviewSnapshot(agents) {
 
 function runChatWebview(snapshot) {
   const source = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
-  // The real webview loads the board and composer policies BEFORE chat.js
-  // (see src/webview.ts); the fake context mirrors that exact script order so
-  // the draft/board contracts are exercised, not the fallbacks.
+  // The real webview loads the board, history and composer policies BEFORE
+  // chat.js (see src/webview.ts); the fake context mirrors that exact script
+  // order so the draft/board/history contracts are exercised, not the
+  // fallbacks.
   const composerSource = readFileSync(
     new URL('../media/composer-state.js', import.meta.url),
     'utf8',
   );
   const boardSource = readFileSync(new URL('../media/board-state.js', import.meta.url), 'utf8');
+  const historySource = readFileSync(new URL('../media/history-state.js', import.meta.url), 'utf8');
   const posted = [];
   const dom = makeFakeDom();
   let messageHandler = null;
@@ -7603,6 +7633,7 @@ function runChatWebview(snapshot) {
   };
   vm.createContext(sandbox);
   vm.runInContext(boardSource, sandbox);
+  vm.runInContext(historySource, sandbox);
   vm.runInContext(composerSource, sandbox);
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
@@ -7626,6 +7657,8 @@ async function presentationWebviewTests() {
     );
     const agents = st.summarizeAgents(nc.validateAgents(backgroundWire));
     const { posted, dom } = runChatWebview(webviewSnapshot(agents));
+    // The agents surface lives in the Inspect / Agents subview.
+    dom.document.getElementById('subtab-agents').click();
     const list = dom.document.getElementById('agent-list');
     const dimmed = findFake(list, (node) => String(node.className).includes('agent-background'));
     assert(dimmed, 'a background child must carry the agent-background class');
@@ -7654,6 +7687,7 @@ async function presentationWebviewTests() {
 
     const foreground = st.summarizeAgents(nc.validateAgents(clone(agentsJson)));
     const second = runChatWebview(webviewSnapshot(foreground));
+    second.dom.document.getElementById('subtab-agents').click();
     const secondList = second.dom.document.getElementById('agent-list');
     assert(
       !findFake(secondList, (node) => String(node.className).includes('agent-background')),
@@ -7677,31 +7711,46 @@ async function presentationWebviewTests() {
     });
   });
 
-  await test('Inspect is progressive disclosure: run details, agents and board stay contextual', () => {
-    const { dom } = runChatWebview(webviewSnapshot([]));
-    const app = dom.document.getElementById('app');
-    // The real markup ships this class; the fake DOM starts from the same
-    // documented state (pinned by the markup drift baseline).
-    app.className = 'inspect-collapsed';
-    const toggle = dom.document.getElementById('btn-inspect');
-    toggle.setAttribute('aria-expanded', 'false');
-    assert(
-      String(app.className).includes('inspect-collapsed'),
-      'contextual surfaces start collapsed so conversation, run and composer stay primary',
-    );
-    assertEqual(toggle.getAttribute('aria-expanded'), 'false');
-    toggle.click();
-    assert(
-      !String(app.className).includes('inspect-collapsed'),
-      'the toggle reveals the inspect region',
-    );
-    assertEqual(toggle.getAttribute('aria-expanded'), 'true');
-    toggle.click();
-    assert(
-      String(app.className).includes('inspect-collapsed'),
-      'a second toggle collapses it again',
-    );
-    assertEqual(toggle.getAttribute('aria-expanded'), 'false');
+  await test('Work / Inspect / History is a tablist shell with Work as the default view', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { posted, dom } = harness;
+    const work = dom.document.getElementById('nav-work');
+    const inspect = dom.document.getElementById('nav-inspect');
+    const history = dom.document.getElementById('nav-history');
+    assertEqual(work.getAttribute('aria-selected'), 'true', 'Work is the default view');
+    assertEqual(work.getAttribute('tabindex'), '0', 'the selected tab is the roving tabindex entry');
+    assertEqual(inspect.getAttribute('aria-selected'), 'false');
+    assertEqual(inspect.getAttribute('tabindex'), '-1');
+    assertEqual(history.getAttribute('aria-selected'), 'false');
+    assertEqual(dom.document.getElementById('work-panel').hidden, false);
+    assertEqual(dom.document.getElementById('inspect-panel').hidden, true);
+    assertEqual(dom.document.getElementById('history-panel').hidden, true);
+    const before = posted.length;
+    inspect.click();
+    assertEqual(inspect.getAttribute('aria-selected'), 'true');
+    assertEqual(work.getAttribute('aria-selected'), 'false');
+    assertEqual(dom.document.getElementById('work-panel').hidden, true);
+    assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
+    assertEqual(posted.length, before, 'switching views is a local move (no host round trip)');
+    history.click();
+    assertEqual(dom.document.getElementById('history-panel').hidden, false);
+    assertEqual(dom.document.getElementById('inspect-panel').hidden, true);
+    work.click();
+    assertEqual(dom.document.getElementById('work-panel').hidden, false);
+    // The `⋯` overflow is the labeled transient options surface: Escape
+    // closes it and returns focus to the EXACT trigger; it never cancels a
+    // run (no cancel message is ever posted).
+    const overflow = dom.document.getElementById('btn-overflow');
+    overflow.click();
+    assertEqual(dom.document.getElementById('diagnostics').hidden, false);
+    assertEqual(overflow.getAttribute('aria-expanded'), 'true');
+    harness.keydown({ key: 'Escape' });
+    assertEqual(dom.document.getElementById('diagnostics').hidden, true);
+    assertEqual(overflow.getAttribute('aria-expanded'), 'false');
+    assertEqual(overflow.focused, true, 'Escape returns focus to the exact trigger');
+    // Opening the Faktor view never grants execution or launches anything:
+    // the panel only announced itself with `ready`.
+    assertDeepEqual(posted, [{ type: 'ready' }]);
   });
 }
 
@@ -7716,7 +7765,8 @@ async function attentionWebviewTests() {
   };
 
   await test('a pending permission renders the approval card decision-first and posts typed replies', () => {
-    const { posted, dom } = runChatWebview({ ...webviewSnapshot([]), permissions: [pendingPermission] });
+    const harness = runChatWebview({ ...webviewSnapshot([]), permissions: [pendingPermission] });
+    const { posted, dom, deliver } = harness;
     const card = dom.document.getElementById('permission-card');
     assertEqual(card.hidden, false, 'a pending permission shows the approval card');
     const list = dom.document.getElementById('permission-list');
@@ -7725,10 +7775,20 @@ async function attentionWebviewTests() {
     assertEqual(item.getAttribute('data-permission-id'), '41');
     const summary = findFake(item, (node) => String(node.className).includes('permission-action'));
     assertEqual(summary.textContent, 'Run a shell command: cargo test --workspace');
+    // The subline is the REQUIRED generic wording plus the exact payload —
+    // the fabricated `Needed to verify` purpose is gone for good.
     const why = findFake(item, (node) => String(node.className).includes('permission-why'));
     assert(
-      why && why.textContent.includes('Needed to verify: cargo test --workspace'),
+      why &&
+        why.textContent.includes('Action requested for this run.') &&
+        why.textContent.includes('capability shell') &&
+        why.textContent.includes('target cargo test --workspace') &&
+        why.textContent.includes('session 7'),
       why && why.textContent,
+    );
+    assert(
+      !fakeText(item).includes('Needed to verify'),
+      `no fabricated purpose copy: ${fakeText(item)}`,
     );
     // The raw handle, capability key and owning conversation id stay behind
     // "View details" (a real disclosure), never in the headline.
@@ -7749,18 +7809,120 @@ async function attentionWebviewTests() {
     );
     const allow = findFake(item, (node) => node.tagName === 'button' && node.textContent === 'Allow');
     assert(allow, 'Allow exists');
+    const replies = () => posted.filter((message) => message.type === 'permissionReply');
     allow.click();
+    assertEqual(replies().length, 1, 'one click posts exactly one reply');
     assertDeepEqual(posted[posted.length - 1], {
       type: 'permissionReply',
       permissionId: '41',
       decision: 'allow',
     });
+    // The click locks BOTH buttons of the request until its result is known.
+    assertEqual(allow.disabled, true, 'the clicked button is locked while in flight');
     const deny = findFake(item, (node) => node.tagName === 'button' && node.textContent === 'Deny');
+    assertEqual(deny.disabled, true, 'the sibling decision is locked while in flight');
     deny.click();
+    assertEqual(replies().length, 1, 'a second click never posts while the result is unknown');
+    // A typed refusal keeps the request visible with the exact reason,
+    // releases the per-request lock (no implicit retry) and re-enables both
+    // buttons for an explicit new decision.
+    deliver({
+      type: 'permissionResult',
+      permissionId: '41',
+      ok: false,
+      reason: nc.permissionReplyFailureMessage('unknown_or_resolved', '41'),
+    });
+    const refusedItem = list.children[0];
+    assert(
+      fakeText(refusedItem).includes('unknown, expired or already resolved'),
+      fakeText(refusedItem),
+    );
+    const refusedAllow = findFake(
+      refusedItem,
+      (node) => node.tagName === 'button' && node.textContent === 'Allow',
+    );
+    const refusedDeny = findFake(
+      refusedItem,
+      (node) => node.tagName === 'button' && node.textContent === 'Deny',
+    );
+    assertEqual(refusedAllow.disabled, false, 'a refusal re-enables the decision');
+    assertEqual(refusedDeny.disabled, false, 'a refusal re-enables the sibling decision');
+    refusedDeny.click();
     assertDeepEqual(posted[posted.length - 1], {
       type: 'permissionReply',
       permissionId: '41',
       decision: 'deny',
+    });
+  });
+
+  await test('approval copy: the authority reason is verbatim and a bare entry fabricates none', () => {
+    const withReason = runChatWebview({
+      ...webviewSnapshot([]),
+      permissions: [
+        {
+          id: '42',
+          sessionId: '7',
+          capability: 'filesystem',
+          detail: '{"path":"src/lib.rs","reason":"write outside the run sandbox"}',
+        },
+      ],
+    });
+    const item = withReason.dom.document.getElementById('permission-list').children[0];
+    const why = findFake(item, (node) => String(node.className).includes('permission-why'));
+    assertEqual(why.textContent, 'write outside the run sandbox', 'the authority reason is verbatim');
+    assert(
+      !fakeText(item).includes('Needed to verify') &&
+        !fakeText(item).includes('Needed to continue'),
+      fakeText(item),
+    );
+    // An entry WITHOUT a reason/detail field renders the required generic
+    // copy plus the exact payload; nothing is inferred from the target.
+    const bare = runChatWebview({
+      ...webviewSnapshot([]),
+      permissions: [{ id: '43', sessionId: '7', capability: 'network' }],
+    });
+    const bareItem = bare.dom.document.getElementById('permission-list').children[0];
+    const bareText = fakeText(bareItem);
+    assert(bareText.includes('Action requested for this run.'), bareText);
+    assert(bareText.includes('capability network'), bareText);
+    assert(bareText.includes('session 7'), bareText);
+    assert(
+      !bareText.includes('Needed to verify') && !bareText.includes('Needed to continue'),
+      bareText,
+    );
+    // A hostile detail (non-JSON, oversized, throwing JSON) never surfaces
+    // an invented reason and never breaks the card.
+    const hostile = runChatWebview({
+      ...webviewSnapshot([]),
+      permissions: [
+        { id: '44', sessionId: '7', capability: 'shell', detail: 'not json {' },
+        { id: '45', sessionId: '7', capability: 'shell', detail: '{"reason": 5}' },
+      ],
+    });
+    const hostileText = fakeText(hostile.dom.document.getElementById('permission-list'));
+    assert(hostileText.includes('Action requested for this run.'), hostileText);
+    assert(!hostileText.includes('undefined'), hostileText);
+  });
+
+  await test('a double click on Allow posts exactly one permissionReply', () => {
+    const { posted, dom } = runChatWebview({
+      ...webviewSnapshot([]),
+      permissions: [pendingPermission],
+    });
+    const allow = findFake(
+      dom.document.getElementById('permission-list'),
+      (node) => node.tagName === 'button' && node.textContent === 'Allow',
+    );
+    assert(allow, 'Allow exists');
+    allow.click();
+    allow.click();
+    allow.click();
+    const replies = posted.filter((message) => message.type === 'permissionReply');
+    assertEqual(replies.length, 1, `exactly one permissionReply: ${JSON.stringify(posted)}`);
+    assertDeepEqual(replies[0], {
+      type: 'permissionReply',
+      permissionId: '41',
+      decision: 'allow',
     });
   });
 
@@ -8034,16 +8196,52 @@ async function composerAttachmentTests() {
       'board-body',
       'btn-board-read',
       'btn-board-post',
+      'nav-work',
+      'nav-inspect',
+      'nav-history',
+      'work-panel',
+      'inspect-panel',
+      'history-panel',
+      'subtab-overview',
+      'subtab-plan',
+      'subtab-changes',
+      'subtab-verification',
+      'subtab-agents',
+      'history-search',
+      'history-list',
+      'history-status',
+      'history-unavailable',
+      'btn-history-refresh',
+      'btn-history-refresh-unavailable',
     ]) {
       assert(markup.includes(`id="${id}"`), `the markup must carry #${id}`);
     }
     assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
     assert(markup.includes('>Ask Faktor…</label>'), 'the accessible name must be the visible label text');
     assert(
-      /<div id="app" class="inspect-collapsed">/.test(markup),
-      'the shipped webview starts with inspect content contextual',
+      /<main id="work-panel"[^>]*role="tabpanel"/.test(markup),
+      'the default Work surface is a real tabpanel',
     );
-    assert(/<button id="btn-inspect"/.test(markup), 'the inspect toggle must exist');
+    assert(
+      /<nav id="nav-switcher"[^>]*role="tablist"/.test(markup),
+      'the Work / Inspect / History switcher is a real tablist',
+    );
+    assert(/id="nav-work"[^>]*aria-selected="true"/.test(markup), 'Work ships selected (the default view)');
+    assert(/id="inspect-panel"[^>]*hidden/.test(markup), 'Inspect starts hidden');
+    assert(/id="history-panel"[^>]*hidden/.test(markup), 'History starts hidden');
+    assert(
+      /<div id="inspect-tabs"[^>]*role="tablist"/.test(markup),
+      'the Inspect subviews are a real tablist',
+    );
+    for (const subview of ['Overview', 'Plan', 'Changes', 'Verification', 'Agents']) {
+      assert(markup.includes(`>${subview}</button>`), `the Inspect subview tab ${subview} must exist`);
+    }
+    assert(markup.includes('>History unavailable</h3>'), 'the T31 label ships verbatim');
+    assert(
+      markup.includes('The conversation list could not be read.'),
+      'the T31 copy ships verbatim',
+    );
+    assert(markup.includes('>Refresh history</button>'), 'the T31 action ships verbatim');
     assert(/<label for="board-subject"/.test(markup), 'the board subject must have a real <label for>');
     assert(/<label for="board-body"/.test(markup), 'the board body must have a real <label for>');
     assert(/<label for="board-subject"[^>]*>Subject<\/label>/.test(markup), 'board subject visible label text');
@@ -8203,6 +8401,8 @@ async function composerAttachmentTests() {
       'faktor.stopServer': 'Diagnostics: Stop Service',
       'faktor.refresh': 'Diagnostics: Refresh State',
       'faktor.reconnectStream': 'Diagnostics: Reconnect Event Stream',
+      'faktor.switchSession': 'Switch Conversation',
+      'faktor.locateDaemon': 'Locate daemon…',
     };
     assertEqual(commands.size, Object.keys(pinned).length, 'the command id set is pinned');
     for (const [id, title] of Object.entries(pinned)) {
@@ -8789,6 +8989,340 @@ async function composerAttachmentTests() {
     goal.focused = false;
     harness.dom.document.getElementById('btn-new-task').click();
     assertEqual(goal.focused, true, 'New task returns focus to the composer');
+  });
+}
+
+// ------------------------- navigation shell, History and session switching
+
+/** The messages of one `case 'name':` arm in extension.ts. */
+function sourceCaseSlice(source, name) {
+  const start = source.indexOf(`case '${name}':`);
+  assert(start >= 0, `extension.ts must carry the ${name} message case`);
+  const next = source.indexOf("\n    case '", start + 1);
+  return next === -1 ? source.slice(start) : source.slice(start, next);
+}
+
+/** The body of one TOP-LEVEL function declaration (host source pins). */
+function sourceFunctionSlice(source, declaration) {
+  const start = source.indexOf(declaration);
+  assert(start >= 0, `the source must carry ${declaration}`);
+  const rest = source.slice(start + declaration.length);
+  const match = /\n(?:export )?(?:async )?function /.exec(rest);
+  const end = match ? start + declaration.length + match.index : source.length;
+  return source.slice(start, end);
+}
+
+async function navigationWebviewTests() {
+  await test('tablist Arrow/Home/End move the active subview exactly once and post nothing', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted } = harness;
+    const ids = ['subtab-overview', 'subtab-plan', 'subtab-changes', 'subtab-verification', 'subtab-agents'];
+    const tab = (id) => dom.document.getElementById(id);
+    const selected = () =>
+      ids.filter((id) => tab(id).getAttribute('aria-selected') === 'true');
+    assertDeepEqual(selected(), ['subtab-overview'], 'Overview is the default subview');
+    const before = posted.length;
+    tab('subtab-overview').dispatch('keydown', { key: 'ArrowRight', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-plan'], 'ArrowRight moves the selection exactly one step');
+    assertEqual(tab('subtab-plan').getAttribute('tabindex'), '0', 'the roving tabindex follows selection');
+    assertEqual(tab('subtab-overview').getAttribute('tabindex'), '-1');
+    assertEqual(dom.document.getElementById('inspect-subpanel-plan').hidden, false);
+    assertEqual(dom.document.getElementById('inspect-subpanel-overview').hidden, true);
+    tab('subtab-plan').dispatch('keydown', { key: 'End', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-agents'], 'End selects the last subview');
+    tab('subtab-agents').dispatch('keydown', { key: 'ArrowRight', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-overview'], 'ArrowRight wraps to the first subview');
+    tab('subtab-overview').dispatch('keydown', { key: 'ArrowLeft', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-agents'], 'ArrowLeft wraps to the last subview');
+    tab('subtab-agents').dispatch('keydown', { key: 'Home', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-overview'], 'Home selects the first subview');
+    // A non-navigation key never moves the selection.
+    tab('subtab-overview').dispatch('keydown', { key: 'a', preventDefault() {} });
+    assertDeepEqual(selected(), ['subtab-overview']);
+    assertEqual(posted.length, before, 'tab navigation is purely local (no host message)');
+    // The top-level switcher has the same tablist contract.
+    dom.document.getElementById('nav-work').dispatch('keydown', { key: 'ArrowRight', preventDefault() {} });
+    assertEqual(dom.document.getElementById('nav-inspect').getAttribute('aria-selected'), 'true');
+    assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
+    assertEqual(dom.document.getElementById('work-panel').hidden, true);
+    assertEqual(posted.length, before, 'the top switcher is local too');
+  });
+
+  await test('History round-trip preserves the Inspect subview, scope breadcrumb and composer draft', () => {
+    const harness = runChatWebview({ ...webviewSnapshot([]), workspaceName: 'Kilo+' });
+    const { dom } = harness;
+    const goal = dom.document.getElementById('goal');
+    goal.value = 'unsent draft for this conversation';
+    dom.document.getElementById('subtab-verification').click();
+    assertEqual(dom.document.getElementById('subtab-verification').getAttribute('aria-selected'), 'true');
+    // The breadcrumb shows Inspect / <Subview> plus the workspace NAME; ids
+    // stay behind the advanced-diagnostics disclosure.
+    assertEqual(dom.document.getElementById('inspect-breadcrumb-path').textContent, 'Inspect / Verification');
+    assertEqual(dom.document.getElementById('inspect-breadcrumb-scope').textContent, 'scope Kilo+');
+    assert(
+      !dom.document.getElementById('inspect-breadcrumb-path').textContent.includes('7'),
+      'the primary breadcrumb label never carries a raw id',
+    );
+    assert(
+      dom.document.getElementById('inspect-breadcrumb-diagnostics-body').textContent.includes('session 7'),
+      'the session id is available as advanced diagnostics',
+    );
+    dom.document.getElementById('nav-history').click();
+    assertEqual(dom.document.getElementById('history-panel').hidden, false);
+    dom.document.getElementById('nav-inspect').click();
+    assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
+    assertEqual(
+      dom.document.getElementById('subtab-verification').getAttribute('aria-selected'),
+      'true',
+      'the subview selection is stable across a History round trip',
+    );
+    assertEqual(dom.document.getElementById('inspect-subpanel-verification').hidden, false);
+    assertEqual(goal.value, 'unsent draft for this conversation', 'navigation never loses the draft');
+    // A background snapshot neither resets the selection nor the draft.
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), workspaceName: 'Kilo+' } });
+    assertEqual(dom.document.getElementById('subtab-verification').getAttribute('aria-selected'), 'true');
+    assertEqual(goal.value, 'unsent draft for this conversation');
+  });
+
+  await test('an unavailable conversation list renders the exact T31 surface and no rows', () => {
+    // The T31 vocabulary is pinned literally (the surface must never drift).
+    assertEqual(historyPolicy.HISTORY_UNAVAILABLE_LABEL, 'History unavailable');
+    assertEqual(
+      historyPolicy.HISTORY_UNAVAILABLE_COPY,
+      'The conversation list could not be read.',
+    );
+    assertEqual(historyPolicy.HISTORY_UNAVAILABLE_ACTION, 'Refresh history');
+    // Explicit read refusal on a running service.
+    const refused = runChatWebview({
+      ...webviewSnapshot([]),
+      sessionsUnavailable: 'GET /native/sessions failed: connection refused',
+    });
+    const dom = refused.dom.document;
+    assertEqual(dom.getElementById('history-unavailable').hidden, false, 'the T31 surface is visible');
+    assertEqual(dom.getElementById('history-unavailable-label').textContent, 'History unavailable');
+    assertEqual(
+      dom.getElementById('history-unavailable-copy').textContent,
+      'The conversation list could not be read.',
+    );
+    assertEqual(dom.getElementById('btn-history-refresh-unavailable').textContent, 'Refresh history');
+    assertEqual(dom.getElementById('history-list').children.length, 0, 'no stale row is rendered');
+    assertEqual(dom.getElementById('history-controls').hidden, true);
+    dom.getElementById('btn-history-refresh-unavailable').click();
+    assertDeepEqual(refused.posted[refused.posted.length - 1], { type: 'refreshHistory' });
+    // A stopped service cannot have read the list either: the same honest
+    // surface, never an empty-list claim.
+    const stopped = runChatWebview({
+      ...webviewSnapshot([]),
+      daemon: 'stopped',
+      sessions: [{ id: '7', title: 'stale', provider: 'f', model: 'm', state: 'idle' }],
+    });
+    assertEqual(stopped.dom.document.getElementById('history-unavailable').hidden, false);
+    assertEqual(stopped.dom.document.getElementById('history-list').children.length, 0);
+    stopped.dom.document.getElementById('btn-history-refresh-unavailable').click();
+    assertDeepEqual(stopped.posted[stopped.posted.length - 1], { type: 'refreshHistory' });
+  });
+
+  await test('a history row renders real title/date/state and never a verification verdict', () => {
+    const sessions = [
+      {
+        id: '7',
+        title: 'Fix the parser',
+        provider: 'fake',
+        model: 'm',
+        state: 'completed',
+        createdMs: 1700000000000,
+      },
+      { id: '8', title: 'Second conversation', provider: 'p', model: 'm2', state: 'idle' },
+    ];
+    const { dom } = runChatWebview({ ...webviewSnapshot([]), sessions, session: sessions[0] });
+    const list = dom.document.getElementById('history-list');
+    assertEqual(list.children.length, 2, 'one bounded row per served conversation');
+    const first = list.children[0];
+    assertEqual(first.getAttribute('data-session-id'), '7');
+    const firstText = fakeText(first);
+    assert(firstText.includes('Fix the parser'), firstText);
+    assert(firstText.includes('completed'), firstText);
+    assert(!/verified/i.test(firstText), `a history row must never claim verification: ${firstText}`);
+    assert(!/verified/i.test(fakeText(list)), 'no row anywhere claims verification');
+    assert(
+      firstText.includes('created 2023-11-14T22:13:20.000Z'),
+      `the served created_ms renders as the actual date: ${firstText}`,
+    );
+    assert(firstText.includes('current'), 'the active conversation is marked');
+    assert(
+      fakeText(list.children[1]).includes('date unavailable'),
+      'a row without a served date says so (never a fabricated date)',
+    );
+    assert(
+      dom.document.getElementById('history-status').textContent.includes('2 conversations'),
+      dom.document.getElementById('history-status').textContent,
+    );
+    assert(
+      dom.document.getElementById('history-status').textContent.includes('at most 1000'),
+      'the capped listing is disclosed, never claimed as complete history',
+    );
+    // The policy is pure and bounded: the date is exact, absent values are
+    // null, and the client-side search is bounded and case-insensitive.
+    assertEqual(historyPolicy.sessionDateLabel(1700000000000), '2023-11-14T22:13:20.000Z');
+    assertEqual(historyPolicy.sessionDateLabel(undefined), null);
+    assertEqual(historyPolicy.sessionDateLabel(Number.NaN), null);
+    const many = [];
+    for (let i = 0; i < 250; i += 1) {
+      many.push({ id: String(i), title: `conversation ${i}`, state: 'idle' });
+    }
+    const capped = historyPolicy.historyRows(many, '');
+    assertEqual(capped.shown, historyPolicy.MAX_HISTORY_ROWS);
+    assertEqual(capped.total, 250);
+    assertEqual(capped.capped, true, 'the bounded render says it is capped');
+    assertEqual(historyPolicy.historyRows(many, 'CONVERSATION 249').rows.length, 1);
+    assertEqual(historyPolicy.historyRows(many, 'no such title').total, 0);
+  });
+
+  await test('a History row Open posts exactly one openSession with the row id', () => {
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      sessions: [{ id: '9', title: 'Target', provider: 'f', model: 'm', state: 'idle' }],
+    });
+    const list = harness.dom.document.getElementById('history-list');
+    const open = findFake(list, (node) => node.tagName === 'button' && node.textContent === 'Open');
+    assert(open, 'every row renders an Open control');
+    open.click();
+    open.dispatch('click', {});
+    const posts = harness.posted.filter((message) => message.type === 'openSession');
+    assertEqual(posts.length, 1, 'a double click must not emit two openSession posts');
+    assertDeepEqual(posts[0], { type: 'openSession', sessionId: '9' });
+    // An async refresh preserves the SAME logical row/button: focus follows
+    // the row identity when the listing reorders, never a structural index.
+    const refreshed = runChatWebview({
+      ...webviewSnapshot([]),
+      sessions: [
+        { id: '9', title: 'Target', provider: 'f', model: 'm', state: 'idle' },
+        { id: '8', title: 'Other', provider: 'f', model: 'm', state: 'idle' },
+      ],
+    });
+    const target = findFake(
+      refreshed.dom.document.getElementById('history-list'),
+      (node) =>
+        node.tagName === 'button' && node.getAttribute('aria-label') === 'Open conversation Target',
+    );
+    assert(target, 'the row Open control must be addressable by its logical label');
+    target.focus();
+    assertEqual(refreshed.dom.document.activeElement === target, true, 'focus is on the row control');
+    refreshed.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...webviewSnapshot([]),
+        sessions: [
+          { id: '8', title: 'Other', provider: 'f', model: 'm', state: 'idle' },
+          { id: '9', title: 'Target', provider: 'f', model: 'm', state: 'idle' },
+        ],
+      },
+    });
+    const restored = findFake(
+      refreshed.dom.document.getElementById('history-list'),
+      (node) =>
+        node.tagName === 'button' && node.getAttribute('aria-label') === 'Open conversation Target',
+    );
+    assert(
+      restored && restored.focused === true,
+      'focus follows the same logical row/button across an async refresh',
+    );
+  });
+
+  await test('the served session listing parses the additive created_ms tolerantly', () => {
+    const withDate = nc.validateSessionList({
+      sessions: [{ ...clone(sessionSummaryJson), created_ms: 1700000000000 }],
+    });
+    assertEqual(withDate[0].createdMs, 1700000000000);
+    const without = nc.validateSessionList({ sessions: [clone(sessionSummaryJson)] });
+    assertEqual(
+      without[0].createdMs,
+      null,
+      'a daemon without the additive field yields an honest null, never a date',
+    );
+    assertProtocol(
+      () =>
+        nc.validateSessionList({
+          sessions: [{ ...clone(sessionSummaryJson), created_ms: 1.5 }],
+        }),
+      'created_ms',
+    );
+    assertProtocol(
+      () =>
+        nc.validateSessionList({
+          sessions: [{ ...clone(sessionSummaryJson), created_ms: 'yesterday' }],
+        }),
+      'created_ms',
+    );
+  });
+
+  await test('switchSession is idempotent for the already-active conversation', () => {
+    assertEqual(ss.sessionSwitchDecision('7', '7').action, 'noop');
+    assert(
+      ss.sessionSwitchDecision('7', '7').reason.includes('already active'),
+      'the no-op names its reason',
+    );
+    assertEqual(
+      ss.sessionSwitchDecision('7', ' 7 ').action,
+      'noop',
+      'a padded same id is still the active conversation',
+    );
+    assertEqual(ss.sessionSwitchDecision('7', '').action, 'noop');
+    assertEqual(ss.sessionSwitchDecision('7', 42).action, 'noop');
+    assertEqual(ss.sessionSwitchDecision('7', null).action, 'noop');
+    const real = ss.sessionSwitchDecision('7', ' 8 ');
+    assertEqual(real.action, 'switch');
+    assertEqual(real.sessionId, '8');
+    assertEqual(ss.sessionSwitchDecision(null, '8').action, 'switch');
+    // The same-id no-op can never drop state: the store only drops
+    // session-scoped panels on a REAL id change.
+    const store = new st.FaktorStore();
+    const sessionA = { id: '7', title: 'a', provider: 'f', model: 'm', state: 'idle' };
+    store.patch({ session: sessionA });
+    store.patch({
+      board: { available: true, source: 'native', revision: 1, unread: 0, posts: [], reason: null },
+    });
+    store.patch({ session: { ...sessionA }, transcript: [] });
+    assert(
+      store.snapshot().board !== null,
+      'a same-id session patch keeps session-scoped state (no duplicate stream start either)',
+    );
+    store.patch({ session: { ...sessionA, id: '8' } });
+    assertEqual(store.snapshot().board, null, 'a real id change drops session-scoped state');
+  });
+
+  await test('no view-open or History message path launches the daemon', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    assertDeepEqual(harness.posted, [{ type: 'ready' }], 'opening the view posts only ready');
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    for (const name of [
+      'ready',
+      'refresh',
+      'refreshHistory',
+      'openSession',
+      'cancelStart',
+      'cancelConfirm',
+      'locateDaemon',
+      'openProject',
+    ]) {
+      assert(
+        !sourceCaseSlice(source, name).includes('startServer('),
+        `the ${name} message path must not launch the daemon`,
+      );
+    }
+    assert(
+      sourceCaseSlice(source, 'startDaemon').includes('startServer('),
+      'the explicit Start action is the only launch path (the slice scan is not vacuous)',
+    );
+    assert(
+      sourceCaseSlice(source, 'confirmStart').includes('startServer('),
+      'T03 Start anyway is an explicit launch path (the confirmation is the card action)',
+    );
+    assertEqual(
+      (source.match(/startServer\(/g) || []).length,
+      5,
+      'the daemon-start call sites are pinned (definition + Start action + confirmed Start anyway + task submit + command)',
+    );
   });
 }
 
@@ -9395,6 +9929,18 @@ async function submissionSingleFlightTests() {
       proofBody.includes('active.taskProof = null'),
       'the proof cache must drop its view on a failed read',
     );
+    assert(
+      proofBody.includes('active.taskProofUnavailable = reason'),
+      'a failed proof fetch must preserve the explicit refusal reason',
+    );
+    assert(
+      source.includes('proofUnavailable: proofRead.unavailable'),
+      'the refresh must hand the proof refusal to the cockpit projection',
+    );
+    assert(
+      source.includes('taskVerificationUnavailable: taskVerification.unavailable'),
+      'the refresh must preserve the verification read refusal',
+    );
     const library = readFileSync(new URL('../src/taskStart.ts', import.meta.url), 'utf8');
     assert(
       library.includes('class EvidenceAuthorityCache'),
@@ -9720,7 +10266,14 @@ async function tournamentWebviewTests() {
       candidates: [candidate('child-0', 'done'), candidate('child-1', 'running')],
     };
     const running = cp.tournamentViewOf(wire);
-    const first = runChatWebview(tournamentCockpitSnapshot(running));
+    // The tournament lives in the Inspect / Plan subview: run the harness and
+    // move there before driving the controls.
+    const runPlanCockpit = (snapshot) => {
+      const harness = runChatWebview(snapshot);
+      harness.dom.document.getElementById('subtab-plan').click();
+      return harness;
+    };
+    const first = runPlanCockpit(tournamentCockpitSnapshot(running));
     const cockpit = first.dom.document.getElementById('cockpit');
     const decide = findFake(
       cockpit,
@@ -9745,7 +10298,7 @@ async function tournamentWebviewTests() {
       ...wire,
       candidates: [candidate('child-0', 'done'), candidate('child-1', 'done')],
     });
-    const second = runChatWebview(tournamentCockpitSnapshot(settled));
+    const second = runPlanCockpit(tournamentCockpitSnapshot(settled));
     const secondCockpit = second.dom.document.getElementById('cockpit');
     const decideNow = findFake(
       secondCockpit,
@@ -9766,7 +10319,7 @@ async function tournamentWebviewTests() {
       winner: 'child-0',
       candidates: [candidate('child-0', 'done'), candidate('child-1', 'discarded')],
     });
-    const third = runChatWebview(tournamentCockpitSnapshot(decided));
+    const third = runPlanCockpit(tournamentCockpitSnapshot(decided));
     const thirdCockpit = third.dom.document.getElementById('cockpit');
     const buttons = [];
     walkFake(thirdCockpit, (node) => {
@@ -10212,7 +10765,12 @@ function taskProofJson(overrides = {}) {
   };
 }
 
-function proofCockpitWith(payload, proofUnavailable = null) {
+function proofCockpitWith(
+  payload,
+  proofUnavailable = null,
+  taskVerification = null,
+  taskVerificationUnavailable = null,
+) {
   const taskView = nc.validateTaskViews([
     {
       ...clone(taskViewJson),
@@ -10239,7 +10797,8 @@ function proofCockpitWith(payload, proofUnavailable = null) {
     agents: [],
     verification: null,
     usage: null,
-    taskVerification: null,
+    taskVerification,
+    taskVerificationUnavailable,
     proof: payload,
     proofUnavailable,
   });
@@ -10370,6 +10929,317 @@ async function proofSummaryTests() {
       !unverifiedLines.some((line) => line.startsWith('VERIFIED')),
       JSON.stringify(unverifiedLines),
     );
+  });
+
+  await test('a passing record is candidate evidence and never VERIFIED without the strict proof gate', () => {
+    const record = clone(verificationRecordJson);
+    const recordCockpit = (payload, taskVerificationUnavailable = null) =>
+      proofCockpitWith(payload, null, { records: [record] }, taskVerificationUnavailable);
+    // Strict proofState `unverified`: the record-derived block says
+    // `Candidate checks passed` and no VERIFIED rendering appears anywhere.
+    const candidate = recordCockpit(
+      nc.validateTaskProof(
+        taskProofJson({ proofState: 'unverified', proofStateReason: 'awaiting integration' }),
+      ),
+    );
+    const candidateSections = cp.cockpitSections(candidate);
+    const candidateVerification = candidateSections.find((s) => s.key === 'verification').lines;
+    assert(
+      candidateVerification[1].startsWith('Candidate checks passed'),
+      candidateVerification[1],
+    );
+    // A positive VERIFIED rendering is one that is neither `NOT VERIFIED`
+    // nor `VERIFICATION UNAVAILABLE`; none may appear while the strict
+    // proof read says unverified.
+    const saysVerified = (line) =>
+      /(^|\W)VERIFIED(\W|$)/.test(line) && !line.includes('NOT VERIFIED');
+    assert(
+      !candidateSections.some((section) => section.lines.some(saysVerified)),
+      `no VERIFIED while the strict proof is unverified: ${JSON.stringify(
+        candidateSections.map((section) => section.lines),
+      )}`,
+    );
+    // The RENDERED panel text carries the candidate wording; no line starts
+    // with a positive VERIFIED (the proof section says `NOT VERIFIED`).
+    const candidateSnapshot = webviewSnapshot([]);
+    candidateSnapshot.cockpit = candidate;
+    candidateSnapshot.cockpitSections = candidateSections;
+    const candidateHarness = runChatWebview(candidateSnapshot);
+    // The verification block lives in the Inspect / Verification subview.
+    candidateHarness.dom.document.getElementById('subtab-verification').click();
+    const candidateCockpit = candidateHarness.dom.document.getElementById('cockpit');
+    const positiveVerified = findFake(
+      candidateCockpit,
+      (node) => typeof node.textContent === 'string' && node.textContent.startsWith('VERIFIED'),
+    );
+    assert(
+      positiveVerified === null,
+      `no positive VERIFIED line may render: ${positiveVerified && positiveVerified.textContent}`,
+    );
+    assert(fakeText(candidateCockpit).includes('Candidate checks passed'), fakeText(candidateCockpit));
+    assert(!fakeText(candidateCockpit).includes('Verified complete'), fakeText(candidateCockpit));
+    // With the strict proof verified, the proof section is the ONLY VERIFIED
+    // surface; the record-derived block still says `Candidate checks passed`.
+    const gated = recordCockpit(nc.validateTaskProof(taskProofJson()));
+    const gatedSections = cp.cockpitSections(gated);
+    assert(gatedSections.find((s) => s.key === 'proof').lines[0].startsWith('VERIFIED'));
+    const gatedVerification = gatedSections.find((s) => s.key === 'verification').lines;
+    assert(gatedVerification[1].startsWith('Candidate checks passed'), gatedVerification[1]);
+    assert(
+      !gatedVerification.some((line) => /(^|\W)VERIFIED(\W|$)/.test(line)),
+      JSON.stringify(gatedVerification),
+    );
+    // Required results missing (a required check still pending/other) keeps
+    // `Completion pending` even though the record itself passed.
+    const pending = recordCockpit(
+      nc.validateTaskProof(
+        taskProofJson({
+          checks: {
+            ...taskProofJson().checks,
+            requiredTotal: 3,
+            requiredPassed: 2,
+            requiredFailed: 0,
+            requiredAllPassed: true,
+          },
+        }),
+      ),
+    );
+    const pendingVerification = cp
+      .cockpitSections(pending)
+      .find((s) => s.key === 'verification').lines;
+    assertEqual(pendingVerification[1], 'Completion pending');
+    // Failed required results are declared, never softened.
+    const failed = recordCockpit(
+      nc.validateTaskProof(
+        taskProofJson({
+          proofState: 'unavailable',
+          proofStateReason: 'a REQUIRED check did not pass',
+          checks: {
+            ...taskProofJson().checks,
+            failed: 1,
+            passed: 2,
+            requiredPassed: 1,
+            requiredFailed: 1,
+            requiredAllPassed: false,
+          },
+        }),
+      ),
+    );
+    const failedVerification = cp
+      .cockpitSections(failed)
+      .find((s) => s.key === 'verification').lines;
+    assert(failedVerification[1].startsWith('Required check failed'), failedVerification[1]);
+    // A failed verification READ is an explicit unavailable with the reason.
+    const unreadable = proofCockpitWith(
+      null,
+      null,
+      null,
+      'GET /native/session/7/tasks/3/verification: corrupt_durable_state',
+    );
+    const unreadableVerification = cp
+      .cockpitSections(unreadable)
+      .find((s) => s.key === 'verification').lines;
+    assert(
+      unreadableVerification[1].startsWith('Verification unavailable'),
+      unreadableVerification[1],
+    );
+    assert(unreadableVerification[1].includes('corrupt_durable_state'), unreadableVerification[1]);
+    // A refused record status stays refused.
+    const refused = proofCockpitWith(null, null, {
+      records: [{ ...clone(verificationRecordJson), status: 'refused' }],
+    });
+    const refusedVerification = cp
+      .cockpitSections(refused)
+      .find((s) => s.key === 'verification').lines;
+    assertEqual(refusedVerification[1], 'Verification refused');
+  });
+
+  await test('integration is its own section: served states render distinct facts, absence is unavailable', () => {
+    const integrationSection = (view) =>
+      cp.cockpitSections(view).find((section) => section.key === 'integration');
+    // Landed: landedSnapshot equals the served verified snapshot.
+    const landed = integrationSection(proofCockpitWith(nc.validateTaskProof(taskProofJson())));
+    assertEqual(landed.title, 'Integration');
+    assert(landed.present, 'the integration section is present');
+    assert(
+      landed.lines[0].startsWith('\u2713 Landed state matches verified state'),
+      landed.lines[0],
+    );
+    assert(landed.lines.some((line) => line.includes('runId run-1')), JSON.stringify(landed.lines));
+    assert(
+      landed.lines.some((line) => line.includes('finalSnapshotHash tm1:bbb')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      landed.lines.some((line) => line.includes('landedSnapshot tm1:bbb')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      landed.lines.some((line) => line.includes('integratedFileCount 1')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      landed.lines.some((line) => line.includes('conflictCount 0')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      landed.lines.some((line) => line.includes('txn blake3:x [landed]')),
+      JSON.stringify(landed.lines),
+    );
+    assert(
+      landed.lines.some((line) => line.includes('verified snapshot tm1:bbb')),
+      JSON.stringify(landed.lines),
+    );
+    // Not integrated (present false) is never a success.
+    const notIntegrated = integrationSection(
+      proofCockpitWith(
+        nc.validateTaskProof(
+          taskProofJson({
+            integration: {
+              present: false,
+              inFlight: null,
+              runId: null,
+              finalSnapshotHash: null,
+              landedSnapshot: null,
+              integratedFileCount: null,
+              conflictCount: null,
+              txn: null,
+            },
+          }),
+        ),
+      ),
+    );
+    assert(notIntegrated.lines[0].startsWith('\u25cb Not integrated'), notIntegrated.lines[0]);
+    assert(
+      !notIntegrated.lines.some((line) => line.includes('Landed state matches')),
+      JSON.stringify(notIntegrated.lines),
+    );
+    // Integrating (in-flight record-first row, empty final hash).
+    const integrating = integrationSection(
+      proofCockpitWith(
+        nc.validateTaskProof(
+          taskProofJson({
+            integration: {
+              present: true,
+              inFlight: true,
+              runId: 'run-2',
+              finalSnapshotHash: '',
+              landedSnapshot: null,
+              integratedFileCount: 0,
+              conflictCount: 0,
+              txn: null,
+            },
+          }),
+        ),
+      ),
+    );
+    assert(integrating.lines[0].startsWith('\u2026 Integrating'), integrating.lines[0]);
+    // A served conflict count is its own state, never a success.
+    const conflict = integrationSection(
+      proofCockpitWith(
+        nc.validateTaskProof(
+          taskProofJson({
+            integration: {
+              present: true,
+              inFlight: true,
+              runId: 'run-3',
+              finalSnapshotHash: '',
+              landedSnapshot: null,
+              integratedFileCount: 0,
+              conflictCount: 2,
+              txn: null,
+            },
+          }),
+        ),
+      ),
+    );
+    assert(conflict.lines[0].startsWith('! Conflict \u2014 2'), conflict.lines[0]);
+    // A landed snapshot that differs from the verified one is a mismatch.
+    const mismatch = integrationSection(
+      proofCockpitWith(
+        nc.validateTaskProof(
+          taskProofJson({
+            proofState: 'unavailable',
+            proofStateReason:
+              'landed_snapshot mismatch: the landed integration snapshot does not equal the verified snapshot',
+            integration: {
+              present: true,
+              inFlight: false,
+              runId: 'run-4',
+              finalSnapshotHash: 'tm1:zzz',
+              landedSnapshot: 'tm1:zzz',
+              integratedFileCount: 1,
+              conflictCount: 0,
+              txn: null,
+            },
+            trees: {
+              ...taskProofJson().trees,
+              verified: 'tm1:bbb',
+              landed: 'tm1:zzz',
+              landedEqualsVerified: false,
+            },
+          }),
+        ),
+      ),
+    );
+    assert(mismatch.lines[0].startsWith('\u2717 Mismatch'), mismatch.lines[0]);
+    // Integration absent from the payload is explicit Unavailable — never
+    // success, and never a crash.
+    const noIntegration = taskProofJson();
+    delete noIntegration.integration;
+    const absent = integrationSection(proofCockpitWith(noIntegration));
+    assert(absent.lines[0].startsWith('? Unavailable'), absent.lines[0]);
+    assert(
+      !absent.lines.some((line) => line.includes('Landed state matches')),
+      JSON.stringify(absent.lines),
+    );
+    // A failed proof read carries its reason into the domain.
+    const unavailable = integrationSection(
+      proofCockpitWith(null, 'GET /native/tasks/{id}/proof: corrupt_durable_state'),
+    );
+    assert(unavailable.lines[0].startsWith('? Unavailable'), unavailable.lines[0]);
+    assert(unavailable.lines[0].includes('corrupt_durable_state'), unavailable.lines[0]);
+  });
+
+  await test('a missing spend never renders as zero: the unavailable wording is preserved', () => {
+    const view = proofCockpitWith(
+      nc.validateTaskProof(
+        taskProofJson({
+          cost: { ...taskProofJson().cost, spentCostMicro: null, maxCostMicro: null },
+        }),
+      ),
+    );
+    const summary = cp.cockpitSections(view).find((section) => section.key === 'proof').lines[0];
+    assert(summary.includes('spend unavailable'), summary);
+    assert(!summary.includes('spend 0'), summary);
+    assert(!/\bspend\s+0\u00b5\$/.test(summary), summary);
+    assertEqual(view.proof.cost.spentMicro, null);
+    assert(view.proof.integration, 'the integration domain survives a cost refusal');
+  });
+
+  await test('a failed proof refresh drops the previously verified presentation', () => {
+    const verified = proofCockpitWith(nc.validateTaskProof(taskProofJson()));
+    const verifiedSnapshot = webviewSnapshot([]);
+    verifiedSnapshot.cockpit = verified;
+    verifiedSnapshot.cockpitSections = cp.cockpitSections(verified);
+    const harness = runChatWebview(verifiedSnapshot);
+    const cockpitNode = harness.dom.document.getElementById('cockpit');
+    assert(fakeText(cockpitNode).includes('VERIFIED'), fakeText(cockpitNode));
+    // The refresh's proof read failed: the cockpit is replaced with the
+    // explicit unavailable view — no stale VERIFIED text may remain.
+    const failed = proofCockpitWith(
+      null,
+      'GET /native/tasks/{id}/proof: corrupt_durable_state',
+    );
+    const failedSnapshot = webviewSnapshot([]);
+    failedSnapshot.cockpit = failed;
+    failedSnapshot.cockpitSections = cp.cockpitSections(failed);
+    harness.deliver({ type: 'snapshot', snapshot: failedSnapshot });
+    const after = fakeText(cockpitNode);
+    assert(!after.includes('VERIFIED'), after);
+    assert(after.includes('VERIFICATION UNAVAILABLE'), after);
+    assert(after.includes('corrupt_durable_state'), after);
+    assert(after.includes('Unavailable'), after);
   });
 }
 
@@ -11406,6 +12276,670 @@ function nearBoundaryEntitlementsJson(overrides = {}) {
   };
 }
 
+// -------------------------------- preflight/readiness (I06) + T27/T28/T32 (I10)
+
+function preflightInput(overrides = {}) {
+  return {
+    workspaceOpen: true,
+    daemon: 'stopped',
+    startingAttempt: false,
+    resolution: null,
+    trust: null,
+    resolveError: null,
+    readiness: 'idle',
+    readinessDetail: null,
+    failureDetail: null,
+    ...overrides,
+  };
+}
+
+const resolvedFixture = { executable: '/opt/faktor/bin/faktor-cli', source: 'binaryPath-setting' };
+const verifiedTrustFixture = {
+  state: 'verified',
+  source: 'binaryPath-setting',
+  detail: 'sha256 aaaa matches the checksum record /opt/faktor/bin/faktor-cli.sha256',
+};
+const unverifiedTrustFixture = {
+  state: 'unverified',
+  source: 'binaryPath-setting',
+  detail: 'no checksum record exists at /opt/faktor/bin/faktor-cli.sha256; the resolved path must be confirmed before start',
+};
+const refusedTrustFixture = {
+  state: 'refused',
+  source: 'binaryPath-setting',
+  detail: 'checksum mismatch for /opt/faktor/bin/faktor-cli: record aaaa, computed bbbb',
+};
+
+function actionLabels(node) {
+  const out = [];
+  for (const child of node.children || []) {
+    if (child.tagName === 'button') {
+      out.push(child.textContent);
+    }
+  }
+  return out;
+}
+
+async function preflightTests() {
+  await test('the T00-T05 preflight matrix renders its exact label, copy and actions in both surfaces', () => {
+    const matrix = [
+      { copy: pf.T00_WORKSPACE_UNAVAILABLE, input: preflightInput({ workspaceOpen: false }) },
+      {
+        copy: pf.T01_STOPPED,
+        input: preflightInput({ resolution: resolvedFixture, trust: verifiedTrustFixture }),
+      },
+      { copy: pf.T02_MISSING, input: preflightInput({ resolveError: 'binary not found' }) },
+      {
+        copy: pf.T03_UNVERIFIED,
+        input: preflightInput({ resolution: resolvedFixture, trust: unverifiedTrustFixture }),
+      },
+      {
+        copy: pf.T04_REFUSED,
+        input: preflightInput({ resolution: resolvedFixture, trust: refusedTrustFixture }),
+      },
+      {
+        copy: pf.T05_STARTING,
+        input: preflightInput({
+          startingAttempt: true,
+          resolution: resolvedFixture,
+          trust: verifiedTrustFixture,
+        }),
+      },
+    ];
+    for (const row of matrix) {
+      const view = pf.derivePreflight(row.input);
+      assertEqual(view.state, row.copy.state, `${row.copy.state} state`);
+      assertEqual(view.label, row.copy.label, `${row.copy.state} label`);
+      assertEqual(view.copy, row.copy.copy, `${row.copy.state} copy`);
+      assertDeepEqual(view.actions, row.copy.actions, `${row.copy.state} actions`);
+      const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
+      const { dom } = harness;
+      assertEqual(
+        dom.document.getElementById('preflight-card').hidden,
+        false,
+        `${row.copy.state} card visible`,
+      );
+      assertEqual(dom.document.getElementById('preflight-label').textContent, row.copy.label);
+      assertEqual(dom.document.getElementById('preflight-copy').textContent, row.copy.copy);
+      assertEqual(dom.document.getElementById('diag-preflight-label').textContent, row.copy.label);
+      assertEqual(dom.document.getElementById('diag-preflight-copy').textContent, row.copy.copy);
+      assertDeepEqual(
+        actionLabels(dom.document.getElementById('preflight-actions')),
+        row.copy.actions.map((action) => action.label),
+        `${row.copy.state} card actions`,
+      );
+      assertDeepEqual(
+        actionLabels(dom.document.getElementById('diag-preflight-actions')),
+        row.copy.actions.map((action) => action.label),
+        `${row.copy.state} Diagnostics mirror actions`,
+      );
+      // Every card action posts its typed host message and nothing implicit.
+      const postFor = {
+        openProject: 'openProject',
+        startService: 'startDaemon',
+        locateDaemon: 'locateDaemon',
+        startAnyway: 'confirmStart',
+        cancelConfirm: 'cancelConfirm',
+        cancelStart: 'cancelStart',
+      };
+      const buttons = dom.document
+        .getElementById('preflight-actions')
+        .children.filter((child) => child.tagName === 'button');
+      for (let b = 0; b < buttons.length; b += 1) {
+        buttons[b].click();
+        assertDeepEqual(
+          harness.posted[harness.posted.length - 1],
+          { type: postFor[row.copy.actions[b].key] },
+          `${row.copy.state} action ${row.copy.actions[b].key}`,
+        );
+      }
+    }
+  });
+
+  await test('ready requires readiness success; a running but not-ready service stays T05', () => {
+    const waiting = pf.derivePreflight(
+      preflightInput({
+        daemon: 'running',
+        readiness: 'waiting',
+        resolution: resolvedFixture,
+        trust: verifiedTrustFixture,
+      }),
+    );
+    assertEqual(waiting.state, 'starting', 'liveness is not readiness');
+    assertDeepEqual(waiting.actions, pf.T05_STARTING.actions);
+    const ready = pf.derivePreflight(
+      preflightInput({
+        daemon: 'running',
+        readiness: 'ready',
+        resolution: resolvedFixture,
+        trust: verifiedTrustFixture,
+      }),
+    );
+    assertEqual(ready.state, 'ready');
+    assertEqual(ready.label, pf.READY.label);
+    assertDeepEqual(ready.actions, [], 'the ready row offers no start action');
+    // A readiness timeout is a typed, VISIBLE state (never implicit ready):
+    // the Diagnostics Readiness row carries the exact detail.
+    const timeout = pf.derivePreflight(
+      preflightInput({
+        daemon: 'running',
+        readiness: 'timeout',
+        readinessDetail:
+          'GET /native/ready did not report ready within 45000ms; the service keeps running but is not ready',
+        resolution: resolvedFixture,
+        trust: verifiedTrustFixture,
+      }),
+    );
+    assert(timeout.state === 'starting');
+    assertEqual(timeout.readiness, 'timeout');
+    const projection = ue.projectError({
+      kind: 'service_not_ready',
+      message: timeout.readinessDetail,
+      code: 'readiness_timeout',
+    });
+    assertEqual(projection.summary, 'The Faktor service is not ready');
+    assert(projection.technical.includes('readiness_timeout'), projection.technical);
+    const harness = runChatWebview({ ...webviewSnapshot([]), preflight: timeout });
+    assert(
+      harness.dom.document.getElementById('readiness-label').textContent.includes('did not report ready'),
+      harness.dom.document.getElementById('readiness-label').textContent,
+    );
+    assertEqual(harness.dom.document.getElementById('preflight-card').hidden, false);
+  });
+
+  await test('a refused trust state offers ONLY Locate daemon and never a start action', () => {
+    const view = pf.derivePreflight(
+      preflightInput({ resolution: resolvedFixture, trust: refusedTrustFixture }),
+    );
+    assertEqual(view.state, 'refused');
+    assertEqual(view.trustLabel, 'Checksum mismatch');
+    assertDeepEqual(
+      view.actions.map((action) => action.key),
+      ['locateDaemon'],
+    );
+    assert(!view.actions.some((action) => /start/i.test(action.label)), 'no start action');
+    const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
+    const labels = actionLabels(harness.dom.document.getElementById('preflight-actions'));
+    assertDeepEqual(labels, ['Locate daemon…']);
+    assert(!labels.some((label) => /start/i.test(label)), 'the rendered card never offers a start');
+  });
+
+  await test('unverified shows the exact resolved path, the D10 wording and both Start anyway / Cancel', () => {
+    const view = pf.derivePreflight(
+      preflightInput({ resolution: resolvedFixture, trust: unverifiedTrustFixture }),
+    );
+    assertEqual(view.state, 'unverified');
+    assertEqual(view.executable, '/opt/faktor/bin/faktor-cli');
+    assertEqual(view.trustLabel, 'No checksum record');
+    assertDeepEqual(
+      view.actions.map((action) => action.label),
+      ['Start anyway', 'Cancel'],
+    );
+    const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
+    const { dom } = harness;
+    assertEqual(dom.document.getElementById('preflight-path-row').hidden, false);
+    assertEqual(dom.document.getElementById('preflight-path').textContent, '/opt/faktor/bin/faktor-cli');
+    assertEqual(dom.document.getElementById('preflight-trust-row').hidden, false);
+    assertEqual(dom.document.getElementById('preflight-trust').textContent, 'No checksum record');
+    assertDeepEqual(actionLabels(dom.document.getElementById('preflight-actions')), [
+      'Start anyway',
+      'Cancel',
+    ]);
+    // Neither action starts implicitly: the card actions post the typed
+    // confirmation/cancel messages and nothing else.
+    dom.document.getElementById('preflight-actions').children[0].click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'confirmStart' });
+    dom.document.getElementById('preflight-actions').children[1].click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'cancelConfirm' });
+  });
+
+  await test('D10: the bare checksum check never claims a signature; launcher wording stays scoped', () => {
+    assertEqual(pf.bareChecksumTrustLabel(verifiedTrustFixture), 'Matches recorded checksum');
+    assertEqual(pf.bareChecksumTrustLabel(unverifiedTrustFixture), 'No checksum record');
+    assertEqual(pf.bareChecksumTrustLabel(refusedTrustFixture), 'Checksum mismatch');
+    for (const trust of [verifiedTrustFixture, unverifiedTrustFixture, refusedTrustFixture]) {
+      assert(
+        !/signed/i.test(pf.bareChecksumTrustLabel(trust)),
+        'a bare .sha256 label never says signed',
+      );
+    }
+    const layout = pf.bareChecksumTrustLabel({ state: 'verified', source: 'install-layout' });
+    assert(/launcher/.test(layout), 'install-layout verification is scoped to the launcher');
+    const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    assert(
+      !/signed checksum record/i.test(daemonSource),
+      'the bare-record detail text must never claim a signature',
+    );
+  });
+
+  await test('T27/T28 stream recovery renders verbatim copy with Wait/Refresh and Reconnect/Refresh from snapshot', () => {
+    const harness = runChatWebview({ ...webviewSnapshot([]), streamStatus: 'open' });
+    const { dom, posted } = harness;
+    const section = dom.document.getElementById('stream-recovery');
+    const pausedVisible = () =>
+      ['btn-reconnect-stream', 'btn-refresh-snapshot']
+        .filter((id) => dom.document.getElementById(id).hidden !== true)
+        .map((id) => dom.document.getElementById(id).textContent);
+    const reconnectingVisible = () =>
+      ['btn-wait-stream', 'btn-refresh-reconnecting']
+        .filter((id) => dom.document.getElementById(id).hidden !== true)
+        .map((id) => dom.document.getElementById(id).textContent);
+    harness.deliver({ type: 'streamBlocked', reason: 'durable frame 5 data is not JSON' });
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...webviewSnapshot([]), streamStatus: 'protocol_blocked' },
+    });
+    assertEqual(section.hidden, false, 'T28 shows while the durable event is unreadable');
+    assertEqual(dom.document.getElementById('stream-recovery-title').textContent, pf.T28_PAUSED.label);
+    assertEqual(dom.document.getElementById('stream-recovery-copy').textContent, pf.T28_PAUSED.copy);
+    assertDeepEqual(pausedVisible(), ['Reconnect', 'Refresh from snapshot']);
+    assertDeepEqual(reconnectingVisible(), []);
+    assert(
+      !fakeText(section).toLowerCase().includes('skip'),
+      'never a skip action in the paused card',
+    );
+    // The explicit reconnect flips the card to T27; the cursor is preserved.
+    harness.deliver({ type: 'streamBlocked', reason: null });
+    harness.deliver({ type: 'streamRecovery', recovering: true });
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...webviewSnapshot([]), streamStatus: 'connecting' },
+    });
+    assertEqual(section.hidden, false, 'T27 shows while reconnecting');
+    assertEqual(
+      dom.document.getElementById('stream-recovery-title').textContent,
+      pf.T27_RECONNECTING.label,
+    );
+    assertEqual(dom.document.getElementById('stream-recovery-copy').textContent, pf.T27_RECONNECTING.copy);
+    assertDeepEqual(pausedVisible(), []);
+    assertDeepEqual(reconnectingVisible(), ['Wait', 'Refresh']);
+    const beforeWait = posted.length;
+    dom.document.getElementById('btn-wait-stream').click();
+    assertEqual(section.hidden, true, 'Wait hides T27 without touching the stream');
+    assertEqual(posted.length, beforeWait, 'Wait posts nothing');
+    assert(
+      !fakeText(section).toLowerCase().includes('skip'),
+      'never a skip action in the reconnecting card',
+    );
+    dom.document.getElementById('btn-refresh-reconnecting').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'refresh' });
+    // A fresh pause re-arms the card after Wait, and the open status ends it.
+    harness.deliver({ type: 'streamBlocked', reason: 'durable frame 6 is not JSON' });
+    assertEqual(section.hidden, false, 'a fresh pause re-arms the card');
+    harness.deliver({ type: 'streamBlocked', reason: null });
+    harness.deliver({ type: 'streamRecovery', recovering: false });
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), streamStatus: 'open' } });
+    assertEqual(section.hidden, true, 'a recovered stream hides the card');
+  });
+
+  await test('T32 sandbox guidance is guidance-only: exact copy, copyable command, no write control', () => {
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(markup.includes(pf.SANDBOX_GUIDANCE.label), 'the T32 label ships verbatim');
+    assert(markup.includes(pf.SANDBOX_GUIDANCE.copy), 'the T32 copy ships verbatim');
+    assert(markup.includes(`>${pf.SANDBOX_GUIDANCE.command}<`), 'the exact command ships verbatim');
+    assert(
+      markup.includes(`>${pf.SANDBOX_GUIDANCE.action.label}<`),
+      'the T32 action label ships verbatim',
+    );
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted } = harness;
+    const before = posted.length;
+    const guidance = dom.document.getElementById('sandbox-guidance');
+    assertEqual(guidance.hidden, true, 'guidance starts closed');
+    dom.document.getElementById('btn-open-sandbox-guidance').click();
+    assertEqual(guidance.hidden, false, 'Open setup guidance reveals the guidance locally');
+    assertEqual(
+      dom.document.getElementById('btn-open-sandbox-guidance').getAttribute('aria-expanded'),
+      'true',
+    );
+    assertEqual(dom.document.getElementById('sandbox-command').textContent, 'faktor sandbox choose');
+    dom.document.getElementById('btn-copy-sandbox-command').click();
+    const status = dom.document.getElementById('sandbox-copy-status').textContent;
+    assert(status.includes('faktor sandbox choose'), `copy feedback names the command: ${status}`);
+    assertEqual(posted.length, before, 'the sandbox card never writes, executes or posts');
+  });
+
+  await test('evidence rows carry list semantics and new approvals announce once without stealing focus', () => {
+    const canonical = canonicalDomSnapshot();
+    const harness = runChatWebview(canonical);
+    const evidenceList = harness.dom.document
+      .getElementById('entries')
+      .querySelector('.evidence-list');
+    assert(evidenceList, 'the tool evidence region exists');
+    assertEqual(evidenceList.getAttribute('role'), 'list');
+    const evidenceItem = evidenceList.querySelector('[role="listitem"]');
+    assert(evidenceItem, 'the evidence row is a listitem');
+    assertEqual(evidenceItem.getAttribute('aria-label'), 'Evidence #7');
+    const cockpitEvidence = runChatWebview({
+      ...webviewSnapshot([]),
+      cockpitSections: [
+        {
+          key: 'evidence',
+          title: 'Evidence',
+          present: true,
+          lines: ['terminal transcript'],
+          evidence: [{ id: 9 }],
+          actions: [],
+        },
+      ],
+    });
+    cockpitEvidence.dom.document.getElementById('subtab-verification').click();
+    const cockpitList = cockpitEvidence.dom.document
+      .getElementById('cockpit')
+      .querySelector('.evidence-list');
+    assert(cockpitList, 'the cockpit evidence section is a list region');
+    assertEqual(cockpitList.getAttribute('role'), 'list');
+    assertEqual(
+      cockpitList.querySelector('[role="listitem"]').getAttribute('aria-label'),
+      'terminal transcript',
+    );
+    // Bounded approval announcements: one per NEW request, focus untouched.
+    const permissions = runChatWebview({ ...webviewSnapshot([]), permissions: [] });
+    const announce = permissions.dom.document.getElementById('permission-announce');
+    assertEqual(announce.textContent, '', 'nothing is announced with no pending request');
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(
+      /id="permission-announce"[^>]*role="status"[^>]*aria-live="polite"/.test(markup),
+      'the announcement line is a bounded polite live region',
+    );
+    const focusBefore = permissions.dom.document.activeElement;
+    const first = { id: '41', sessionId: '7', capability: 'shell', detail: '{"tool":"bash"}' };
+    permissions.deliver({
+      type: 'snapshot',
+      snapshot: { ...webviewSnapshot([]), permissions: [first] },
+    });
+    assert(
+      announce.textContent.includes('Faktor needs your approval'),
+      announce.textContent,
+    );
+    assertEqual(permissions.dom.document.activeElement, focusBefore, 'announcing never steals focus');
+    const announced = announce.textContent;
+    permissions.deliver({
+      type: 'snapshot',
+      snapshot: { ...webviewSnapshot([]), permissions: [first] },
+    });
+    assertEqual(announce.textContent, announced, 'an unchanged set is announced exactly once');
+    permissions.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...webviewSnapshot([]),
+        permissions: [
+          first,
+          { id: '42', sessionId: '7', capability: 'shell', detail: '{}' },
+          { id: '43', sessionId: '7', capability: 'shell', detail: '{}' },
+        ],
+      },
+    });
+    assert(announce.textContent.includes('+1 more'), announce.textContent);
+  });
+
+  await test('T32 ships guidance only: no sandbox write/execute route exists in the extension', () => {
+    // The CLI owns the fail-closed choice; there is no IDE write route and
+    // none may be added. The frozen error envelope carries no sandbox refusal
+    // code, so no sandbox_setup detection may be fabricated either.
+    for (const file of ['extension.ts', 'daemon.ts', 'nativeClient.ts', 'errors.ts']) {
+      const text = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
+      assert(
+        !/sandbox/i.test(text),
+        `${file} must not grow sandbox policy vocabulary or write/execute routes`,
+      );
+    }
+    const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    assert(
+      !/sandboxControl|sandboxChoose|writeSandbox|executeSandbox/i.test(chatSource),
+      'the panel posts no sandbox control message',
+    );
+    const errorContract = readFileSync(
+      new URL('../../../crates/protocol/src/error.rs', import.meta.url),
+      'utf8',
+    );
+    assert(
+      !/sandbox/i.test(errorContract),
+      'the frozen error envelope carries no sandbox refusal code to map (I10 stays guidance-only)',
+    );
+  });
+
+  await test('host wiring: locateDaemon, cancellable startup and the readiness gate are pinned', () => {
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    assert(
+      source.includes("registerCommand('faktor.locateDaemon'"),
+      'the palette command is registered',
+    );
+    const locateSlice = sourceFunctionSlice(source, 'async function locateDaemon');
+    assertEqual(
+      (locateSlice.match(/applyMachineScopedWrite\(/g) || []).length,
+      1,
+      'the global write goes through the adapter exactly once',
+    );
+    assert(locateSlice.includes('ConfigurationTarget.Global'), 'the write targets global scope');
+    assert(locateSlice.includes('inspectScopes()'), 'the effective scopes are re-validated');
+    assert(locateSlice.includes('workspaceScopedSettingRefusal('), 'D11 refusal is reused');
+    const cancelSlice = sourceFunctionSlice(source, 'function cancelStart');
+    assert(cancelSlice.includes('.abort()'), 'cancel aborts the in-flight attempt');
+    const noAttemptIndex = cancelSlice.indexOf('attempt === null');
+    const abortIndex = cancelSlice.indexOf('.abort()');
+    assert(noAttemptIndex >= 0 && noAttemptIndex < abortIndex, 'a missing attempt is checked first');
+    assert(
+      cancelSlice.includes('already running; there is nothing to cancel'),
+      'a late cancel (start succeeded) is a no-op with a notice',
+    );
+    assert(
+      cancelSlice.indexOf('already running; there is nothing to cancel') < abortIndex,
+      'the no-op notice precedes any abort',
+    );
+    const startSlice = sourceFunctionSlice(source, 'async function startServer');
+    assert(startSlice.includes('await awaitReady('), 'readiness is awaited after health');
+    assert(
+      startSlice.indexOf('awaitReady(') < startSlice.indexOf('ensureSession(client, context)'),
+      'readiness precedes session creation and any ready notice',
+    );
+    assert(startSlice.includes('readiness_timeout'), 'the readiness timeout is typed');
+    assert(startSlice.includes('service_not_ready'), 'the readiness outcome has its own kind');
+    assert(
+      startSlice.includes('signal: attempt.controller.signal'),
+      'the start attempt carries the abort signal',
+    );
+    const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    assert(daemonSource.includes('DaemonStartCancelledError'), 'daemon.ts types the cancellation');
+    assert(
+      daemonSource.includes("addEventListener('abort'"),
+      'the spawn/handshake observes the abort signal',
+    );
+    // Diagnostics rows: the exact advanced row set.
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    for (const row of ['Readiness', 'Index coverage', 'Trust']) {
+      assert(markup.includes(`>${row}</span>`), `the ${row} Diagnostics row exists`);
+    }
+  });
+}
+
+async function readinessTests() {
+  await test('readiness never succeeds before ready:true; the deadline is a typed timeout', async () => {
+    let attempts = 0;
+    const report = await rd.awaitReady(
+      {
+        ready: async () => {
+          attempts += 1;
+          return { ready: false };
+        },
+      },
+      { timeoutMs: 25, pollMs: 1 },
+    );
+    assertEqual(report.state, 'timeout');
+    assert(report.detail.includes('did not report ready'), report.detail);
+    assert(attempts >= 1, 'the readiness route was actually polled');
+  });
+
+  await test('a served but absent readiness route is a terminal typed failure; ready:true succeeds', async () => {
+    const missingRoute = await rd.awaitReady(
+      {
+        ready: async () => {
+          const error = new Error('native API error 404 not_found: no route');
+          error.status = 404;
+          throw error;
+        },
+      },
+      { timeoutMs: 1000, pollMs: 1 },
+    );
+    assertEqual(missingRoute.state, 'failed');
+    assert(missingRoute.detail.includes('not served'), missingRoute.detail);
+    const ready = await rd.awaitReady(
+      { ready: async () => ({ ready: true }) },
+      { timeoutMs: 1000, pollMs: 1 },
+    );
+    assertEqual(ready.state, 'ready');
+  });
+
+  await test('an abort unwinds the readiness wait typed and promptly', async () => {
+    const controller = new AbortController();
+    let rejected = null;
+    try {
+      await rd.awaitReady(
+        { ready: async () => ({ ready: false }) },
+        {
+          timeoutMs: 60_000,
+          pollMs: 1,
+          signal: controller.signal,
+          sleep: async () => {
+            controller.abort();
+          },
+        },
+      );
+    } catch (error) {
+      rejected = error;
+    }
+    assert(rejected instanceof rd.ReadinessCancelledError, String(rejected));
+    assertEqual(rejected.code, 'start_cancelled');
+  });
+}
+
+async function daemonCancelTests() {
+  await test('cancel startup aborts the attempt, kills the spawned child and leaves no orphan', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-daemon-cancel-'));
+    const pidfile = join(root, 'child.pid');
+    const spawns = join(root, 'spawns.txt');
+    const bin = join(root, 'slow-bin.sh');
+    writeExecutable(bin, `#!/bin/sh\necho spawn >> '${spawns}'\necho $$ > '${pidfile}'\nexec sleep 30\n`);
+    const controller = new AbortController();
+    try {
+      const settle = (promise) =>
+        promise.then(
+          (handle) => ({ ok: true, handle }),
+          (error) => ({ ok: false, error }),
+        );
+      // A concurrent caller joins the SAME single-flight attempt: cancelling
+      // it is a typed cancellation for every joined caller, never a success.
+      const first = settle(
+        dm.startDaemon({ workspaceRoot: '/nonexistent', binaryPath: bin, signal: controller.signal }),
+      );
+      const second = settle(dm.startDaemon({ workspaceRoot: '/nonexistent', binaryPath: bin }));
+      await waitFor(
+        () => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim().length > 0,
+        5000,
+        'the spawned child pid',
+      );
+      const childPid = Number(readFileSync(pidfile, 'utf8').trim());
+      assert(dm.processAlive(childPid), 'the fixture child must be alive before the cancel');
+      controller.abort();
+      const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+      for (const outcome of [firstOutcome, secondOutcome]) {
+        assert(outcome.ok === false, 'a cancelled start must reject for every joined caller');
+        assert(
+          dm.isDaemonStartCancelled(outcome.error),
+          `typed cancellation: ${outcome.error && outcome.error.message}`,
+        );
+        assertEqual(outcome.error.code, 'start_cancelled');
+      }
+      await waitFor(() => !dm.processAlive(childPid), 5000, 'the spawned child to die');
+      assertEqual(
+        readFileSync(spawns, 'utf8').trim().split('\n').length,
+        1,
+        'exactly one process was spawned (no retry, no orphan)',
+      );
+      // The single-flight slot is cleared: a fresh start succeeds afterwards.
+      const release = join(root, 'fake-release.cjs');
+      writeExecutable(release, FAKE_RELEASE_SOURCE);
+      const goodBin = join(root, 'good-bin.sh');
+      writeExecutable(goodBin, `#!/bin/sh\nexec node '${release}' "$@"\n`);
+      const handle = await dm.startDaemon({ workspaceRoot: '/nonexistent', binaryPath: goodBin });
+      assertEqual(await handle.alive(), true, 'a fresh start after a cancel succeeds');
+      await dm.stopDaemon(handle);
+      assertEqual(await handle.alive(), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('an already-aborted signal refuses before any spawn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-daemon-precancel-'));
+    const spawns = join(root, 'spawns.txt');
+    const bin = join(root, 'counting.sh');
+    writeExecutable(bin, `#!/bin/sh\necho spawn >> '${spawns}'\n`);
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      let failure = null;
+      try {
+        await dm.startDaemon({
+          workspaceRoot: '/nonexistent',
+          binaryPath: bin,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        failure = error;
+      }
+      assert(dm.isDaemonStartCancelled(failure), String(failure));
+      assert(!existsSync(spawns), 'nothing may be spawned after the signal was already aborted');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('the machine-scoped write adapter refuses workspace values and writes exactly once otherwise', async () => {
+    const writes = [];
+    const refused = await dm.applyMachineScopedWrite(
+      'faktor.binaryPath',
+      { workspaceValue: '/repo/faktor-cli', globalValue: '/usr/local/bin/faktor-cli' },
+      '/opt/faktor-cli',
+      async (key, value) => {
+        writes.push([key, value]);
+      },
+    );
+    assertEqual(refused.written, false);
+    assertEqual(refused.refusal.code, 'workspace_scoped_setting_refused');
+    assertEqual(writes.length, 0, 'a workspace-scoped effective value never writes');
+    const folderRefused = await dm.applyMachineScopedWrite(
+      'faktor.binaryPath',
+      { workspaceFolderValue: '/repo/bin' },
+      '/opt/faktor-cli',
+      async (key, value) => {
+        writes.push([key, value]);
+      },
+    );
+    assertEqual(folderRefused.written, false);
+    assertEqual(writes.length, 0);
+    const written = await dm.applyMachineScopedWrite(
+      'faktor.binaryPath',
+      { globalValue: '/old' },
+      '/opt/faktor-cli',
+      async (key, value) => {
+        writes.push([key, value]);
+      },
+    );
+    assertEqual(written.written, true);
+    assertEqual(written.refusal, null);
+    assertEqual(writes.length, 1, 'the global write goes through the adapter exactly once');
+    assertDeepEqual(writes[0], ['faktor.binaryPath', '/opt/faktor-cli']);
+    const outcome = dm.machineScopedSetting(
+      'faktor.binaryPath',
+      { workspaceValue: '/repo/bin' },
+      '',
+    );
+    assertEqual(outcome.value, '');
+    assertEqual(outcome.refusal.code, 'workspace_scoped_setting_refused');
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -11415,6 +12949,9 @@ async function main() {
   await eventStreamTests();
   await stateTests();
   await daemonTests();
+  await daemonCancelTests();
+  await preflightTests();
+  await readinessTests();
   await shadowDefaultTests();
   await completionContractTests();
   await errorProjectionTests();
@@ -11436,6 +12973,7 @@ async function main() {
   await controlPlaneCredentialTests();
   await presentationWebviewTests();
   await attentionWebviewTests();
+  await navigationWebviewTests();
   await composerAttachmentTests();
   await submissionSingleFlightTests();
   await transcriptScrollTests();

@@ -1,0 +1,54 @@
+{
+  "product": "Faktor",
+  "identity": "Faktor / Visual Identity V3 / 11 October 2026",
+  "mark": {
+    "name": "Cut F",
+    "rule": "One solid angular initial; only straight edges. No circle, curl, spiral, koru, arc or curve. Path commands restricted to M, V, H, L and Z.",
+    "geometry": {
+      "viewBox": [0, 0, 50, 52],
+      "unit": "1 viewBox unit; stem 16 units wide, arms 14 units thick, clipped tips 6 units",
+      "path": "M0 52 L0 0 L50 0 L50 8 L44 14 L16 14 L16 25 L41 25 L41 33 L35 39 L16 39 L16 52 Z",
+      "note": "Upper arm longer than the middle arm. Exact masters: docs/assets/brand/faktor-symbol*.svg; IDE slots use the bare symbol with the host's own color behavior."
+    }
+  },
+  "palette": {
+    "ink": "#08110C",
+    "forest": "#143D2B",
+    "paper": "#F3F5EF",
+    "sage": "#92AA99",
+    "ochre": "#D9BA75",
+    "ochreDeep": "#72541E"
+  },
+  "state": {
+    "success": { "light": "#145C39", "dark": "#68DC93" },
+    "pending": { "light": "#72541E", "dark": "#D9BA75" },
+    "failure": { "light": "#9D3131", "dark": "#FFB3AE" },
+    "rule": "Every treatment includes text and a shape. Brand ochre is not success; never rely on color alone."
+  },
+  "contrast": {
+    "inkOnPaper": "17.45:1",
+    "forestOnPaper": "11.04:1",
+    "mutedOnPaper": "5.66:1",
+    "sageOnInk": "7.69:1",
+    "ochreOnInk": "10.25:1",
+    "ochreDeepOnPaper": "6.37:1",
+    "ochreOnPaper": "1.7:1 (decorative accent only)"
+  },
+  "type": {
+    "displayHeading": "Barlow Semi Condensed 600/700, 56-108 px",
+    "sectionHeading": "Barlow Semi Condensed, 38-66 px",
+    "readingControls": "Barlow, 19-25 px",
+    "technicalMetadata": "IBM Plex Mono, 10-14 px",
+    "productHost": "inherit the IDE reading font; marketing type never enters the product widget"
+  },
+  "clearSpace": "Keep H/4 clear space on all sides of the visible artwork (H = visible symbol height). Empty viewBox padding is not clear space.",
+  "minimumSize": { "bareSymbol": "24 px preferred", "tinyIcon": "16 px supplied", "horizontalLockup": "160 px wide" },
+  "voice": {
+    "campaign": "Make the change. Show the evidence.",
+    "pending": "One required result is missing. Completion stays pending.",
+    "failure": "Required check failed. Inspect the result.",
+    "unavailable": "Verification unavailable. No verdict for this claim.",
+    "mismatch": "Landed state differs from the verified candidate.",
+    "cost": "Recorded spend, rework and final basis. No invented savings or public prices."
+  }
+}

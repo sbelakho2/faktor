@@ -97,6 +97,9 @@ class FaktorFrontendService(
         fun onError(message: String) {}
     }
 
+    /** The resolved daemon executable plus its trust decision at the last start. */
+    data class BinaryTrust(val executable: Path, val trust: DaemonBinary.Trust)
+
     private val lifecycleLock = Any()
 
     private var manager: BackendProcessManager? = null
@@ -125,6 +128,14 @@ class FaktorFrontendService(
      * is reaped before any state is published. */
     @Volatile
     private var stopRequested = false
+
+    /**
+     * The executable + trust decision of the last start attempt ([start]);
+     * null until an explicit start resolved a binary. Exposed for the
+     * Diagnostics trust readout — never a project/workspace lookup.
+     */
+    @Volatile
+    private var lastBinaryTrust: BinaryTrust? = null
 
     /** Bumped by every stop; an attach that began before it is aborted. */
     private var stopGeneration = 0L
@@ -208,6 +219,9 @@ class FaktorFrontendService(
 
     fun currentSessionId(): String? = sessionId
 
+    /** The binary + trust of the last start attempt, or null when none ran. */
+    fun lastDaemonTrust(): BinaryTrust? = lastBinaryTrust
+
     fun daemonDescription(): String = synchronized(lifecycleLock) {
         val c = client ?: return "stopped"
         return "connected: ${c.baseUrl}"
@@ -236,7 +250,9 @@ class FaktorFrontendService(
         // workspace/target path can never reach the spawn, and the resolved
         // path is reported before anything starts.
         val binaryPath = resolveBinary()
-        when (val trust = DaemonBinary.checksumTrust(binaryPath)) {
+        val trust = DaemonBinary.checksumTrust(binaryPath)
+        lastBinaryTrust = BinaryTrust(binaryPath, trust)
+        when (trust) {
             is DaemonBinary.Trust.Refused ->
                 throw BackendException("refusing to start the daemon: ${trust.detail}")
             else -> {}

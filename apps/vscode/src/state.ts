@@ -12,6 +12,7 @@ import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { EngineeringContractView } from './contract.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
+import type { PreflightView } from './preflight.ts';
 import type {
   NativeBoardPage,
   NativeIndexCoverageSnapshot,
@@ -388,6 +389,12 @@ export interface SessionSummary {
   readonly provider: string;
   readonly model: string;
   readonly state: string;
+  /**
+   * The durable creation time the listing serves (epoch ms); `null`/absent
+   * when the serving daemon does not carry it. The History surface renders
+   * the real date or an explicit absence — never a fabricated one.
+   */
+  readonly createdMs?: number | null;
 }
 
 /** Bound of the pending-permission card list and its free-form detail. */
@@ -479,6 +486,18 @@ export interface FaktorSnapshot {
   readonly machineState: string;
   readonly machineLabel: string;
   readonly sessions: readonly SessionSummary[];
+  /**
+   * The refusal text of the last durable session-list read (null = the last
+   * read was served or none happened yet). When set, the History surface
+   * renders its explicit unavailable state (T31 copy) and NO rows.
+   */
+  readonly sessionsUnavailable: string | null;
+  /**
+   * The workspace name of this window (the first folder's name), or null.
+   * The Inspect breadcrumb scope uses it; session/run ids stay advanced
+   * diagnostics, never the primary label.
+   */
+  readonly workspaceName: string | null;
   readonly runs: readonly RunSummary[];
   readonly activeRunId: string | null;
   readonly agents: readonly AgentSummary[];
@@ -508,6 +527,13 @@ export interface FaktorSnapshot {
   readonly indexCoverage: NativeIndexCoverageSnapshot | null;
   readonly transcript: readonly TranscriptEntry[];
   readonly streamStatus: string;
+  /**
+   * The ONE preflight/readiness presentation state (I06): the same view the
+   * Work empty-state card and the Diagnostics mirror render. Null only
+   * before the host publishes it (the panel then renders no card and never
+   * fabricates a state).
+   */
+  readonly preflight: PreflightView | null;
   readonly lastError: string | null;
   readonly busy: boolean;
 }
@@ -521,6 +547,8 @@ export function emptySnapshot(): FaktorSnapshot {
     machineState: 'unknown',
     machineLabel: 'Daemon stopped',
     sessions: [],
+    sessionsUnavailable: null,
+    workspaceName: null,
     runs: [],
     activeRunId: null,
     agents: [],
@@ -536,6 +564,7 @@ export function emptySnapshot(): FaktorSnapshot {
     permissions: [],
     transcript: [],
     streamStatus: 'stopped',
+    preflight: null,
     lastError: null,
     busy: false,
   };

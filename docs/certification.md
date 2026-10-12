@@ -1108,7 +1108,9 @@ fails with `unassigned`; an unconventional tag fails with
   (default/nightly-lane 86400; a 12 h operator variant is 43200) of REAL wall
   clock has elapsed — a fast workload can never shorten either target, and
   `FAKTOR_SOAK_MAX_WALL_SECONDS`/`FAKTOR_SOAK_TEST_TIMEOUT_SECONDS` bound the
-  run. Imported budget/scale refusals remain hard failures: zero/negative/
+  run (on an emulated/VM runner the campaign wall budget is derived from
+  same-run controls — see the load-aware wall budget below). Imported
+  budget/scale refusals remain hard failures: zero/negative/
   unparseable scale, non-positive budget, zero-test campaign. Every run
   records `target/certification/soak.json` with lane/mode/commit/tree/
   target/rounds/status, per-group counts and the embedded convergence report
@@ -1146,8 +1148,42 @@ fails with `unassigned`; an unconventional tag fails with
     shared-runner burst allowance — measured I/O-throttle steps reach
     ~15–16×; and ≤ 500 ms hard),
     `reconnect_correct` (≥ 1 reconnect event and 0 failures),
-    `duration_target_met` (real elapsed ≥ the mode target and ≤ the wall
-    budget). The full band table is embedded in every soak.json.
+    `duration_target_met` (real elapsed ≥ the mode target and ≤ the
+    LOAD-AWARE wall budget; see below). The full band table is embedded in
+    every soak.json.
+  - **Load-aware wall budget (emulated/VM runners).** The documented product
+    budget (`FAKTOR_SOAK_MAX_WALL_SECONDS`) assumes the documented product
+    runner; emulated (Rosetta/VM) runners stretch wall clock, so the
+    campaign budget is derived from same-run controls instead of trusting
+    the constant. The CONTROL is a bounded calibration workload run through
+    the SAME harness invocation path before the campaign (the same cargo
+    command with the test filters normalized to `soak_convergence_churn`
+    and `FAKTOR_SOAK_CALIBRATION_TURNS` set — fixed churn turns on the real
+    runtime/store; `FAKTOR_SOAK_CALIBRATION_NOMINAL_MS` documents the
+    product-runner reference cost), and the RUN-WIDE control is the bounded
+    convergence sampler recording both the harness accounting clock (`t`)
+    and `CLOCK_MONOTONIC` (`mono_ms`) per tick, so a realtime step during
+    the campaign (VM suspend, emulated clock stretch) is measured over the
+    campaign itself. Derivation:
+    `effective = min(max(product, factor * product), cap)` with
+    `factor = min(max(work_factor, clock_factor), FAKTOR_SOAK_MAX_WALL_FACTOR)`
+    (default 8, matching the scale clamp) and the documented hard ceiling
+    `FAKTOR_SOAK_WALL_CAP_SECONDS` (default 172800 = 48 h). The product
+    budget is a floor, never shrunk; the per-invocation `timeout` scales by
+    the same measured factor up to the cap; the sampler's own duration
+    bound is monotonic; the duration target stays the requirement, and a
+    campaign over even the derived budget still fails
+    (`wall-budget: … over the … load-aware budget`). soak.json records
+    `wall_budget_seconds`/`wall_budget_product_seconds`/`wall_budget_factor`
+    (`work_factor`, `clock_factor`, cap) and the calibration outcome. The
+    other fixed wall-clock budgets were reviewed for the same class: the
+    per-invocation test timeout (scaled as above), the sampler duration
+    bound (now monotonic, capped by the documented ceiling), and the
+    sampler SIGTERM/`wait` shutdown (bounded cleanup, left fixed); the
+    nightly *realtime* lane inherits the derivation but its Woodpecker
+    pipeline timeout (25 h per `setup.md §6`) is intentionally NOT raised
+    here — an operator raising the cap above it must raise the pipeline
+    timeout accordingly.
   - Wiring: the trusted per-release `soak-smoke` lane runs
     `--mode churn -p faktor-tests-soak --release -- --ignored --exact
     soak_convergence_churn` with `FAKTOR_SOAK_CONVERGENCE=required`; the
@@ -1161,7 +1197,11 @@ fails with `unassigned`; an unconventional tag fails with
     (`soak-smoke`=churn, `soak`=realtime), or a non-passing soak status.
     `scripts/soak.sh --selftest` proves the metric algebra (converged world,
     leaky world, missing samples, duration band) and the churn integration
-    against fake metrics; `node scripts/certification/evidence.mjs selftest`
+    against fake metrics, including the load-aware budget matrix under an
+    injected clock stretch (same campaign passes when the derived budget
+    absorbs the stretch; a run past the derived budget fails; a
+    non-converging world still fails while the adapted budget is active);
+    `node scripts/certification/evidence.mjs selftest`
     proves the certificate's soak rejection matrix.
     Operator real-time campaign:
     `FAKTOR_SOAK_MODE=realtime bash scripts/soak.sh --mode realtime -p faktor-tests-soak --release -- --ignored`.

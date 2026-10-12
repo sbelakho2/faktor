@@ -1,5 +1,10 @@
 # Faktor
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/faktor-lockup-accent.svg">
+  <img src="docs/assets/brand/faktor-lockup-ink.svg" alt="Faktor" width="360">
+</picture>
+
 **An engineering agent that can inspect, modify and verify this workspace.**
 
 Faktor plans the work, edits code in an isolated candidate workspace behind
@@ -210,7 +215,11 @@ verifying signed evidence file fails the run.
 All user-visible metadata in this repository uses Faktor branding; the
 retired product name survives only in the historical attribution under
 `ui/LICENSES/` (enforced by `scripts/branding-scan.sh` and the static
-source scan in `tests/static-authority`). The external GitHub repository
+source scan in `tests/static-authority`). The visual identity — the exact
+Cut F mark, lockup masters, palette and type system — lives in
+`docs/assets/brand/` (`faktor-tokens.json` is the canonical record); the
+IDE panels use the bare mark with the host's own theme color and never
+repaint the editor or inject marketing fonts. The external GitHub repository
 name and description are not tracked in-tree; they were set with
 `gh repo rename` (name `faktor`) and
 `gh repo edit --description "Faktor — native Rust coding-agent runtime with

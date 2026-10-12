@@ -88,6 +88,7 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/EvidenceNavigatorPanel.k
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/HistoryPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PermissionsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ApprovalCards.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/SettingsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UsagePanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TerminalPanel.kt

@@ -32,6 +32,56 @@
       return [];
     },
   };
+  // History presentation policy comes from media/history-state.js (loaded
+  // first); the fallback keeps the surface honest without it: nothing is
+  // fabricated, the T31 copy is exact, and no row is ever rendered.
+  var historyPolicy = (typeof FaktorHistory !== 'undefined' && FaktorHistory) || {
+    HISTORY_UNAVAILABLE_LABEL: 'History unavailable',
+    HISTORY_UNAVAILABLE_COPY: 'The conversation list could not be read.',
+    HISTORY_UNAVAILABLE_ACTION: 'Refresh history',
+    HISTORY_CAP_NOTE: 'the conversation list policy is unavailable',
+    HISTORY_SEPARATION_NOTE: 'conversation state is not verification evidence',
+    HISTORY_EMPTY: 'No conversations are served yet.',
+    HISTORY_NO_MATCH: 'No conversation title matches this search.',
+    MAX_HISTORY_QUERY: 200,
+    sessionDateLabel: function () {
+      return null;
+    },
+    historyTitle: function () {
+      return 'conversation';
+    },
+    historyStateLabel: function () {
+      return 'unknown';
+    },
+    historyRows: function () {
+      return { rows: [], total: 0, shown: 0, capped: false };
+    },
+    historyStatusText: function () {
+      return 'history unavailable (policy missing)';
+    },
+  };
+  // The T27/T28 recovery presentation (I06e). The mode is chosen from the
+  // host's stream status + the explicit recovery message; the copy is frozen
+  // and the actions are exactly Wait/Refresh and Reconnect/Refresh from
+  // snapshot — a skip action is never offered.
+  var STREAM_RECOVERY = {
+    reconnecting: {
+      label: 'Reconnecting live updates',
+      copy: 'The last valid journal position is kept.',
+      actions: [
+        { key: 'wait', label: 'Wait' },
+        { key: 'refresh', label: 'Refresh' },
+      ],
+    },
+    paused: {
+      label: 'Live updates paused',
+      copy: 'The client cannot read the next durable event. Nothing is skipped.',
+      actions: [
+        { key: 'reconnectStream', label: 'Reconnect' },
+        { key: 'refreshSnapshot', label: 'Refresh from snapshot' },
+      ],
+    },
+  };
 
   // One logical submission at a time. The flag gates the composer BEFORE the
   // post, so a double click / Enter+click race can never emit a second
@@ -42,6 +92,24 @@
   /** The exact draft a board post submitted (token-correlated ack). */
   var submittedBoard = null;
   var boardSubmitSeq = 0;
+  /**
+   * The per-request approval in-flight set: a clicked request's Allow/Deny
+   * stay disabled until the host reports THAT request's result (never a
+   * global lock). Refusal reasons stay on the card while the request is
+   * still visible; both are bounded.
+   */
+  var permissionInFlight = [];
+  var permissionRefusals = [];
+  var MAX_PERMISSION_REFUSALS = 8;
+  var MAX_PERMISSION_REASON_CHARS = 240;
+  /** The last rendered pending set (refusal re-render source). */
+  var lastPermissions = [];
+  /**
+   * The ids of the last rendered pending set: a NEW approval is announced
+   * exactly once (bounded aria-live), and an unchanged re-render never
+   * re-announces or steals focus.
+   */
+  var lastPermissionIds = null;
   /** True while an IME composition is active (chord/Enter must not submit). */
   var composing = false;
   // Scroll-ownership state: the signature of the rendered transcript and the
@@ -57,6 +125,24 @@
   var currentSessionId = null;
   var streamBlockedReason = null;
   var streamBlockedCursor = null;
+  /** The last emitted stream status (snapshot source for the T27/T28 card). */
+  var streamStatusValue = 'stopped';
+  /** True while an explicit reconnect attempt is in flight (T27). */
+  var streamRecovering = false;
+  /** The operator chose Wait: hide T27 until the next recovery/paused event. */
+  var recoveryWaitDismissed = false;
+  /** The last rendered preflight view (diagnostics mirror source). */
+  var lastPreflight = null;
+  // Navigation shell state: the ONE active view (Work is the default and the
+  // host never forces it back), the active Inspect subview, the last snapshot
+  // (subview re-render source), the bounded history search text, the
+  // in-flight row Open identity and the diagnostics popover state.
+  var activeView = 'work';
+  var activeSubview = 'overview';
+  var lastSnapshot = null;
+  var historyQuery = '';
+  var historyOpenInFlight = null;
+  var diagnosticsOpen = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
   var lastRenderedError = null;
   /** Technical tails currently displayed; identical errors never stack. */
@@ -257,9 +343,22 @@
         renderContractSection(block, section.contract, section.lines);
       } else {
         var lines = Array.isArray(section.lines) ? section.lines : [];
+        var evidenceList = null;
+        if (section.key === 'evidence' && lines.length > 0) {
+          // The evidence region is a list; each ref is one listitem with an
+          // accessible name (the served label).
+          evidenceList = document.createElement('div');
+          evidenceList.className = 'evidence-list';
+          evidenceList.setAttribute('role', 'list');
+          evidenceList.setAttribute(
+            'aria-label',
+            'Evidence: ' + String(section.title == null ? 'section' : section.title),
+          );
+          block.appendChild(evidenceList);
+        }
         for (var j = 0; j < lines.length; j++) {
           if (section.key === 'evidence') {
-            renderEvidenceLine(block, section, lines[j], j);
+            renderEvidenceLine(evidenceList || block, section, lines[j], j);
           } else if (section.key === 'usage') {
             renderUsageLine(block, lines[j]);
           } else {
@@ -326,6 +425,11 @@
     var ref = refs[index];
     var row = document.createElement('div');
     row.className = 'evidence';
+    row.setAttribute('role', 'listitem');
+    row.setAttribute(
+      'aria-label',
+      typeof label === 'string' && label.length > 0 ? label : 'Evidence',
+    );
     var text = document.createElement('span');
     text.className = 'muted';
     text.textContent = label;
@@ -540,6 +644,468 @@
     }
   }
 
+  // ------------------------------------------------------- navigation shell
+  //
+  // ONE compact Work / Inspect / History switcher plus the Inspect subview
+  // tablist (Overview / Plan / Changes / Verification / Agents). Both are
+  // real tablists: role=tab controls, aria-selected + roving tabindex, and
+  // ArrowLeft/ArrowRight/Home/End while a tab is focused. Selection is LOCAL
+  // and stable — the host never switches views — and an Inspect subview
+  // re-renders from the last snapshot when it becomes active. Work is the
+  // default view and is never forced back by an incoming snapshot.
+
+  var INSPECT_SUBVIEWS = [
+    {
+      key: 'overview',
+      label: 'Overview',
+      tab: 'subtab-overview',
+      sections: ['disclosure', 'acceptance', 'contract', 'proof', 'integration', 'completion', 'phase', 'spend', 'usage'],
+    },
+    {
+      key: 'plan',
+      label: 'Plan',
+      tab: 'subtab-plan',
+      sections: ['plan', 'children', 'tournament', 'blockers'],
+    },
+    { key: 'changes', label: 'Changes', tab: 'subtab-changes', sections: [] },
+    {
+      key: 'verification',
+      label: 'Verification',
+      tab: 'subtab-verification',
+      sections: ['verification', 'evidence'],
+    },
+    { key: 'agents', label: 'Agents', tab: 'subtab-agents', sections: [] },
+  ];
+  var TOP_TABS = [
+    { key: 'work', tab: 'nav-work', panel: 'work-panel' },
+    { key: 'inspect', tab: 'nav-inspect', panel: 'inspect-panel' },
+    { key: 'history', tab: 'nav-history', panel: 'history-panel' },
+  ];
+  var CHANGES_EMPTY_LINE = 'No candidate changes are served for this run yet.';
+  var MAX_CHANGED_PATHS = 200;
+
+  function subviewOf(key) {
+    for (var i = 0; i < INSPECT_SUBVIEWS.length; i++) {
+      if (INSPECT_SUBVIEWS[i].key === key) {
+        return INSPECT_SUBVIEWS[i];
+      }
+    }
+    return INSPECT_SUBVIEWS[0];
+  }
+
+  function setTabSelected(id, selected) {
+    var node = byId(id);
+    if (!node || typeof node.setAttribute !== 'function') {
+      return;
+    }
+    node.setAttribute('aria-selected', selected ? 'true' : 'false');
+    node.setAttribute('tabindex', selected ? '0' : '-1');
+  }
+
+  /**
+   * Roving-tabindex tablist wiring: click selects, and while a tab is
+   * focused ArrowLeft/ArrowRight/Home/End move the selection exactly one
+   * step with explicit focus following it. One active tab, stable selection.
+   */
+  function wireTablist(tabIds, select) {
+    for (var i = 0; i < tabIds.length; i++) {
+      (function (index) {
+        var node = byId(tabIds[index]);
+        if (!node || typeof node.addEventListener !== 'function') {
+          return;
+        }
+        node.addEventListener('click', function () {
+          select(tabIds[index], true);
+        });
+        node.addEventListener('keydown', function (event) {
+          var key = event && event.key;
+          var target = null;
+          if (key === 'ArrowRight' || key === 'ArrowDown') {
+            target = (index + 1) % tabIds.length;
+          } else if (key === 'ArrowLeft' || key === 'ArrowUp') {
+            target = (index - 1 + tabIds.length) % tabIds.length;
+          } else if (key === 'Home') {
+            target = 0;
+          } else if (key === 'End') {
+            target = tabIds.length - 1;
+          }
+          if (target === null) {
+            return;
+          }
+          if (event.preventDefault) {
+            event.preventDefault();
+          }
+          select(tabIds[target], true);
+        });
+      })(i);
+    }
+  }
+
+  function setActiveView(key) {
+    for (var i = 0; i < TOP_TABS.length; i++) {
+      var selected = TOP_TABS[i].key === key;
+      if (selected) {
+        activeView = TOP_TABS[i].key;
+      }
+      setTabSelected(TOP_TABS[i].tab, selected);
+      var panel = byId(TOP_TABS[i].panel);
+      if (panel) {
+        panel.hidden = !selected;
+      }
+    }
+  }
+
+  function topTabKey(tabId) {
+    for (var i = 0; i < TOP_TABS.length; i++) {
+      if (TOP_TABS[i].tab === tabId) {
+        return TOP_TABS[i].key;
+      }
+    }
+    return null;
+  }
+
+  function selectTopTab(tabId, focusTab) {
+    var key = topTabKey(tabId);
+    if (key === null) {
+      return;
+    }
+    setActiveView(key);
+    if (focusTab === true) {
+      var node = byId(tabId);
+      if (node && typeof node.focus === 'function') {
+        node.focus();
+      }
+    }
+  }
+
+  function subviewTabKey(tabId) {
+    for (var i = 0; i < INSPECT_SUBVIEWS.length; i++) {
+      if (INSPECT_SUBVIEWS[i].tab === tabId) {
+        return INSPECT_SUBVIEWS[i].key;
+      }
+    }
+    return null;
+  }
+
+  function selectSubviewTab(tabId, focusTab) {
+    var key = subviewTabKey(tabId);
+    if (key === null) {
+      return;
+    }
+    setActiveSubview(key);
+    if (focusTab === true) {
+      var node = byId(tabId);
+      if (node && typeof node.focus === 'function') {
+        node.focus();
+      }
+    }
+  }
+
+  /** Mount the ONE shared cockpit card into the active content subpanel. */
+  function mountInspectCard(subviewKey) {
+    if (subviewKey !== 'overview' && subviewKey !== 'plan' && subviewKey !== 'verification') {
+      return;
+    }
+    var card = byId('inspect-card');
+    var panel = byId('inspect-subpanel-' + subviewKey);
+    if (!card || !panel || typeof panel.appendChild !== 'function') {
+      return;
+    }
+    if (card.parentNode !== panel) {
+      if (card.parentNode && typeof card.parentNode.removeChild === 'function') {
+        card.parentNode.removeChild(card);
+      }
+      panel.appendChild(card);
+    }
+  }
+
+  function setActiveSubview(key) {
+    var spec = subviewOf(key);
+    activeSubview = spec.key;
+    for (var i = 0; i < INSPECT_SUBVIEWS.length; i++) {
+      var selected = INSPECT_SUBVIEWS[i].key === spec.key;
+      setTabSelected(INSPECT_SUBVIEWS[i].tab, selected);
+      var panel = byId('inspect-subpanel-' + INSPECT_SUBVIEWS[i].key);
+      if (panel) {
+        panel.hidden = !selected;
+      }
+    }
+    mountInspectCard(spec.key);
+    renderBreadcrumb(lastSnapshot);
+    if (lastSnapshot) {
+      renderInspectContent(lastSnapshot);
+    }
+  }
+
+  /**
+   * The same-scope breadcrumb: `Inspect / <Subview>` plus the current scope
+   * (the workspace NAME — never a raw id). Session/run ids stay behind the
+   * "Advanced diagnostics" disclosure, never in the primary line.
+   */
+  function renderBreadcrumb(snapshot) {
+    var spec = subviewOf(activeSubview);
+    var path = byId('inspect-breadcrumb-path');
+    if (path) {
+      path.textContent = 'Inspect / ' + spec.label;
+    }
+    var scope = byId('inspect-breadcrumb-scope');
+    if (scope) {
+      var name =
+        snapshot && typeof snapshot.workspaceName === 'string' && snapshot.workspaceName.trim().length > 0
+          ? snapshot.workspaceName.trim()
+          : null;
+      scope.textContent = name !== null ? 'scope ' + name : 'scope this window';
+    }
+    var diagnostics = byId('inspect-breadcrumb-diagnostics-body');
+    if (diagnostics) {
+      var sessionId = snapshot && snapshot.session ? String(snapshot.session.id) : null;
+      var runId = snapshot && snapshot.activeRunId ? String(snapshot.activeRunId) : null;
+      diagnostics.textContent =
+        'session ' + (sessionId === null ? 'none' : sessionId) + ' \u00b7 run ' + (runId === null ? 'none' : runId);
+    }
+  }
+
+  /**
+   * Filter the served cockpit sections for one subview. Every section maps to
+   * exactly one subview; an ADDITIVE section this panel version does not know
+   * yet stays visible on Overview instead of being silently dropped. Section
+   * content and wording are never altered here.
+   */
+  function sectionsForSubview(subviewKey, sections) {
+    var spec = subviewOf(subviewKey);
+    var list = Array.isArray(sections) ? sections : [];
+    var known = {};
+    for (var i = 0; i < INSPECT_SUBVIEWS.length; i++) {
+      for (var j = 0; j < INSPECT_SUBVIEWS[i].sections.length; j++) {
+        known[INSPECT_SUBVIEWS[i].sections[j]] = true;
+      }
+    }
+    var out = [];
+    for (var k = 0; k < list.length; k++) {
+      var section = list[k];
+      var key = section && typeof section.key === 'string' ? section.key : '';
+      if (spec.sections.indexOf(key) !== -1) {
+        out.push(section);
+      } else if (spec.key === 'overview' && key.length > 0 && known[key] !== true) {
+        out.push(section);
+      }
+    }
+    return out;
+  }
+
+  /** Re-render every Inspect surface from the current snapshot + selection. */
+  function renderInspectContent(snapshot) {
+    if (!snapshot) {
+      return;
+    }
+    renderCockpit(snapshot.cockpit, sectionsForSubview(activeSubview, snapshot.cockpitSections));
+    renderChanges(snapshot);
+    renderAgents(snapshot.agents);
+    renderBoard(snapshot.board);
+  }
+
+  /**
+   * The Changes surface: only candidate data that is ALREADY served (the
+   * task's changed paths). When none is served the explicit empty state
+   * renders; nothing is invented and no diff is claimed before I03 ships it.
+   */
+  function renderChanges(snapshot) {
+    var list = byId('changes-list');
+    var empty = byId('changes-empty');
+    if (!list || !empty) {
+      return;
+    }
+    var files =
+      snapshot && snapshot.task && Array.isArray(snapshot.task.changedFiles)
+        ? snapshot.task.changedFiles
+        : [];
+    var focus = captureFocus(list);
+    clear(list);
+    if (files.length === 0) {
+      empty.hidden = false;
+      if (empty.textContent !== CHANGES_EMPTY_LINE) {
+        empty.textContent = CHANGES_EMPTY_LINE;
+      }
+      return;
+    }
+    empty.hidden = true;
+    var shown = files.slice(0, MAX_CHANGED_PATHS);
+    for (var i = 0; i < shown.length; i++) {
+      var item = document.createElement('li');
+      item.className = 'changes-path';
+      item.textContent = String(shown[i]);
+      list.appendChild(item);
+    }
+    if (files.length > shown.length) {
+      var more = document.createElement('li');
+      more.className = 'changes-path muted';
+      more.textContent = '... ' + (files.length - shown.length) + ' more';
+      list.appendChild(more);
+    }
+    restoreFocus(list, focus);
+  }
+
+  // ------------------------------------------------------------- history
+  //
+  // The History destination renders ONLY the served durable listing: real
+  // title, served state and the served created_ms date (an explicit "date
+  // unavailable" when the daemon serves none). A read failure renders the
+  // T31 copy with a Refresh history action and NO rows. Row Open posts ONE
+  // `openSession`; the host performs the single switch path.
+
+  function captureHistoryFocus() {
+    var active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!active) {
+      return null;
+    }
+    var activeId =
+      active.id !== undefined && active.id !== ''
+        ? active.id
+        : active.getAttribute
+          ? active.getAttribute('id')
+          : null;
+    if (activeId === 'history-search') {
+      return { kind: 'search' };
+    }
+    var cursor = active;
+    while (cursor) {
+      if (cursor.getAttribute && cursor.getAttribute('data-session-id')) {
+        return { kind: 'open', sessionId: cursor.getAttribute('data-session-id') };
+      }
+      cursor = cursor.parentNode;
+    }
+    return null;
+  }
+
+  /** Restore focus onto the SAME logical row/button after an async refresh. */
+  function restoreHistoryFocus(descriptor) {
+    if (!descriptor) {
+      return;
+    }
+    if (descriptor.kind === 'search') {
+      var search = byId('history-search');
+      if (search && typeof search.focus === 'function') {
+        search.focus();
+      }
+      return;
+    }
+    if (descriptor.kind === 'open' && /^[0-9]+$/.test(String(descriptor.sessionId))) {
+      var list = byId('history-list');
+      var row =
+        list && list.querySelector
+          ? list.querySelector('[data-session-id="' + descriptor.sessionId + '"]')
+          : null;
+      var button = row && row.querySelector ? row.querySelector('.history-open') : null;
+      if (button && typeof button.focus === 'function') {
+        button.focus();
+      }
+    }
+  }
+
+  function historyRowNode(snapshot, entry) {
+    var id = entry && entry.id !== undefined && entry.id !== null ? String(entry.id) : '';
+    var item = document.createElement('li');
+    item.className = 'history-row';
+    if (id.length > 0) {
+      item.setAttribute('data-session-id', id);
+    }
+    var main = document.createElement('div');
+    main.className = 'history-row-main';
+    var title = span(main, historyPolicy.historyTitle(entry), 'history-row-title');
+    span(main, historyPolicy.historyStateLabel(entry), 'chip history-row-state');
+    if (snapshot && snapshot.session && String(snapshot.session.id) === id) {
+      span(main, 'current', 'chip history-row-current');
+    }
+    item.appendChild(main);
+    var metaBits = [];
+    var date = historyPolicy.sessionDateLabel(entry ? entry.createdMs : null);
+    metaBits.push(date === null ? 'date unavailable' : 'created ' + date);
+    var provider = entry && typeof entry.provider === 'string' ? entry.provider : '';
+    var model = entry && typeof entry.model === 'string' ? entry.model : '';
+    if (provider.length > 0 || model.length > 0) {
+      metaBits.push(model.length > 0 ? (provider.length > 0 ? provider + ' / ' + model : model) : provider);
+    }
+    line(item, metaBits.join(' \u00b7 '), 'muted history-row-meta');
+    var open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'secondary history-open';
+    open.textContent = 'Open';
+    open.setAttribute('aria-label', 'Open conversation ' + title.textContent);
+    open.disabled = historyOpenInFlight !== null && historyOpenInFlight === id;
+    open.addEventListener('click', function () {
+      // Single-flight per logical row: a double click can never emit two
+      // openSession posts for the same conversation.
+      if (id.length === 0 || historyOpenInFlight === id) {
+        return;
+      }
+      historyOpenInFlight = id;
+      open.disabled = true;
+      vscode.postMessage({ type: 'openSession', sessionId: id });
+    });
+    item.appendChild(open);
+    return item;
+  }
+
+  function renderHistory(snapshot) {
+    if (snapshot) {
+      lastSnapshot = snapshot;
+    }
+    if (!lastSnapshot) {
+      return;
+    }
+    snapshot = lastSnapshot;
+    var list = byId('history-list');
+    var status = byId('history-status');
+    var note = byId('history-note');
+    var controls = byId('history-controls');
+    var unavailable = byId('history-unavailable');
+    if (!list || !status || !note || !controls || !unavailable) {
+      return;
+    }
+    if (note.textContent !== historyPolicy.HISTORY_SEPARATION_NOTE) {
+      note.textContent = historyPolicy.HISTORY_SEPARATION_NOTE;
+    }
+    var readFailed =
+      typeof snapshot.sessionsUnavailable === 'string' && snapshot.sessionsUnavailable.length > 0;
+    var serviceDown = snapshot.daemon !== 'running';
+    if (readFailed || serviceDown) {
+      setText('history-unavailable-label', historyPolicy.HISTORY_UNAVAILABLE_LABEL);
+      setText('history-unavailable-copy', historyPolicy.HISTORY_UNAVAILABLE_COPY);
+      setText('btn-history-refresh-unavailable', historyPolicy.HISTORY_UNAVAILABLE_ACTION);
+      unavailable.hidden = false;
+      controls.hidden = true;
+      status.hidden = true;
+      note.hidden = true;
+      list.hidden = true;
+      historyOpenInFlight = null;
+      clear(list);
+      return;
+    }
+    unavailable.hidden = true;
+    controls.hidden = false;
+    status.hidden = false;
+    note.hidden = false;
+    list.hidden = false;
+    if (
+      historyOpenInFlight !== null &&
+      snapshot.session &&
+      String(snapshot.session.id) === historyOpenInFlight
+    ) {
+      historyOpenInFlight = null;
+    }
+    var result = historyPolicy.historyRows(
+      Array.isArray(snapshot.sessions) ? snapshot.sessions : [],
+      historyQuery,
+    );
+    status.textContent = historyPolicy.historyStatusText(result, historyQuery);
+    var focus = captureHistoryFocus();
+    clear(list);
+    for (var i = 0; i < result.rows.length; i++) {
+      list.appendChild(historyRowNode(snapshot, result.rows[i]));
+    }
+    restoreHistoryFocus(focus);
+  }
+
   function renderTask(task, view, agents) {
     var card = byId('task-card');
     // No task, no run strip: an empty card full of em-dashes would be pure
@@ -665,6 +1231,35 @@
   // says what the run wants to do and to what; the reply handle, capability
   // key and owning conversation id stay behind "View details".
 
+  /**
+   * The AUTHORITY reason of one native detail payload: an explicit
+   * `reason`/`purpose`/`why` string field, surfaced verbatim and bounded.
+   * Nothing is inferred from other fields, and a detail that is not a JSON
+   * object carries no authority reason at all.
+   */
+  function permissionAuthorityReason(detail) {
+    if (typeof detail !== 'string' || detail.length === 0 || detail.charAt(0) !== '{') {
+      return null;
+    }
+    var parsed;
+    try {
+      parsed = JSON.parse(detail);
+    } catch (error) {
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    var keys = ['reason', 'purpose', 'why'];
+    for (var i = 0; i < keys.length; i++) {
+      var value = parsed[keys[i]];
+      if (typeof value === 'string' && value.trim().length > 0) {
+        return value.trim().slice(0, MAX_PERMISSION_REASON_CHARS);
+      }
+    }
+    return null;
+  }
+
   /** Human decision headline: what the agent wants to do, and to what. */
   function permissionHeadline(permission) {
     var kind = String(permission.capability == null ? '' : permission.capability).toLowerCase();
@@ -702,9 +1297,11 @@
       headline: target ? what + ': ' + target : what,
       target: target,
       detail: detail,
+      reason: permissionAuthorityReason(detail),
     };
   }
 
+  /** One approval decision button; both buttons gate on the request lock. */
   function permissionButton(permission, decision, label, secondary) {
     var id = String(permission.id == null ? '' : permission.id);
     var button = document.createElement('button');
@@ -714,7 +1311,20 @@
     }
     button.textContent = label;
     button.setAttribute('aria-label', label + ' permission request ' + id);
+    button.disabled = permissionInFlight.indexOf(id) !== -1;
     button.addEventListener('click', function () {
+      // The in-flight lock gates BEFORE the post: a double click, an
+      // Enter+click race or a hostile burst can never emit a second reply
+      // for the same request. It is released ONLY by that request's
+      // explicit host result (permissionResult).
+      if (permissionInFlight.indexOf(id) !== -1) {
+        return;
+      }
+      permissionInFlight.push(id);
+      if (permissionInFlight.length > MAX_PENDING_PERMISSIONS) {
+        permissionInFlight.shift();
+      }
+      setPermissionDecisionsDisabled(id, true);
       vscode.postMessage({
         type: 'permissionReply',
         permissionId: id,
@@ -724,9 +1334,88 @@
     return button;
   }
 
+  /** The rendered card item of one request id, or null. */
+  function permissionItemById(id) {
+    var list = byId('permission-list');
+    if (!list) {
+      return null;
+    }
+    for (var i = 0; i < list.children.length; i++) {
+      var item = list.children[i];
+      if (item.getAttribute && item.getAttribute('data-permission-id') === id) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /** Disable/enable BOTH decision buttons of one request (never global). */
+  function setPermissionDecisionsDisabled(id, disabled) {
+    var item = permissionItemById(id);
+    var actions = item && item.querySelector ? item.querySelector('.permission-actions') : null;
+    if (!actions) {
+      return;
+    }
+    for (var i = 0; i < actions.children.length; i++) {
+      var child = actions.children[i];
+      if (child.tagName === 'button') {
+        child.disabled = disabled;
+      }
+    }
+  }
+
+  /** The refusal reason currently displayed for one request id, or null. */
+  function permissionRefusalFor(id) {
+    for (var i = 0; i < permissionRefusals.length; i++) {
+      if (permissionRefusals[i].id === id) {
+        return permissionRefusals[i].reason;
+      }
+    }
+    return null;
+  }
+
+  function rememberPermissionRefusal(id, reason) {
+    var next = [];
+    for (var i = 0; i < permissionRefusals.length; i++) {
+      if (permissionRefusals[i].id !== id) {
+        next.push(permissionRefusals[i]);
+      }
+    }
+    next.push({ id: id, reason: reason });
+    permissionRefusals = next.slice(Math.max(0, next.length - MAX_PERMISSION_REFUSALS));
+  }
+
+  function forgetPermissionRefusal(id) {
+    var next = [];
+    for (var i = 0; i < permissionRefusals.length; i++) {
+      if (permissionRefusals[i].id !== id) {
+        next.push(permissionRefusals[i]);
+      }
+    }
+    permissionRefusals = next;
+  }
+
+  /** Drop refusal state for requests no longer pending; keep it bounded. */
+  function prunePermissionRefusals(items) {
+    var live = [];
+    for (var i = 0; i < items.length; i++) {
+      live.push(String(items[i].id == null ? '' : items[i].id));
+    }
+    var next = [];
+    for (var j = 0; j < permissionRefusals.length; j++) {
+      if (live.indexOf(permissionRefusals[j].id) !== -1) {
+        next.push(permissionRefusals[j]);
+      }
+    }
+    permissionRefusals = next;
+  }
+
   /**
    * The approval card list. The card is driven by the SAME snapshot data the
    * reply path resolves against; an empty list hides the card entirely.
+   * The subline is the AUTHORITY reason when the detail serves one and the
+   * exact `Action requested for this run.` payload line otherwise — never a
+   * fabricated purpose. A refused reply keeps its exact reason on the card.
    */
   function renderPermissions(permissions) {
     var card = byId('permission-card');
@@ -737,6 +1426,35 @@
     var focus = captureFocus(list);
     clear(list);
     var items = Array.isArray(permissions) ? permissions.slice(0, MAX_PENDING_PERMISSIONS) : [];
+    lastPermissions = items;
+    prunePermissionRefusals(items);
+    // Bounded aria-live: a request id that was not pending in the previous
+    // render is announced ONCE with its headline; an unchanged set never
+    // re-announces, and focus is never moved.
+    var pendingIds = [];
+    for (var p = 0; p < items.length; p++) {
+      pendingIds.push(String(items[p].id == null ? '' : items[p].id));
+    }
+    var announcements = [];
+    if (lastPermissionIds !== null) {
+      for (var q = 0; q < items.length; q++) {
+        if (lastPermissionIds.indexOf(pendingIds[q]) === -1) {
+          announcements.push(permissionHeadline(items[q]).headline);
+        }
+      }
+    }
+    lastPermissionIds = pendingIds;
+    var announceNode = byId('permission-announce');
+    if (announceNode) {
+      if (announcements.length > 0) {
+        announceNode.textContent =
+          'Faktor needs your approval: ' +
+          announcements[0] +
+          (announcements.length > 1 ? ' (+' + (announcements.length - 1) + ' more)' : '');
+      } else if (items.length === 0) {
+        announceNode.textContent = '';
+      }
+    }
     if (items.length === 0) {
       card.hidden = true;
       return;
@@ -752,11 +1470,24 @@
         item.className = 'permission';
         item.setAttribute('data-permission-id', id);
         line(item, info.headline, 'permission-action');
+        var whyBits = [
+          'capability ' + (capability.length > 0 ? capability : 'unavailable'),
+          info.target !== null ? 'target ' + info.target : null,
+          'session ' + (sessionId.length > 0 ? sessionId : 'unavailable'),
+        ].filter(function (bit) {
+          return bit !== null;
+        });
         line(
           item,
-          info.target ? 'Needed to verify: ' + info.target : 'Needed to continue this run.',
+          info.reason !== null
+            ? info.reason
+            : 'Action requested for this run. \u00b7 ' + whyBits.join(' \u00b7 '),
           'muted permission-why',
         );
+        var refusal = permissionRefusalFor(id);
+        if (refusal !== null) {
+          line(item, refusal, 'muted permission-refusal');
+        }
         var actions = document.createElement('div');
         actions.className = 'composer-actions permission-actions';
         actions.appendChild(permissionButton(permission, 'allow', 'Allow', false));
@@ -937,9 +1668,14 @@
   function renderAgents(agents) {
     var card = byId('agents-card');
     var list = byId('agent-list');
+    if (!card || !list) {
+      return;
+    }
     var focus = captureFocus(list);
     clear(list);
-    if (!agents || agents.length === 0) {
+    // The agents surface belongs to the Inspect / Agents subview: another
+    // subview never shows it, and no agent is ever fabricated.
+    if (activeSubview !== 'agents' || !agents || agents.length === 0) {
       card.hidden = true;
       return;
     }
@@ -1565,8 +2301,17 @@
 
     var evidenceId = evidenceIdOf(tool.artifact);
     if (evidenceId !== null) {
+      // Evidence rows are a LIST: the region carries role=list and each
+      // evidence row is a listitem with an accessible name; the retrieve
+      // button stays the only control.
+      var region = document.createElement('div');
+      region.className = 'evidence-list';
+      region.setAttribute('role', 'list');
+      region.setAttribute('aria-label', 'Evidence artifacts');
       var holder = document.createElement('div');
       holder.className = 'evidence';
+      holder.setAttribute('role', 'listitem');
+      holder.setAttribute('aria-label', 'Evidence #' + evidenceId);
       holder.setAttribute('data-evidence', String(evidenceId));
       var button = document.createElement('button');
       button.type = 'button';
@@ -1575,7 +2320,8 @@
         vscode.postMessage({ type: 'retrieveEvidence', evidenceId: evidenceId });
       });
       holder.appendChild(button);
-      details.appendChild(holder);
+      region.appendChild(holder);
+      details.appendChild(region);
     }
     row.appendChild(details);
     container.appendChild(row);
@@ -1906,17 +2652,55 @@
       });
   }
 
+  /**
+   * The stream-recovery card: T28 `Live updates paused` while the next
+   * durable event cannot be read, T27 `Reconnecting live updates` while an
+   * explicit reconnect is in flight (the last valid journal position is
+   * kept). The two action rows swap; a skip action never exists.
+   */
   function renderStreamRecovery(status) {
     var section = byId('stream-recovery');
     if (!section) {
       return;
     }
-    if (status === 'protocol_blocked') {
-      section.hidden = false;
-      setText('stream-recovery-reason', streamBlockedReason || 'the durable event stream is blocked');
+    var paused = status === 'protocol_blocked' || streamBlockedReason !== null;
+    var reconnecting = !paused && streamRecovering && !recoveryWaitDismissed;
+    if (!paused && !reconnecting) {
+      section.hidden = true;
       return;
     }
-    section.hidden = true;
+    section.hidden = false;
+    var mode = paused ? STREAM_RECOVERY.paused : STREAM_RECOVERY.reconnecting;
+    setText('stream-recovery-title', mode.label);
+    setText('stream-recovery-copy', mode.copy);
+    var reasonNode = byId('stream-recovery-reason');
+    if (reasonNode) {
+      reasonNode.hidden = !paused;
+      reasonNode.textContent = paused
+        ? String(streamBlockedReason || 'the durable event stream is blocked')
+        : '';
+    }
+    var pausedButtons = ['btn-reconnect-stream', 'btn-refresh-snapshot'];
+    var reconnectingButtons = ['btn-wait-stream', 'btn-refresh-reconnecting'];
+    var i;
+    for (i = 0; i < pausedButtons.length; i++) {
+      var pausedNode = byId(pausedButtons[i]);
+      if (pausedNode) {
+        pausedNode.hidden = !paused;
+        if (paused) {
+          pausedNode.textContent = STREAM_RECOVERY.paused.actions[i].label;
+        }
+      }
+    }
+    for (i = 0; i < reconnectingButtons.length; i++) {
+      var reconnectNode = byId(reconnectingButtons[i]);
+      if (reconnectNode) {
+        reconnectNode.hidden = paused;
+        if (!paused) {
+          reconnectNode.textContent = STREAM_RECOVERY.reconnecting.actions[i].label;
+        }
+      }
+    }
   }
 
   /**
@@ -1944,6 +2728,74 @@
     var notice = byId('attachment-notice');
     if (notice) {
       notice.hidden = true;
+    }
+  }
+
+  // ------------------------------------------------------ sandbox guidance I10
+  // T32 is guidance only: the panel has NO write control, and the exact
+  // command is presented for copying, never executed from here.
+
+  function setSandboxGuidanceOpen(open) {
+    var guidance = byId('sandbox-guidance');
+    if (guidance) {
+      guidance.hidden = open !== true;
+    }
+    var button = byId('btn-open-sandbox-guidance');
+    if (button && typeof button.setAttribute === 'function') {
+      button.setAttribute('aria-expanded', open === true ? 'true' : 'false');
+    }
+  }
+
+  function copySandboxCommand() {
+    var commandNode = byId('sandbox-command');
+    var status = byId('sandbox-copy-status');
+    var text =
+      commandNode && typeof commandNode.textContent === 'string' ? commandNode.textContent : '';
+    var copied = function () {
+      if (status) {
+        status.textContent = 'Copied: ' + text;
+      }
+    };
+    var fallback = function () {
+      if (commandNode && typeof commandNode.setAttribute === 'function') {
+        commandNode.setAttribute('tabindex', '0');
+      }
+      if (commandNode && typeof commandNode.focus === 'function') {
+        commandNode.focus();
+      }
+      if (status) {
+        status.textContent =
+          'Clipboard unavailable in this host; select and copy the command manually: ' + text;
+      }
+    };
+    try {
+      if (
+        typeof navigator !== 'undefined' &&
+        navigator.clipboard &&
+        typeof navigator.clipboard.writeText === 'function'
+      ) {
+        navigator.clipboard.writeText(text).then(copied, fallback);
+        return;
+      }
+    } catch (error) {
+      // Fall through to the selection fallback.
+    }
+    fallback();
+  }
+
+  /**
+   * The diagnostics popover state. Escape closes it and returns focus to the
+   * EXACT trigger (the `⋯` button); Escape never cancels a run.
+   */
+  function setDiagnosticsOpen(open) {
+    diagnosticsOpen = open === true;
+    var panel = byId('diagnostics');
+    if (panel) {
+      panel.hidden = !diagnosticsOpen;
+    }
+    var button = byId('btn-overflow');
+    if (button && typeof button.setAttribute === 'function') {
+      button.setAttribute('aria-expanded', diagnosticsOpen ? 'true' : 'false');
     }
   }
 
@@ -2013,6 +2865,236 @@
       list.appendChild(item);
     }
     updateBoardPostEnabled();
+    // The board is the Coordination surface of the Inspect / Agents subview.
+    var card = byId('board-card');
+    if (card) {
+      card.hidden = activeSubview !== 'agents';
+    }
+  }
+
+  // ---------------------------------------------------- preflight/readiness I06
+
+  /** The exact action dispatch for the preflight card + Diagnostics mirror. */
+  function dispatchPreflightAction(key) {
+    if (key === 'openProject') {
+      vscode.postMessage({ type: 'openProject' });
+    } else if (key === 'startService') {
+      vscode.postMessage({ type: 'startDaemon' });
+    } else if (key === 'locateDaemon') {
+      vscode.postMessage({ type: 'locateDaemon' });
+    } else if (key === 'startAnyway') {
+      vscode.postMessage({ type: 'confirmStart' });
+    } else if (key === 'cancelConfirm') {
+      vscode.postMessage({ type: 'cancelConfirm' });
+    } else if (key === 'cancelStart') {
+      vscode.postMessage({ type: 'cancelStart' });
+    } else if (key === 'openSetupGuidance') {
+      setSandboxGuidanceOpen(true);
+    }
+  }
+
+  function dispatchStreamRecoveryAction(key) {
+    if (key === 'wait') {
+      recoveryWaitDismissed = true;
+      renderStreamRecovery(streamStatusValue);
+    } else if (key === 'refresh') {
+      vscode.postMessage({ type: 'refresh' });
+    } else if (key === 'reconnectStream') {
+      vscode.postMessage({ type: 'recoverStream' });
+    } else if (key === 'refreshSnapshot') {
+      vscode.postMessage({ type: 'refresh' });
+    }
+  }
+
+  function preflightDotClass(state) {
+    if (state === 'ready') {
+      return 'dot-running';
+    }
+    if (state === 'starting' || state === 'unverified') {
+      return 'dot-starting';
+    }
+    if (state === 'refused' || state === 'missing') {
+      return 'dot-error';
+    }
+    return 'dot-stopped';
+  }
+
+  /** The Diagnostics Readiness row: the typed readiness outcome. */
+  function readinessText(view) {
+    if (!view || typeof view.readiness !== 'string') {
+      return 'not requested';
+    }
+    if (view.readiness === 'idle') {
+      return 'not requested';
+    }
+    if (view.readiness === 'waiting') {
+      return 'waiting for GET /native/ready';
+    }
+    if (view.readiness === 'ready') {
+      return 'ready';
+    }
+    return String(view.readinessDetail || view.readiness);
+  }
+
+  /** Honest index-coverage label; never flattened into "ready". */
+  function indexCoverageText(snapshot) {
+    var coverage = snapshot && snapshot.indexCoverage;
+    if (!coverage) {
+      return 'not reported';
+    }
+    var counters = '';
+    if (coverage.coverage) {
+      counters = coverage.coverage.files_indexed + '/' + coverage.coverage.files_seen + ' files';
+    }
+    if (coverage.freshness === 'partial') {
+      return 'partial ' + counters;
+    }
+    if (coverage.freshness === 'stale_while_rebuilding') {
+      return 'stale while rebuilding';
+    }
+    if (coverage.freshness === 'current') {
+      return 'current';
+    }
+    return 'unknown';
+  }
+
+  function preflightDetailText(view) {
+    if (!view) {
+      return null;
+    }
+    if (typeof view.readinessDetail === 'string' && view.readinessDetail.length > 0 && view.readiness !== 'ready') {
+      return view.readinessDetail;
+    }
+    if (typeof view.failureDetail === 'string' && view.failureDetail.length > 0) {
+      return view.failureDetail;
+    }
+    if (view.state === 'unverified' || view.state === 'refused') {
+      return typeof view.trustDetail === 'string' && view.trustDetail.length > 0 ? view.trustDetail : null;
+    }
+    return null;
+  }
+
+  function renderPreflightActions(containerId, view) {
+    var container = byId(containerId);
+    if (!container) {
+      return;
+    }
+    var focus = captureFocus(container);
+    clear(container);
+    var actions = view && Array.isArray(view.actions) ? view.actions : [];
+    for (var i = 0; i < actions.length; i++) {
+      (function (action) {
+        if (!action || typeof action.label !== 'string' || action.label.length === 0) {
+          return;
+        }
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'preflight-action';
+        button.textContent = action.label;
+        button.addEventListener('click', function () {
+          dispatchPreflightAction(action.key);
+        });
+        container.appendChild(button);
+      })(actions[i]);
+    }
+    restoreFocus(container, focus);
+  }
+
+  /**
+   * Render the ONE preflight view: the Work empty-state card and the
+   * Diagnostics mirror share this exact state, label, copy and actions.
+   */
+  function renderPreflight(view) {
+    lastPreflight = view && typeof view.state === 'string' ? view : null;
+    var card = byId('preflight-card');
+    if (card) {
+      if (lastPreflight === null) {
+        card.hidden = true;
+      } else {
+        card.hidden = false;
+        card.className = 'preflight preflight-' + lastPreflight.state;
+        var dot = byId('preflight-dot');
+        if (dot) {
+          dot.className = 'dot ' + preflightDotClass(lastPreflight.state);
+        }
+        setText('preflight-label', lastPreflight.label);
+        setText('preflight-copy', lastPreflight.copy);
+        var hasPath =
+          typeof lastPreflight.executable === 'string' && lastPreflight.executable.length > 0;
+        var pathRow = byId('preflight-path-row');
+        if (pathRow) {
+          pathRow.hidden = !hasPath;
+        }
+        if (hasPath) {
+          var pathNode = byId('preflight-path');
+          if (pathNode) {
+            pathNode.textContent = lastPreflight.executable;
+          }
+        }
+        var hasTrust =
+          typeof lastPreflight.trustLabel === 'string' && lastPreflight.trustLabel.length > 0;
+        var trustRow = byId('preflight-trust-row');
+        if (trustRow) {
+          trustRow.hidden = !hasTrust;
+        }
+        if (hasTrust) {
+          setText('preflight-trust', lastPreflight.trustLabel);
+        }
+        var detail = preflightDetailText(lastPreflight);
+        var detailNode = byId('preflight-detail');
+        if (detailNode) {
+          detailNode.hidden = detail === null;
+          detailNode.textContent = detail === null ? '' : detail;
+        }
+        renderPreflightActions('preflight-actions', lastPreflight);
+      }
+    }
+    renderPreflightMirror(lastPreflight);
+  }
+
+  function renderPreflightMirror(view) {
+    var mirror = byId('diagnostics-preflight');
+    if (!mirror) {
+      return;
+    }
+    setText('readiness-label', readinessText(view));
+    setText('trust-label', view && view.trustLabel ? view.trustLabel : null);
+    if (view === null) {
+      mirror.hidden = true;
+      return;
+    }
+    mirror.hidden = false;
+    var dot = byId('diag-preflight-dot');
+    if (dot) {
+      dot.className = 'dot ' + preflightDotClass(view.state);
+    }
+    setText('diag-preflight-label', view.label);
+    setText('diag-preflight-copy', view.copy);
+    var lines = [];
+    if (typeof view.executable === 'string' && view.executable.length > 0) {
+      lines.push('Executable: ' + view.executable);
+    }
+    if (typeof view.trustLabel === 'string' && view.trustLabel.length > 0) {
+      lines.push(
+        'Trust: ' +
+          view.trustLabel +
+          (typeof view.trustDetail === 'string' && view.trustDetail.length > 0
+            ? ' — ' + view.trustDetail
+            : ''),
+      );
+    }
+    if (typeof view.readinessDetail === 'string' && view.readinessDetail.length > 0) {
+      lines.push('Readiness: ' + view.readinessDetail);
+    }
+    if (typeof view.failureDetail === 'string' && view.failureDetail.length > 0) {
+      lines.push('Last start failure: ' + view.failureDetail);
+    }
+    var detailNode = byId('diag-preflight-detail');
+    if (detailNode) {
+      detailNode.hidden = lines.length === 0;
+      detailNode.textContent = lines.join('\n');
+    }
+    renderPreflightActions('diag-preflight-actions', view);
   }
 
   function renderSnapshot(snapshot) {
@@ -2028,18 +3110,28 @@
       renderAttachments();
     }
     currentSessionId = sessionId;
+    streamStatusValue =
+      typeof snapshot.streamStatus === 'string' && snapshot.streamStatus.length > 0
+        ? snapshot.streamStatus
+        : 'stopped';
+    if (streamStatusValue !== 'connecting' && streamStatusValue !== 'retrying') {
+      // A settled status re-arms the T27 card after an explicit Wait.
+      recoveryWaitDismissed = false;
+    }
     setDaemon(snapshot.daemon, snapshot.daemonDetail);
     setText('daemon-text', headerStatusText(snapshot));
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', streamStatusLabel(snapshot.streamStatus));
+    setText('index-coverage', indexCoverageText(snapshot));
     renderComposerModel(snapshot.session);
-    renderStreamRecovery(snapshot.streamStatus);
+    renderPreflight(snapshot.preflight);
+    renderStreamRecovery(streamStatusValue);
     renderTask(snapshot.task, snapshot.cockpit, snapshot.agents);
     renderPermissions(snapshot.permissions);
-    renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
-    renderAgents(snapshot.agents);
-    renderBoard(snapshot.board);
+    renderInspectContent(snapshot);
+    renderBreadcrumb(snapshot);
+    renderHistory(snapshot);
     renderWelcome(snapshot.transcript);
     renderTranscript(snapshot.transcript);
     // The raw last error lives in Diagnostics; the structured projection
@@ -2304,6 +3396,28 @@
         submittedBoard = null;
         updateBoardPostEnabled();
       }
+    } else if (message.type === 'permissionResult') {
+      // Answered by the host for EVERY reply outcome, correlated by the
+      // request id: the per-request lock is released, a refusal keeps the
+      // request visible with its exact reason, and the buttons re-enable.
+      // Nothing is retried implicitly; a retry is always a new user click.
+      var resultId = String(message.permissionId == null ? '' : message.permissionId);
+      var inFlightIndex = permissionInFlight.indexOf(resultId);
+      if (inFlightIndex !== -1) {
+        permissionInFlight.splice(inFlightIndex, 1);
+      }
+      if (message.ok !== true) {
+        var refusalReason =
+          typeof message.reason === 'string' && message.reason.length > 0
+            ? message.reason.slice(0, MAX_PERMISSION_REASON_CHARS)
+            : 'the reply was refused';
+        rememberPermissionRefusal(resultId, refusalReason);
+        renderPermissions(lastPermissions);
+      } else {
+        // The accepted request is about to disappear from the pending card;
+        // a stale refusal line from an earlier attempt must not outlive it.
+        forgetPermissionRefusal(resultId);
+      }
     } else if (message.type === 'startResult') {
       // The explicit result releases the submitting lock on EVERY outcome.
       setSubmitting(false);
@@ -2343,17 +3457,28 @@
       streamBlockedCursor =
         typeof message.cursor === 'number' && isFinite(message.cursor) ? message.cursor : null;
       if (streamBlockedReason !== null) {
-        var recovery = byId('stream-recovery');
-        if (recovery) {
-          recovery.hidden = false;
-        }
-        setText('stream-recovery-reason', streamBlockedReason);
+        // A fresh pause re-arms the card after an explicit Wait.
+        recoveryWaitDismissed = false;
       }
       renderStreamCursor();
+      renderStreamRecovery(streamStatusValue);
+    } else if (message.type === 'streamRecovery') {
+      streamRecovering = message.recovering === true;
+      if (streamRecovering) {
+        recoveryWaitDismissed = false;
+      }
+      renderStreamRecovery(streamStatusValue);
     } else if (message.type === 'userError') {
       showUserError(message.error);
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
+      // A refused Open (or a failed history refresh) answers with a notice:
+      // release the row lock so the operator can retry without waiting for
+      // an unrelated snapshot.
+      if (historyOpenInFlight !== null) {
+        historyOpenInFlight = null;
+        renderHistory(lastSnapshot);
+      }
     }
   });
 
@@ -2589,11 +3714,22 @@
     ingestFiles(transfer.files);
   });
 
-  // Escape dismisses the transient attachment-refusal notice.
+  // Escape closes the transient diagnostics/options surface first (returning
+  // focus to its EXACT trigger — the `⋯` button) and otherwise dismisses the
+  // transient notice. Escape never cancels a run.
   window.addEventListener('keydown', function (event) {
-    if (event && event.key === 'Escape') {
-      dismissTransient();
+    if (!event || event.key !== 'Escape') {
+      return;
     }
+    if (diagnosticsOpen) {
+      setDiagnosticsOpen(false);
+      var trigger = byId('btn-overflow');
+      if (trigger && typeof trigger.focus === 'function') {
+        trigger.focus();
+      }
+      return;
+    }
+    dismissTransient();
   });
 
   byId('btn-attach').addEventListener('click', function () {
@@ -2610,32 +3746,37 @@
     }
     vscode.postMessage({ type: 'clearAttachments' });
   });
-  // Inspect is progressive disclosure (audit UI-1): the conversation, the
-  // current run and the composer stay primary; run details, agents, board
-  // and evidence live behind this one explicit toggle. The DOM stays intact
-  // (and focusable) — only the visual grouping changes.
-  byId('btn-inspect').addEventListener('click', function () {
-    var app = byId('app');
-    var collapsed = app.classList.toggle('inspect-collapsed');
-    byId('btn-inspect').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  });
   // The `⋯` overflow holds the service/diagnostics vocabulary: session and
   // stream metadata, the raw service URL, Refresh/Start/Stop and the raw
   // stream position. Nothing in it is product copy, so it stays collapsed
-  // until asked for.
+  // until asked for (Escape closes it and returns focus here).
   byId('btn-overflow').addEventListener('click', function () {
-    var panel = byId('diagnostics');
-    var button = byId('btn-overflow');
-    var open = panel.hidden === true;
-    panel.hidden = !open;
-    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    setDiagnosticsOpen(!diagnosticsOpen);
   });
   byId('btn-refresh-snapshot').addEventListener('click', function () {
     vscode.postMessage({ type: 'refresh' });
   });
   byId('btn-reconnect-stream').addEventListener('click', function () {
-    vscode.postMessage({ type: 'recoverStream' });
+    dispatchStreamRecoveryAction('reconnectStream');
   });
+  byId('btn-wait-stream').addEventListener('click', function () {
+    dispatchStreamRecoveryAction('wait');
+  });
+  byId('btn-refresh-reconnecting').addEventListener('click', function () {
+    dispatchStreamRecoveryAction('refresh');
+  });
+  byId('btn-open-sandbox-guidance').addEventListener('click', function () {
+    setSandboxGuidanceOpen(true);
+  });
+  byId('btn-copy-sandbox-command').addEventListener('click', copySandboxCommand);
+  // T32: the exact guidance command ships in the static markup; mirror it into
+  // an empty code node so the copy action copies the visible text verbatim.
+  var sandboxCommand = byId('sandbox-command');
+  if (sandboxCommand && !sandboxCommand.textContent) {
+    sandboxCommand.textContent = 'faktor sandbox choose';
+  }
+  // The guidance disclosure starts closed in every rendering context.
+  setSandboxGuidanceOpen(false);
   byId('btn-new-task').addEventListener('click', function () {
     if (submitting) {
       return;
@@ -2657,6 +3798,35 @@
   });
   byId('btn-stop').addEventListener('click', function () {
     vscode.postMessage({ type: 'stopDaemon' });
+  });
+
+  // ------------------------------------------------------- shell wiring
+  // The Work / Inspect / History switcher and the Inspect subview tablist.
+  // Work is the default view; both tablists keep roving tabindex semantics.
+  wireTablist(['nav-work', 'nav-inspect', 'nav-history'], selectTopTab);
+  wireTablist(
+    ['subtab-overview', 'subtab-plan', 'subtab-changes', 'subtab-verification', 'subtab-agents'],
+    selectSubviewTab,
+  );
+  setActiveView('work');
+  setActiveSubview('overview');
+
+  // History: the bounded title search re-filters only the served rows; both
+  // refresh affordances post ONE refreshHistory (never a full implicit
+  // daemon start).
+  byId('history-search').addEventListener('input', function () {
+    var node = byId('history-search');
+    historyQuery =
+      node && typeof node.value === 'string'
+        ? node.value.slice(0, historyPolicy.MAX_HISTORY_QUERY)
+        : '';
+    renderHistory(lastSnapshot);
+  });
+  byId('btn-history-refresh').addEventListener('click', function () {
+    vscode.postMessage({ type: 'refreshHistory' });
+  });
+  byId('btn-history-refresh-unavailable').addEventListener('click', function () {
+    vscode.postMessage({ type: 'refreshHistory' });
   });
 
   // Onboarding prompt chips: fill the composer and focus it (feed, never

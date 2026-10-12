@@ -15,6 +15,7 @@
 export type UserErrorKind =
   | 'daemon_down'
   | 'daemon_start_failed'
+  | 'service_not_ready'
   | 'stream_gap'
   | 'run_failure'
   | 'permission_expired'
@@ -80,6 +81,11 @@ const KIND_COPY: Record<UserErrorKind, KindCopy> = {
     hint: 'Check the technical details; the service is not running yet.',
     action: { key: 'startService', label: 'Try again' },
   },
+  service_not_ready: {
+    summary: 'The Faktor service is not ready',
+    hint: 'The service is running but has not reported readiness; Diagnostics carries the exact readiness detail.',
+    action: null,
+  },
   stream_gap: {
     summary: 'Live updates paused',
     hint: 'Reconnect to resume from the last event. Nothing is skipped.',
@@ -114,6 +120,7 @@ function kindCopyOf(kind: unknown): KindCopy {
 function kindOf(kind: unknown): UserErrorKind {
   return kind === 'daemon_down' ||
     kind === 'daemon_start_failed' ||
+    kind === 'service_not_ready' ||
     kind === 'stream_gap' ||
     kind === 'run_failure' ||
     kind === 'permission_expired' ||

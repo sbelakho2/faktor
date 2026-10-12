@@ -434,6 +434,21 @@ function harnessSnapshot(empty = false, permissions = false) {
     streamStatus: 'open',
     lastError: null,
     busy: false,
+    // The preflight/readiness state the host publishes (I06): the stopped row
+    // renders in the Work empty state and the Diagnostics mirror.
+    preflight: {
+      state: 'stopped',
+      label: 'Faktor is stopped',
+      copy: 'Start the service when you are ready.',
+      actions: [{ key: 'startService', label: 'Start service' }],
+      executable: '/opt/faktor/bin/faktor-cli',
+      trust: 'verified',
+      trustLabel: 'Matches recorded checksum',
+      trustDetail: 'sha256 matches the checksum record /opt/faktor/bin/faktor-cli.sha256',
+      readiness: 'idle',
+      readinessDetail: null,
+      failureDetail: null,
+    },
   };
   if (empty) {
     // The onboarding/empty-state fixture: no conversation, no run, no
@@ -476,6 +491,7 @@ export function buildHarnessHtml(empty = false, attachments = false, permissions
   for (const [placeholder, path] of [
     ['${styleUri}', join(MEDIA, 'chat.css')],
     ['${boardUri}', join(MEDIA, 'board-state.js')],
+    ['${historyUri}', join(MEDIA, 'history-state.js')],
     ['${composerUri}', join(MEDIA, 'composer-state.js')],
     ['${scriptUri}', join(MEDIA, 'chat.js')],
   ]) {
@@ -716,9 +732,7 @@ async function openContractComposer(cdp, fill) {
     if (details) { details.open = true; }
     ${
       fill
-        ? `var inspect = document.getElementById('btn-inspect');
-    if (inspect && inspect.getAttribute('aria-expanded') !== 'true') { inspect.click(); }
-    document.getElementById('contract-constraints').value = 'existing sessions remain valid\\nexisting API clients cannot break';
+        ? `document.getElementById('contract-constraints').value = 'existing sessions remain valid\\nexisting API clients cannot break';
     document.getElementById('contract-invariants').value = 'revoked sessions cannot authenticate';
     document.getElementById('contract-risks').value = 'race conditions';
     document.getElementById('contract-obligations').value = 'replayed refresh tokens fail\\nlegacy sessions survive the migration';`
@@ -799,6 +813,35 @@ export async function runHarness(args) {
           }
         }
       }
+      // The EMPTY state (welcome + preflight card visible) is its own layout:
+      // exercise the same widths so the narrow single-column rules and the
+      // preflight actions are measured, not hidden behind a populated
+      // transcript.
+      {
+        const emptyHtml = buildHarnessHtml(true, args.attachments === true, args.permissions === true);
+        const emptyDir = mkdtempSync(join(tmpdir(), 'faktor-render-page-empty-'));
+        const emptyPath = join(emptyDir, 'index.html');
+        writeFileSync(emptyPath, emptyHtml);
+        const emptyUrl = pathToFileURL(emptyPath).href;
+        for (const width of WIDTHS) {
+          await loadPage(cdp, emptyUrl, width);
+          const result = await cdp.evaluate(MEASURE_SCRIPT);
+          const overflows = result.scrollWidth > result.innerWidth + 1;
+          if (overflows) {
+            failures.push(
+              `empty@${width}px: horizontal overflow (scrollWidth ${result.scrollWidth} > innerWidth ${result.innerWidth})`,
+            );
+          }
+          for (const control of result.controls) {
+            const min = control.primary ? MAIN_MIN : OTHER_MIN;
+            if (control.w < min - 0.51 || control.h < min - 0.51) {
+              failures.push(
+                `empty@${width}px: ${control.name} is ${control.w}x${control.h} (needs >= ${min}x${min})`,
+              );
+            }
+          }
+        }
+      }
       // Keyboard focus ring: fresh load, press Tab, inspect the focused node.
       await loadPage(cdp, pageUrl, 480);
       await cdp.send('Input.dispatchKeyEvent', {
@@ -824,7 +867,7 @@ export async function runHarness(args) {
       // Pointer focus must NOT show the ring (suppression).
       await loadPage(cdp, pageUrl, 480);
       const refreshBox = await cdp.evaluate(`(() => {
-        const r = document.getElementById('btn-inspect').getBoundingClientRect();
+        const r = document.getElementById('nav-inspect').getBoundingClientRect();
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
       })()`);
       await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
@@ -835,7 +878,7 @@ export async function runHarness(args) {
         return { id: el.id, outlineStyle: cs.outlineStyle };
       })()`);
       if (pointer.outlineStyle !== 'none') {
-        failures.push(`pointer click on #btn-inspect left outline ${pointer.outlineStyle}`);
+        failures.push(`pointer click on #nav-inspect left outline ${pointer.outlineStyle}`);
       }
       console.log('RENDER CHECK measured controls (largest width):');
       for (const control of measured.values()) {

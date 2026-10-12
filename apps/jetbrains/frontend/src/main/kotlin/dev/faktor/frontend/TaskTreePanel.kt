@@ -12,7 +12,6 @@ import java.awt.Component
 import java.awt.Dimension
 import java.awt.Font
 import java.awt.Point
-import java.math.BigInteger
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import javax.swing.BorderFactory
@@ -616,11 +615,11 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         return node
     }
 
-    private fun spendText(spend: SpendSummary?): String {
+    internal fun spendText(spend: SpendSummary?): String {
         if (spend == null) return "spend: -"
-        val tokens = "${spend.spentTokens ?: 0}/${spend.maxTokens ?: "unlimited"}" +
+        val tokens = "${spend.spentTokens ?: "unavailable"}/${spend.maxTokens ?: "unlimited"}" +
             (spend.remainingTokens?.let { " remaining $it" } ?: "")
-        val cost = "${spend.spentCostMicro ?: BigInteger.ZERO}/" +
+        val cost = "${spend.spentCostMicro ?: "unavailable"}/" +
             "${spend.maxCostMicro ?: "unlimited"} micro" +
             (spend.remainingCostMicro?.let { " remaining $it" } ?: "")
         val open = if (spend.openReservedMicro.signum() > 0) {
@@ -673,9 +672,10 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         )
         text.append(" ownership=").append(child.ownership)
         text.append(" worktree=").append(child.worktreeId)
-        text.append(" tokens=").append(child.spentTokens ?: 0).append("/").append(child.budgetMaxTokens ?: "unlimited")
+        text.append(" tokens=").append(child.spentTokens ?: "unavailable")
+            .append("/").append(child.budgetMaxTokens ?: "unlimited")
         if (child.remainingTokens != null) text.append(" remaining=").append(child.remainingTokens)
-        text.append(" cost=").append(child.spentCostMicro ?: BigInteger.ZERO)
+        text.append(" cost=").append(child.spentCostMicro ?: "unavailable")
             .append("/").append(child.maxCostMicro ?: "unlimited")
         child.blocker?.let { blocker ->
             text.append(" blocker=").append(blocker.kind).append(": ").append(bound(blocker.reason, 80))

@@ -498,6 +498,47 @@ async fn soak_convergence_churn() {
         .unwrap()
         .id();
 
+    // BOUNDED CALIBRATION CONTROL (same workload shape, reduced fixed size).
+    // `scripts/soak.sh` invokes this same test through the same bounded
+    // harness path with `FAKTOR_SOAK_CALIBRATION_TURNS` set, measures the
+    // harness wall it observed, and derives the campaign's load-aware wall
+    // budget from this monotonic cost over the documented product nominal
+    // (see the soak budget derivation in docs/certification.md §2.15). In
+    // calibration mode the wall target does not apply and no gauge/reconnect
+    // evidence is emitted: the campaign round owns that evidence.
+    if let Some(calibration_turns) = std::env::var("FAKTOR_SOAK_CALIBRATION_TURNS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|turns| *turns > 0)
+    {
+        let started = std::time::Instant::now();
+        for turn in 0..calibration_turns {
+            let agent = agent_for(manager.clone(), true, 1.0);
+            let outcome = agent
+                .run_turn(session_id, &format!("calibration turn {turn}"), &[])
+                .await
+                .unwrap();
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            drop(agent);
+            let handle = manager.get_session(session_id).unwrap().unwrap();
+            let _ = handle.latest_messages_page(100).unwrap();
+            let _ = handle.messages_page(None, 50).unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        // libtest captures test stderr, so the harness reads the measurement
+        // from the env-pointed file; the stderr line stays for manual runs.
+        if let Ok(path) = std::env::var("FAKTOR_SOAK_CALIBRATION_OUT") {
+            let _ = std::fs::write(
+                path,
+                format!(
+                    "{{\"schema\":\"faktor-soak-calibration/v1\",\"turns\":{calibration_turns},\"elapsed_ms\":{elapsed_ms}}}\n"
+                ),
+            );
+        }
+        eprintln!("soak calibration: turns={calibration_turns} elapsed_ms={elapsed_ms}");
+        return;
+    }
+
     let mut emitter = ConvergenceEmitter::new();
     let started = std::time::Instant::now();
     let target = Duration::from_secs(target_seconds);

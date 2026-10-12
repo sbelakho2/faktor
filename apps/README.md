@@ -1,5 +1,10 @@
 # IDE clients (Faktor-owned)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../docs/assets/brand/faktor-lockup-accent.svg">
+  <img src="../docs/assets/brand/faktor-lockup-ink.svg" alt="Faktor" width="300">
+</picture>
+
 - `vscode/` — the Faktor VS Code extension: `src/` is the extension host,
   `media/chat.js` + `chat.css` + `composer-state.js` are the hand-written
   chat panel served by `src/webview.ts` (local-resource-only CSP, nonce,

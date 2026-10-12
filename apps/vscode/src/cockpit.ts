@@ -165,8 +165,9 @@ export interface CockpitVerificationView {
   readonly failedChecks: number;
   /**
    * True only when the served record proves the FULL criterion set with no
-   * failed check: the summary may then render VERIFIED. A missing record is
-   * never verified.
+   * failed check — CANDIDATE evidence only, never a VERIFIED rendering. The
+   * strict proof read (`CockpitProofView.state === 'verified'`) is the only
+   * gate for the top-level verdict. A missing record is never verified.
    */
   readonly verified: boolean;
   readonly reviewer: string | null;
@@ -222,6 +223,12 @@ export interface CockpitView {
   readonly children: readonly CockpitChildView[];
   readonly blockers: readonly string[];
   readonly verification: CockpitVerificationView;
+  /**
+   * The refusal text of the per-task verification read (null = read OK or
+   * never attempted). Renders `Verification unavailable` + reason; the
+   * record-derived block can never mask a failed read.
+   */
+  readonly verificationUnavailable: string | null;
   readonly evidence: readonly CockpitEvidenceRef[];
   readonly spend: CockpitSpendView | null;
   readonly tournament: CockpitTournamentView | null;
@@ -265,6 +272,34 @@ export interface CockpitProofStepView {
 }
 
 /**
+ * The integration domain of the strict proof as the cockpit renders it:
+ * projected from the served `integration` block only. The state is a
+ * projection of served facts (`present`, `inFlight`, `conflictCount`,
+ * `landedSnapshot`/`finalSnapshotHash` versus the served verified snapshot)
+ * — success is never inferred, and a missing/unserved integration block is
+ * an explicit `unavailable`.
+ */
+export interface CockpitIntegrationView {
+  readonly state:
+    | 'not_integrated'
+    | 'integrating'
+    | 'conflict'
+    | 'landed'
+    | 'mismatch'
+    | 'unavailable';
+  /** The unavailability reason (served entry or the failed proof read). */
+  readonly reason: string | null;
+  readonly present: boolean;
+  readonly inFlight: boolean | null;
+  readonly runId: string | null;
+  readonly finalSnapshotHash: string | null;
+  readonly landedSnapshot: string | null;
+  readonly integratedFileCount: number | null;
+  readonly conflictCount: number | null;
+  readonly txn: { readonly txnId: string; readonly phase: string } | null;
+}
+
+/**
  * The top-level VERIFIED view derived from `GET /native/tasks/{id}/proof`.
  * `state` is the daemon's own three-way verdict, never re-derived here: the
  * cockpit renders `VERIFIED` ONLY for `verified`. A failed read is an
@@ -284,9 +319,14 @@ export interface CockpitProofView {
   readonly checks: {
     readonly passed: number;
     readonly total: number;
+    readonly failed: number;
     readonly requiredPassed: number;
     readonly requiredTotal: number;
+    readonly requiredFailed: number;
+    readonly requiredAllPassed: boolean | null;
   };
+  /** The integration domain (never a fabricated success; see above). */
+  readonly integration: CockpitIntegrationView;
   readonly review: {
     readonly status: string | null;
     readonly reviewer: string | null;
@@ -339,8 +379,11 @@ export interface CockpitNativeProof {
   readonly checks: {
     readonly passed: number;
     readonly total: number;
+    readonly failed: number;
     readonly requiredPassed: number;
     readonly requiredTotal: number;
+    readonly requiredFailed: number;
+    readonly requiredAllPassed: boolean;
   };
   readonly review: {
     readonly status: string | null;
@@ -374,11 +417,102 @@ export interface CockpitNativeProof {
       readonly atMs: number | null;
     }[];
   };
+  /** The served integration block; absent on a payload that does not serve
+   * one (an honest `null`, rendered as explicit Unavailable). */
+  readonly integration?: {
+    readonly present: boolean;
+    readonly inFlight: boolean | null;
+    readonly runId: string | null;
+    readonly finalSnapshotHash: string | null;
+    readonly landedSnapshot: string | null;
+    readonly integratedFileCount: number | null;
+    readonly conflictCount: number | null;
+    readonly txn: { readonly txnId: string; readonly phase: string } | null;
+  } | null;
   readonly unavailable: readonly {
     readonly component: string;
     readonly kind: string;
     readonly reason: string;
   }[];
+}
+
+/**
+ * Project the served integration block into the cockpit's integration view.
+ * The state is derived from served facts only: an absent block, an absent
+ * verified snapshot or an underivable landed identity is an explicit
+ * `unavailable` (with the served reason when one exists) — never success.
+ */
+function integrationViewOf(
+  integration: CockpitNativeProof['integration'],
+  verifiedSnapshot: string | null,
+  unavailable: CockpitNativeProof['unavailable'],
+): CockpitIntegrationView {
+  const empty: Omit<CockpitIntegrationView, 'state' | 'reason'> = {
+    present: false,
+    inFlight: null,
+    runId: null,
+    finalSnapshotHash: null,
+    landedSnapshot: null,
+    integratedFileCount: null,
+    conflictCount: null,
+    txn: null,
+  };
+  if (integration === null || integration === undefined) {
+    const entry = unavailable.find(
+      (row) => row.component === 'integration' || row.component.startsWith('integration'),
+    );
+    return {
+      ...empty,
+      state: 'unavailable',
+      reason:
+        entry === undefined ? null : clamp(`${entry.component} (${entry.kind}): ${entry.reason}`),
+    };
+  }
+  const served: Omit<CockpitIntegrationView, 'state' | 'reason'> = {
+    present: integration.present,
+    inFlight: integration.inFlight,
+    runId: integration.runId === null ? null : clamp(integration.runId),
+    finalSnapshotHash:
+      integration.finalSnapshotHash === null ? null : clamp(integration.finalSnapshotHash),
+    landedSnapshot: integration.landedSnapshot === null ? null : clamp(integration.landedSnapshot),
+    integratedFileCount: integration.integratedFileCount,
+    conflictCount: integration.conflictCount,
+    txn: integration.txn,
+  };
+  if (integration.present !== true) {
+    return { ...served, state: 'not_integrated', reason: null };
+  }
+  if (integration.conflictCount !== null && integration.conflictCount > 0) {
+    return { ...served, state: 'conflict', reason: null };
+  }
+  if (integration.inFlight === true) {
+    return { ...served, state: 'integrating', reason: null };
+  }
+  const landed =
+    served.landedSnapshot !== null && served.landedSnapshot.length > 0
+      ? served.landedSnapshot
+      : served.finalSnapshotHash !== null && served.finalSnapshotHash.length > 0
+        ? served.finalSnapshotHash
+        : null;
+  if (landed === null) {
+    return {
+      ...served,
+      state: 'unavailable',
+      reason: 'the integration record does not serve a landed snapshot',
+    };
+  }
+  if (verifiedSnapshot === null) {
+    return {
+      ...served,
+      state: 'unavailable',
+      reason: 'the verified snapshot is not served, so the landed state cannot be compared',
+    };
+  }
+  return {
+    ...served,
+    state: landed === verifiedSnapshot ? 'landed' : 'mismatch',
+    reason: null,
+  };
 }
 
 /**
@@ -398,12 +532,32 @@ export function proofViewOf(
       state: 'unavailable',
       reason: clamp(unavailableReason),
       criteria: { passed: 0, total: 0, failed: 0, unavailable: 0, certifiesCompletion: false },
-      checks: { passed: 0, total: 0, requiredPassed: 0, requiredTotal: 0 },
+      checks: {
+        passed: 0,
+        total: 0,
+        failed: 0,
+        requiredPassed: 0,
+        requiredTotal: 0,
+        requiredFailed: 0,
+        requiredAllPassed: null,
+      },
       review: { status: null, reviewer: null, independentVerdict: 'none' },
       trees: { verified: null, landed: null, landedEqualsVerified: null },
       publication: { commitOid: null, remoteHeadOid: null, pullRequestId: null },
       cost: { status: 'unavailable', spentMicro: null, maxMicro: null, reason: 'proof unavailable' },
       completion: null,
+      integration: {
+        state: 'unavailable',
+        reason: clamp(unavailableReason),
+        present: false,
+        inFlight: null,
+        runId: null,
+        finalSnapshotHash: null,
+        landedSnapshot: null,
+        integratedFileCount: null,
+        conflictCount: null,
+        txn: null,
+      },
       unavailable: [
         { component: 'proof', kind: 'unavailable', reason: clamp(unavailableReason) },
       ],
@@ -428,8 +582,11 @@ export function proofViewOf(
     checks: {
       passed: proof.checks.passed,
       total: proof.checks.total,
+      failed: proof.checks.failed,
       requiredPassed: proof.checks.requiredPassed,
       requiredTotal: proof.checks.requiredTotal,
+      requiredFailed: proof.checks.requiredFailed,
+      requiredAllPassed: proof.checks.requiredAllPassed,
     },
     review: {
       status: proof.review.status,
@@ -452,6 +609,11 @@ export function proofViewOf(
       maxMicro: proof.cost.maxCostMicro === null ? null : microToString(proof.cost.maxCostMicro),
       reason: proof.cost.reason === null ? null : clamp(proof.cost.reason),
     },
+    integration: integrationViewOf(
+      proof.integration,
+      proof.trees.verified,
+      proof.unavailable,
+    ),
     completion: proof.completion
       ? {
           gate: proof.completion.gate.status,
@@ -495,8 +657,8 @@ export function proofSummaryLine(proof: CockpitProofView): string {
       ? null
       : `remote head ${shortRef(proof.publication.remoteHeadOid)}`,
     proof.publication.pullRequestId === null ? null : `PR ${proof.publication.pullRequestId}`,
-    proof.cost.status === 'known'
-      ? `spend ${proof.cost.spentMicro ?? '0'}\u00b5$${
+    proof.cost.status === 'known' && proof.cost.spentMicro !== null
+      ? `spend ${proof.cost.spentMicro}\u00b5$${
           proof.cost.maxMicro === null ? '' : ` of ${proof.cost.maxMicro}\u00b5$`
         }`
       : `spend unavailable${proof.cost.reason === null ? '' : ` (${proof.cost.reason})`}`,
@@ -524,6 +686,67 @@ export function proofStepLines(proof: CockpitProofView): string[] {
       proof.completion.gateReason === null ? '' : ` \u2014 ${proof.completion.gateReason}`
     }`,
   );
+  return lines;
+}
+
+/**
+ * The bounded lines of the Integration section: the state glyph + text
+ * first, then the exact served `integration` facts. Text carries the state
+ * (the glyph is never the only signal); success is never inferred and an
+ * unserved block renders explicit Unavailable with its reason.
+ */
+export function proofIntegrationLines(proof: CockpitProofView | null): string[] {
+  if (proof === null) {
+    return ['? Unavailable \u2014 the proof read was not fetched'];
+  }
+  const integration = proof.integration;
+  const stateText =
+    integration.state === 'not_integrated'
+      ? 'Not integrated'
+      : integration.state === 'integrating'
+        ? 'Integrating'
+        : integration.state === 'conflict'
+          ? `Conflict${
+              integration.conflictCount === null ? '' : ` \u2014 ${integration.conflictCount}`
+            }`
+          : integration.state === 'landed'
+            ? 'Landed state matches verified state'
+            : integration.state === 'mismatch'
+              ? 'Mismatch'
+              : `Unavailable${integration.reason === null ? '' : ` \u2014 ${integration.reason}`}`;
+  const glyph =
+    integration.state === 'not_integrated'
+      ? '\u25cb'
+      : integration.state === 'integrating'
+        ? '\u2026'
+        : integration.state === 'conflict'
+          ? '!'
+          : integration.state === 'landed'
+            ? '\u2713'
+            : integration.state === 'mismatch'
+              ? '\u2717'
+              : '?';
+  const lines = [`${glyph} ${stateText}`];
+  const facts: (string | null)[] = [
+    integration.runId === null ? null : `runId ${integration.runId}`,
+    integration.finalSnapshotHash === null || integration.finalSnapshotHash.length === 0
+      ? null
+      : `finalSnapshotHash ${shortRef(integration.finalSnapshotHash)}`,
+    integration.landedSnapshot === null
+      ? null
+      : `landedSnapshot ${shortRef(integration.landedSnapshot)}`,
+    integration.integratedFileCount === null
+      ? null
+      : `integratedFileCount ${integration.integratedFileCount}`,
+    integration.conflictCount === null ? null : `conflictCount ${integration.conflictCount}`,
+    integration.txn === null ? null : `txn ${integration.txn.txnId} [${integration.txn.phase}]`,
+    proof.trees.verified === null ? null : `verified snapshot ${shortRef(proof.trees.verified)}`,
+  ];
+  for (const fact of facts) {
+    if (fact !== null && lines.length < MAX_LINES) {
+      lines.push(fact);
+    }
+  }
   return lines;
 }
 
@@ -1216,6 +1439,12 @@ export interface CockpitInput {
   readonly verification: VerificationSummary | null;
   readonly usage: UsageSummary | null;
   readonly taskVerification: CockpitTaskVerification | null;
+  /**
+   * A per-task verification read refusal. Preserved as an explicit
+   * `Verification unavailable` + reason; a stale passed record can never
+   * stand in for an unreadable verification read.
+   */
+  readonly taskVerificationUnavailable?: string | null;
   /** The durable tournament of the session, when one exists. */
   readonly tournament?: CockpitTournamentView | null;
   /** The strict proof summary for the top-level VERIFIED view. */
@@ -2041,6 +2270,10 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     })),
     blockers,
     verification: verificationView,
+    verificationUnavailable:
+      input.taskVerificationUnavailable === null || input.taskVerificationUnavailable === undefined
+        ? null
+        : clamp(input.taskVerificationUnavailable),
     evidence,
     spend,
     tournament,
@@ -2102,6 +2335,56 @@ function contractEvidenceLine(
   ]
     .filter((bit): bit is string => bit !== null)
     .join(' · ');
+}
+
+/**
+ * The record-derived verdict of the Verification section: CANDIDATE
+ * evidence only, never `VERIFIED` (the strict proof read is the only
+ * VERIFIED gate). Precedence follows the served facts: an unreadable
+ * verification read is an explicit unavailable with its reason, a refused
+ * record stays refused, failed required results are declared, missing
+ * required results stay `Completion pending`, and only a fully passing
+ * record renders `Candidate checks passed`.
+ */
+function verificationVerdictOf(view: CockpitView): string {
+  const verification = view.verification;
+  const checks = view.proof === null ? null : view.proof.checks;
+  const status = verification.status.trim().toLowerCase();
+  const facts = [
+    `criteria ${verification.criteriaPassed}/${verification.criteriaTotal} passed`,
+    `checks failed ${verification.checksFailed}`,
+    verification.reviewer === null ? null : `review ${verification.reviewer}`,
+    verification.tree === null ? null : `tree ${digestLabel(verification.tree)}`,
+    verification.publishedCommit === null
+      ? null
+      : `commit ${digestLabel(verification.publishedCommit)}`,
+    verification.remotePrHead === null ? null : `head ${digestLabel(verification.remotePrHead)}`,
+    view.spend === null ? null : `cost ${microText(BigInt(view.spend.spentCostMicro).toString())}`,
+  ].filter((bit): bit is string => bit !== null);
+  if (view.verificationUnavailable !== null || status === 'unavailable') {
+    return `Verification unavailable${
+      view.verificationUnavailable === null ? '' : ` \u2014 ${view.verificationUnavailable}`
+    }`;
+  }
+  if (status === 'refused') {
+    return 'Verification refused';
+  }
+  const requiredFailed =
+    checks !== null && (checks.requiredFailed > 0 || checks.requiredAllPassed === false);
+  if (requiredFailed || verification.checksFailed > 0 || status === 'failed') {
+    return `Required check failed \u2014 ${facts.join(' \u00b7 ')}`;
+  }
+  const requiredMissing =
+    checks !== null
+      ? checks.requiredPassed + checks.requiredFailed < checks.requiredTotal
+      : verification.criteriaTotal === 0;
+  if (requiredMissing || status === 'pending' || status === 'running') {
+    return 'Completion pending';
+  }
+  if (verification.verified) {
+    return `Candidate checks passed \u2014 ${facts.join(' \u00b7 ')}`;
+  }
+  return 'Completion pending';
 }
 
 /** The render plan of the persistent cockpit panel, in fixed order. */
@@ -2234,6 +2517,13 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     evidence: [],
   });
   sections.push({
+    key: 'integration',
+    title: 'Integration',
+    present: true,
+    lines: proofIntegrationLines(view.proof).slice(0, MAX_LINES),
+    evidence: [],
+  });
+  sections.push({
     key: 'plan',
     title: 'Plan / DAG steps',
     present: view.steps.length > 0,
@@ -2359,36 +2649,11 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     present: true,
     lines: [
       `status ${view.verification.status}`,
-      // The top-level summary: only a served record that proves the full
-      // criterion set with no failed check renders VERIFIED; criteria,
-      // checks, review, tree, published commit, remote PR head and cost are
-      // appended when the payload serves them.
-      ...(view.verification.verified
-        ? [
-            [
-              'VERIFIED',
-              `criteria ${view.verification.criteriaPassed}/${view.verification.criteriaTotal}`,
-              `checks failed ${view.verification.checksFailed}`,
-              view.verification.reviewer !== null
-                ? `review ${view.verification.reviewer}`
-                : null,
-              view.verification.tree !== null
-                ? `tree ${digestLabel(view.verification.tree)}`
-                : null,
-              view.verification.publishedCommit !== null
-                ? `commit ${digestLabel(view.verification.publishedCommit)}`
-                : null,
-              view.verification.remotePrHead !== null
-                ? `head ${digestLabel(view.verification.remotePrHead)}`
-                : null,
-              view.spend !== null
-                ? `cost ${microText(BigInt(view.spend.spentCostMicro).toString())}`
-                : null,
-            ]
-              .filter((bit): bit is string => bit !== null)
-              .join(' · '),
-          ]
-        : []),
+      // CANDIDATE evidence: the record-derived verdict never renders
+      // VERIFIED (the strict proof read summarised in the proof section is
+      // the only VERIFIED gate); candidate checks, pending, failed,
+      // unavailable and refused are distinct states.
+      verificationVerdictOf(view),
       `criteria ${view.verification.criteriaPassed}/${view.verification.criteriaTotal} passed`,
       `checks failed ${view.verification.checksFailed}`,
       `owed ${view.verification.owed} · failed checks ${view.verification.failedChecks}`,

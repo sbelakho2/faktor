@@ -33,6 +33,7 @@ import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionList
 import dev.faktor.shared.parseNativePresentationAck
+import dev.faktor.shared.parseNativeSessionList
 import dev.faktor.shared.parseNativeSessionUsage
 import dev.faktor.shared.parseNativeTaskCompletionSteps
 import dev.faktor.shared.parseNativeTaskProof
@@ -270,6 +271,17 @@ private const val TASK_VERIFICATION_JSON = "{" +
     "\"verifiedSnapshot\":\"ver1234\",\"basedOnSnapshot\":\"base1234\"," +
     "\"sourceCount\":2,\"landedSnapshot\":\"land1234\"}]}"
 
+// One criterion carrying FOUR served evidence refs: the criterion card must
+// keep one bound button per ref (a west-stacked row used to drop all but the
+// last).
+private const val MULTI_EVIDENCE_VERIFICATION_JSON = "{" +
+    "\"sessionId\":\"1\",\"taskId\":\"3\",\"records\":[{" +
+    "\"recordId\":\"r1\",\"status\":\"passed\"," +
+    "\"criteria\":[{\"criterionKey\":\"multi evidence\",\"passed\":true," +
+    "\"evidence\":\"evidence:41 ref one; evidence:42 ref two; evidence:43 ref three; " +
+    "evidence:44 ref four\"}]," +
+    "\"checks\":[],\"changedFiles\":[]}]}"
+
 // Criterion proof coverage: all SEVEN typed binding kinds served on the wire
 // (the typed binding object + origin/requirement + the three-way verdict)
 // plus a legacy unbound row, and the record-level P0 proof snapshots and
@@ -417,6 +429,31 @@ private const val PRESENTATION_ACK_JSON = "{" +
 private const val PERMISSION_LIST_JSON = "{" +
     "\"permissions\":[{\"id\":\"7\",\"session_id\":\"9\",\"capability\":\"shell\"," +
     "\"detail\":{\"tool\":\"bash\"}}]}"
+
+// T22: a served PR completion step carrying the daemon's typed
+// `native_pr_scm_not_configured` blocker; the OTHER fixture is a PR failure
+// with no such code (never read as a missing-SCM configuration).
+private const val BLOCKED_PR_TASK_JSON = "[" +
+    "{\"goal\":\"ship it\",\"state\":\"failed\",\"milestones\":{\"completed\":[],\"open\":[]}," +
+    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"verification\":[]," +
+    "\"completion\":{\"contract\":{\"include_commit\":true,\"include_push\":true," +
+    "\"include_pr\":true},\"steps\":[" +
+    "{\"step\":\"push\",\"status\":\"succeeded\",\"detail\":\"pushed to origin\"}," +
+    "{\"step\":\"pr\",\"status\":\"blocked\",\"detail\":\"native PR refused " +
+    "(native_pr_scm_not_configured): the completion contract requests the native PR " +
+    "step but no SCM provider is wired\"}]}}]"
+
+private const val BLOCKED_PR_OTHER_JSON = "[" +
+    "{\"goal\":\"ship it\",\"state\":\"failed\",\"milestones\":{\"completed\":[],\"open\":[]}," +
+    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"verification\":[]," +
+    "\"completion\":{\"contract\":{\"include_commit\":true,\"include_push\":true," +
+    "\"include_pr\":true},\"steps\":[" +
+    "{\"step\":\"pr\",\"status\":\"failed\",\"detail\":\"remote rejected: authentication failed\"}" +
+    "]}}]"
+
+private const val SMOKE_SESSIONS_JSON = "{" +
+    "\"sessions\":[{\"id\":\"7\",\"title\":\"work\",\"provider\":\"fake\",\"model\":\"m\"," +
+    "\"state\":\"ready\",\"created_ms\":1700000000000}]}"
 
 private const val BILLING_USAGE_JSON = "{" +
     "\"ok\":true,\"organization\":\"org-local\"," +
@@ -743,6 +780,397 @@ object FrontendSmoke {
             assertEquals(conflictText, panel.refusalText())
             assertTrue(panel.headerText().contains("last reply refused"), panel.headerText())
             assertEquals(1, panel.count(), "a refused reply keeps the pending list")
+        }
+
+        step("approval renderer: authority reason only when present, exact fallback + payload") {
+            val withReason = NativePermissionEntry(
+                "7", "9", "shell",
+                "{\"tool\":\"bash\",\"reason\":\"the run needs the test runner to reproduce the failure\"}"
+            )
+            assertEquals(
+                "the run needs the test runner to reproduce the failure",
+                approvalAuthorityReason(withReason.detail)
+            )
+            assertEquals(
+                "the run needs the test runner to reproduce the failure",
+                approvalReasonText(withReason)
+            )
+            val bare = NativePermissionEntry("8", "9", "shell", "{\"tool\":\"bash\"}")
+            assertEquals(
+                null,
+                approvalAuthorityReason(bare.detail),
+                "a payload without reason/purpose/why must not yield an inferred purpose"
+            )
+            assertEquals("Action requested for this run.", approvalReasonText(bare))
+            assertEquals("Run a shell command: bash", approvalHeadlineOf(bare))
+            // A non-object detail carries no authority reason at all.
+            assertEquals(null, approvalAuthorityReason("tool=bash reason=because"))
+            assertEquals("Action requested for this run.", approvalReasonText(
+                NativePermissionEntry("9", "9", "write", "just text")
+            ))
+            // The shared card renders the exact copy, the fallback and the
+            // EXACT payload; the decisions are per-request Allow/Deny/Details.
+            val gate = ApprovalReplyGate()
+            val card = approvalRequestCard(bare, gate, onReply = {})
+            val texts = textsOf(card.body)
+            assertTrue(texts.contains("Action requested for this run."), "fallback missing: $texts")
+            assertTrue(texts.contains("{\"tool\":\"bash\"}"), "exact payload missing: $texts")
+            assertTrue(texts.any { it.contains("capability shell") }, "capability missing: $texts")
+            assertTrue(texts.any { it.contains("target bash") }, "target missing: $texts")
+            assertTrue(texts.contains("Run a shell command: bash"), "headline missing: $texts")
+            assertEquals("Allow", card.allowButton.text)
+            assertEquals("Deny", card.denyButton.text)
+            assertEquals("Details", card.detailsButton.text)
+            assertTrue(
+                card.allowButton.accessibleContext.accessibleName
+                    .contains("Allow approval request 8"),
+                card.allowButton.accessibleContext.accessibleName
+            )
+            assertTrue(
+                card.denyButton.accessibleContext.accessibleName
+                    .contains("Deny approval request 8"),
+                card.denyButton.accessibleContext.accessibleName
+            )
+            assertTrue(
+                card.detailsButton.accessibleContext.accessibleName
+                    .contains("approval request 8"),
+                card.detailsButton.accessibleContext.accessibleName
+            )
+            // The authority reason replaces the fallback verbatim when present.
+            val reasoned = approvalRequestCard(withReason, ApprovalReplyGate(), onReply = {})
+            assertTrue(
+                textsOf(reasoned.body).contains(
+                    "the run needs the test runner to reproduce the failure"
+                ),
+                textsOf(reasoned.body).toString()
+            )
+        }
+
+        step("approval gating: one reply per request id, refusal keeps the card, rebuild keeps pending") {
+            val gate = ApprovalReplyGate()
+            val workCard = WorkApprovalCard(gate)
+            val replies = ArrayList<String>()
+            var refreshes = 0
+            workCard.setListener(object : WorkApprovalCard.Listener {
+                override fun onReply(
+                    permission: NativePermissionEntry,
+                    decision: String
+                ) {
+                    replies.add("${permission.id}:$decision")
+                }
+
+                override fun onRefresh() {
+                    refreshes++
+                }
+            })
+            val permission = NativePermissionEntry("7", "9", "shell", "{\"tool\":\"bash\"}")
+            workCard.update(listOf(permission))
+            assertEquals(true, workCard.isVisible)
+            assertEquals("Faktor needs your approval", workCard.headlineText())
+            assertEquals("Review the action, target and stated reason.", workCard.supportingText())
+            val buttons = workCard.replyButtonsForTest("7")
+                ?: fail("the work approval card must render request 7")
+            // A double click (the second on the now-disabled button) emits
+            // exactly ONE reply.
+            buttons.first.doClick()
+            buttons.first.doClick()
+            assertEquals(listOf("7:allow"), replies)
+            assertEquals(false, buttons.first.isEnabled)
+            assertEquals(false, buttons.second.isEnabled)
+            assertEquals(true, gate.pending("7"))
+            // A rebuild with the same pending snapshot keeps the request and
+            // its in-flight gating (the state lives in the panel's gate, not
+            // in the transient buttons).
+            workCard.update(listOf(permission))
+            val rebuilt = workCard.replyButtonsForTest("7")
+                ?: fail("the rebuilt card must render request 7")
+            assertTrue(rebuilt.first !== buttons.first, "the rebuild must create new buttons")
+            assertEquals(false, rebuilt.first.isEnabled)
+            assertEquals(false, rebuilt.second.isEnabled)
+            // A typed refusal releases the gate, keeps the request visible
+            // with its reason and offers a refresh; nothing is retried.
+            gate.finish("7")
+            val refusal =
+                "permission 7 is unknown, expired or already resolved (409 conflict); refresh the pending list"
+            workCard.setReplyRefusal("7", refusal)
+            val released = workCard.replyButtonsForTest("7")
+                ?: fail("the refused card must stay visible")
+            assertEquals(true, released.first.isEnabled)
+            assertEquals(true, released.second.isEnabled)
+            assertEquals(refusal, workCard.refusalTextForTest("7"))
+            val refusedTexts = textsOf(workCard)
+            assertTrue(
+                refusedTexts.any { it.contains("Reply refused: permission 7") },
+                "the typed refusal must stay on the card: $refusedTexts"
+            )
+            assertEquals(0, refreshes)
+            workCard.refreshButtonForTest("7")?.doClick()
+                ?: fail("the refused card must offer Refresh")
+            assertEquals(1, refreshes)
+            // Success removes the card.
+            workCard.update(emptyList())
+            assertEquals(false, workCard.isVisible)
+            assertEquals(0, workCard.count())
+
+            // The SAME gate is shared with the Approvals list: a reply claimed
+            // on one surface disables the request on the other.
+            val sharedGate = ApprovalReplyGate()
+            val work = WorkApprovalCard(sharedGate)
+            val list = PermissionsPanel(sharedGate)
+            val sharedReplies = ArrayList<String>()
+            list.setListener(object : PermissionsPanel.Listener {
+                override fun onPermissionReply(
+                    permission: NativePermissionEntry,
+                    decision: String
+                ) {
+                    sharedReplies.add(decision)
+                }
+
+                override fun onRefresh() {}
+            })
+            work.setListener(object : WorkApprovalCard.Listener {
+                override fun onReply(
+                    permission: NativePermissionEntry,
+                    decision: String
+                ) {
+                    sharedReplies.add("work:$decision")
+                }
+
+                override fun onRefresh() {}
+            })
+            list.update(listOf(permission))
+            work.update(listOf(permission))
+            list.submitReply("deny")
+            assertEquals(listOf("deny"), sharedReplies)
+            assertEquals(true, sharedGate.pending("7"))
+            // The work card rebuild sees the same in-flight id.
+            work.update(listOf(permission))
+            val cross = work.replyButtonsForTest("7") ?: fail("work card missing request 7")
+            assertEquals(false, cross.first.isEnabled)
+            assertEquals(false, cross.second.isEnabled)
+            // The typed refusal is recorded on BOTH surfaces.
+            sharedGate.finish("7")
+            list.setReplyRefusal("7", refusal)
+            work.setReplyRefusal("7", refusal)
+            assertEquals(refusal, list.refusalText())
+            assertEquals(refusal, work.refusalTextForTest("7"))
+            assertTrue(list.allowEnabled(), "the refusal re-enables the list card")
+            assertTrue(
+                cross.first.isEnabled || work.replyButtonsForTest("7")!!.first.isEnabled,
+                "the refusal re-enables the work card"
+            )
+        }
+
+        step("approval announcement: once per new request, no focus jump") {
+            val gate = ApprovalReplyGate()
+            val card = WorkApprovalCard(gate)
+            val announcements = ArrayList<String>()
+            card.announcementSink = { text -> announcements.add(text) }
+            val permission = NativePermissionEntry("7", "9", "shell", "{\"tool\":\"bash\"}")
+            card.update(listOf(permission))
+            assertEquals(1, announcements.size)
+            assertTrue(announcements[0].startsWith("Faktor needs your approval"))
+            assertTrue(announcements[0].contains("Run a shell command: bash"))
+            // A rebuild with the same pending request announces nothing again.
+            card.update(listOf(permission))
+            assertEquals(1, announcements.size)
+            // A genuinely new request is announced once.
+            card.update(
+                listOf(permission, NativePermissionEntry("8", "9", "network", "{\"host\":\"x\"}"))
+            )
+            assertEquals(2, announcements.size)
+            // No approval path ever requests focus: the composer never moves.
+            assertEquals(false, card.isFocusOwner)
+        }
+
+        step("utilities toolbar wraps at 240px with no horizontal scrollbar") {
+            val service = FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-toolbar-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                ParityAwt.layout(panel, 240, 600)
+                val toolbar = panel.utilitiesToolbarForTest()
+                assertTrue(
+                    !containsScrollPane(toolbar),
+                    "the toolbar must not carry a horizontal-scroll fallback"
+                )
+                assertTrue(toolbar.width <= 240, "toolbar width ${toolbar.width} exceeds 240")
+                val rows = rowYs(toolbar)
+                assertTrue(
+                    rows.size >= 2,
+                    "the toolbar must wrap into multiple rows at 240px (rows=$rows)"
+                )
+                for (child in (toolbar as java.awt.Container).components) {
+                    if (!child.isVisible) continue
+                    assertTrue(
+                        child.x + child.width <= 240,
+                        "'${child.javaClass.simpleName}' escapes the 240px host " +
+                            "(x=${child.x} w=${child.width})"
+                    )
+                }
+                // Primary controls stay visible: New session, Refresh and the
+                // session chooser all render with real width.
+                val labels = toolbar.components.mapNotNull {
+                    when (it) {
+                        is javax.swing.JButton -> it.text
+                        is javax.swing.JComboBox<*> -> "session chooser"
+                        else -> null
+                    }
+                }
+                assertTrue(labels.contains("New session"), labels.toString())
+                assertTrue(labels.contains("Refresh"), labels.toString())
+                assertTrue(labels.contains("session chooser"), labels.toString())
+                // The secondary utilities moved under More: no standalone
+                // Settings button remains in the row.
+                assertTrue(!labels.contains("Settings"), labels.toString())
+            } finally {
+                panel.shutdown()
+            }
+        }
+
+        step("diagnostics: trust wording, readiness and T27/T28 copy pins") {
+            assertEquals(
+                "Matches recorded checksum",
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Verified("sha256 match"))
+            )
+            assertEquals(
+                "No checksum record",
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Unverified("no record"))
+            )
+            assertEquals(
+                "Checksum mismatch",
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Refused("mismatch"))
+            )
+            assertEquals("—", daemonTrustLabel(null))
+            val labels = listOf(
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Verified("x")),
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Unverified("x")),
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Refused("x"))
+            )
+            assertTrue(
+                labels.none { it.contains("signed", ignoreCase = true) },
+                "the bare .sha256 record must never be worded as signed: $labels"
+            )
+            val panel = DiagnosticsPanel()
+            panel.setTrust(
+                daemonTrustLabel(dev.faktor.backend.DaemonBinary.Trust.Verified("x")),
+                "/opt/faktor/launcher"
+            )
+            assertEquals("Matches recorded checksum\n/opt/faktor/launcher", panel.trustText())
+            panel.setTrust("—", null)
+            assertEquals("—", panel.trustText())
+            // Readiness: waiting / ready / timeout, never 0.
+            assertEquals("—", panel.readinessText())
+            panel.setReadiness("waiting", "starting the service")
+            assertTrue(panel.readinessText().startsWith("waiting"), panel.readinessText())
+            panel.setReadiness("ready", "version 1.2.3")
+            assertTrue(panel.readinessText().startsWith("ready"), panel.readinessText())
+            panel.setReadiness("timeout", "daemon never reported ready")
+            assertTrue(panel.readinessText().startsWith("timeout"), panel.readinessText())
+            assertTrue(panel.readinessText().contains("never reported ready"))
+            // T27 verbatim copy + actions.
+            panel.setStreamRecovery(StreamRecoveryState.RECONNECTING)
+            assertEquals("Reconnecting live updates", panel.recoveryHeadline())
+            assertEquals("The last valid journal position is kept.", panel.recoveryBody())
+            assertEquals(listOf("Wait", "Refresh"), panel.recoveryActions())
+            // T28 verbatim copy + actions; a skip action never exists.
+            panel.setStreamRecovery(
+                StreamRecoveryState.PAUSED,
+                "schema_mismatch at cursor 42: unsupported frame schema"
+            )
+            assertEquals("Live updates paused", panel.recoveryHeadline())
+            assertEquals(
+                "The client cannot read the next durable event. Nothing is skipped.",
+                panel.recoveryBody()
+            )
+            assertEquals(listOf("Reconnect", "Refresh from snapshot"), panel.recoveryActions())
+            assertTrue(
+                panel.recoveryActions().none { it.contains("skip", ignoreCase = true) },
+                "recovery must never offer a skip action"
+            )
+            // The cursor readout stays on the Live updates row.
+            panel.setConnection("connected: http://127.0.0.1:9", "retrying", 42L, "7")
+            assertTrue(panel.streamText().contains("cursor 42"), panel.streamText())
+        }
+
+        step("diagnostics setup: T32 copy + exact sandbox guidance command") {
+            assertEquals("Shell execution needs a decision", SANDBOX_SETUP_HEADLINE)
+            assertEquals(
+                "The secure default remains fail-closed on this platform.",
+                SANDBOX_SETUP_COPY
+            )
+            assertEquals("Open setup guidance", SANDBOX_SETUP_ACTION)
+            assertEquals("faktor sandbox choose", SANDBOX_GUIDANCE_COMMAND)
+            val panel = DiagnosticsPanel()
+            val texts = textsOf(panel)
+            assertTrue(texts.contains("Shell execution needs a decision"), texts.toString())
+            assertTrue(
+                texts.contains("The secure default remains fail-closed on this platform."),
+                texts.toString()
+            )
+            assertTrue(texts.contains("faktor sandbox choose"), texts.toString())
+            assertEquals("faktor sandbox choose", panel.sandboxCommandTextForTest())
+            assertEquals("Open setup guidance", panel.setupActionForTest().text)
+            assertEquals(false, panel.setupGuidanceVisibleForTest())
+            panel.setupActionForTest().doClick()
+            assertEquals(true, panel.setupGuidanceVisibleForTest())
+        }
+
+        step("T22: served SCM-not-configured PR block surfaces the exact copy") {
+            val blocked = parseNativeTaskViews(BLOCKED_PR_TASK_JSON)[0]
+            assertTrue(prScmSetupBlocked(blocked), "the typed blocker code must be detected")
+            assertEquals(false, prScmSetupBlocked(parseNativeTaskViews(TASK_JSON)[0]))
+            assertEquals(false, prScmSetupBlocked(null))
+            // A PR step with any OTHER failure is not read as missing SCM.
+            val other = parseNativeTaskViews(BLOCKED_PR_OTHER_JSON)[0]
+            assertEquals(false, prScmSetupBlocked(other))
+            // The Work current-run strip renders the exact T22 copy and the
+            // setup-guidance action only for the typed blocker.
+            val service = FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-t22-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                panel.applyRunSummaryForTest(parseNativeTaskViews(TASK_JSON)[0])
+                assertEquals(false, panel.prSetupNoticeVisibleForTest())
+                panel.applyRunSummaryForTest(blocked)
+                assertEquals(true, panel.prSetupNoticeVisibleForTest())
+                val notice = panel.prSetupCopyForTest()
+                assertEquals("Pull request integration unavailable", notice.first)
+                assertEquals(
+                    "Configure the native SCM integration; no PR success is inferred.",
+                    notice.second
+                )
+                assertEquals("Open setup guidance", notice.third)
+                panel.applyRunSummaryForTest(null)
+                assertEquals(false, panel.prSetupNoticeVisibleForTest())
+            } finally {
+                panel.shutdown()
+            }
+        }
+
+        step("history unavailable renders the T31 copy with its refresh action") {
+            val panel = HistoryPanel()
+            var refreshes = 0
+            panel.setListener(object : HistoryPanel.Listener {
+                override fun onOpenSession(sessionId: String) {}
+
+                override fun onRefresh() {
+                    refreshes++
+                }
+            })
+            panel.setUnavailable("history read refused (status 503)")
+            assertEquals(false, panel.available())
+            assertEquals("History unavailable", panel.unavailableHeadlineText())
+            assertEquals("The conversation list could not be read.", panel.unavailableCopyText())
+            assertEquals("Refresh history", panel.refreshHistoryActionText())
+            panel.refreshHistoryButtonForTest().doClick()
+            assertEquals(1, refreshes)
+            panel.update(parseNativeSessionList(SMOKE_SESSIONS_JSON), null)
+            assertEquals(true, panel.available())
         }
 
         step("attachments ride the task-run/tournament requests") {
@@ -1133,12 +1561,13 @@ object FrontendSmoke {
             )
             try {
                 assertEquals(null, panel.completionContractFromControls())
-                panel.completionCommit.isSelected = true
-                panel.completionPr.isSelected = true
+                panel.selectFinishLevelForTest(FinishLevel.PR)
                 assertEquals(
-                    NativeCompletionContract(includeCommit = true, includePush = false, includePr = true),
+                    NativeCompletionContract(includeCommit = true, includePush = true, includePr = true),
                     panel.completionContractFromControls()
                 )
+                panel.selectFinishLevelForTest(FinishLevel.LOCAL)
+                assertEquals(null, panel.completionContractFromControls())
             } finally {
                 panel.shutdown()
             }
@@ -1388,7 +1817,8 @@ object FrontendSmoke {
                 taskVerification = parseNativeTaskVerification(TASK_VERIFICATION_JSON),
                 usage = usage,
                 childUsage = mapOf("9" to usage),
-                tournament = parseNativeTournament(TOURNAMENT_JSON)
+                tournament = parseNativeTournament(TOURNAMENT_JSON),
+                proof = parseNativeTaskProof(TASK_PROOF_JSON)
             )
             assertEquals("ship it", model.goal)
             assertEquals("in_progress", model.state)
@@ -1641,6 +2071,171 @@ object FrontendSmoke {
                 assertTrue(row.unavailable.contains("binding"), row.unavailable.toString())
                 assertTrue(row.verdictReason?.contains("no durable verification record") == true, row.verdictReason)
             }
+        }
+
+        step("verification summary renders VERIFIED only under the strict verified proof") {
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val records = parseNativeTaskVerification(TASK_VERIFICATION_JSON)
+            // A passing record alone is NOT verified: only the strict proof
+            // state may confirm.
+            val noProof = TaskTree.build(task = task, taskVerification = records)
+            assertEquals(false, noProof.verification.verified)
+            val unverified = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"proofState\":\"verified\"",
+                        "\"proofState\":\"unverified\""
+                    )
+                )
+            )
+            assertEquals("unverified", unverified.proof?.state)
+            assertEquals(false, unverified.verification.verified)
+            assertEquals("passed", unverified.verification.status)
+            // An unavailable proof keeps its served reason and never
+            // re-renders the candidate record as verified.
+            val unavailable = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proof = parseNativeTaskProof(TASK_PROOF_UNAVAILABLE_JSON)
+            )
+            assertEquals(false, unavailable.verification.verified)
+            assertEquals("unavailable", unavailable.verification.status)
+            assertTrue(
+                unavailable.verification.summaryText().startsWith("VERIFICATION UNAVAILABLE"),
+                unavailable.verification.summaryText()
+            )
+            assertTrue(
+                unavailable.verification.summaryText().contains("landed_snapshot mismatch"),
+                unavailable.verification.summaryText()
+            )
+            val refused = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proofUnavailable = "proof read failed: corrupt_durable_state"
+            )
+            assertEquals(false, refused.verification.verified)
+            assertTrue(
+                refused.verification.summaryText().contains("corrupt_durable_state"),
+                refused.verification.summaryText()
+            )
+            // The strict verified proof plus the passing record may confirm.
+            val verified = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proof = parseNativeTaskProof(TASK_PROOF_JSON)
+            )
+            assertEquals(true, verified.verification.verified)
+        }
+
+        step("verification panel keeps every served evidence ref as its own button") {
+            val model = TaskTree.build(
+                taskVerification = parseNativeTaskVerification(MULTI_EVIDENCE_VERIFICATION_JSON)
+            )
+            val panel = VerificationPanel()
+            panel.updateModel(model)
+            assertEquals(1, panel.criterionCount())
+            assertEquals(listOf("41", "42", "43", "44"), panel.evidenceButtonIds())
+        }
+
+        step("overview keeps proof, spend and completed states honest") {
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val records = parseNativeTaskVerification(TASK_VERIFICATION_JSON)
+            val panel = OverviewPanel()
+            // A passing record without a strict verified proof is candidate
+            // level only: the verified wording never appears.
+            panel.updateModel(TaskTree.build(task = task, taskVerification = records))
+            val candidateRow = panel.summaryText("Verification")
+            assertTrue(candidateRow.startsWith("Candidate checks passed"), candidateRow)
+            assertTrue(!candidateRow.contains("Verified"), candidateRow)
+            // A served but unverified proof keeps the candidate wording and
+            // never borrows the verified one.
+            panel.updateModel(
+                TaskTree.build(
+                    task = task,
+                    taskVerification = records,
+                    proof = parseNativeTaskProof(
+                        TASK_PROOF_JSON.replace(
+                            "\"proofState\":\"verified\"",
+                            "\"proofState\":\"unverified\""
+                        )
+                    )
+                )
+            )
+            val unverifiedRow = panel.summaryText("Verification")
+            assertTrue(unverifiedRow.startsWith("Candidate checks passed"), unverifiedRow)
+            assertTrue(!unverifiedRow.contains("Verified"), unverifiedRow)
+            // An unavailable proof names itself and its served reason.
+            panel.updateModel(
+                TaskTree.build(
+                    task = task,
+                    taskVerification = records,
+                    proof = parseNativeTaskProof(TASK_PROOF_UNAVAILABLE_JSON)
+                )
+            )
+            val unavailableRow = panel.summaryText("Verification")
+            assertTrue(unavailableRow.startsWith("Verification unavailable"), unavailableRow)
+            assertTrue(unavailableRow.contains("landed_snapshot mismatch"), unavailableRow)
+            // Only the strict verified proof renders the verified wording.
+            panel.updateModel(
+                TaskTree.build(
+                    task = task,
+                    taskVerification = records,
+                    proof = parseNativeTaskProof(TASK_PROOF_JSON)
+                )
+            )
+            assertTrue(
+                panel.summaryText("Verification").startsWith("Verified"),
+                panel.summaryText("Verification")
+            )
+            // A completed run without verified proof stays neutral: the bare
+            // state token never derives the positive tint.
+            val completedTask = task.copy(state = "completed", blockers = emptyList())
+            panel.updateModel(TaskTree.build(task = completedTask))
+            assertEquals(
+                SemanticState.DIM,
+                panel.runStateOfForTest(TaskTree.build(task = completedTask))
+            )
+            assertTrue(panel.stateLabelText().contains("completed"), panel.stateLabelText())
+            assertTrue(!panel.stateLabelText().contains("Verified"), panel.stateLabelText())
+            // Missing spend is explicitly unavailable; a known zero is not.
+            panel.updateModel(TaskTree.build(taskVerification = records))
+            assertEquals("Cost unavailable", panel.summaryText("Spend"))
+            panel.updateModel(
+                TaskTree.build(
+                    usage = parseNativeSessionUsage(
+                        "{\"sessionId\":\"1\",\"providerCalls\":{\"tokens\":0}," +
+                            "\"tasks\":[{\"taskId\":\"3\",\"budget\":{\"spentTokens\":0," +
+                            "\"spentCostMicro\":0,\"openReservedMicro\":0}}]}"
+                    )
+                )
+            )
+            assertTrue(
+                panel.summaryText("Spend").startsWith("\$0.0000"),
+                panel.summaryText("Spend")
+            )
+            assertTrue(
+                !panel.summaryText("Spend").contains("unavailable"),
+                panel.summaryText("Spend")
+            )
+        }
+
+        step("task tree spend and child rows keep missing values missing") {
+            val panel = TaskTreePanel()
+            val child = TaskTree.build(agents = parseNativeAgents(AGENTS_JSON)).children[0]
+            assertEquals(null, child.spentTokens)
+            assertEquals(null, child.spentCostMicro)
+            val childLabel = panel.childLabel(child)
+            assertTrue(childLabel.contains("tokens=unavailable/1000"), childLabel)
+            assertTrue(childLabel.contains("cost=unavailable/unlimited"), childLabel)
+            assertTrue(!childLabel.contains("tokens=0/"), childLabel)
+            val spend = panel.spendText(
+                SpendSummary(null, null, null, null, BigInteger.ZERO, null, null, true)
+            )
+            assertTrue(spend.contains("tokens unavailable/unlimited"), spend)
+            assertTrue(spend.contains("cost unavailable/unlimited micro"), spend)
+            assertTrue(!spend.contains("tokens 0/"), spend)
         }
 
         step("same model two providers: each child joins its OWN provider metadata") {
@@ -2987,6 +3582,44 @@ object FrontendSmoke {
             }
         }
 
+        step("Task options sheet: bounded scrollable surface, trigger and Back preserve the draft") {
+            val service = FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-task-options-smoke-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                assertEquals(false, panel.taskOptionsOpenForTest())
+                panel.setTaskFieldsForTest("draft goal", "c1")
+                panel.setBudgetFieldsForTest("", "")
+                assertEquals("Task options ▾", panel.toggleTaskOptionsForTest())
+                assertEquals(true, panel.taskOptionsOpenForTest())
+                // The sheet body is the scrollable column inside a scroll pane.
+                val sheet = panel.taskOptionsSheetForTest() ?: fail("the sheet must exist")
+                assertTrue(
+                    sheet.components.any { it is javax.swing.JScrollPane },
+                    "the sheet must carry a bounded scrollable body"
+                )
+                assertEquals("draft goal", panel.goalTextForTest())
+                assertEquals("Task options ▸", panel.toggleTaskOptionsForTest())
+                assertEquals(false, panel.taskOptionsOpenForTest())
+                assertEquals("draft goal", panel.goalTextForTest(), "the draft survives the sheet")
+                // Escape closes the sheet without starting anything.
+                panel.toggleTaskOptionsForTest()
+                assertEquals(true, panel.taskOptionsOpenForTest())
+                panel.triggerEscapeForTest()
+                assertEquals(false, panel.taskOptionsOpenForTest(), "Escape closes the sheet")
+                assertEquals("draft goal", panel.goalTextForTest())
+                assertEquals(false, panel.askModeSelected(), "Task mode is the default")
+                panel.selectModeForTest(ask = true)
+                assertEquals(true, panel.askModeSelected())
+                panel.selectModeForTest(ask = false)
+                assertEquals(false, panel.askModeSelected())
+            } finally {
+                panel.shutdown()
+            }
+        }
+
         if (args.isEmpty()) {
             println("FRONTEND SMOKE PASS (canned only: no daemon binary argument)")
             kotlin.system.exitProcess(if (failures == 0) 0 else 1)
@@ -3276,6 +3909,47 @@ object FrontendSmoke {
             println("FAIL $name: ${e.message}")
         }
     }
+}
+
+/** Every rendered text of a component subtree (smoke assertions). */
+private fun collectTexts(component: java.awt.Component, out: MutableList<String>) {
+    when (component) {
+        is WrappedLabel -> out.add(component.fullText)
+        is javax.swing.JLabel -> out.add(component.text)
+        is javax.swing.text.JTextComponent -> out.add(component.text)
+        else -> {}
+    }
+    if (component is java.awt.Container) {
+        for (child in component.components) collectTexts(child, out)
+    }
+}
+
+private fun textsOf(component: java.awt.Component): List<String> {
+    val out = ArrayList<String>()
+    collectTexts(component, out)
+    return out
+}
+
+/** True when the subtree contains a scroll pane (narrow-host guard). */
+private fun containsScrollPane(component: java.awt.Component): Boolean {
+    if (component is javax.swing.JScrollPane) return true
+    if (component is java.awt.Container) {
+        for (child in component.components) {
+            if (containsScrollPane(child)) return true
+        }
+    }
+    return false
+}
+
+/** The distinct row Y positions of a wrapping row (wrap proof). */
+private fun rowYs(component: java.awt.Component): Set<Int> {
+    val ys = LinkedHashSet<Int>()
+    if (component is java.awt.Container) {
+        for (child in component.components) {
+            if (child.isVisible) ys.add(child.y)
+        }
+    }
+    return ys
 }
 
 /** The typed refusal raised by one attachment-plan call (smoke helper). */

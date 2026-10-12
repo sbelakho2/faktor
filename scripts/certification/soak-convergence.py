@@ -44,9 +44,18 @@
 #      (`missing-metric-samples`), never a skip: the samplers above exist and
 #      production lanes must produce the data.
 #
-#   3. `selftest` proves the metric algebra with fake metrics (pass and fail
-#      worlds); `scripts/soak.sh --selftest` additionally exercises the whole
-#      driver integration against fake cargo output.
+#   3. `budget` derives the campaign wall budget from same-run controls: the
+#      bounded calibration workload's monotonic cost over the documented
+#      product nominal, and the sampler stream's own realtime-vs-monotonic
+#      span (an emulated/VM runner can stretch wall accounting without
+#      stretching the workload clock). `effective = min(max(product,
+#      factor * product), cap)`; the product budget is a floor, the cap is
+#      documented, and a genuinely over-budget campaign still fails.
+#
+#   4. `selftest` proves the metric algebra with fake metrics (pass and fail
+#      worlds) and the budget derivation matrix; `scripts/soak.sh --selftest`
+#      additionally exercises the whole driver integration against fake
+#      cargo output.
 #
 # Usage:
 #   python3 scripts/certification/soak-convergence.py sample \
@@ -56,7 +65,10 @@
 #   python3 scripts/certification/soak-convergence.py check \
 #     --samples F.jsonl [--workload F.jsonl] [--final F.json] \
 #     [--lane L] [--mode M] [--commit SHA] [--tree TREE] \
-#     [--elapsed-seconds N] [--target-seconds N] [--out F.json]
+#     [--elapsed-seconds N] [--target-seconds N] [--max-seconds N] [--out F.json]
+#   python3 scripts/certification/soak-convergence.py budget \
+#     --product-seconds N [--samples F.jsonl] [--calibration-ms N] \
+#     [--nominal-ms N] [--max-factor N] [--cap-seconds N]
 #   python3 scripts/certification/soak-convergence.py selftest
 #
 # Exit codes: 0 pass; 1 failed metric / refused sample; 2 usage error.
@@ -446,7 +458,13 @@ class Sampler:
         sample = {
             "schema": SAMPLER_SCHEMA,
             "t": int(time.time() * 1000),
-            "elapsed_ms": int((time.time() - self.started) * 1000),
+            # The workload's own clock class (CLOCK_MONOTONIC): a VM/host
+            # suspend or an emulated-runner clock step stretches `t` (realtime)
+            # without stretching `mono_ms`, and the driver's `budget` command
+            # uses this same-run pair to measure the runner's accounting
+            # stretch instead of trusting the fixed product budget.
+            "mono_ms": int(time.monotonic() * 1000),
+            "elapsed_ms": int((time.monotonic() - self.started_mono) * 1000),
         }
         resolved = self._pid()
         root = resolved[0] if resolved else None
@@ -492,9 +510,15 @@ class Sampler:
 
     def run(self):
         self.started = time.time()
+        self.started_mono = time.monotonic()
         interval = min(max(self.args.interval, 0.2), 60.0)
         duration = min(max(self.args.duration, 0.2), 7 * 24 * 3600)
-        deadline = self.started + duration
+        # The sample window is bounded in the workload's own clock class
+        # (CLOCK_MONOTONIC), so a realtime clock step on an emulated/VM runner
+        # cannot truncate or extend the sample stream; the driver still stops
+        # the sampler when the campaign ends and `--max-samples` stays a hard
+        # cap.
+        deadline = self.started_mono + duration
 
         def _on_signal(_signum, _frame):
             self.stop = True
@@ -506,11 +530,11 @@ class Sampler:
                 self.tick()
                 if self.samples >= self.args.max_samples:
                     break
-                now = time.time()
+                now = time.monotonic()
                 if now >= deadline:
                     break
                 # Wait until the next tick, waking early on a stop request.
-                while not self.stop and time.time() < min(now + interval, deadline):
+                while not self.stop and time.monotonic() < min(now + interval, deadline):
                     time.sleep(0.1)
         finally:
             self.tick(final=True)
@@ -967,6 +991,96 @@ def build_report(args):
     return report
 
 
+# ---------------------------------------------------------- load-aware budget
+
+BUDGET_SCHEMA = "faktor-soak-budget/v1"
+# Documented constants for the campaign wall budget derivation. The driver
+# passes them explicitly; the defaults here keep the tool usable standalone.
+DEFAULT_CALIBRATION_NOMINAL_MS = 2000
+DEFAULT_MAX_WALL_FACTOR = 8
+DEFAULT_WALL_CAP_SECONDS = 172800  # 48 h hard ceiling on any derived budget
+# Sampling-tick/timestamp slack subtracted from the measured realtime span
+# before ceiling the clock factor: a healthy runner always shows a few
+# milliseconds of sampler jitter between `t` and `mono_ms`, and one tick of
+# rounding must not read as a 2x clock stretch.
+CLOCK_MEASUREMENT_SLACK_MS = 2000
+
+
+def _ceil_div(value, divisor):
+    return -(-value // divisor)
+
+
+def load_aware_budget(product_seconds, samples_path=None, calibration_ms=None,
+                      nominal_ms=None, max_factor=None, cap_seconds=None):
+    """Derive the campaign wall budget from same-run control measurements.
+
+    `effective = min(max(product, factor * product), cap)` where:
+
+    * `factor` is the larger of (a) the measured emulation factor for the
+      SAME workload shape (`calibration_ms / nominal_ms`, from the bounded
+      calibration workload run through the same harness) and (b) the measured
+      stretch of the harness's wall accounting relative to the sampler's own
+      monotonic clock across this very campaign (`t` vs `mono_ms` spans in
+      the sampler stream);
+    * `max_factor` is the documented runner-slowness allowance (matching the
+      soak scale clamp) and `cap_seconds` the documented hard ceiling.
+
+    The product budget is a floor (never shrunk) and a genuinely over-budget
+    campaign still fails: only the runner-derived edge moves, the duration
+    requirement does not.
+    """
+    try:
+        product = int(product_seconds)
+        nominal = int(nominal_ms) if nominal_ms is not None else DEFAULT_CALIBRATION_NOMINAL_MS
+        max_f = int(max_factor) if max_factor is not None else DEFAULT_MAX_WALL_FACTOR
+        cap_doc = int(cap_seconds) if cap_seconds is not None else DEFAULT_WALL_CAP_SECONDS
+    except (TypeError, ValueError):
+        return None
+    if product <= 0 or nominal <= 0 or max_f < 1 or cap_doc < 1:
+        return None
+    work_factor = 1
+    if calibration_ms is not None:
+        try:
+            work_factor = max(1, _ceil_div(int(calibration_ms), nominal))
+        except (TypeError, ValueError):
+            return None
+    clock_factor = 1
+    sample_monotonic_seconds = None
+    if samples_path and os.path.isfile(samples_path):
+        records, _truncated = read_jsonl_bounded(samples_path)
+        pairs = [
+            (record["t"], record["mono_ms"])
+            for record in records
+            if isinstance(record.get("t"), (int, float))
+            and isinstance(record.get("mono_ms"), (int, float))
+        ]
+        if len(pairs) >= 2:
+            wall_span_ms = pairs[-1][0] - pairs[0][0]
+            mono_span_ms = pairs[-1][1] - pairs[0][1]
+            if mono_span_ms > 0:
+                clock_factor = max(
+                    1,
+                    _ceil_div(max(0, int(wall_span_ms) - CLOCK_MEASUREMENT_SLACK_MS), int(mono_span_ms)),
+                )
+                sample_monotonic_seconds = mono_span_ms / 1000.0
+    factor = min(max(work_factor, clock_factor), max_f)
+    cap = max(product, min(product * max_f, cap_doc))
+    effective = min(max(product, factor * product), cap)
+    return {
+        "schema": BUDGET_SCHEMA,
+        "product_seconds": product,
+        "calibration_ms": calibration_ms,
+        "nominal_ms": nominal,
+        "work_factor": work_factor,
+        "clock_factor": clock_factor,
+        "sample_monotonic_seconds": sample_monotonic_seconds,
+        "factor": factor,
+        "max_factor": max_f,
+        "cap_seconds": cap,
+        "effective_seconds": effective,
+    }
+
+
 # ---------------------------------------------------------------- selftest
 
 
@@ -1255,10 +1369,55 @@ def run_selftest():
             )
             failures += 1
 
+        # Load-aware campaign wall budget (same-run control): a healthy
+        # runner (harness wall == workload monotonic) keeps the documented
+        # product budget; a measured emulation factor or a stretched harness
+        # clock widens it linearly; the max-factor clamp and the documented
+        # hard cap still bind; the product budget is never shrunk.
+        def check_budget(name, payload, **want):
+            nonlocal failures
+            ok = payload is not None and all(payload.get(k) == v for k, v in want.items())
+            if ok:
+                print(f"selftest ok: {name}")
+            else:
+                print(f"selftest FAIL: {name} (payload={payload} want={want})", file=sys.stderr)
+                failures += 1
+
+        healthy = os.path.join(tmp, "budget-healthy.jsonl")
+        for i in range(8):
+            _append_jsonl(healthy, {"t": 1000 * i, "mono_ms": 1000 * i})
+        check_budget("healthy runner keeps the product budget",
+                     load_aware_budget(3600, samples_path=healthy),
+                     work_factor=1, clock_factor=1, factor=1, effective_seconds=3600)
+
+        stretched = os.path.join(tmp, "budget-stretched.jsonl")
+        for i in range(8):
+            _append_jsonl(stretched, {"t": 4000 * i, "mono_ms": 1000 * i})
+        check_budget("a stretched harness clock widens the budget linearly",
+                     load_aware_budget(3600, samples_path=stretched),
+                     clock_factor=4, factor=4, effective_seconds=14400)
+
+        check_budget("a slow calibration widens the budget linearly",
+                     load_aware_budget(3600, calibration_ms=8000, nominal_ms=2000),
+                     work_factor=4, factor=4, effective_seconds=14400)
+        check_budget("a fast calibration never shrinks the product budget",
+                     load_aware_budget(3600, calibration_ms=100, nominal_ms=4000),
+                     work_factor=1, factor=1, effective_seconds=3600)
+        check_budget("the documented hard cap binds",
+                     load_aware_budget(3600, calibration_ms=64000, nominal_ms=2000,
+                                       max_factor=8, cap_seconds=10000),
+                     factor=8, effective_seconds=10000)
+        empty = os.path.join(tmp, "budget-empty.jsonl")
+        open(empty, "w", encoding="utf-8").close()
+        check_budget("missing clock samples fall back to the product budget",
+                     load_aware_budget(3600, samples_path=empty,
+                                       calibration_ms=2000, nominal_ms=2000),
+                     factor=1, effective_seconds=3600)
+
     if failures:
         print(f"soak-convergence selftest: FAIL ({failures} case(s))", file=sys.stderr)
         return 1
-    print("soak-convergence selftest: PASS (converged world, leaky world, missing-sample and duration-band matrices)")
+    print("soak-convergence selftest: PASS (converged world, leaky world, missing-sample, duration-band and load-aware budget matrices)")
     return 0
 
 
@@ -1294,6 +1453,14 @@ def main(argv):
     check.add_argument("--max-seconds", type=int)
     check.add_argument("--out")
 
+    budget = sub.add_parser("budget")
+    budget.add_argument("--product-seconds", type=int, required=True)
+    budget.add_argument("--samples")
+    budget.add_argument("--calibration-ms", type=int)
+    budget.add_argument("--nominal-ms", type=int)
+    budget.add_argument("--max-factor", type=int)
+    budget.add_argument("--cap-seconds", type=int)
+
     sub.add_parser("selftest")
 
     args = parser.parse_args(argv)
@@ -1309,6 +1476,19 @@ def main(argv):
             _write_json_atomic(args.out, report)
         print(json.dumps(report, sort_keys=True))
         return 0 if report["ok"] else 1
+    if args.command == "budget":
+        payload = load_aware_budget(
+            args.product_seconds,
+            samples_path=args.samples,
+            calibration_ms=args.calibration_ms,
+            nominal_ms=args.nominal_ms,
+            max_factor=args.max_factor,
+            cap_seconds=args.cap_seconds,
+        )
+        if payload is None:
+            return 2
+        print(json.dumps(payload, sort_keys=True))
+        return 0
     if args.command == "selftest":
         return run_selftest()
     parser.print_help()

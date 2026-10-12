@@ -90,13 +90,22 @@ class OverviewPanel : JPanel(BorderLayout()) {
             else -> "${plural(model.children.size, "agent")} · $active active · $blocked blocked"
         }
         val verification = model.verification
-        rows["Verification"]?.fullText = buildString {
-            append(if (verification.verified) "Verified" else "Not verified yet")
-            append(" · criteria ")
-            append(verification.criteriaPassed).append(" of ").append(verification.criteriaTotal)
-            append(" passed · ").append(plural(verification.failedChecks, "failed check"))
+        val proof = model.proof
+        val verificationDetails = buildString {
+            append("criteria ").append(verification.criteriaPassed)
+            append(" of ").append(verification.criteriaTotal).append(" passed")
+            append(" · ").append(plural(verification.failedChecks, "failed check"))
             append(" · ").append(plural(verification.owed, "owed check"))
             verification.reviewer?.let { append(" · reviewer ").append(it) }
+        }
+        val recordPassed = (verification.recordStatus ?: verification.status)
+            .equals("passed", ignoreCase = true)
+        rows["Verification"]?.fullText = when {
+            proof?.verified == true -> "Verified · " + verificationDetails
+            proof?.state == "unavailable" -> "Verification unavailable" +
+                (proof.reason?.takeIf { it.isNotEmpty() }?.let { " — " + it } ?: "")
+            recordPassed -> "Candidate checks passed · " + verificationDetails
+            else -> "Not verified yet · " + verificationDetails
         }
         rows["Acceptance criteria"]?.fullText = if (model.acceptanceCriteria.isEmpty()) {
             "No acceptance criteria"
@@ -106,11 +115,11 @@ class OverviewPanel : JPanel(BorderLayout()) {
         val spend = model.spend
         val spent = spend?.spentCostMicro
         rows["Spend"]?.fullText = if (spend == null || spent == null) {
-            "No spend recorded yet"
+            "Cost unavailable"
         } else {
             "$" + MicroMoney.usdText(spent) +
                 (spend.maxCostMicro?.let { " of $" + MicroMoney.usdText(it) } ?: "") +
-                " · " + (spend.spentTokens ?: 0L) + " tokens" +
+                " · " + (spend.spentTokens?.let { "$it tokens" } ?: "tokens unavailable") +
                 (spend.maxTokens?.let { " of $it" } ?: "")
         }
         val completion = model.completion
@@ -157,7 +166,6 @@ class OverviewPanel : JPanel(BorderLayout()) {
                 SemanticState.WARNING
             state.contains("block") || state.contains("await") || state.contains("needs") ->
                 SemanticState.WARNING
-            state.contains("complete") || state.contains("done") -> SemanticState.POSITIVE
             else -> SemanticState.DIM
         }
     }
@@ -171,6 +179,9 @@ class OverviewPanel : JPanel(BorderLayout()) {
     }
 
     fun summaryText(key: String): String = rows[key]?.fullText ?: ""
+
+    /** The semantic tone of the run chip for one model (smoke assertions). */
+    internal fun runStateOfForTest(model: TaskTreeModel): SemanticState = runStateOf(model)
 
     fun stateLabelText(): String {
         val chip = stateChip.components.firstOrNull() as? javax.swing.JLabel
