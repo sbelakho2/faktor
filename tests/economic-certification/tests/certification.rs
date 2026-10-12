@@ -1,11 +1,16 @@
 #![cfg(unix)]
-//! Certification tests for `faktor-tests-economic-certification` (audit item
-//! 9 follow-up). Every test here is adversarial about honesty:
+//! ROUTER-ECONOMICS REGRESSION tests for `faktor-tests-router-economics`
+//! (audit item 9 follow-up). These tests certify the ROUTER's economics
+//! discipline over a scripted, policy-independent fake model; they are NOT
+//! model-quality evidence and must never be cited as coding-competitiveness
+//! or local-model-ability measurements. Real model evidence comes from the
+//! capture/replay coding benchmark in the same crate. Every test here is
+//! adversarial about honesty:
 //!
 //! - the corpus contract is proved BOTH directions with real subprocesses
 //!   (pristine repos fail their own tests; the scripted fix passes at the
 //!   documented attempt; unsolvable patches never pass);
-//! - the certification is deterministic across full runs;
+//! - the regression is deterministic across full runs;
 //! - a policy regression (always-frontier) still runs the comparison
 //!   harness but produces measurably worse values;
 //! - unsolvable tasks are counted as failures, never successes;
@@ -16,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ecc::PrimaryPolicy;
-use faktor_tests_economic_certification as ecc;
+use faktor_tests_router_economics as ecc;
 
 fn write_file(path: &Path, content: &str) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
@@ -143,10 +148,10 @@ fn loader_rejects_hostile_corpus_shapes() {
     assert!(ecc::load_corpus(&empty).is_err());
 }
 
-// ------------------------------------------------------------ certification
+// ------------------------------------------------- router-economics regression
 
 #[test]
-fn economy_certification_passes_generous_bounds_and_reports_artifact() {
+fn router_economics_regression_passes_generous_bounds_and_reports_artifact() {
     let cert = ecc::run_certification(PrimaryPolicy::Economy).expect("certification runs");
     assert_eq!(cert.schema, ecc::SCHEMA);
     assert_eq!(cert.corpus.tasks, 12);

@@ -28,7 +28,16 @@ use super::*;
 ///   source of the managed/BYOK decision. Unknown plan/feature/limit names
 ///   are refused loudly; an enabled section with no plans (or a default
 ///   plan outside the table) is a startup error — the daemon never boots
-///   with a silently empty entitlement surface;
+///   with a silently empty entitlement surface. Feature tags cover BOTH
+///   halves of the commercial vocabulary: the inference-centric tags
+///   (`managed_providers`, `byok`, `credits`) and the value-centric ones
+///   (`advanced_verification_policy`, `organization_contracts`,
+///   `shared_intelligence`, `cross_repo_intelligence`, `outcome_analytics`,
+///   `signed_proof_provenance`, `audit_retention_history`,
+///   `model_optimization_learning`, `private_runners`,
+///   `enterprise_governance` plus the `governance_sso`/`governance_scim`
+///   capability flags) — so a 100% local deployment with no inference
+///   limits still maps paid value entitlements;
 /// - unknown keys, duplicates, non-object shapes and wrong value types are
 ///   parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]

@@ -131,6 +131,15 @@ fn text_field(name: &'static str) -> Field {
 
 /// The plain DTOs, in the source order of [`crate::native`].
 fn type_defs() -> Vec<TypeDef> {
+    let mut out = type_defs_conversation();
+    out.extend(type_defs_attachments());
+    out.extend(type_defs_task_runs());
+    out.extend(type_defs_outcomes());
+    out.extend(type_defs_value_entitlements());
+    out
+}
+
+fn type_defs_conversation() -> Vec<TypeDef> {
     vec![
         TypeDef {
             name: "Message",
@@ -290,371 +299,459 @@ fn type_defs() -> Vec<TypeDef> {
         // orchestrator's durable run rows / the native handlers) stay the
         // behavioral authority, and the generated TS/Kotlin clients consume
         // these shapes instead of hand-rolled parsers.
-        TypeDef {
-            name: "AttachmentId",
-            doc: "One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("digest"),
-                    text_field("mime"),
-                    nullable("filename", Ty::String),
-                    req("size", Ty::I64),
-                ],
-            },
+    ]
+}
+
+fn type_defs_attachments() -> Vec<TypeDef> {
+    vec![
+    TypeDef {
+        name: "AttachmentId",
+        doc: "One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("digest"),
+                text_field("mime"),
+                nullable("filename", Ty::String),
+                req("size", Ty::I64),
+            ],
         },
-        TypeDef {
-            name: "AttachmentRef",
-            doc: "One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("ref_id", Ty::I64),
-                    text_field("digest"),
-                    text_field("mime"),
-                    nullable("filename", Ty::String),
-                    req("size", Ty::I64),
-                ],
-            },
+    },
+    TypeDef {
+        name: "AttachmentRef",
+        doc: "One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("ref_id", Ty::I64),
+                text_field("digest"),
+                text_field("mime"),
+                nullable("filename", Ty::String),
+                req("size", Ty::I64),
+            ],
         },
-        TypeDef {
-            name: "AttachmentUpload",
-            doc: "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
-            unknown_fields: "reject",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("mime"),
-                    field("filename", Ty::String, true, true),
-                    text_field("data_base64"),
-                ],
-            },
+    },
+    TypeDef {
+        name: "AttachmentUpload",
+        doc: "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
+        unknown_fields: "reject",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("mime"),
+                field("filename", Ty::String, true, true),
+                text_field("data_base64"),
+            ],
         },
-        TypeDef {
-            name: "TaskRun",
-            doc: "One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields).",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("task_id", Ty::I64),
-                    text_field("run_id"),
-                    text_field("mode"),
-                    text_field("state"),
-                    nullable("goal", Ty::String),
-                    req(
-                        "item_ids",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                    ),
-                    nullable("model", Ty::String),
-                ],
-            },
+    },
+    ]
+}
+
+fn type_defs_task_runs() -> Vec<TypeDef> {
+    vec![
+    TypeDef {
+        name: "TaskRun",
+        doc: "One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("task_id", Ty::I64),
+                text_field("run_id"),
+                text_field("mode"),
+                text_field("state"),
+                nullable("goal", Ty::String),
+                req(
+                    "item_ids",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                ),
+                nullable("model", Ty::String),
+            ],
         },
-        TypeDef {
-            name: "TaskRunStarted",
-            doc: "Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored).",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("task_id", Ty::I64),
-                    text_field("run_id"),
-                    text_field("state"),
-                ],
-            },
+    },
+    TypeDef {
+        name: "TaskRunStarted",
+        doc: "Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("task_id", Ty::I64),
+                text_field("run_id"),
+                text_field("state"),
+            ],
         },
-        TypeDef {
-            name: "TaskRunCancelled",
-            doc: "Response of a native task-run cancel (additive: unknown fields ignored).",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![text_field("run_id"), req("cancelled", Ty::Bool)],
-            },
+    },
+    TypeDef {
+        name: "TaskRunCancelled",
+        doc: "Response of a native task-run cancel (additive: unknown fields ignored).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![text_field("run_id"), req("cancelled", Ty::Bool)],
         },
-        TypeDef {
-            name: "TaskRunWorkItem",
-            doc: "One wire work item of a native task-run start (the orchestrator's own JSON vocabulary).",
-            unknown_fields: "reject",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("id"),
-                    text_field("kind"),
-                    field("summary", Ty::String, true, true),
-                    field(
-                        "depends_on",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                        true,
-                        true,
-                    ),
-                    field(
-                        "acceptance_checks",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                        true,
-                        true,
-                    ),
-                    field("ownership", Ty::Json, true, true),
-                    field("required_capabilities", Ty::Json, true, true),
-                ],
-            },
+    },
+    TypeDef {
+        name: "TaskRunWorkItem",
+        doc: "One wire work item of a native task-run start (the orchestrator's own JSON vocabulary).",
+        unknown_fields: "reject",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("id"),
+                text_field("kind"),
+                field("summary", Ty::String, true, true),
+                field(
+                    "depends_on",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                    true,
+                    true,
+                ),
+                field(
+                    "acceptance_checks",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                    true,
+                    true,
+                ),
+                field("ownership", Ty::Json, true, true),
+                field("required_capabilities", Ty::Json, true, true),
+            ],
         },
-        TypeDef {
-            name: "TaskRunStartRequest",
-            doc: "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. `submission_id` is the required client submission UUID of the logical start (idempotency key: a repeated key replays the original run receipt byte-for-byte).",
-            unknown_fields: "reject",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("goal"),
-                    text_field("submission_id"),
-                    field(
-                        "criteria",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                        true,
-                        true,
-                    ),
-                    field(
-                        "work_items",
-                        Ty::List {
-                            of: Box::new(Ty::Named {
-                                name: "TaskRunWorkItem",
-                            }),
-                        },
-                        true,
-                        true,
-                    ),
-                    field("ownership", Ty::Json, true, true),
-                    field("model", Ty::String, true, true),
-                    field("max_tokens", Ty::I64, true, true),
-                    field("max_cost_micro", Ty::Json, true, true),
-                    field("mutation_mode", Ty::String, true, true),
-                    field("routing_mode", Ty::String, true, true),
-                    field(
-                        "files",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                        true,
-                        true,
-                    ),
-                    field(
-                        "attachments",
-                        Ty::List {
-                            of: Box::new(Ty::Named {
-                                name: "AttachmentId",
-                            }),
-                        },
-                        true,
-                        true,
-                    ),
-                    field("completion_contract", Ty::Json, true, true),
-                ],
-            },
+    },
+    TypeDef {
+        name: "TaskRunStartRequest",
+        doc: "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. `submission_id` is the required client submission UUID of the logical start (idempotency key: a repeated key replays the original run receipt byte-for-byte).",
+        unknown_fields: "reject",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("goal"),
+                text_field("submission_id"),
+                field(
+                    "criteria",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                    true,
+                    true,
+                ),
+                field(
+                    "work_items",
+                    Ty::List {
+                        of: Box::new(Ty::Named {
+                            name: "TaskRunWorkItem",
+                        }),
+                    },
+                    true,
+                    true,
+                ),
+                field("ownership", Ty::Json, true, true),
+                field("model", Ty::String, true, true),
+                field("max_tokens", Ty::I64, true, true),
+                field("max_cost_micro", Ty::Json, true, true),
+                field("mutation_mode", Ty::String, true, true),
+                field("routing_mode", Ty::String, true, true),
+                field(
+                    "files",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                    true,
+                    true,
+                ),
+                field(
+                    "attachments",
+                    Ty::List {
+                        of: Box::new(Ty::Named {
+                            name: "AttachmentId",
+                        }),
+                    },
+                    true,
+                    true,
+                ),
+                field("completion_contract", Ty::Json, true, true),
+            ],
         },
-        TypeDef {
-            name: "SessionPromptRequest",
-            doc: "Strict request body of POST /native/session/{id}/prompt. `submission_id` is the required client submission UUID of the logical prompt (idempotency key: a repeated key with the equal normalized body returns the original receipt byte-for-byte; a different body under the same key is a typed conflict). The daemon validates every member strictly (`deny_unknown_fields`; an unknown field or typo is a 400).",
-            unknown_fields: "reject",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("session_id"),
-                    text_field("submission_id"),
-                    text_field("prompt"),
-                    field(
-                        "files",
-                        Ty::List {
-                            of: Box::new(Ty::String),
-                        },
-                        true,
-                        true,
-                    ),
-                ],
-            },
+    },
+    TypeDef {
+        name: "SessionPromptRequest",
+        doc: "Strict request body of POST /native/session/{id}/prompt. `submission_id` is the required client submission UUID of the logical prompt (idempotency key: a repeated key with the equal normalized body returns the original receipt byte-for-byte; a different body under the same key is a typed conflict). The daemon validates every member strictly (`deny_unknown_fields`; an unknown field or typo is a 400).",
+        unknown_fields: "reject",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("session_id"),
+                text_field("submission_id"),
+                text_field("prompt"),
+                field(
+                    "files",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                    true,
+                    true,
+                ),
+            ],
         },
-        TypeDef {
-            name: "SessionPromptReceipt",
-            doc: "Response of a native prompt: the accepted in-session run identity and queued flag (additive: unknown fields ignored). A submission-keyed replay returns the stored receipt byte-for-byte.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("op_id"),
-                    text_field("run_id"),
-                    req("accepted", Ty::Bool),
-                    req("queued", Ty::Bool),
-                ],
-            },
+    },
+    TypeDef {
+        name: "SessionPromptReceipt",
+        doc: "Response of a native prompt: the accepted in-session run identity and queued flag (additive: unknown fields ignored). A submission-keyed replay returns the stored receipt byte-for-byte.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("op_id"),
+                text_field("run_id"),
+                req("accepted", Ty::Bool),
+                req("queued", Ty::Bool),
+            ],
         },
-        // ---------------------------------- engineering outcome ledger (audit 7)
-        //
-        // The Engineering Outcome Ledger read surface (`GET /native/outcomes`)
-        // projects the durable `faktor_agent::outcome_ledger` records into a
-        // camelCase wire response. The schema mirrors that projection
-        // field-for-field (see `crates/server/src/native/outcomes.rs`): money
-        // keys ride the decimal-string `*Micro` encoding, every other number
-        // is a plain JSON integer and non-nullable. The strict scalar query
-        // (`limit` / `before_ms` / `before_run`) has no JSON body, so it is
-        // not a schema DTO.
-        TypeDef {
-            name: "OutcomeMetrics",
-            doc: "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("runs", Ty::I64),
-                    req("verifiedChanges", Ty::I64),
-                    req("verifiedFirstPassChanges", Ty::I64),
-                    req("verifiedFirstPassPpm", Ty::I64),
-                    text_field("totalVerifiedSpendMicro"),
-                    text_field("verifiedCostPerChangeMicro"),
-                    text_field("totalSpendMicro"),
-                    text_field("totalReworkSpendMicro"),
-                    req("reworkCostRatioPpm", Ty::I64),
+    },
+    // ---------------------------------- engineering outcome ledger (audit 7)
+    //
+    // The Engineering Outcome Ledger read surface (`GET /native/outcomes`)
+    // projects the durable `faktor_agent::outcome_ledger` records into a
+    // camelCase wire response. The schema mirrors that projection
+    // field-for-field (see `crates/server/src/native/outcomes.rs`): money
+    // keys ride the decimal-string `*Micro` encoding, every other number
+    // is a plain JSON integer and non-nullable. The strict scalar query
+    // (`limit` / `before_ms` / `before_run`) has no JSON body, so it is
+    // not a schema DTO.
+    ]
+}
+
+fn type_defs_outcomes() -> Vec<TypeDef> {
+    vec![
+    TypeDef {
+        name: "OutcomeMetrics",
+        doc: "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("runs", Ty::I64),
+                req("verifiedChanges", Ty::I64),
+                req("verifiedFirstPassChanges", Ty::I64),
+                req("verifiedFirstPassPpm", Ty::I64),
+                text_field("totalVerifiedSpendMicro"),
+                text_field("successfulRunCostMicro"),
+                text_field("totalSpendMicro"),
+                text_field("verifiedCostPerSuccessfulChangeMicro"),
+                text_field("totalReworkSpendMicro"),
+                req("reworkCostRatioPpm", Ty::I64),
                     req("localRuns", Ty::I64),
-                    req("localSubstitutionPpm", Ty::I64),
-                    text_field("avoidedHostedInferenceMicro"),
-                    req("totalWallTimeMs", Ty::I64),
-                    req("meanTimeToVerifiedChangeMs", Ty::I64),
-                    req("humanInterventionRuns", Ty::I64),
-                    req("humanInterventionPpm", Ty::I64),
-                    req("rollbackRuns", Ty::I64),
-                    req("regressionRollbackPpm", Ty::I64),
-                    req("checksPassed", Ty::I64),
-                    req("checksRequired", Ty::I64),
-                    req("proofCoveragePpm", Ty::I64),
-                    req("frontierEscalationRuns", Ty::I64),
-                    req("frontierEscalationPpm", Ty::I64),
-                    req("scanned", Ty::I64),
-                    req("truncated", Ty::Bool),
-                ],
-            },
+                    req("localOnlyRuns", Ty::I64),
+                    req("localOnlyVerifiedChanges", Ty::I64),
+                    req("localOnlyVerifiedPpm", Ty::I64),
+                    req("localFinalRuns", Ty::I64),
+                    req("localFinalVerifiedChanges", Ty::I64),
+                    req("localFinalVerifiedPpm", Ty::I64),
+                req("localFirstRuns", Ty::I64),
+                req("localFirstSuccessChanges", Ty::I64),
+                req("localFirstSuccessPpm", Ty::I64),
+                req("localToFrontierFallbackRuns", Ty::I64),
+                req("localToFrontierFallbackPpm", Ty::I64),
+                req("frontierOnlyRuns", Ty::I64),
+                req("frontierOnlyPpm", Ty::I64),
+                text_field("avoidedHostedInferenceMicro"),
+                req("totalWallTimeMs", Ty::I64),
+                req("meanTimeToVerifiedChangeMs", Ty::I64),
+                req("humanInterventionRuns", Ty::I64),
+                req("humanInterventionPpm", Ty::I64),
+                req("rollbackRuns", Ty::I64),
+                req("regressionRollbackPpm", Ty::I64),
+                req("checksPassed", Ty::I64),
+                req("checksRequired", Ty::I64),
+                req("proofCoveragePpm", Ty::I64),
+                req("frontierEscalationRuns", Ty::I64),
+                req("frontierEscalationPpm", Ty::I64),
+                req("scanned", Ty::I64),
+                req("truncated", Ty::Bool),
+            ],
         },
-        TypeDef {
-            name: "RunOutcomeModelStep",
-            doc: "One provider/model step of a completed run's execution sequence (money as a decimal string).",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("provider"),
-                    text_field("model"),
-                    req("local", Ty::Bool),
-                    text_field("spendMicro"),
-                ],
-            },
+    },
+    TypeDef {
+        name: "RunOutcomeModelStep",
+        doc: "One provider/model step of a completed run's execution sequence (money as a decimal string).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("provider"),
+                text_field("model"),
+                req("local", Ty::Bool),
+                text_field("spendMicro"),
+            ],
         },
-        TypeDef {
-            name: "RunOutcomeProof",
-            doc: "One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("checksPassed", Ty::I64),
-                    req("checksRequired", Ty::I64),
-                    req("coveragePpm", Ty::I64),
-                ],
-            },
+    },
+    TypeDef {
+        name: "RunOutcomeProof",
+        doc: "One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("checksPassed", Ty::I64),
+                req("checksRequired", Ty::I64),
+                req("coveragePpm", Ty::I64),
+            ],
         },
-        TypeDef {
-            name: "RunOutcomeChangeScale",
-            doc: "One completed run's changed-code scale.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req("files", Ty::I64),
-                    req("addedLines", Ty::I64),
-                    req("removedLines", Ty::I64),
-                ],
-            },
+    },
+    TypeDef {
+        name: "RunOutcomeChangeScale",
+        doc: "One completed run's changed-code scale.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req("files", Ty::I64),
+                req("addedLines", Ty::I64),
+                req("removedLines", Ty::I64),
+            ],
         },
-        TypeDef {
-            name: "RunOutcome",
-            doc: "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    text_field("runId"),
-                    req("sessionId", Ty::I64),
-                    req("taskId", Ty::I64),
-                    text_field("taskClass"),
-                    text_field("riskClass"),
-                    nullable("candidateSnapshot", Ty::String),
-                    text_field("finalSnapshot"),
-                    req("accepted", Ty::Bool),
-                    req("integrated", Ty::Bool),
-                    req("verified", Ty::Bool),
-                    req("verifiedFirstAttempt", Ty::Bool),
-                    req("repairAttempts", Ty::I64),
-                    req(
-                        "modelSequence",
-                        Ty::List {
-                            of: Box::new(Ty::Named {
-                                name: "RunOutcomeModelStep",
-                            }),
-                        },
-                    ),
-                    text_field("modelSpendMicro"),
-                    text_field("verificationSpendMicro"),
-                    text_field("reworkSpendMicro"),
-                    text_field("avoidedHostedMicro"),
-                    req("wallTimeMs", Ty::I64),
-                    req("humanInterventions", Ty::I64),
-                    req(
-                        "proof",
-                        Ty::Named {
-                            name: "RunOutcomeProof",
-                        },
-                    ),
-                    req(
-                        "changeScale",
-                        Ty::Named {
-                            name: "RunOutcomeChangeScale",
-                        },
-                    ),
-                    req("rollbackEvents", Ty::I64),
-                    req("recoveryEvents", Ty::I64),
-                    text_field("finalBasis"),
-                    req("frontierEscalations", Ty::I64),
-                    req("completedAtMs", Ty::I64),
-                ],
-            },
+    },
+    TypeDef {
+        name: "RunOutcome",
+        doc: "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("runId"),
+                req("sessionId", Ty::I64),
+                req("taskId", Ty::I64),
+                text_field("taskClass"),
+                text_field("riskClass"),
+                nullable("candidateSnapshot", Ty::String),
+                text_field("finalSnapshot"),
+                req("accepted", Ty::Bool),
+                req("integrated", Ty::Bool),
+                req("verified", Ty::Bool),
+                req("verifiedFirstAttempt", Ty::Bool),
+                req("repairAttempts", Ty::I64),
+                req(
+                    "modelSequence",
+                    Ty::List {
+                        of: Box::new(Ty::Named {
+                            name: "RunOutcomeModelStep",
+                        }),
+                    },
+                ),
+                text_field("modelSpendMicro"),
+                text_field("verificationSpendMicro"),
+                text_field("reworkSpendMicro"),
+                text_field("avoidedHostedMicro"),
+                req("wallTimeMs", Ty::I64),
+                req("humanInterventions", Ty::I64),
+                req(
+                    "proof",
+                    Ty::Named {
+                        name: "RunOutcomeProof",
+                    },
+                ),
+                req(
+                    "changeScale",
+                    Ty::Named {
+                        name: "RunOutcomeChangeScale",
+                    },
+                ),
+                req("rollbackEvents", Ty::I64),
+                req("recoveryEvents", Ty::I64),
+                text_field("finalBasis"),
+                req("frontierEscalations", Ty::I64),
+                req("completedAtMs", Ty::I64),
+            ],
         },
-        TypeDef {
-            name: "OutcomeCursor",
-            doc: "The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full.",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![req("completedAtMs", Ty::I64), text_field("runId")],
-            },
+    },
+    TypeDef {
+        name: "OutcomeCursor",
+        doc: "The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![req("completedAtMs", Ty::I64), text_field("runId")],
         },
-        TypeDef {
-            name: "OutcomesPage",
-            doc: "Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted).",
-            unknown_fields: "ignore",
-            shape: Shape::Struct {
-                fields: vec![
-                    req(
-                        "metrics",
-                        Ty::Named {
-                            name: "OutcomeMetrics",
-                        },
-                    ),
-                    req(
-                        "runs",
-                        Ty::List {
-                            of: Box::new(Ty::Named { name: "RunOutcome" }),
-                        },
-                    ),
-                    nullable(
-                        "nextCursor",
-                        Ty::Named {
-                            name: "OutcomeCursor",
-                        },
-                    ),
-                ],
-            },
+    },
+    TypeDef {
+        name: "OutcomesPage",
+        doc: "Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                req(
+                    "metrics",
+                    Ty::Named {
+                        name: "OutcomeMetrics",
+                    },
+                ),
+                req(
+                    "runs",
+                    Ty::List {
+                        of: Box::new(Ty::Named { name: "RunOutcome" }),
+                    },
+                ),
+                nullable(
+                    "nextCursor",
+                    Ty::Named {
+                        name: "OutcomeCursor",
+                    },
+                ),
+            ],
         },
+    },
+    ]
+}
+
+fn type_defs_value_entitlements() -> Vec<TypeDef> {
+    vec![
+    TypeDef {
+        name: "ValueGovernanceCapabilities",
+        doc: "The value-entitlement report's governance capability picture (`governance`): `sso`/`scim` are capability vocabulary, effective only behind the `enterprise_governance` value entitlement (never an implementation).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![req("sso", Ty::Bool), req("scim", Ty::Bool)],
+        },
+    },
+    TypeDef {
+        name: "ValueEntitlementDecision",
+        doc: "One per-entitlement value decision of the report: the entitlement tag, its typed enforcement hook, whether it is enforceable now and (only when not) the exact refusal cause. A granted decision omits `cause` (the schema field is optional).",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("entitlement"),
+                text_field("hook"),
+                req("granted", Ty::Bool),
+                field("cause", Ty::String, true, true),
+            ],
+        },
+    },
+    TypeDef {
+        name: "ValueEntitlementsReport",
+        doc: "The caller organization's DERIVED value-entitlement report (`value_entitlements` member of GET /native/value-entitlements): the plan resolution, the plan-mapped inference-independent value tags, the effective governance capability flags and one typed decision per entitlement. The report never folds usage, credits or tokens.",
+        unknown_fields: "ignore",
+        shape: Shape::Struct {
+            fields: vec![
+                text_field("organization_id"),
+                nullable("plan_id", Ty::String),
+                req("plan_found", Ty::Bool),
+                req("subscription_active", Ty::Bool),
+                req(
+                    "plan_entitlements",
+                    Ty::List {
+                        of: Box::new(Ty::String),
+                    },
+                ),
+                req(
+                    "governance",
+                    Ty::Named {
+                        name: "ValueGovernanceCapabilities",
+                    },
+                ),
+                req(
+                    "decisions",
+                    Ty::List {
+                        of: Box::new(Ty::Named {
+                            name: "ValueEntitlementDecision",
+                        }),
+                    },
+                ),
+                req("now_ms", Ty::I64),
+            ],
+        },
+    },
     ]
 }
 
@@ -901,6 +998,74 @@ mod tests {
                 "RunOutcome.{money} must be a decimal-string field"
             );
         }
+    }
+
+    /// The value-entitlement report DTOs (commercial value gate) must STAY
+    /// in the canonical schema — the live wire response shape is pinned
+    /// against these entries by the server route test
+    /// (`crates/server/src/native/value_tests.rs`), so removing one is a
+    /// generated-client regression, not a label change.
+    #[test]
+    fn value_entitlements_wire_dtos_are_in_the_canonical_schema() {
+        let types = type_defs();
+        let names: Vec<&str> = types.iter().map(|def| def.name).collect();
+        for name in [
+            "ValueEntitlementsReport",
+            "ValueEntitlementDecision",
+            "ValueGovernanceCapabilities",
+        ] {
+            assert!(
+                names.contains(&name),
+                "value-entitlement migration: {name} must stay in the canonical schema"
+            );
+        }
+        let def = |name: &str| -> TypeDef {
+            types
+                .iter()
+                .find(|def| def.name == name)
+                .unwrap_or_else(|| panic!("{name} must be in the canonical schema"))
+                .clone()
+        };
+        let field = |name: &str, field_name: &str| -> Field {
+            let Shape::Struct { fields } = def(name).shape else {
+                panic!("{name} must be a struct")
+            };
+            fields
+                .into_iter()
+                .find(|f| f.name == field_name)
+                .unwrap_or_else(|| panic!("{name}.{field_name} must exist"))
+        };
+        // Granted decisions OMIT the cause key: the schema field must stay
+        // optional (and null is accepted by the generated decoders).
+        let cause = field("ValueEntitlementDecision", "cause");
+        assert!(
+            cause.optional,
+            "cause must stay optional (skip_serializing_if)"
+        );
+        assert!(cause.nullable, "cause accepts JSON null");
+        // `plan_id` is always present, null when nothing resolved.
+        let plan_id = field("ValueEntitlementsReport", "plan_id");
+        assert!(
+            plan_id.nullable && !plan_id.optional,
+            "plan_id: null, never absent"
+        );
+        // The plan tags and the decisions are string arrays / struct lists.
+        let plan_entitlements = field("ValueEntitlementsReport", "plan_entitlements");
+        assert!(matches!(
+            plan_entitlements.ty,
+            Ty::List { ref of } if matches!(of.as_ref(), Ty::String)
+        ));
+        let decisions = field("ValueEntitlementsReport", "decisions");
+        assert!(matches!(
+            decisions.ty,
+            Ty::List { ref of }
+                if matches!(
+                    of.as_ref(),
+                    Ty::Named {
+                        name: "ValueEntitlementDecision"
+                    }
+                )
+        ));
     }
 
     /// The `AttachmentId` schema entry mirrors the REAL serde struct

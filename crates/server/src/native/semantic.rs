@@ -32,12 +32,13 @@ use super::*;
 
 /// One [`IntelligenceCapability`]'s public JSON shape: the existing
 /// per-operation status fields plus `tier` (`null` = unknown, never assumed
-/// high) and the bounded `confidence_bps`.
+/// high, never scored) and the bounded `confidence_bps` derived from the
+/// orthogonal evidence dimensions.
 fn intelligence_capability_json(capability: &IntelligenceCapability) -> serde_json::Value {
     serde_json::json!({
         "available": capability.available,
-        "fidelity": capability.fidelity,
-        "completeness": capability.completeness,
+        "fidelity": capability.fidelity(),
+        "completeness": capability.completeness(),
         "source": capability.source,
         "tier": capability.tier,
         "confidence_bps": capability.confidence_bps(),
@@ -70,8 +71,8 @@ fn native_intelligence_json() -> serde_json::Value {
                 "op": capability.op,
                 "tier": capability.tier,
                 "available": capability.available,
-                "fidelity": capability.fidelity,
-                "completeness": capability.completeness,
+                "fidelity": capability.fidelity(),
+                "completeness": capability.completeness(),
                 "source": capability.source,
                 "confidence_bps": capability.confidence_bps(),
             })
@@ -117,7 +118,7 @@ fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
                 .completeness
                 .unwrap_or(SemanticCompleteness::Unknown),
             // Declared intelligence tier; `null` = undeclared (unknown,
-            // confidence carries no tier bonus).
+            // capability metadata only — never an input to confidence).
             "tier": descriptor.intelligence_tier(),
             "capabilities": capabilities_json(descriptor.capabilities),
         }),
@@ -469,8 +470,10 @@ mod tests {
         assert_eq!(body["operations"]["context"]["fidelity"], "heuristic");
         assert_eq!(body["operations"]["context"]["completeness"], "partial");
         assert_eq!(body["operations"]["context"]["tier"], 0);
-        // 2500 (heuristic) × 7500 (partial) / 10000 + 0 (tier 0) = 1875.
-        assert_eq!(body["operations"]["context"]["confidence_bps"], 1875);
+        // 2500 (heuristic) × 7500 (partial) × the native evidence
+        // dimensions (current × deterministic × inferred × direct ×
+        // declared) / 10000^5 = 1434; the tier adds nothing.
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 1434);
         assert_eq!(body["operations"]["verify"]["available"], false);
         assert_eq!(body["operations"]["verify"]["confidence_bps"], 0);
         assert_eq!(body["operations"]["snapshot"]["available"], false);
@@ -631,18 +634,20 @@ mod tests {
         registry
     }
 
-    /// A declared external descriptor tier is reported verbatim; an absent
-    /// tier reports null with confidence computed WITHOUT the tier bonus and
-    /// strictly below the same descriptor declaring tier 5.
+    /// A declared external descriptor tier is reported verbatim, but it is
+    /// capability metadata only: identical declared fidelity/completeness
+    /// (and evidence) score identically whether the tier is declared,
+    /// absent, or tier 5. An absent tier reports null (never assumed high).
     #[tokio::test]
-    async fn declared_tier_reports_and_absent_tier_is_never_assumed_high() {
+    async fn declared_tier_reports_verbatim_and_never_moves_confidence() {
         let two = warmed_registry(Some(2)).await;
         let body = status_json(Some(&two));
         assert_eq!(body["providers"][0]["validated"], true);
         assert_eq!(body["providers"][0]["tier"], 2);
         assert_eq!(body["operations"]["context"]["tier"], 2);
-        // 8000 (compiler_exact) × 10000 (complete) / 10000 + 2 × 200 = 8400.
-        assert_eq!(body["operations"]["context"]["confidence_bps"], 8400);
+        // 8000 (compiler_exact) × 10000 (complete) × 0.7^4 × 0.8 (no
+        // evidence axes declared) = 1536; the tier adds nothing.
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 1536);
         assert_eq!(body["intelligence"]["tier"], 2);
         assert_eq!(body["intelligence"]["operations"]["context"], 2);
         // Uncovered ops still report the honest fallback Tier 0.
@@ -654,8 +659,8 @@ mod tests {
         assert!(absent_body["providers"][0]["tier"].is_null());
         assert!(absent_body["operations"]["context"]["tier"].is_null());
         assert_eq!(
-            absent_body["operations"]["context"]["confidence_bps"], 8000,
-            "no tier bonus without a declared tier"
+            absent_body["operations"]["context"]["confidence_bps"], 1536,
+            "an absent tier changes nothing; there is no tier bonus"
         );
         assert_eq!(
             absent_body["intelligence"]["tier"], 0,
@@ -666,16 +671,12 @@ mod tests {
         let five_body = status_json(Some(&five));
         assert_eq!(five_body["providers"][0]["tier"], 5);
         assert_eq!(five_body["operations"]["context"]["tier"], 5);
-        assert_eq!(five_body["operations"]["context"]["confidence_bps"], 9000);
+        assert_eq!(five_body["operations"]["context"]["confidence_bps"], 1536);
         assert_eq!(five_body["intelligence"]["tier"], 5);
-        assert!(
-            absent_body["operations"]["context"]["confidence_bps"]
-                .as_u64()
-                .unwrap()
-                < five_body["operations"]["context"]["confidence_bps"]
-                    .as_u64()
-                    .unwrap(),
-            "an absent tier must never be assumed as high as a declared tier 5"
+        assert_eq!(
+            absent_body["operations"]["context"]["confidence_bps"],
+            five_body["operations"]["context"]["confidence_bps"],
+            "a declared tier 5 must never outscore an identical undeclared one"
         );
     }
 
@@ -690,7 +691,7 @@ mod tests {
         assert!(body["providers"][0]["tier"].is_null());
         assert_eq!(body["operations"]["context"]["tier"], 0);
         assert_eq!(body["operations"]["context"]["source"], GENERIC_FALLBACK_ID);
-        assert_eq!(body["operations"]["context"]["confidence_bps"], 1875);
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 1434);
         assert_eq!(body["intelligence"]["tier"], 0);
     }
 }

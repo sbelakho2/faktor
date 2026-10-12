@@ -1,0 +1,10 @@
+{
+  "id": "sh-debug-range-offbyone",
+  "order": 1,
+  "category": "debugging",
+  "language": "shell",
+  "runtime": "sh",
+  "task_class": "easy",
+  "phase": "debug",
+  "goal": "range.sh is supposed to print every integer from 1 through N (inclusive), one per line, and print nothing for N=0. It currently omits N itself. Fix run.sh so the printed range includes N; keep the one-number-per-line output and print nothing for N=0."
+}

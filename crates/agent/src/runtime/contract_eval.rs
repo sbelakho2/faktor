@@ -328,7 +328,11 @@ enum ProviderDispatchFailure {
 ///   native executed-check path);
 /// - a provider verdict becomes evidence bound to the obligation's own
 ///   binding (the provider was asked exactly that question), tagged with the
-///   provider identity for the proof record.
+///   provider identity for the proof record;
+/// - a provider result that does not ECHO the request's declared subject
+///   snapshot (missing or mismatched snapshot, or a missing/mismatched
+///   basis subject) is refused typed by the registry: the verdict is never
+///   accepted and never stamped with the current candidate after the fact.
 async fn dispatch_provider_claims(
     handle: &SessionHandle,
     contract: &EngineeringContract,
@@ -386,7 +390,7 @@ async fn dispatch_provider_claims(
         let Some(obligation) = obligations.get(result.obligation_id.as_str()) else {
             continue;
         };
-        evidence.push(provider_claim_evidence(obligation, result, candidate));
+        evidence.push(provider_claim_evidence(obligation, result));
     }
     Ok(evidence)
 }
@@ -403,15 +407,16 @@ fn classify_dispatch_failure(error: VerificationError) -> ProviderDispatchFailur
 }
 
 /// Project one neutral per-claim verdict into the contract evidence model.
+/// The snapshot carried is ONLY the identity the provider itself echoed: the
+/// registry boundary refuses a result whose subject is missing or mismatched
+/// when the request declared one, so an external verdict can never be
+/// stamped with the current candidate after the fact. A request without a
+/// declared subject yields evidence without a snapshot (honest absence).
 fn provider_claim_evidence(
     obligation: &ProofObligation,
     result: &ClaimVerificationResult,
-    candidate: Option<&SubjectSnapshot>,
 ) -> ContractEvidence {
-    let snapshot = result
-        .subject_snapshot
-        .clone()
-        .or_else(|| candidate.cloned());
+    let snapshot = result.subject_snapshot.clone();
     let bindings = if obligation.evidence_binding.is_bound() {
         vec![obligation.evidence_binding.clone()]
     } else {

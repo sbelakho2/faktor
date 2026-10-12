@@ -73,10 +73,11 @@ pub use contract::{
     Requirement, RiskHypothesis, RiskSeverity, SubjectSnapshot, VerificationDepth,
 };
 pub use contract_compile::{
-    compile_contract, compile_contract_with, intent_tokens, CompiledContract,
-    ContractCompileRequest, ContractUncertainty, EnrichmentKind, EnrichmentOutcome,
-    EnrichmentRequest, EnrichmentStatement, RepositoryFile, RepositorySnapshot, StatementKind,
-    StatementOrigin, StatementProvenance, SystemIntelligenceProvider,
+    compile_contract, compile_contract_with, intent_tokens, AcquisitionGap, AcquisitionGapKind,
+    CompiledContract, ContractCompileRequest, ContractUncertainty, EnrichmentKind,
+    EnrichmentOutcome, EnrichmentRequest, EnrichmentStatement, RepositoryAcquisition,
+    RepositoryFile, RepositorySnapshot, StatementKind, StatementOrigin, StatementProvenance,
+    SystemIntelligenceProvider,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};

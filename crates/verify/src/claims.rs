@@ -19,6 +19,16 @@
 //!    the ground a `Disproven` result is already held to. `KnownTrue`
 //!    additionally requires proof-grade
 //!    ([`EvidenceStrength::Proof`]) evidence.
+//! 3. **Subject identity is never synthesized.** When the request declares a
+//!    candidate subject snapshot, every provider result must ECHO that exact
+//!    identity in both [`ClaimVerificationResult::subject_snapshot`] and the
+//!    [`ProofBasis::subject`] of its verdict basis; a missing or mismatched
+//!    subject is a typed refusal
+//!    ([`ClaimVerificationResult::validate_subject_identity`]). Faktor never
+//!    stamps the current candidate onto a provider result after the fact: an
+//!    external verdict stands only for the subject the provider itself
+//!    answered for. A request carrying no declared subject requires no
+//!    identity (the documented no-subject semantics).
 //!
 //! The routing from a claim to one neutral operation
 //! ([`op_for_claim`]) is deterministic: the obligation's evidence binding
@@ -117,7 +127,11 @@ pub fn evidence_adequacy(
 pub struct ClaimVerificationResult {
     pub obligation_id: String,
     /// The candidate subject the verdict was produced against, when the
-    /// caller declared one.
+    /// caller declared one. When the request declares a subject snapshot the
+    /// result MUST echo it exactly: a missing or mismatched subject is a
+    /// typed refusal at the registry boundary
+    /// ([`Self::validate_subject_identity`]); the runtime never stamps the
+    /// current candidate onto a result after the fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_snapshot: Option<SubjectSnapshot>,
     pub state: ClaimState,
@@ -268,6 +282,52 @@ impl ClaimVerificationResult {
             ));
         }
         Ok(())
+    }
+
+    /// The neutral subject-identity law of the claim round trip (law 3 in
+    /// the module docs): when the request declared a subject snapshot, the
+    /// result MUST echo that exact identity in both
+    /// [`Self::subject_snapshot`] and the [`ProofBasis::subject`] of its
+    /// verdict basis. A missing or mismatched subject is a typed refusal —
+    /// Faktor never stamps the current candidate onto a provider result after
+    /// the fact, so an external verdict can never borrow an identity the
+    /// provider did not itself answer for. A request without a declared
+    /// subject requires no identity (the documented no-subject semantics).
+    pub fn validate_subject_identity(
+        &self,
+        request_snapshot: Option<&SubjectSnapshot>,
+    ) -> Result<(), VerificationError> {
+        let Some(request_snapshot) = request_snapshot else {
+            return Ok(());
+        };
+        match &self.subject_snapshot {
+            Some(subject) if subject == request_snapshot => {}
+            Some(subject) => {
+                return Err(VerificationError::Malformed(format!(
+                    "claim {} result answered for subject snapshot {} but the request declared {}",
+                    self.obligation_id, subject.candidate, request_snapshot.candidate
+                )));
+            }
+            None => {
+                return Err(VerificationError::Malformed(format!(
+                    "claim {} result omitted the subject snapshot the request declared ({}); \
+                     a provider verdict must echo its own subject identity",
+                    self.obligation_id, request_snapshot.candidate
+                )));
+            }
+        }
+        match &self.basis.subject {
+            Some(subject) if subject == request_snapshot => Ok(()),
+            Some(subject) => Err(VerificationError::Malformed(format!(
+                "claim {} result basis subject {} does not match the request subject {}",
+                self.obligation_id, subject.candidate, request_snapshot.candidate
+            ))),
+            None => Err(VerificationError::Malformed(format!(
+                "claim {} result omitted the basis subject the request declared ({}); \
+                 an unbound verdict basis is refused",
+                self.obligation_id, request_snapshot.candidate
+            ))),
+        }
     }
 }
 

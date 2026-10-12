@@ -1017,6 +1017,10 @@ impl TaskExecutor {
         if let Err(e) = self.finalize_shadow_run(parent) {
             eprintln!("shadow discard after cancel of run {}: {e}", row.run_id);
         }
+        // The terminal cancel is the run's ledger boundary: its ONE
+        // engineering-outcome row is recorded now (the in-session identity
+        // the post-drive settlement re-uses; a later settle is a no-op).
+        self.record_terminal_run_outcome(parent, &faktor_agent::session_terminal_run_id(parent))?;
         Ok(())
     }
 
@@ -1074,6 +1078,9 @@ impl TaskExecutor {
                     })?;
             }
         }
+        // The root task row is terminal: the run's ONE engineering-outcome
+        // row is recorded now (a later settlement pass re-uses it verbatim).
+        self.record_terminal_run_outcome(handle.id(), run_id)?;
         Ok(())
     }
 

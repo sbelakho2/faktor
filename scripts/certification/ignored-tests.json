@@ -40,6 +40,11 @@
       "step": "coding-benchmark-real-model",
       "command": "cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored"
     },
+    "live-paid-econ": {
+      "workflow": "nightly",
+      "step": "coding-benchmark-real-model",
+      "command": "cargo test -p faktor-tests-router-economics --test capture -- --ignored"
+    },
     "contention": {
       "workflow": "nightly",
       "step": "contention",
@@ -151,6 +156,11 @@
       "file": "tests/coding-benchmark/tests/real.rs",
       "fn": "real_daemon_mechanics_with_stub_provider",
       "lane": "live-paid"
+    },
+    {
+      "file": "tests/economic-certification/tests/capture.rs",
+      "fn": "live_coding_capture_requires_env_and_freezes_real_outputs",
+      "lane": "live-paid-econ"
     },
     {
       "file": "tests/performance/tests/contention.rs",

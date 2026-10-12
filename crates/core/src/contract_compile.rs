@@ -241,23 +241,126 @@ impl RepositoryFile {
     }
 }
 
+/// The typed kind of one repository-acquisition gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquisitionGapKind {
+    /// A directory in the bounded walk could not be listed; its paths (and
+    /// anything under them) are unknown.
+    UnreadableDirectory,
+    /// A directory entry (or its metadata) could not be inspected.
+    UnreadableEntry,
+    /// A selected file's bytes could not be read.
+    UnreadableFile,
+    /// A selected file's bytes were not valid UTF-8 text.
+    InvalidUtf8,
+    /// A selected file exceeded the per-file content bound.
+    OversizedFile,
+    /// The content budget was exhausted before a selected file was read.
+    ReadBudgetExhausted,
+    /// The bounded walk stopped at a cap; unvisited paths may exist.
+    WalkTruncated,
+}
+
+impl AcquisitionGapKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnreadableDirectory => "unreadable_directory",
+            Self::UnreadableEntry => "unreadable_entry",
+            Self::UnreadableFile => "unreadable_file",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::OversizedFile => "oversized_file",
+            Self::ReadBudgetExhausted => "read_budget_exhausted",
+            Self::WalkTruncated => "walk_truncated",
+        }
+    }
+}
+
+/// One concrete, typed reason a snapshot is not
+/// [`RepositoryAcquisition::Complete`]: WHAT could not be acquired and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionGap {
+    pub kind: AcquisitionGapKind,
+    /// The repo-relative path (or directory) the gap concerns; `None` for
+    /// whole-walk findings (caps, totals).
+    pub path: Option<String>,
+    /// The concrete cause, including the underlying error when one exists.
+    pub detail: String,
+    /// TRUE when the missing content could have carried proof-relevant
+    /// evidence (a build manifest, an intent-matched source, a test file):
+    /// the compiler then discloses this gap as its own uncertainty instead of
+    /// burying it in the aggregate.
+    pub proof_relevant: bool,
+}
+
+impl AcquisitionGap {
+    /// Deterministic single-line rendering used as an uncertainty basis.
+    pub fn render(&self) -> String {
+        match &self.path {
+            Some(path) => format!("{} {path}: {}", self.kind.as_str(), self.detail),
+            None => format!("{}: {}", self.kind.as_str(), self.detail),
+        }
+    }
+}
+
+/// Truthful acquisition state of a [`RepositorySnapshot`]: what the caller
+/// could actually READ, never conflated with what it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryAcquisition {
+    /// The caller read every path it needed to inspect. An empty file list
+    /// here is a GENUINELY empty (readable) repository.
+    Complete,
+    /// Part of the surface could not be acquired; `reasons` carries the typed
+    /// per-condition explanations. Missing paths may hide evidence.
+    Partial { reasons: Vec<AcquisitionGap> },
+    /// The repository surface could not be acquired at all; `reason` names
+    /// the typed cause. NEVER equivalent to an empty repository.
+    Unavailable { reason: String },
+}
+
+impl RepositoryAcquisition {
+    /// Stable label for diagnostics/telemetry.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial { .. } => "partial",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    /// TRUE only for a genuinely complete acquisition.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// TRUE when nothing of the repository surface could be acquired.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+
+    /// The typed gaps of a [`Self::Partial`] acquisition (empty otherwise).
+    pub fn reasons(&self) -> &[AcquisitionGap] {
+        match self {
+            Self::Partial { reasons } => reasons,
+            _ => &[],
+        }
+    }
+}
+
 /// A bounded snapshot of repository state the compiler reasons over.
-/// `complete` is the caller's completeness verdict: `false` means discovery
-/// refused or truncated, and the compiler then records an explicit
-/// uncertainty instead of silently analyzing a partial tree.
+/// `acquisition` is the caller's truthful acquisition verdict: a `Partial`
+/// or `Unavailable` state makes the compiler record explicit uncertainties
+/// instead of silently (or claiming to) analyzing a tree it could not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub files: Vec<RepositoryFile>,
-    pub complete: bool,
-    pub incompleteness: Option<String>,
+    pub acquisition: RepositoryAcquisition,
 }
 
 impl Default for RepositorySnapshot {
     fn default() -> Self {
         Self {
             files: Vec::new(),
-            complete: true,
-            incompleteness: None,
+            acquisition: RepositoryAcquisition::Complete,
         }
     }
 }
@@ -266,8 +369,7 @@ impl RepositorySnapshot {
     pub fn from_files(files: Vec<RepositoryFile>) -> Self {
         Self {
             files,
-            complete: true,
-            incompleteness: None,
+            acquisition: RepositoryAcquisition::Complete,
         }
     }
 
@@ -379,8 +481,12 @@ pub struct CompiledContract {
     pub touched_files: Vec<String>,
     /// The text-level touched-symbol graph (`fn foo in src/x.rs`, ...).
     pub touched_symbols: Vec<String>,
-    /// Content identity of the snapshot the contract was compiled against.
+    /// Content identity of the snapshot the contract was compiled against
+    /// (files AND truthful acquisition state).
     pub repository_digest: String,
+    /// The snapshot's truthful acquisition state; `Partial`/`Unavailable`
+    /// contracts carry explicit uncertainties and never claim full analysis.
+    pub repository_acquisition: RepositoryAcquisition,
     /// Per-provider enrichment outcomes (empty for native-only compiles).
     pub enrichments: Vec<EnrichmentOutcome>,
 }
@@ -536,7 +642,7 @@ impl<'a> NativeCompile<'a> {
         state.compile_migration_statements();
         state.compile_risks();
         state.record_uncertainties();
-        let repository_digest = repository_digest(&request.repository.files);
+        let repository_digest = repository_digest(&request.repository);
         CompiledContract {
             contract: state.contract,
             provenance: state.provenance,
@@ -546,6 +652,7 @@ impl<'a> NativeCompile<'a> {
             touched_files: state.touched_files,
             touched_symbols: state.touched_symbols,
             repository_digest,
+            repository_acquisition: request.repository.acquisition.clone(),
             enrichments: Vec::new(),
         }
     }
@@ -878,8 +985,10 @@ impl<'a> NativeCompile<'a> {
         let mut reasons: Vec<(StatementOrigin, u16, String, String, RiskSeverity)> = Vec::new();
         let has_obligations = !self.contract.proof_obligations.is_empty();
         if !has_obligations {
-            let reason = if self.build_systems.is_empty() {
-                "no build system was detected"
+            let reason = if self.request.repository.acquisition.is_unavailable() {
+                "the repository state was unavailable"
+            } else if self.build_systems.is_empty() {
+                "no build system was detected in the acquired snapshot"
             } else if self.selectors.is_empty() {
                 "no existing test was discovered"
             } else {
@@ -911,29 +1020,59 @@ impl<'a> NativeCompile<'a> {
             ));
         }
         if self.build_systems.is_empty() {
+            let (statement, basis) = match &self.request.repository.acquisition {
+                RepositoryAcquisition::Complete => (
+                    "no build system was detected; automated verification may be unavailable for this objective".to_string(),
+                    "manifest detection over the bounded snapshot found no known build-system manifest".to_string(),
+                ),
+                RepositoryAcquisition::Partial { .. } => (
+                    "no build system was detected in the partially acquired repository state; unread paths may contain manifests".to_string(),
+                    "manifest detection over the partially acquired snapshot found no known build-system manifest".to_string(),
+                ),
+                RepositoryAcquisition::Unavailable { reason } => (
+                    "no build system could be detected because the repository state was unavailable".to_string(),
+                    format!("repository acquisition is Unavailable: {reason}"),
+                ),
+            };
             reasons.push((
                 StatementOrigin::RepoAnalysis,
                 3_500,
-                "no build system was detected; automated verification may be unavailable for this objective".to_string(),
-                "manifest detection over the bounded snapshot found no known build-system manifest".to_string(),
+                statement,
+                basis,
                 RiskSeverity::Medium,
             ));
         }
         // Intent-vs-repository mismatches (source analysis): the goal names a
         // concern the bounded snapshot could not corroborate. Disclosed,
         // never silently dropped.
-        if self
+        let detects_migration = self
             .intent
             .iter()
-            .any(|token| MIGRATION_TOKENS.contains(&token.as_str()))
-            && detect_migration_files(&self.files).is_empty()
-        {
+            .any(|token| MIGRATION_TOKENS.contains(&token.as_str()));
+        if detects_migration && detect_migration_files(&self.files).is_empty() {
+            let (statement, basis, severity) = match &self.request.repository.acquisition {
+                RepositoryAcquisition::Complete => (
+                    "the objective names a migration, but no migration artifact was detected in the bounded snapshot".to_string(),
+                    "goal tokens name migration/schema; path-based migration detection found nothing".to_string(),
+                    RiskSeverity::Medium,
+                ),
+                RepositoryAcquisition::Partial { .. } => (
+                    "the objective names a migration, but no migration artifact was found in the partially acquired repository state".to_string(),
+                    "goal tokens name migration/schema; path-based migration detection found nothing in the partially acquired snapshot".to_string(),
+                    RiskSeverity::Medium,
+                ),
+                RepositoryAcquisition::Unavailable { reason } => (
+                    "the objective names a migration, but no migration artifact could be verified because the repository state was unavailable".to_string(),
+                    format!("goal tokens name migration/schema; no repository content could be acquired: {reason}"),
+                    RiskSeverity::Unknown,
+                ),
+            };
             reasons.push((
                 StatementOrigin::SourceAnalysis,
                 3_000,
-                "the objective names a migration, but no migration artifact was detected in the bounded snapshot".to_string(),
-                "goal tokens name migration/schema; path-based migration detection found nothing".to_string(),
-                RiskSeverity::Medium,
+                statement,
+                basis,
+                severity,
             ));
         }
         if self
@@ -942,27 +1081,74 @@ impl<'a> NativeCompile<'a> {
             .any(|token| RACE_TOKENS.contains(&token.as_str()))
             && self.touched_files.is_empty()
         {
+            let (statement, basis, severity) = match &self.request.repository.acquisition {
+                RepositoryAcquisition::Complete => (
+                    "the objective names concurrency or replay, but no matching code was found in the bounded snapshot".to_string(),
+                    "goal tokens name concurrency/replay; the matched-file set is empty".to_string(),
+                    RiskSeverity::Medium,
+                ),
+                RepositoryAcquisition::Partial { .. } => (
+                    "the objective names concurrency or replay, but no matching code was found in the partially acquired repository state".to_string(),
+                    "goal tokens name concurrency/replay; the matched-file set is empty over the partially acquired snapshot".to_string(),
+                    RiskSeverity::Medium,
+                ),
+                RepositoryAcquisition::Unavailable { reason } => (
+                    "the objective names concurrency or replay, but no matching code could be verified because the repository state was unavailable".to_string(),
+                    format!("goal tokens name concurrency/replay; no repository content could be acquired: {reason}"),
+                    RiskSeverity::Unknown,
+                ),
+            };
             reasons.push((
                 StatementOrigin::SourceAnalysis,
                 3_000,
-                "the objective names concurrency or replay, but no matching code was found in the bounded snapshot".to_string(),
-                "goal tokens name concurrency/replay; the matched-file set is empty".to_string(),
-                RiskSeverity::Medium,
+                statement,
+                basis,
+                severity,
             ));
         }
-        if !self.request.repository.complete {
-            reasons.push((
-                StatementOrigin::RepoAnalysis,
-                3_000,
-                "repository analysis was truncated; deterministic coverage may be missing"
-                    .to_string(),
-                self.request
-                    .repository
-                    .incompleteness
-                    .clone()
-                    .unwrap_or_else(|| "the caller reported an incomplete snapshot".to_string()),
-                RiskSeverity::Unknown,
-            ));
+        match &self.request.repository.acquisition {
+            RepositoryAcquisition::Complete => {}
+            RepositoryAcquisition::Unavailable { reason } => {
+                reasons.push((
+                    StatementOrigin::RepoAnalysis,
+                    3_000,
+                    "repository state is unavailable; no repository content could be analyzed for this objective"
+                        .to_string(),
+                    format!("repository acquisition is Unavailable: {reason}"),
+                    RiskSeverity::Unknown,
+                ));
+            }
+            RepositoryAcquisition::Partial { reasons: gaps } => {
+                // The state disclosure is emitted FIRST so the uncertainty
+                // cap can never silently drop it; proof-relevant gaps follow
+                // as their own bounded rows.
+                reasons.push((
+                    StatementOrigin::RepoAnalysis,
+                    3_000,
+                    "repository analysis is partial; deterministic coverage may be missing"
+                        .to_string(),
+                    format!(
+                        "repository acquisition is Partial; acquisition gaps: {}",
+                        gaps.iter()
+                            .map(AcquisitionGap::render)
+                            .collect::<Vec<String>>()
+                            .join("; ")
+                    ),
+                    RiskSeverity::Unknown,
+                ));
+                for gap in gaps.iter().filter(|gap| gap.proof_relevant) {
+                    reasons.push((
+                        StatementOrigin::RepoAnalysis,
+                        3_000,
+                        format!(
+                            "repository analysis is partial: proof-relevant content could not be acquired ({})",
+                            gap.kind.as_str()
+                        ),
+                        gap.render(),
+                        RiskSeverity::Unknown,
+                    ));
+                }
+            }
         }
         for (origin, confidence_bps, statement, basis, severity) in reasons {
             if self.uncertainties.len() >= MAX_UNCERTAINTIES {
@@ -1657,12 +1843,39 @@ fn matches_tokens(haystack_lower: &str, tokens: &[String]) -> bool {
 }
 
 /// Deterministic content identity of the snapshot the contract was compiled
-/// against.
-fn repository_digest(files: &[RepositoryFile]) -> String {
-    let mut sorted: Vec<&RepositoryFile> = files.iter().collect();
+/// against, including its truthful acquisition state: a partially readable
+/// tree is never byte-identical to a fully readable one with the same files.
+fn repository_digest(repository: &RepositorySnapshot) -> String {
+    let mut sorted: Vec<&RepositoryFile> = repository.files.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"faktor.contract.compile.repo.v1\0");
+    hasher.update(b"faktor.contract.compile.repo.v2\0");
+    match &repository.acquisition {
+        RepositoryAcquisition::Complete => {
+            hasher.update(b"complete\0");
+        }
+        RepositoryAcquisition::Partial { reasons } => {
+            hasher.update(b"partial\0");
+            for gap in reasons {
+                hasher.update(gap.kind.as_str().as_bytes());
+                hasher.update(b"\0");
+                hasher.update(gap.path.as_deref().unwrap_or("").as_bytes());
+                hasher.update(b"\0");
+                hasher.update(gap.detail.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(if gap.proof_relevant {
+                    b"proof\0"
+                } else {
+                    b"context\0"
+                });
+            }
+        }
+        RepositoryAcquisition::Unavailable { reason } => {
+            hasher.update(b"unavailable\0");
+            hasher.update(reason.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
     for file in sorted {
         hasher.update(file.path.as_bytes());
         hasher.update(b"\0");
@@ -1676,7 +1889,7 @@ fn repository_digest(files: &[RepositoryFile]) -> String {
         }
         hasher.update(b"\n");
     }
-    format!("repo1:{}", hasher.finalize().to_hex())
+    format!("repo2:{}", hasher.finalize().to_hex())
 }
 
 /// The deterministic statement id, replicating the session's user-authored
@@ -1866,6 +2079,11 @@ fn replayed_refresh_token_fails() {}
     #[test]
     fn empty_repository_records_uncertainty_instead_of_fabrication() {
         let compiled = compile_contract(&request(REFRESH_GOAL, RepositorySnapshot::default()));
+        assert_eq!(
+            compiled.repository_acquisition,
+            RepositoryAcquisition::Complete,
+            "a genuinely empty (readable) repository is complete"
+        );
         assert!(compiled.contract.proof_obligations.is_empty());
         assert!(
             !compiled.contract.is_empty(),
@@ -1875,6 +2093,16 @@ fn replayed_refresh_token_fails() {}
         assert!(compiled.uncertainties.iter().any(|uncertainty| uncertainty
             .statement
             .contains("no deterministic proof obligation")));
+        assert!(
+            !compiled.uncertainties.iter().any(|uncertainty| uncertainty
+                .statement
+                .contains("repository analysis is partial")
+                || uncertainty
+                    .statement
+                    .contains("repository state is unavailable")),
+            "an honest empty repository claims neither partiality nor unavailability: {:?}",
+            compiled.uncertainties
+        );
         // Every uncertainty is durable as a risk hypothesis of the contract
         // (Medium disclosure, never a fabricated obligation).
         for uncertainty in &compiled.uncertainties {
@@ -1964,6 +2192,24 @@ fn replayed_refresh_token_fails() {}
         assert_eq!(
             a.contract, d.contract,
             "prose changes do not re-id the contract"
+        );
+        // Acquisition gaps compile deterministically, and a partially
+        // readable tree is never byte-identical to the fully readable one.
+        let mut partial = refresh_snapshot();
+        partial.acquisition = RepositoryAcquisition::Partial {
+            reasons: vec![AcquisitionGap {
+                kind: AcquisitionGapKind::UnreadableFile,
+                path: Some("src/auth/refresh.rs".into()),
+                detail: "selected file could not be read: permission denied".into(),
+                proof_relevant: true,
+            }],
+        };
+        let e = compile_contract(&request(REFRESH_GOAL, partial.clone()));
+        let f = compile_contract(&request(REFRESH_GOAL, partial));
+        assert_eq!(e, f, "acquisition state compiles deterministically");
+        assert_ne!(
+            a.repository_digest, e.repository_digest,
+            "acquisition state is part of the snapshot identity"
         );
     }
 
@@ -2289,23 +2535,105 @@ fn replayed_refresh_token_fails() {}
     }
 
     #[test]
-    fn incomplete_repository_records_an_unknown_severity_uncertainty() {
+    fn partial_repository_discloses_state_gaps_and_never_claims_full_analysis() {
         let mut repository = refresh_snapshot();
-        repository.complete = false;
-        repository.incompleteness = Some("entry cap reached".into());
-        let compiled = compile_contract(&request(REFRESH_GOAL, repository));
-        let truncated = compiled
+        repository.acquisition = RepositoryAcquisition::Partial {
+            reasons: vec![AcquisitionGap {
+                kind: AcquisitionGapKind::InvalidUtf8,
+                path: Some("src/auth/refresh.rs".into()),
+                detail: "selected file is not valid UTF-8 text".into(),
+                proof_relevant: true,
+            }],
+        };
+        let compiled = compile_contract(&request(REFRESH_GOAL, repository.clone()));
+        assert_eq!(compiled.repository_acquisition, repository.acquisition);
+        assert!(
+            compiled.has_uncertainty(),
+            "a partial snapshot must never compile to a silently full contract"
+        );
+        let partial = compiled
             .uncertainties
             .iter()
-            .find(|uncertainty| uncertainty.statement.contains("truncated"))
-            .expect("the truncation uncertainty");
+            .find(|uncertainty| uncertainty.statement.contains("partial"))
+            .expect("the partial-acquisition uncertainty");
+        assert_eq!(partial.origin, StatementOrigin::RepoAnalysis);
+        assert!(
+            partial.basis.contains("refresh.rs"),
+            "the aggregate basis names the gap: {}",
+            partial.basis
+        );
         let risk = compiled
             .contract
             .risks
             .iter()
-            .find(|risk| risk.id == truncated.id)
+            .find(|risk| risk.id == partial.id)
             .expect("the uncertainty is durable");
         assert_eq!(risk.severity, RiskSeverity::Unknown);
+        // The readable files still ground obligations, but the proof-relevant
+        // gap is disclosed as its own row: the two are never silently
+        // conflated into a trustworthy full analysis.
+        assert!(!compiled.contract.proof_obligations.is_empty());
+        assert!(compiled.uncertainties.iter().any(|uncertainty| uncertainty
+            .statement
+            .contains("proof-relevant")
+            && uncertainty.basis.contains("refresh.rs")));
+    }
+
+    #[test]
+    fn unavailable_repository_is_never_analyzed_as_an_empty_repo() {
+        let compiled = compile_contract(&request(
+            REFRESH_GOAL,
+            RepositorySnapshot {
+                files: Vec::new(),
+                acquisition: RepositoryAcquisition::Unavailable {
+                    reason: "workspace root unreadable: permission denied".into(),
+                },
+            },
+        ));
+        assert!(compiled.repository_acquisition.is_unavailable());
+        assert!(compiled.contract.proof_obligations.is_empty());
+        assert!(!compiled.contract.is_empty());
+        let unavailable = compiled
+            .uncertainties
+            .iter()
+            .find(|uncertainty| {
+                uncertainty
+                    .statement
+                    .contains("repository state is unavailable")
+            })
+            .expect("the unavailable-acquisition uncertainty");
+        assert_eq!(unavailable.origin, StatementOrigin::RepoAnalysis);
+        assert!(unavailable.basis.contains("permission denied"));
+        // The heuristic conclusion names the unavailable state, not an empty
+        // construction result.
+        assert!(compiled.uncertainties.iter().any(|uncertainty| uncertainty
+            .statement
+            .contains("no deterministic proof obligation")
+            && uncertainty
+                .statement
+                .contains("the repository state was unavailable")));
+        // No row may claim the repository was analyzed: the build-system
+        // disclosure names the unavailable state, not an empty scan result.
+        let build = compiled
+            .uncertainties
+            .iter()
+            .find(|uncertainty| uncertainty.statement.contains("build system"))
+            .expect("the build-system uncertainty");
+        assert!(
+            build.statement.contains("unavailable"),
+            "{}",
+            build.statement
+        );
+        assert!(
+            !compiled.uncertainties.iter().any(|uncertainty| {
+                uncertainty
+                    .statement
+                    .contains("no migration artifact was detected")
+                    || uncertainty.statement.contains("no matching code was found")
+            }),
+            "an unavailable repository cannot claim a search found nothing: {:?}",
+            compiled.uncertainties
+        );
     }
 
     #[test]

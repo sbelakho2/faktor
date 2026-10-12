@@ -50,12 +50,25 @@ fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json
         "verifiedFirstPassChanges": m.verified_first_pass_changes,
         "verifiedFirstPassPpm": m.verified_first_pass_ppm,
         "totalVerifiedSpendMicro": m.total_verified_spend_micro,
-        "verifiedCostPerChangeMicro": m.verified_cost_per_change_micro,
+        "successfulRunCostMicro": m.successful_run_cost_micro,
         "totalSpendMicro": m.total_spend_micro,
+        "verifiedCostPerSuccessfulChangeMicro": m.verified_cost_per_successful_change_micro,
         "totalReworkSpendMicro": m.total_rework_spend_micro,
         "reworkCostRatioPpm": m.rework_cost_ratio_ppm,
         "localRuns": m.local_runs,
-        "localSubstitutionPpm": m.local_substitution_ppm,
+        "localOnlyRuns": m.local_only_runs,
+        "localOnlyVerifiedChanges": m.local_only_verified_changes,
+        "localOnlyVerifiedPpm": m.local_only_verified_ppm,
+        "localFinalRuns": m.local_final_runs,
+        "localFinalVerifiedChanges": m.local_final_verified_changes,
+        "localFinalVerifiedPpm": m.local_final_verified_ppm,
+        "localFirstRuns": m.local_first_runs,
+        "localFirstSuccessChanges": m.local_first_success_changes,
+        "localFirstSuccessPpm": m.local_first_success_ppm,
+        "localToFrontierFallbackRuns": m.local_to_frontier_fallback_runs,
+        "localToFrontierFallbackPpm": m.local_to_frontier_fallback_ppm,
+        "frontierOnlyRuns": m.frontier_only_runs,
+        "frontierOnlyPpm": m.frontier_only_ppm,
         "avoidedHostedInferenceMicro": m.avoided_hosted_inference_micro,
         "totalWallTimeMs": m.total_wall_time_ms,
         "meanTimeToVerifiedChangeMs": m.mean_time_to_verified_change_ms,
@@ -126,8 +139,9 @@ fn run_json(record: &faktor_agent::RunOutcomeRecord) -> serde_json::Value {
 }
 
 /// `GET /native/outcomes[?limit=<n>&before_ms=<ms>&before_run=<id>]` — the
-/// Engineering Outcome Ledger's durable aggregates (all ten first-class
-/// metrics plus the fold's scan honesty) and one bounded newest-first page
+/// Engineering Outcome Ledger's durable aggregates (the first-class metrics,
+/// including Successful-Run Cost and the all-in VCSC, plus the fold's scan
+/// honesty) and one bounded newest-first page
 /// of runs. Pure read; auth-gated; strict DTO; oversized/zero limits and
 /// half-given cursors are 400s.
 pub(crate) async fn native_outcomes(

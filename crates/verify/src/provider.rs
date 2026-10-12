@@ -458,7 +458,10 @@ pub struct VerificationRequest {
     /// the request's operation ([`crate::claims::op_for_claim`]).
     pub claims: Vec<ClaimRequest>,
     /// The candidate subject snapshot the caller declares the verification
-    /// is requested against (stamped onto provider claim results).
+    /// is requested against. When present, every per-claim provider result
+    /// must ECHO this exact identity (missing or mismatched subject, in the
+    /// result or in its verdict basis, is a typed refusal at validation);
+    /// Faktor never stamps it onto a result after the fact.
     pub subject_snapshot: Option<SubjectSnapshot>,
     pub max_output_bytes: usize,
     /// Demand INDEPENDENT verification: dispatch skips the native baseline
@@ -738,8 +741,9 @@ impl VerificationResponse {
     }
 
     /// Validate the response against its request: op identity, per-field
-    /// bounds, claim identity/completeness and the request's total output
-    /// bound. Every failure is typed.
+    /// bounds, claim identity/completeness, the subject-identity echo law
+    /// (a declared request subject must be echoed exactly by every result)
+    /// and the request's total output bound. Every failure is typed.
     pub fn validate(&self, request: &VerificationRequest) -> Result<(), VerificationError> {
         if self.op != request.op {
             return Err(VerificationError::Malformed(format!(
@@ -778,6 +782,15 @@ impl VerificationResponse {
         // every REQUIRED claim (unless it declared the whole batch
         // unavailable with no claim detail at all). A silently omitted
         // required claim is a typed refusal, never accepted data.
+        //
+        // Subject identity is structural too (the neutral law 3): when the
+        // request declares a subject snapshot, every per-claim result must
+        // ECHO that exact identity in its subject snapshot AND basis
+        // subject. A missing or mismatched subject is a typed refusal — the
+        // runtime never stamps the current candidate onto an external
+        // result after the fact (`ClaimVerificationResult::validate` only
+        // checks a supplied snapshot structurally; the equality to the
+        // request is enforced HERE, across every provider).
         if !self.claims.is_empty() && request.claims.is_empty() {
             return Err(VerificationError::Malformed(
                 "verification response carries claims for a request without a claim batch"
@@ -787,6 +800,7 @@ impl VerificationResponse {
         let mut seen = std::collections::BTreeSet::new();
         for claim in &self.claims {
             claim.validate()?;
+            claim.validate_subject_identity(request.subject_snapshot.as_ref())?;
             if !request
                 .claims
                 .iter()
@@ -1739,6 +1753,135 @@ mod tests {
             VerificationError::Malformed(detail) => assert!(detail.contains("po1:b"), "{detail}"),
             other => panic!("expected typed Malformed, got {other:?}"),
         }
+    }
+
+    /// A provider verdict that does not ECHO the request's declared subject
+    /// snapshot is refused at the registry boundary: a missing or mismatched
+    /// subject snapshot — or a missing/mismatched basis subject — never
+    /// passes, so the current candidate can never be stamped onto a foreign
+    /// verdict after the fact.
+    #[tokio::test]
+    async fn a_provider_verdict_must_echo_the_requested_subject_identity() {
+        async fn dispatch(
+            result: ClaimVerificationResult,
+            request: VerificationRequest,
+            claim: ClaimRequest,
+        ) -> Result<Vec<ClaimVerificationResult>, VerificationError> {
+            let provider = Arc::new(BatchProvider {
+                id: "external",
+                native: false,
+                capability: VerificationCapabilities::of_many(&VerificationOp::ALL),
+                verdict: Box::new(move |request: &VerificationRequest| {
+                    Ok(VerificationResponse::new(
+                        VerificationProviderId::parse("external").unwrap(),
+                        request.op,
+                        VerificationOutcome::Passed,
+                    )
+                    .with_claims(vec![result.clone()]))
+                }),
+            });
+            let mut registry = VerificationRegistry::new();
+            registry.register(provider);
+            registry.verify_claims(request, vec![claim]).await
+        }
+
+        let claim = batch_claim(
+            "po1:a",
+            ProofEvidenceKind::ContractCheck,
+            EvidenceBinding::ContractIds(vec!["c1".into()]),
+            Requirement::Required,
+        );
+        let candidate = SubjectSnapshot::new("tm1:candidate").with_environment("env-1");
+        let foreign = SubjectSnapshot::new("tm1:foreign");
+        let request_with_subject = claim_batch_request().with_subject_snapshot(candidate.clone());
+        let verdict = |subject: Option<SubjectSnapshot>, basis: Option<SubjectSnapshot>| {
+            let mut result = ClaimVerificationResult::verdict(
+                VerificationProviderId::parse("external").unwrap(),
+                "po1:a",
+                ClaimState::Supported,
+                EvidenceStrength::Observed,
+                vec![ArtifactRef::new(ProofEvidenceKind::ContractCheck, "ext", "ok").unwrap()],
+                Vec::new(),
+            );
+            result.subject_snapshot = subject;
+            result.basis.subject = basis;
+            result
+        };
+
+        // The exact echo is the only accepted shape, and the echoed identity
+        // is what comes back.
+        let results = dispatch(
+            verdict(Some(candidate.clone()), Some(candidate.clone())),
+            request_with_subject.clone(),
+            claim.clone(),
+        )
+        .await
+        .expect("an exact echo is accepted");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].subject_snapshot.as_ref(), Some(&candidate));
+        assert_eq!(results[0].basis.subject.as_ref(), Some(&candidate));
+
+        // A MISSING subject snapshot is a typed refusal.
+        let err = dispatch(
+            verdict(None, None),
+            request_with_subject.clone(),
+            claim.clone(),
+        )
+        .await
+        .expect_err("a missing subject must be refused");
+        match err {
+            VerificationError::Malformed(detail) => {
+                assert!(detail.contains("po1:a"), "{detail}");
+                assert!(detail.contains("subject"), "{detail}");
+            }
+            other => panic!("expected typed Malformed, got {other:?}"),
+        }
+
+        // A MISMATCHED subject snapshot is a typed refusal.
+        let err = dispatch(
+            verdict(Some(foreign.clone()), Some(foreign.clone())),
+            request_with_subject.clone(),
+            claim.clone(),
+        )
+        .await
+        .expect_err("a mismatched subject must be refused");
+        assert!(matches!(err, VerificationError::Malformed(_)), "{err:?}");
+
+        // An echoed snapshot with an UNBOUND basis subject is refused.
+        let err = dispatch(
+            verdict(Some(candidate.clone()), None),
+            request_with_subject.clone(),
+            claim.clone(),
+        )
+        .await
+        .expect_err("a missing basis subject must be refused");
+        match err {
+            VerificationError::Malformed(detail) => assert!(detail.contains("basis"), "{detail}"),
+            other => panic!("expected typed Malformed, got {other:?}"),
+        }
+
+        // An echoed snapshot with a basis naming ANOTHER subject is refused.
+        let err = dispatch(
+            verdict(Some(candidate), Some(foreign)),
+            request_with_subject,
+            claim.clone(),
+        )
+        .await
+        .expect_err("a mismatched basis subject must be refused");
+        match err {
+            VerificationError::Malformed(detail) => assert!(detail.contains("basis"), "{detail}"),
+            other => panic!("expected typed Malformed, got {other:?}"),
+        }
+
+        // A request WITHOUT a declared subject requires no identity (the
+        // documented no-subject semantics): the same subject-less verdict is
+        // accepted, with no synthesized snapshot.
+        let results = dispatch(verdict(None, None), claim_batch_request(), claim)
+            .await
+            .expect("no declared request subject = no identity requirement");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].subject_snapshot.is_none());
+        assert!(results[0].basis.subject.is_none());
     }
 
     #[tokio::test]

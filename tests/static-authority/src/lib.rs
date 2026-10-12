@@ -8755,9 +8755,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         max_lines: usize,
     }
 
-    /// THE shrink-only grandfather list (seven giants recorded when the
-    /// 500-line gate landed). Removing an entry is progress; editing
-    /// `max_lines` upward is forbidden by the gate's own growth check.
+    /// THE shrink-only grandfather list (recorded when the 500-line gate
+    /// landed; `type_defs` was retired when it was split into per-domain
+    /// helpers). Removing an entry is progress; editing `max_lines` upward
+    /// is forbidden by the gate's own growth check.
     const FUNCTION_GRANDFATHERS: &[Grandfathered] = &[
         Grandfathered {
             rel: "crates/agent/src/runtime/tool_loop.rs",
@@ -8778,11 +8779,6 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             rel: "crates/index/src/service/mod.rs",
             name: "run_build",
             max_lines: 546,
-        },
-        Grandfathered {
-            rel: "crates/protocol/src/schema.rs",
-            name: "type_defs",
-            max_lines: 527,
         },
         Grandfathered {
             rel: "crates/agent/src/runtime/compaction.rs",

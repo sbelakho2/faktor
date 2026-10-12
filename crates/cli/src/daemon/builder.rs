@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// The shared trait-object handle of the OPTIONAL system-intelligence
+/// enrichment seam (the contract compiler's `compile_contract_with`
+/// provider). Every production entry passes `None`, so drive-start contract
+/// compilation keeps the byte-identical native path; a daemon whose
+/// `[semantic]` section configures external providers installs the
+/// [`faktor_semantic::SemanticIntelligenceAdapter`] over its ONE registry,
+/// and the production-wiring certification injects a spy through
+/// [`build_daemon_with_system_intelligence`] to prove the seam is consulted
+/// through the real `build_daemon_core` assembly. There is no config key,
+/// environment variable or CLI flag for this seam.
+pub type SystemIntelligenceHandle =
+    Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>;
+
 /// The injectable EXTERNAL seams of the daemon's GitHub App surface — the
 /// pieces of the `[cloud.github_app]` completion-SCM wiring that talk to the
 /// network or read the wall clock, so a certification host can substitute a
@@ -60,7 +73,7 @@ pub fn build_daemon_with_scm_seams(
     config: Option<config::Config>,
     scm_seams: GithubAppSeams,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_seams_and_planner(data_dir, config, scm_seams, None)
+    build_daemon_with_seams_and_planner(data_dir, config, scm_seams, None, None)
 }
 
 /// [`build_daemon`] with an explicit Faktor Acquire planner seam. Every
@@ -76,17 +89,39 @@ pub fn build_daemon_with_acquisition_planner(
     config: Option<config::Config>,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_seams_and_planner(data_dir, config, GithubAppSeams::default(), planner)
+    build_daemon_with_seams_and_planner(data_dir, config, GithubAppSeams::default(), planner, None)
+}
+
+/// [`build_daemon`] with an explicit system-intelligence provider seam (the
+/// contract compiler's additive enrichment path). Production entries pass
+/// `None`; the daemon then installs the semantic-registry adapter itself
+/// when `[semantic] providers` is configured, and nothing when it is not.
+/// The production-wiring certification passes a spy here to prove the REAL
+/// `build_daemon_core` assembly installs it on the runtime and that
+/// drive-start contract compilation consults it on the production turn path.
+pub fn build_daemon_with_system_intelligence(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    system_intelligence: Option<SystemIntelligenceHandle>,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_seams_and_planner(
+        data_dir,
+        config,
+        GithubAppSeams::default(),
+        None,
+        system_intelligence,
+    )
 }
 
 /// The one shared sync construction path: steps 1-2 (store/session + CAS),
-/// step 3 (the ONE supervisor) and the core (steps 4-21) over both explicit
-/// seams (`None` in every production entry).
+/// step 3 (the ONE supervisor) and the core (steps 4-21) over every explicit
+/// seam (`None` in every production entry).
 pub(crate) fn build_daemon_with_seams_and_planner(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
     scm_seams: GithubAppSeams,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
+    system_intelligence: Option<SystemIntelligenceHandle>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     // PURE preflight BEFORE the data dir/store/CAS exist: a refused config
@@ -108,6 +143,7 @@ pub(crate) fn build_daemon_with_seams_and_planner(
         None,
         graph::SemanticCfg::default(),
         planner,
+        system_intelligence,
         scm_seams,
     )
 }
@@ -268,6 +304,7 @@ pub(crate) async fn build_daemon_with_mcp_inner(
         mcp_tools,
         chunk_tx,
         semantic,
+        None,
         None,
         GithubAppSeams::default(),
     )?;
@@ -999,7 +1036,12 @@ pub(crate) fn daemon_context_prior(
 /// of the daemon lifetime is this function's construction. The `scm_seams`
 /// are EXTERNAL seam substitutions only (`None` in production): the
 /// completion SCM provider is transformed from `[cloud.github_app]` here,
-/// never installed onto the executor after the build.
+/// never installed onto the executor after the build. `system_intelligence`
+/// is the same kind of seam for the contract compiler's optional enrichment
+/// provider: `Some` (certification spy, or the adapter the core itself
+/// installs over a configured `[semantic]` registry) is installed on the
+/// runtime below; `None` with no configured semantic providers leaves
+/// drive-start contract compilation byte-identical to the native path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_daemon_core(
     data_dir: &std::path::Path,
@@ -1010,6 +1052,7 @@ pub(crate) fn build_daemon_core(
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
     semantic: graph::SemanticCfg,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
+    system_intelligence: Option<SystemIntelligenceHandle>,
     scm_seams: GithubAppSeams,
 ) -> Result<DaemonGraph, String> {
     // ONE policy instance for every provider call of this daemon (chat turns
@@ -1180,6 +1223,13 @@ pub(crate) fn build_daemon_core(
         // store; the project-memory authority over the SAME store; and the
         // tokenizer registry with the real local backends (unregistered
         // identities keep their conservative UpperBound label).
+        //
+        // The `[semantic]` section is ALSO the CONFIGURATION of contract
+        // enrichment: any configured external provider makes the core install
+        // the semantic-registry adapter as the runtime's system-intelligence
+        // provider below. An empty provider list installs nothing (native
+        // byte-identical contract compilation).
+    let semantic_enrichment_configured = !semantic.providers.is_empty();
     let semantic = graph::semantic_registry(&semantic, &supervisor, &transport)?;
     let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
     let memory = graph::DaemonMemory::new(store.clone());
@@ -1351,6 +1401,22 @@ pub(crate) fn build_daemon_core(
     // when `[verification.kiwi]` is disabled) dispatches nothing, so default
     // completion behavior is unchanged.
     agent.set_verification_providers(verification_providers.registry.clone());
+    // The system-intelligence enrichment seam (contract compiler): an
+    // explicit injected provider (the production-wiring certification's spy)
+    // wins; otherwise a configured `[semantic]` provider set installs the
+    // ONE semantic-registry adapter over the SAME registry Arc the agent and
+    // server serve. Nothing configured => nothing installed, and drive-start
+    // contract compilation stays byte-identical to the native path.
+    let system_intelligence = match system_intelligence {
+        Some(provider) => Some(provider),
+        None if semantic_enrichment_configured => Some(Arc::new(
+            faktor_semantic::SemanticIntelligenceAdapter::new(semantic.clone()),
+        ) as SystemIntelligenceHandle),
+        None => None,
+    };
+    if let Some(provider) = system_intelligence {
+        agent.set_system_intelligence_provider(provider);
+    }
     for ollama in ollama_warmers {
         warm_ollama(ollama);
     }

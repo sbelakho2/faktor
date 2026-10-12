@@ -438,8 +438,27 @@ impl Subscription {
 pub const FEATURE_MANAGED_PROVIDERS: &str = "managed_providers";
 pub const FEATURE_BYOK: &str = "byok";
 pub const FEATURE_CREDITS: &str = "credits";
-/// Every legal feature tag (strict: an unknown tag is a config error).
-pub const ALL_FEATURES: &[&str] = &[FEATURE_MANAGED_PROVIDERS, FEATURE_BYOK, FEATURE_CREDITS];
+/// Every legal feature tag (strict: an unknown tag is a config error). The
+/// inference-centric tags above plus the value-centric vocabulary of
+/// [`crate::value`] (the 10 value entitlements and the 2 governance
+/// capability flags): a plan maps both halves from the SAME feature set.
+pub const ALL_FEATURES: &[&str] = &[
+    FEATURE_MANAGED_PROVIDERS,
+    FEATURE_BYOK,
+    FEATURE_CREDITS,
+    crate::value::FEATURE_ADVANCED_VERIFICATION_POLICY,
+    crate::value::FEATURE_ORGANIZATION_CONTRACTS,
+    crate::value::FEATURE_SHARED_INTELLIGENCE,
+    crate::value::FEATURE_CROSS_REPO_INTELLIGENCE,
+    crate::value::FEATURE_OUTCOME_ANALYTICS,
+    crate::value::FEATURE_SIGNED_PROOF_PROVENANCE,
+    crate::value::FEATURE_AUDIT_RETENTION_HISTORY,
+    crate::value::FEATURE_MODEL_OPTIMIZATION_LEARNING,
+    crate::value::FEATURE_PRIVATE_RUNNERS,
+    crate::value::FEATURE_ENTERPRISE_GOVERNANCE,
+    crate::value::FEATURE_GOVERNANCE_SSO,
+    crate::value::FEATURE_GOVERNANCE_SCIM,
+];
 
 /// Legal plan limit names.
 pub const LIMIT_MAX_ACTIVE_TASKS: &str = "max_active_tasks";

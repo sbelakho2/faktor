@@ -22,7 +22,14 @@
 //! - [`billing_store`]: the [`billing_store::BillingStore`] seam over the
 //!   SAME SQLite database (its own migration v2) and the in-memory twin;
 //! - [`entitlements`]: the [`entitlements::EntitlementService`] — the ONE
-//!   snapshot/derivation authority and the ONE admission gate.
+//!   snapshot/derivation authority and the ONE admission gate;
+//! - [`value`]: the VALUE-centric paid entitlement vocabulary (advanced
+//!   verification policy, organization contracts, shared/cross-repo
+//!   intelligence, outcome analytics, signed proof/provenance, audit
+//!   retention history, model-optimization learning, private runners,
+//!   enterprise governance capability flags): plan-mapped, typed and
+//!   independent of inference volume, with the offline-capable
+//!   [`value::ValueGate`] default.
 
 pub mod billing;
 pub mod billing_store;
@@ -44,6 +51,7 @@ pub mod report_schedule;
 pub mod service;
 pub mod sso;
 pub mod store;
+pub mod value;
 pub mod vendor;
 
 pub use billing::{
@@ -122,6 +130,15 @@ pub use store::{
     CloudStoreError, ControlPlaneStore, IdempotencyRecord, MemoryControlPlaneStore,
     SqliteControlPlaneStore, IDEMPOTENCY_TTL_MS, MAX_IDEMPOTENCY_ROWS,
     MAX_IDEMPOTENT_RESPONSE_BYTES,
+};
+pub use value::{
+    EnforcementHook, GovernanceCapabilities, GovernanceCapability, ValueEntitlement,
+    ValueEntitlementDecision, ValueEntitlementRefused, ValueEntitlementSet, ValueGate,
+    ValueRefusalCause, FEATURE_ADVANCED_VERIFICATION_POLICY, FEATURE_AUDIT_RETENTION_HISTORY,
+    FEATURE_CROSS_REPO_INTELLIGENCE, FEATURE_ENTERPRISE_GOVERNANCE, FEATURE_GOVERNANCE_SCIM,
+    FEATURE_GOVERNANCE_SSO, FEATURE_MODEL_OPTIMIZATION_LEARNING, FEATURE_ORGANIZATION_CONTRACTS,
+    FEATURE_OUTCOME_ANALYTICS, FEATURE_PRIVATE_RUNNERS, FEATURE_SHARED_INTELLIGENCE,
+    FEATURE_SIGNED_PROOF_PROVENANCE, VALUE_FEATURE_TAGS,
 };
 pub use vendor::{
     BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,

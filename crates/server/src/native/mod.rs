@@ -65,6 +65,9 @@ pub mod terminal_authority;
 /// `[updater]` section is enabled).
 pub(crate) mod updater;
 pub(crate) mod usage;
+/// Value-centric paid entitlement report (`/native/value-entitlements`;
+/// plan-mapped, inference-independent; absent unless `[billing]` is on).
+pub(crate) mod value;
 pub(crate) mod verification;
 /// The remote/VPC worker plane (registration/leases/jobs; absent unless the
 /// `[workers]` section is enabled).
@@ -95,6 +98,7 @@ pub(crate) use task::*;
 pub(crate) use terminal::*;
 pub(crate) use updater::*;
 pub(crate) use usage::*;
+pub(crate) use value::*;
 pub(crate) use verification::*;
 pub(crate) use workers::*;
 

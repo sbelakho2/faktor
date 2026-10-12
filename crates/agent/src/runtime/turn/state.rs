@@ -590,6 +590,18 @@ pub struct AgentRuntime {
     /// (Kiwi-shaped) providers.
     pub(crate) verification_providers:
         std::sync::Mutex<Option<Arc<faktor_verify::VerificationRegistry>>>,
+    /// The OPTIONAL neutral system-intelligence enrichment provider (the
+    /// `compile_contract_with` seam). `None` (the default, and any daemon
+    /// with no configured external semantic provider) keeps drive-start
+    /// contract compilation on the byte-identical native path. Installed by
+    /// the daemon through [`AgentRuntime::set_system_intelligence_provider`]
+    /// — the semantic-registry adapter when `[semantic] providers` is
+    /// configured, or the production-wiring certification's spy through the
+    /// builder seam. Enrichment is strictly additive with
+    /// `external:<provider>` provenance and can never fail a turn.
+    pub(crate) system_intelligence: std::sync::Mutex<
+        Option<Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>>,
+    >,
 }
 
 #[derive(Debug, Clone)]
@@ -1908,6 +1920,7 @@ impl AgentRuntime {
             provider_debits: std::sync::Mutex::new(None),
             retry_policy_override: std::sync::Mutex::new(None),
             verification_providers: std::sync::Mutex::new(None),
+            system_intelligence: std::sync::Mutex::new(None),
         }))
     }
 
@@ -1927,6 +1940,34 @@ impl AgentRuntime {
     /// The installed neutral verification registry, when one was installed.
     pub(crate) fn verification_registry(&self) -> Option<Arc<faktor_verify::VerificationRegistry>> {
         self.verification_providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Install the OPTIONAL neutral system-intelligence enrichment provider
+    /// consulted at drive-start contract compilation
+    /// (`compile_contract_with`). Additive: a runtime without one compiles
+    /// exactly the native contract byte-for-byte; an installed provider's
+    /// statements are appended with `external:<provider>` provenance, and a
+    /// refusing/erroring provider leaves the native contract untouched (it is
+    /// diagnosed in the compile outcome, never a failed turn).
+    pub fn set_system_intelligence_provider(
+        &self,
+        provider: Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>,
+    ) {
+        *self
+            .system_intelligence
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(provider);
+    }
+
+    /// The installed system-intelligence provider, when one was installed.
+    pub(crate) fn system_intelligence_provider(
+        &self,
+    ) -> Option<Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>>
+    {
+        self.system_intelligence
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()

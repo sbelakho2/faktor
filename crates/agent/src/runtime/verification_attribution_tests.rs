@@ -3220,9 +3220,15 @@ async fn deterministic_gate_feeds_verified_samples_keyed_by_provider_model_phase
         .unwrap();
     assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
     drop(runtime);
-    let after_success = outcomes
-        .phase_stats("fake", "m", RouterPhase::Implement)
-        .expect("the verified turn recorded Implement samples");
+    // The terminal turn's samples ride the run's ONE engineering-outcome
+    // record and its atomic durable append: the store-backed registry sees
+    // exactly the verified success, and the policy's own (memory) telemetry
+    // store deliberately does NOT (the sample is never fed twice).
+    let durable = manager.store();
+    let after_success = durable
+        .model_outcome_stats_phase("fake", "m", RouterPhase::Implement)
+        .unwrap()
+        .expect("the verified turn recorded Implement samples in the ledger registry");
     assert!(
         after_success.successes_first_pass >= 1,
         "the deterministic verified-success signal recorded success samples: {after_success:?}"
@@ -3236,10 +3242,15 @@ async fn deterministic_gate_feeds_verified_samples_keyed_by_provider_model_phase
         "success samples never carry rework"
     );
     assert!(
-        outcomes
-            .phase_stats("fake", "m", RouterPhase::Review)
+        durable
+            .model_outcome_stats_phase("fake", "m", RouterPhase::Review)
+            .unwrap()
             .is_none(),
         "no Review samples without a review call"
+    );
+    assert!(
+        outcomes.phase_stats("fake", "m", RouterPhase::Implement).is_none(),
+        "the terminal turn's verified sample is fed atomically by the ledger record, never also per call"
     );
     let successes_before = after_success.successes_first_pass;
 
@@ -3283,11 +3294,14 @@ async fn deterministic_gate_feeds_verified_samples_keyed_by_provider_model_phase
         "{o2:?}"
     );
     drop(runtime2);
+    // The run is already recorded, so THIS turn's samples keep the per-call
+    // feed (the policy's own store sees the failures) — and the durable
+    // registry still holds exactly the one recorded success.
     let after_failure = outcomes
         .phase_stats("fake", "m", RouterPhase::Implement)
         .expect("samples still recorded");
     assert_eq!(
-        after_failure.successes_first_pass, successes_before,
+        after_failure.successes_first_pass, 0,
         "a failed verification never learns a success"
     );
     assert!(
@@ -3298,6 +3312,15 @@ async fn deterministic_gate_feeds_verified_samples_keyed_by_provider_model_phase
         after_failure.sample_count,
         after_failure.successes_first_pass + after_failure.failures_first_pass
     );
+    let durable_after = durable
+        .model_outcome_stats_phase("fake", "m", RouterPhase::Implement)
+        .unwrap()
+        .expect("the recorded success row still exists after the failing turn");
+    assert_eq!(
+        durable_after.successes_first_pass, successes_before,
+        "the recorded success is never re-fed or flipped by a later gate"
+    );
+    assert_eq!(durable_after.failures_first_pass, 0);
 }
 
 #[tokio::test]
@@ -3366,6 +3389,97 @@ async fn semantic_high_risk_upgrades_review_strength_tier_and_parallelism() {
         review_req.quality_floor > crate::ModelCallIntent::review().quality_floor(),
         "escalation must raise the floor"
     );
+}
+
+/// The production producer (economic audit item 7 P1): a real terminal
+/// VerifiedComplete turn appends ONE engineering-outcome record from its
+/// durable facts — identity, acceptance/integration, first-pass/repair,
+/// proof coverage, final basis and the settled model sequence — and the
+/// terminal turn's explicit verified samples ride the record's atomic
+/// append (never also the per-call feed, never twice).
+#[tokio::test]
+async fn terminal_verified_turn_produces_one_derived_engineering_outcome_record() {
+    let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+    let outcomes: Arc<faktor_router::MemoryOutcomeStore> =
+        Arc::new(faktor_router::MemoryOutcomeStore::new());
+    let routing = outcome_wired_policy(outcomes.clone());
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({
+                "path": "src/calc.rs",
+                "content": "pub fn add(a: i32, b: i32) -> i32 {\n    let sum: i32 = a.checked_add(b).expect(\"overflow\");\n    sum.saturating_mul(2)\n}\n",
+            }),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let (deps, _d) = snapshot_review_deps_full(
+        &manager,
+        &snapshots,
+        &cas,
+        vec![Arc::new(scripted_provider(script))],
+        vec![checkpoint_write_tool()],
+        routing,
+        fake_ok(),
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "implement add", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let ledger = OutcomeLedger::new(manager.store());
+    assert_eq!(ledger.count().unwrap(), 1, "exactly one record for the run");
+    let run_id = session_terminal_run_id(session);
+    let record = ledger.get(&run_id).unwrap().unwrap();
+    assert_eq!(record.session_id, session.raw());
+    assert_eq!(record.task_id, handle.task_id().unwrap().raw());
+    assert!(record.accepted && record.integrated, "{record:?}");
+    assert!(record.verified(), "the record must be a verified change");
+    assert!(record.verified_first_attempt);
+    assert_eq!(record.repair_attempts, 0);
+    assert!(record.final_basis.is_deterministic_verified());
+    assert!(record.proof.checks_required >= 1, "{record:?}");
+    assert_eq!(record.proof.checks_passed, record.proof.checks_required);
+    let step_sum: u64 = record
+        .model_sequence
+        .iter()
+        .map(|s| s.spend_micro)
+        .fold(0u64, u64::saturating_add);
+    assert_eq!(step_sum, record.model_spend_micro);
+    assert!(
+        !record.verified_samples.is_empty(),
+        "the terminal turn's explicit samples ride the record: {record:?}"
+    );
+    assert!(record.verified_samples.iter().all(|s| s.verified_success));
+    // The record feed landed in the durable registry the production router
+    // consults; the policy's own (memory) store never saw these samples.
+    assert!(
+        manager
+            .store()
+            .model_outcome_stats_phase(
+                &record.verified_samples[0].provider,
+                &record.verified_samples[0].model,
+                record.verified_samples[0].phase,
+            )
+            .unwrap()
+            .is_some(),
+        "the record's samples must be durably learned"
+    );
+    assert!(outcomes
+        .phase_stats("fake", "m", RouterPhase::Implement)
+        .is_none());
+    // A replay of the terminal settlement never re-derives or re-feeds.
+    assert_eq!(
+        ledger
+            .record_terminal_run(&handle, &run_id, TerminalRunFacts::default())
+            .unwrap(),
+        None
+    );
+    assert_eq!(ledger.count().unwrap(), 1);
 }
 
 /// (1) Review: a RISKY change drives the independent review call; the

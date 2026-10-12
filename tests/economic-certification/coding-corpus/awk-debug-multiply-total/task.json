@@ -1,0 +1,10 @@
+{
+  "id": "awk-debug-multiply-total",
+  "order": 9,
+  "category": "debugging",
+  "language": "awk",
+  "runtime": "awk",
+  "task_class": "easy",
+  "phase": "debug",
+  "goal": "sum.awk reads a table of `item count unit_price` rows and must print the grand total of count * unit_price with two decimals. It currently adds count and price instead of multiplying them. Fix sum.awk so the printed total is the sum of count * unit_price."
+}

@@ -1,0 +1,10 @@
+{
+  "id": "py-refactor-slug-normalize",
+  "order": 8,
+  "category": "cross-file-refactor",
+  "language": "python",
+  "runtime": "python3",
+  "task_class": "medium",
+  "phase": "implement",
+  "goal": "app_a.py and app_b.py each define their own normalize() and have drifted apart, so the same input produces different labels. The canonical form is lowercase, surrounding whitespace stripped, and every run of internal whitespace collapsed to a single '-'. Extract the normalization into a new shared module `common.py` and make both apps import and use it, so the two labels can no longer diverge."
+}

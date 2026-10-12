@@ -1,0 +1,10 @@
+{
+  "id": "sh-refactor-shared-log-lib",
+  "order": 4,
+  "category": "cross-file-refactor",
+  "language": "shell",
+  "runtime": "sh",
+  "task_class": "medium",
+  "phase": "implement",
+  "goal": "app1.sh and app2.sh each format their log line themselves and have drifted apart: app1 prints `[info] <message>` while app2 prints `INFO: <message>`. Both must print exactly `[info] <message>`. Refactor the shared formatting into a single sourced helper file `lib/log.sh` (run from the repository root) and make both scripts use it, so the format can no longer diverge."
+}

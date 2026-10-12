@@ -351,12 +351,25 @@ export interface ProtocolOutcomeMetrics {
   readonly verifiedFirstPassChanges: number;
   readonly verifiedFirstPassPpm: number;
   readonly totalVerifiedSpendMicro: string;
-  readonly verifiedCostPerChangeMicro: string;
+  readonly successfulRunCostMicro: string;
   readonly totalSpendMicro: string;
+  readonly verifiedCostPerSuccessfulChangeMicro: string;
   readonly totalReworkSpendMicro: string;
   readonly reworkCostRatioPpm: number;
   readonly localRuns: number;
-  readonly localSubstitutionPpm: number;
+  readonly localOnlyRuns: number;
+  readonly localOnlyVerifiedChanges: number;
+  readonly localOnlyVerifiedPpm: number;
+  readonly localFinalRuns: number;
+  readonly localFinalVerifiedChanges: number;
+  readonly localFinalVerifiedPpm: number;
+  readonly localFirstRuns: number;
+  readonly localFirstSuccessChanges: number;
+  readonly localFirstSuccessPpm: number;
+  readonly localToFrontierFallbackRuns: number;
+  readonly localToFrontierFallbackPpm: number;
+  readonly frontierOnlyRuns: number;
+  readonly frontierOnlyPpm: number;
   readonly avoidedHostedInferenceMicro: string;
   readonly totalWallTimeMs: number;
   readonly meanTimeToVerifiedChangeMs: number;
@@ -436,6 +449,32 @@ export interface ProtocolOutcomesPage {
   readonly metrics: ProtocolOutcomeMetrics;
   readonly runs: readonly ProtocolRunOutcome[];
   readonly nextCursor: ProtocolOutcomeCursor | null;
+}
+
+/** The value-entitlement report's governance capability picture (`governance`): `sso`/`scim` are capability vocabulary, effective only behind the `enterprise_governance` value entitlement (never an implementation). (unknown_fields: ignore) */
+export interface ProtocolValueGovernanceCapabilities {
+  readonly sso: boolean;
+  readonly scim: boolean;
+}
+
+/** One per-entitlement value decision of the report: the entitlement tag, its typed enforcement hook, whether it is enforceable now and (only when not) the exact refusal cause. A granted decision omits `cause` (the schema field is optional). (unknown_fields: ignore) */
+export interface ProtocolValueEntitlementDecision {
+  readonly entitlement: string;
+  readonly hook: string;
+  readonly granted: boolean;
+  readonly cause: string | null;
+}
+
+/** The caller organization's DERIVED value-entitlement report (`value_entitlements` member of GET /native/value-entitlements): the plan resolution, the plan-mapped inference-independent value tags, the effective governance capability flags and one typed decision per entitlement. The report never folds usage, credits or tokens. (unknown_fields: ignore) */
+export interface ProtocolValueEntitlementsReport {
+  readonly organization_id: string;
+  readonly plan_id: string | null;
+  readonly plan_found: boolean;
+  readonly subscription_active: boolean;
+  readonly plan_entitlements: readonly string[];
+  readonly governance: ProtocolValueGovernanceCapabilities;
+  readonly decisions: readonly ProtocolValueEntitlementDecision[];
+  readonly now_ms: number;
 }
 
 // ------------------------------------------------------------ defaults
@@ -750,7 +789,7 @@ export function validateProtocolSessionPromptReceipt(value: ProtocolJson, path =
 
 export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "ProtocolOutcomeMetrics"): ProtocolOutcomeMetrics {
   const object = dtoObject(value, path);
-  const required = ["runs","verifiedChanges","verifiedFirstPassChanges","verifiedFirstPassPpm","totalVerifiedSpendMicro","verifiedCostPerChangeMicro","totalSpendMicro","totalReworkSpendMicro","reworkCostRatioPpm","localRuns","localSubstitutionPpm","avoidedHostedInferenceMicro","totalWallTimeMs","meanTimeToVerifiedChangeMs","humanInterventionRuns","humanInterventionPpm","rollbackRuns","regressionRollbackPpm","checksPassed","checksRequired","proofCoveragePpm","frontierEscalationRuns","frontierEscalationPpm","scanned","truncated"];
+  const required = ["runs","verifiedChanges","verifiedFirstPassChanges","verifiedFirstPassPpm","totalVerifiedSpendMicro","successfulRunCostMicro","totalSpendMicro","verifiedCostPerSuccessfulChangeMicro","totalReworkSpendMicro","reworkCostRatioPpm","localRuns","localOnlyRuns","localOnlyVerifiedChanges","localOnlyVerifiedPpm","localFinalRuns","localFinalVerifiedChanges","localFinalVerifiedPpm","localFirstRuns","localFirstSuccessChanges","localFirstSuccessPpm","localToFrontierFallbackRuns","localToFrontierFallbackPpm","frontierOnlyRuns","frontierOnlyPpm","avoidedHostedInferenceMicro","totalWallTimeMs","meanTimeToVerifiedChangeMs","humanInterventionRuns","humanInterventionPpm","rollbackRuns","regressionRollbackPpm","checksPassed","checksRequired","proofCoveragePpm","frontierEscalationRuns","frontierEscalationPpm","scanned","truncated"];
   for (const key of required) {
     dtoRequired(object, key, path);
   }
@@ -760,12 +799,25 @@ export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "Prot
     verifiedFirstPassChanges: dtoI64(object, "verifiedFirstPassChanges", path),
     verifiedFirstPassPpm: dtoI64(object, "verifiedFirstPassPpm", path),
     totalVerifiedSpendMicro: dtoString(object, "totalVerifiedSpendMicro", path),
-    verifiedCostPerChangeMicro: dtoString(object, "verifiedCostPerChangeMicro", path),
+    successfulRunCostMicro: dtoString(object, "successfulRunCostMicro", path),
     totalSpendMicro: dtoString(object, "totalSpendMicro", path),
+    verifiedCostPerSuccessfulChangeMicro: dtoString(object, "verifiedCostPerSuccessfulChangeMicro", path),
     totalReworkSpendMicro: dtoString(object, "totalReworkSpendMicro", path),
     reworkCostRatioPpm: dtoI64(object, "reworkCostRatioPpm", path),
     localRuns: dtoI64(object, "localRuns", path),
-    localSubstitutionPpm: dtoI64(object, "localSubstitutionPpm", path),
+    localOnlyRuns: dtoI64(object, "localOnlyRuns", path),
+    localOnlyVerifiedChanges: dtoI64(object, "localOnlyVerifiedChanges", path),
+    localOnlyVerifiedPpm: dtoI64(object, "localOnlyVerifiedPpm", path),
+    localFinalRuns: dtoI64(object, "localFinalRuns", path),
+    localFinalVerifiedChanges: dtoI64(object, "localFinalVerifiedChanges", path),
+    localFinalVerifiedPpm: dtoI64(object, "localFinalVerifiedPpm", path),
+    localFirstRuns: dtoI64(object, "localFirstRuns", path),
+    localFirstSuccessChanges: dtoI64(object, "localFirstSuccessChanges", path),
+    localFirstSuccessPpm: dtoI64(object, "localFirstSuccessPpm", path),
+    localToFrontierFallbackRuns: dtoI64(object, "localToFrontierFallbackRuns", path),
+    localToFrontierFallbackPpm: dtoI64(object, "localToFrontierFallbackPpm", path),
+    frontierOnlyRuns: dtoI64(object, "frontierOnlyRuns", path),
+    frontierOnlyPpm: dtoI64(object, "frontierOnlyPpm", path),
     avoidedHostedInferenceMicro: dtoString(object, "avoidedHostedInferenceMicro", path),
     totalWallTimeMs: dtoI64(object, "totalWallTimeMs", path),
     meanTimeToVerifiedChangeMs: dtoI64(object, "meanTimeToVerifiedChangeMs", path),
@@ -883,6 +935,50 @@ export function validateProtocolOutcomesPage(value: ProtocolJson, path = "Protoc
     nextCursor: dtoRequired(object, "nextCursor", path) === null
         ? null
         : validateProtocolOutcomeCursor(dtoRequired(object, "nextCursor", path), path + ".nextCursor"),
+  };
+}
+
+export function validateProtocolValueGovernanceCapabilities(value: ProtocolJson, path = "ProtocolValueGovernanceCapabilities"): ProtocolValueGovernanceCapabilities {
+  const object = dtoObject(value, path);
+  const required = ["sso","scim"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    sso: dtoBool(object, "sso", path),
+    scim: dtoBool(object, "scim", path),
+  };
+}
+
+export function validateProtocolValueEntitlementDecision(value: ProtocolJson, path = "ProtocolValueEntitlementDecision"): ProtocolValueEntitlementDecision {
+  const object = dtoObject(value, path);
+  const required = ["entitlement","hook","granted"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    entitlement: dtoString(object, "entitlement", path),
+    hook: dtoString(object, "hook", path),
+    granted: dtoBool(object, "granted", path),
+    cause: dtoOptionalNullableString(object, "cause", path),
+  };
+}
+
+export function validateProtocolValueEntitlementsReport(value: ProtocolJson, path = "ProtocolValueEntitlementsReport"): ProtocolValueEntitlementsReport {
+  const object = dtoObject(value, path);
+  const required = ["organization_id","plan_id","plan_found","subscription_active","plan_entitlements","governance","decisions","now_ms"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    organization_id: dtoString(object, "organization_id", path),
+    plan_id: dtoNullableString(object, "plan_id", path),
+    plan_found: dtoBool(object, "plan_found", path),
+    subscription_active: dtoBool(object, "subscription_active", path),
+    plan_entitlements: dtoList(object, "plan_entitlements", path).map((item, index) => dtoStringElement(item, path + ".plan_entitlements[" + index + "]")),
+    governance: validateProtocolValueGovernanceCapabilities(dtoRequired(object, "governance", path), path + ".governance"),
+    decisions: dtoList(object, "decisions", path).map((item, index) => validateProtocolValueEntitlementDecision(item, path + ".decisions[" + index + "]")),
+    now_ms: dtoI64(object, "now_ms", path),
   };
 }
 

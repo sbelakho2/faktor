@@ -756,14 +756,21 @@ pub struct SemanticProviderDescriptor {
     #[serde(default)]
     pub completeness: Option<SemanticCompleteness>,
     /// Declared intelligence tier (`0..=5`,
-    /// [`crate::intelligence::IntelligenceTier`]). Additive and optional:
-    /// absent = UNKNOWN, never assumed high — confidence is then computed
-    /// without any tier bonus. Validated by
-    /// [`SemanticProviderDescriptor::validate`] at handshake, so an
-    /// out-of-range claim is refused before it can drive selection or
+    /// [`crate::intelligence::IntelligenceTier`]). Optional capability
+    /// METADATA: absent = UNKNOWN, never assumed high, and the tier is never
+    /// an input to confidence (tier describes capability, not truth).
+    /// Validated by [`SemanticProviderDescriptor::validate`] at handshake,
+    /// so an out-of-range claim is refused before it can drive selection or
     /// status.
     #[serde(default)]
     pub tier: Option<u8>,
+    /// Declared orthogonal evidence dimensions (freshness, determinism,
+    /// revision binding, provenance scope/uncertainty, measured
+    /// corroboration). Additive and optional per axis: an absent axis stays
+    /// `Unknown` (conservative) and never raises confidence — a declared
+    /// tier can never substitute for an evidence claim that was not made.
+    #[serde(default)]
+    pub evidence: crate::intelligence::EvidenceDimensions,
 }
 
 impl SemanticProviderDescriptor {
@@ -781,6 +788,7 @@ impl SemanticProviderDescriptor {
             fidelity: None,
             completeness: None,
             tier: None,
+            evidence: crate::intelligence::EvidenceDimensions::UNKNOWN,
         }
     }
 
@@ -796,6 +804,7 @@ impl SemanticProviderDescriptor {
             fidelity: None,
             completeness: None,
             tier: None,
+            evidence: crate::intelligence::EvidenceDimensions::UNKNOWN,
         }
     }
 

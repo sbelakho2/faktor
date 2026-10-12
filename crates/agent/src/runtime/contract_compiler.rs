@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use faktor_core::contract_compile::{
-    compile_contract, ContractCompileRequest, RepositoryFile, RepositorySnapshot,
+    compile_contract_with, AcquisitionGap, AcquisitionGapKind, ContractCompileRequest,
+    RepositoryAcquisition, RepositoryFile, RepositorySnapshot, SystemIntelligenceProvider,
 };
 use faktor_session::{SessionHandle, Task};
 
@@ -43,6 +44,9 @@ const MAX_SCAN_MANIFEST_FILES: usize = 64;
 const MAX_SCAN_FILE_BYTES: u64 = 256 * 1024;
 /// Hard bound on the total content read (bytes).
 const MAX_SCAN_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard bound on typed acquisition gaps kept in one snapshot (the last slot
+/// becomes an explicit "further gaps omitted" marker when exceeded).
+const MAX_SCAN_GAPS: usize = 16;
 
 /// Directories never scanned (build output, VCS, caches, vendored deps).
 const SKIP_DIRS: &[&str] = &[
@@ -103,59 +107,109 @@ struct Candidate {
 
 /// Bounded deterministic repository scan for the compiler.
 ///
-/// A missing/unreadable ROOT yields an empty COMPLETE snapshot: there is no
-/// repository state to analyze, and the compiler's own "no build system / no
-/// matching test" uncertainties disclose that honestly (never an escalation
-/// caused by a scan that had nothing to read). A PARTIAL walk (entry/depth
-/// caps) yields `complete = false` with the typed reason, because missing
-/// paths can hide evidence.
+/// Acquisition is reported TRUTHFULLY: an unreadable ROOT yields
+/// [`RepositoryAcquisition::Unavailable`] (never an empty complete
+/// snapshot); a nested unreadable directory, a walk cap or a selected-file
+/// content failure (I/O error, invalid UTF-8, oversized, budget) yields
+/// [`RepositoryAcquisition::Partial`] with typed reasons. A genuinely empty
+/// READABLE repository is [`RepositoryAcquisition::Complete`] with no files:
+/// "verified there is nothing" and "could not read what is here" are never
+/// conflated.
 pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> RepositorySnapshot {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut stack: Vec<(PathBuf, String, usize)> = vec![(root.to_path_buf(), String::new(), 0)];
+    let mut gaps: Vec<AcquisitionGap> = Vec::new();
     let mut entries_seen = 0usize;
-    let mut truncated: Option<String> = None;
-    let mut root_read = false;
     let mut stop = false;
     while let Some((dir, rel_dir, depth)) = stack.pop() {
         if stop {
             break;
         }
         if depth > MAX_SCAN_DEPTH {
-            truncated.get_or_insert(format!(
-                "directory depth exceeds {MAX_SCAN_DEPTH} at {rel_dir:?}"
-            ));
+            push_gap(
+                &mut gaps,
+                AcquisitionGap {
+                    kind: AcquisitionGapKind::WalkTruncated,
+                    path: Some(rel_dir.clone()),
+                    detail: format!("directory depth exceeds {MAX_SCAN_DEPTH}"),
+                    proof_relevant: false,
+                },
+            );
             continue;
         }
         let read = match std::fs::read_dir(&dir) {
             Ok(read) => read,
             Err(error) => {
-                if rel_dir.is_empty() && !root_read {
-                    // No repository state to analyze; parity with an empty
-                    // workspace (the compiler records its own uncertainties).
-                    return RepositorySnapshot::default();
+                if rel_dir.is_empty() {
+                    // The ROOT could not be read: the repository surface is
+                    // UNKNOWN, never an empty repository.
+                    return RepositorySnapshot {
+                        files: Vec::new(),
+                        acquisition: RepositoryAcquisition::Unavailable {
+                            reason: format!("workspace root {root:?} could not be read: {error}"),
+                        },
+                    };
                 }
-                truncated.get_or_insert(format!("directory {rel_dir:?} unreadable: {error}"));
+                push_gap(
+                    &mut gaps,
+                    AcquisitionGap {
+                        kind: AcquisitionGapKind::UnreadableDirectory,
+                        path: Some(rel_dir.clone()),
+                        detail: format!("directory could not be read: {error}"),
+                        proof_relevant: false,
+                    },
+                );
                 continue;
             }
         };
-        root_read = true;
         let mut entries: Vec<(String, bool, u64)> = Vec::new();
         for entry in read {
             entries_seen += 1;
             if entries_seen > MAX_SCAN_ENTRIES {
-                truncated.get_or_insert(format!(
-                    "entry cap of {MAX_SCAN_ENTRIES} reached; the file list is incomplete"
-                ));
+                push_gap(
+                    &mut gaps,
+                    AcquisitionGap {
+                        kind: AcquisitionGapKind::WalkTruncated,
+                        path: None,
+                        detail: format!(
+                            "entry cap of {MAX_SCAN_ENTRIES} reached; the file list is incomplete"
+                        ),
+                        proof_relevant: false,
+                    },
+                );
                 stop = true;
                 break;
             }
-            let Ok(entry) = entry else {
-                truncated.get_or_insert("a directory entry could not be read".to_string());
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    push_gap(
+                        &mut gaps,
+                        AcquisitionGap {
+                            kind: AcquisitionGapKind::UnreadableEntry,
+                            path: Some(rel_dir.clone()),
+                            detail: format!("directory entry could not be read: {error}"),
+                            proof_relevant: false,
+                        },
+                    );
+                    continue;
+                }
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    push_gap(
+                        &mut gaps,
+                        AcquisitionGap {
+                            kind: AcquisitionGapKind::UnreadableEntry,
+                            path: Some(join_rel(&rel_dir, &name)),
+                            detail: format!("entry type could not be inspected: {error}"),
+                            proof_relevant: false,
+                        },
+                    );
+                    continue;
+                }
             };
             // Symlinks are never followed: no cycles, no escaping the root.
             if file_type.is_dir() {
@@ -164,17 +218,25 @@ pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> Reposi
                 }
                 entries.push((name, true, 0));
             } else if file_type.is_file() {
-                let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                let mut size = 0u64;
+                match entry.metadata() {
+                    Ok(meta) => size = meta.len(),
+                    Err(error) => push_gap(
+                        &mut gaps,
+                        AcquisitionGap {
+                            kind: AcquisitionGapKind::UnreadableEntry,
+                            path: Some(join_rel(&rel_dir, &name)),
+                            detail: format!("file metadata could not be read: {error}"),
+                            proof_relevant: false,
+                        },
+                    ),
+                }
                 entries.push((name, false, size));
             }
         }
         entries.sort();
         for (name, is_dir, size) in entries.into_iter().rev() {
-            let rel = if rel_dir.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel_dir}/{name}")
-            };
+            let rel = join_rel(&rel_dir, &name);
             if is_dir {
                 stack.push((dir.join(&name), rel, depth + 1));
                 continue;
@@ -208,9 +270,17 @@ pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> Reposi
     candidates.sort_by(|a, b| a.rel.cmp(&b.rel));
     candidates.dedup_by(|a, b| a.rel == b.rel);
     if candidates.len() > MAX_SCAN_FILES {
-        truncated.get_or_insert(format!(
-            "candidate cap of {MAX_SCAN_FILES} reached; the file list is incomplete"
-        ));
+        push_gap(
+            &mut gaps,
+            AcquisitionGap {
+                kind: AcquisitionGapKind::WalkTruncated,
+                path: None,
+                detail: format!(
+                    "candidate cap of {MAX_SCAN_FILES} reached; the file list is incomplete"
+                ),
+                proof_relevant: false,
+            },
+        );
         candidates.truncate(MAX_SCAN_FILES);
     }
     let mut content: BTreeMap<String, String> = BTreeMap::new();
@@ -219,18 +289,24 @@ pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> Reposi
         if content.len() >= MAX_SCAN_MANIFEST_FILES {
             break;
         }
-        read_content(
+        if let Err(failure) = read_content(
             &root.join(&candidate.rel),
             candidate.size,
             &mut budget,
             &mut content,
             &candidate.rel,
-        );
+        ) {
+            // A manifest is build-system evidence: its missing content is
+            // always proof-relevant.
+            push_gap(&mut gaps, content_gap(&candidate.rel, failure, true));
+        }
     }
     // Content reads are SELECTIVE by design (path/test relevance first,
     // then bounded): a full-content read of a large repository is not a
     // goal of the scan, and the compiler's uncertainty rows disclose when no
-    // evidence could be derived from what was read.
+    // evidence could be derived from what was read. A selected file whose
+    // content FAILS to land (error, invalid UTF-8, oversized, budget) is a
+    // gap, never a silent skip.
     let mut sources: Vec<&Candidate> = candidates
         .iter()
         .filter(|candidate| candidate.is_source && !candidate.is_manifest)
@@ -247,14 +323,21 @@ pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> Reposi
         if reads >= MAX_SCAN_READ_FILES || budget == 0 {
             break;
         }
-        if read_content(
+        match read_content(
             &root.join(&candidate.rel),
             candidate.size,
             &mut budget,
             &mut content,
             &candidate.rel,
         ) {
-            reads += 1;
+            Ok(()) => reads += 1,
+            Err(failure) => {
+                let proof_relevant = candidate.token_match || candidate.test_related;
+                push_gap(
+                    &mut gaps,
+                    content_gap(&candidate.rel, failure, proof_relevant),
+                );
+            }
         }
     }
     let files: Vec<RepositoryFile> = candidates
@@ -264,40 +347,107 @@ pub(crate) fn scan_repository_snapshot(root: &Path, tokens: &[String]) -> Reposi
             content: content.remove(&candidate.rel),
         })
         .collect();
-    RepositorySnapshot {
-        files,
-        complete: truncated.is_none(),
-        incompleteness: truncated,
+    let acquisition = if gaps.is_empty() {
+        RepositoryAcquisition::Complete
+    } else {
+        RepositoryAcquisition::Partial { reasons: gaps }
+    };
+    RepositorySnapshot { files, acquisition }
+}
+
+/// Bounded acquisition-gap reporting: once the cap is reached the last slot
+/// becomes an explicit "further gaps omitted" marker instead of silently
+/// dropping reasons.
+fn push_gap(gaps: &mut Vec<AcquisitionGap>, gap: AcquisitionGap) {
+    if gaps.len() < MAX_SCAN_GAPS {
+        gaps.push(gap);
+        return;
+    }
+    gaps[MAX_SCAN_GAPS - 1] = AcquisitionGap {
+        kind: AcquisitionGapKind::WalkTruncated,
+        path: None,
+        detail: format!(
+            "further acquisition gaps omitted at the {MAX_SCAN_GAPS}-gap reporting cap"
+        ),
+        proof_relevant: false,
+    };
+}
+
+fn join_rel(rel_dir: &str, name: &str) -> String {
+    if rel_dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{rel_dir}/{name}")
+    }
+}
+
+/// Why a selected file's content is missing from the snapshot.
+enum ContentFailure {
+    TooLarge,
+    BudgetExhausted,
+    Io(String),
+    InvalidUtf8,
+}
+
+/// Turn one selected-file content failure into a typed acquisition gap.
+fn content_gap(rel: &str, failure: ContentFailure, proof_relevant: bool) -> AcquisitionGap {
+    let (kind, detail) = match failure {
+        ContentFailure::TooLarge => (
+            AcquisitionGapKind::OversizedFile,
+            format!(
+                "selected file exceeds the {MAX_SCAN_FILE_BYTES}-byte per-file content bound and was not analyzed"
+            ),
+        ),
+        ContentFailure::BudgetExhausted => (
+            AcquisitionGapKind::ReadBudgetExhausted,
+            format!(
+                "the {MAX_SCAN_TOTAL_BYTES}-byte total content budget was exhausted before this selected file was read"
+            ),
+        ),
+        ContentFailure::Io(error) => (
+            AcquisitionGapKind::UnreadableFile,
+            format!("selected file could not be read: {error}"),
+        ),
+        ContentFailure::InvalidUtf8 => (
+            AcquisitionGapKind::InvalidUtf8,
+            "selected file is not valid UTF-8 text and was not analyzed".to_string(),
+        ),
+    };
+    AcquisitionGap {
+        kind,
+        path: Some(rel.to_string()),
+        detail,
+        proof_relevant,
     }
 }
 
 /// Read one file's content into `content` when it fits the per-file and total
-/// budgets and is valid UTF-8. Returns TRUE when content landed.
+/// budgets and is valid UTF-8. An `Err` names WHY the selected content is
+/// missing so the caller can mark the snapshot partial.
 fn read_content(
     path: &Path,
     size: u64,
     budget: &mut u64,
     content: &mut BTreeMap<String, String>,
     rel: &str,
-) -> bool {
-    if size > MAX_SCAN_FILE_BYTES || *budget < size {
-        return false;
+) -> Result<(), ContentFailure> {
+    if size > MAX_SCAN_FILE_BYTES {
+        return Err(ContentFailure::TooLarge);
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
+    if *budget < size {
+        return Err(ContentFailure::BudgetExhausted);
+    }
+    let bytes = std::fs::read(path).map_err(|error| ContentFailure::Io(error.to_string()))?;
     if bytes.len() as u64 > MAX_SCAN_FILE_BYTES {
-        return false;
+        return Err(ContentFailure::TooLarge);
     }
-    let Ok(text) = String::from_utf8(bytes) else {
-        return false;
-    };
+    let text = String::from_utf8(bytes).map_err(|_| ContentFailure::InvalidUtf8)?;
     if text.len() as u64 > *budget {
-        return false;
+        return Err(ContentFailure::BudgetExhausted);
     }
     *budget -= text.len() as u64;
     content.insert(rel.to_string(), text);
-    true
+    Ok(())
 }
 
 impl AgentRuntime {
@@ -330,10 +480,45 @@ impl AgentRuntime {
         };
         let tokens = faktor_core::contract_compile::intent_tokens(&task.goal);
         let repository = scan_repository_snapshot(&root, &tokens);
-        let compiled = compile_contract(&ContractCompileRequest {
-            goal: task.goal.clone(),
-            repository,
-        });
+        // The OPTIONAL system-intelligence provider (daemon-installed): the
+        // compile is the SAME native contract plus, when a provider is
+        // installed and stands behind a validated capability, its strictly
+        // additive `external:<provider>` statements. `None` is the
+        // byte-identical native path; a refusing/erroring provider leaves the
+        // native contract untouched and is diagnosed below — never a failed
+        // turn.
+        let provider = self.system_intelligence_provider();
+        let compiled = compile_contract_with(
+            &ContractCompileRequest {
+                goal: task.goal.clone(),
+                repository,
+            },
+            provider
+                .as_ref()
+                .map(|provider| provider.as_ref() as &dyn SystemIntelligenceProvider),
+        );
+        for outcome in &compiled.enrichments {
+            match &outcome.diagnostic {
+                Some(diagnostic) => tracing::warn!(
+                    session = %session,
+                    task_id = task.task_id.raw(),
+                    provider = %outcome.provider,
+                    applied = outcome.applied,
+                    skipped = outcome.skipped,
+                    diagnostic = %diagnostic,
+                    "system-intelligence enrichment left the native contract untouched"
+                ),
+                None if outcome.applied > 0 => tracing::info!(
+                    session = %session,
+                    task_id = task.task_id.raw(),
+                    provider = %outcome.provider,
+                    applied = outcome.applied,
+                    skipped = outcome.skipped,
+                    "native baseline engineering contract additively enriched"
+                ),
+                None => {}
+            }
+        }
         if compiled.contract.is_empty() {
             return;
         }
@@ -347,6 +532,7 @@ impl AgentRuntime {
                 risks = compiled.contract.risks.len(),
                 uncertainties = compiled.uncertainties.len(),
                 build_systems = %compiled.build_systems.join(","),
+                acquisition = compiled.repository_acquisition.label(),
                 repository = %compiled.repository_digest,
                 "baseline engineering contract compiled from intent + repository state"
             ),

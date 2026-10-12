@@ -39,7 +39,10 @@ pub(crate) const MAX_INGEST_SESSIONS: usize = 2_000;
 /// Bound on the tasks per session one ingestion pass scans.
 pub(crate) const MAX_INGEST_TASKS: usize = 500;
 
-fn billing_disabled() -> ApiError {
+/// The typed refusal shared by every cloud/billing-gated route when the
+/// `[billing]`/`[cloud]` authority is absent: the offline default (value
+/// entitlements included) denies typed instead of guessing.
+pub(crate) fn billing_disabled() -> ApiError {
     ApiError {
         code: "billing_disabled",
         message: "commercial billing is disabled (enable the [billing] section to use it)".into(),

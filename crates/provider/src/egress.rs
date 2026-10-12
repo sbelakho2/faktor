@@ -2961,23 +2961,49 @@ mod tests {
 
     /// Test-only source paths are exempt from the raw-client scan: a file
     /// under a `/tests/` component, or a `tests.rs`/`*_tests.rs` file whose
-    /// name is backed by a real cfg(test)-gated include in a sibling (a
-    /// name alone must never exempt production code). `rel` may arrive in
-    /// either separator spelling; it is normalized first.
+    /// name is backed by a real cfg(test)-gated include (a name alone must
+    /// never exempt production code). `rel` may arrive in either separator
+    /// spelling; it is normalized first.
+    ///
+    /// Both Rust module spellings are searched for the declaring include:
+    /// the flat layout (`foo_tests.rs` next to its declaring file) and the
+    /// module-tree layout (`egress/budget_tests.rs` declared by
+    /// `egress.rs` as `mod budget_tests;`, or by `egress/mod.rs`).
     fn is_test_rel_at(root: &std::path::Path, rel: &str) -> bool {
-        let rel = normalize_rel(rel);
-        if rel.contains("/tests/") {
+        is_test_path_at(root, &normalize_rel(rel))
+    }
+
+    /// `is_test_rel_at` on an already-normalized rel.
+    fn is_test_path_at(root: &std::path::Path, rel: &str) -> bool {
+        if rel.split('/').any(|c| c == "tests") {
             return true;
         }
-        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        let name = rel.rsplit('/').next().unwrap_or(rel);
         if name != "tests.rs" && !name.ends_with("_tests.rs") {
             return false;
         }
-        let path = root.join(&rel);
+        let path = root.join(rel);
         let Some(dir) = path.parent() else {
             return false;
         };
-        has_test_include(dir, name, name.strip_suffix(".rs").unwrap_or(name))
+        let stem = name.strip_suffix(".rs").unwrap_or(name);
+        // Same directory: the declaring file is the module file NAMED like
+        // the tests file minus `_tests` (`shadow.rs` declares
+        // `mod shadow_tests;`) or a `mod.rs` beside it.
+        if has_test_include(dir, name, stem) {
+            return true;
+        }
+        // Module-tree layout: `something/<stem>_tests.rs` is declared by
+        // `something.rs` (or `something/mod.rs`) one level up.
+        let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if dir.join("mod.rs").is_file() && has_test_include(dir, "mod.rs", stem) {
+            return true;
+        }
+        let module_file = format!("{dir_name}.rs");
+        dir.parent()
+            .is_some_and(|up| has_test_include(up, &module_file, stem))
     }
 
     fn is_test_rel(rel: &str) -> bool {
@@ -3134,6 +3160,25 @@ mod tests {
         )
         .unwrap();
         assert!(!is_test_rel_at(tmp.path(), "x/src/shadow_tests.rs"));
+        // Module-tree layout (the egress.rs split): `egress/budget_tests.rs`
+        // is declared by `egress.rs` one level up as `mod budget_tests;`.
+        let module_dir = src.join("egress");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("budget_tests.rs"), "").unwrap();
+        std::fs::write(src.join("egress.rs"), "#[cfg(test)]\nmod budget_tests;\n").unwrap();
+        assert!(is_test_rel_at(tmp.path(), "x/src/egress/budget_tests.rs"));
+        // …the same name with a PRODUCTION (ungated) declaration stays
+        // scanned.
+        std::fs::write(src.join("egress.rs"), "\nmod budget_tests;\n").unwrap();
+        assert!(!is_test_rel_at(tmp.path(), "x/src/egress/budget_tests.rs"));
+        // The declaring module file itself is production code.
+        assert!(!is_test_rel_at(tmp.path(), "x/src/egress.rs"));
+        // `egress/mod.rs` spelling declares the module just as validly.
+        let mod_dir = src.join("budget");
+        std::fs::create_dir_all(&mod_dir).unwrap();
+        std::fs::write(mod_dir.join("mod.rs"), "#[cfg(test)]\nmod case_tests;\n").unwrap();
+        std::fs::write(mod_dir.join("case_tests.rs"), "").unwrap();
+        assert!(is_test_rel_at(tmp.path(), "x/src/budget/case_tests.rs"));
     }
 
     // -------------------------------------- permissive-constructor scan

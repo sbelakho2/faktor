@@ -1,0 +1,61 @@
+{
+  "default_plan": "local",
+  "plans": {
+    "local": {
+      "plan_id": "local",
+      "features": [
+        "advanced_verification_policy",
+        "organization_contracts",
+        "signed_proof_provenance"
+      ],
+      "limits": {}
+    },
+    "pro": {
+      "plan_id": "pro",
+      "features": [
+        "advanced_verification_policy",
+        "organization_contracts",
+        "signed_proof_provenance",
+        "shared_intelligence",
+        "outcome_analytics",
+        "audit_retention_history",
+        "model_optimization_learning"
+      ],
+      "limits": {}
+    },
+    "team": {
+      "plan_id": "team",
+      "features": [
+        "advanced_verification_policy",
+        "organization_contracts",
+        "signed_proof_provenance",
+        "shared_intelligence",
+        "outcome_analytics",
+        "audit_retention_history",
+        "model_optimization_learning",
+        "cross_repo_intelligence",
+        "private_runners"
+      ],
+      "limits": {}
+    },
+    "enterprise": {
+      "plan_id": "enterprise",
+      "features": [
+        "advanced_verification_policy",
+        "organization_contracts",
+        "signed_proof_provenance",
+        "shared_intelligence",
+        "outcome_analytics",
+        "audit_retention_history",
+        "model_optimization_learning",
+        "cross_repo_intelligence",
+        "private_runners",
+        "enterprise_governance",
+        "governance_sso",
+        "governance_scim"
+      ],
+      "limits": {}
+    }
+  },
+  "managed_providers": []
+}

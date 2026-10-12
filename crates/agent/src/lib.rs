@@ -49,10 +49,11 @@ pub use faktor_session::VerificationRecord;
 pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
 pub use outcome_ledger::{
-    ChangedCodeScale, FinalVerificationBasis, LedgerAppend, OutcomeCursor, OutcomeLedger,
-    OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport, OutcomeLedgerPage,
-    ProofCoverage, RunModelStep, RunOutcomeRecord, RunVerifiedSample, MAX_LEDGER_PAGE,
-    MAX_METRICS_RECORDS, OUTCOME_RECORD_SCHEMA_V,
+    session_terminal_run_id, ChangedCodeScale, FinalVerificationBasis, LedgerAppend, OutcomeCursor,
+    OutcomeLedger, OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport,
+    OutcomeLedgerPage, ProofCoverage, RunModelStep, RunOutcomeRecord, RunVerifiedSample,
+    TerminalRunFacts, MAX_LEDGER_PAGE, MAX_METRICS_RECORDS, MAX_RUN_VERIFIED_SAMPLES,
+    OUTCOME_RECORD_SCHEMA_V,
 };
 pub use runtime::{
     review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,

@@ -522,6 +522,55 @@ impl Store {
             StoreError::Corrupt(vec![format!("engineering_outcome count {n} is negative")])
         })
     }
+
+    /// Count the RESOLVED permission decisions of one session (the durable
+    /// human-intervention projection of the outcome ledger): every
+    /// `allow` / `deny` / `expired` decision row is one recorded human
+    /// intervention. Pending rows are not decisions and never count.
+    pub fn engineering_outcome_human_interventions(&self, session: SessionId) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let session = i64::try_from(session.raw()).map_err(|_| {
+            StoreError::Malformed(format!(
+                "session id {} exceeds the durable signed 64-bit domain",
+                session.raw()
+            ))
+        })?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM permission WHERE session_id = ?1 \
+             AND decision IN ('allow', 'deny', 'expired')",
+            params![session],
+            |r| r.get(0),
+        )?;
+        count_to_u64("human_interventions", n)
+    }
+
+    /// Count the durable crash-recovery events of one session
+    /// (`recovery_applied` journal events; the terminal event of one real
+    /// recovery pass). A corrupt/expected count is a loud typed error.
+    pub fn engineering_outcome_recovery_events(&self, session: SessionId) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let session = i64::try_from(session.raw()).map_err(|_| {
+            StoreError::Malformed(format!(
+                "session id {} exceeds the durable signed 64-bit domain",
+                session.raw()
+            ))
+        })?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM event WHERE session_id = ?1 AND kind = 'recovery_applied'",
+            params![session],
+            |r| r.get(0),
+        )?;
+        count_to_u64("recovery_events", n)
+    }
+}
+
+/// Fallible `i64 -> u64` counter read (a negative SQLite COUNT is corruption).
+fn count_to_u64(what: &str, n: i64) -> StoreResult<u64> {
+    u64::try_from(n).map_err(|_| {
+        StoreError::Corrupt(vec![format!(
+            "engineering_outcome {what} count {n} is negative"
+        )])
+    })
 }
 
 /// One prepared sample of the router feed (enum dimensions already encoded
