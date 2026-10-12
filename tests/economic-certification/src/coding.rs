@@ -660,22 +660,39 @@ impl Verification {
         if text.is_empty() {
             return None;
         }
-        let mut variants: Vec<String> = vec![workspace.to_string_lossy().into_owned()];
+        // Replace in specificity order: the CANONICAL spelling of a path
+        // first, then its possibly-aliased non-canonical spelling. Hosts whose
+        // temp dir carries a symlink alias (macOS `/var` -> `/private/var`)
+        // make interpreters print the canonical form; replacing the shorter
+        // non-canonical prefix inside it would strand the differing prefix
+        // (`/private<workspace>`), making the same verification excerpt a
+        // different byte string per host.
+        let mut variants: Vec<(String, &'static str)> = Vec::new();
+        let workspace_text = workspace.to_string_lossy().into_owned();
         if let Ok(canonical) = workspace.canonicalize() {
             let canonical = canonical.to_string_lossy().into_owned();
-            if !variants.contains(&canonical) {
-                variants.push(canonical);
+            if !canonical.is_empty() && canonical != workspace_text {
+                variants.push((canonical, "<workspace>"));
             }
         }
-        for variant in variants {
-            if !variant.is_empty() {
-                text = text.replace(&variant, "<workspace>");
-            }
+        if !workspace_text.is_empty() {
+            variants.push((workspace_text, "<workspace>"));
         }
         let tmp = std::env::temp_dir();
-        let tmp = tmp.to_string_lossy();
+        let tmp = tmp.to_string_lossy().into_owned();
         if !tmp.is_empty() && tmp != "/" {
-            text = text.replace(tmp.as_ref(), "<tmp>");
+            if let Ok(canonical) = std::env::temp_dir().canonicalize() {
+                let canonical = canonical.to_string_lossy().into_owned();
+                if !canonical.is_empty() && canonical != tmp {
+                    variants.push((canonical, "<tmp>"));
+                }
+            }
+            variants.push((tmp, "<tmp>"));
+        }
+        for (variant, placeholder) in variants {
+            if !variant.is_empty() {
+                text = text.replace(&variant, placeholder);
+            }
         }
         let start = text.len().saturating_sub(REPAIR_FEEDBACK_CAP);
         Some(text[start..].to_string())

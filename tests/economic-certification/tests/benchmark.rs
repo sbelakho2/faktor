@@ -15,7 +15,7 @@ use std::path::Path;
 
 use ecc::coding::{
     apply_candidate, copy_coding_repo, load_coding_corpus, parse_model_candidate,
-    run_task_verification, runtime_available, validate_candidate_path, Candidate,
+    run_task_verification, runtime_available, validate_candidate_path, Candidate, Verification,
     CODING_VERIFY_TIMEOUT,
 };
 use ecc::frozen::{load_capture, Arm, CaptureSource, VerifyOutcome};
@@ -418,6 +418,47 @@ fn candidate_application_refuses_symlink_and_preserves_verification() {
     files.insert("verify.sh".to_string(), "exit 0".to_string());
     let err = apply_candidate(&ws, &Candidate { files }).expect_err("verify.sh refused");
     assert!(err.contains("verification"), "unexpected: {err}");
+}
+
+#[test]
+fn repair_excerpt_normalization_is_alias_independent() {
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let ws = scratch
+        .path()
+        .join("baseline")
+        .join("py-migration-config-v2");
+    std::fs::create_dir_all(&ws).expect("workspace dir");
+    let canonical = ws.canonicalize().expect("canonical workspace");
+    // Interpreters on hosts whose temp dir is a symlink alias (macOS
+    // /var -> /private/var) print the CANONICAL spelling while the pipeline
+    // hands `failure_excerpt_for` the path it created. The canonical spelling
+    // must be replaced whole: replacing the non-canonical alias inside it
+    // strands the differing prefix (`/private<workspace>`), which made the
+    // repair prompt host-dependent (trusted-lane drift: 24 extra bytes = 6
+    // prompt tokens per excerpt on the blessing host).
+    let verification = Verification {
+        result: ecc::VerifyResult::Failed,
+        stdout_tail: String::new(),
+        stderr_tail: format!(
+            "Traceback (most recent call last):\n  File \"{}/migrate.py\", line 28\nKeyError: 'port'\n",
+            canonical.display()
+        ),
+        millis: 0,
+    };
+    let from_alias = verification
+        .failure_excerpt_for(&ws)
+        .expect("a failed verification carries a repair excerpt");
+    assert!(
+        from_alias.contains("<workspace>/migrate.py"),
+        "canonical workspace spelling must be replaced whole: {from_alias}"
+    );
+    let from_canonical = verification
+        .failure_excerpt_for(&canonical)
+        .expect("a failed verification carries a repair excerpt");
+    assert_eq!(
+        from_alias, from_canonical,
+        "the repair excerpt must not depend on which host spelling names the workspace"
+    );
 }
 
 #[test]

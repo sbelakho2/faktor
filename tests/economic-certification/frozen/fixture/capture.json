@@ -410,9 +410,9 @@
           "provider": "fixture-frontier",
           "model": "scripted-frontier-plumbing",
           "local": false,
-          "tokens_in": 800,
+          "tokens_in": 794,
           "tokens_out": 186,
-          "spend_micro": 4632,
+          "spend_micro": 4614,
           "cost_source": "fixture",
           "latency_ms": 500,
           "raw_response": "```json\n{\"files\":{\"migrate.py\":\"\\\"\\\"\\\"Migrate a v1 device config to v2.\\\"\\\"\\\"\\nimport json\\nimport sys\\n\\n\\ndef migrate(old):\\n    if old.get(\\\"version\\\") == 2:\\n        return old\\n    return {\\n        \\\"version\\\": 2,\\n        \\\"endpoint\\\": {\\\"host\\\": old[\\\"host\\\"], \\\"port\\\": old[\\\"port\\\"]},\\n        \\\"user\\\": old[\\\"user_name\\\"],\\n        \\\"tls\\\": old.get(\\\"tls\\\", True),\\n    }\\n\\n\\ndef main():\\n    src, dst = sys.argv[1], sys.argv[2]\\n    with open(src, \\\"r\\\", encoding=\\\"utf-8\\\") as fh:\\n        old = json.load(fh)\\n    with open(dst, \\\"w\\\", encoding=\\\"utf-8\\\") as fh:\\n        json.dump(migrate(old), fh, indent=2, sort_keys=True)\\n        fh.write(\\\"\\\\n\\\")\\n    return 0\\n\\n\\nif __name__ == \\\"__main__\\\":\\n    sys.exit(main())\\n\"}}\n```\n",
@@ -431,8 +431,8 @@
             "outcome": "failed",
             "millis": 0
           },
-          "prompt_blake3": "f752ae018fa3e25ad1c6cc80e81082e606b53b0404ae592ce96b3aa902b62063",
-          "prompt_tokens_est": 800
+          "prompt_blake3": "5a2009acb1bad25a577b21df9eda805d00be044acf52cbaaf3f7934958cb8b29",
+          "prompt_tokens_est": 794
         }
       ],
       "verified": false,
@@ -1025,9 +1025,9 @@
           "provider": "fixture-frontier",
           "model": "scripted-frontier-plumbing",
           "local": false,
-          "tokens_in": 1037,
+          "tokens_in": 1031,
           "tokens_out": 186,
-          "spend_micro": 5343,
+          "spend_micro": 5325,
           "cost_source": "fixture",
           "latency_ms": 500,
           "raw_response": "```json\n{\"files\":{\"migrate.py\":\"\\\"\\\"\\\"Migrate a v1 device config to v2.\\\"\\\"\\\"\\nimport json\\nimport sys\\n\\n\\ndef migrate(old):\\n    if old.get(\\\"version\\\") == 2:\\n        return old\\n    return {\\n        \\\"version\\\": 2,\\n        \\\"endpoint\\\": {\\\"host\\\": old[\\\"host\\\"], \\\"port\\\": old[\\\"port\\\"]},\\n        \\\"user\\\": old[\\\"user_name\\\"],\\n        \\\"tls\\\": old.get(\\\"tls\\\", True),\\n    }\\n\\n\\ndef main():\\n    src, dst = sys.argv[1], sys.argv[2]\\n    with open(src, \\\"r\\\", encoding=\\\"utf-8\\\") as fh:\\n        old = json.load(fh)\\n    with open(dst, \\\"w\\\", encoding=\\\"utf-8\\\") as fh:\\n        json.dump(migrate(old), fh, indent=2, sort_keys=True)\\n        fh.write(\\\"\\\\n\\\")\\n    return 0\\n\\n\\nif __name__ == \\\"__main__\\\":\\n    sys.exit(main())\\n\"}}\n```\n",
@@ -1046,8 +1046,8 @@
             "outcome": "failed",
             "millis": 0
           },
-          "prompt_blake3": "7c99721310b337aa9fdbe72c59b1f765dee1f090138ffc1592b7a7545fd51abf",
-          "prompt_tokens_est": 1037
+          "prompt_blake3": "6b0926c82bb65bf3ea8ff4f3654c5ed4ad19bd847a5751c7c970415b2cfd7afd",
+          "prompt_tokens_est": 1031
         }
       ],
       "verified": false,
@@ -1303,5 +1303,5 @@
       "completed_at_ms": 1700000541000
     }
   ],
-  "digest": "4405d803cbabd708941b8c20b25230252283e1d56fb6600e01a43af9c3a02331"
+  "digest": "906d1e468edfb171818a0286ab65ba95ba76881cac5148767e3bc57e82cd7658"
 }
