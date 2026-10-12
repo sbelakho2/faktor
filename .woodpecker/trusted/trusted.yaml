@@ -177,13 +177,6 @@ matrix:
 labels:
   platform: ${platform}
 
-# The declared platform is the CONTAINER platform too: linux/amd64 workflows
-# run genuine x86_64 containers (Rosetta on this arm64 host) instead of
-# silently inheriting the host architecture — lanes like vscode-e2e verify
-# the architecture they were scheduled for. darwin workflows run on the
-# local backend, where the platform field is inert.
-platform: ${platform}
-
 # push (any branch) and tag events are collaborator-authored: only these may
 # mount the trusted caches. pull_request never reaches this file.
 when:
@@ -481,7 +474,7 @@ steps:
   # Chromium runtime libraries, which the node:24 baseline does not ship and
   # which are installed via NO apt step here.
   - name: vscode-e2e
-    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:b27e719ecbfef153e13fd24e8341736733bf2658b229677eb21ff57ff5d7fb29 # mcr.microsoft.com/playwright:v1.55.0-noble @ 2026-10-02
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:7e20a8225950eb93a9d306a917b05d822a68a67333973e254f1b0cd86c0f3742 # linux/amd64 manifest of playwright:v1.55.0-noble (lane requires genuine x86_64; Rosetta runs it on arm64 hosts)
     depends_on: [vscode]
     when:
       matrix:
