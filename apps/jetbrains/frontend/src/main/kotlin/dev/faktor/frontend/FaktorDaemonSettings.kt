@@ -13,8 +13,8 @@
 // smoke-testable without the platform.
 package dev.faktor.frontend
 
-import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
@@ -26,22 +26,26 @@ import java.nio.file.Paths
 object FaktorDaemonSettings {
 
     /** The application-level properties key (never a project property). */
-    const val BINARY_PATH_KEY = "faktor.daemon.binaryPath"
+    const val BINARY_PATH_KEY = FaktorSettingKeys.BINARY_PATH
+
+    /** The one shared application-settings store (the Configurable uses it too). */
+    private fun store(): FaktorSettingsStore = IntelliJApplicationSettingsStore()
 
     /** The application-level Faktor binary path, or null when unset. */
     fun applicationBinaryPath(): String? =
-        PropertiesComponent.getInstance().getValue(BINARY_PATH_KEY)?.takeIf { it.isNotBlank() }
+        FaktorSettingsRules.storedOrNull(store().read(BINARY_PATH_KEY))
 
     /** Persist the operator-picked daemon path at APPLICATION scope only. */
     fun storeApplicationBinaryPath(path: Path) {
-        PropertiesComponent.getInstance().setValue(
-            BINARY_PATH_KEY,
-            path.toAbsolutePath().normalize().toString()
+        store().write(
+            linkedMapOf(
+                BINARY_PATH_KEY to path.toAbsolutePath().normalize().toString()
+            )
         )
     }
 
     fun clearApplicationBinaryPath() {
-        PropertiesComponent.getInstance().unsetValue(BINARY_PATH_KEY)
+        store().write(linkedMapOf(BINARY_PATH_KEY to null))
     }
 
     private fun home(): Path = Paths.get(System.getProperty("user.home", "."))
@@ -66,6 +70,18 @@ object FaktorDaemonSettings {
     }
 
     /**
+     * The shared daemon file-chooser descriptor: the Settings Configurable
+     * and the missing-daemon dialog offer the SAME chooser.
+     */
+    fun daemonChooserDescriptor(): FileChooserDescriptor =
+        FileChooserDescriptorFactory.createSingleFileNoJarsDescriptor()
+            .withTitle("Locate the faktor-cli daemon executable")
+            .withDescription(
+                "Pick the faktor-cli executable (the daemon). The path is stored as an " +
+                    "application-level Faktor setting, never in the project."
+            )
+
+    /**
      * The actionable missing-daemon dialog: "Locate daemon…" opens the file
      * chooser, stores the picked executable at application scope and returns
      * true; Cancel returns false.
@@ -80,13 +96,7 @@ object FaktorDaemonSettings {
             Messages.getWarningIcon()
         )
         if (choice != 0) return false
-        val descriptor = FileChooserDescriptorFactory.createSingleFileNoJarsDescriptor()
-            .withTitle("Locate the faktor-cli daemon executable")
-            .withDescription(
-                "Pick the faktor-cli executable (the daemon). The path is stored as an " +
-                    "application-level Faktor setting, never in the project."
-            )
-        val chosen = FileChooser.chooseFile(descriptor, project, null) ?: return false
+        val chosen = FileChooser.chooseFile(daemonChooserDescriptor(), project, null) ?: return false
         val path = Paths.get(chosen.path)
         if (!Files.isRegularFile(path) || !Files.isExecutable(path)) {
             Messages.showErrorDialog(

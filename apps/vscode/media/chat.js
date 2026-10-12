@@ -143,6 +143,17 @@
   var historyQuery = '';
   var historyOpenInFlight = null;
   var diagnosticsOpen = false;
+  // I03: the locally selected change (preserved by PATH across refreshes,
+  // clamped when the path disappears) and the last explicit review result
+  // for exactly that path. I07: the active History sub-tab and the render
+  // cache so a conversation snapshot never rebuilds the outcomes surface.
+  var selectedChangePath = null;
+  var selectedChangeIndex = -1;
+  var changeReviewState = null;
+  var activeHistoryTab = 'conversations';
+  var renderedOutcomes = null;
+  /** TRUE while an explicit outcomes read awaits its snapshot. */
+  var outcomesReading = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
   var lastRenderedError = null;
   /** Technical tails currently displayed; identical errors never stack. */
@@ -334,10 +345,20 @@
       // The acceptance-criteria section renders one PROOF row per criterion
       // when the host serves the structured rows; older snapshots fall back
       // to the bounded lines (whose `[verdict]` prefix still styles).
+      // Structured proof rows render whenever a section serves them; the
+      // acceptance section replaces its text lines with the rows (today's
+      // contract), while the Verification section keeps its status lines AND
+      // gains the selectable criterion rows (`Open claim`).
       var criteria = Array.isArray(section.criteria) ? section.criteria : [];
-      if (section.key === 'acceptance' && criteria.length > 0) {
+      if (criteria.length > 0) {
         for (var c = 0; c < criteria.length; c++) {
           renderCriterionRow(block, criteria[c]);
+        }
+        if (section.key !== 'acceptance') {
+          var extraLines = Array.isArray(section.lines) ? section.lines : [];
+          for (var x = 0; x < extraLines.length; x++) {
+            line(block, extraLines[x], 'muted');
+          }
         }
       } else if (section.key === 'contract' && section.contract) {
         renderContractSection(block, section.contract, section.lines);
@@ -477,6 +498,10 @@
     var card = document.createElement('div');
     card.className = 'criterion criterion-' + verdict;
     card.setAttribute('data-verdict', verdict);
+    if (typeof value.criterionKey === 'string' && value.criterionKey.length > 0) {
+      // The stable target of `Open claim` (select the related criterion).
+      card.setAttribute('data-criterion-key', value.criterionKey);
+    }
     if (typeof value.binding === 'string') {
       card.setAttribute('data-binding', value.binding);
     }
@@ -683,6 +708,21 @@
   ];
   var CHANGES_EMPTY_LINE = 'No candidate changes are served for this run yet.';
   var MAX_CHANGED_PATHS = 200;
+  var DIFF_UNAVAILABLE_LABEL = 'Diff unavailable';
+  var DIFF_UNAVAILABLE_COPY =
+    'The runtime does not serve an immutable candidate content read for this change.';
+  var CHANGES_UNAVAILABLE_LABEL = 'Changes unavailable';
+  var OUTCOMES_UNAVAILABLE_LABEL = 'Cost unavailable';
+  var OUTCOMES_UNAVAILABLE_COPY = 'The current authority has not supplied a cost value.';
+  var OUTCOMES_TRUNCATED_NOTE = 'Truncated sample';
+  var MAX_OUTCOME_METRIC_ROWS = 32;
+  var MAX_OUTCOME_RUN_ROWS = 200;
+  // The History destination's two surfaces (I07): the Conversations tab is
+  // the untouched listing; Outcomes is read LAZILY on an explicit open.
+  var HISTORY_TABS = [
+    { key: 'conversations', tab: 'history-tab-conversations', panel: 'history-conversations' },
+    { key: 'outcomes', tab: 'history-tab-outcomes', panel: 'history-outcomes' },
+  ];
 
   function subviewOf(key) {
     for (var i = 0; i < INSPECT_SUBVIEWS.length; i++) {
@@ -905,44 +945,297 @@
   }
 
   /**
-   * The Changes surface: only candidate data that is ALREADY served (the
-   * task's changed paths). When none is served the explicit empty state
-   * renders; nothing is invented and no diff is claimed before I03 ships it.
+   * The Changes surface (I03): the served `projection.filesChanged` rows with
+   * only served refs, the scope toolbar of the selected change, the explicit
+   * unavailable state on a failed projection read and the exact
+   * `Diff unavailable` in-view state when no immutable basis is served.
+   * Selection is LOCAL, keyed by path and preserved across refreshes.
    */
+  function selectedIndexFor(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return -1;
+    }
+    if (selectedChangePath !== null) {
+      for (var i = 0; i < rows.length; i++) {
+        if (String(rows[i].path) === selectedChangePath) {
+          return i;
+        }
+      }
+    }
+    if (!Number.isInteger(selectedChangeIndex) || selectedChangeIndex < 0) {
+      return 0;
+    }
+    return Math.min(selectedChangeIndex, rows.length - 1);
+  }
+
+  function changeRowNode(row, index) {
+    var item = document.createElement('li');
+    var selected = index === selectedChangeIndex;
+    item.className = 'changes-row' + (selected ? ' changes-row-selected' : '');
+    item.setAttribute('data-change-path', String(row.path));
+    var select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'change-select';
+    select.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    select.textContent = String(row.path);
+    select.addEventListener('click', function () {
+      selectChange(index, rowsFromSnapshot());
+    });
+    item.appendChild(select);
+    if (typeof row.changeKind === 'string' && row.changeKind.length > 0) {
+      span(item, 'kind ' + row.changeKind, 'chip change-kind');
+    }
+    var refs = Array.isArray(row.refs) ? row.refs : [];
+    for (var r = 0; r < refs.length; r++) {
+      var ref = refs[r] || {};
+      line(item, String(ref.label == null ? '' : ref.label), 'muted change-ref');
+    }
+    return item;
+  }
+
+  function rowsFromSnapshot() {
+    var changes = lastSnapshot && lastSnapshot.changes ? lastSnapshot.changes : null;
+    return changes && Array.isArray(changes.rows) ? changes.rows : [];
+  }
+
+  /** Local selection move (rows are served, never fabricated). */
+  function selectChange(index, rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return;
+    }
+    if (index < 0) {
+      index = 0;
+    }
+    if (index >= rows.length) {
+      index = rows.length - 1;
+    }
+    selectedChangeIndex = index;
+    selectedChangePath = String(rows[index].path);
+    renderChanges(lastSnapshot);
+  }
+
+  function renderChangeToolbar(changes, row, index) {
+    var candidate = byId('change-candidate');
+    if (candidate) {
+      var display =
+        changes && typeof changes.candidateDisplay === 'string' && changes.candidateDisplay.length > 0
+          ? changes.candidateDisplay
+          : 'Candidate change';
+      candidate.textContent = display;
+    }
+    var rows = changes && Array.isArray(changes.rows) ? changes.rows : [];
+    var hasRow = row !== null && row !== undefined && index >= 0;
+    var prev = byId('btn-change-prev');
+    var next = byId('btn-change-next');
+    var review = byId('btn-change-review');
+    var claim = byId('btn-change-claim');
+    if (prev) {
+      prev.disabled = !hasRow || index <= 0;
+    }
+    if (next) {
+      next.disabled = !hasRow || index >= rows.length - 1;
+    }
+    if (review) {
+      review.disabled = !hasRow;
+    }
+    var criterionKey = null;
+    if (hasRow) {
+      var refs = Array.isArray(row.refs) ? row.refs : [];
+      for (var i = 0; i < refs.length; i++) {
+        if (refs[i] && typeof refs[i].criterionKey === 'string' && refs[i].criterionKey.length > 0) {
+          criterionKey = refs[i].criterionKey;
+          break;
+        }
+      }
+    }
+    if (claim) {
+      claim.disabled = criterionKey === null;
+    }
+    var basis = byId('change-basis');
+    if (basis) {
+      clear(basis);
+      var summary = changes && changes.basis ? changes.basis : null;
+      if (summary && Array.isArray(summary.lines)) {
+        for (var b = 0; b < summary.lines.length; b++) {
+          line(basis, String(summary.lines[b]), 'change-basis-line');
+        }
+      }
+    }
+    var advancedBody = byId('change-advanced-body');
+    if (advancedBody) {
+      clear(advancedBody);
+      var advanced = changes && Array.isArray(changes.advanced) ? changes.advanced : [];
+      for (var a = 0; a < advanced.length; a++) {
+        var fact = advanced[a] || {};
+        line(advancedBody, String(fact.label == null ? '' : fact.label) + ': ' + String(fact.value == null ? '—' : fact.value), 'change-advanced-fact');
+      }
+    }
+  }
+
+  function renderChangeReviewState() {
+    var node = byId('change-review-state');
+    if (!node) {
+      return;
+    }
+    var state = changeReviewState;
+    if (!state || state.path !== selectedChangePath) {
+      node.hidden = true;
+      clear(node);
+      return;
+    }
+    clear(node);
+    node.hidden = false;
+    if (state.state === 'unavailable') {
+      line(node, DIFF_UNAVAILABLE_LABEL, 'change-review-label');
+      line(node, DIFF_UNAVAILABLE_COPY, 'muted');
+      if (typeof state.reason === 'string' && state.reason.length > 0) {
+        line(node, state.reason, 'muted change-review-reason');
+      }
+    } else {
+      line(
+        node,
+        'Immutable basis opened — evidence #' +
+          String(state.evidenceId == null ? '—' : state.evidenceId) +
+          ' (read-only).',
+        'muted',
+      );
+    }
+  }
+
   function renderChanges(snapshot) {
     var list = byId('changes-list');
     var empty = byId('changes-empty');
-    if (!list || !empty) {
+    var unavailable = byId('changes-unavailable');
+    var toolbar = byId('changes-toolbar');
+    if (!list || !empty || !unavailable || !toolbar) {
       return;
     }
-    var files =
-      snapshot && snapshot.task && Array.isArray(snapshot.task.changedFiles)
-        ? snapshot.task.changedFiles
-        : [];
+    var changes = snapshot && snapshot.changes ? snapshot.changes : null;
+    if (!changes) {
+      changes = {
+        available: true,
+        reason: null,
+        rows: [],
+        candidateDisplay: 'Candidate change',
+        basis: null,
+        advanced: [],
+      };
+    }
     var focus = captureFocus(list);
     clear(list);
-    if (files.length === 0) {
+    if (changes.available === false) {
+      // Explicit unavailable state with the exact reason; no rows and no
+      // stale previously served paths (the read failure drops them).
+      setText('changes-unavailable-label', CHANGES_UNAVAILABLE_LABEL);
+      setText(
+        'changes-unavailable-copy',
+        typeof changes.reason === 'string' && changes.reason.length > 0
+          ? 'The changed-path read failed: ' + changes.reason
+          : 'The changed-path read failed and no reason was supplied.',
+      );
+      unavailable.hidden = false;
+      toolbar.hidden = true;
+      list.hidden = true;
+      empty.hidden = true;
+      var review = byId('change-review-state');
+      if (review) {
+        review.hidden = true;
+      }
+      return;
+    }
+    unavailable.hidden = true;
+    toolbar.hidden = false;
+    list.hidden = false;
+    var rows = Array.isArray(changes.rows) ? changes.rows : [];
+    var index = selectedIndexFor(rows);
+    selectedChangeIndex = index;
+    selectedChangePath = index >= 0 ? String(rows[index].path) : null;
+    if (rows.length === 0) {
       empty.hidden = false;
       if (empty.textContent !== CHANGES_EMPTY_LINE) {
         empty.textContent = CHANGES_EMPTY_LINE;
       }
+      renderChangeToolbar(changes, null, -1);
+      renderChangeReviewState();
       return;
     }
     empty.hidden = true;
-    var shown = files.slice(0, MAX_CHANGED_PATHS);
+    var shown = rows.slice(0, MAX_CHANGED_PATHS);
     for (var i = 0; i < shown.length; i++) {
-      var item = document.createElement('li');
-      item.className = 'changes-path';
-      item.textContent = String(shown[i]);
-      list.appendChild(item);
+      list.appendChild(changeRowNode(shown[i], i));
     }
-    if (files.length > shown.length) {
+    if (rows.length > shown.length) {
       var more = document.createElement('li');
       more.className = 'changes-path muted';
-      more.textContent = '... ' + (files.length - shown.length) + ' more';
+      more.textContent = '... ' + (rows.length - shown.length) + ' more';
       list.appendChild(more);
     }
+    renderChangeToolbar(changes, rows[index], index);
+    renderChangeReviewState();
     restoreFocus(list, focus);
+  }
+
+  /**
+   * `Open claim`: switch to Inspect / Verification and select the related
+   * criterion row when it is served in the current verification view. When
+   * the criterion is not served there, say so — never fabricate a row.
+   */
+  function openClaimForSelected() {
+    var rows = rowsFromSnapshot();
+    var index = selectedIndexFor(rows);
+    if (index < 0) {
+      return;
+    }
+    var refs = Array.isArray(rows[index].refs) ? rows[index].refs : [];
+    var key = null;
+    for (var i = 0; i < refs.length; i++) {
+      if (refs[i] && typeof refs[i].criterionKey === 'string' && refs[i].criterionKey.length > 0) {
+        key = refs[i].criterionKey;
+        break;
+      }
+    }
+    if (key === null) {
+      return;
+    }
+    setActiveView('inspect');
+    setActiveSubview('verification');
+    var found = null;
+    var cards =
+      typeof document.querySelectorAll === 'function'
+        ? document.querySelectorAll('[data-criterion-key]')
+        : [];
+    for (var c = 0; c < cards.length; c++) {
+      if (!cards[c].getAttribute || cards[c].getAttribute('data-criterion-key') !== key) {
+        continue;
+      }
+      // Prefer the VISIBLE card (the same criterion can render in the
+      // Overview panel too; the hidden one must never take focus).
+      var cursor = cards[c];
+      var hiddenAncestor = false;
+      while (cursor) {
+        if (cursor.hidden === true) {
+          hiddenAncestor = true;
+          break;
+        }
+        cursor = cursor.parentNode;
+      }
+      if (!hiddenAncestor) {
+        found = cards[c];
+        break;
+      }
+      if (found === null) {
+        found = cards[c];
+      }
+    }
+    if (found === null) {
+      showNotice('info', 'the related criterion is not served in the current verification view');
+      return;
+    }
+    found.classList.add('criterion-selected');
+    found.setAttribute('tabindex', '-1');
+    if (typeof found.focus === 'function') {
+      found.focus();
+    }
   }
 
   // ------------------------------------------------------------- history
@@ -1104,6 +1397,237 @@
       list.appendChild(historyRowNode(snapshot, result.rows[i]));
     }
     restoreHistoryFocus(focus);
+  }
+
+  // ---------------------------------------------------------- outcomes (I07)
+  //
+  // The Engineering Outcome Ledger surface. It renders ONLY the host's
+  // projection of the served page: every metric keeps its served counts and
+  // the host already applied the honesty rules (`No verified changes yet`,
+  // `not measured`, exact money strings). The read is LAZY: switching to the
+  // Outcomes tab posts ONE `readOutcomes`; the normal conversation snapshot
+  // never triggers a ledger read.
+
+  function outcomeMetricNode(metric) {
+    var row = document.createElement('div');
+    var group = typeof metric.group === 'string' ? metric.group : 'rate';
+    var cohort = typeof metric.cohort === 'string' && metric.cohort.length > 0 ? metric.cohort : null;
+    row.className =
+      'outcome-metric outcome-metric-' +
+      group +
+      (cohort !== null ? ' outcome-cohort-' + cohort : '') +
+      (metric.unmeasured === true ? ' outcome-metric-unmeasured' : '');
+    row.setAttribute('data-metric', String(metric.key == null ? '' : metric.key));
+    var head = document.createElement('div');
+    head.className = 'outcome-metric-head';
+    span(head, String(metric.label == null ? '' : metric.label), 'outcome-metric-label');
+    span(head, String(metric.value == null ? '—' : metric.value), 'outcome-metric-value');
+    row.appendChild(head);
+    line(row, String(metric.detail == null ? '' : metric.detail), 'muted outcome-metric-detail');
+    var explain = document.createElement('details');
+    explain.className = 'technical-disclosure outcome-metric-explain';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Explain metric';
+    explain.appendChild(summary);
+    line(explain, String(metric.definition == null ? '' : metric.definition), 'muted');
+    row.appendChild(explain);
+    return row;
+  }
+
+  function outcomeRunNode(run) {
+    var item = document.createElement('li');
+    item.className = 'outcome-run ' + (run.verified === true ? 'outcome-run-verified' : 'outcome-run-unverified');
+    var head = document.createElement('div');
+    head.className = 'outcome-run-head';
+    span(head, String(run.verdict == null ? '' : run.verdict), 'chip outcome-run-verdict');
+    span(head, String(run.completedText == null ? '—' : run.completedText), 'muted outcome-run-date');
+    span(head, String(run.modelSpendUsd == null ? '—' : run.modelSpendUsd), 'outcome-run-cost');
+    span(head, String(run.wallText == null ? '—' : run.wallText), 'muted outcome-run-wall');
+    item.appendChild(head);
+    var facts = [
+      'class ' + String(run.taskClass == null ? '—' : run.taskClass),
+      'risk ' + String(run.riskClass == null ? '—' : run.riskClass),
+      run.firstPass === true
+        ? 'first-pass verified'
+        : String(run.repairAttempts == null ? 0 : run.repairAttempts) + ' repair attempt(s)',
+      'files ' + String(run.changeFiles == null ? 0 : run.changeFiles),
+      'steps ' + String(run.steps == null ? '—' : run.steps),
+    ];
+    line(item, facts.join(' · '), 'muted outcome-run-meta');
+    var details = document.createElement('details');
+    details.className = 'technical-disclosure';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Advanced details';
+    details.appendChild(summary);
+    line(
+      details,
+      'run ' +
+        String(run.runId == null ? '—' : run.runId) +
+        ' · task ' +
+        String(run.taskId == null ? '—' : run.taskId) +
+        ' · session ' +
+        String(run.sessionId == null ? '—' : run.sessionId),
+      'muted outcome-run-ids',
+    );
+    line(
+      details,
+      'model spend ' +
+        String(run.modelSpendExact == null ? '—' : run.modelSpendExact) +
+        ' · verification ' +
+        String(run.verificationSpendExact == null ? '—' : run.verificationSpendExact) +
+        ' · rework ' +
+        String(run.reworkSpendExact == null ? '—' : run.reworkSpendExact) +
+        ' · avoided hosted ' +
+        String(run.avoidedHostedExact == null ? '—' : run.avoidedHostedExact),
+      'muted outcome-run-spend',
+    );
+    line(
+      details,
+      'interventions ' +
+        String(run.humanInterventions == null ? 0 : run.humanInterventions) +
+        ' · rollbacks ' +
+        String(run.rollbackEvents == null ? 0 : run.rollbackEvents) +
+        ' · recoveries ' +
+        String(run.recoveryEvents == null ? 0 : run.recoveryEvents) +
+        ' · frontier escalations ' +
+        String(run.frontierEscalations == null ? 0 : run.frontierEscalations),
+      'muted outcome-run-events',
+    );
+    item.appendChild(details);
+    return item;
+  }
+
+  function renderOutcomes(snapshot) {
+    var card = byId('outcomes-card');
+    if (!card) {
+      return;
+    }
+    if (snapshot) {
+      lastSnapshot = snapshot;
+    }
+    var view = lastSnapshot ? lastSnapshot.outcomes : null;
+    outcomesReading = false;
+    if (view === renderedOutcomes) {
+      updateOutcomesControls(view);
+      return;
+    }
+    renderedOutcomes = view;
+    var metrics = byId('outcomes-metrics');
+    var runs = byId('outcomes-runs');
+    var status = byId('outcomes-status');
+    var unavailable = byId('outcomes-unavailable');
+    var truncated = byId('outcomes-truncated');
+    if (!metrics || !runs || !status || !unavailable || !truncated) {
+      return;
+    }
+    if (view === null || view === undefined) {
+      status.textContent = 'Outcomes have not been read yet.';
+      metrics.hidden = true;
+      runs.hidden = true;
+      truncated.hidden = true;
+      unavailable.hidden = true;
+      updateOutcomesControls(null);
+      return;
+    }
+    if (view.state === 'unavailable') {
+      // T29: a distinct cost-unavailable state; NO monetary value renders.
+      setText('outcomes-unavailable-label', OUTCOMES_UNAVAILABLE_LABEL);
+      setText('outcomes-unavailable-copy', OUTCOMES_UNAVAILABLE_COPY);
+      var detail = byId('outcomes-unavailable-detail');
+      if (detail) {
+        detail.textContent =
+          (typeof view.reasonCode === 'string' && view.reasonCode.length > 0
+            ? '[' + view.reasonCode + '] '
+            : '') + String(view.reason == null ? 'no further detail was supplied' : view.reason);
+      }
+      unavailable.hidden = false;
+      status.textContent = 'the outcome ledger read failed';
+      status.hidden = false;
+      metrics.hidden = true;
+      runs.hidden = true;
+      truncated.hidden = true;
+      clear(metrics);
+      clear(runs);
+      updateOutcomesControls(view);
+      return;
+    }
+    unavailable.hidden = true;
+    status.hidden = false;
+    status.textContent =
+      String(view.scanned == null ? 0 : view.scanned) +
+      ' run(s) scanned · ' +
+      String(view.metrics && view.runs ? view.runs.length : 0) +
+      ' run row(s) loaded · page ' +
+      String(view.pageCount == null ? 1 : view.pageCount);
+    truncated.hidden = view.truncated !== true;
+    setText('outcomes-truncated', OUTCOMES_TRUNCATED_NOTE);
+    metrics.hidden = false;
+    runs.hidden = false;
+    clear(metrics);
+    var metricRows = Array.isArray(view.metrics) ? view.metrics : [];
+    if (metricRows.length > 0 && typeof view.costNote === 'string' && view.costNote.length > 0) {
+      line(metrics, view.costNote, 'muted outcomes-cost-note');
+    }
+    for (var i = 0; i < metricRows.length && i < MAX_OUTCOME_METRIC_ROWS; i++) {
+      metrics.appendChild(outcomeMetricNode(metricRows[i]));
+    }
+    clear(runs);
+    var runRows = Array.isArray(view.runs) ? view.runs : [];
+    for (var r = 0; r < runRows.length && r < MAX_OUTCOME_RUN_ROWS; r++) {
+      runs.appendChild(outcomeRunNode(runRows[r]));
+    }
+    updateOutcomesControls(view);
+  }
+
+  function updateOutcomesControls(view) {
+    var refresh = byId('btn-outcomes-refresh');
+    var older = byId('btn-outcomes-older');
+    if (refresh) {
+      refresh.disabled = outcomesReading;
+    }
+    if (older) {
+      var hasOlder =
+        view !== null &&
+        view !== undefined &&
+        view.state === 'ok' &&
+        view.nextCursor !== null &&
+        view.nextCursor !== undefined;
+      older.hidden = !hasOlder;
+      older.disabled = outcomesReading || !hasOlder;
+    }
+  }
+
+  function setHistoryTab(key, focusTab) {
+    var spec = null;
+    for (var i = 0; i < HISTORY_TABS.length; i++) {
+      if (HISTORY_TABS[i].key === key) {
+        spec = HISTORY_TABS[i];
+      }
+    }
+    if (spec === null) {
+      return;
+    }
+    activeHistoryTab = spec.key;
+    for (var t = 0; t < HISTORY_TABS.length; t++) {
+      setTabSelected(HISTORY_TABS[t].tab, HISTORY_TABS[t].key === spec.key);
+      var panel = byId(HISTORY_TABS[t].panel);
+      if (panel) {
+        panel.hidden = HISTORY_TABS[t].key !== spec.key;
+      }
+    }
+    if (focusTab === true) {
+      var node = byId(spec.tab);
+      if (node && typeof node.focus === 'function') {
+        node.focus();
+      }
+    }
+    if (spec.key === 'outcomes') {
+      // Opening the tab IS the explicit request: one bounded ledger read.
+      outcomesReading = true;
+      updateOutcomesControls(lastSnapshot ? lastSnapshot.outcomes : null);
+      vscode.postMessage({ type: 'readOutcomes' });
+      renderOutcomes(lastSnapshot);
+    }
   }
 
   function renderTask(task, view, agents) {
@@ -3132,6 +3656,7 @@
     renderInspectContent(snapshot);
     renderBreadcrumb(snapshot);
     renderHistory(snapshot);
+    renderOutcomes(snapshot);
     renderWelcome(snapshot.transcript);
     renderTranscript(snapshot.transcript);
     // The raw last error lives in Diagnostics; the structured projection
@@ -3437,6 +3962,7 @@
         // retry.
         clearCompletionControls();
         clearContractRowControls();
+        clearRunBudgetControls();
         if (goalNode && typeof goalNode.focus === 'function') {
           goalNode.focus();
         }
@@ -3470,6 +3996,17 @@
       renderStreamRecovery(streamStatusValue);
     } else if (message.type === 'userError') {
       showUserError(message.error);
+    } else if (message.type === 'changeReview') {
+      // The host resolved the selected change's immutable basis: `opened`
+      // names the served evidence id now in the native editor; `unavailable`
+      // asks for the exact in-view state (nothing live was read).
+      changeReviewState = {
+        path: typeof message.path === 'string' ? message.path : '',
+        state: message.state === 'opened' ? 'opened' : 'unavailable',
+        evidenceId: typeof message.evidenceId === 'number' ? message.evidenceId : null,
+        reason: typeof message.reason === 'string' ? message.reason : null,
+      };
+      renderChangeReviewState();
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
       // A refused Open (or a failed history refresh) answers with a notice:
@@ -3564,6 +4101,37 @@
   }
 
   /**
+   * The two per-run budget fields of the "Acceptance & contract" disclosure
+   * (I02). Empty = the setting is used; a non-empty value rides THIS
+   * submission verbatim (the host validates and refuses typed on garbage).
+   */
+  function runBudgetFromControls() {
+    var tokensNode = byId('contract-budget-tokens');
+    var costNode = byId('contract-budget-cost');
+    var tokens = tokensNode && typeof tokensNode.value === 'string' ? tokensNode.value.trim() : '';
+    var cost = costNode && typeof costNode.value === 'string' ? costNode.value.trim() : '';
+    var budget = {};
+    if (tokens.length > 0) {
+      budget.tokens = tokens;
+    }
+    if (cost.length > 0) {
+      budget.cost = cost;
+    }
+    return budget;
+  }
+
+  /** A successful start clears the per-run budget fields (kept on failure). */
+  function clearRunBudgetControls() {
+    var ids = ['contract-budget-tokens', 'contract-budget-cost'];
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      if (node) {
+        node.value = '';
+      }
+    }
+  }
+
+  /**
    * Start one logical submission. Single-flight: the flag gates the composer
    * BEFORE the post, so a double click / Enter+click race can never emit a
    * second sendGoal; it is released ONLY by an explicit host result. The
@@ -3585,6 +4153,7 @@
     // chat never carries it.
     var contract = completionContractFromControls();
     var contractRows = contractRowsFromControls();
+    var budget = runBudgetFromControls();
     var message = { type: 'sendGoal', goal: goal };
     if (attachments.length > 0) {
       var ids = [];
@@ -3598,6 +4167,12 @@
     }
     if (contractRows) {
       message.contractRows = contractRows;
+    }
+    if (budget.tokens !== undefined) {
+      message.budgetTokens = budget.tokens;
+    }
+    if (budget.cost !== undefined) {
+      message.budgetCostMicro = budget.cost;
     }
     transcriptPinRequested = true;
     setSubmitting(true);
@@ -3801,15 +4376,20 @@
   });
 
   // ------------------------------------------------------- shell wiring
-  // The Work / Inspect / History switcher and the Inspect subview tablist.
-  // Work is the default view; both tablists keep roving tabindex semantics.
+  // The Work / Inspect / History switcher, the Inspect subview tablist and
+  // the History Conversations/Outcomes pair. Work is the default view; every
+  // tablist keeps roving tabindex semantics.
   wireTablist(['nav-work', 'nav-inspect', 'nav-history'], selectTopTab);
   wireTablist(
     ['subtab-overview', 'subtab-plan', 'subtab-changes', 'subtab-verification', 'subtab-agents'],
     selectSubviewTab,
   );
+  wireTablist(['history-tab-conversations', 'history-tab-outcomes'], function (tabId, focusTab) {
+    setHistoryTab(tabId === 'history-tab-outcomes' ? 'outcomes' : 'conversations', focusTab);
+  });
   setActiveView('work');
   setActiveSubview('overview');
+  setHistoryTab('conversations', false);
 
   // History: the bounded title search re-filters only the served rows; both
   // refresh affordances post ONE refreshHistory (never a full implicit
@@ -3828,6 +4408,59 @@
   byId('btn-history-refresh-unavailable').addEventListener('click', function () {
     vscode.postMessage({ type: 'refreshHistory' });
   });
+
+  // I07: the Outcomes read is EXPLICIT (Refresh / Older runs); the top read
+  // replaces the list, the cursor read appends through the composite cursor.
+  byId('btn-outcomes-refresh').addEventListener('click', function () {
+    outcomesReading = true;
+    updateOutcomesControls(lastSnapshot ? lastSnapshot.outcomes : null);
+    vscode.postMessage({ type: 'readOutcomes' });
+  });
+  byId('btn-outcomes-older').addEventListener('click', function () {
+    var view = lastSnapshot ? lastSnapshot.outcomes : null;
+    if (!view || view.state !== 'ok' || !view.nextCursor) {
+      return;
+    }
+    outcomesReading = true;
+    updateOutcomesControls(view);
+    vscode.postMessage({
+      type: 'readOutcomes',
+      beforeMs: view.nextCursor.completedAtMs,
+      beforeRun: view.nextCursor.runId,
+    });
+  });
+
+  // I03: the scope toolbar of the selected change. Previous/Next are bounded
+  // (disabled at the ends); Review asks the host to resolve and open the
+  // immutable basis; Open claim selects the served criterion in Verification;
+  // Return to run focuses the chat command and switches to Work; Recheck
+  // re-runs the served reads and re-derives the current basis.
+  byId('btn-change-prev').addEventListener('click', function () {
+    selectChange(selectedIndexFor(rowsFromSnapshot()) - 1, rowsFromSnapshot());
+  });
+  byId('btn-change-next').addEventListener('click', function () {
+    selectChange(selectedIndexFor(rowsFromSnapshot()) + 1, rowsFromSnapshot());
+  });
+  byId('btn-change-review').addEventListener('click', function () {
+    var rows = rowsFromSnapshot();
+    var index = selectedIndexFor(rows);
+    if (index < 0) {
+      return;
+    }
+    changeReviewState = null;
+    renderChangeReviewState();
+    vscode.postMessage({ type: 'reviewChange', path: String(rows[index].path) });
+  });
+  byId('btn-change-claim').addEventListener('click', openClaimForSelected);
+  byId('btn-change-return').addEventListener('click', function () {
+    setActiveView('work');
+    vscode.postMessage({ type: 'openWork' });
+  });
+  function recheckChangesFromGesture() {
+    vscode.postMessage({ type: 'recheckChanges' });
+  }
+  byId('btn-change-recheck').addEventListener('click', recheckChangesFromGesture);
+  byId('btn-changes-recheck-unavailable').addEventListener('click', recheckChangesFromGesture);
 
   // Onboarding prompt chips: fill the composer and focus it (feed, never
   // submit). They live in the empty-state markup, so the static markup pin

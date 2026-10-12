@@ -318,6 +318,40 @@ private const val EVIDENCE_RETRIEVAL_JSON = "{" +
     "\"byteLen\":5,\"truncatedByPolicy\":false" +
     "}"
 
+/**
+ * `GET /native/outcomes`: the metrics fold plus one run row. `limit=666`
+ * swaps in a scientific-notation money string; `limit=667` an out-of-range
+ * rate (both must be typed refusals, never silent metrics).
+ */
+private const val OUTCOMES_JSON = "{" +
+    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstPassChanges\":1," +
+    "\"verifiedFirstPassPpm\":1000000,\"totalVerifiedSpendMicro\":\"5\"," +
+    "\"successfulRunCostMicro\":\"5\",\"totalSpendMicro\":\"9\"," +
+    "\"verifiedCostPerSuccessfulChangeMicro\":\"9\",\"totalReworkSpendMicro\":\"1\"," +
+    "\"reworkCostRatioPpm\":111111,\"localRuns\":1,\"localOnlyRuns\":1," +
+    "\"localOnlyVerifiedChanges\":1,\"localOnlyVerifiedPpm\":1000000," +
+    "\"localFinalRuns\":1,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":1000000," +
+    "\"localFirstRuns\":1,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":1000000," +
+    "\"localToFrontierFallbackRuns\":0,\"localToFrontierFallbackPpm\":0," +
+    "\"frontierOnlyRuns\":2,\"frontierOnlyPpm\":666666," +
+    "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":10," +
+    "\"meanTimeToVerifiedChangeMs\":10,\"humanInterventionRuns\":0," +
+    "\"humanInterventionPpm\":0,\"rollbackRuns\":0,\"regressionRollbackPpm\":0," +
+    "\"checksPassed\":1,\"checksRequired\":1,\"proofCoveragePpm\":1000000," +
+    "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+    "\"scanned\":3,\"truncated\":false}," +
+    "\"runs\":[{\"runId\":\"run-1\",\"sessionId\":1,\"taskId\":2," +
+    "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
+    "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":false,\"verified\":true," +
+    "\"verifiedFirstAttempt\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"modelSpendMicro\":\"5\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
+    "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":10,\"humanInterventions\":0," +
+    "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
+    "\"changeScale\":{\"files\":1,\"addedLines\":1,\"removedLines\":0}," +
+    "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +
+    "\"frontierEscalations\":0,\"completedAtMs\":10}]," +
+    "\"nextCursor\":null}"
+
 private const val MESSAGES_JSON = "{" +
     "\"sessionId\":\"7\",\"messages\":[" +
     "{\"seq\":1,\"id\":1,\"role\":\"user\",\"createdMs\":1,\"data\":{\"text\":\"hi\"}," +
@@ -1201,6 +1235,21 @@ private fun assertClientRoutes() {
     daemon.on("POST", "/native/evidence/9/retrieve") { _, response ->
         response.json(200, EVIDENCE_RETRIEVAL_JSON)
     }
+    daemon.on("GET", "/native/outcomes") { request, response ->
+        if (request.query["limit"] == "666") {
+            response.json(
+                200,
+                OUTCOMES_JSON.replace("\"totalSpendMicro\":\"9\"", "\"totalSpendMicro\":\"9e3\"")
+            )
+        } else if (request.query["limit"] == "667") {
+            response.json(
+                200,
+                OUTCOMES_JSON.replace("\"verifiedFirstPassPpm\":1000000", "\"verifiedFirstPassPpm\":1000001")
+            )
+        } else {
+            response.json(200, OUTCOMES_JSON)
+        }
+    }
     daemon.on("GET", "/native/permissions") { _, response ->
         response.json(200, PERMISSIONS_JSON)
     }
@@ -1250,6 +1299,40 @@ private fun assertClientRoutes() {
         assertEquals("3", client.taskVerification("7", "3").taskId)
         assertEquals(9L, client.evidence("7", 9).id)
         assertEquals("hello", String(client.retrieveEvidence("7", 9, "{\"selector\":\"all\"}").bytes))
+
+        // The outcomes ledger: the composite cursor rides the query, the
+        // page parses, and malformed served numbers are typed refusals.
+        val outcomes = client.outcomes(limit = 2L, beforeMs = 42L, beforeRun = "run-9")
+        assertEquals(3L, outcomes.metrics.runs)
+        assertEquals(1L, outcomes.metrics.verifiedChanges)
+        assertEquals("9", outcomes.metrics.verifiedCostPerSuccessfulChangeMicro)
+        assertEquals("run-1", outcomes.runs[0].runId)
+        assertEquals(false, outcomes.metrics.truncated)
+        assertEquals(null, outcomes.nextCursor)
+        val outcomesRead = daemon.requests.first {
+            it.method == "GET" && it.path == "/native/outcomes"
+        }
+        assertEquals("2", outcomesRead.query["limit"], "limit must ride the query")
+        assertEquals("42", outcomesRead.query["before_ms"], "the cursor ms must ride the query")
+        assertEquals("run-9", outcomesRead.query["before_run"], "the cursor run must ride the query")
+        try {
+            client.outcomes(beforeMs = 1L)
+            fail("a half-given cursor must refuse before any request")
+        } catch (e: NativeProtocolException) {
+            assertTrue(e.message!!.contains("together"), e.message!!)
+        }
+        try {
+            client.outcomes(limit = 666L)
+            fail("a non-decimal money string must refuse typed")
+        } catch (e: NativeProtocolException) {
+            assertTrue(e.message!!.contains("totalSpendMicro"), e.message!!)
+        }
+        try {
+            client.outcomes(limit = 667L)
+            fail("an out-of-range ppm must refuse typed")
+        } catch (e: NativeProtocolException) {
+            assertTrue(e.message!!.contains("verifiedFirstPassPpm"), e.message!!)
+        }
 
         // Permissions: the pending list carries the OWNING session per entry;
         // the reply body is the strict session-scoped DTO.

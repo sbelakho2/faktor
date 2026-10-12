@@ -76,6 +76,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * The result of one selected-change review (I03): `opened` names the
+   * served evidence id whose immutable document (or side-by-side diff) the
+   * native editor now shows; `unavailable` asks the Changes view to render
+   * its exact `Diff unavailable` state (no live workspace read happened).
+   */
+  postChangeReview(result: {
+    readonly path: string;
+    readonly state: 'opened' | 'unavailable';
+    readonly evidenceId?: number;
+    readonly reason?: string | null;
+  }): void {
+    this.post({ type: 'changeReview', ...result });
+  }
+
+  /**
    * The result of one `sendGoal`: the built-in composer clears its draft
    * ONLY when `ok` is true and the textarea still holds the submitted goal
    * (see media/composer-state.js).
@@ -371,6 +386,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <textarea id="contract-risks" class="contract-rows" rows="2" spellcheck="false" placeholder="One risk per line"></textarea>
       <label for="contract-obligations" class="composer-label">Proof obligations — claims verification must evaluate</label>
       <textarea id="contract-obligations" class="contract-rows" rows="2" spellcheck="false" placeholder="One claim per line"></textarea>
+      <p class="muted">Optional budget for THIS task start only. Empty uses the Faktor setting; an invalid value refuses the start and keeps the draft.</p>
+      <label for="contract-budget-tokens" class="composer-label">Per-run token budget — non-negative integer, empty uses the setting</label>
+      <input id="contract-budget-tokens" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 200000" />
+      <label for="contract-budget-cost" class="composer-label">Per-run cost budget — micro-USD, exact non-negative integer, empty uses the setting</label>
+      <input id="contract-budget-cost" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 5000000" />
     </details>
     <div class="composer-actions">
       <button id="btn-send" class="primary-action" type="submit">Run task</button>
@@ -406,8 +426,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="inspect-subpanel-changes" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-changes" hidden>
       <section id="changes-card" class="card">
         <h2>Changes</h2>
+        <div id="changes-toolbar" class="changes-toolbar">
+          <div id="change-candidate" class="change-candidate"></div>
+          <div class="changes-nav">
+            <button id="btn-change-prev" class="secondary" type="button" title="Select the previous changed path">Previous change</button>
+            <button id="btn-change-next" class="secondary" type="button" title="Select the next changed path">Next change</button>
+            <button id="btn-change-review" type="button" title="Open the served immutable basis of the selected change (read-only)">Review change</button>
+            <button id="btn-change-claim" class="secondary" type="button" title="Select the related criterion in Verification">Open claim</button>
+            <button id="btn-change-return" class="secondary" type="button" title="Return to the current run in Work">Return to run</button>
+            <button id="btn-change-recheck" class="secondary" type="button" title="Re-run the proof and projection reads and re-derive the current basis">Recheck current basis</button>
+          </div>
+          <div id="change-basis" class="change-basis"></div>
+          <details id="change-advanced" class="technical-disclosure">
+            <summary>Advanced details</summary>
+            <div id="change-advanced-body" class="muted"></div>
+          </details>
+        </div>
+        <div id="change-review-state" class="change-review-state" hidden role="status"></div>
         <ul id="changes-list" class="changes-list" aria-label="Changed paths served for this run"></ul>
         <div id="changes-empty" class="muted"></div>
+        <section id="changes-unavailable" class="changes-unavailable" hidden>
+          <h3 id="changes-unavailable-label" class="changes-unavailable-label" role="alert">Changes unavailable</h3>
+          <p id="changes-unavailable-copy" class="muted"></p>
+          <button id="btn-changes-recheck-unavailable" class="secondary" type="button">Recheck current basis</button>
+        </section>
       </section>
     </div>
     <div id="inspect-subpanel-verification" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-verification" hidden></div>
@@ -435,6 +477,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </section>
   <section id="history-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-history" hidden>
+    <div id="history-tabs" class="tablist history-tabs" role="tablist" aria-label="History surfaces">
+      <button id="history-tab-conversations" class="tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="history-conversations">Conversations</button>
+      <button id="history-tab-outcomes" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-outcomes">Outcomes</button>
+    </div>
+    <section id="history-conversations" role="tabpanel" aria-labelledby="history-tab-conversations">
     <section id="history-card" class="card">
       <h2>History</h2>
       <div id="history-controls" class="history-controls">
@@ -448,6 +495,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <h3 id="history-unavailable-label" class="history-unavailable-label" role="alert">History unavailable</h3>
         <p id="history-unavailable-copy" class="muted">The conversation list could not be read.</p>
         <button id="btn-history-refresh-unavailable" type="button">Refresh history</button>
+      </section>
+    </section>
+    </section>
+    <section id="history-outcomes" role="tabpanel" aria-labelledby="history-tab-outcomes" hidden>
+      <section id="outcomes-card" class="card">
+        <h2>Outcomes</h2>
+        <div class="outcomes-controls">
+          <button id="btn-outcomes-refresh" class="secondary" type="button" title="Re-read the ledger metrics and the newest run page">Refresh</button>
+        </div>
+        <div id="outcomes-status" class="muted" role="status"></div>
+        <div id="outcomes-truncated" class="outcomes-truncated" role="note" hidden>Truncated sample</div>
+        <div id="outcomes-metrics" class="outcomes-metrics"></div>
+        <div id="outcomes-runs" class="outcomes-runs"></div>
+        <button id="btn-outcomes-older" class="secondary" type="button" hidden>Older runs</button>
+        <section id="outcomes-unavailable" class="outcomes-unavailable" hidden>
+          <h3 id="outcomes-unavailable-label" class="outcomes-unavailable-label" role="alert">Cost unavailable</h3>
+          <p id="outcomes-unavailable-copy" class="muted">The current authority has not supplied a cost value.</p>
+          <details class="technical-disclosure">
+            <summary>View details</summary>
+            <div id="outcomes-unavailable-detail" class="muted"></div>
+          </details>
+        </section>
       </section>
     </section>
   </section>

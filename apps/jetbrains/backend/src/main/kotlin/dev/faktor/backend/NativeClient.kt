@@ -16,6 +16,7 @@ package dev.faktor.backend
 
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
+import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
@@ -67,6 +68,7 @@ import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.ProtocolAttachmentRef
+import dev.faktor.shared.ProtocolOutcomesPage
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
@@ -113,6 +115,7 @@ import dev.faktor.shared.parseNativeUsage
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.parseProtocolAttachmentRef
 import dev.faktor.shared.parseProtocolErrorEnvelope
+import dev.faktor.shared.parseProtocolOutcomesPage
 import dev.faktor.shared.view
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -779,6 +782,134 @@ class NativeClient(
     fun verification(sessionId: String): NativeVerificationView = parseNativeVerificationView(
         request("GET", "/native/session/" + encode(sessionId) + "/verification")
     )
+
+    /**
+     * One bounded newest-first page of the Engineering Outcome Ledger plus
+     * its durable metrics fold (`GET /native/outcomes`). `beforeMs` and
+     * `beforeRun` are the composite cursor of a previous page and must be
+     * given together. Money fields are validated as exact decimal strings
+     * and rates as ppm in 0..=1_000_000 before the model layer consumes
+     * them: a malformed served number is a typed refusal, never a
+     * fabricated metric.
+     */
+    fun outcomes(
+        limit: Long? = null,
+        beforeMs: Long? = null,
+        beforeRun: String? = null
+    ): ProtocolOutcomesPage {
+        val path = "GET /native/outcomes"
+        if ((beforeMs == null) != (beforeRun == null)) {
+            throw NativeProtocolException(path, "beforeMs and beforeRun must be given together")
+        }
+        val page = parseProtocolOutcomesPage(
+            JsonCodec.parse(
+                request(
+                    "GET", "/native/outcomes",
+                    query(
+                        "limit" to limit?.toString(),
+                        "before_ms" to beforeMs?.toString(),
+                        "before_run" to beforeRun
+                    )
+                )
+            ).view(path)
+        )
+        validateOutcomesPage(page, path)
+        return page
+    }
+
+    /** Exact-decimal money + ppm/counter honesty checks for the ledger page. */
+    private fun validateOutcomesPage(page: ProtocolOutcomesPage, path: String) {
+        val metrics = page.metrics
+        val money = linkedMapOf(
+            "totalVerifiedSpendMicro" to metrics.totalVerifiedSpendMicro,
+            "successfulRunCostMicro" to metrics.successfulRunCostMicro,
+            "totalSpendMicro" to metrics.totalSpendMicro,
+            "verifiedCostPerSuccessfulChangeMicro" to metrics.verifiedCostPerSuccessfulChangeMicro,
+            "totalReworkSpendMicro" to metrics.totalReworkSpendMicro,
+            "avoidedHostedInferenceMicro" to metrics.avoidedHostedInferenceMicro
+        )
+        for ((field, value) in money) {
+            if (MicroMoney.parseDecimal(value) == null) {
+                throw NativeProtocolException(
+                    path,
+                    "the outcome metric $field is not an exact decimal money string: \"$value\""
+                )
+            }
+        }
+        val rates = linkedMapOf(
+            "verifiedFirstPassPpm" to metrics.verifiedFirstPassPpm,
+            "reworkCostRatioPpm" to metrics.reworkCostRatioPpm,
+            "localOnlyVerifiedPpm" to metrics.localOnlyVerifiedPpm,
+            "localFinalVerifiedPpm" to metrics.localFinalVerifiedPpm,
+            "localFirstSuccessPpm" to metrics.localFirstSuccessPpm,
+            "localToFrontierFallbackPpm" to metrics.localToFrontierFallbackPpm,
+            "frontierOnlyPpm" to metrics.frontierOnlyPpm,
+            "humanInterventionPpm" to metrics.humanInterventionPpm,
+            "regressionRollbackPpm" to metrics.regressionRollbackPpm,
+            "proofCoveragePpm" to metrics.proofCoveragePpm,
+            "frontierEscalationPpm" to metrics.frontierEscalationPpm
+        )
+        for ((field, value) in rates) {
+            if (value < 0L || value > 1_000_000L) {
+                throw NativeProtocolException(
+                    path,
+                    "the outcome rate $field must be ppm in 0..=1000000, got $value"
+                )
+            }
+        }
+        val counters = linkedMapOf(
+            "runs" to metrics.runs,
+            "verifiedChanges" to metrics.verifiedChanges,
+            "verifiedFirstPassChanges" to metrics.verifiedFirstPassChanges,
+            "localRuns" to metrics.localRuns,
+            "localOnlyRuns" to metrics.localOnlyRuns,
+            "localOnlyVerifiedChanges" to metrics.localOnlyVerifiedChanges,
+            "localFinalRuns" to metrics.localFinalRuns,
+            "localFinalVerifiedChanges" to metrics.localFinalVerifiedChanges,
+            "localFirstRuns" to metrics.localFirstRuns,
+            "localFirstSuccessChanges" to metrics.localFirstSuccessChanges,
+            "localToFrontierFallbackRuns" to metrics.localToFrontierFallbackRuns,
+            "frontierOnlyRuns" to metrics.frontierOnlyRuns,
+            "totalWallTimeMs" to metrics.totalWallTimeMs,
+            "meanTimeToVerifiedChangeMs" to metrics.meanTimeToVerifiedChangeMs,
+            "humanInterventionRuns" to metrics.humanInterventionRuns,
+            "rollbackRuns" to metrics.rollbackRuns,
+            "checksPassed" to metrics.checksPassed,
+            "checksRequired" to metrics.checksRequired,
+            "frontierEscalationRuns" to metrics.frontierEscalationRuns,
+            "scanned" to metrics.scanned
+        )
+        for ((field, value) in counters) {
+            if (value < 0L) {
+                throw NativeProtocolException(path, "the outcome counter $field must be >= 0, got $value")
+            }
+        }
+        for (run in page.runs) {
+            val runMoney = linkedMapOf(
+                "modelSpendMicro" to run.modelSpendMicro,
+                "verificationSpendMicro" to run.verificationSpendMicro,
+                "reworkSpendMicro" to run.reworkSpendMicro,
+                "avoidedHostedMicro" to run.avoidedHostedMicro
+            )
+            for ((field, value) in runMoney) {
+                if (MicroMoney.parseDecimal(value) == null) {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: $field is not an exact decimal money string: \"$value\""
+                    )
+                }
+            }
+            for (step in run.modelSequence) {
+                if (MicroMoney.parseDecimal(step.spendMicro) == null) {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: model step spendMicro is not an exact decimal money " +
+                            "string: \"${step.spendMicro}\""
+                    )
+                }
+            }
+        }
+    }
 
     fun taskVerification(sessionId: String, taskId: String): NativeTaskVerification =
         parseNativeTaskVerification(

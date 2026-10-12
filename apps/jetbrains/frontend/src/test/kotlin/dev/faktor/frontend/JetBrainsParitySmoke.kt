@@ -1041,6 +1041,7 @@ object JetBrainsParitySmoke {
         // files reach the `files` array as relative paths.
         val workspace = Files.createTempDirectory("faktor-parity-fake-workspace-")
         var panel: FaktorChatPanel? = null
+        val reviewHost = ParityReviewHost()
         val registry = ParityMatrixRegistry
         // The parity matrix owns `current` for this run; only the observable
         // registry is ours to clear between suites.
@@ -1050,7 +1051,11 @@ object JetBrainsParitySmoke {
             val created = service.createSession("alpha", "m", workspace.toString(), title = "parity")
             assertEquals("7", created.id)
             service.watchSession("7", 0)
-            panel = FaktorChatPanel(service, workspaceRoot = workspace)
+            panel = FaktorChatPanel(
+                service,
+                workspaceRoot = workspace,
+                changeReviewHost = reviewHost
+            )
             assertTrue(panel.refreshNowForTest(), "one refresh cycle must finish")
             val chat = panel
 
@@ -1466,6 +1471,69 @@ object JetBrainsParitySmoke {
                     chat.diagnosticsView().restartEnabled(),
                     "restart stays available on Diagnostics"
                 )
+            }
+            registry.observables["change_review"] = {
+                // I03: rows derive from the served task view + the served
+                // verification record only; the immutable basis resolves to
+                // the served source diff evidence and opens through the host
+                // seam (bytes, never a workspace file); Open claim selects
+                // the served criterion on the Verification surface.
+                val view = chat.changesView()
+                assertEquals(1, view.rowCount(), "one served change row")
+                val model = view.currentModel() ?: fail("the change model must be populated")
+                assertEquals("src/a.rs", model.rows.first().path)
+                assertEquals(listOf("r1"), model.rows.first().verificationRecordIds)
+                assertEquals(listOf("file criterion"), model.rows.first().criterionKeys)
+                assertEquals("digest-file", model.rows.first().expectedDigest)
+                assertTrue(
+                    model.rows.first().evidenceRefs.any { it.id == 41L },
+                    "the served evidence ref must attach to the row"
+                )
+                assertEquals("candidate tm1:cand", model.basis?.candidateLabel)
+                view.clickOpen()
+                await("the immutable artifact opens through the host seam") {
+                    reviewHost.artifacts.size == 1
+                }
+                val artifact = reviewHost.artifacts[0]
+                assertEquals(41L, artifact.evidenceId)
+                assertEquals(
+                    "candidate tm1:cand — source diff — evidence #41 (immutable)",
+                    artifact.title
+                )
+                assertTrue(
+                    artifact.text.contains("parity tool output"),
+                    "the artifact carries the served bytes: ${artifact.text}"
+                )
+                view.clickRecheck()
+                await("the basis recheck completes") { view.conflictFacts().isNotEmpty() }
+                assertTrue(
+                    view.conflictFacts().any { it.contains("unchanged") },
+                    view.conflictFacts().toString()
+                )
+                assertTrue(view.claimEnabled(), "the served claim enables Open claim")
+                view.clickClaim()
+                assertEquals(
+                    "file criterion",
+                    chat.verificationView().selectedCriterion(),
+                    "Open claim selects the related criterion in Verification"
+                )
+            }
+            registry.observables["outcomes"] = {
+                // I07: the first Outcomes open lazily reads the ledger; the
+                // exact metric names and served counters render.
+                assertTrue(
+                    chat.selectPanelForTest("Outcomes"),
+                    "the Outcomes surface must be reachable"
+                )
+                await("the lazy outcomes read completes") {
+                    chat.outcomesView().model()?.state == "ok"
+                }
+                val model = chat.outcomesView().model() ?: fail("the outcomes model must exist")
+                assertEquals(3L, model.metrics?.runs)
+                assertEquals("Successful-Run Cost", model.metricRows.first().name)
+                assertTrue(model.metricNames().contains("Local-Final Verified Rate"))
+                assertTrue(model.metricNames().contains("Local-to-Frontier Fallback Rate"))
+                assertEquals("not measured", model.metricValue("Avoided Hosted Inference"))
             }
             // The executable parity matrix runs NOW, inside the live
             // fake-daemon session: its daemon rows drive the real clients
@@ -2031,6 +2099,9 @@ object JetBrainsParitySmoke {
         daemon.on("GET", "/session/7/projection") { _, response -> response.json(200, PROJECTION_JSON) }
         daemon.on("GET", "/native/messages") { _, response -> response.json(200, MESSAGES_JSON) }
         daemon.on("GET", "/native/session/7/tasks") { _, response -> response.json(200, TASK_VIEWS_JSON) }
+        daemon.on("GET", "/native/outcomes") { _, response ->
+            response.json(200, PARITY_OUTCOMES_PAGE_JSON)
+        }
         daemon.on("GET", "/native/session/7/task-runs") { _, response -> response.json(200, TASK_RUNS_JSON) }
         daemon.on("POST", "/native/session/7/task-runs") { _, response ->
             response.json(200, TASK_RUN_STARTED_JSON)
@@ -2202,7 +2273,7 @@ object JetBrainsParitySmoke {
     private const val TASK_VIEWS_JSON = "[" +
         "{\"goal\":\"parity goal\",\"constraints\":[],\"state\":\"in_progress\"," +
         "\"milestones\":{\"completed\":[],\"open\":[]}," +
-        "\"decisions\":[],\"failures\":[],\"changedFiles\":[]," +
+        "\"decisions\":[],\"failures\":[],\"changedFiles\":[\"src/a.rs\"]," +
         "\"tests\":{\"run\":[],\"failed\":[]},\"preferences\":[],\"verification\":[]," +
         "\"progress\":null,\"budget\":null," +
         "\"contract\":{" +
@@ -2469,5 +2540,23 @@ private class TaskStartHarness(
         daemon.stop()
         process.destroyForcibly()
         workspace.toFile().deleteRecursively()
+    }
+}
+
+/**
+ * The I03 host seam double for the fake-daemon suite: records the immutable
+ * artifacts opened through the panel (bytes + immutable title only — the
+ * seam has no path-taking method).
+ */
+private class ParityReviewHost : ChangeReviewHost {
+    val artifacts = ArrayList<ImmutableArtifact>()
+    val diffs = ArrayList<Triple<String, ImmutableArtifact, ImmutableArtifact>>()
+
+    override fun openArtifact(artifact: ImmutableArtifact) {
+        artifacts.add(artifact)
+    }
+
+    override fun openDiff(title: String, left: ImmutableArtifact, right: ImmutableArtifact) {
+        diffs.add(Triple(title, left, right))
     }
 }

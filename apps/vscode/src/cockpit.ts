@@ -2659,6 +2659,10 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
       `owed ${view.verification.owed} · failed checks ${view.verification.failedChecks}`,
     ],
     evidence: [],
+    // The same served criterion rows the acceptance section proofs: the
+    // Verification subview renders them so `Open claim` (I03) can select the
+    // related criterion in place. Absent rows stay absent, never fabricated.
+    criteria: view.criteriaProof.slice(0, MAX_CRITERIA_PROOF),
   });
   sections.push({
     key: 'evidence',

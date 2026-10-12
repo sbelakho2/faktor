@@ -33,6 +33,8 @@ import * as dt from '../src/displayText.ts';
 import * as ue from '../src/errors.ts';
 import * as pf from '../src/preflight.ts';
 import * as rd from '../src/readiness.ts';
+import * as cr from '../src/changeReview.ts';
+import * as oc from '../src/outcomes.ts';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
 import historyPolicy from '../media/history-state.js';
@@ -50,6 +52,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 // `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
 // (out/ + media/, the Faktor-owned panel) without a daemon.
@@ -625,6 +628,85 @@ const semanticStatusJson = {
   snapshotState: { providers: [], fallback: true },
 };
 const abortAckJson = { aborted: ['1'] };
+// I07: one served Engineering Outcome Ledger page (metrics + run + cursor).
+// `futureMember` is an additive unknown field the strict DTO must ignore.
+const outcomesMetricsJson = {
+  runs: 2,
+  verifiedChanges: 1,
+  verifiedFirstPassChanges: 1,
+  verifiedFirstPassPpm: 1000000,
+  totalVerifiedSpendMicro: '1262500',
+  successfulRunCostMicro: '1262500',
+  totalSpendMicro: '5550000',
+  verifiedCostPerSuccessfulChangeMicro: '5550000',
+  totalReworkSpendMicro: '250000',
+  reworkCostRatioPpm: 45045,
+  localRuns: 1,
+  localOnlyRuns: 1,
+  localOnlyVerifiedChanges: 1,
+  localOnlyVerifiedPpm: 1000000,
+  localFinalRuns: 1,
+  localFinalVerifiedChanges: 1,
+  localFinalVerifiedPpm: 1000000,
+  localFirstRuns: 1,
+  localFirstSuccessChanges: 1,
+  localFirstSuccessPpm: 1000000,
+  localToFrontierFallbackRuns: 0,
+  localToFrontierFallbackPpm: 0,
+  frontierOnlyRuns: 1,
+  frontierOnlyPpm: 500000,
+  avoidedHostedInferenceMicro: '0',
+  totalWallTimeMs: 4000,
+  meanTimeToVerifiedChangeMs: 4000,
+  humanInterventionRuns: 1,
+  humanInterventionPpm: 500000,
+  rollbackRuns: 0,
+  regressionRollbackPpm: 0,
+  checksPassed: 3,
+  checksRequired: 4,
+  proofCoveragePpm: 750000,
+  frontierEscalationRuns: 0,
+  frontierEscalationPpm: 0,
+  scanned: 2,
+  truncated: false,
+};
+const outcomeRunJson = {
+  runId: 'run-1',
+  sessionId: 7,
+  taskId: 3,
+  taskClass: 'implementation',
+  riskClass: 'low',
+  candidateSnapshot: 'cand',
+  finalSnapshot: 'final',
+  accepted: true,
+  integrated: true,
+  verified: true,
+  verifiedFirstAttempt: true,
+  repairAttempts: 0,
+  modelSequence: [
+    { provider: 'local', model: 'llama', local: true, spendMicro: '0' },
+    { provider: 'openai', model: 'gpt', local: false, spendMicro: '1262500' },
+  ],
+  modelSpendMicro: '1262500',
+  verificationSpendMicro: '0',
+  reworkSpendMicro: '0',
+  avoidedHostedMicro: '0',
+  wallTimeMs: 4000,
+  humanInterventions: 1,
+  proof: { checksPassed: 3, checksRequired: 4, coveragePpm: 750000 },
+  changeScale: { files: 2, addedLines: 0, removedLines: 0 },
+  rollbackEvents: 0,
+  recoveryEvents: 0,
+  finalBasis: 'deterministic_checks_and_review',
+  frontierEscalations: 0,
+  completedAtMs: 1_700_000_000_000,
+};
+const outcomesPageJson = {
+  metrics: outcomesMetricsJson,
+  runs: [outcomeRunJson],
+  nextCursor: { completedAtMs: 1_700_000_000_000, runId: 'run-1' },
+  futureMember: { note: 'additive unknown field, must be ignored' },
+};
 // Audits 5/6/16: a PARTIAL generation with a capped fingerprint round.
 const indexCoverageJson = {
   sessionId: '7',
@@ -8430,6 +8512,25 @@ async function composerAttachmentTests() {
 
   await test('the webview markup and canonical DOM identity are pinned against drift', () => {
     const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    const surfaces = `${markup}\n${chatSource}`;
+    // The I03/I07 exact copies ship verbatim (markup or the renderer
+    // constants); the markup is the contract users read.
+    assert(surfaces.includes('No candidate changes are served for this run yet.'), 'I03 empty copy');
+    assert(surfaces.includes('Diff unavailable'), 'I03 diff-unavailable label');
+    assert(
+      surfaces.includes('The runtime does not serve an immutable candidate content read for this change.'),
+      'I03 diff-unavailable copy',
+    );
+    assert(surfaces.includes('Cost unavailable'), 'I07 T29 label');
+    assert(
+      surfaces.includes('The current authority has not supplied a cost value.'),
+      'I07 T29 copy',
+    );
+    assert(markup.includes('>View details</summary>'), 'I07 T29 details affordance');
+    assert(surfaces.includes('Truncated sample'), 'I07 truncation note');
+    assert(markup.includes('>Conversations</button>'), 'I07 History conversations tab');
+    assert(markup.includes('>Outcomes</button>'), 'I07 History outcomes tab');
     const { dom } = runChatWebview(canonicalDomSnapshot());
     const observed = {
       schema: DOM_BASELINE_SCHEMA,
@@ -9049,7 +9150,7 @@ async function navigationWebviewTests() {
   });
 
   await test('History round-trip preserves the Inspect subview, scope breadcrumb and composer draft', () => {
-    const harness = runChatWebview({ ...webviewSnapshot([]), workspaceName: 'Kilo+' });
+    const harness = runChatWebview({ ...webviewSnapshot([]), workspaceName: 'Faktor' });
     const { dom } = harness;
     const goal = dom.document.getElementById('goal');
     goal.value = 'unsent draft for this conversation';
@@ -9058,7 +9159,7 @@ async function navigationWebviewTests() {
     // The breadcrumb shows Inspect / <Subview> plus the workspace NAME; ids
     // stay behind the advanced-diagnostics disclosure.
     assertEqual(dom.document.getElementById('inspect-breadcrumb-path').textContent, 'Inspect / Verification');
-    assertEqual(dom.document.getElementById('inspect-breadcrumb-scope').textContent, 'scope Kilo+');
+    assertEqual(dom.document.getElementById('inspect-breadcrumb-scope').textContent, 'scope Faktor');
     assert(
       !dom.document.getElementById('inspect-breadcrumb-path').textContent.includes('7'),
       'the primary breadcrumb label never carries a raw id',
@@ -9079,7 +9180,7 @@ async function navigationWebviewTests() {
     assertEqual(dom.document.getElementById('inspect-subpanel-verification').hidden, false);
     assertEqual(goal.value, 'unsent draft for this conversation', 'navigation never loses the draft');
     // A background snapshot neither resets the selection nor the draft.
-    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), workspaceName: 'Kilo+' } });
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), workspaceName: 'Faktor' } });
     assertEqual(dom.document.getElementById('subtab-verification').getAttribute('aria-selected'), 'true');
     assertEqual(goal.value, 'unsent draft for this conversation');
   });
@@ -10548,6 +10649,19 @@ async function verdictContrastTests() {
 
 // ------------------------------------------------------- packaged VSIX layout
 
+/** Recursive repository-relative file walk under `dir` (`/`-joined). */
+function walkPackagedFiles(dir, prefix = '', out = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = `${prefix}${entry.name}`;
+    if (entry.isDirectory()) {
+      walkPackagedFiles(join(dir, entry.name), `${rel}/`, out);
+    } else {
+      out.push(rel);
+    }
+  }
+  return out;
+}
+
 /** Assert the packaged layout is the Faktor-owned panel, self-contained. */
 async function packagedLayoutTests(dir) {
   await test(`packaged VSIX layout is self-contained (${dir})`, () => {
@@ -10557,10 +10671,12 @@ async function packagedLayoutTests(dir) {
       'out/webview.js',
       'out/daemon.js',
       'out/steer.js',
+      'out/generated/protocolDto.js',
       'media/chat.js',
       'media/chat.css',
       'media/composer-state.js',
       'media/board-state.js',
+      'media/history-state.js',
       'media/faktor.svg',
     ]) {
       assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
@@ -10581,23 +10697,32 @@ async function packagedLayoutTests(dir) {
       readFileSync(join(dir, licenseTarget), 'utf8').includes('Apache License'),
       'packaged LICENSE.txt is the Apache-2.0 text the manifest references',
     );
-    // The Faktor-owned panel ships exactly the hand-written media files: an
-    // allowlist makes ANY extra file (a vendored closure included) a failure.
-    const media = readdirSync(join(dir, 'media')).sort();
+    // The Faktor-owned panel ships exactly the hand-written media/ files: the
+    // pinned allowlist makes ANY extra file (a vendored closure included) a
+    // failure, and the walk is recursive so a nested extra cannot hide.
+    const media = walkPackagedFiles(join(dir, 'media')).sort();
     assertDeepEqual(
       media,
-      ['board-state.js', 'chat.css', 'chat.js', 'composer-state.js', 'faktor.svg'],
+      [
+        'board-state.js',
+        'chat.css',
+        'chat.js',
+        'composer-state.js',
+        'faktor.svg',
+        'history-state.js',
+      ],
       'media/ ships exactly the Faktor-owned panel',
     );
-    // out/ ships exactly one compiled module per src/ module: an extra
-    // bridge/closure artifact is a failure even when nobody names it.
-    const sources = readdirSync(new URL('../src', import.meta.url))
-      .filter((name) => name.endsWith('.ts'))
-      .map((name) => name.replace(/\.ts$/, '.js'))
+    // out/ ships exactly one compiled module per src/ module at the SAME
+    // relative depth (tsconfig's recursive include compiles src/generated to
+    // out/generated): both walks are RECURSIVE so a missing generated DTO and
+    // any extra artifact at any depth both fail even when nobody names them.
+    const srcRoot = fileURLToPath(new URL('../src', import.meta.url));
+    const sources = walkPackagedFiles(srcRoot)
+      .filter((rel) => rel.endsWith('.ts'))
+      .map((rel) => rel.replace(/\.ts$/, '.js'))
       .sort();
-    const compiled = readdirSync(join(dir, 'out'))
-      .filter((name) => name.endsWith('.js'))
-      .sort();
+    const compiled = walkPackagedFiles(join(dir, 'out')).sort();
     assertDeepEqual(compiled, sources, 'out/ ships exactly the compiled src/ modules');
     const built = readFileSync(join(dir, 'out', 'webview.js'), 'utf8');
     assert(
@@ -10612,6 +10737,7 @@ async function packagedLayoutTests(dir) {
       'media/chat.js',
       'media/composer-state.js',
       'media/board-state.js',
+      'media/history-state.js',
       'media/chat.css',
     ]) {
       const text = readFileSync(join(dir, ...rel.split('/')), 'utf8');
@@ -12940,6 +13066,1039 @@ async function daemonCancelTests() {
   });
 }
 
+// ---------------------------------------------------- I02 per-run budget
+
+async function runBudgetTests() {
+  await test('per-run budget: strict parse, exact bounds, typed refusals', () => {
+    assertDeepEqual(ts.parseRunBudget(undefined, undefined), { budget: null });
+    assertDeepEqual(ts.parseRunBudget('', null), { budget: null });
+    assertDeepEqual(ts.parseRunBudget('   ', '  '), { budget: null });
+    const both = ts.parseRunBudget('120', '250000');
+    assert(!('reason' in both), 'a valid pair must parse');
+    assertEqual(both.budget.tokens, 120);
+    assertEqual(both.budget.costMicro, 250000n);
+    const tokensOnly = ts.parseRunBudget('7', '');
+    assertEqual(tokensOnly.budget.tokens, 7);
+    assertEqual(tokensOnly.budget.costMicro, null);
+    const costOnly = ts.parseRunBudget(null, '9');
+    assertEqual(costOnly.budget.tokens, null);
+    assertEqual(costOnly.budget.costMicro, 9n);
+    const exactMax = ts.parseRunBudget(String(ts.MAX_RUN_BUDGET_TOKENS), '9007199254740991');
+    assert(!('reason' in exactMax), 'the exact 2^53-1 bound must be accepted on both fields');
+    for (const bad of ['-1', '1.5', 'abc', '1e3', '0x10', '9007199254740992']) {
+      const parsed = ts.parseRunBudget(bad, '');
+      assert('reason' in parsed, `token ${JSON.stringify(bad)} must refuse`);
+      assert(parsed.reason.includes('the task was not started'), parsed.reason);
+    }
+    assert('reason' in ts.parseRunBudget(5, ''), 'a non-string token value must refuse typed');
+    for (const bad of ['-1', '1.5', 'abc', '1e3', '9007199254740992', '18446744073709551616']) {
+      const parsed = ts.parseRunBudget('', bad);
+      assert('reason' in parsed, `cost ${JSON.stringify(bad)} must refuse`);
+      assert(parsed.reason.includes('the task was not started'), parsed.reason);
+    }
+    assert('reason' in ts.parseRunBudget('', 5), 'a non-string cost value must refuse typed');
+  });
+
+  await test('per-run budget: the override wins over the settings and rides the start request', () => {
+    const effective = ts.resolveRunBudget({
+      override: { tokens: 42, costMicro: 4242n },
+      settingsTokens: 7,
+      settingsCostMicro: 900n,
+    });
+    assertEqual(effective.maxTokens, 42, 'the token override wins');
+    assertEqual(effective.maxCostMicro, 4242n, 'the cost override wins');
+    const partial = ts.resolveRunBudget({
+      override: { tokens: 5, costMicro: null },
+      settingsTokens: 7,
+      settingsCostMicro: 900n,
+    });
+    assertEqual(partial.maxTokens, 5, 'a one-dimension override still wins for that dimension');
+    assertEqual(partial.maxCostMicro, 900n, 'the other dimension falls back to the setting');
+    const fallback = ts.resolveRunBudget({ override: null, settingsTokens: 7, settingsCostMicro: 900n });
+    assertEqual(fallback.maxTokens, 7);
+    assertEqual(fallback.maxCostMicro, 900n);
+    const unrepresentable = ts.resolveRunBudget({
+      override: null,
+      settingsTokens: 0,
+      settingsCostMicro: null,
+    });
+    assertEqual(unrepresentable.maxCostMicro, null, 'a null settings cost stays visible to the caller (refusal)');
+    const request = ts.startTaskRequest('goal', {
+      mutationMode: '',
+      maxTokens: effective.maxTokens,
+      maxCostMicro: effective.maxCostMicro,
+    });
+    assertEqual(request.max_tokens, 42);
+    assertEqual(request.max_cost_micro, 4242);
+    const bare = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0n });
+    assert(!('max_tokens' in bare) && !('max_cost_micro' in bare), 'the default path carries no budget fields');
+  });
+
+  await test('per-run budget: captured per submission, reused on retry, cleared after acceptance', () => {
+    const gate = new ts.TaskStartGate();
+    let next = 0;
+    const newId = () => `00000000-0000-4000-8000-${String(++next).padStart(12, '0')}`;
+    const envelope = ts.parsePendingSubmission({ text: 'budgeted', sessionId: '7' });
+    assert(envelope !== null, 'the envelope fixture must parse');
+    const budget = { tokens: 10, costMicro: 11n };
+    const first = gate.admit({ pending: envelope, files: [], contract: null, budget, newId });
+    assertEqual(first.action, 'start');
+    assertEqual(first.retry, false);
+    assertDeepEqual(first.snapshot.budget, budget);
+    gate.settle(first.snapshot.submissionId, 'transport');
+    const retry = gate.admit({
+      pending: envelope,
+      files: [],
+      contract: null,
+      budget: { tokens: 10, costMicro: 11n },
+      newId,
+    });
+    assertEqual(retry.action, 'start');
+    assertEqual(retry.retry, true, 'the same body and budget retry under the stored id');
+    assertEqual(retry.snapshot.submissionId, first.snapshot.submissionId);
+    assertDeepEqual(retry.snapshot.budget, budget, 'the retry reuses the captured per-run values');
+    gate.settle(retry.snapshot.submissionId, 'transport');
+    const changed = gate.admit({
+      pending: envelope,
+      files: [],
+      contract: null,
+      budget: { tokens: 99, costMicro: 11n },
+      newId,
+    });
+    assertEqual(changed.action, 'start');
+    assertEqual(changed.retry, false, 'a changed budget is a NEW logical submission');
+    assert(changed.snapshot.submissionId !== first.snapshot.submissionId);
+    gate.settle(changed.snapshot.submissionId, 'started');
+    assertEqual(gate.inFlight(), false, 'durable acceptance clears the captured submission');
+  });
+
+  await test('webview: per-run budget fields ride sendGoal and clear only on durable acceptance', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted, deliver } = harness;
+    const goal = dom.document.getElementById('goal');
+    const tokens = dom.document.getElementById('contract-budget-tokens');
+    const cost = dom.document.getElementById('contract-budget-cost');
+    assert(tokens && cost, 'both per-run budget fields exist in the Acceptance & contract disclosure');
+    goal.value = 'budgeted goal';
+    tokens.value = ' 120000 ';
+    cost.value = '5000000';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'sendGoal',
+      goal: 'budgeted goal',
+      budgetTokens: '120000',
+      budgetCostMicro: '5000000',
+    });
+    deliver({ type: 'startResult', goal: 'budgeted goal', ok: false });
+    assertEqual(tokens.value, ' 120000 ', 'a failed start keeps the per-run budget fields');
+    assertEqual(cost.value, '5000000');
+    tokens.value = '   ';
+    cost.value = '';
+    goal.value = 'plain goal';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal' });
+    deliver({ type: 'startResult', goal: 'plain goal', ok: true });
+    assertEqual(tokens.value, '', 'durable acceptance clears the token override');
+    assertEqual(cost.value, '', 'durable acceptance clears the cost override');
+  });
+}
+
+// ---------------------------------------------------- I03 change review
+
+function changeVerificationJson(sourceDiffEvidence = null) {
+  const record = clone(verificationRecordJson);
+  record.criteria = [
+    { criterionKey: 'build', passed: true, evidence: 'file:a.ts; evidence:41' },
+    { criterionKey: 'lint', passed: true, evidence: null },
+  ];
+  record.changedFiles = [{ path: 'a.ts', digestHex: 'ab', size: 4 }];
+  record.candidateProof = { ...record.candidateProof, sourceDiffEvidence };
+  return { sessionId: '7', taskId: 't1', records: [record] };
+}
+
+function assertChangeReviewError(fn, code) {
+  try {
+    fn();
+  } catch (error) {
+    assert(
+      error instanceof cr.ChangeReviewError,
+      `expected ChangeReviewError, got ${error && error.name}: ${error && error.message}`,
+    );
+    if (code) {
+      assertEqual(error.code, code, 'ChangeReviewError code');
+    }
+    return;
+  }
+  throw new Error('expected a ChangeReviewError, nothing was thrown');
+}
+
+async function assertChangeReviewRejects(factory, code) {
+  try {
+    await factory();
+  } catch (error) {
+    assert(
+      error instanceof cr.ChangeReviewError,
+      `expected ChangeReviewError, got ${error && error.name}: ${error && error.message}`,
+    );
+    if (code) {
+      assertEqual(error.code, code, 'ChangeReviewError code');
+    }
+    return;
+  }
+  throw new Error('expected a ChangeReviewError rejection');
+}
+
+function fakeEvidenceReader(meta, retrieval) {
+  const calls = [];
+  return {
+    calls,
+    client: {
+      evidence: async (sessionId, evidenceId) => {
+        calls.push(['evidence', sessionId, evidenceId]);
+        return meta;
+      },
+      retrieveEvidence: async (sessionId, evidenceId, selector) => {
+        calls.push(['retrieve', sessionId, evidenceId, selector]);
+        return retrieval;
+      },
+    },
+  };
+}
+
+async function changeReviewTests() {
+  await test('changes: rows derive from served paths and only served relationships attach refs', () => {
+    const verification = nc.validateTaskVerification(changeVerificationJson('12'));
+    const rows = cr.changeRowsOf({
+      filesChanged: ['a.ts', 'b.ts', 'a.ts', 'bad\u0001.ts', ''],
+      verification,
+      proof: null,
+    });
+    assertEqual(rows.length, 2, 'duplicate/hostile paths collapse or drop; order is preserved');
+    assertEqual(rows[0].path, 'a.ts');
+    assertEqual(rows[0].changeKind, null, 'no change kind is served today (never fabricated)');
+    const labels = rows[0].refs.map((ref) => ref.label);
+    assert(labels.includes('verification record rec1'), JSON.stringify(labels));
+    assert(labels.includes('criterion build'), JSON.stringify(labels));
+    assert(labels.some((label) => label === 'evidence #41'), JSON.stringify(labels));
+    const evidenceRef = rows[0].refs.find((ref) => ref.kind === 'evidence');
+    assertEqual(evidenceRef.evidenceId, 41);
+    const criterionRef = rows[0].refs.find((ref) => ref.kind === 'criterion');
+    assertEqual(criterionRef.criterionKey, 'build');
+    assertEqual(rows[1].path, 'b.ts');
+    assertDeepEqual(rows[1].refs, [], 'an unrelated path attaches NO refs (never guessed)');
+    const bounded = cr.changeRowsOf({
+      filesChanged: Array.from({ length: 250 }, (_, index) => `f${index}.ts`),
+      verification: null,
+      proof: null,
+    });
+    assertEqual(bounded.length, cr.MAX_CHANGE_PATHS, 'the row list is bounded');
+    assertDeepEqual(cr.evidenceIdsIn('file:a.ts; evidence:41; evidence#42'), [41, 42]);
+  });
+
+  await test('changes: the source-diff evidence id is read from the served records only', () => {
+    assertEqual(cr.sourceDiffEvidenceIdOf(null), null);
+    assertEqual(
+      cr.sourceDiffEvidenceIdOf(nc.validateTaskVerification(changeVerificationJson('7'))),
+      7,
+    );
+    assertEqual(
+      cr.sourceDiffEvidenceIdOf(nc.validateTaskVerification(changeVerificationJson('evidence:8'))),
+      8,
+      'the typed evidence ref form is accepted too',
+    );
+    assertEqual(
+      cr.sourceDiffEvidenceIdOf(nc.validateTaskVerification(changeVerificationJson('not-an-id'))),
+      null,
+      'a non-id value is an honest absence, never a guessed id',
+    );
+    assertEqual(
+      cr.sourceDiffEvidenceIdOf(nc.validateTaskVerification(changeVerificationJson('0'))),
+      null,
+      'zero is not a served evidence id',
+    );
+  });
+
+  await test('changes basis: exact resolution order and immutable titles', () => {
+    const verification = nc.validateTaskVerification(changeVerificationJson('9'));
+    const rows = cr.changeRowsOf({ filesChanged: ['a.ts'], verification, proof: null });
+    const display = cr.candidateDisplayOf('ship it');
+    assertEqual(display, 'Candidate "ship it"');
+    const basis = cr.resolveReviewBasis({
+      path: 'a.ts',
+      row: rows[0],
+      sourceDiffEvidenceId: cr.sourceDiffEvidenceIdOf(verification),
+      candidateDisplay: display,
+    });
+    assertEqual(basis.primary.kind, 'source-diff');
+    assertEqual(basis.primary.evidenceId, 9);
+    assertEqual(
+      basis.primary.title,
+      'Candidate "ship it" — source diff — evidence #9 (immutable)',
+    );
+    assertEqual(basis.secondary.kind, 'evidence');
+    assertEqual(basis.secondary.evidenceId, 41);
+    assertEqual(basis.secondary.title, 'a.ts — evidence #41 (immutable)');
+    const refsOnly = cr.resolveReviewBasis({
+      path: 'a.ts',
+      row: rows[0],
+      sourceDiffEvidenceId: null,
+      candidateDisplay: display,
+    });
+    assertEqual(refsOnly.primary, null, 'without a served source diff the primary is absent');
+    assertEqual(refsOnly.secondary.evidenceId, 41);
+    const nothing = cr.resolveReviewBasis({
+      path: 'b.ts',
+      row: { path: 'b.ts', changeKind: null, refs: [] },
+      sourceDiffEvidenceId: null,
+      candidateDisplay: display,
+    });
+    assertEqual(nothing.primary, null);
+    assertEqual(nothing.secondary, null, 'no served basis resolves to the explicit unavailable state');
+  });
+
+  await test('changes: unavailable projection drops rows and names the reason', () => {
+    const changes = cr.buildChangesSummary({
+      filesChanged: ['a.ts'],
+      verification: nc.validateTaskVerification(changeVerificationJson('9')),
+      proof: null,
+      unavailable: 'projection read refused',
+      candidateDisplay: 'Candidate "x"',
+    });
+    assertEqual(changes.available, false);
+    assertEqual(changes.reason, 'projection read refused');
+    assertDeepEqual(changes.rows, [], 'a failed read never re-serves stale rows');
+    const served = cr.buildChangesSummary({
+      filesChanged: ['a.ts'],
+      verification: nc.validateTaskVerification(changeVerificationJson('9')),
+      proof: nc.validateTaskProof(taskProofJson()),
+      unavailable: null,
+      candidateDisplay: 'Candidate "x"',
+    });
+    assertEqual(served.available, true);
+    assertEqual(served.rows.length, 1);
+    assert(
+      served.basis.lines.some((line) => line === 'source diff: evidence #9 served'),
+      JSON.stringify(served.basis.lines),
+    );
+    assert(
+      served.advanced.some((fact) => fact.label === 'run id' && fact.value === 'run-1'),
+      JSON.stringify(served.advanced),
+    );
+    assertEqual(served.basis.state, 'verified');
+    assert(
+      served.basis.lines.some((line) => line.includes('landed snapshot matches')),
+      JSON.stringify(served.basis.lines),
+    );
+  });
+
+  await test('evidence documents: URI round-trip and typed refusals for hostile ids', () => {
+    const request = {
+      sessionId: '7',
+      evidenceId: 12,
+      purpose: 'source-diff',
+      title: 'Candidate "x" — source diff — evidence #12 (immutable)',
+    };
+    const uri = cr.evidenceDocumentUri(request);
+    const parsed = cr.parseEvidenceDocumentUri({
+      scheme: 'faktor-evidence',
+      path: uri.slice(`${cr.FAKTOR_EVIDENCE_SCHEME}:`.length),
+    });
+    assertDeepEqual(parsed, request);
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'file', path: '/etc/passwd' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'faktor-evidence', path: '/7/abc/evidence/t' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'faktor-evidence', path: '/7/0/evidence/t' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'faktor-evidence', path: '/7/12/nope/t' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'faktor-evidence', path: '/7/12/evidence' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () => cr.parseEvidenceDocumentUri({ scheme: 'faktor-evidence', path: '/7/12/evidence/%' }),
+      'invalid_uri',
+    );
+    assertChangeReviewError(
+      () =>
+        cr.parseEvidenceDocumentUri({
+          scheme: 'faktor-evidence',
+          path: `/7/12/evidence/${encodeURIComponent('x'.repeat(400))}`,
+        }),
+      'invalid_uri',
+    );
+  });
+
+  await test('evidence documents: content equals served bytes exactly and truncation is the first line', async () => {
+    const unicode = 'héllo 🚀\nsecond — line\n';
+    const encoded = Buffer.from(unicode, 'utf8').toString('base64');
+    const reader = fakeEvidenceReader(
+      { ...clone(evidenceJson), id: 41, sessionId: 7, maxBytes: 4096 },
+      {
+        id: 41,
+        selector: { selector: 'all' },
+        bytesBase64: encoded,
+        byteLen: Buffer.byteLength(unicode, 'utf8'),
+        truncatedByPolicy: false,
+      },
+    );
+    const text = await cr.loadEvidenceDocument(
+      { sessionId: '7', evidenceId: 41, purpose: 'evidence', title: 'a.ts — evidence #41 (immutable)' },
+      reader.client,
+    );
+    assertEqual(text, unicode, 'the document equals the decoded served bytes exactly');
+    assertDeepEqual(
+      reader.calls,
+      [
+        ['evidence', '7', 41],
+        ['retrieve', '7', 41, { selector: 'all' }],
+      ],
+      'the adapter reads ONLY the two served evidence calls (no workspace read)',
+    );
+    const truncatedReader = fakeEvidenceReader(
+      { ...clone(evidenceJson), id: 41, sessionId: 7, maxBytes: 4096 },
+      {
+        id: 41,
+        selector: { selector: 'all' },
+        bytesBase64: encoded,
+        byteLen: Buffer.byteLength(unicode, 'utf8'),
+        truncatedByPolicy: true,
+      },
+    );
+    const truncated = await cr.loadEvidenceDocument(
+      { sessionId: '7', evidenceId: 41, purpose: 'source-diff', title: 't' },
+      truncatedReader.client,
+    );
+    assert(
+      truncated.startsWith(`${cr.TRUNCATED_EVIDENCE_HEADER}\n`),
+      'the truncation marker is the FIRST line when the server truncated by policy',
+    );
+    assert(truncated.includes(unicode));
+    const hugeBody = 'ab'.repeat(60_000);
+    const hugeReader = fakeEvidenceReader(
+      { ...clone(evidenceJson), id: 41, sessionId: 7, maxBytes: 1_000_000 },
+      {
+        id: 41,
+        selector: { selector: 'all' },
+        bytesBase64: Buffer.from(hugeBody, 'utf8').toString('base64'),
+        byteLen: hugeBody.length,
+        truncatedByPolicy: false,
+      },
+    );
+    const huge = await cr.loadEvidenceDocument(
+      { sessionId: '7', evidenceId: 41, purpose: 'evidence', title: 't' },
+      hugeReader.client,
+    );
+    assertEqual(huge, hugeBody, 'a bounded huge payload decodes byte-exactly');
+  });
+
+  await test('evidence documents: unknown, cross-session, malformed and oversized payloads refuse typed', async () => {
+    const baseMeta = { ...clone(evidenceJson), id: 41, sessionId: 7, maxBytes: 4096 };
+    const baseRetrieval = {
+      id: 41,
+      selector: { selector: 'all' },
+      bytesBase64: Buffer.from('ok').toString('base64'),
+      byteLen: 2,
+      truncatedByPolicy: false,
+    };
+    const request = { sessionId: '7', evidenceId: 41, purpose: 'evidence', title: 't' };
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(request, fakeEvidenceReader({ ...baseMeta, id: 99 }, baseRetrieval).client),
+      'unknown_evidence',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(request, fakeEvidenceReader({ ...baseMeta, sessionId: 8 }, baseRetrieval).client),
+      'cross_session',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(
+          request,
+          fakeEvidenceReader(baseMeta, { ...baseRetrieval, id: 99 }).client,
+        ),
+      'unknown_evidence',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(
+          request,
+          fakeEvidenceReader(baseMeta, { ...baseRetrieval, bytesBase64: '!!!' }).client,
+        ),
+      'malformed_payload',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(
+          request,
+          fakeEvidenceReader(baseMeta, { ...baseRetrieval, byteLen: 999 }).client,
+        ),
+      'malformed_payload',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(
+          request,
+          fakeEvidenceReader({ ...baseMeta, maxBytes: 1 }, baseRetrieval).client,
+        ),
+      'oversized',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(request, {
+          evidence: async () => {
+            throw new Error('store down');
+          },
+          retrieveEvidence: async () => baseRetrieval,
+        }),
+      'fetch_failed',
+    );
+    await assertChangeReviewRejects(
+      () =>
+        cr.loadEvidenceDocument(request, {
+          evidence: async () => baseMeta,
+          retrieveEvidence: async () => {
+            throw new Error('store down');
+          },
+        }),
+      'fetch_failed',
+    );
+    // The provider path is a source-scan assertion: the adapter modules
+    // never touch the workspace/filesystem APIs.
+    for (const relative of ['../src/changeReview.ts', '../src/evidenceDocuments.ts']) {
+      const source = readFileSync(new URL(relative, import.meta.url), 'utf8');
+      assert(
+        !/node:fs|readFile|writeFile|workspace\.fs|openTextDocument|readFileSync/.test(source),
+        `${relative} must never read a workspace file`,
+      );
+    }
+    const providerSource = readFileSync(
+      new URL('../src/evidenceDocuments.ts', import.meta.url),
+      'utf8',
+    );
+    assert(
+      providerSource.includes('registerTextDocumentContentProvider') &&
+        providerSource.includes('loadEvidenceDocument'),
+      'the provider renders only through the immutable adapter',
+    );
+  });
+
+  await test('webview changes: rows, bounded Previous/Next, toolbar actions and focus preservation', () => {
+    const verification = nc.validateTaskVerification(changeVerificationJson('12'));
+    const changes = cr.buildChangesSummary({
+      filesChanged: ['a.ts', 'b.ts'],
+      verification,
+      proof: nc.validateTaskProof(taskProofJson()),
+      unavailable: null,
+      candidateDisplay: cr.candidateDisplayOf('ship it'),
+    });
+    const snapshot = webviewSnapshot([]);
+    snapshot.changes = changes;
+    snapshot.cockpitSections = [
+      {
+        key: 'verification',
+        title: 'Verification',
+        present: true,
+        lines: ['status passed'],
+        evidence: [],
+        actions: [],
+        criteria: [
+          {
+            verdict: 'pass',
+            criterionKey: 'build',
+            requirement: 'required',
+            origin: 'user',
+            binding: 'required_check',
+            bindingSource: 'daemon',
+            bindingReference: 'check:build',
+          },
+        ],
+      },
+    ];
+    const harness = runChatWebview(snapshot);
+    const { dom, posted } = harness;
+    dom.document.getElementById('subtab-changes').click();
+    const list = dom.document.getElementById('changes-list');
+    assertEqual(list.children.length, 2, 'one row per served path');
+    const prev = dom.document.getElementById('btn-change-prev');
+    const next = dom.document.getElementById('btn-change-next');
+    assertEqual(prev.disabled, true, 'Previous is disabled on the first row');
+    assertEqual(next.disabled, false);
+    assertEqual(dom.document.getElementById('change-candidate').textContent, 'Candidate "ship it"');
+    assert(
+      fakeText(dom.document.getElementById('change-basis')).includes('candidate basis: verified'),
+      fakeText(dom.document.getElementById('change-basis')),
+    );
+    assert(
+      fakeText(dom.document.getElementById('change-advanced-body')).includes('run id: run-1'),
+      'raw ids stay under Advanced details',
+    );
+    // Focus a row, then a refresh must keep focus on the SAME path.
+    const firstButton = findFake(list, (node) => node.tagName === 'button' && node.textContent === 'a.ts');
+    assert(firstButton, 'the a.ts row button exists');
+    firstButton.focus();
+    const refreshed = clone(snapshot);
+    refreshed.changes = { ...changes, rows: [...changes.rows, { path: 'c.ts', changeKind: null, refs: [] }] };
+    harness.deliver({ type: 'snapshot', snapshot: refreshed });
+    assert(
+      dom.document.activeElement && dom.document.activeElement.textContent === 'a.ts',
+      'focus follows the same selected path across a refresh',
+    );
+    // Back to the 2-row served list for the bounded navigation assertions.
+    harness.deliver({ type: 'snapshot', snapshot: clone(snapshot) });
+    next.click();
+    assert(
+      findFake(list, (node) => String(node.className).includes('changes-row-selected') && node.getAttribute('data-change-path') === 'b.ts'),
+      'Next selects the second row',
+    );
+    assertEqual(next.disabled, true, 'Next is disabled on the last row');
+    next.click();
+    assert(
+      findFake(list, (node) => String(node.className).includes('changes-row-selected') && node.getAttribute('data-change-path') === 'b.ts'),
+      'Next clamps at the last row',
+    );
+    prev.click();
+    assert(
+      findFake(list, (node) => String(node.className).includes('changes-row-selected') && node.getAttribute('data-change-path') === 'a.ts'),
+      'Previous returns to the first row',
+    );
+    // Review / recheck / return-to-run post the documented messages.
+    dom.document.getElementById('btn-change-review').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'reviewChange', path: 'a.ts' });
+    dom.document.getElementById('btn-change-recheck').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'recheckChanges' });
+    dom.document.getElementById('btn-change-return').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'openWork' });
+    assertEqual(dom.document.getElementById('work-panel').hidden, false, 'Return to run shows Work');
+    // Open claim selects the related criterion in Verification when served.
+    dom.document.getElementById('subtab-changes').click();
+    dom.document.getElementById('btn-change-claim').click();
+    assertEqual(dom.document.getElementById('subtab-verification').getAttribute('aria-selected'), 'true');
+    const criterion = findFake(
+      dom.document.getElementById('cockpit'),
+      (node) => node.getAttribute && node.getAttribute('data-criterion-key') === 'build',
+    );
+    assert(criterion, 'the served criterion row renders in Verification');
+    assert(criterion.classList.contains('criterion-selected'), 'Open claim selects the criterion');
+    // The host's unavailable review answer renders the exact in-view state.
+    harness.deliver({ type: 'changeReview', path: 'a.ts', state: 'unavailable' });
+    const reviewState = dom.document.getElementById('change-review-state');
+    assertEqual(reviewState.hidden, false);
+    assert(fakeText(reviewState).includes('Diff unavailable'), fakeText(reviewState));
+    assert(fakeText(reviewState).includes('The runtime does not serve an immutable candidate content read for this change.'));
+  });
+
+  await test('webview changes: empty and unavailable states are exact, with no stale rows', () => {
+    const empty = runChatWebview({
+      ...webviewSnapshot([]),
+      changes: {
+        available: true,
+        reason: null,
+        rows: [],
+        candidateDisplay: 'Candidate change',
+        basis: { state: 'no-basis', lines: [] },
+        advanced: [],
+      },
+    });
+    empty.dom.document.getElementById('subtab-changes').click();
+    assertEqual(
+      empty.dom.document.getElementById('changes-empty').textContent,
+      'No candidate changes are served for this run yet.',
+    );
+    assertEqual(empty.dom.document.getElementById('btn-change-prev').disabled, true);
+    assertEqual(empty.dom.document.getElementById('btn-change-next').disabled, true);
+    assertEqual(empty.dom.document.getElementById('btn-change-review').disabled, true);
+    const failed = runChatWebview({
+      ...webviewSnapshot([]),
+      changes: {
+        available: false,
+        reason: 'projection read refused',
+        rows: [],
+        candidateDisplay: 'Candidate change',
+        basis: { state: 'unavailable', lines: [] },
+        advanced: [],
+      },
+    });
+    failed.dom.document.getElementById('subtab-changes').click();
+    const unavailable = failed.dom.document.getElementById('changes-unavailable');
+    assertEqual(unavailable.hidden, false, 'a failed read renders the explicit unavailable state');
+    assert(
+      failed.dom.document
+        .getElementById('changes-unavailable-copy')
+        .textContent.includes('projection read refused'),
+      failed.dom.document.getElementById('changes-unavailable-copy').textContent,
+    );
+    assertEqual(failed.dom.document.getElementById('changes-list').hidden, true);
+    assertEqual(failed.dom.document.getElementById('changes-list').children.length, 0, 'no stale rows');
+    failed.dom.document.getElementById('btn-changes-recheck-unavailable').click();
+    assertDeepEqual(failed.posted[failed.posted.length - 1], { type: 'recheckChanges' });
+  });
+}
+
+// --------------------------------------------------------- I07 outcomes
+
+async function outcomeTests() {
+  await test('outcomes client: validated page, cursor query, hostile payload refused typed', async () => {
+    const { client, calls } = makeClient({
+      'GET /native/outcomes': () => jsonResponse(clone(outcomesPageJson)),
+    });
+    const page = await client.outcomes({ limit: 25 });
+    assertEqual(page.metrics.runs, 2);
+    assertEqual(page.runs[0].runId, 'run-1');
+    assertEqual(page.runs[0].modelSpendMicro, '1262500');
+    assertDeepEqual(page.nextCursor, { completedAtMs: 1_700_000_000_000, runId: 'run-1' });
+    const older = await client.outcomes({
+      beforeMs: 1_700_000_000_000,
+      beforeRun: 'run-1',
+    });
+    assertEqual(older.runs.length, 1);
+    assertDeepEqual(findCall(calls, 'GET', '/native/outcomes').query, { limit: '25' });
+    const cursorCall = calls.filter((call) => call.path === '/native/outcomes')[1];
+    assertDeepEqual(cursorCall.query, {
+      before_ms: '1700000000000',
+      before_run: 'run-1',
+    });
+    const hostile = makeClient({
+      'GET /native/outcomes': () =>
+        jsonResponse({ metrics: outcomesMetricsJson, runs: 'not-a-list', nextCursor: null }),
+    });
+    await assertRejects(
+      () => hostile.client.outcomes({}),
+      (error) => error instanceof nc.NativeProtocolError && error.path.includes('GET /native/outcomes'),
+      'malformed outcomes page',
+    );
+    const missing = makeClient({
+      'GET /native/outcomes': () =>
+        jsonResponse({
+          metrics: { ...clone(outcomesMetricsJson), successfulRunCostMicro: 5 },
+          runs: [],
+          nextCursor: null,
+        }),
+    });
+    await assertRejects(
+      () => missing.client.outcomes({}),
+      (error) => error instanceof nc.NativeProtocolError,
+      'money must be a decimal string, never a rounded number',
+    );
+  });
+
+  await test('outcomes: ppm percents are exact floor values, never rounded or scientific', () => {
+    assertEqual(oc.formatPpm(0), '0%');
+    assertEqual(oc.formatPpm(1), '0.0001%');
+    assertEqual(oc.formatPpm(9999), '0.9999%');
+    assertEqual(oc.formatPpm(86400), '8.64%');
+    assertEqual(oc.formatPpm(864000), '86.4%');
+    assertEqual(oc.formatPpm(833333), '83.3333%');
+    assertEqual(oc.formatPpm(1000000), '100%');
+    assertEqual(oc.formatPpm(-1), '—');
+    assertEqual(oc.formatPpm(Number.NaN), '—');
+    // Exact money: >2^53 micro stays exact decimal, never scientific.
+    assertEqual(oc.usdTextOfMicro('18446744073709551615'), '18446744073709.5516 USD');
+    assertEqual(oc.microExactTextOf('18446744073709551615'), '18446744073709551615 µ$');
+    assertEqual(oc.usdTextOfMicro('not-money'), null);
+  });
+
+  await test('outcomes metrics: exact names, served counts and the honesty rules', () => {
+    const page = oc.parseOutcomesPage(clone(outcomesPageJson));
+    const view = oc.buildOutcomesView(page);
+    assertEqual(view.state, 'ok');
+    assertEqual(view.truncated, false);
+    assertEqual(view.scanned, 2);
+    const byKey = new Map(view.metrics.map((metric) => [metric.key, metric]));
+    const expectedNames = [
+      'successfulRunCostMicro',
+      'verifiedCostPerSuccessfulChangeMicro',
+      'verifiedFirstPassPpm',
+      'reworkCostRatioPpm',
+      'localOnlyVerifiedPpm',
+      'localFinalVerifiedPpm',
+      'localFirstSuccessPpm',
+      'localToFrontierFallbackPpm',
+      'frontierOnlyPpm',
+      'avoidedHostedInferenceMicro',
+      'meanTimeToVerifiedChangeMs',
+      'humanInterventionPpm',
+      'regressionRollbackPpm',
+      'proofCoveragePpm',
+      'frontierEscalationPpm',
+    ];
+    for (const key of expectedNames) {
+      assert(byKey.has(key), `metric ${key} must render`);
+    }
+    assertEqual(byKey.get('successfulRunCostMicro').label, 'Successful-Run Cost');
+    assertEqual(
+      byKey.get('verifiedCostPerSuccessfulChangeMicro').label,
+      'Verified Cost per Successful Change (VCSC)',
+    );
+    assertEqual(byKey.get('successfulRunCostMicro').value, '1.2625 USD');
+    assert(
+      byKey.get('successfulRunCostMicro').detail.includes('1262500 µ$'),
+      byKey.get('successfulRunCostMicro').detail,
+    );
+    assert(
+      byKey.get('verifiedCostPerSuccessfulChangeMicro').detail.includes('5550000 µ$'),
+      'VCSC surfaces the all-attempt spend',
+    );
+    assertEqual(byKey.get('verifiedFirstPassPpm').value, '100%');
+    assert(
+      byKey.get('verifiedFirstPassPpm').detail.startsWith('1/1 verified changes'),
+      byKey.get('verifiedFirstPassPpm').detail,
+    );
+    assertEqual(byKey.get('reworkCostRatioPpm').value, '4.5045%');
+    assertEqual(byKey.get('localOnlyVerifiedPpm').value, '100%');
+    assert(
+      byKey.get('localOnlyVerifiedPpm').detail.includes('1/1 local-only runs'),
+      byKey.get('localOnlyVerifiedPpm').detail,
+    );
+    assertEqual(byKey.get('localOnlyVerifiedPpm').cohort, 'local-only');
+    assertEqual(byKey.get('localFinalVerifiedPpm').cohort, 'local-final');
+    assertEqual(byKey.get('localFirstSuccessPpm').cohort, 'local-first');
+    assertEqual(byKey.get('localToFrontierFallbackPpm').cohort, 'local-to-frontier');
+    assertEqual(byKey.get('frontierOnlyPpm').value, '50%');
+    assertEqual(byKey.get('avoidedHostedInferenceMicro').value, 'not measured');
+    assertEqual(byKey.get('avoidedHostedInferenceMicro').unmeasured, true);
+    assertEqual(byKey.get('frontierEscalationPpm').value, 'not measured');
+    assertEqual(byKey.get('proofCoveragePpm').value, '75%');
+    assert(
+      byKey.get('proofCoveragePpm').detail.includes('3/4 required checks'),
+      byKey.get('proofCoveragePpm').detail,
+    );
+    assertEqual(byKey.get('meanTimeToVerifiedChangeMs').value, '4000 ms');
+    assertEqual(byKey.get('humanInterventionPpm').value, '50%');
+    assertEqual(byKey.get('regressionRollbackPpm').value, '0%');
+    assert(view.costNote.includes('Successful-Run Cost averages only the runs that verified'));
+
+    // An empty verified denominator renders the exact copy, never a free run.
+    const emptyPage = oc.parseOutcomesPage(
+      clone({
+        ...outcomesPageJson,
+        metrics: {
+          ...outcomesMetricsJson,
+          runs: 1,
+          verifiedChanges: 0,
+          verifiedFirstPassChanges: 0,
+          verifiedFirstPassPpm: 0,
+          totalVerifiedSpendMicro: '0',
+          successfulRunCostMicro: '0',
+          totalSpendMicro: '0',
+          verifiedCostPerSuccessfulChangeMicro: '0',
+          meanTimeToVerifiedChangeMs: 0,
+          totalWallTimeMs: 0,
+          localOnlyRuns: 0,
+          localFinalRuns: 0,
+          localFirstRuns: 0,
+          localOnlyVerifiedChanges: 0,
+          localFinalVerifiedChanges: 0,
+          localFirstSuccessChanges: 0,
+          checksRequired: 0,
+          checksPassed: 0,
+          proofCoveragePpm: 0,
+        },
+        runs: [],
+        nextCursor: null,
+      }),
+    );
+    const empty = oc.buildOutcomesView(emptyPage);
+    const emptyByKey = new Map(empty.metrics.map((metric) => [metric.key, metric]));
+    assertEqual(emptyByKey.get('successfulRunCostMicro').value, oc.NO_VERIFIED_CHANGES);
+    assertEqual(emptyByKey.get('verifiedCostPerSuccessfulChangeMicro').value, oc.NO_VERIFIED_CHANGES);
+    assertEqual(emptyByKey.get('verifiedFirstPassPpm').value, oc.NO_VERIFIED_CHANGES);
+    assertEqual(emptyByKey.get('meanTimeToVerifiedChangeMs').value, oc.NO_VERIFIED_CHANGES);
+    assertEqual(emptyByKey.get('localOnlyVerifiedPpm').value, '—');
+    assertEqual(emptyByKey.get('proofCoveragePpm').value, '—');
+    assertEqual(emptyByKey.get('reworkCostRatioPpm').value, '—');
+    assertEqual(emptyByKey.get('avoidedHostedInferenceMicro').value, 'not measured');
+    assertEqual(empty.runs.length, 0);
+    assertEqual(empty.nextCursor, null);
+
+    // The truncated fold is named, never silently exact.
+    const truncatedPage = oc.parseOutcomesPage(
+      clone({ ...outcomesPageJson, metrics: { ...outcomesMetricsJson, truncated: true, scanned: 10000 } }),
+    );
+    assertEqual(oc.buildOutcomesView(truncatedPage).truncated, true);
+
+    // Avoided Hosted Inference shows the SERVED value only when > 0.
+    const avoidedPage = oc.parseOutcomesPage(
+      clone({
+        ...outcomesPageJson,
+        metrics: { ...outcomesMetricsJson, avoidedHostedInferenceMicro: '2500000' },
+      }),
+    );
+    const avoided = new Map(
+      oc.buildOutcomesView(avoidedPage).metrics.map((metric) => [metric.key, metric]),
+    );
+    assertEqual(avoided.get('avoidedHostedInferenceMicro').value, '2.5000 USD (2500000 µ$)');
+  });
+
+  await test('outcomes runs: newest-first rows, advanced run id, composite cursor paging', () => {
+    const first = oc.buildOutcomesView(oc.parseOutcomesPage(clone(outcomesPageJson)));
+    assertEqual(first.runs.length, 1);
+    const run = first.runs[0];
+    assertEqual(run.verdict, 'verified change');
+    assertEqual(run.completedText, '2023-11-14 22:13:20Z');
+    assertEqual(run.modelSpendUsd, '1.2625 USD');
+    assertEqual(run.modelSpendExact, '1262500 µ$');
+    assertEqual(run.steps, 'local:local/llama · hosted:openai/gpt');
+    assertEqual(run.runId, 'run-1', 'the run id travels as data (rendered only under Advanced details)');
+    assertDeepEqual(first.nextCursor, { completedAtMs: 1_700_000_000_000, runId: 'run-1' });
+    const olderPage = oc.parseOutcomesPage(
+      clone({
+        ...outcomesPageJson,
+        runs: [
+          { ...outcomeRunJson, runId: 'run-0', verified: false, accepted: false, integrated: false, verifiedFirstAttempt: false },
+          clone(outcomeRunJson),
+        ],
+        nextCursor: null,
+      }),
+    );
+    const merged = oc.mergeOutcomesPage(first, olderPage);
+    assertEqual(merged.pageCount, 2);
+    assertEqual(merged.runs.length, 2, 'the older page appends without duplicating the seen run id');
+    assertDeepEqual(merged.runs.map((entry) => entry.runId), ['run-1', 'run-0']);
+    assertEqual(merged.nextCursor, null, 'cursor exhaustion hides the older-page action');
+    const unavailable = oc.unavailableOutcomesView('store read failed', 'store_error');
+    assertEqual(unavailable.state, 'unavailable');
+    assertDeepEqual(unavailable.metrics, []);
+    assertDeepEqual(unavailable.runs, [], 'a failed read renders no monetary rows at all');
+    assertEqual(unavailable.reasonCode, 'store_error');
+  });
+
+  await test('outcomes cursor requests are strict (both members or neither)', () => {
+    assertDeepEqual(oc.parseOutcomesReadRequest(undefined, undefined), {
+      beforeMs: null,
+      beforeRun: null,
+    });
+    assertDeepEqual(oc.parseOutcomesReadRequest(null, null), { beforeMs: null, beforeRun: null });
+    assertDeepEqual(oc.parseOutcomesReadRequest(5, 'run-1'), { beforeMs: 5, beforeRun: 'run-1' });
+    assert('reason' in oc.parseOutcomesReadRequest(5, undefined), 'half a cursor is refused');
+    assert('reason' in oc.parseOutcomesReadRequest(undefined, 'run-1'), 'half a cursor is refused');
+    assert('reason' in oc.parseOutcomesReadRequest(-1, 'run-1'), 'a negative timestamp is refused');
+    assert('reason' in oc.parseOutcomesReadRequest(5.5, 'run-1'), 'a fractional timestamp is refused');
+    assert('reason' in oc.parseOutcomesReadRequest(5, ''), 'an empty run id is refused');
+    assert('reason' in oc.parseOutcomesReadRequest(5, 'x'.repeat(201)), 'an oversized run id is refused');
+  });
+
+  await test('webview outcomes: exact names, cohorts, T29 unavailable and lazy reads', () => {
+    const view = oc.buildOutcomesView(oc.parseOutcomesPage(clone(outcomesPageJson)));
+    const snapshot = webviewSnapshot([]);
+    snapshot.sessions = [clone(sessionSummaryJson)];
+    snapshot.outcomes = view;
+    const harness = runChatWebview(snapshot);
+    const { dom, posted } = harness;
+    // The ledger is NOT read by the normal snapshot path.
+    assertEqual(
+      posted.filter((message) => message.type === 'readOutcomes').length,
+      0,
+      'normal snapshots never trigger a ledger read',
+    );
+    dom.document.getElementById('nav-history').click();
+    dom.document.getElementById('history-tab-outcomes').click();
+    assertEqual(posted[posted.length - 1].type, 'readOutcomes', 'opening Outcomes posts exactly one read');
+    assertEqual(posted[posted.length - 1].beforeMs, undefined, 'the top read carries no cursor');
+    const metricsRoot = dom.document.getElementById('outcomes-metrics');
+    const runsRoot = dom.document.getElementById('outcomes-runs');
+    const text = fakeText(metricsRoot) + fakeText(runsRoot);
+    for (const name of [
+      'Successful-Run Cost',
+      'Verified Cost per Successful Change (VCSC)',
+      'Verified First-Pass Rate',
+      'Rework Cost Ratio',
+      'Local-Only Verified Rate',
+      'Local-Final Verified Rate',
+      'Local-First Success Rate',
+      'Local-to-Frontier Fallback Rate',
+      'Frontier-Only Rate',
+      'Avoided Hosted Inference',
+      'Mean Time to Verified Change',
+      'Human Intervention Rate',
+      'Regression/Rollback Rate',
+      'Proof Coverage',
+      'Frontier Escalation Rate',
+    ]) {
+      assert(text.includes(name), `the exact ledger name ${name} must render`);
+    }
+    assert(text.includes('not measured'), 'avoided 0 renders not measured');
+    for (const cohort of ['local-only', 'local-final', 'local-first', 'local-to-frontier']) {
+      assert(
+        findFake(metricsRoot, (node) => String(node.className).includes(`outcome-cohort-${cohort}`)),
+        `the ${cohort} cohort carries its distinct class`,
+      );
+    }
+    assert(
+      findFake(metricsRoot, (node) => String(node.className).includes('outcome-metric-explain')),
+      'every metric offers an Explain metric disclosure',
+    );
+    const runRow = findFake(runsRoot, (node) => String(node.className).includes('outcome-run'));
+    assert(runRow, 'a served run renders as a bounded row');
+    assert(fakeText(runRow).includes('run run-1'), 'the run id stays under Advanced details');
+    assertEqual(dom.document.getElementById('outcomes-truncated').hidden, true);
+    assertEqual(dom.document.getElementById('outcomes-truncated').textContent, 'Truncated sample');
+    // The composite cursor drives the older-page action.
+    const older = dom.document.getElementById('btn-outcomes-older');
+    assertEqual(older.hidden, false);
+    older.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'readOutcomes',
+      beforeMs: 1_700_000_000_000,
+      beforeRun: 'run-1',
+    });
+    // Cursor exhaustion hides the action.
+    const exhausted = clone(snapshot);
+    exhausted.outcomes = { ...view, nextCursor: null };
+    harness.deliver({ type: 'snapshot', snapshot: exhausted });
+    assertEqual(dom.document.getElementById('btn-outcomes-older').hidden, true);
+    // A truncated fold names itself.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...exhausted, outcomes: { ...view, truncated: true } },
+    });
+    assertEqual(dom.document.getElementById('outcomes-truncated').hidden, false);
+    assertEqual(dom.document.getElementById('outcomes-truncated').textContent, 'Truncated sample');
+  });
+
+  await test('webview outcomes: T29 read failure renders no money and never touches conversations', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.sessions = [clone(sessionSummaryJson)];
+    snapshot.outcomes = oc.unavailableOutcomesView('store read failed', 'store_error');
+    const harness = runChatWebview(snapshot);
+    const { dom } = harness;
+    dom.document.getElementById('history-tab-outcomes').click();
+    const unavailable = dom.document.getElementById('outcomes-unavailable');
+    assertEqual(unavailable.hidden, false, 'a failed read renders the distinct T29 state');
+    assertEqual(
+      dom.document.getElementById('outcomes-unavailable-label').textContent,
+      'Cost unavailable',
+    );
+    assertEqual(
+      dom.document.getElementById('outcomes-unavailable-copy').textContent,
+      'The current authority has not supplied a cost value.',
+    );
+    const detailText = dom.document.getElementById('outcomes-unavailable-detail').textContent;
+    assert(detailText.includes('[store_error]'), detailText);
+    assert(detailText.includes('store read failed'), detailText);
+    const metricsRoot = dom.document.getElementById('outcomes-metrics');
+    const runsRoot = dom.document.getElementById('outcomes-runs');
+    const cardText = fakeText(metricsRoot) + fakeText(runsRoot) + detailText;
+    assert(!cardText.includes('USD'), `no monetary value renders on a failed read: ${cardText}`);
+    assert(!cardText.includes('µ$'), `no micro money renders on a failed read: ${cardText}`);
+    assertEqual(metricsRoot.children.length, 0);
+    assertEqual(runsRoot.children.length, 0);
+    // The conversation surface is untouched by the outcome read failure.
+    const historyRows = dom.document.getElementById('history-list').children.length;
+    assertEqual(historyRows, 1, 'the conversation listing still renders its served rows');
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -12976,6 +14135,9 @@ async function main() {
   await navigationWebviewTests();
   await composerAttachmentTests();
   await submissionSingleFlightTests();
+  await runBudgetTests();
+  await changeReviewTests();
+  await outcomeTests();
   await transcriptScrollTests();
   await tournamentWebviewTests();
   await reducedMotionTests();

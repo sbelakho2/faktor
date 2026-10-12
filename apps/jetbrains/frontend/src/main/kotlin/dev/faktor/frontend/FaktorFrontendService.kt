@@ -689,6 +689,19 @@ class FaktorFrontendService(
     fun verification(): NativeVerificationView =
         clientOrThrow().verification(requireSession())
 
+    /**
+     * One bounded newest-first page of the Engineering Outcome Ledger
+     * (`GET /native/outcomes`): the durable metrics fold plus run rows and
+     * the composite older-page cursor. Money and rates are validated by the
+     * client; a refusal propagates typed.
+     */
+    fun outcomes(
+        limit: Long? = null,
+        beforeMs: Long? = null,
+        beforeRun: String? = null
+    ): dev.faktor.shared.ProtocolOutcomesPage =
+        clientOrThrow().outcomes(limit, beforeMs, beforeRun)
+
     fun taskVerification(taskId: String): NativeTaskVerification =
         clientOrThrow().taskVerification(requireSession(), taskId)
 

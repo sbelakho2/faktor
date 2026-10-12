@@ -26,7 +26,12 @@ import type {
 } from './nativeClient.ts';
 import { MAX_CONTRACT_ROWS, MAX_CONTRACT_ROW_BYTES } from './contract.ts';
 import { stripDisplayControls } from './displayText.ts';
-import { microWireValue, type MicroMoney } from './money.ts';
+import {
+  MICRO_MAX_SAFE_NUMBER,
+  microFromDecimal,
+  microWireValue,
+  type MicroMoney,
+} from './money.ts';
 
 /** One durable typed attachment id a task start accepts (native DTO mirror). */
 export type TaskAttachmentId = NativeAttachmentId;
@@ -726,6 +731,114 @@ export function completionContractFromPicks(
     include_pr: picks.some((pick) => pick.key === 'include_pr'),
   };
   return hasCompletionSteps(contract) ? contract : null;
+}
+
+/**
+ * One per-run budget override captured by the composer's "Acceptance &
+ * contract" disclosure (I02). `null` per dimension = fall back to the
+ * `faktor.budgetTokens` / `faktor.budgetCostMicro` setting for THIS
+ * submission only; the override is captured into the immutable submission
+ * snapshot, so a retried ambiguous start (F04) reuses exactly these values.
+ */
+export interface RunBudgetOverride {
+  readonly tokens: number | null;
+  readonly costMicro: MicroMoney | null;
+}
+
+/** The exact-integer bound the per-run fields mirror (2^53-1). */
+export const MAX_RUN_BUDGET_TOKENS = 9_007_199_254_740_991;
+
+const RUN_BUDGET_DECIMAL = /^[0-9]+$/;
+
+/**
+ * Strict parse of the two bounded composer fields. Empty/absent = use the
+ * settings default (no override). A malformed value is a typed reason: the
+ * caller must refuse the START loudly (never silently drop the stated
+ * budget) and keep the draft. The cost field mirrors the settings-path
+ * validation exactly: a plain non-negative decimal micro amount within
+ * 2^53-1 (the number setting's exact range); the token field is a
+ * non-negative integer within the same exact-integer range.
+ */
+export function parseRunBudget(
+  rawTokens: unknown,
+  rawCost: unknown,
+): { readonly budget: RunBudgetOverride | null } | { readonly reason: string } {
+  let tokens: number | null = null;
+  let costMicro: MicroMoney | null = null;
+  if (rawTokens !== undefined && rawTokens !== null) {
+    if (typeof rawTokens !== 'string') {
+      return { reason: 'per-run token budget must be a decimal integer string (empty uses the setting)' };
+    }
+    const text = rawTokens.trim();
+    if (text.length > 0) {
+      if (!RUN_BUDGET_DECIMAL.test(text)) {
+        return {
+          reason:
+            `per-run token budget ${JSON.stringify(text)} is not a non-negative integer ` +
+            'token count; the task was not started',
+        };
+      }
+      const parsed = Number(text);
+      if (!Number.isSafeInteger(parsed) || parsed > MAX_RUN_BUDGET_TOKENS) {
+        return {
+          reason:
+            `per-run token budget ${JSON.stringify(text)} exceeds the exact integer range ` +
+            '(max 2^53-1); the task was not started',
+        };
+      }
+      tokens = parsed;
+    }
+  }
+  if (rawCost !== undefined && rawCost !== null) {
+    if (typeof rawCost !== 'string') {
+      return { reason: 'per-run cost budget must be a decimal micro-USD string (empty uses the setting)' };
+    }
+    const text = rawCost.trim();
+    if (text.length > 0) {
+      const parsed = microFromDecimal(text);
+      if (parsed === null || parsed > MICRO_MAX_SAFE_NUMBER) {
+        return {
+          reason:
+            `per-run cost budget ${JSON.stringify(text)} is not an exact non-negative integer ` +
+            'micro amount (max 2^53-1); the task was not started',
+        };
+      }
+      costMicro = parsed;
+    }
+  }
+  if (tokens === null && costMicro === null) {
+    return { budget: null };
+  }
+  return { budget: { tokens, costMicro } };
+}
+
+/**
+ * Resolve the effective budget for one submission: the captured per-run
+ * override wins per dimension, the settings values remain the fallback. The
+ * caller has already validated the override (`parseRunBudget`); a null
+ * `settingsCostMicro` means the settings fallback was unrepresentable and
+ * the caller must refuse BEFORE using the result. No silent coercion.
+ */
+export function resolveRunBudget(input: {
+  readonly override: RunBudgetOverride | null;
+  readonly settingsTokens: number;
+  readonly settingsCostMicro: MicroMoney | null;
+}): { readonly maxTokens: number; readonly maxCostMicro: MicroMoney | null } {
+  return {
+    maxTokens: input.override?.tokens ?? input.settingsTokens,
+    maxCostMicro: input.override?.costMicro ?? input.settingsCostMicro,
+  };
+}
+
+/** Body identity of the per-run budget override (retry/duplicate matching). */
+export function sameRunBudget(
+  a: RunBudgetOverride | null,
+  b: RunBudgetOverride | null,
+): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  return a.tokens === b.tokens && a.costMicro === b.costMicro;
 }
 
 export interface StartTaskSettings {
@@ -1735,6 +1848,12 @@ export interface StartSubmissionSnapshot {
   /** The bounded user-authored contract rows captured at admission. */
   readonly contractRows: StartTaskContractRows | null;
   /**
+   * The per-run budget override captured at admission (I02): every attempt
+   * of this logical submission reuses exactly these values; null = both
+   * dimensions fall back to the settings.
+   */
+  readonly budget: RunBudgetOverride | null;
+  /**
    * The HOST-SIDE composer attachment ids this snapshot selected (empty for
    * a legacy raw envelope). On durable acceptance ONLY these entries are
    * cleared, so an attachment added for the next task during the request
@@ -1915,17 +2034,20 @@ export class TaskStartGate {
     readonly files: readonly string[];
     readonly contract: NativeCompletionContract | null;
     readonly contractRows?: StartTaskContractRows | null;
+    readonly budget?: RunBudgetOverride | null;
     readonly attachmentIds?: readonly string[];
     readonly newId: () => string;
   }): SubmissionStartDecision {
     const contractRows = input.contractRows ?? null;
+    const budget = input.budget ?? null;
     const current = this.current;
     if (current !== null) {
       const sameBody =
         samePendingSubmission(input.pending, current.snapshot.pending) &&
         sameFileList(input.files, current.snapshot.files) &&
         sameContract(input.contract, current.snapshot.contract) &&
-        sameContractRows(contractRows, current.snapshot.contractRows);
+        sameContractRows(contractRows, current.snapshot.contractRows) &&
+        sameRunBudget(budget, current.snapshot.budget);
       if (current.state === 'in_flight') {
         if (sameBody) {
           return { action: 'duplicate' };
@@ -1951,6 +2073,7 @@ export class TaskStartGate {
       files: input.files,
       contract: input.contract,
       contractRows,
+      budget,
       attachmentIds: input.attachmentIds ?? [],
     };
     this.current = { snapshot, state: 'in_flight' };

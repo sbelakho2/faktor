@@ -104,6 +104,12 @@ const PANEL_MARKERS = [
   'boardPost',
   'openSession',
   'refreshHistory',
+  // I03/I07: the change-review, basis-recheck and outcome-ledger messages.
+  'reviewChange',
+  'recheckChanges',
+  'changeReview',
+  'readOutcomes',
+  'openWork',
 ];
 
 const DEFAULT_MIN_MEDIA_FILES = 4;
@@ -175,16 +181,26 @@ function archiveChecks(vsix, minMediaFiles) {
     mediaFiles.length >= minMediaFiles,
     `VSIX has >= ${minMediaFiles} files under extension/media (found ${mediaFiles.length})`,
   );
-  const allowed = new Set(PANEL_FILES.map((relative) => `extension/${relative}`));
-  const extras = entries
+  // STRICT full surface: the archive carries EXACTLY the allowed regular
+  // files — the two VSIX container manifests, package.json, the license and
+  // third-party notices, and the Faktor-owned panel (out/**.js + media/).
+  // Any other file (a stray .gitignore, a vendored closure, a build cache)
+  // fails without the check having to name it, so no blanket allowlisting
+  // can hide an added artifact.
+  const allowed = new Set([
+    'extension.vsixmanifest',
+    '[Content_Types].xml',
+    'extension/package.json',
+    ...REQUIRED_LEGAL_FILES.map((legal) => `extension/${legal}`),
+    ...(licenseTarget !== null ? [`extension/${licenseTarget}`] : []),
+    ...PANEL_FILES.map((relative) => `extension/${relative}`),
+  ]);
+  const unexpected = entries
     .map((entry) => entry.name)
-    .filter(
-      (name) => name.startsWith('extension/media/') || name.startsWith('extension/out/'),
-    )
-    .filter((name) => !allowed.has(name) && !name.endsWith('/'));
+    .filter((name) => !name.endsWith('/') && !allowed.has(name));
   check(
-    extras.length === 0,
-    `VSIX carries exactly the Faktor-owned panel surface (unexpected: ${extras.join(', ') || 'none'})`,
+    unexpected.length === 0,
+    `VSIX carries exactly the allowed surface (unexpected: ${unexpected.join(', ') || 'none'})`,
   );
   return mediaFiles.length;
 }

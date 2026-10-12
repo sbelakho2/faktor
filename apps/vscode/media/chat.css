@@ -192,6 +192,244 @@ header button {
   word-break: break-all;
 }
 
+/* I03: the scope toolbar of the selected change. */
+.changes-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--faktor-border-quiet);
+  padding-bottom: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+
+.change-candidate {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.changes-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.change-basis {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 0.9em;
+}
+
+.change-basis-line {
+  color: var(--vscode-descriptionForeground);
+}
+
+.changes-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border: 1px solid transparent;
+  border-radius: var(--faktor-radius);
+  padding: 2px var(--space-1);
+}
+
+.changes-row-selected {
+  border-color: var(--faktor-accent);
+  background: var(--faktor-hover);
+}
+
+button.change-select {
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: none;
+  padding: 0;
+  min-width: 0;
+  min-height: 24px;
+  text-align: left;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+  word-break: break-all;
+}
+
+button.change-select:hover:not(:disabled) {
+  background: transparent;
+  color: var(--vscode-textLink-foreground);
+}
+
+.change-ref {
+  font-size: 0.85em;
+  padding-left: var(--space-2);
+}
+
+.change-review-state {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius);
+  padding: var(--space-1) var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.change-review-label {
+  font-weight: 600;
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+.changes-unavailable-label {
+  margin: 0 0 var(--space-1) 0;
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+/* -------------------------------------------------- Outcomes (I07) */
+.history-tabs {
+  margin-bottom: var(--space-1);
+}
+
+.outcomes-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.outcomes-truncated {
+  margin: var(--space-1) 0;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--vscode-editorWarning-foreground, var(--faktor-border));
+  border-radius: var(--faktor-radius);
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+.outcomes-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0;
+}
+
+.outcomes-cost-note {
+  font-size: 0.85em;
+}
+
+.outcome-metric {
+  border: 1px solid var(--faktor-border-quiet);
+  border-radius: var(--faktor-radius);
+  padding: var(--space-1) var(--space-2);
+}
+
+.outcome-metric-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.outcome-metric-label {
+  font-weight: 600;
+}
+
+.outcome-metric-value {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.outcome-metric-unmeasured .outcome-metric-value {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+.outcome-metric-detail {
+  font-size: 0.85em;
+}
+
+.outcome-metric-explain {
+  font-size: 0.85em;
+}
+
+/* The four local cohorts stay visually distinct (a left accent marker per
+   cohort; the frontier-only row carries its own). */
+.outcome-cohort-local-only {
+  border-left: 3px solid var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.outcome-cohort-local-final {
+  border-left: 3px double var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.outcome-cohort-local-first {
+  border-left: 3px dotted var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.outcome-cohort-local-to-frontier {
+  border-left: 3px dashed var(--vscode-editorWarning-foreground, #d29922);
+}
+
+.outcome-cohort-frontier-only {
+  border-left: 3px solid var(--vscode-disabledForeground, #8c8c8c);
+}
+
+.outcomes-runs {
+  list-style: none;
+  margin: var(--space-1) 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.outcome-run {
+  border: 1px solid var(--faktor-border-quiet);
+  border-radius: var(--faktor-radius);
+  padding: var(--space-1) var(--space-2);
+}
+
+.outcome-run-verified {
+  border-left: 3px solid var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.outcome-run-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.outcome-run-cost {
+  font-variant-numeric: tabular-nums;
+}
+
+.outcome-run-meta {
+  font-size: 0.85em;
+}
+
+.outcomes-unavailable-label {
+  margin: 0 0 var(--space-1) 0;
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+/* The budget fields of the Acceptance & contract disclosure (I02). */
+.contract-budget {
+  box-sizing: border-box;
+  width: 100%;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: var(--vscode-input-background, transparent);
+  border: 1px solid var(--vscode-input-border, var(--faktor-border));
+  border-radius: var(--faktor-radius-control);
+  padding: var(--space-1) var(--space-2);
+  min-height: 28px;
+}
+
+/* The criterion selected by `Open claim`. */
+.criterion-selected {
+  outline: 1px solid var(--faktor-accent);
+  outline-offset: 2px;
+}
+
 /* -------------------------------------------------------------- History */
 .history-controls {
   display: flex;

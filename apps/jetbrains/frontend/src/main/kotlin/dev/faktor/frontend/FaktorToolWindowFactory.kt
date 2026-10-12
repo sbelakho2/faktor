@@ -47,7 +47,15 @@ class FaktorToolWindowFactory : ToolWindowFactory {
         // so the daemon resolves the submitted workspace-relative `files`
         // against the same root (the projection exposes no workspace path).
         val workspaceRoot = project.basePath?.let { Paths.get(it) }
-        val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore, workspaceRoot)
+        val panel = FaktorChatPanel(
+            service,
+            credentialStore,
+            scopeStore,
+            sessionStore,
+            workspaceRoot,
+            FaktorSettingsController(IntelliJApplicationSettingsStore()),
+            ChangeReviewAdapter(project)
+        )
         val content = ContentFactory.getInstance().createContent(panel, "Faktor", false)
         Disposer.register(
             content,

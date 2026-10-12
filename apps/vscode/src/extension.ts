@@ -56,6 +56,7 @@ import {
   NativeMessagePage,
   NativeModelInfo,
   NativePermissionEntry,
+  NativeProjection,
   NativeSessionUsage,
   NativeSessionSummary,
   NativeTaskRun,
@@ -132,9 +133,29 @@ import {
   parseCompletionContract,
   parseContractRows,
   parsePendingSubmission,
+  parseRunBudget,
+  resolveRunBudget,
   submissionRetryable,
   verificationAuthorityKey,
 } from './taskStart';
+import {
+  buildChangesSummary,
+  candidateDisplayOf,
+  changeRowsOf,
+  evidenceDiffTitle,
+  evidenceDocumentUri,
+  resolveReviewBasis,
+  sourceDiffEvidenceIdOf,
+  type ChangeRowSummary,
+} from './changeReview';
+import { registerEvidenceDocumentProvider } from './evidenceDocuments';
+import {
+  OUTCOMES_PAGE_LIMIT,
+  buildOutcomesView,
+  mergeOutcomesPage,
+  parseOutcomesReadRequest,
+  unavailableOutcomesView,
+} from './outcomes';
 import {
   SessionBindings,
   boundSessionFor,
@@ -1646,6 +1667,14 @@ async function refresh(): Promise<void> {
     // The board read is OPTIONAL and never rejects: an older daemon records
     // an explicit unavailable block instead of blanking the snapshot.
     const boardPromise = boardFor(client, sessionId);
+    // The projection read is FAILURE-ISOLATED (I03): its `filesChanged` feeds
+    // the Changes view, and a refusal becomes that view's explicit
+    // unavailable state with the reason — never a whole-refresh failure that
+    // would blank unrelated durable reads (or a stale change list).
+    const projectionRead = client.projection(sessionId).then(
+      (value) => ({ value, reason: null as string | null }),
+      (error) => ({ value: null as NativeProjection | null, reason: messageOf(error) }),
+    );
     const [
       projection,
       tasks,
@@ -1658,7 +1687,7 @@ async function refresh(): Promise<void> {
       catalog,
       permissionList,
     ] = await Promise.all([
-      client.projection(sessionId),
+      projectionRead,
       client.tasks(sessionId),
       client.verification(sessionId),
       client.sessionUsage(sessionId),
@@ -1687,6 +1716,7 @@ async function refresh(): Promise<void> {
     if (!current()) {
       return;
     }
+    const projectionValue = projection.value;
     // Durable index coverage (audits 5/6): optional like the board read — an
     // older daemon or a never-hosted index service yields null, never a
     // snapshot failure.
@@ -1754,8 +1784,10 @@ async function refresh(): Promise<void> {
             sessionsUnavailable:
               sessionListing.reason ?? 'the conversation list could not be read',
           }),
-      machineState: projection.state.machine,
-      machineLabel: projection.state.label,
+      // A failed projection read keeps the last known machine state (the
+      // Changes view carries the explicit reason) instead of blanking it.
+      machineState: projectionValue?.state.machine ?? store.snapshot().machineState,
+      machineLabel: projectionValue?.state.label ?? store.snapshot().machineLabel,
       task,
       verification: verificationView,
       usage: usageView,
@@ -1773,6 +1805,17 @@ async function refresh(): Promise<void> {
       usagePanel,
       tournament: cockpitProjection.cockpit?.tournament ?? null,
       board,
+      // I03: the served candidate-change view. Only served relationships
+      // attach refs; a projection failure is its explicit unavailable state.
+      changes: buildChangesSummary({
+        filesChanged: projectionValue?.filesChanged ?? [],
+        verification: taskVerification.view,
+        proof: proofRead.proof,
+        unavailable: projection.reason,
+        candidateDisplay: candidateDisplayOf(
+          proofRead.proof?.task?.goal ?? task?.goal ?? null,
+        ),
+      }),
       indexCoverage,
       lastError: cockpitProjection.error,
     });
@@ -2485,9 +2528,18 @@ async function startTask(
         attachmentLimits = EMERGENCY_ATTACHMENT_POLICY;
       }
     }
+    // I02: the captured per-run budget override wins per dimension for THIS
+    // submission; the settings remain the fallback and keep their exact
+    // validation (never a silently rounded budget). With an override cost,
+    // the settings value is not consulted at all.
     const budgetCostRaw = config('budgetCostMicro', 0);
-    const maxCostMicro = microFromNumber(budgetCostRaw);
-    if (maxCostMicro === null) {
+    const settingsCostMicro = microFromNumber(budgetCostRaw);
+    const effectiveBudget = resolveRunBudget({
+      override: snapshot.budget,
+      settingsTokens: config('budgetTokens', 0),
+      settingsCostMicro,
+    });
+    if (effectiveBudget.maxCostMicro === null) {
       // A configured micro amount above 2^53-1 cannot be represented exactly
       // by a VS Code number setting; refusing is the only honest option (the
       // run must never start with a silently rounded budget).
@@ -2502,8 +2554,8 @@ async function startTask(
       // "shadow" names it explicitly. The removed direct_compat value is a
       // typed refusal at admission; a refused shadow run never downgrades.
       mutationMode: config('mutationMode', ''),
-      maxTokens: config('budgetTokens', 0),
-      maxCostMicro,
+      maxTokens: effectiveBudget.maxTokens,
+      maxCostMicro: effectiveBudget.maxCostMicro,
       files,
       completionContract: contract,
       contractRows,
@@ -3042,6 +3094,240 @@ async function retrieveEvidence(message: ChatMessage): Promise<void> {
   }
 }
 
+// ------------------------------------------------- I03 changes + review
+
+/** The served facts one change read needs (every refusal kept explicit). */
+interface ServedChangeContext {
+  readonly filesChanged: readonly string[];
+  /** The projection read failure: the Changes view is then unavailable. */
+  readonly unavailable: string | null;
+  readonly verification: NativeTaskVerification | null;
+  readonly proof: NativeTaskProof | null;
+  readonly candidateDisplay: string;
+}
+
+/**
+ * Re-run the projection + proof + verification reads (the `Recheck current
+ * basis` path, S15) with per-read failure isolation: a projection refusal
+ * marks the view unavailable; a proof/verification refusal only degrades the
+ * refs (rows still render from the served `filesChanged`).
+ */
+async function readChangeContext(
+  client: NativeClient,
+  sessionId: string,
+): Promise<ServedChangeContext> {
+  const runs = store.snapshot().runs;
+  const taskId = runs.length > 0 ? runs[0]!.taskId : null;
+  const [projectionRead, verificationRead, proofRead] = await Promise.all([
+    client.projection(sessionId).then(
+      (value) => ({ value, reason: null as string | null }),
+      (error) => ({ value: null as NativeProjection | null, reason: messageOf(error) }),
+    ),
+    taskId === null
+      ? Promise.resolve({ value: null as NativeTaskVerification | null, reason: null })
+      : client.taskVerification(sessionId, taskId).then(
+          (value) => ({ value, reason: null as string | null }),
+          (error) => ({ value: null, reason: messageOf(error) }),
+        ),
+    taskId === null
+      ? Promise.resolve({ value: null as NativeTaskProof | null, reason: null })
+      : client.taskProof(sessionId, taskId).then(
+          (value) => ({ value, reason: null as string | null }),
+          (error) => ({ value: null, reason: messageOf(error) }),
+        ),
+  ]);
+  return {
+    filesChanged: projectionRead.value?.filesChanged ?? [],
+    unavailable: projectionRead.reason,
+    verification: verificationRead.value,
+    proof: proofRead.value,
+    candidateDisplay: candidateDisplayOf(proofRead.value?.task?.goal ?? null),
+  };
+}
+
+function changesSummaryOf(context: ServedChangeContext): ReturnType<typeof buildChangesSummary> {
+  return buildChangesSummary({
+    filesChanged: context.filesChanged,
+    verification: context.verification,
+    proof: context.proof,
+    unavailable: context.unavailable,
+    candidateDisplay: context.candidateDisplay,
+  });
+}
+
+/**
+ * `Recheck current basis`: re-run the proof/projection reads and re-derive
+ * the conflict facts (S15). There is deliberately NO rebase/apply control:
+ * the runtime exposes no such capability, so none is offered.
+ */
+async function recheckChanges(): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  if (!client || !sessionId) {
+    chatProvider?.postNotice('error', 'no active service connection; the current basis was not rechecked');
+    return;
+  }
+  const generation = lifecycle.current();
+  const context = await readChangeContext(client, sessionId);
+  if (!lifecycle.isCurrent(generation) || active.client !== client || active.sessionId !== sessionId) {
+    return;
+  }
+  if (context.proof !== null) {
+    // Keep the strict proof cache coherent with the fresh read, so the
+    // Overview and the Changes basis can never disagree after a recheck.
+    const runs = store.snapshot().runs;
+    const task = store.snapshot().task;
+    if (runs.length > 0 && task !== null) {
+      active.taskProofKey = `${runs[0]!.taskId}:${task.state}:${runs[0]!.state}`;
+      active.taskProof = context.proof;
+      active.taskProofUnavailable = null;
+    }
+  }
+  store.patch({ changes: changesSummaryOf(context) });
+  chatProvider?.postNotice('info', 'changes rechecked against the served projection and proof');
+}
+
+/**
+ * The selected-change review adapter: resolve the immutable basis in the
+ * documented order and open it in the NATIVE editor as read-only virtual
+ * documents. Nothing here reads a workspace file and no Accept/Apply/write
+ * action exists. With no served basis the exact `Diff unavailable` in-view
+ * state is posted instead.
+ */
+async function reviewChange(message: ChatMessage): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  const path = typeof message.path === 'string' ? message.path.trim() : '';
+  if (!client || !sessionId) {
+    chatProvider?.postNotice('error', 'no active service connection; the change was not opened');
+    return;
+  }
+  const generation = lifecycle.current();
+  const context = await readChangeContext(client, sessionId);
+  if (!lifecycle.isCurrent(generation) || active.client !== client || active.sessionId !== sessionId) {
+    return;
+  }
+  if (context.unavailable !== null) {
+    chatProvider?.postNotice('error', `changes are unavailable: ${context.unavailable}`);
+    return;
+  }
+  const rows: readonly ChangeRowSummary[] = changeRowsOf({
+    filesChanged: context.filesChanged,
+    verification: context.verification,
+    proof: context.proof,
+  });
+  const row = rows.find((entry) => entry.path === path) ?? null;
+  if (row === null) {
+    chatProvider?.postNotice(
+      'error',
+      `change ${JSON.stringify(path)} is not among the served changes for this run`,
+    );
+    return;
+  }
+  const basis = resolveReviewBasis({
+    path,
+    row,
+    sourceDiffEvidenceId: sourceDiffEvidenceIdOf(context.verification),
+    candidateDisplay: context.candidateDisplay,
+  });
+  const primary = basis.primary ?? basis.secondary;
+  if (primary === null) {
+    chatProvider?.postChangeReview({ path, state: 'unavailable' });
+    return;
+  }
+  const primaryUri = vscode.Uri.parse(
+    evidenceDocumentUri({
+      sessionId,
+      evidenceId: primary.evidenceId,
+      purpose: primary.kind,
+      title: primary.title,
+    }),
+  );
+  try {
+    const secondary = basis.primary !== null ? basis.secondary : null;
+    if (secondary !== null && secondary.evidenceId !== primary.evidenceId) {
+      const secondaryUri = vscode.Uri.parse(
+        evidenceDocumentUri({
+          sessionId,
+          evidenceId: secondary.evidenceId,
+          purpose: secondary.kind,
+          title: secondary.title,
+        }),
+      );
+      await vscode.commands.executeCommand(
+        'vscode.diff',
+        primaryUri,
+        secondaryUri,
+        evidenceDiffTitle(primary, secondary),
+      );
+    } else {
+      await vscode.window.showTextDocument(primaryUri, { preview: false });
+    }
+    chatProvider?.postChangeReview({
+      path,
+      state: 'opened',
+      evidenceId: primary.evidenceId,
+    });
+  } catch (error) {
+    chatProvider?.postChangeReview({
+      path,
+      state: 'unavailable',
+      reason: messageOf(error),
+    });
+  }
+}
+
+// ------------------------------------------------------------ I07 outcomes
+
+/**
+ * One bounded, explicitly requested outcome-ledger read. The read is
+ * LAZY (only the History / Outcomes tab asks for it) and failure-isolated:
+ * a refusal patches ONLY the outcomes view to its `Cost unavailable` state
+ * and never touches the conversation surface. A cursor read appends the
+ * older page; a top read replaces the list.
+ */
+async function readOutcomes(message: ChatMessage): Promise<void> {
+  const client = active.client;
+  const cursor = parseOutcomesReadRequest(message.beforeMs, message.beforeRun);
+  if ('reason' in cursor) {
+    chatProvider?.postNotice('error', cursor.reason);
+    return;
+  }
+  if (!client) {
+    store.patch({
+      outcomes: unavailableOutcomesView('no active service connection', null),
+    });
+    return;
+  }
+  const generation = lifecycle.current();
+  try {
+    const page = await client.outcomes({
+      limit: OUTCOMES_PAGE_LIMIT,
+      ...(cursor.beforeMs !== null && cursor.beforeRun !== null
+        ? { beforeMs: cursor.beforeMs, beforeRun: cursor.beforeRun }
+        : {}),
+    });
+    if (!lifecycle.isCurrent(generation) || active.client !== client) {
+      return;
+    }
+    const view =
+      cursor.beforeMs === null
+        ? buildOutcomesView(page)
+        : mergeOutcomesPage(store.snapshot().outcomes, page);
+    store.patch({ outcomes: view });
+  } catch (error) {
+    if (!lifecycle.isCurrent(generation) || active.client !== client) {
+      return;
+    }
+    store.patch({
+      outcomes: unavailableOutcomesView(
+        messageOf(error),
+        error instanceof NativeApiError ? error.code : null,
+      ),
+    });
+  }
+}
+
 // --------------------------------------------------------------- status bar
 
 function updateStatusBar(): void {
@@ -3216,6 +3502,18 @@ async function handleWebviewMessage(
         chatProvider?.postStartResult(goal, false);
         return;
       }
+      // I02: the bounded per-run budget fields of the "Acceptance & contract"
+      // disclosure. A malformed value refuses the START loudly (a typed
+      // userError; the draft and the visible options are kept) and never
+      // starts a run with a silently dropped or rounded budget.
+      const runBudget = parseRunBudget(message.budgetTokens, message.budgetCostMicro);
+      if ('reason' in runBudget) {
+        chatProvider?.postUserError(
+          projectError({ kind: 'run_failure', message: `task start refused: ${runBudget.reason}` }),
+        );
+        chatProvider?.postStartResult(goal, false);
+        return;
+      }
       // Binary attachments (pasted/attached images and screenshots) ride the
       // strict pending-submission envelope: the REAL composer path carries
       // HOST-SIDE attachment ids (`sendGoal.attachmentIds`) that resolve into
@@ -3286,6 +3584,7 @@ async function handleWebviewMessage(
         files,
         contract: contract.contract,
         contractRows: contractRows.rows,
+        budget: runBudget.budget,
         attachmentIds: selectedAttachmentIds,
         newId: randomUUID,
       });
@@ -3332,6 +3631,25 @@ async function handleWebviewMessage(
       return;
     case 'retrieveEvidence':
       await retrieveEvidence(message);
+      return;
+    // I03: the selected-change review and the explicit basis recheck. Both
+    // re-run the served reads; neither writes anything.
+    case 'reviewChange':
+      await reviewChange(message);
+      return;
+    case 'recheckChanges':
+      await recheckChanges();
+      return;
+    // I07: the lazily read Engineering Outcome Ledger page (History /
+    // Outcomes). The cursor is validated before any read.
+    case 'readOutcomes':
+      await readOutcomes(message);
+      return;
+    // `Return to run`: the chat command focuses the panel and the webview's
+    // own Work subview switch happens locally (one surface, no round trip
+    // needed for the view move).
+    case 'openWork':
+      await vscode.commands.executeCommand('faktor.openChat');
       return;
     // Coordination board: the native surface serves one bounded newest-first
     // page (GET) and one bounded post (POST). The host re-validates every
@@ -3396,6 +3714,10 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   context.subscriptions.push(
+    // I03: the read-only virtual documents of served evidence. The provider
+    // reads ONLY through the native client (never a workspace file), and a
+    // typed refusal renders an explicit refusal document.
+    registerEvidenceDocumentProvider(() => active.client),
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),

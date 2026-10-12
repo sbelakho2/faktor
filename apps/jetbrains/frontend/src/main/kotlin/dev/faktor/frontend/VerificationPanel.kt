@@ -32,6 +32,11 @@ class VerificationPanel : JPanel(BorderLayout()) {
 
     private val contractColumn = ScrollableColumn()
 
+    /** The served criterion cards, keyed for claim selection (I03). */
+    private val criterionCards = LinkedHashMap<String, JPanel>()
+
+    private var selectedCriterionKey: String? = null
+
     private var listener: Listener? = null
 
     private var criterionCount = 0
@@ -62,6 +67,7 @@ class VerificationPanel : JPanel(BorderLayout()) {
     fun updateModel(model: TaskTreeModel?) {
         criteriaColumn.removeAll()
         contractColumn.removeAll()
+        criterionCards.clear()
         renderContract(model?.contract)
         if (model == null) {
             criterionCount = 0
@@ -92,13 +98,56 @@ class VerificationPanel : JPanel(BorderLayout()) {
         } else {
             for (row in model.criteriaProof) {
                 criteriaColumn.add(vSpace(Spacing.S))
-                criteriaColumn.add(criterionCard(row))
+                val cardBody = criterionCard(row)
+                if (row.criterionKey.isNotEmpty() && !criterionCards.containsKey(row.criterionKey)) {
+                    criterionCards[row.criterionKey] = cardBody
+                }
+                criteriaColumn.add(cardBody)
             }
         }
+        applyCriterionSelectionHighlight()
         criteriaColumn.revalidate()
         revalidate()
         repaint()
     }
+
+    /**
+     * Selects the criterion whose card is rendered (I03 `Open claim`). The
+     * card is highlighted and scrolled into view; false means the key is not
+     * served by the current model (never a fabricated selection).
+     */
+    fun selectCriterion(criterionKey: String): Boolean {
+        val card = criterionCards[criterionKey] ?: return false
+        selectedCriterionKey = criterionKey
+        applyCriterionSelectionHighlight()
+        card.scrollRectToVisible(java.awt.Rectangle(0, 0, card.width, card.height))
+        return true
+    }
+
+    fun clearCriterionSelection() {
+        selectedCriterionKey = null
+        applyCriterionSelectionHighlight()
+    }
+
+    /** The key of the currently selected criterion (smoke observable). */
+    fun selectedCriterion(): String? = selectedCriterionKey
+
+    private fun applyCriterionSelectionHighlight() {
+        for ((key, card) in criterionCards) {
+            card.border = criterionCardBorder(key == selectedCriterionKey)
+        }
+        criteriaColumn.revalidate()
+        criteriaColumn.repaint()
+    }
+
+    /** The card border; the selected claim carries the accent hairline. */
+    private fun criterionCardBorder(selected: Boolean): javax.swing.border.Border =
+        FaktorRoundedBorder(
+            lineColor = if (selected) FaktorTheme.accent() else cardBorderColor(),
+            radius = Radii.CARD,
+            fill = FaktorTheme.cardSurface(),
+            padding = java.awt.Insets(Spacing.M, Spacing.M, Spacing.M, Spacing.M)
+        )
 
     /**
      * The Contract card rows. The "Needs disclosure" line is text-first (the
