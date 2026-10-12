@@ -12,6 +12,8 @@ import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { EngineeringContractView } from './contract.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
+import type { ChangesSummary } from './changeReview.ts';
+import type { OutcomesView } from './outcomes.ts';
 import type { PreflightView } from './preflight.ts';
 import type {
   NativeBoardPage,
@@ -520,6 +522,18 @@ export interface FaktorSnapshot {
   /** The run-family coordination board surface (explicitly unavailable when
    * the serving daemon exposes no board read). */
   readonly board: BoardStateSummary | null;
+  /**
+   * I03: the served candidate-change view (projection filesChanged + refs
+   * from served proof/verification relationships). Null before the first
+   * read; an explicit unavailable block on a failed projection read.
+   */
+  readonly changes: ChangesSummary | null;
+  /**
+   * I07: the lazily read Engineering Outcome Ledger view (History /
+   * Outcomes). Null until the operator opens the Outcomes tab; an explicit
+   * `Cost unavailable` state on a failed read (never stale numbers).
+   */
+  readonly outcomes: OutcomesView | null;
   /** Durable index coverage of the session's workspace (audits 5/6): a
    * PARTIAL generation and a stale-while-rebuilding index are named, never
    * flattened into "ready". Null until a read happens or when the daemon
@@ -560,6 +574,8 @@ export function emptySnapshot(): FaktorSnapshot {
     cockpitSections: [],
     tournament: null,
     board: null,
+    changes: null,
+    outcomes: null,
     indexCoverage: null,
     permissions: [],
     transcript: [],
@@ -611,6 +627,7 @@ export class FaktorStore {
     if (sessionChanged || stopped) {
       next.tournament = null;
       next.board = null;
+      next.changes = null;
       next.indexCoverage = null;
       // Pending approvals belong to ONE session/authority: a switch or a
       // stop must never leave a stale approval card actionable.
@@ -618,8 +635,10 @@ export class FaktorStore {
     }
     // The usage/credits panel is ORGANIZATION-scoped (not session-owned): it
     // survives a session switch and is dropped only when the daemon stops.
+    // The outcome ledger view is DAEMON-scoped the same way.
     if (stopped) {
       next.usagePanel = null;
+      next.outcomes = null;
     }
     this.state = nextState;
     this.emit();

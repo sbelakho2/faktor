@@ -36,6 +36,7 @@ import {
   parseProtocolErrorEnvelope,
   validateProtocolAttachmentId,
   validateProtocolAttachmentRef,
+  validateProtocolOutcomesPage,
   validateProtocolTaskRun,
   validateProtocolTaskRunCancelled,
   validateProtocolTaskRunStarted,
@@ -43,6 +44,7 @@ import {
   type ProtocolAttachmentId,
   type ProtocolAttachmentRef,
   type ProtocolJson,
+  type ProtocolOutcomesPage,
   type ProtocolTaskRun,
   type ProtocolTaskRunCancelled,
   type ProtocolTaskRunStarted,
@@ -4484,6 +4486,29 @@ export class NativeClient {
 
   semanticStatus(): Promise<NativeSemanticStatus> {
     return this.request('GET', '/native/semantic/status', { validate: validateSemanticStatus });
+  }
+
+  /**
+   * Engineering Outcome Ledger page (`GET /native/outcomes`): the durable
+   * metrics fold plus one bounded newest-first run page. `beforeMs` and
+   * `beforeRun` are the COMPOSITE cursor of the previous page (both or
+   * neither; the server refuses a half-given cursor typed). Unknown response
+   * fields are ignored per the additive v1 contract; every known field is
+   * validated exactly by the generated DTO.
+   */
+  outcomes(request: {
+    readonly limit?: number;
+    readonly beforeMs?: number;
+    readonly beforeRun?: string;
+  }): Promise<ProtocolOutcomesPage> {
+    return this.request('GET', '/native/outcomes', {
+      query: {
+        limit: request.limit,
+        before_ms: request.beforeMs,
+        before_run: request.beforeRun,
+      },
+      validate: (json, path) => asNativeProtocol(() => validateProtocolOutcomesPage(json, path)),
+    });
   }
 
   /** Durable index coverage of the session's workspace (audits 5/6/16):

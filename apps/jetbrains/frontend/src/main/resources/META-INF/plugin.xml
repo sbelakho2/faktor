@@ -17,5 +17,11 @@
                     canCloseContents="true"
                     icon="/META-INF/faktor.svg"
                     factoryClass="dev.faktor.frontend.FaktorToolWindowFactory"/>
+        <!-- I08: APPLICATION-level settings (the daemon binary path is
+             application-scoped and must never be project-configurable).
+             The `instance` attribute is the registration form the bundled
+             2024.1 platform's ConfigurableEP supports. -->
+        <applicationConfigurable id="dev.faktor.settings"
+                                 instance="dev.faktor.frontend.FaktorConfigurable"/>
     </extensions>
 </idea-plugin>

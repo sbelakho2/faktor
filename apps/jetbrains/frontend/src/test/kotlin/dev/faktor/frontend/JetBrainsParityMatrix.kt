@@ -49,6 +49,7 @@ import dev.faktor.shared.parseNativeTerminalPage
 import dev.faktor.shared.parseNativeTerminalSpawned
 import dev.faktor.shared.parseNativeTournament
 import dev.faktor.shared.parseNativeTournamentSummaries
+import dev.faktor.shared.parseProtocolOutcomesPage
 import dev.faktor.shared.view
 import java.awt.Component
 import java.awt.Container
@@ -846,6 +847,87 @@ internal object ParityMatrix {
                     assertTrue(panel.streamText().contains("off"), panel.streamText())
                 },
                 daemonCheck = { fakeDaemonCheck("restart/reconnect", "restart_reconnect") }
+            )
+        )
+        register(
+            ParityRow(
+                "change review",
+                canned = {
+                    // Observable: rows derive from served relationships only;
+                    // the immutable basis resolves to the served source diff;
+                    // navigation is bounded; the exact I03 copy renders.
+                    val verification = parseNativeTaskVerification(PARITY_CRITERION_PROOF_JSON)
+                    val task = parseNativeTaskViews(PARITY_TASK_JSON)[0]
+                        .copy(changedFiles = listOf("src/a.rs", "src/b.kt"))
+                    val model = changeReviewOf(null, task, verification)
+                    assertEquals(listOf("src/a.rs", "src/b.kt"), model.rows.map { it.path })
+                    val row = model.rows[0]
+                    assertEquals(listOf("r1"), row.verificationRecordIds)
+                    assertEquals(listOf("file criterion"), row.criterionKeys)
+                    assertEquals("digest-file", row.expectedDigest)
+                    assertTrue(
+                        row.evidenceRefs.any { it.id == 41L },
+                        "the served evidence ref attaches: ${row.evidenceRefs}"
+                    )
+                    assertEquals("candidate tm1:cand", model.basis?.candidateLabel)
+                    val resolved = resolveChangeBasis(model, 0)
+                    assertTrue(resolved is BasisResolution.Single, "served source diff first")
+                    assertEquals(
+                        "candidate tm1:cand — source diff — evidence #41 (immutable)",
+                        (resolved as BasisResolution.Single).title
+                    )
+                    val panel = ChangesPanel()
+                    panel.update(model)
+                    assertEquals(false, panel.previousEnabled())
+                    assertEquals(true, panel.nextEnabled())
+                    panel.clickNext()
+                    assertEquals("src/b.kt", panel.selectedPath())
+                    assertEquals(false, panel.nextEnabled(), "bounded at the end")
+                    panel.showDiffUnavailable()
+                    assertEquals(DIFF_UNAVAILABLE_LABEL, panel.diffUnavailableLabelText())
+                    assertEquals(DIFF_UNAVAILABLE_COPY, panel.diffUnavailableCopyText())
+                    panel.update(ChangeReviewModel(basis = null, rows = emptyList()))
+                    assertEquals(CHANGES_EMPTY_COPY, panel.emptyText())
+                },
+                daemonCheck = { fakeDaemonCheck("change review", "change_review") }
+            )
+        )
+        register(
+            ParityRow(
+                "outcomes",
+                canned = {
+                    // Observable: exact metric names, the distinct
+                    // Successful-Run Cost vs VCSC, the local cohort rows, the
+                    // unmeasured counterfactual and the T29 refusal state.
+                    val page = parseProtocolOutcomesPage(
+                        JsonCodec.parse(PARITY_OUTCOMES_PAGE_JSON).view("outcomes")
+                    )
+                    val model = outcomesPanelModelOf(page)
+                    assertEquals("Successful-Run Cost", model.metricRows[0].name)
+                    assertEquals(
+                        "Verified Cost per Successful Change (VCSC)",
+                        model.metricRows[1].name
+                    )
+                    for (name in listOf(
+                        "Local-Only Verified Rate",
+                        "Local-Final Verified Rate",
+                        "Local-First Success Rate",
+                        "Local-to-Frontier Fallback Rate"
+                    )) {
+                        assertTrue(model.metricNames().contains(name), name)
+                    }
+                    assertEquals("not measured", model.metricValue("Avoided Hosted Inference"))
+                    val panel = OutcomesPanel()
+                    panel.setModel(model)
+                    assertEquals("View details", panel.viewDetailsText())
+                    panel.setModel(outcomesPanelModelOf(null, "refused"))
+                    assertEquals(
+                        "The current authority has not supplied a cost value.",
+                        panel.unavailableCopyText()
+                    )
+                    assertTrue(!panel.model()!!.hasMonetaryValue(), "no money behind a refusal")
+                },
+                daemonCheck = { fakeDaemonCheck("outcomes", "outcomes") }
             )
         )
     }
@@ -1770,7 +1852,8 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
     "\"binding\":{\"kind\":\"integration_coverage\"," +
     "\"required_work_items\":[\"impl-a\",\"impl-b\"]}," +
     "\"origin\":\"project_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
-    "{\"criterionKey\":\"file criterion\",\"passed\":true,\"evidence\":\"file:src/a.rs\"," +
+    "{\"criterionKey\":\"file criterion\",\"passed\":true," +
+    "\"evidence\":\"file:src/a.rs;evidence:41\"," +
     "\"binding\":{\"kind\":\"file_state\",\"path\":\"src/a.rs\"," +
     "\"expected_digest\":\"digest-file\"}," +
     "\"origin\":\"verification_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
@@ -1791,9 +1874,45 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
     "{\"criterionKey\":\"legacy criterion\",\"passed\":true," +
     "\"evidence\":\"file:src/legacy.rs\"}" +
     "]," +
-    "\"checks\":[],\"changedFiles\":[],\"unrelatedChanges\":[],\"reviewer\":null," +
-    "\"status\":\"passed\",\"startedMs\":11,\"completedMs\":22" +
+    "\"checks\":[],\"changedFiles\":[{\"path\":\"src/a.rs\"}],\"unrelatedChanges\":[],\"reviewer\":null," +
+    "\"status\":\"passed\",\"startedMs\":11,\"completedMs\":22," +
+    "\"candidateProof\":{\"runId\":\"run-9\",\"candidateSnapshot\":\"tm1:cand\"," +
+    "\"sourceDiffEvidence\":\"evidence:41\",\"changedFilesDigest\":\"cf-1\"}" +
     "}]}"
+
+/**
+ * `GET /native/outcomes` for the parity fake daemon and the canned outcomes
+ * row: a small valid fold with one run, an exhausted cursor and a zero
+ * avoided counterfactual (which must render `not measured`).
+ */
+internal const val PARITY_OUTCOMES_PAGE_JSON = "{" +
+    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstPassChanges\":1," +
+    "\"verifiedFirstPassPpm\":1000000,\"totalVerifiedSpendMicro\":\"5\"," +
+    "\"successfulRunCostMicro\":\"5\",\"totalSpendMicro\":\"9\"," +
+    "\"verifiedCostPerSuccessfulChangeMicro\":\"9\",\"totalReworkSpendMicro\":\"1\"," +
+    "\"reworkCostRatioPpm\":111111,\"localRuns\":1,\"localOnlyRuns\":1," +
+    "\"localOnlyVerifiedChanges\":1,\"localOnlyVerifiedPpm\":1000000," +
+    "\"localFinalRuns\":1,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":1000000," +
+    "\"localFirstRuns\":1,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":1000000," +
+    "\"localToFrontierFallbackRuns\":0,\"localToFrontierFallbackPpm\":0," +
+    "\"frontierOnlyRuns\":2,\"frontierOnlyPpm\":666666," +
+    "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":10," +
+    "\"meanTimeToVerifiedChangeMs\":10,\"humanInterventionRuns\":0," +
+    "\"humanInterventionPpm\":0,\"rollbackRuns\":0,\"regressionRollbackPpm\":0," +
+    "\"checksPassed\":1,\"checksRequired\":1,\"proofCoveragePpm\":1000000," +
+    "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+    "\"scanned\":3,\"truncated\":false}," +
+    "\"runs\":[{\"runId\":\"run-1\",\"sessionId\":1,\"taskId\":2," +
+    "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
+    "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":false,\"verified\":true," +
+    "\"verifiedFirstAttempt\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"modelSpendMicro\":\"5\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
+    "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":10,\"humanInterventions\":0," +
+    "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
+    "\"changeScale\":{\"files\":1,\"addedLines\":1,\"removedLines\":0}," +
+    "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +
+    "\"frontierEscalations\":0,\"completedAtMs\":10}]," +
+    "\"nextCursor\":null}"
 
 internal const val PARITY_SESSIONS_JSON = "{\"sessions\":[" +
     "{\"id\":\"7\",\"title\":\"parity\",\"provider\":\"alpha\",\"model\":\"m\"," +

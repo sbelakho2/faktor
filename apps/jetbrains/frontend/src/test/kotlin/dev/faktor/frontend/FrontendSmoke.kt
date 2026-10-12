@@ -17,6 +17,7 @@ import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
+import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
@@ -48,6 +49,7 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.parseProtocolAttachmentRef
+import dev.faktor.shared.parseProtocolOutcomesPage
 import dev.faktor.shared.view
 import java.awt.GraphicsEnvironment
 import java.awt.Toolkit
@@ -541,6 +543,11 @@ object FrontendSmoke {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        // I03/I07/I08 pure-surface tests (no display, no daemon) run first so
+        // a model regression fails fast with its own name.
+        changeReviewUnitTests()
+        outcomesUnitTests()
+        faktorSettingsUnitTests()
         step("canned native parsing: blocker/progress/result/capabilities") {
             val agents = parseNativeAgents(AGENTS_JSON)
             assertEquals(2, agents.size)
@@ -3881,8 +3888,27 @@ object FrontendSmoke {
                             }
                         }
                     }
+                    step("outcomes ledger reads with strict bounds (bounds never fabricated)") {
+                       val page = client.outcomes(limit = 5L)
+                        println(
+                            "  outcomes runs=${page.metrics.runs} " +
+                                "verified=${page.metrics.verifiedChanges} " +
+                                "truncated=${page.metrics.truncated}"
+                        )
+                        if (page.nextCursor != null && page.runs.isEmpty()) {
+                            fail("a non-null cursor with no rows is contradictory")
+                        }
+                        try {
+                            client.outcomes(limit = 0L)
+                            fail("a zero page limit must be refused")
+                        } catch (e: NativeApiException) {
+                            if (e.status !in 400..499) {
+                                fail("unexpected outcomes refusal ${e.status} ${e.code}")
+                            }
+                        }
+                    }
                 }
-            }
+           }
         } finally {
             if (connection != null) {
                 val c = connection!!
@@ -3897,6 +3923,712 @@ object FrontendSmoke {
             }
             dataDir.toFile().deleteRecursively()
             workspace.toFile().deleteRecursively()
+        }
+    }
+
+    // ------------------------------------------------- I03 change review
+
+    /**
+     * I03: rows derive from SERVED relationships only; the immutable basis
+     * resolves in the exact order (candidate source diff -> attached refs ->
+     * explicit unavailable); the host seam receives bytes and never a
+     * workspace file; navigation is bounded; a read failure clears rows.
+     */
+    private fun changeReviewUnitTests() {
+        val proof = dev.faktor.shared.NativeCandidateProof(
+            taskRevision = "rev-2",
+            baseManifestHash = "base-manifest",
+            candidateManifestHash = "cand-manifest",
+            sourceDiffEvidence = "evidence:77",
+            riskReportEvidence = null,
+            accountingSnapshotDigest = null,
+            runId = "run-1",
+            runBaseSnapshot = "tm1:base",
+            candidateSnapshot = "tm1:cand",
+            sourcesDigest = "src-digest",
+            changedFilesDigest = "cf-digest"
+        )
+        val record1 = dev.faktor.shared.NativeVerificationRecord(
+            recordId = "r1",
+            status = "passed",
+            criteriaPassed = 1,
+            criteriaTotal = 1,
+            checks = listOf("unit=passed"),
+            changedFiles = listOf("src/a.rs"),
+            criteria = listOf(
+                dev.faktor.shared.NativeCriterionVerdict(
+                    criterionKey = "c1",
+                    passed = true,
+                    evidence = "evidence:41;file:src/a.rs",
+                    binding = dev.faktor.shared.NativeCriterionBinding(
+                        kind = "file_state",
+                        path = "src/a.rs",
+                        expectedDigest = "sha256:aa"
+                    ),
+                    origin = "user",
+                    requirement = "required",
+                    verdict = "pass"
+                )
+            ),
+            candidateProof = proof,
+            completedMs = 100L
+        )
+        val record2 = dev.faktor.shared.NativeVerificationRecord(
+            recordId = "r2",
+            status = "failed",
+            criteriaPassed = 0,
+            criteriaTotal = 1,
+            checks = emptyList(),
+            changedFiles = listOf("src/b.kt"),
+            criteria = listOf(
+                dev.faktor.shared.NativeCriterionVerdict(
+                    criterionKey = "c2",
+                    passed = false,
+                    evidence = "evidence:42",
+                    binding = dev.faktor.shared.NativeCriterionBinding(
+                        kind = "evidence",
+                        evidenceId = "42"
+                    ),
+                    origin = "user",
+                    requirement = "required",
+                    verdict = "fail"
+                )
+            ),
+            completedMs = 50L
+        )
+        val verification = dev.faktor.shared.NativeTaskVerification(
+            sessionId = "s1",
+            taskId = "t1",
+            records = listOf(record1, record2)
+        )
+        val task = parseNativeTaskViews(TASK_JSON)[0].copy(changedFiles = listOf("src/a.rs", "src/b.kt"))
+
+        step("I03 rows derive only served relationships (path + kind + attached refs)") {
+            val model = changeReviewOf(projection = null, task = task, taskVerification = verification)
+            assertEquals(listOf("src/a.rs", "src/b.kt"), model.rows.map { it.path })
+            val a = model.rows[0]
+            assertEquals(null, a.changeKind, "no daemon serves a change kind; none is fabricated")
+            assertEquals(listOf("r1"), a.verificationRecordIds)
+            assertEquals(listOf("c1"), a.criterionKeys)
+            assertEquals(listOf(41L), a.evidenceRefs.mapNotNull { it.id })
+            assertEquals("sha256:aa", a.expectedDigest)
+            val b = model.rows[1]
+            assertEquals(listOf("r2"), b.verificationRecordIds)
+            assertTrue(b.criterionKeys.isEmpty(), "an evidence binding is not a path relationship")
+            assertTrue(b.evidenceRefs.isEmpty(), "no served ref is attached to src/b.kt")
+            // The projection's filesChanged is part of the served union.
+            val projection = dev.faktor.shared.NativeProjection(
+                sessionId = "s1", title = "T", provider = "p", model = "m",
+                lifecycle = "open", machine = "ready", label = "ready", active = true,
+                terminal = false, activeModel = null, activeTool = null,
+                filesChanged = listOf("src/c.py"), verification = emptyList(), queued = 0
+            )
+            val union = changeReviewOf(projection, task, verification)
+            assertEquals(listOf("src/a.rs", "src/b.kt", "src/c.py"), union.rows.map { it.path })
+            // The candidate display is the served identity; raw hashes stay
+            // advanced detail.
+            assertEquals("candidate tm1:cand", union.basis?.candidateLabel)
+            assertEquals(77L, union.basis?.sourceDiffEvidenceId)
+            assertTrue(
+                union.basis?.candidateDetail?.any { it.contains("candidate manifest: cand-manifest") } == true,
+                "raw hashes stay available as advanced detail"
+            )
+        }
+
+        step("I03 basis resolution follows the exact order a -> b -> c") {
+            val model = changeReviewOf(null, task, verification)
+            val first = resolveChangeBasis(model, 0)
+            assertTrue(first is BasisResolution.Single, "the candidate source diff wins first")
+            assertEquals(77L, (first as BasisResolution.Single).evidenceId)
+            assertEquals(
+                "candidate tm1:cand — source diff — evidence #77 (immutable)",
+                first.title
+            )
+            // Without a served source diff, the selected path's refs resolve.
+            val basisless = model.copy(basis = model.basis?.copy(sourceDiffEvidenceRaw = null, sourceDiffEvidenceId = null))
+            val second = resolveChangeBasis(basisless, 0)
+            assertEquals(41L, (second as BasisResolution.Single).evidenceId)
+            assertEquals("src/a.rs — evidence #41 (immutable)", second.title)
+            // Two immutable artifacts for the same path: a true diff is allowed.
+            val pairRow = model.rows[0].copy(
+                evidenceRefs = listOf(EvidenceRef(41L, "evidence:41"), EvidenceRef(42L, "evidence:42"))
+            )
+            val pair = resolveChangeBasis(basisless.copy(rows = listOf(pairRow)), 0)
+            assertTrue(pair is BasisResolution.Pair, "two served artifacts for one path form a diff")
+            assertEquals(41L, (pair as BasisResolution.Pair).first)
+            assertEquals(42L, pair.second)
+            assertTrue(pair.title.contains("\u2194"), pair.title)
+            // No basis and no refs: the explicit in-panel state.
+            val none = basisless.copy(rows = listOf(pairRow.copy(evidenceRefs = emptyList())))
+            assertTrue(resolveChangeBasis(none, 0) is BasisResolution.Unavailable)
+            // A served-but-invalid id is a typed refusal, never skipped.
+            val invalid = model.copy(
+                basis = model.basis?.copy(
+                    sourceDiffEvidenceRaw = "not-an-id",
+                    sourceDiffEvidenceId = null
+                )
+            )
+            val refused = resolveChangeBasis(invalid, 0)
+            assertTrue(refused is BasisResolution.Invalid, "an invalid served id refuses typed")
+            assertTrue(
+                (refused as BasisResolution.Invalid).reason.contains("not a valid evidence id"),
+                refused.reason
+            )
+        }
+
+        step("I03 adapter seam opens the served bytes exactly (unicode + truncated header)") {
+            val unicode = "caf\u00e9 \u2014 \u00fcn\u00efcode \u2713"
+            val hit = java.util.concurrent.atomic.AtomicInteger(0)
+            val host = RecordingChangeReviewHost()
+            val controller = ChangeReviewController(host) { id ->
+                hit.incrementAndGet()
+                NativeEvidenceRetrieval(
+                    id, "{\"selector\":\"all\"}",
+                    unicode.toByteArray(Charsets.UTF_8),
+                    unicode.toByteArray(Charsets.UTF_8).size.toLong(),
+                    true
+                )
+            }
+            val model = changeReviewOf(null, task, verification)
+            assertEquals(ChangeOpenResult.Opened, controller.open(model, 0))
+            assertEquals(1, hit.get())
+            assertEquals(1, host.artifacts.size)
+            val artifact = host.artifacts[0]
+            assertEquals(77L, artifact.evidenceId)
+            assertEquals(true, artifact.truncatedByPolicy)
+            val lines = artifact.text.split('\n')
+            assertEquals(TRUNCATED_BY_POLICY_HEADER, lines.first(), "truncated first line")
+            assertTrue(artifact.text.contains(unicode), "the served bytes are byte-exact (unicode)")
+        }
+
+        step("I03 large bounded artifact opens byte-exact") {
+            val bytes = ByteArray(1 shl 20) { 'x'.code.toByte() }
+            val host = RecordingChangeReviewHost()
+            val controller = ChangeReviewController(host) { id ->
+                NativeEvidenceRetrieval(id, "{}", bytes, bytes.size.toLong(), false)
+            }
+            val model = changeReviewOf(null, task, verification)
+            assertEquals(ChangeOpenResult.Opened, controller.open(model, 0))
+            assertEquals(String(bytes, Charsets.UTF_8), host.artifacts[0].text)
+            assertEquals(false, host.artifacts[0].truncatedByPolicy)
+        }
+
+        step("I03 invalid/unknown/foreign evidence refused typed and nothing opens") {
+            val host = RecordingChangeReviewHost()
+            val unknown = ChangeReviewController(host) { id ->
+                throw NativeApiException(404, "not_found", "no evidence $id", false)
+            }
+            val model = changeReviewOf(null, task, verification)
+            val refusedUnknown = unknown.open(model, 0)
+            assertTrue(refusedUnknown is ChangeOpenResult.Refused, "unknown evidence refuses")
+            assertTrue(
+                (refusedUnknown as ChangeOpenResult.Refused).reason.contains("status 404"),
+                refusedUnknown.reason
+            )
+            val foreign = ChangeReviewController(host) { id ->
+                NativeEvidenceRetrieval(999L, "{}", "other".toByteArray(), 5L, false)
+            }
+            val refusedForeign = foreign.open(model, 0)
+            assertTrue(refusedForeign is ChangeOpenResult.Refused, "foreign evidence refuses")
+            assertTrue(
+                (refusedForeign as ChangeOpenResult.Refused).reason.contains("foreign artifact"),
+                refusedForeign.reason
+            )
+            val invalid = ChangeReviewController(host) { id ->
+                fail("an invalid id must never be retrieved (asked #$id)")
+            }
+            val invalidModel = model.copy(
+                basis = model.basis?.copy(sourceDiffEvidenceRaw = "nope", sourceDiffEvidenceId = null)
+            )
+            assertTrue(invalid.open(invalidModel, 0) is ChangeOpenResult.Refused)
+            assertEquals(0, host.artifacts.size, "nothing opens on any refusal")
+            assertEquals(0, host.diffs.size)
+        }
+
+        step("I03 no workspace file path is ever opened (adapter seam)") {
+            val host = RecordingChangeReviewHost()
+            val controller = ChangeReviewController(host) { id ->
+                NativeEvidenceRetrieval(id, "{}", "content".toByteArray(), 7L, false)
+            }
+            // No served candidate source diff here: resolution must fall to
+            // the selected path's attached evidence ref. The row path is a
+            // workspace-looking absolute path: it may ONLY ever appear as the
+            // immutable title, never as an open target.
+            val model = ChangeReviewModel(
+                basis = null,
+                rows = listOf(
+                    ChangeRow(
+                        path = "/etc/passwd",
+                        changeKind = null,
+                        verificationRecordIds = emptyList(),
+                        criterionKeys = emptyList(),
+                        evidenceRefs = listOf(EvidenceRef(41L, "evidence:41")),
+                        expectedDigest = null
+                    )
+                )
+            )
+            assertEquals(ChangeOpenResult.Opened, controller.open(model, 0))
+            assertEquals(1, host.artifacts.size)
+            assertEquals(
+                "/etc/passwd — evidence #41 (immutable)",
+                host.artifacts[0].title,
+                "the path appears only in the immutable title, never as an open target"
+            )
+            assertEquals(0, host.diffs.size)
+            // Structural: the seam carries no file/Path parameter at all.
+            for (method in ChangeReviewHost::class.java.methods) {
+                for (parameter in method.parameterTypes) {
+                    assertTrue(
+                        parameter != java.io.File::class.java &&
+                            parameter != java.nio.file.Path::class.java,
+                        "the host seam must not take file paths: ${method.name}"
+                    )
+                }
+            }
+        }
+
+        step("I03 diff-unavailable state carries the exact copy; no apply/rebase control") {
+            assertEquals("Diff unavailable", DIFF_UNAVAILABLE_LABEL)
+            assertEquals(
+                "The runtime does not serve an immutable candidate content read for this change.",
+                DIFF_UNAVAILABLE_COPY
+            )
+            val panel = ChangesPanel()
+            panel.update(changeReviewOf(null, task, verification))
+            panel.showDiffUnavailable()
+            assertEquals(true, panel.diffUnavailableVisible())
+            assertEquals(DIFF_UNAVAILABLE_LABEL, panel.diffUnavailableLabelText())
+            assertEquals(DIFF_UNAVAILABLE_COPY, panel.diffUnavailableCopyText())
+            val controls = ArrayList<String>()
+            collectButtonTexts(panel, controls)
+            for (label in controls) {
+                assertTrue(
+                    !label.contains("Rebase", ignoreCase = true) &&
+                        !label.contains("Apply", ignoreCase = true),
+                    "no rebase/apply capability exists; got control \"$label\""
+                )
+            }
+        }
+
+        step("I03 previous/next are bounded and selection survives refreshes") {
+            val panel = ChangesPanel()
+            val rows = listOf("a.rs", "b.rs", "c.rs").map {
+                ChangeRow(it, null, emptyList(), emptyList(), emptyList(), null)
+            }
+            panel.update(ChangeReviewModel(basis = null, rows = rows))
+            assertEquals(0, panel.selectedIndex())
+            assertEquals(false, panel.previousEnabled())
+            assertEquals(true, panel.nextEnabled())
+            panel.clickNext()
+            panel.clickNext()
+            assertEquals(2, panel.selectedIndex())
+            assertEquals(false, panel.nextEnabled(), "next is disabled at the end")
+            panel.clickNext()
+            assertEquals(2, panel.selectedIndex(), "next past the end stays bounded")
+            // A refresh reordered/replaced rows: the same path stays selected.
+            panel.selectIndex(1)
+            assertEquals("b.rs", panel.selectedPath())
+            panel.update(
+                ChangeReviewModel(basis = null, rows = listOf(rows[2], rows[1], rows[0]))
+            )
+            assertEquals("b.rs", panel.selectedPath(), "selection survives a refresh")
+            assertEquals(1, panel.selectedIndex())
+            // Shrinking the row set clamps the index.
+            panel.update(ChangeReviewModel(basis = null, rows = listOf(rows[0])))
+            assertEquals(0, panel.selectedIndex())
+            // A read failure clears every row and states the reason.
+            panel.setUnavailable("change read failed: 503")
+            assertEquals(0, panel.rowCount(), "no stale rows behind a read failure")
+            assertEquals("change read failed: 503", panel.unavailableReason())
+            assertEquals(CHANGES_UNAVAILABLE_LABEL, panel.unavailableHeadlineText())
+            // The empty served state uses the exact I03 copy.
+            panel.update(ChangeReviewModel(basis = null, rows = emptyList()))
+            assertEquals(CHANGES_EMPTY_COPY, panel.emptyText())
+        }
+
+        step("I03 recheck re-derives conflict facts (no rebase control)") {
+            val model = changeReviewOf(null, task, verification)
+            val unchanged = basisConflictFacts(model, model)
+            assertEquals(1, unchanged.size)
+            assertTrue(unchanged[0].contains("unchanged"), unchanged[0])
+            val moved = model.copy(
+                basis = model.basis?.copy(sourceDiffEvidenceRaw = "evidence:78", sourceDiffEvidenceId = 78L)
+            )
+            val facts = basisConflictFacts(model, moved)
+            assertTrue(facts.any { it.contains("conflict") && it.contains("#77") && it.contains("#78") }, facts.toString())
+            val shrunken = model.copy(rows = model.rows.take(1))
+            assertTrue(basisConflictFacts(model, shrunken).any { it.contains("changed-file set changed") })
+            assertTrue(
+                basisConflictFacts(model, changeReviewOf(null, null, null, "read failed"))
+                    .any { it.contains("could not be re-read") }
+            )
+        }
+    }
+
+    // --------------------------------------------------------- I07 outcomes
+
+    private const val OUTCOMES_METRICS_JSON = "{" +
+        "\"runs\":10,\"verifiedChanges\":2,\"verifiedFirstPassChanges\":1," +
+        "\"verifiedFirstPassPpm\":500000," +
+        "\"totalVerifiedSpendMicro\":\"3000000\",\"successfulRunCostMicro\":\"1500000\"," +
+        "\"totalSpendMicro\":\"90000000\"," +
+        "\"verifiedCostPerSuccessfulChangeMicro\":\"45000000\"," +
+        "\"totalReworkSpendMicro\":\"1000000\",\"reworkCostRatioPpm\":11111," +
+        "\"localRuns\":4,\"localOnlyRuns\":3,\"localOnlyVerifiedChanges\":1," +
+        "\"localOnlyVerifiedPpm\":333333," +
+        "\"localFinalRuns\":2,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":500000," +
+        "\"localFirstRuns\":5,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":200000," +
+        "\"localToFrontierFallbackRuns\":2,\"localToFrontierFallbackPpm\":400000," +
+        "\"frontierOnlyRuns\":6,\"frontierOnlyPpm\":600000," +
+        "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":100," +
+        "\"meanTimeToVerifiedChangeMs\":50," +
+        "\"humanInterventionRuns\":1,\"humanInterventionPpm\":100000," +
+        "\"rollbackRuns\":1,\"regressionRollbackPpm\":100000," +
+        "\"checksPassed\":3,\"checksRequired\":4,\"proofCoveragePpm\":750000," +
+        "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+        "\"scanned\":10,\"truncated\":false}"
+
+    private const val OUTCOMES_PAGE_JSON = "{\"metrics\":" + OUTCOMES_METRICS_JSON + "," +
+        "\"runs\":[{\"runId\":\"run-9\",\"sessionId\":1,\"taskId\":2," +
+        "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
+        "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":true,\"verified\":true," +
+        "\"verifiedFirstAttempt\":true,\"repairAttempts\":0," +
+        "\"modelSequence\":[{\"provider\":\"local\",\"model\":\"m\",\"local\":true," +
+        "\"spendMicro\":\"1\"}]," +
+        "\"modelSpendMicro\":\"1\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
+        "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":5,\"humanInterventions\":0," +
+        "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
+        "\"changeScale\":{\"files\":1,\"addedLines\":2,\"removedLines\":3}," +
+        "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +
+        "\"frontierEscalations\":0,\"completedAtMs\":42}]," +
+        "\"nextCursor\":{\"completedAtMs\":42,\"runId\":\"run-9\"}}"
+
+    /**
+     * I07: exact metric names/definitions, the served counts and denominators,
+     * the empty-denominator copy, scan truncation, the unmeasured
+     * counterfactual and the T29 read-failure state (no monetary value).
+     */
+    private fun outcomesUnitTests() {
+        step("I07 parse validity: additive fields ignored, malformed typed, exact money") {
+            val withUnknown = OUTCOMES_METRICS_JSON.replace(
+                "\"scanned\":10",
+                "\"scanned\":10,\"futureMetric\":123"
+            )
+            val tolerant = parseProtocolOutcomesPage(
+                JsonCodec.parse(
+                    "{\"metrics\":$withUnknown,\"runs\":[],\"nextCursor\":null}"
+                ).view("test")
+            )
+            assertEquals(10L, tolerant.metrics.runs)
+            assertEquals(false, tolerant.metrics.truncated)
+            val malformed = "{\"metrics\":" +
+                OUTCOMES_METRICS_JSON.replace("\"runs\":10", "\"runs\":\"ten\"") +
+                ",\"runs\":[],\"nextCursor\":null}"
+            try {
+                parseProtocolOutcomesPage(JsonCodec.parse(malformed).view("test"))
+                fail("a string runs counter must fail typed")
+            } catch (e: NativeProtocolException) {
+                assertTrue(e.message!!.contains("runs"), e.message!!)
+            }
+            val page = parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            assertEquals(2L, page.metrics.verifiedChanges)
+            assertEquals("45000000", page.metrics.verifiedCostPerSuccessfulChangeMicro)
+            assertEquals("run-9", page.runs[0].runId)
+            assertEquals(42L, page.nextCursor?.completedAtMs)
+        }
+
+        step("I07 exact metric names + Successful-Run Cost vs VCSC + local cohorts stay distinct") {
+            val page = parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            val model = outcomesPanelModelOf(page)
+            assertEquals("ok", model.state)
+            val names = model.metricNames()
+            for (name in listOf(
+                "Successful-Run Cost",
+                "Verified Cost per Successful Change (VCSC)",
+                "Verified First-Pass Rate",
+                "Rework Cost Ratio",
+                "Avoided Hosted Inference",
+                "Mean Time to Verified Change",
+                "Human Intervention Rate",
+                "Regression/Rollback Rate",
+                "Proof Coverage",
+                "Frontier Escalation Rate",
+                "Local-Only Verified Rate",
+                "Local-Final Verified Rate",
+                "Local-First Success Rate",
+                "Local-to-Frontier Fallback Rate",
+                "Frontier-Only Rate"
+            )) {
+                assertTrue(names.contains(name), "metric \"$name\" must render")
+            }
+            assertEquals("$1.5000 \u00b7 1500000\u00b5\$", model.metricValue("Successful-Run Cost"))
+            assertEquals("$45.0000 \u00b7 45000000\u00b5\$", model.metricValue("Verified Cost per Successful Change (VCSC)"))
+            assertEquals("50.0000%", model.metricValue("Verified First-Pass Rate"))
+            assertEquals("33.3333%", model.metricValue("Local-Only Verified Rate"))
+            assertEquals("50.0000%", model.metricValue("Local-Final Verified Rate"))
+            assertEquals("20.0000%", model.metricValue("Local-First Success Rate"))
+            assertEquals("40.0000%", model.metricValue("Local-to-Frontier Fallback Rate"))
+            assertEquals("60.0000%", model.metricValue("Frontier-Only Rate"))
+            assertEquals("1.1111%", model.metricValue("Rework Cost Ratio"))
+            assertEquals("75.0000%", model.metricValue("Proof Coverage"))
+            // The VCSC explanation names the audit example (failures included).
+            val vcsc = model.metricRows.first { it.name == "Verified Cost per Successful Change (VCSC)" }
+            assertTrue(vcsc.explanation.contains("$91 per successful change"), vcsc.explanation)
+        }
+
+        step("I07 empty verified denominator uses the exact copy; zero avoided is not measured") {
+            val page = parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            val empty = outcomesPanelModelOf(
+                page.copy(metrics = page.metrics.copy(verifiedChanges = 0))
+            )
+            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Successful-Run Cost"))
+            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Verified Cost per Successful Change (VCSC)"))
+            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Verified First-Pass Rate"))
+            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Mean Time to Verified Change"))
+            // Zero avoided hosted inference is unmeasured, never a free claim.
+            assertEquals("not measured", empty.metricValue("Avoided Hosted Inference"))
+            val measured = outcomesPanelModelOf(
+                page.copy(
+                    metrics = page.metrics.copy(avoidedHostedInferenceMicro = "1234567890")
+                )
+            )
+            val avoided = measured.metricValue("Avoided Hosted Inference")!!
+            assertTrue(avoided.contains("1234567890"), avoided)
+            assertTrue(!avoided.contains("E"), "money never renders scientific notation: $avoided")
+        }
+
+        step("I07 truncation is shown explicitly and big money renders exactly") {
+            val page = parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            val truncated = outcomesPanelModelOf(
+                page.copy(metrics = page.metrics.copy(truncated = true, scanned = 10000))
+            )
+            assertEquals(true, truncated.truncated)
+            val panel = OutcomesPanel()
+            panel.setModel(truncated)
+            assertTrue(panel.truncatedText().contains("[TRUNCATED]"), panel.truncatedText())
+            assertTrue(panel.truncatedText().contains("10000"), panel.truncatedText())
+            val big = moneyText("18446744073709551615")
+            assertEquals("$18446744073709.5516 \u00b7 18446744073709551615\u00b5\$", big)
+            assertTrue(!big.contains("E"), "exact big money never goes scientific")
+            assertEquals("50.0000%", ppmPercentText(500000L))
+            assertEquals("100.0000%", ppmPercentText(1_000_000L))
+            assertEquals("0.0001%", ppmPercentText(1L))
+        }
+
+        step("I07 read failure is the T29 state with no monetary value and View details") {
+            assertEquals("Cost unavailable", OUTCOMES_COST_UNAVAILABLE)
+            assertEquals("The current authority has not supplied a cost value.", OUTCOMES_COST_UNAVAILABLE_COPY)
+            val model = outcomesPanelModelOf(null, "outcomes read refused (status 503 store_error)")
+            assertEquals("unavailable", model.state)
+            assertTrue(!model.hasMonetaryValue(), "no monetary value behind a refusal")
+            assertTrue(model.metricRows.isEmpty())
+            assertTrue(model.runRows.isEmpty())
+            var details = 0
+            val panel = OutcomesPanel()
+            panel.setListener(object : OutcomesPanel.Listener {
+                override fun onRefresh() {}
+                override fun onOlderPage() {}
+                override fun onViewDetails() {
+                    details++
+                }
+            })
+            panel.setModel(model)
+            assertEquals(OUTCOMES_COST_UNAVAILABLE, panel.unavailableHeadlineText())
+            assertEquals(OUTCOMES_COST_UNAVAILABLE_COPY, panel.unavailableCopyText())
+            assertEquals("View details", panel.viewDetailsText())
+            panel.clickViewDetails()
+            assertEquals(1, details, "T29 View details routes to the details surface")
+        }
+
+        step("I07 paging is bounded newest-first and reports exhaustion") {
+            val page = parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            val model = outcomesPanelModelOf(page)
+            assertEquals(42L, model.nextCursor?.completedAtMs)
+            assertEquals(true, model.olderEnabled())
+            assertEquals(false, model.pagingExhausted)
+            val exhausted = outcomesPanelModelOf(page.copy(nextCursor = null))
+            assertEquals(false, exhausted.olderEnabled())
+            assertEquals(true, exhausted.pagingExhausted)
+            val panel = OutcomesPanel()
+            var older = 0
+            panel.setListener(object : OutcomesPanel.Listener {
+                override fun onRefresh() {}
+                override fun onOlderPage() {
+                    older++
+                }
+                override fun onViewDetails() {}
+            })
+            panel.setModel(model)
+            assertEquals(true, panel.olderEnabled())
+            panel.clickOlder()
+            assertEquals(1, older)
+            panel.setModel(exhausted)
+            assertEquals(false, panel.olderEnabled())
+            panel.clickOlder()
+            assertEquals(1, older, "an exhausted page never fires a cursor read")
+            // The row page stays bounded.
+            val runs = StringBuilder()
+            for (index in 0 until 250) {
+                if (index > 0) runs.append(',')
+                runs.append(
+                    "{\"runId\":\"run-$index\",\"sessionId\":1,\"taskId\":2," +
+                        "\"taskClass\":\"Implementation\",\"riskClass\":\"low\"," +
+                        "\"candidateSnapshot\":null,\"finalSnapshot\":\"tm1:x\"," +
+                        "\"accepted\":true,\"integrated\":true,\"verified\":true," +
+                        "\"verifiedFirstAttempt\":true,\"repairAttempts\":0," +
+                        "\"modelSequence\":[],\"modelSpendMicro\":\"1\"," +
+                        "\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
+                        "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":1," +
+                        "\"humanInterventions\":0," +
+                        "\"proof\":{\"checksPassed\":0,\"checksRequired\":0,\"coveragePpm\":0}," +
+                        "\"changeScale\":{\"files\":0,\"addedLines\":0,\"removedLines\":0}," +
+                        "\"rollbackEvents\":0,\"recoveryEvents\":0," +
+                        "\"finalBasis\":\"unverified\",\"frontierEscalations\":0," +
+                        "\"completedAtMs\":$index}"
+                )
+            }
+            val many = parseProtocolOutcomesPage(
+                JsonCodec.parse("{\"metrics\":$OUTCOMES_METRICS_JSON,\"runs\":[$runs]," +
+                    "\"nextCursor\":null}").view("test")
+            )
+            assertEquals(250, many.runs.size)
+            assertEquals(OUTCOMES_MAX_RUN_ROWS, outcomesPanelModelOf(many).runRows.size)
+        }
+    }
+
+    // --------------------------------------------------- I08 app settings
+
+    private fun faktorSettingsUnitTests() {
+        step("I08 apply validates first and persists valid values exactly once") {
+            val store = RecordingSettingsStore()
+            val controller = FaktorSettingsController(store)
+            assertEquals("", controller.read().controlPlaneEndpoint, "endpoint default is EMPTY")
+            assertEquals(FaktorSettingsSnapshot.DEFAULT_MUTATION_MODE, controller.read().mutationMode)
+            val snapshot = FaktorSettingsSnapshot(
+                binaryPath = null,
+                provider = "alpha",
+                model = "alpha-1",
+                mutationMode = "shadow",
+                controlPlaneEndpoint = "http://127.0.0.1:9",
+                controlPlaneOrganization = "org-local"
+            )
+            controller.apply(snapshot)
+            assertEquals(1, store.writeCalls, "one validated batch write")
+            assertEquals(
+                "alpha",
+                store.writes[0][FaktorSettingKeys.RUN_PROVIDER]
+            )
+            assertEquals("shadow", store.writes[0][FaktorSettingKeys.RUN_MUTATION_MODE])
+            assertEquals("http://127.0.0.1:9", store.writes[0][FaktorSettingKeys.CONTROL_PLANE_ENDPOINT])
+            val read = controller.read()
+            assertEquals("alpha", read.provider)
+            assertEquals("alpha-1", read.model)
+            assertEquals("shadow", read.mutationMode)
+            assertEquals("http://127.0.0.1:9", read.controlPlaneEndpoint)
+            // Run-defaults-only writes keep the binary path and coordinates.
+            controller.applyRunDefaults("beta", "beta-1", "default")
+            assertEquals(2, store.writeCalls)
+            assertEquals(
+                setOf(
+                    FaktorSettingKeys.RUN_PROVIDER,
+                    FaktorSettingKeys.RUN_MODEL,
+                    FaktorSettingKeys.RUN_MUTATION_MODE
+                ),
+                store.writes[1].keys
+            )
+        }
+
+        step("I08 invalid input raises a typed refusal and writes nothing") {
+            val store = RecordingSettingsStore()
+            val controller = FaktorSettingsController(store)
+            val base = FaktorSettingsSnapshot(null, null, null, "default", "", "")
+            try {
+                controller.apply(base.copy(mutationMode = "direct"))
+                fail("an unknown mutation mode must refuse")
+            } catch (e: FaktorSettingsValidationException) {
+                assertTrue(e.message!!.contains("mutation mode"), e.message!!)
+            }
+            try {
+                controller.apply(base.copy(controlPlaneEndpoint = "acme-host"))
+                fail("a scheme-less endpoint must refuse")
+            } catch (e: FaktorSettingsValidationException) {
+                assertTrue(e.message!!.contains("endpoint"), e.message!!)
+            }
+            try {
+                controller.apply(base.copy(binaryPath = "bin/faktor"))
+                fail("a relative binary path must refuse")
+            } catch (e: FaktorSettingsValidationException) {
+                assertTrue(e.message!!.contains("absolute"), e.message!!)
+            }
+            try {
+                controller.apply(base.copy(controlPlaneEndpoint = "http://"))
+                fail("a host-less endpoint must refuse")
+            } catch (e: FaktorSettingsValidationException) {
+                Unit
+            }
+            assertEquals(0, store.writeCalls, "no partial write on any refusal")
+            assertTrue(store.values.isEmpty())
+        }
+
+        step("I08 reset restores defaults and keeps the PasswordSafe credential") {
+            val vault = RecordingVault()
+            val credentialStore = ControlPlaneCredentialStore(vault)
+            val scope = ControlPlaneScope("http://127.0.0.1:9", "org-local")
+            credentialStore.store(scope, "sekret-token-xyz")
+            assertEquals(1, vault.setCalls)
+            assertEquals("sekret-token-xyz", credentialStore.resolve(scope))
+            val store = RecordingSettingsStore()
+            val controller = FaktorSettingsController(store)
+            val defaults = controller.reset()
+            assertEquals(FaktorSettingsSnapshot.DEFAULTS, defaults)
+            assertEquals("", defaults.controlPlaneEndpoint)
+            assertEquals(FaktorSettingsSnapshot.DEFAULT_MUTATION_MODE, defaults.mutationMode)
+            // Reset touched neither the settings store nor the credential row.
+            assertEquals(0, store.writeCalls)
+            assertEquals(1, vault.setCalls, "reset never writes the credential store")
+            assertEquals("sekret-token-xyz", credentialStore.resolve(scope), "the credential survives reset")
+        }
+
+        step("I08 the credential never appears in any settings value") {
+            val vault = RecordingVault()
+            val credentialStore = ControlPlaneCredentialStore(vault)
+            val scope = ControlPlaneScope("http://127.0.0.1:9", "org-local")
+            credentialStore.store(scope, "sekret-token-xyz")
+            val store = RecordingSettingsStore()
+            val controller = FaktorSettingsController(store)
+            controller.apply(
+                FaktorSettingsSnapshot(
+                    binaryPath = null,
+                    provider = "alpha",
+                    model = null,
+                    mutationMode = "default",
+                    controlPlaneEndpoint = "http://127.0.0.1:9",
+                    controlPlaneOrganization = "org-local"
+                )
+            )
+            val serialized = StringBuilder()
+            for ((key, value) in store.values) serialized.append(key).append('=').append(value).append('\n')
+            for (batchWrite in store.writes) {
+                for ((key, value) in batchWrite) serialized.append(key).append('=').append(value).append('\n')
+            }
+            serialized.append(controller.read().toString())
+            assertTrue(
+                !serialized.contains("sekret-token-xyz"),
+                "the credential value must never enter settings/state: $serialized"
+            )
+            assertTrue(!serialized.contains("password"), "no credential-shaped key is persisted")
+        }
+
+        step("I08 endpoint default stays empty (no vendor substitution)") {
+            assertEquals("", FaktorSettingsSnapshot.DEFAULTS.controlPlaneEndpoint)
+            val store = RecordingSettingsStore()
+            val controller = FaktorSettingsController(store)
+            val read = controller.read()
+            assertEquals("", read.controlPlaneEndpoint)
+            assertTrue(!read.controlPlaneEndpoint.contains("http"))
+            assertTrue(!read.controlPlaneEndpoint.lowercase().contains("faktor"))
+            val reset = controller.reset()
+            assertEquals("", reset.controlPlaneEndpoint)
         }
     }
 
@@ -4006,3 +4738,63 @@ private const val INDEX_COVERAGE_JSON = "{" +
     "\"truncated_reason\":\"fingerprint_files\"}," +
     "\"freshness\":\"partial\",\"serving\":true}}"
 private const val INDEX_COVERAGE_UNHOSTED_JSON = "{\"sessionId\":\"7\",\"index_coverage\":null}"
+
+// ------------------------------------------------- I03/I08 test doubles
+
+/**
+ * The I03 host seam double: records the immutable artifacts it receives
+ * (bytes + immutable title only). The seam has no path-taking method, so a
+ * workspace file can never reach an open through it.
+ */
+private class RecordingChangeReviewHost : ChangeReviewHost {
+    val artifacts = ArrayList<ImmutableArtifact>()
+    val diffs = ArrayList<Triple<String, ImmutableArtifact, ImmutableArtifact>>()
+
+    override fun openArtifact(artifact: ImmutableArtifact) {
+        artifacts.add(artifact)
+    }
+
+    override fun openDiff(title: String, left: ImmutableArtifact, right: ImmutableArtifact) {
+        diffs.add(Triple(title, left, right))
+    }
+}
+
+/** Every button label of a component subtree (control-surface assertions). */
+private fun collectButtonTexts(component: java.awt.Component, out: MutableList<String>) {
+    if (component is javax.swing.AbstractButton) out.add(component.text ?: "")
+    if (component is java.awt.Container) {
+        for (child in component.components) collectButtonTexts(child, out)
+    }
+}
+
+/** In-memory application settings store with write accounting (I08). */
+private class RecordingSettingsStore : FaktorSettingsStore {
+    val values = LinkedHashMap<String, String>()
+    val writes = ArrayList<Map<String, String?>>()
+    var writeCalls = 0
+
+    override fun read(key: String): String? = values[key]
+
+    override fun write(values: Map<String, String?>) {
+        writeCalls++
+        writes.add(LinkedHashMap(values))
+        for ((key, value) in values) {
+            if (value == null) this.values.remove(key) else this.values[key] = value
+        }
+    }
+}
+
+/** PasswordSafe-shaped fake with write accounting; only a row's value. */
+private class RecordingVault : SecretVault {
+    private val rows = HashMap<String, String>()
+    var setCalls = 0
+
+    override fun getPassword(service: String, account: String): String? =
+        rows[service + "|" + account]
+
+    override fun setPassword(service: String, account: String, password: String?) {
+        setCalls++
+        val key = service + "|" + account
+        if (password == null) rows.remove(key) else rows[key] = password
+    }
+}

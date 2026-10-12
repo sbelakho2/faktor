@@ -120,7 +120,20 @@ class FaktorChatPanel(
      * is the client authority. Null = no root: ordinary attachments are
      * refused typed instead of being sent as absolute paths.
      */
-    private val workspaceRoot: Path? = null
+    private val workspaceRoot: Path? = null,
+    /**
+     * The shared application-settings controller (I08): the Settings utility
+     * loads/persists the run defaults through it, exactly like the platform
+     * `FaktorConfigurable`. Null keeps the selection in-panel (display tests,
+     * standalone embedding).
+     */
+    private val settingsController: FaktorSettingsController? = null,
+    /**
+     * The I03 editor host for the immutable diff review (the platform
+     * `ChangeReviewAdapter` in production). Null keeps the pure surface but
+     * refuses an open with a typed reason instead of silently doing nothing.
+     */
+    private val changeReviewHost: ChangeReviewHost? = null
 ) : JPanel(BorderLayout()), FaktorFrontendService.Listener {
 
     private val worker = Executors.newSingleThreadExecutor { runnable ->
@@ -329,9 +342,14 @@ class FaktorChatPanel(
 
     private val terminalPanel = TerminalPanel()
 
-    private val settingsPanel = SettingsPanel()
+    private val settingsPanel = SettingsPanel(settingsController)
 
     private val historyPanel = HistoryPanel()
+
+    /** The I07 Outcomes surface (lazy-read on first open), beside the list. */
+    private val outcomesPanel = OutcomesPanel()
+
+    private val historyTabs = FaktorTabbedPane()
 
     private val usagePanel = UsagePanel()
 
@@ -362,6 +380,17 @@ class FaktorChatPanel(
     private val usagePagingInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val billingPrevCursors = ArrayList<String>()
+
+    // The outcomes ledger read: lazy on first Outcomes open + explicit
+    // Refresh; the paging cursor stack replays exact older-page cursors.
+    private var outcomesCursor: dev.faktor.shared.ProtocolOutcomeCursor? = null
+
+    private val outcomesPrevCursors =
+        ArrayList<dev.faktor.shared.ProtocolOutcomeCursor?>()
+
+    private val outcomesPagingInFlight = AtomicBoolean(false)
+
+    private var outcomesLoaded = false
 
     /** The inspector root: 3 top-level cluster destinations (Work/Inspect/History). */
     private val tabs = FaktorTabbedPane()
@@ -551,7 +580,14 @@ class FaktorChatPanel(
         tabs.removeAll()
         tabs.addTab("Work", workPlane)
         tabs.addTab("Inspect", inspectTabs)
-        tabs.addTab("History", historyPanel)
+        // The History cluster keeps the conversations list intact and adds
+        // the I07 Outcomes surface beside it; the ledger read is lazy (first
+        // open) and failure-isolated from the conversation listing.
+        historyTabs.removeAll()
+        historyTabs.addTab("Conversations", historyPanel)
+        historyTabs.addTab("Outcomes", outcomesPanel)
+        historyTabs.addChangeListener { ensureOutcomesLoaded() }
+        tabs.addTab("History", historyTabs)
 
         add(toolbar, BorderLayout.NORTH)
         add(contentHost, BorderLayout.CENTER)
@@ -1663,22 +1699,33 @@ class FaktorChatPanel(
         }
         treePanel.setListener(object : TaskTreePanel.Listener {
             override fun onEvidenceSelected(ref: EvidenceRef) {
-                // Selection is a Swing mutation: run it on the EDT. The
-                // selector is a Swing READ, so it is captured on the EDT too;
-                // only the network retrieval runs on the worker.
-                onEdt {
-                    selectInspectorPanel(navigator)
-                    navigator.selectEvidence(ref)
-                }
-                if (ref.id != null) {
-                    runAsync("evidence ${ref.id}") {
-                        retrieveEvidenceIntoNavigator(ref.id, onEdtValue { navigator.selectorJson() })
-                    }
-                }
+                selectEvidenceRef(ref)
             }
 
             override fun onChildSelected(child: ChildNode) {
                 loadChildTranscript(child)
+            }
+        })
+        changesPanel.setListener(object : ChangesPanel.Listener {
+            override fun onEvidenceSelected(ref: EvidenceRef) {
+                selectEvidenceRef(ref)
+            }
+
+            override fun onOpenSourceDiff(model: ChangeReviewModel, rowIndex: Int?) {
+                openImmutableChange(model, rowIndex)
+            }
+
+            override fun onOpenClaim(criterionKey: String) {
+                openClaimInVerification(criterionKey)
+            }
+
+            override fun onReturnToRun() {
+                selectCluster("Work")
+                appendSystem("returned to the run surface")
+            }
+
+            override fun onRecheckBasis() {
+                runAsync("recheck change basis") { recheckChangeBasisBlocking() }
             }
         })
         blockersPanel.setListener(object : BlockersPanel.Listener {
@@ -2082,6 +2129,32 @@ class FaktorChatPanel(
                 runAsync("refresh history") { refreshHistoryBlocking() }
             }
         })
+        outcomesPanel.setListener(object : OutcomesPanel.Listener {
+            override fun onRefresh() {
+                outcomesCursor = null
+                outcomesPrevCursors.clear()
+                runAsync("refresh outcomes") { refreshOutcomesBlocking() }
+            }
+
+            override fun onOlderPage() {
+                if (!outcomesPagingInFlight.compareAndSet(false, true)) return
+                val next = onEdtValue { outcomesPanel.model()?.nextCursor }
+                if (next == null) {
+                    outcomesPagingInFlight.set(false)
+                    return
+                }
+                outcomesPrevCursors.add(outcomesCursor)
+                outcomesCursor = next
+                runAsync("outcomes older page") { refreshOutcomesBlocking() }
+            }
+
+            override fun onViewDetails() {
+                // T29 `View details`: the Diagnostics utility carries the
+                // daemon/authority readout; no monetary value is rendered in
+                // the unavailable state itself.
+                showUtility("Diagnostics", diagnosticsPanel)
+            }
+        })
         // The daemon/stream recovery machinery lives on Diagnostics, not on
         // History: reconnect resumes from the exact cursor, restart adopts a
         // restarted service, refresh re-reads the whole model.
@@ -2281,8 +2354,11 @@ class FaktorChatPanel(
     private fun refreshAllBlocking() {
         if (!service.isRunning()) return
         // The usage/credits panel is ORGANIZATION-scoped: it refreshes even
-        // before a session is selected.
+        // before a session is selected. The outcomes ledger is daemon-wide
+        // too, but stays LAZY: only an already-opened Outcomes surface
+        // refreshes here (its own Refresh button reads it otherwise).
         refreshUsagePanelBlocking()
+        if (outcomesLoaded) refreshOutcomesBlocking()
         if (service.currentSessionId() == null) return
         refreshStatusBlocking()
         refreshIndexCoverageBlocking()
@@ -2767,6 +2843,64 @@ class FaktorChatPanel(
         }
     }
 
+    /**
+     * Lazy first read of the outcomes ledger when the Outcomes surface is
+     * first opened (and never before); a stopped daemon leaves the panel in
+     * its honest not-read state.
+     */
+    private fun ensureOutcomesLoaded() {
+        if (outcomesLoaded || !service.isRunning()) return
+        if (historyTabs.selectedComponent !== outcomesPanel) return
+        outcomesLoaded = true
+        runAsync("outcomes") { refreshOutcomesBlocking() }
+    }
+
+    /**
+     * One bounded newest-first outcomes page from the CURRENT cursor. A
+     * refusal renders the T29 `Cost unavailable` state (no monetary rows);
+     * the conversations listing is untouched (failure isolation).
+     */
+    private fun refreshOutcomesBlocking() {
+        if (!service.isRunning()) {
+            outcomesPagingInFlight.set(false)
+            return
+        }
+        val cursor = outcomesCursor
+        try {
+            val page = service.outcomes(
+                limit = OUTCOMES_PAGE_LIMIT,
+                beforeMs = cursor?.completedAtMs,
+                beforeRun = cursor?.runId
+            )
+            onEdt {
+                outcomesPanel.setModel(outcomesPanelModelOf(page))
+                outcomesPagingInFlight.set(false)
+            }
+        } catch (e: NativeApiException) {
+            outcomesCursor = null
+            onEdt {
+                outcomesPanel.setModel(
+                    outcomesPanelModelOf(
+                        null,
+                        "outcomes read refused (status ${e.status} ${e.code}: ${e.detail})"
+                    )
+                )
+                outcomesPagingInFlight.set(false)
+            }
+        } catch (e: Exception) {
+            outcomesCursor = null
+            onEdt {
+                outcomesPanel.setModel(
+                    outcomesPanelModelOf(
+                        null,
+                        "outcomes read failed: ${e.message ?: e.javaClass.simpleName}"
+                    )
+                )
+                outcomesPagingInFlight.set(false)
+            }
+        }
+    }
+
     private fun refreshVerificationBlocking() {
         val verification = service.verification()
         onEdt {
@@ -2864,9 +2998,11 @@ class FaktorChatPanel(
 
     private fun refreshTaskTreeBlocking() {
         val projection = service.projection()
+        var taskReadFailure: String? = null
         val task = try {
             service.taskViews().firstOrNull()
         } catch (e: Exception) {
+            taskReadFailure = e.message ?: e.javaClass.simpleName
             null
         }
         val agents = service.agents()
@@ -2954,8 +3090,18 @@ class FaktorChatPanel(
             navigator.setEvidence(model.evidence)
             overviewPanel.updateModel(model)
             verificationPanel.updateModel(model)
-            val files = task?.changedFiles.orEmpty().ifEmpty { projection.filesChanged }
-            changesPanel.update(files, model.evidence)
+            // I03: rows from served data only. When no change facts could be
+            // read at all (the task view read failed and the projection
+            // serves none), the surface reports the explicit read failure
+            // instead of the empty-state copy; stale rows are never kept.
+            val changeUnavailable = if (
+                task == null && projection.filesChanged.isEmpty() && taskReadFailure != null
+            ) {
+                "change read failed: $taskReadFailure"
+            } else {
+                null
+            }
+            changesPanel.update(changeReviewOf(projection, task, taskVerification, changeUnavailable))
             agentsPanel.update(currentAgents, model)
         }
     }
@@ -2995,6 +3141,128 @@ class FaktorChatPanel(
                 navigator.showError(evidenceId, message)
                 appendSystem("evidence $evidenceId error: $message")
             }
+        }
+    }
+
+    /**
+     * One evidence selection from ANY surface (tree or Changes): show the
+     * Evidence detail, select the ref, then retrieve it on the worker (only
+     * the network read runs off the EDT).
+     */
+    private fun selectEvidenceRef(ref: EvidenceRef) {
+        onEdt {
+            selectInspectorPanel(navigator)
+            navigator.selectEvidence(ref)
+        }
+        if (ref.id != null) {
+            runAsync("evidence ${ref.id}") {
+                retrieveEvidenceIntoNavigator(ref.id, onEdtValue { navigator.selectorJson() })
+            }
+        }
+    }
+
+    /** Selects one top-level cluster by title (Work/Inspect/History). */
+    private fun selectCluster(title: String) {
+        for (i in 0 until tabs.tabCount) {
+            if (tabs.getTitleAt(i) == title) {
+                tabs.selectedIndex = i
+                return
+            }
+        }
+    }
+
+    /**
+     * I03 open: the pure controller resolves the immutable basis (candidate
+     * `sourceDiffEvidence`, else the selected change's attached evidence
+     * refs) and opens the served BYTES through the host seam. The session is
+     * captured before the read; a session switch mid-read refuses typed
+     * instead of opening foreign evidence.
+     */
+    private fun openImmutableChange(model: ChangeReviewModel, rowIndex: Int?) {
+        val host = changeReviewHost
+        if (host == null) {
+            changesPanel.showOpenRefusal(
+                "no IDE editor host is attached; the immutable basis cannot be opened in this environment"
+            )
+            return
+        }
+        runAsync("open source diff") {
+            val session = service.currentSessionId()
+            val controller = ChangeReviewController(host) { evidenceId ->
+                if (service.currentSessionId() != session) {
+                    throw dev.faktor.shared.NativeProtocolException(
+                        "change review",
+                        "the session changed during the immutable read"
+                    )
+                }
+                service.retrieveEvidence(
+                    evidenceId,
+                    dev.faktor.shared.NativeRequests.evidenceSelectorAll()
+                )
+            }
+            val result = controller.open(model, rowIndex)
+            onEdt {
+                when (result) {
+                    is ChangeOpenResult.Opened -> changesPanel.clearOpenState()
+                    is ChangeOpenResult.Unavailable -> changesPanel.showDiffUnavailable()
+                    is ChangeOpenResult.Refused -> changesPanel.showOpenRefusal(result.reason)
+                }
+            }
+        }
+    }
+
+    /**
+     * I03 `Open claim`: select the related criterion in the Verification
+     * surface when it is served; otherwise say so explicitly (never a
+     * fabricated selection).
+     */
+    private fun openClaimInVerification(criterionKey: String) {
+        selectInspectorPanel(verificationPanel)
+        selectInspectDetail("Verification", "Verification")
+        val selected = onEdtValue { verificationPanel.selectCriterion(criterionKey) }
+        if (!selected) {
+            appendSystem("no criterion \"$criterionKey\" is served in this run's verification")
+        }
+    }
+
+    /** Clicks one Inspect selector option by label (production path). */
+    private fun selectInspectDetail(tabTitle: String, label: String): Boolean {
+        val selector = inspectSelectorFor(tabTitle) ?: return false
+        for (button in selector.components.filterIsInstance<JToggleButton>()) {
+            if (button.text == label) {
+                button.doClick()
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * S15 `Recheck current basis`: re-read the proof/projection and re-derive
+     * the conflict facts against the last captured basis. There is no
+     * rebase/apply control because no such capability exists.
+     */
+    private fun recheckChangeBasisBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        val previous = onEdtValue { changesPanel.currentModel() }
+        val projection = service.projection()
+        val task = try {
+            service.taskViews().firstOrNull()
+        } catch (e: Exception) {
+            null
+        }
+        val verification = try {
+            val runs = service.taskRuns()
+            if (runs.isEmpty()) null else service.taskVerification(runs[0].taskId.toString())
+        } catch (e: Exception) {
+            null
+        }
+        val current = changeReviewOf(projection, task, verification)
+        val facts = basisConflictFacts(previous, current)
+        onEdt {
+            changesPanel.update(current)
+            changesPanel.showConflictFacts(facts)
+            appendSystem("basis recheck: " + facts.joinToString("; "))
         }
     }
 
@@ -3429,6 +3697,8 @@ class FaktorChatPanel(
 
     internal fun historyView(): HistoryPanel = historyPanel
 
+    internal fun outcomesView(): OutcomesPanel = outcomesPanel
+
     internal fun tournamentViewForTest(): TournamentPanel = tournamentPanel
 
     internal fun usageView(): UsagePanel = usagePanel
@@ -3609,6 +3879,8 @@ class FaktorChatPanel(
             overviewPanel.updateModel(null)
             verificationPanel.updateModel(null)
             changesPanel.update(emptyList(), emptyList())
+            changesPanel.showConflictFacts(emptyList())
+            changesPanel.clearOpenState()
             blockersPanel.update(emptyList(), emptyList())
             permissionsPanel.update(emptyList())
             workApprovalCard.update(emptyList())

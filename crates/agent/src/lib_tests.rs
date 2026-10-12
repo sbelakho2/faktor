@@ -952,6 +952,33 @@ mod bounded_evidence_executor_tests {
         }
     }
 
+    /// Bounded OBSERVATION-ONLY wait: poll the executor's stats until `cond`
+    /// holds (or fail loudly with the last snapshot) without ever driving a
+    /// retirement pass. Used for transitions the released providers drive
+    /// themselves, where a `maintain` pass would CHANGE the state under
+    /// observation: once drained threads free runtime budget room, that pass
+    /// would legitimately retire a released-but-not-yet-returned stuck slot
+    /// (an extra abandonment), so the history may only be asserted after the
+    /// released providers have actually returned.
+    async fn observe_until(
+        executor: &Arc<EvidenceExecutor>,
+        what: &str,
+        cond: impl Fn(&EvidenceExecutorStats) -> bool,
+    ) -> EvidenceExecutorStats {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let stats = executor.stats();
+            if cond(&stats) {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out observing {what}: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     /// Wedge ONE worker with a synchronously blocking provider and return
     /// only once the provider was actually ENTERED (the gate counter grew).
     /// A loaded worker may dequeue the job only after the caller's budget
@@ -1183,15 +1210,27 @@ mod bounded_evidence_executor_tests {
             );
         }
 
-        // RECOVERY: the stuck provider returns (test seam) -> the abandoned
-        // threads drain -> the circuit closes -> capacity is restored.
+        // RECOVERY: the stuck provider returns (test seam) -> the released
+        // workers return and the abandoned physical threads drain. This wait
+        // is OBSERVATION-ONLY (no retirement pass): the drained threads free
+        // runtime budget room, so a `maintain` pass here would legitimately
+        // retire the released stuck slot if its provider had not returned
+        // yet — an extra abandonment that is correct product behavior but
+        // would race the exact-history assertion below. Waiting for the
+        // released providers to actually return (healthy capacity + zero
+        // live abandonments) makes the history deterministic; the circuit
+        // close is then driven explicitly.
         gate.release_all();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while executor.stats().runtime_abandoned > 0 {
-            assert!(Instant::now() < deadline, "abandoned threads never drained");
-            executor.maintain();
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let restored = observe_until(
+            &executor,
+            "the released providers to return and the abandoned threads to drain",
+            |stats| stats.runtime_abandoned == 0 && stats.workers_healthy == 2,
+        )
+        .await;
+        assert_eq!(
+            restored.runtime_abandoned_total, 4,
+            "the abandonment history stays observable: {restored:?}"
+        );
         let stats = maintain_until(&executor, "restored healthy capacity", |stats| {
             stats.circuit == EvidenceCircuitState::Closed
                 && stats.workers == 2
@@ -1377,18 +1416,26 @@ mod bounded_evidence_executor_tests {
         );
 
         // Drain: the gate releases the wedged providers (originals + the
-        // stuck replacement) -> abandoned threads exit, circuit closes.
+        // stuck replacement) -> abandoned threads exit, circuit closes. The
+        // wait is OBSERVATION-ONLY (see `observe_until`): a `maintain` pass
+        // while the released stuck slot had not returned yet would
+        // legitimately retire it once the drained budget freed room, so the
+        // exact history is asserted only after every released provider
+        // actually returned; the circuit close is then driven explicitly.
         gate.release_all();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while executor.stats().runtime_abandoned > 0 {
-            assert!(Instant::now() < deadline, "abandoned threads never drained");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        executor.maintain();
-        let stats = executor.stats();
-        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
-        assert_eq!(stats.workers, 4, "capacity stays restored: {stats:?}");
-        assert_eq!(stats.workers_healthy, 4, "{stats:?}");
+        let restored = observe_until(
+            &executor,
+            "the released providers to return and the abandoned threads to drain",
+            |stats| stats.runtime_abandoned == 0 && stats.workers_healthy == 4,
+        )
+        .await;
+        assert_eq!(restored.runtime_abandoned_total, 4, "{restored:?}");
+        let stats = maintain_until(&executor, "restored capacity", |stats| {
+            stats.circuit == EvidenceCircuitState::Closed
+                && stats.workers == 4
+                && stats.workers_healthy == 4
+        })
+        .await;
         assert_eq!(stats.runtime_abandoned_total, 4, "{stats:?}");
         assert_eq!(stats.shutdown_abandoned, 0, "{stats:?}");
         assert_eq!(

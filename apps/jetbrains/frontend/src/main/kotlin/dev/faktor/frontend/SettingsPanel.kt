@@ -22,7 +22,16 @@ import javax.swing.JScrollPane
 import javax.swing.JTextField
 import java.awt.event.ActionListener
 
-class SettingsPanel : JPanel(BorderLayout()) {
+class SettingsPanel(
+    /**
+     * The shared application-settings controller (I08). When present, the
+     * run defaults (provider/model/mutation mode) are loaded from the
+     * application store and every user selection is persisted through it, so
+     * this fallback utility and the platform `FaktorConfigurable` never
+     * diverge. Null (display tests) keeps the selection purely in-panel.
+     */
+    private val settingsController: FaktorSettingsController? = null
+) : JPanel(BorderLayout()) {
 
     interface Listener {
         fun onRefreshProviders()
@@ -93,11 +102,24 @@ class SettingsPanel : JPanel(BorderLayout()) {
 
     private var suppressEvents = false
 
+    /** The persisted run defaults (application scope), when a controller exists. */
+    private var preferredProvider: String? = null
+
+    private var preferredModel: String? = null
+
     init {
-        mutationModel.addElement("default")
+        mutationModel.addElement(FaktorSettingsSnapshot.DEFAULT_MUTATION_MODE)
         mutationModel.addElement("shadow")
+        settingsController?.read()?.let { snapshot ->
+            preferredProvider = snapshot.provider
+            preferredModel = snapshot.model
+            val index = (0 until mutationModel.size)
+                .indexOfFirst { mutationModel.getElementAt(it) == snapshot.mutationMode }
+            if (index >= 0) mutationCombo.selectedIndex = index
+        }
         providerCombo.addActionListener(ActionListener { providerChanged() })
         modelCombo.addActionListener(ActionListener { emitSelection() })
+        mutationCombo.addActionListener(ActionListener { persistRunDefaults() })
         refreshButton.addActionListener { listener?.onRefreshProviders() }
         saveCredentialButton.addActionListener { submitControlPlaneCredential() }
         signOutButton.addActionListener { submitControlPlaneLogout() }
@@ -149,6 +171,8 @@ class SettingsPanel : JPanel(BorderLayout()) {
         for (provider in list) providerModel.addElement(provider.instanceId)
         if (selected != null && list.any { it.instanceId == selected }) {
             providerCombo.selectedItem = selected
+        } else if (preferredProvider != null && list.any { it.instanceId == preferredProvider }) {
+            providerCombo.selectedItem = preferredProvider
         } else if (list.isNotEmpty()) {
             providerCombo.selectedIndex = 0
         }
@@ -196,6 +220,8 @@ class SettingsPanel : JPanel(BorderLayout()) {
         for (provider in frozen.keys) providerModel.addElement(provider)
         if (selected != null && frozen.containsKey(selected)) {
             providerCombo.selectedItem = selected
+        } else if (preferredProvider != null && frozen.containsKey(preferredProvider)) {
+            providerCombo.selectedItem = preferredProvider
         } else if (frozen.isNotEmpty()) {
             providerCombo.selectedIndex = 0
         }
@@ -383,7 +409,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
     private fun refreshModelCombo() {
         val provider = providerCombo.selectedItem as? String
         val models = if (provider == null) emptyList() else modelsByProvider[provider] ?: emptyList()
-        val selected = modelCombo.selectedItem as? String
+        val selected = modelCombo.selectedItem as? String ?: preferredModel
         suppressEvents = true
         modelModel.removeAllElements()
         for (model in models) modelModel.addElement(model)
@@ -401,7 +427,27 @@ class SettingsPanel : JPanel(BorderLayout()) {
         val provider = providerCombo.selectedItem as? String
         val model = modelCombo.selectedItem as? String
         if (provider != null && model != null) {
+            persistRunDefaults()
             listener?.onProviderSelectionChanged(provider, model)
+        }
+    }
+
+    /**
+     * Persist the run defaults through the shared controller (one validated
+     * batch write). A refusal keeps the selection local: the offered values
+     * come from the served registries and stay usable for this session.
+     */
+    private fun persistRunDefaults() {
+        val controller = settingsController ?: return
+        try {
+            controller.applyRunDefaults(
+                providerCombo.selectedItem as? String,
+                modelCombo.selectedItem as? String,
+                mutationCombo.selectedItem as? String
+                    ?: FaktorSettingsSnapshot.DEFAULT_MUTATION_MODE
+            )
+        } catch (e: FaktorSettingsValidationException) {
+            // The in-panel selection stays authoritative for this session.
         }
     }
 
