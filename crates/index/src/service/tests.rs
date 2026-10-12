@@ -2410,6 +2410,187 @@ fn walk_tolerates_directories_vanished_between_batches() {
     .is_err());
 }
 
+/// CI pipeline 48 regression, helper level: the READ bound — not the stat
+/// size — decides. A stream that never reaches EOF (procfs `pagemap`
+/// reports size 0 and streams tens of GiB; a FIFO has the same shape) must
+/// be refused with `None` even though its metadata hint is tiny. Deterministic:
+/// the FIFO write end stays open while the reader works, so EOF never arrives.
+#[cfg(unix)]
+#[test]
+fn read_bounded_caps_a_stream_that_never_eofs() {
+    use std::io::Write as _;
+
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("stream.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success(),
+        "mkfifo {fifo:?}"
+    );
+    let cap: u64 = 512 * 1024;
+    let reader = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || read_bounded(&fifo, cap))
+    };
+    let writer = std::thread::spawn(move || {
+        // The open rendezvous with the reader happens first; a closed/
+        // capped reader surfaces as a broken pipe, which ends the writer.
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        for _ in 0..64 {
+            if writer.write_all(&[b'x'; 32 * 1024]).is_err() {
+                break;
+            }
+        }
+    });
+    let result = reader.join().unwrap();
+    writer.join().unwrap();
+    assert!(
+        result.is_none(),
+        "a non-EOF stream must be refused by the READ bound"
+    );
+}
+
+/// `read_bounded` keeps the historical boundary semantics: a file of
+/// exactly the cap is returned, one byte over is refused, and unreadable
+/// paths degrade to `None` (never a panic, never a partial buffer).
+#[test]
+fn read_bounded_preserves_exact_cap_and_unreadable_semantics() {
+    let dir = TempDir::new().unwrap();
+    let exact = dir.path().join("exact.bin");
+    std::fs::write(&exact, vec![b'a'; 4096]).unwrap();
+    let over = dir.path().join("over.bin");
+    std::fs::write(&over, vec![b'a'; 4097]).unwrap();
+    assert_eq!(read_bounded(&exact, 4096).unwrap().len(), 4096);
+    assert!(read_bounded(&over, 4096).is_none());
+    assert!(read_bounded(&dir.path().join("missing.bin"), 4096).is_none());
+}
+
+/// The exact CI shape: a procfs file (`/proc/kallsyms`) is a regular file
+/// with stat size 0 whose readable stream is far larger than the per-file
+/// cap (the page-table files `pagemap`/`kpageflags` are the unbounded case;
+/// they reject sub-8-byte reads, which the read bound turns into a refusal
+/// too). `read_bounded` must refuse the oversized stream by the READ cap,
+/// and the stream must actually exceed the cap so this test proves the
+/// hazard instead of a short file.
+#[cfg(target_os = "linux")]
+#[test]
+fn procfs_stat_size_zero_streams_are_read_bounded() {
+    use std::io::Read as _;
+
+    let path = Path::new("/proc/kallsyms");
+    let stat_size_zero = fs::metadata(path)
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(false);
+    if !stat_size_zero {
+        eprintln!("/proc/kallsyms unavailable; hazard not exercisable");
+        return;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        eprintln!("/proc/kallsyms unreadable here; hazard not exercisable");
+        return;
+    };
+    let mut probe = Vec::new();
+    let probed = file
+        .take(SCAN_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut probe)
+        .is_ok();
+    if !probed || probe.len() as u64 <= SCAN_MAX_FILE_BYTES {
+        eprintln!("/proc/kallsyms did not stream past the cap; hazard not exercisable");
+        return;
+    }
+    assert!(
+        read_bounded(path, SCAN_MAX_FILE_BYTES).is_none(),
+        "a stat-size-0 procfs stream past the cap must be refused by the read bound"
+    );
+}
+
+/// End-to-end CI-shape regression: a workspace rooted at a procfs directory
+/// contains `/proc/<pid>/pagemap` — a regular file with stat size 0 that
+/// streams the page tables without EOF. The scan must finish with every
+/// batch inside its read caps. Pre-fix this exact walk OOM-killed the
+/// `faktor-cli` test binary (pipeline 48); the RSS watchdog aborts a
+/// regressed run at 2 GiB so the failure is fast and attributed instead of
+/// taking the machine down.
+#[cfg(target_os = "linux")]
+#[test]
+fn procfs_workspace_scan_is_read_bounded_not_oom() {
+    let root = PathBuf::from(format!("/proc/{}", std::process::id()));
+    let pagemap = root.join("pagemap");
+    let Ok(meta) = fs::metadata(&pagemap) else {
+        eprintln!("no /proc/<pid>/pagemap here; hazard not exercisable");
+        return;
+    };
+    if meta.len() != 0 || fs::File::open(&pagemap).is_err() {
+        eprintln!("pagemap is not a stat-size-0 readable regular file; skipped");
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok(statm) = fs::read_to_string("/proc/self/statm") else {
+                    return;
+                };
+                let rss_bytes = statm
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|pages| pages.parse::<u64>().ok())
+                    .map(|pages| pages.saturating_mul(4096))
+                    .unwrap_or(0);
+                if rss_bytes > 2 * 1024 * 1024 * 1024 {
+                    eprintln!(
+                        "[procfs-scan-watchdog] RSS {} MiB while scanning procfs: the read \
+                         bound regressed; aborting before the kernel OOM-kills",
+                        rss_bytes / (1024 * 1024)
+                    );
+                    std::process::abort();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let batch = scan_content_batch(
+        &root,
+        &ScanCursor::default(),
+        &ServiceConfig::default(),
+        None,
+        None,
+    );
+    stop.store(true, Ordering::SeqCst);
+    watchdog.join().unwrap();
+    let batch = batch.expect("a readable procfs root scans");
+    assert!(
+        batch.files_seen > 0,
+        "the procfs walk must observe regular files"
+    );
+    let sizes: Vec<usize> = batch.files.iter().map(|f| f.bytes.len()).collect();
+    assert!(
+        sizes.iter().all(|len| *len as u64 <= SCAN_MAX_FILE_BYTES),
+        "no procfs file may exceed the per-file read cap: {sizes:?}"
+    );
+}
+
+/// Containment teeth: production file content reads in the service module go
+/// through the READ-bounded helper, never `fs::read` (whose buffer growth
+/// trusts the stat size). A reverted call site fails this scan.
+#[test]
+fn content_reads_use_the_read_bound_not_fs_read() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/service/mod.rs"))
+        .unwrap();
+    assert!(src.contains("read_bounded(path, SCAN_MAX_FILE_BYTES)"));
+    assert!(src.contains("read_bounded(path, MAX_GENERATION_FILE_BYTES)"));
+    for banned in ["fs::read(", "std::fs::read("] {
+        assert!(
+            !src.contains(banned),
+            "service file content must be read through read_bounded, not {banned}"
+        );
+    }
+}
+
 /// Audit 5 fixture: a repository larger than the OLD total cap (4,000
 /// files) where the symbol exists only in file 4,500. Batch budgets make
 /// the generation eventually complete, the suffix symbol is found, and

@@ -6642,6 +6642,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // move out of main.rs): the two libc::kill zero-signal probes.
         ("crates/cli/src/main_acp_tests.rs", 1),
         ("crates/cli/src/main_serve_tests.rs", 1),
+        // The CLI bin test target's attributed live-byte memory guard
+        // (CI pipeline 48): the single file-level allow backs the
+        // `GlobalAlloc` wrapper whose allocation-free `libc::write` report
+        // must not recurse through the allocator.
+        ("crates/cli/src/test_memory_guard.rs", 1),
         ("tests/coding-benchmark/src/daemon.rs", 1),
         ("tests/coding-benchmark/src/process.rs", 1),
     ];

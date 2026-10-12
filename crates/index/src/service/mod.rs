@@ -2903,8 +2903,33 @@ fn persisted_generation(workspace: WorkspaceId, generation: i64) -> Result<u64, 
     })
 }
 
+/// Read at most `max_bytes` of `path` with the CAP ENFORCED BY THE READ
+/// ITSELF, never by the metadata hint alone.
+///
+/// `fs::read` preallocates `metadata().len()` and then grows via
+/// `read_to_end`: a regular-looking virtual file whose stat size is a lie
+/// (procfs `/proc/*/pagemap` and `/proc/kpageflags` report size 0 and stream
+/// the kernel page tables forever; a concurrently appended log has the same
+/// shape) therefore streams into RAM until OOM. CI pipeline 48 observed
+/// exactly that: the `faktor-cli` test binary was OOM-killed at ~30 GiB
+/// while `scan_content_batch` indexed a `/`-rooted workspace, with the
+/// allocation stack in `fs::read` inside this module. `None` means
+/// unreadable or larger than the cap; a file of exactly `max_bytes` is
+/// returned (matching the historical `len > cap` skip semantics).
+fn read_bounded(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = fs::File::open(path).ok()?;
+    let hint = fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(hint.min(max_bytes) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
 /// Read + decode a generation file (bounded read: oversized hostile files
-/// are a loud corruption, never a RAM flood).
+/// are a loud corruption, never a RAM flood; the bound is enforced by the
+/// read, not only by the metadata hint, so a stat-size lie cannot flood).
 fn read_generation_file(path: &Path) -> Result<GenerationFile, IndexError> {
     let meta = fs::metadata(path).map_err(|e| IndexError::CorruptGeneration {
         workspace: 0,
@@ -2920,9 +2945,15 @@ fn read_generation_file(path: &Path) -> Result<GenerationFile, IndexError> {
             ),
         });
     }
-    let bytes = fs::read(path).map_err(|e| IndexError::CorruptGeneration {
-        workspace: 0,
-        message: format!("generation file {} unreadable: {e}", path.display()),
+    let bytes = read_bounded(path, MAX_GENERATION_FILE_BYTES).ok_or_else(|| {
+        IndexError::CorruptGeneration {
+            workspace: 0,
+            message: format!(
+                "generation file {} was unreadable or streamed past the \
+                 {MAX_GENERATION_FILE_BYTES} byte cap (read-bounded)",
+                path.display()
+            ),
+        }
     })?;
     GenerationFile::from_bytes(&bytes).map_err(|e| IndexError::CorruptGeneration {
         workspace: 0,
@@ -3393,7 +3424,11 @@ fn scan_content_batch(
         if meta.len() > SCAN_MAX_FILE_BYTES {
             return WalkControl::Continue;
         }
-        let Ok(bytes) = fs::read(path) else {
+        // The metadata check above is only a fast skip: it is a HINT, not a
+        // bound. The read itself is capped (see `read_bounded`), so a file
+        // whose stat size lies — procfs `pagemap`/`kpageflags` report 0 and
+        // stream forever — is skipped instead of growing RAM to OOM.
+        let Some(bytes) = read_bounded(path, SCAN_MAX_FILE_BYTES) else {
             return WalkControl::Continue;
         };
         // Binary sniff: a NUL in the first 8 KiB means not text.
