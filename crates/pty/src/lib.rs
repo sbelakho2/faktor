@@ -67,6 +67,17 @@ pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only extinction ceiling for a killed process group (and for the pid
+/// that leads it). Every wait using it is on the observable condition
+/// (`kill(-pgid, 0)`/`kill(pid, 0)` returning `ESRCH`, zombies included) and
+/// exits the instant it holds. An emulated/VM or containerized runner can
+/// stretch signal delivery and the init/launchd reap of a killed member (a
+/// reparented zombie keeps the group a member) well past a tight pin, so the
+/// ceiling is generous and only bounds a genuinely wedged kill — it never
+/// shortens the extinction proof.
+#[cfg(test)]
+pub(crate) const GROUP_EXTINCTION_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(unix)]
 mod unix;
 

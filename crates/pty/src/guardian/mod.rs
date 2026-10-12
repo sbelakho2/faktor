@@ -1013,7 +1013,7 @@ mod tests {
             "guardian must SIGKILL the group at EOF"
         );
         let _ = child.wait();
-        wait_group_gone(identity.pgid, Duration::from_secs(5));
+        wait_group_gone(identity.pgid, crate::GROUP_EXTINCTION_CEILING);
         let mut status = 0;
         // SAFETY: the pid is this module's own child (or already reaped, reported as ECHILD) and `status` is a live stack local.
         unsafe {
@@ -1043,7 +1043,7 @@ mod tests {
         assert!(group_alive(pid), "the grandchild keeps the group alive");
         let mut guardian = GuardianHandle::spawn(identity).expect("fork guardian");
         assert_eq!(guardian.release(), Some(GUARDIAN_EXIT_KILLED));
-        wait_group_gone(pid, Duration::from_secs(5));
+        wait_group_gone(pid, crate::GROUP_EXTINCTION_CEILING);
     }
 
     #[test]
@@ -1080,7 +1080,7 @@ mod tests {
         // The group might briefly hold a reparented zombie member after its
         // leader is reaped; the bounded wait is the same extinction proof the
         // other guardian tests use.
-        wait_group_gone(identity.pgid, Duration::from_secs(5));
+        wait_group_gone(identity.pgid, crate::GROUP_EXTINCTION_CEILING);
         assert_eq!(
             guardian.release(),
             Some(GUARDIAN_EXIT_NOTHING_TO_DO),
@@ -1255,7 +1255,7 @@ mod tests {
             "the FIFO channel must deliver EOF and kill the group"
         );
         let _ = child.wait();
-        wait_group_gone(identity.pgid, Duration::from_secs(5));
+        wait_group_gone(identity.pgid, crate::GROUP_EXTINCTION_CEILING);
     }
 }
 #[cfg(test)]

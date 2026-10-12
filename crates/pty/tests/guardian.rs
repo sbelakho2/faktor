@@ -152,7 +152,12 @@ fn pid_alive(pid: i32) -> bool {
 
 /// Wait until the process group has NO member left — live or unreaped zombie.
 /// The only observable that authorizes "settled" is `ESRCH`; the bound is an
-/// explicit generous deadline for a wedged guardian, not a sleep to outlast.
+/// explicit generous ceiling for a wedged guardian, never a sleep to
+/// outlast. It is deliberately far above a normal kill latency because an
+/// emulated/VM runner can stretch signal delivery and the init/launchd reap
+/// of a killed member; the wait still exits the instant the group is gone.
+const GROUP_EXTINCTION_CEILING: Duration = Duration::from_secs(60);
+
 fn wait_group_settled(leader: i32, bound: Duration, what: &str) {
     let deadline = Instant::now() + bound;
     while group_alive(leader) {
@@ -258,7 +263,7 @@ fn daemon_crash_kills_the_whole_pty_group_and_leaves_no_zombie() {
     // ESRCH for the whole group (no live and no unreaped member).
     wait_group_settled(
         leader,
-        Duration::from_secs(10),
+        GROUP_EXTINCTION_CEILING,
         "guardian must kill the whole pty group",
     );
     // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
@@ -290,7 +295,7 @@ fn restart_reconciliation_reports_the_lost_terminal_typed_and_never_kills() {
     // reach ESRCH — zombies included — before reconciliation is meaningful.
     wait_group_settled(
         leader,
-        Duration::from_secs(10),
+        GROUP_EXTINCTION_CEILING,
         "guardian settles the group",
     );
     // Restarted daemon: open the same durable ledger and reconcile.
@@ -337,7 +342,7 @@ fn a_healthy_daemon_does_not_trigger_the_guardian() {
     let _ = daemon.wait();
     wait_group_settled(
         leader,
-        Duration::from_secs(10),
+        GROUP_EXTINCTION_CEILING,
         "guardian settles after the crash",
     );
 }
@@ -360,7 +365,7 @@ fn daemon_group_kill_does_not_take_the_guardian_with_it() {
     assert_eq!(status.signal(), Some(libc::SIGKILL));
     wait_group_settled(
         leader,
-        Duration::from_secs(10),
+        GROUP_EXTINCTION_CEILING,
         "the detached guardian must still kill the pty group",
     );
     // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
