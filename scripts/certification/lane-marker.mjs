@@ -34,10 +34,18 @@
 //   printf '%s' "$CMDS" | node scripts/certification/lane-marker.mjs write \
 //     --lane linux --status passed \
 //     [--reason TEXT] [--artifact PATH]... [--optional-artifact PATH]... \
+//     [--flake-file target/certification/flakes/linux.json] \
 //     [--commands TEXT | --commands-file FILE] \
 //     [--out target/certification/lanes/linux.json] [--cwd DIR] \
 //     [--commit SHA] [--tree SHA] [--run-id ID] [--started-at ISO] \
 //     [--finished-at ISO] [--runner-os OS] [--runner-arch ARCH] [--runner-ci CI]
+//
+// `--flake-file` reads the `faktor-flake-tolerance/v1` report the
+// flake-tolerance runner wrote for THIS lane, refuses an inconsistent report
+// (foreign lane, failed/persistent status, count mismatches), attaches the
+// report file as a marker artifact (so its digest is bound) and records the
+// bounded `flakes` summary inside the marker: the flake list is visible in
+// the certification artifact and covered by the marker HMAC.
 
 import { createHash, createHmac } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -243,12 +251,58 @@ function readStdin() {
 function usage() {
   console.error(`usage: lane-marker.mjs write --lane ID [--status passed|failed|skipped] \\
   [--reason TEXT] [--artifact PATH]... [--optional-artifact PATH]... \\
+  [--flake-file target/certification/flakes/ID.json] \\
   [--commands TEXT | --commands-file FILE] [--out FILE] [--cwd DIR] \\
   [--commit SHA] [--tree SHA] [--run-id ID] [--started-at ISO] [--finished-at ISO] \\
   [--runner-os OS] [--runner-arch ARCH] [--runner-ci CI]
 
 Commands default to stdin (pipe the lane's CMDS heredoc into write).
 Token: lane's own CI secret env (faktor_lane_token_<lane>, uppercase accepted).`);
+}
+
+/**
+ * Read + validate the flake-tolerance report for THIS lane and turn it into
+ * the bounded marker summary. A report that cannot certify the lane (foreign
+ * lane, persistent failures, budget breach, count mismatch) is refused loud:
+ * tolerance is only ever recorded for the exact lane that earned it.
+ */
+export function flakeSummary(report, lane, file) {
+  const fail = (message) => {
+    throw new Error(`--flake-file ${file}: ${message}`);
+  };
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    fail('not a JSON object');
+  }
+  if (report.schema !== 'faktor-flake-tolerance/v1') {
+    fail(`schema '${report.schema}' is not faktor-flake-tolerance/v1`);
+  }
+  if (report.lane !== lane) {
+    fail(`report lane '${report.lane}' is not '${lane}'`);
+  }
+  const status = String(report.status);
+  if (!['clean', 'passed_with_flakes'].includes(status)) {
+    fail(`status '${status}' cannot certify a passed lane`);
+  }
+  const flakes = Array.isArray(report.flakes) ? report.flakes : fail('flakes is not an array');
+  const tests = flakes.map((flake) => {
+    if (!flake || typeof flake.test !== 'string' || flake.test.length === 0) {
+      fail('flake entry without a test name');
+    }
+    if (flake.isolated_result !== 'passed' || flake.isolation_attempts !== 1) {
+      fail(`flake '${flake.test}' is not a once-retried isolated pass`);
+    }
+    return flake.test;
+  });
+  if (status === 'clean' && tests.length !== 0) {
+    fail('clean report carries flakes');
+  }
+  if (status === 'passed_with_flakes' && tests.length === 0) {
+    fail('passed_with_flakes report carries no flakes');
+  }
+  if (Array.isArray(report.persistent_failures) && report.persistent_failures.length > 0) {
+    fail('report carries persistent failures and cannot certify a passed lane');
+  }
+  return { schema: report.schema, status, count: tests.length, tests, report: file };
 }
 
 export function generateMarker(options) {
@@ -265,6 +319,7 @@ export function generateMarker(options) {
     finishedAt,
     runner,
     token = '',
+    flakes = null,
   } = options;
   if (!lane || typeof lane !== 'string') {
     throw new Error('--lane is required');
@@ -280,6 +335,9 @@ export function generateMarker(options) {
     lane,
     status,
     ...(reasonProvided ? { reason } : {}),
+    // Recorded flake tolerance (bounded summary of the runner's report);
+    // absent unless the lane passed `--flake-file`.
+    ...(flakes ? { flakes } : {}),
     commit,
     tree,
     runner,
@@ -331,6 +389,21 @@ function writeCommand(args) {
       artifacts.push({ path, sha256: hashFile(full) });
     }
   }
+  let flakes = null;
+  const flakeFile = flagValue(args, '--flake-file');
+  if (flakeFile) {
+    const full = resolve(cwd, flakeFile);
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(full, 'utf8'));
+    } catch (error) {
+      throw new Error(`--flake-file ${flakeFile}: ${error.message}`);
+    }
+    flakes = flakeSummary(parsed, lane, flakeFile);
+    if (!artifacts.some((artifact) => artifact.path === flakeFile)) {
+      artifacts.push({ path: flakeFile, sha256: hashFile(full) });
+    }
+  }
   let commit = flagValue(args, '--commit') || process.env.CI_COMMIT_SHA || '';
   if (!commit) {
     commit = git(['rev-parse', 'HEAD'], cwd);
@@ -362,6 +435,7 @@ function writeCommand(args) {
     },
     clean: workingTreeClean(cwd),
     token: laneTokenFromEnv(lane),
+    flakes,
   });
   const out = resolve(cwd, flagValue(args, '--out', `target/certification/lanes/${lane}.json`));
   mkdirSync(dirname(out), { recursive: true });

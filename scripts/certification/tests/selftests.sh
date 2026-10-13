@@ -28,6 +28,12 @@
 #   scripts/certification/soak-convergence.py selftest
 #                                           soak convergence metric algebra
 #                                           (converged/leaky/missing/duration)
+#   scripts/certification/flake-tolerance.py selftest
+#                                           bounded retry-once semantics for the
+#                                           trusted linux test lane: flaky pass
+#                                           recorded, persistent failure red,
+#                                           budget/unverified-pass/no-retry
+#                                           refusals (fault/soak/live/perf)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -56,6 +62,7 @@ run "check-gradle-integrity.sh --selftest" bash scripts/check-gradle-integrity.s
 run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --selftest
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
 run "soak-convergence.py selftest" python3 scripts/certification/soak-convergence.py selftest
+run "flake-tolerance.py selftest" python3 scripts/certification/flake-tolerance.py selftest
 
 printf '\n=====================\n'
 if [ "$failures" -eq 0 ]; then
