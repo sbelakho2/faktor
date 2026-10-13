@@ -944,17 +944,7 @@ function genKotlin(schema) {
   out.push('    return ProtocolErrorEnvelope(code, message, retryable)');
   out.push('}');
   out.push('');
-  const text = out.join('\n');
-  // The pinned CI image compiles this file with apt-kotlinc 1.3.31, which has
-  // no trailing-comma support (a Kotlin 1.4 feature). Refuse to emit a file
-  // the CI lane cannot compile instead of discovering it in the lane.
-  const trailing = text.match(/,\s*\)/g);
-  if (trailing !== null) {
-    throw new Error(
-      `genKotlin: refusing to emit ${trailing.length} trailing comma(s) before ')': kotlinc 1.3.31 in the pinned CI image rejects them`,
-    );
-  }
-  return text;
+  return out.join('\n');
 }
 
 // ------------------------------------------------------- native inventory

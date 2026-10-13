@@ -208,7 +208,7 @@ steps:
   # Dockerfile against the running image and that apt points at the fixed
   # snapshot only (scripts/build-ci-image.sh --verify-runtime).
   - name: ci-image
-    image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:2c972ad0f7dc6d85ab138da184262a85e6c9f839aec90659e03e5e30bafbc333 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
     pull: false
     when:
       matrix:
@@ -540,7 +540,7 @@ steps:
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
     # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
     # that the pinned Gradle wrapper (9.7.1) requires.
-    image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:2c972ad0f7dc6d85ab138da184262a85e6c9f839aec90659e03e5e30bafbc333 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
     depends_on: [ci-image]
     when:
@@ -586,7 +586,7 @@ steps:
           --optional-artifact "$artifact_path" \
           --out target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
-    image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:2c972ad0f7dc6d85ab138da184262a85e6c9f839aec90659e03e5e30bafbc333 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
     # `jetbrains-build` produces the plugin ZIP this lane proves: the host
     # matrix runs against the BUILT ZIP (never source classes), so the ZIP is
@@ -603,10 +603,10 @@ steps:
       - faktor-trusted-cargo-git:/usr/local/cargo/git
     commands:
       # No apt: the digest-pinned Faktor CI image already carries the pinned
-      # toolchain (kotlin, openjdk-11-jre-headless, openjdk-17-jdk-headless,
-      # git, build-essential, curl, pkg-config, libssl-dev). The `ci-image`
-      # pre-step fails the pipeline closed when the image was not
-      # produced/pulled.
+      # toolchain (standalone kotlinc 2.4.20 matching the Gradle Kotlin plugin,
+      # openjdk-17-jdk-headless, git, build-essential, curl, pkg-config,
+      # libssl-dev). The `ci-image` pre-step fails the pipeline closed when
+      # the image was not produced/pulled.
       - |
         set -eu
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init

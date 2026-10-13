@@ -1098,6 +1098,10 @@ object JetBrainsParitySmoke {
                     chat.permissionsView().unitLabel(0).contains("capability=shell"),
                     chat.permissionsView().unitLabel(0)
                 )
+                // The reply action is a click on the card's control: await
+                // its enablement (the same EDT render that painted the row)
+                // so the driven click can never race a disabled button.
+                await("the deny control is live") { chat.permissionsView().denyEnabled() }
                 chat.permissionsView().submitReply("deny")
                 await("permission reply routed") {
                     daemon.requestCount("POST", "/native/permission/reply") >= 1
@@ -1114,7 +1118,12 @@ object JetBrainsParitySmoke {
                 }
                 // Typed 409 conflict (unknown/expired/already resolved) is
                 // surfaced as an explicit panel state (naming the exact id),
-                // never retried.
+                // never retried. Await the control the same release re-render
+                // re-enables before clicking it (a click on a still-disabled
+                // button is a silent no-op by construction).
+                await("the allow control is live after the gate release") {
+                    chat.permissionsView().allowEnabled()
+                }
                 chat.permissionsView().submitReply("allow")
                 await("typed conflict surfaced") {
                     chat.permissionsView().refusalText()?.contains("409 conflict") == true
@@ -1135,7 +1144,11 @@ object JetBrainsParitySmoke {
                 await("permission reply gate released after the conflict") {
                     !chat.permissionsView().isReplyPendingForTest("7")
                 }
-                // Typed 409 permission_session_mismatch is surfaced too.
+                // Typed 409 permission_session_mismatch is surfaced too; the
+                // clicked control must be live again before the click.
+                await("the deny control is live after the gate release") {
+                    chat.permissionsView().denyEnabled()
+                }
                 chat.permissionsView().submitReply("deny")
                 await("typed session mismatch surfaced") {
                     chat.permissionsView().refusalText()
@@ -1514,7 +1527,10 @@ object JetBrainsParitySmoke {
                 await("the served change facts are current") {
                     chat.changesView().currentModel()?.basis?.sourceDiffEvidenceRaw == "evidence:41"
                 }
-                assertTrue(view.openEnabled(), "the open control must be live")
+                // The open control derives from the same refreshed model the
+                // await above observed: wait for its enablement on the render
+                // thread instead of asserting it in the same tick.
+                await("the open control must be live") { view.openEnabled() }
                 view.clickOpen()
                 val openDeadline = System.currentTimeMillis() + 10_000L
                 while (System.currentTimeMillis() < openDeadline &&

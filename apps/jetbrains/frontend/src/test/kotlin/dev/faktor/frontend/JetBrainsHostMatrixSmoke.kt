@@ -1662,6 +1662,10 @@ object JetBrainsHostMatrixSmoke {
         var nonCorner = 0
         var sampled = 0
         var y = 0
+        // 8px probe grid: a 16px grid under-counts sparse, flat-painted rows
+        // (Metal renders the utilities toolbar as text + flat fills that a
+        // 16px grid mostly steps over), reading a fully painted frame as
+        // degenerate; a truly blank frame still yields 1-2 colors at 8px.
         while (y < height) {
             var x = 0
             while (x < width) {
@@ -1669,9 +1673,9 @@ object JetBrainsHostMatrixSmoke {
                 distinct[rgb] = true
                 sampled++
                 if (rgb != corner) nonCorner++
-                x += 16
+                x += 8
             }
-            y += 16
+            y += 8
         }
         val permille = if (sampled == 0) 0 else nonCorner * 1000 / sampled
         return RenderStats(width, height, distinct.size, permille)

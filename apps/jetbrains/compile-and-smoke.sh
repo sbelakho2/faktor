@@ -22,6 +22,10 @@
 #   ./gradlew :backend:smoke :frontend:smoke -PfaktorCliBin=<bin>
 #   ./gradlew :frontend:smokeHostMatrixZip          # ZIP-hosted proof
 # CI images that ship kotlinc keep the self-contained, network-free path.
+# The compiler there is the standalone kotlinc pinned to the Gradle Kotlin
+# plugin version (docker/faktor-ci/Dockerfile), matching what `./gradlew`
+# compiles; the sources use Kotlin 1.5+ stdlib calls (`String.lowercase`,
+# `Char.code`), so the old apt kotlin 1.3.31 package cannot compile them.
 #
 # Toolchain heaps are BOUNDED and explicit (the jetbrains-smoke run-66 OOM
 # class: under concurrent lane pressure the stock kotlinc launcher default
@@ -221,8 +225,9 @@ fi
 # ---- 3. kotlin-stdlib.jar (bundled with the compiler distribution) ---------
 # The test file is dependency-free (plain check/require, no kotlin.test),
 # so only the stdlib is needed on the compile classpath. Both homebrew
-# (opt/kotlin/libexec/lib) and the Ubuntu apt package
-# (/usr/share/java, /usr/share/kotlin/kotlinc/lib) ship it next to kotlinc.
+# (opt/kotlin/libexec/lib) and distribution layouts
+# (/opt/kotlinc/lib in the CI image; /usr/share/kotlin/kotlinc/lib,
+# /usr/lib/kotlin/kotlinc/lib on dev hosts) ship it next to kotlinc.
 resolve_symlink() {
   local p="$1"
   while [ -L "$p" ]; do
@@ -262,50 +267,7 @@ if [ -z "$STDLIB_JAR" ]; then
 fi
 echo "[compile-and-smoke] kotlin-stdlib.jar: $STDLIB_JAR"
 
-# ---- 4. JDK fallback for old apt kotlinc -----------------------------------
-# kotlinc 1.3.31 (Ubuntu apt) cannot read class files from JDK >= 16. When
-# the plain compile fails and an older JDK (<= 12) is installed, retry the
-# compiler on it. The compiled jar targets 1.8 and still runs on any JVM.
-jdk_major() {
-  local v
-  v="$("$1/bin/java" -version 2>&1 | head -1)"
-  v="${v#*\"}"
-  v="${v%%\"*}"
-  case "$v" in
-    1.*) v="${v#1.}" ;;
-  esac
-  v="${v%%.*}"
-  echo "$v"
-}
-
-newest_jdk_at_most() {
-  local limit="$1" best="" d v
-  for d in /usr/lib/jvm/*/; do
-    [ -x "$d/bin/java" ] || continue
-    v="$(jdk_major "$d")"
-    case "$v" in
-      '' | *[!0-9]*) continue ;;
-    esac
-    if [ "$v" -le "$limit" ] && { [ -z "$best" ] || [ "$v" -gt "$(jdk_major "$best")" ]; }; then
-      best="$d"
-    fi
-  done
-  echo "$best"
-}
-
-OLD_JDK="$(newest_jdk_at_most 12)"
-
-kotlinc_cmd() {
-  local jdk="$1"
-  shift
-  if [ -n "$jdk" ]; then
-    JAVA_OPTS="$KOTLINC_JAVA_OPTS" JAVA_HOME="$jdk" PATH="$jdk/bin:$PATH" "$KOTLINC" "$@"
-  else
-    JAVA_OPTS="$KOTLINC_JAVA_OPTS" "$KOTLINC" "$@"
-  fi
-}
-
-# ---- 5. compile -------------------------------------------------------------
+# ---- 4. compile -------------------------------------------------------------
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/faktor-jb-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SMOKE_JAR="$WORK/smoke.jar"
@@ -316,15 +278,9 @@ KOTLINC_LOG="$WORK/kotlinc.log"
 # classified typed with its diagnostics (see report_toolchain_failure).
 compile_kotlin() {
   local out rc
-  out="$(kotlinc_cmd "" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
+  out="$(JAVA_OPTS="$KOTLINC_JAVA_OPTS" "$KOTLINC" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
     $SHARED_SRC $BACKEND_SRC $TEST_SRC $FRONTEND_SRC 2>&1)"
   rc=$?
-  if [ $rc -ne 0 ] && [ -n "$OLD_JDK" ]; then
-    echo "[compile-and-smoke] plain kotlinc failed; retrying with $OLD_JDK" >&2
-    out="$(kotlinc_cmd "$OLD_JDK" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
-      $SHARED_SRC $BACKEND_SRC $TEST_SRC $FRONTEND_SRC 2>&1)"
-    rc=$?
-  fi
   printf '%s\n' "$out" >"$KOTLINC_LOG"
   return $rc
 }
@@ -337,7 +293,7 @@ if [ "$COMPILE_RC" -ne 0 ]; then
   exit 1
 fi
 
-# ---- 6. smokes against the real daemon --------------------------------------
+# ---- 5. smokes against the real daemon --------------------------------------
 # The smokes start the real daemon (daemon logs ride the Java process stderr).
 # Capture that stderr so a failure prints a bounded daemon-log tail instead of
 # only the Java-side message — a timed-out request is usually daemon-side.
@@ -368,7 +324,7 @@ run_smoke ControlPlaneCredentialSmoke dev.faktor.frontend.ControlPlaneCredential
 echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
 run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke || exit $?
 
-# ---- 7. host matrix: the BUILT plugin ZIP ----------------------------------
+# ---- 6. host matrix: the BUILT plugin ZIP ----------------------------------
 # Extracts the built plugin ZIP and runs the host matrix with the ZIP's
 # `faktor/lib/*.jar` FIRST on the classpath, so the panel classes under test
 # are the shipped ones (the smoke asserts the class provenance). The trusted

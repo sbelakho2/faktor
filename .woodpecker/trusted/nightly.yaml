@@ -444,7 +444,7 @@ steps:
     # (JDK 17 + kotlinc + git). pull:false: the image is produced by
     # scripts/build-ci-image.sh and recorded in docker/faktor-ci/image-digest.txt;
     # the trusted ci-image pre-step fails closed when it is absent.
-    image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:2c972ad0f7dc6d85ab138da184262a85e6c9f839aec90659e03e5e30bafbc333 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
     pull: false
     environment:
       RUST_BACKTRACE: "1"
