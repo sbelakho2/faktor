@@ -407,8 +407,11 @@ impl ConvergenceEmitter {
     }
 
     /// [`Self::gauge`] with the `quiescent` marker: the checker requires
-    /// EVERY post-settle marked sample to be zero (the convergence
-    /// invariant), while unmarked churn samples are allowed to be busy.
+    /// EVERY marked sample to be zero (the convergence invariant), while
+    /// unmarked churn samples are allowed to be busy. Marked samples are
+    /// only emitted while the drain condition is actually OBSERVED zero
+    /// (see the observable quiescence wait in [`soak_convergence_churn`]),
+    /// so the marker is evidence, never a claim.
     #[allow(clippy::too_many_arguments)] // one flat metric row; a param struct would hide the wire shape
     fn gauge_marked(
         &mut self,
@@ -466,7 +469,8 @@ fn push_bounded(window: &mut std::collections::VecDeque<u128>, value: u128) {
 /// (persistent sampled data dir) and `FAKTOR_SOAK_METRICS_FILE` (the runtime
 /// gauge stream). The paced rate keeps durable growth linear and bounded
 /// while still exercising WAL, journal and CAS churn; a successful run ends
-/// quiescent (no active turns, no running tools, empty writer queue).
+/// quiescent (drain to zero OBSERVED, then held stable for a window derived
+/// from this run's own measured turn cost — see the quiescence wait below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "[soak] convergence churn (driver-targeted real wall clock) — run via scripts/soak.sh"]
 async fn soak_convergence_churn() {
@@ -567,6 +571,12 @@ async fn soak_convergence_churn() {
     let mut last_reconnect = std::time::Instant::now();
     let mut journal_window: std::collections::VecDeque<u128> = std::collections::VecDeque::new();
     let mut index_window: std::collections::VecDeque<u128> = std::collections::VecDeque::new();
+    // Same-run control for the quiescence wait below: the p95 cost of a whole
+    // churn turn in THIS run (runtime turn + the durable reads the workload
+    // repeats), the workload shape whose residual writer work the final drain
+    // must retire. A loaded/emulated runner stretches this measurement with
+    // the run, so the derived wait windows scale with it.
+    let mut turn_window: std::collections::VecDeque<u128> = std::collections::VecDeque::new();
 
     // One real restart/reconnect before the first gauge so even a short run
     // records a reconnect event (the checker requires at least one).
@@ -585,6 +595,7 @@ async fn soak_convergence_churn() {
     }
 
     while started.elapsed() < target {
+        let turn_started = std::time::Instant::now();
         let agent = agent_for(manager.clone(), true, 1.0);
         let outcome = agent
             .run_turn(session_id, &format!("convergence turn {turns}"), &[])
@@ -607,6 +618,8 @@ async fn soak_convergence_churn() {
             let _ = handle.messages_page(None, 50).unwrap();
             push_bounded(&mut index_window, index_start.elapsed().as_micros());
         }
+        // Observed cost of the complete turn unit this run actually sustained.
+        push_bounded(&mut turn_window, turn_started.elapsed().as_millis().max(1));
 
         tokio::time::sleep(pace).await;
 
@@ -668,46 +681,98 @@ async fn soak_convergence_churn() {
     }
 
     // Quiescent convergence: background work must settle and the writer
-    // queue must drain to zero after the churn stops. The settled gauges are
-    // marked `quiescent`; the checker requires EVERY marked sample to be
-    // zero (the convergence invariant) and ignores busy churn samples, so a
-    // loaded host cannot present a mid-churn queue depth as non-convergence.
-    let mut settled = false;
-    for _ in 0..60 {
+    // queue must drain to zero after the churn stops. The drain is an
+    // OBSERVABLE condition, so it is waited for, never judged by a fixed
+    // wall window: an emulated/loaded runner stretches every turn, and a
+    // constant settle window misreads a slow-but-draining writer queue as
+    // non-convergence (run 67: the fixed 30 s window expired with the queue
+    // at depth 1 after a 1690 s campaign).
+    //
+    //   * CONTROL (same run): the p95 churn-turn cost measured above — the
+    //     cost unit whose residual work the drain must retire.
+    //   * OBSERVATION: poll until active turns, running tool rows and the
+    //     writer pending depth are ALL zero, then require them to stay zero
+    //     for a documented stable window of 10 x control, clamped to
+    //     [2 s, 60 s]. Marked `quiescent` gauges carry the observed values,
+    //     so the checker's every-marked-sample-zero rule keeps its teeth.
+    //   * TEETH: the whole wait is capped at 60 x control, clamped to
+    //     [120 s, 900 s]; a genuinely non-draining queue never reaches the
+    //     stable window and fails loudly with the last observed state, and
+    //     the quiesce property is asserted exactly (== 0) where observed.
+    let control_ms = bounded_p95(&turn_window).max(1);
+    let stable_ms = control_ms.saturating_mul(10).clamp(2_000, 60_000);
+    let settle_cap_ms = control_ms.saturating_mul(60).clamp(120_000, 900_000);
+    let poll_ms = (control_ms / 2).clamp(250, 2_000);
+    let deadline = std::time::Instant::now() + Duration::from_millis(settle_cap_ms);
+    let mut zero_since: Option<std::time::Instant> = None;
+    let mut last_mark: Option<std::time::Instant> = None;
+    loop {
+        let now = std::time::Instant::now();
+        let pending = manager.store().writer_telemetry().pending_depth;
         let active = manager.store().all_active_turns().unwrap().len();
         let tools = manager.store().all_running_tool_rows().unwrap().len();
-        if active == 0 && tools == 0 {
-            settled = true;
-            break;
+        if pending == 0 && active == 0 && tools == 0 {
+            let since = *zero_since.get_or_insert(now);
+            if last_mark.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)) {
+                emitter.gauge_marked(
+                    turns,
+                    pending as u64,
+                    active as u64,
+                    tools as u64,
+                    bounded_p95(&journal_window),
+                    bounded_p95(&index_window),
+                    true,
+                );
+                last_mark = Some(now);
+            }
+            if now.duration_since(since) >= Duration::from_millis(stable_ms) {
+                break;
+            }
+        } else {
+            zero_since = None;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    assert!(settled, "background tasks did not settle before quiescence");
-    assert_eq!(
-        manager.store().writer_telemetry().pending_depth,
-        0,
-        "writer queue must quiesce to zero"
-    );
-    // Three consecutive marked samples during the quiet window: the checker
-    // gets a real quiescent tail to evaluate (never a single lucky sample).
-    for _ in 0..3 {
-        emitter.gauge_marked(
-            turns,
-            0,
-            0,
-            0,
-            bounded_p95(&journal_window),
-            bounded_p95(&index_window),
-            true,
+        assert!(
+            now < deadline,
+            "writer queue did not quiesce to zero within {settle_cap_ms} ms \
+             (control={control_ms} ms turn p95, stable window={stable_ms} ms): \
+             active_turns={active} running_tools={tools} pending_depth={pending}"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
+    // The quiesce property, asserted exactly where it was observed.
+    let pending = manager.store().writer_telemetry().pending_depth;
+    let active = manager.store().all_active_turns().unwrap().len();
+    let tools = manager.store().all_running_tool_rows().unwrap().len();
+    assert_eq!(
+        pending, 0,
+        "writer queue must quiesce to zero (observed drain + stable window)"
+    );
+    assert_eq!(
+        active, 0,
+        "no active turns may remain after quiescence was observed"
+    );
+    assert_eq!(
+        tools, 0,
+        "no running tool rows may remain after quiescence was observed"
+    );
+    emitter.gauge_marked(
+        turns,
+        0,
+        0,
+        0,
+        bounded_p95(&journal_window),
+        bounded_p95(&index_window),
+        true,
+    );
     drop(manager);
     // A quiet window lets the driver's bounded samplers capture the
-    // post-quiescence process/data-dir state before this process exits.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // post-quiescence process/data-dir state before this process exits. It
+    // scales with the same-run control (an emulated runner's sampler ticks
+    // are slower too) and stays bounded.
+    let quiet_ms = control_ms.saturating_mul(4).clamp(3_000, 20_000);
+    tokio::time::sleep(Duration::from_millis(quiet_ms)).await;
     eprintln!(
-        "soak convergence churn: target={target_seconds}s elapsed={:.1}s turns={turns} reconnects={reconnects}",
+        "soak convergence churn: target={target_seconds}s elapsed={:.1}s turns={turns} reconnects={reconnects} control_ms={control_ms} stable_ms={stable_ms} settle_cap_ms={settle_cap_ms} quiet_ms={quiet_ms}",
         started.elapsed().as_secs_f64()
     );
 }

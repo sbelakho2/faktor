@@ -365,6 +365,16 @@ and are never fabricated locally.
   `FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 bash apps/jetbrains/compile-and-smoke.sh`
   (typed failure on a missing ZIP); the Gradle equivalents are
   `./gradlew :frontend:smokeHostMatrixZip` / `./gradlew smokeHostMatrixZip`.
+  Toolchain heaps are bounded and documented (the jetbrains-smoke run-66
+  `OutOfMemoryError` class under concurrent lane pressure): kotlinc runs
+  with `JAVA_OPTS=-Xmx2g -Xms256m` (`FAKTOR_JETBRAINS_KOTLINC_JAVA_OPTS`
+  overrides) instead of the launcher's stock `-Xmx512M`, and
+  `gradle.properties` pins `kotlin.daemon.jvmargs=-Xmx2g` beside the
+  existing `org.gradle.jvmargs=-Xmx3g`. An OOM/heap-exhaustion failure in
+  kotlinc, Gradle, a smoke JVM or the host matrix is classified as a TYPED
+  `environment-resource:` failure (JVM OOM marker or signal-kill rc) with
+  the captured diagnostics tail — still a hard lane failure, never a
+  silent crash or a pass.
 
 100% requires the builds and smokes green **and the derived capability
 manifest labels honest**. It does not require byte-for-byte parity where
@@ -1192,7 +1202,15 @@ fails with `unassigned`; an unconventional tag fails with
     `child_processes_zero` (0 descendants; 0 pgid orphans),
     `background_tasks_settled` / `writer_queue_zero` / `reader_queue_zero`
     (every post-settle `quiescent` gauge is 0; a stream without quiescent
-    markers checks its final gauge instead of a mid-churn window),
+    markers checks its final gauge instead of a mid-churn window; the
+    workload marks a sample only while the drain to zero is OBSERVED, so
+    the marker is evidence, never a claim. The workload's own quiescence
+    wait is an observable condition with a same-run control — drain to zero
+    held for 10 × the run's p95 churn-turn cost clamped to [2 s, 60 s], the
+    whole wait capped at 60 × that cost clamped to [120 s, 900 s] — so an
+    emulated/loaded runner cannot present a slow-but-draining writer queue
+    as non-convergence while a genuinely non-draining queue still fails at
+    the cap with the last observed state),
     `wal_converged` (last-window growth ≤ 4 MiB and size
     ≤ 64 MiB), `temp_files_removed` (= 0),
     `cas_unreachable_stable` (≤ first window + 8 blobs and not monotonically
@@ -1235,7 +1253,9 @@ fails with `unassigned`; an unconventional tag fails with
     other fixed wall-clock budgets were reviewed for the same class: the
     per-invocation test timeout (scaled as above), the sampler duration
     bound (now monotonic, capped by the documented ceiling), and the
-    sampler SIGTERM/`wait` shutdown (bounded cleanup, left fixed); the
+    sampler SIGTERM/`wait` shutdown (30 s × the run's measured load factor
+    with the KILL fallback for a genuinely wedged sampler — the final
+    quiescent sample and final scan are written on SIGTERM); the
     nightly *realtime* lane inherits the derivation but its Woodpecker
     pipeline timeout (25 h per `setup.md §6`) is intentionally NOT raised
     here — an operator raising the cap above it must raise the pipeline

@@ -744,11 +744,18 @@ run_campaign() {
 
   # ------------------------------------------------- convergence evaluation
   # The sampler is stopped FIRST so its final quiescent sample + final scan
-  # land on disk before the checker reads them.
+  # land on disk before the checker reads them. The stop wait is the last
+  # fixed quiesce window in the driver: a single sampler tick (process tree +
+  # data-dir walk + read-only store scan) is stretched by the same load factor
+  # as the campaign, so the wait scales with the run's measured factor
+  # (WALL_BUDGET_FACTOR, itself bounded by FAKTOR_SOAK_MAX_WALL_FACTOR) and
+  # keeps the KILL fallback for a genuinely wedged sampler.
   if [ -n "$sampler_pid" ]; then
     kill -TERM "$sampler_pid" 2>/dev/null || true
     local waited=0
-    while kill -0 "$sampler_pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    local sampler_stop_cap=$((30 * ${WALL_BUDGET_FACTOR:-1}))
+    [ "$sampler_stop_cap" -ge 30 ] || sampler_stop_cap=30
+    while kill -0 "$sampler_pid" 2>/dev/null && [ "$waited" -lt "$sampler_stop_cap" ]; do
       sleep 1
       waited=$((waited + 1))
     done
