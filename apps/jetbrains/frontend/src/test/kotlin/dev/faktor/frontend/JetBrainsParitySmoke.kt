@@ -1319,6 +1319,17 @@ object JetBrainsParitySmoke {
                 )
                 assertEquals(1, chat.attachmentsView().binaryCount())
                 val runsBeforeClipboard = daemon.requestCount("POST", "/native/session/7/task-runs")
+                // The document await above proves the request reached the
+                // DAEMON; the panel's single-flight gate is released later,
+                // when the start completes on its worker, and a submit that
+                // lands inside that window is ignored BY DESIGN (a genuinely
+                // stuck start must still fail). Await the completion
+                // transition the row depends on (this start's success line,
+                // the same transition `taskStartSuccessStep` counts) so the
+                // clipboard submit can never be dropped.
+                await("the document start completes before the clipboard submit") {
+                    countOccurrences(chat.transcriptTextForTest(), "run-9 started") == 2
+                }
                 chat.submitTaskForTest()
                 await("clipboard PNG upload routed") {
                     attachmentBodies(daemon).any { it.contains("\"mime\":\"image/png\"") } &&
@@ -1348,6 +1359,15 @@ object JetBrainsParitySmoke {
                 chat.attachmentsView().addFiles(listOf(oversize.toString()))
                 val uploadsBeforeRefusal = attachmentBodies(daemon).size
                 val runsBeforeRefusal = daemon.requestCount("POST", "/native/session/7/task-runs")
+                // Same single-flight ordering as above: the clipboard await
+                // observes only the DAEMON boundary, so the clipboard start
+                // may still be settling when the oversized submit is driven.
+                // Await its completion transition first; the refusal below
+                // must come from an ACCEPTED submit, never from one the
+                // panel dropped in flight.
+                await("the clipboard start completes before the oversized submit") {
+                    countOccurrences(chat.transcriptTextForTest(), "run-9 started") == 3
+                }
                 chat.submitTaskForTest()
                 await("typed oversized document refusal surfaces") {
                     chat.transcriptTextForTest().contains("per-document bound")
@@ -1509,6 +1529,14 @@ object JetBrainsParitySmoke {
                 await("session 7 reopened for the change review") {
                     service.currentSessionId() == "7"
                 }
+                // The reopen job keeps refreshing panels on the SINGLE worker
+                // after the session id flips, and the open click below queues
+                // FIFO behind that tail; under load the tail can outlast the
+                // row's open window. Settle one full refresh cycle through the
+                // existing worker seam (it drains the queue and flushes the
+                // EDT), so the click's open job runs immediately. A wedged
+                // refresh still fails the row via the settle itself.
+                assertTrue(chat.refreshNowForTest(), "the reopen refresh must settle")
                 await("the served change row lands") {
                     chat.changesView().rowCount() == 1
                 }
