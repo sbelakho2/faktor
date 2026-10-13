@@ -1329,8 +1329,7 @@ internal object ParityMatrix {
 }
 
 /** The fake-daemon row driver: the suite submits one check per surface.
- * A function type (not `fun interface`) so the pinned kotlinc 1.3.31 in the
- * hermetic CI image can compile it. */
+ * A function type keeps the driver a plain callable with no nominal type. */
 internal typealias ParityFakeDriver = (surface: String, observable: String, body: () -> Unit) -> Unit
 
 /**

@@ -29,9 +29,10 @@
 #
 # --verify-runtime runs INSIDE a built Faktor CI image (no docker needed): it
 # checks the platform, that every exact `pkg=version` pin in the Dockerfile is
-# satisfied by the running image, that the pinned tools (including git and the
-# JDK 17 javac the JetBrains lanes need) are on PATH and that apt is pointed
-# at the fixed snapshot only. This is the required CI pre-step's check.
+# satisfied by the running image, that the pinned tools (including git, the
+# JDK 17 javac the JetBrains lanes need, and the standalone kotlinc at the
+# pinned Kotlin version) are on PATH and that apt is pointed at the fixed
+# snapshot only. This is the required CI pre-step's check.
 #
 # Exit codes: 0 built (or selftest/verify-runtime passed); 2 usage error;
 # other = docker failure or verification failure.
@@ -122,7 +123,7 @@ verify_runtime() {
             rc=1
         }
     done
-    specs="$(grep -oE '[a-z0-9][a-z0-9+.-]*=[0-9][^ \;]*' "$DOCKERFILE" | sort -u || true)"
+    specs="$(grep -vE '^[[:space:]]*ARG[[:space:]]' "$DOCKERFILE" | grep -oE '[a-z0-9][a-z0-9+.-]*=[0-9][^ \;]*' | sort -u || true)"
     if [ -z "$specs" ]; then
         echo "build-ci-image verify-runtime: FAIL: no exact pkg=version pins found in $DOCKERFILE" >&2
         rc=1
@@ -136,6 +137,19 @@ verify_runtime() {
             rc=1
         fi
     done
+    # The standalone kotlinc is a SHA-256-verified release download (not an
+    # apt package), so re-assert its pinned version explicitly.
+    want_kotlinc="$(sed -n 's/^ARG KOTLINC_VERSION=\([0-9][0-9.]*\)$/\1/p' "$DOCKERFILE" | head -n 1)"
+    if [ -z "$want_kotlinc" ]; then
+        echo "build-ci-image verify-runtime: FAIL: no ARG KOTLINC_VERSION pin found in $DOCKERFILE" >&2
+        rc=1
+    else
+        got_kotlinc="$(kotlinc -version 2>&1 | sed -n 's/^.*kotlinc-jvm \([0-9][0-9.]*\).*$/\1/p' | head -n 1)"
+        if [ "$got_kotlinc" != "$want_kotlinc" ]; then
+            echo "build-ci-image verify-runtime: FAIL: kotlinc version drift: ${got_kotlinc:-missing} (want $want_kotlinc)" >&2
+            rc=1
+        fi
+    fi
     if [ "$rc" -eq 0 ]; then
         echo "build-ci-image verify-runtime: every pinned package/tool matches docker/faktor-ci/Dockerfile"
     fi
@@ -184,6 +198,12 @@ selftest() {
         echo "selftest ok: built image re-verifies the pins with dpkg-query"
     else
         echo "build-ci-image selftest: FAIL: no post-install version verification" >&2
+        rc=1
+    fi
+    if grep -qE '^ARG KOTLINC_VERSION=[0-9][0-9.]*$' "$DOCKERFILE" && grep -qE '^ARG KOTLINC_SHA256=[0-9a-f]{64}$' "$DOCKERFILE"; then
+        echo "selftest ok: standalone kotlinc is version + SHA-256 pinned"
+    else
+        echo "build-ci-image selftest: FAIL: standalone kotlinc version/SHA-256 pin missing" >&2
         rc=1
     fi
     if [ "$rc" -eq 0 ]; then

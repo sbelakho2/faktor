@@ -1132,13 +1132,17 @@ fails with `unassigned`; an unconventional tag fails with
   `docker/faktor-ci/Dockerfile` pins the `ubuntu:24.04` base by multi-arch
   index digest, pins the same noble snapshot, and installs the full CI apt
   toolchain at exact versions (`build-essential`, `curl`, `pkg-config`,
-  `libssl-dev`, `kotlin`, `openjdk-11-jre-headless`,
-  `openjdk-17-jdk-headless`, `git`, `unzip`, `python3`, `procps`,
-  `ca-certificates`). The JetBrains build and smoke lanes run on this one
-  digest-pinned image: `git` supplies the `git rev-parse 'HEAD^{tree}'`
-  lane-marker tree binding (the stock eclipse-temurin baseline ships no
-  git), and JDK 17 is the minimum JVM for the pinned Gradle wrapper (9.7.1)
-  while the JDK 11 JRE stays for the apt-kotlinc smoke fallback.
+  `libssl-dev`, `openjdk-17-jdk-headless`, `git`, `unzip`, `python3`,
+  `procps`, `ca-certificates`). The standalone `kotlinc` is the pinned Kotlin
+  release matching the Gradle Kotlin plugin (2.4.20), fetched from the
+  pinned release URL and SHA-256-verified at build time (the noble apt
+  `kotlin` package is 1.3.31 and cannot compile the tree's Kotlin 1.5+
+  stdlib calls); the required `ci-image` pre-step re-asserts the pinned
+  version inside the running image. The JetBrains build and smoke lanes run
+  on this one digest-pinned image: `git` supplies the
+  `git rev-parse 'HEAD^{tree}'` lane-marker tree binding (the stock
+  eclipse-temurin baseline ships no git), and JDK 17 is the minimum JVM for
+  the pinned Gradle wrapper (9.7.1).
   `bash scripts/build-ci-image.sh` builds it
   (default `linux/amd64`), prints the image digest, verifies the pinned
   package set inside the built image, and pushes the digest when a registry
