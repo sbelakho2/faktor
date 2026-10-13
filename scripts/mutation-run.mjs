@@ -108,8 +108,12 @@ function prepareGateRoot() {
     return;
   }
   const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-'));
+  // verbatimSymlinks keeps in-repo symlinks (`.woodpecker/*.yaml`) relative in
+  // the scratch: the plain copy rewrites the target to the absolute SOURCE
+  // path, which the JetBrains smokes' shadow isolation rejects as an escape.
   cpSync(SCRIPT_ROOT, scratch, {
     recursive: true,
+    verbatimSymlinks: true,
     filter: (source) => !excludedUnder(SCRIPT_ROOT, source),
   });
   provisionGateSupports(SCRIPT_ROOT, scratch);

@@ -702,7 +702,17 @@ function main() {
     // copied tree, because a recursive copy cannot target its own
     // subdirectory. It is removed in the finally below.
     const scratch = mkdtempSync(join(resolve(root, '..'), '.faktor-mutation-campaign-'));
-    cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
+    // verbatimSymlinks keeps the in-repo workflow symlinks (`.woodpecker/*.yaml`
+    // -> `trusted/...`, `untrusted/...`) RELATIVE in the scratch. The plain
+    // copy rewrites a relative target to an absolute SOURCE path, and the
+    // JetBrains smokes' session isolation then rejects the escape when it
+    // shadows the workspace ("an absolute target cannot stay inside the shadow
+    // copy") — a scratch artifact that has nothing to do with the mutation.
+    cpSync(root, scratch, {
+      recursive: true,
+      verbatimSymlinks: true,
+      filter: (source) => !excludedUnder(root, source),
+    });
     // Snapshot the gate support trees (P2-9 + P1-11): the CLI is an
     // immutable COPY and node_modules a hardlink snapshot (or full copy,
     // never a symlink), both CONTENT-digested into evidence.

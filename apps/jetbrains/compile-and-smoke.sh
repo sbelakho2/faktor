@@ -64,19 +64,55 @@ if [ -f "$CORE_FONTS_CONF" ] && [ "$(uname -s)" = "Linux" ]; then
   echo "[compile-and-smoke] pinned core-fonts fontconfig: $CORE_FONTS_CONF"
 fi
 
+# ---- flags -----------------------------------------------------------------
+# `--smoke <Label>` (repeatable, labels: Backend, NativeBridge, Frontend,
+# ControlPlaneCredential, JetBrainsParity, HostMatrix) runs ONLY the named
+# executable smoke(s) on the same compiled tree; no selection runs the full
+# suite the trusted lane proves. The planted-mutation gates in
+# scripts/mutations/INV-*.json use the focused form so each gate runs exactly
+# its own oracle on the pinned CI image's self-contained kotlinc toolchain
+# (the image ships no warm Gradle cache, so the Gradle tasks cannot run
+# `--offline` there).
 EXTRA_JVM_ARGS=""
-for arg in "$@"; do
-  case "$arg" in
+SMOKE_SELECTION=()
+KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix"
+while [ $# -gt 0 ]; do
+  case "$1" in
     --write-baselines)
       EXTRA_JVM_ARGS="-Dfaktor.parity.writeBaselines=true"
       echo "[compile-and-smoke] writing pinned visual baselines from this render"
+      shift
+      ;;
+    --smoke)
+      if [ $# -lt 2 ]; then
+        echo "FAIL: --smoke needs one label from: $KNOWN_SMOKES" >&2
+        exit 1
+      fi
+      case " $KNOWN_SMOKES " in
+        *" $2 "*) SMOKE_SELECTION=(${SMOKE_SELECTION[@]+"${SMOKE_SELECTION[@]}"} "$2") ;;
+        *)
+          echo "FAIL: unknown smoke label '$2' (expected one of: $KNOWN_SMOKES)" >&2
+          exit 1
+          ;;
+      esac
+      shift 2
       ;;
     *)
-      echo "FAIL: unknown flag: $arg" >&2
+      echo "FAIL: unknown flag: $1" >&2
       exit 1
       ;;
   esac
 done
+
+# TRUE when the label is selected (an empty selection means the full suite).
+smoke_selected() { # label
+  [ ${#SMOKE_SELECTION[@]} -eq 0 ] && return 0
+  local label
+  for label in ${SMOKE_SELECTION[@]+"${SMOKE_SELECTION[@]}"}; do
+    [ "$label" = "$1" ] && return 0
+  done
+  return 1
+}
 
 # ---- bounded toolchain heaps + typed environment-resource failures ---------
 # kotlinc's stock launcher defaults to -Xmx512M; under concurrent lane
@@ -213,13 +249,24 @@ if [ -z "$KOTLINC" ]; then
     rm -f "$log"
     return 0
   }
-  run_gradle_smoke "gradle :backend:smoke :frontend:smoke" \
-    "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke || exit $?
-  # The packaged-plugin host proof on the same Gradle-managed classpath set:
-  # buildPlugin + extract + run the host matrix with the ZIP jars first.
-  run_gradle_smoke "gradle :frontend:smokeHostMatrixZip" \
-    --console=plain --no-daemon :frontend:smokeHostMatrixZip
-  exit $?
+  if [ ${#SMOKE_SELECTION[@]} -eq 0 ]; then
+    run_gradle_smoke "gradle :backend:smoke :frontend:smoke" \
+      "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke || exit $?
+    # The packaged-plugin host proof on the same Gradle-managed classpath set:
+    # buildPlugin + extract + run the host matrix with the ZIP jars first.
+    run_gradle_smoke "gradle :frontend:smokeHostMatrixZip" \
+      --console=plain --no-daemon :frontend:smokeHostMatrixZip
+    exit $?
+  fi
+  for label in ${SMOKE_SELECTION[@]+"${SMOKE_SELECTION[@]}"}; do
+    case "$label" in
+      Backend|NativeBridge) task=":backend:smoke$label" ;;
+      HostMatrix) task=":frontend:smokeHostMatrixZip" ;;
+      *) task=":frontend:smoke$label" ;;
+    esac
+    run_gradle_smoke "gradle $task" "${GRADLE_SMOKE_ARGS[@]}" "$task" || exit $?
+  done
+  exit 0
 fi
 
 # ---- 3. kotlin-stdlib.jar (bundled with the compiler distribution) ---------
@@ -269,7 +316,11 @@ echo "[compile-and-smoke] kotlin-stdlib.jar: $STDLIB_JAR"
 
 # ---- 4. compile -------------------------------------------------------------
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/faktor-jb-smoke.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# Zero orphans: the lifecycle tests deliberately spawn fake releases/launchers
+# (a launcher that exits early leaves its release running so ownership transfer
+# can be asserted); anything the run itself leaked is reaped here by the exact
+# classpath, so no smoke run — passing or failing — leaves a child behind.
+trap 'pkill -f "$SMOKE_JAR" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 SMOKE_JAR="$WORK/smoke.jar"
 KOTLINC_LOG="$WORK/kotlinc.log"
 
@@ -309,21 +360,32 @@ run_smoke() {
   return $rc
 }
 
-echo "[compile-and-smoke] running BackendSmoke (daemon lifecycle) against $BIN"
-run_smoke BackendSmoke dev.faktor.backend.BackendSmoke || exit $?
+if smoke_selected Backend; then
+  echo "[compile-and-smoke] running BackendSmoke (daemon lifecycle) against $BIN"
+  run_smoke BackendSmoke dev.faktor.backend.BackendSmoke || exit $?
+fi
 
-echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"
-run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
+if smoke_selected NativeBridge; then
+  echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"
+  run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
+fi
 
-echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
-run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke || exit $?
+if smoke_selected Frontend; then
+  echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
+  run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke || exit $?
+fi
 
-echo "[compile-and-smoke] running ControlPlaneCredentialSmoke (fake PasswordSafe rows) against $BIN"
-run_smoke ControlPlaneCredentialSmoke dev.faktor.frontend.ControlPlaneCredentialSmoke || exit $?
+if smoke_selected ControlPlaneCredential; then
+  echo "[compile-and-smoke] running ControlPlaneCredentialSmoke (fake PasswordSafe rows) against $BIN"
+  run_smoke ControlPlaneCredentialSmoke dev.faktor.frontend.ControlPlaneCredentialSmoke || exit $?
+fi
 
-echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
-run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke || exit $?
+if smoke_selected JetBrainsParity; then
+  echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
+  run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke || exit $?
+fi
 
+if smoke_selected HostMatrix; then
 # ---- 6. host matrix: the BUILT plugin ZIP ----------------------------------
 # Extracts the built plugin ZIP and runs the host matrix with the ZIP's
 # `faktor/lib/*.jar` FIRST on the classpath, so the panel classes under test
@@ -365,4 +427,5 @@ if [ $HOST_RC -ne 0 ]; then
   report_toolchain_failure "JetBrainsHostMatrixSmoke" "$WORK/HostMatrix.stderr" "$HOST_RC"
   exit $HOST_RC
 fi
+fi  # smoke_selected HostMatrix
 exit 0
