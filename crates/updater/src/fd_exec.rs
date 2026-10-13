@@ -65,13 +65,44 @@ pub(crate) fn exec_verified_fd(
     let outcome =
         unsafe { libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
     if outcome == -1 {
-        return Err(UpdateError::LaunchRefused {
-            detail: format!(
-                "exec verified fd for {}: {}",
-                program.display(),
-                std::io::Error::last_os_error()
-            ),
-        });
+        let first = std::io::Error::last_os_error();
+        // binfmt_misc hosts (Rosetta / qemu-user on a non-native kernel) hand
+        // the executable descriptor to the interpreter ACROSS the exec; an
+        // FD_CLOEXEC flag on the verified descriptor closes it at that point,
+        // and the handoff fails ENOENT even though the descriptor is live
+        // (measured in the pinned CI container: execveat(AT_EMPTY_PATH) on a
+        // live O_CLOEXEC fd returns ENOENT, the same fd without the flag
+        // execs). Clear FD_CLOEXEC and retry once; on a native exec the first
+        // call succeeds and the descriptor keeps its normal close-on-exec
+        // lifetime, so only interpreter hosts ever see the extra descriptor.
+        if first.raw_os_error() != Some(libc::ENOENT) {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!("exec verified fd for {}: {first}", program.display()),
+            });
+        }
+        #[allow(unsafe_code)]
+        let cleared = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) };
+        if cleared == -1 {
+            let clear_error = std::io::Error::last_os_error();
+            return Err(UpdateError::LaunchRefused {
+                detail: format!(
+                    "clear FD_CLOEXEC on the verified descriptor for {}: {clear_error}",
+                    program.display()
+                ),
+            });
+        }
+        #[allow(unsafe_code)]
+        let retried =
+            unsafe { libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+        if retried == -1 {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!(
+                    "exec verified fd for {}: {} (also after clearing FD_CLOEXEC)",
+                    program.display(),
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
     }
     unreachable!("a successful fexecve never returns to the caller")
 }

@@ -89,7 +89,15 @@ object BackendSmoke {
             }
             val conn = connection
             if (conn != null) {
-                val client = NativeClient.forConnection(conn)
+                // The real-daemon suite bound: the first prompt drives a COLD
+                // engineering-contract acquisition over the smoke's workspace,
+                // and the bundled smoke jar (seeded model config, contract
+                // compiler + source indexing on the first turn) legitimately
+                // needs more than the 15s production default when the campaign
+                // runs the smokes in an emulated container; NativeClientTest's
+                // real-daemon suite uses the same 180s bound. The steps below
+                // assert the same functional properties either way.
+                val client = NativeClient.forConnection(conn, timeoutMs = 180_000L)
                 step("native health (GET /native/health)") {
                     val h = client.health()
                     if (!h.ok) fail("health ok=false")

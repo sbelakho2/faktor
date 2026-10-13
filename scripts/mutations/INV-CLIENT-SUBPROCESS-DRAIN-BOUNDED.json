@@ -3,7 +3,7 @@
   "file": "apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt",
   "find": "                    val room = cap - retained.size()",
   "replace": "                    val room = Int.MAX_VALUE - retained.size()",
-  "gate": "apps/jetbrains/gradlew -p apps/jetbrains --offline --console=plain --no-daemon :backend:smokeBackend -PfaktorCliBin=\"$PWD/target/debug/faktor-cli\"",
+  "gate": "bash apps/jetbrains/compile-and-smoke.sh --smoke Backend",
   "timeout_ms": 1800000,
   "note": "The BoundedDrainer ignores its byte cap: a flooding child accumulates unbounded retained output instead of the hard bound."
 }
