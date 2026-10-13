@@ -214,6 +214,9 @@ def generate_marker(options):
     }
     if options.get("reasonProvided"):
         record["reason"] = options.get("reason", "")
+    flakes = options.get("flakes")
+    if flakes:
+        record["flakes"] = flakes
     record.update(
         {
             "commit": options.get("commit"),
@@ -234,10 +237,54 @@ def generate_marker(options):
     return record
 
 
+def flake_summary(report, lane, path):
+    """Parity port of lane-marker.mjs flakeSummary: the flake-tolerance
+    report for THIS lane, validated and reduced to the bounded marker
+    summary. See the JS implementation for the contract."""
+
+    def fail(message):
+        raise ValueError("--flake-file {}: {}".format(path, message))
+
+    if not isinstance(report, dict):
+        fail("not a JSON object")
+    if report.get("schema") != "faktor-flake-tolerance/v1":
+        fail("schema '{}' is not faktor-flake-tolerance/v1".format(report.get("schema")))
+    if report.get("lane") != lane:
+        fail("report lane '{}' is not '{}'".format(report.get("lane"), lane))
+    status = str(report.get("status"))
+    if status not in ("clean", "passed_with_flakes"):
+        fail("status '{}' cannot certify a passed lane".format(status))
+    flakes = report.get("flakes")
+    if not isinstance(flakes, list):
+        fail("flakes is not an array")
+    tests = []
+    for flake in flakes:
+        if not isinstance(flake, dict) or not flake.get("test"):
+            fail("flake entry without a test name")
+        if flake.get("isolated_result") != "passed" or flake.get("isolation_attempts") != 1:
+            fail("flake '{}' is not a once-retried isolated pass".format(flake.get("test")))
+        tests.append(flake["test"])
+    if status == "clean" and tests:
+        fail("clean report carries flakes")
+    if status == "passed_with_flakes" and not tests:
+        fail("passed_with_flakes report carries no flakes")
+    persistent = report.get("persistent_failures")
+    if isinstance(persistent, list) and persistent:
+        fail("report carries persistent failures and cannot certify a passed lane")
+    return {
+        "schema": report["schema"],
+        "status": status,
+        "count": len(tests),
+        "tests": tests,
+        "report": path,
+    }
+
+
 def usage():
     print(
         "usage: lane-marker.py write --lane ID [--status passed|failed|skipped]\n"
         "  [--reason TEXT] [--artifact PATH]... [--optional-artifact PATH]...\n"
+        "  [--flake-file target/certification/flakes/ID.json]\n"
         "  [--commands TEXT | --commands-file FILE] [--out FILE] [--cwd DIR]\n"
         "  [--commit SHA] [--tree SHA] [--run-id ID] [--started-at ISO] [--finished-at ISO]\n"
         "  [--runner-os OS] [--runner-arch ARCH] [--runner-ci CI]\n\n"
@@ -271,6 +318,18 @@ def write_command(args):
         full = os.path.join(cwd, path)
         if os.path.isfile(full):
             artifacts.append({"path": path, "sha256": hash_file(full)})
+    flakes = None
+    flake_file = flag_value(args, "--flake-file")
+    if flake_file:
+        full = os.path.join(cwd, flake_file)
+        try:
+            with open(full, encoding="utf-8") as handle:
+                parsed = json.load(handle)
+        except Exception as error:  # noqa: BLE001 - CLI boundary: report and exit 1
+            raise ValueError("--flake-file {}: {}".format(flake_file, error))
+        flakes = flake_summary(parsed, lane, flake_file)
+        if not any(artifact["path"] == flake_file for artifact in artifacts):
+            artifacts.append({"path": flake_file, "sha256": hash_file(full)})
     commit = flag_value(args, "--commit") or os.environ.get("CI_COMMIT_SHA", "")
     if not commit:
         commit = git(["rev-parse", "HEAD"], cwd)
@@ -302,6 +361,7 @@ def write_command(args):
                 "run_id": run_id,
             },
             "token": lane_token_from_env(lane),
+            "flakes": flakes,
         }
     )
     out = os.path.realpath(

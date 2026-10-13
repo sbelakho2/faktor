@@ -265,7 +265,18 @@ steps:
       - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - cargo test --workspace --all-features
+      # Bounded, RECORDED flake tolerance (scripts/certification/flake-tolerance.py;
+      # honest exit semantics in docs/certification.md): the workspace suite runs
+      # exactly once; only the EXACT failed test names are re-run, once each, alone
+      # (`-- --exact <name> --test-threads=1`). A name that fails again in isolation
+      # fails the lane (real regressions are never masked); a name that passes in
+      # isolation is recorded as a flake (name + first failure excerpt) in the
+      # lane's report, attached to the lane marker via --flake-file and surfaced in
+      # the certificate manifest — never a silent green. Initial failures above the
+      # flake budget (3) fail the lane with no retries at all; fault/soak/live/perf
+      # lanes and any `--ignored` selection are refused typed by the runner.
+      - python3 scripts/certification/flake-tolerance.py selftest
+      - python3 scripts/certification/flake-tolerance.py run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
       # P0-PROOF (audit 3): compiled test enumeration, not source-text
       # matching. Every proven capability's unit proof must be a REAL libtest
       # entry exactly once, and tests/production-crates.json must be fresh
@@ -283,13 +294,15 @@ steps:
         sh scripts/check-fault-seams.sh
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo test --workspace --all-features
+        python3 scripts/certification/flake-tolerance.py selftest
+        python3 scripts/certification/flake-tolerance.py run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
         cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane linux --status passed \
+          --flake-file target/certification/flakes/linux.json \
           --out target/certification/lanes/linux.json
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative

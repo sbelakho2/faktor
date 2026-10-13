@@ -249,9 +249,24 @@ run_canonical_gates() { # runs the canonical list; 0 all pass, 1 any fail
 }
 
 extract_ci_gate_commands() { # workflow_yaml lane -> unique cargo gate commands
+    # The trusted linux lane may wrap the canonical `cargo test` gate in the
+    # bounded flake-tolerance recorder (scripts/certification/flake-tolerance.py)
+    # — `run --lane linux --max-flakes N -- cargo test ...` executes the
+    # canonical argv byte-for-byte and only ever adds isolation reruns of
+    # already-failed test names, so parity is proven against the WRAPPED
+    # command's inner argv. The untrusted PR lane runs the bare command.
     awk -v lane="$2" '
         /^  - name: / { in_lane = ($3 == lane); next }
-        in_lane && /^      - cargo (fmt|check|clippy|test)( |$)/ && !/\|/ { sub(/^      - /, ""); print }
+        in_lane && !/\|/ {
+            if ($0 ~ /^      - cargo (fmt|check|clippy|test)( |$)/) {
+                sub(/^      - /, ""); print; next
+            }
+            if ($0 ~ /^      - python3 scripts\/certification\/flake-tolerance\.py run /) {
+                inner = $0
+                sub(/^      - python3 scripts\/certification\/flake-tolerance\.py run .* -- /, "", inner)
+                if (inner ~ /^cargo (fmt|check|clippy|test)( |$)/) print inner
+            }
+        }
     ' "$1" 2>/dev/null | sed 's/[[:space:]]*$//' | sort -u
 }
 

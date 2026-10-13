@@ -26,6 +26,21 @@ pub(crate) use faktor_session::BudgetAuthority;
 
 pub(crate) use tempfile::tempdir;
 
+/// Tool budget used by the shared fixtures. The scheduler fails an op whose
+/// deadline expired BEFORE it ran (the scheduler modelcheck pins that
+/// semantics), and the pre-execution durable bookkeeping (the tool-run
+/// journal hop and the permission resolution) is charged to this budget.
+/// On the heavily emulated CI runner an I/O stall can take seconds, and a 2s
+/// fixture budget then failed a benign tiny write before it ever executed:
+/// the turn recorded `tool write_file failed` with no file change, which in
+/// turn skipped the independent review (no changed files) and tripped
+/// `review must run` in the routing/degraded/hostile semantic tests. The
+/// budget stays BOUNDED — a genuinely stuck tool still fails — while no
+/// benign fixture write should ever need 60s even on a stalled runner.
+/// Dedicated deadline-expiry teeth live in the scheduler's own tests, which
+/// keep their own budgets.
+pub(crate) const LOAD_TOLERANT_TOOL_DEADLINE_MS: u64 = 60_000;
+
 /// Wave-16 ergonomics kept by the typed-verifier migration (P0-9/10): a
 /// scripted [`crate::VerificationService`] over a legacy-style
 /// command-string closure. Deterministic verdicts and asserted command
@@ -105,7 +120,7 @@ pub(crate) fn deps_with(
         instructions: "You are a test agent.".into(),
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::Native,
-        tool_deadline_ms: 2000,
+        tool_deadline_ms: LOAD_TOLERANT_TOOL_DEADLINE_MS,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,
@@ -161,7 +176,7 @@ pub(crate) fn deps_sharing_session(
             instructions: "You are a test agent.".into(),
             clock: Arc::new(SystemClock),
             tool_call_mode: ToolCallMode::Native,
-            tool_deadline_ms: 2000,
+            tool_deadline_ms: LOAD_TOLERANT_TOOL_DEADLINE_MS,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
             context_prior: None,
@@ -893,7 +908,7 @@ pub(crate) fn verified_rust_env(
         instructions: "You are a test agent.".into(),
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::Native,
-        tool_deadline_ms: 2000,
+        tool_deadline_ms: LOAD_TOLERANT_TOOL_DEADLINE_MS,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,
@@ -1257,7 +1272,7 @@ pub(crate) fn review_env(
         instructions: "You are a test agent.".into(),
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::Native,
-        tool_deadline_ms: 2000,
+        tool_deadline_ms: LOAD_TOLERANT_TOOL_DEADLINE_MS,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,

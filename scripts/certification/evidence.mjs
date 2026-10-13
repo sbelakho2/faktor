@@ -95,6 +95,11 @@ const MARKER_SCHEMA = 'faktor-woodpecker-lane/v2';
 const CI_CERT_SCHEMA = 'faktor-ci-certification/v2';
 const EMPTY_ARTIFACT_DIGEST = `sha256:${sha256Hex('')}`;
 const ED25519_SPKI_PREFIX = '302a300506032b6570032100';
+// Recorded flake tolerance is bounded: the runner retries each failed name at
+// most once and its total budget is a small number. A marker claiming more
+// tolerated flakes than this hard ceiling is refused — tolerance must never
+// grow into an unbounded allowance.
+const MAX_TOLERATED_FLAKES_PER_LANE = 16;
 
 // ------------------------------------------------------------------ utils
 
@@ -1097,6 +1102,37 @@ function markerProblems(record, options) {
       }
     }
   }
+  if (record.flakes !== undefined && record.flakes !== null) {
+    const flakes = record.flakes;
+    if (typeof flakes !== 'object' || Array.isArray(flakes)) {
+      problems.push(`flake-mismatch: ${label} flakes is not an object`);
+    } else if (flakes.schema !== 'faktor-flake-tolerance/v1') {
+      problems.push(`flake-mismatch: ${label} flakes.schema=${flakes.schema}`);
+    } else if (!['clean', 'passed_with_flakes'].includes(flakes.status)) {
+      problems.push(`flake-mismatch: ${label} flakes.status=${flakes.status}`);
+    } else if (
+      !Number.isInteger(flakes.count) ||
+      flakes.count < 0 ||
+      !Array.isArray(flakes.tests) ||
+      flakes.tests.some((test) => typeof test !== 'string' || test.length === 0)
+    ) {
+      problems.push(`flake-mismatch: ${label} flakes count/tests malformed`);
+    } else if (flakes.tests.length !== flakes.count) {
+      problems.push(
+        `flake-mismatch: ${label} flakes.count=${flakes.count} != tests.length=${flakes.tests.length}`,
+      );
+    } else if (flakes.count > MAX_TOLERATED_FLAKES_PER_LANE) {
+      problems.push(
+        `flake-over-budget: ${label} records ${flakes.count} tolerated flake(s) > ceiling ${MAX_TOLERATED_FLAKES_PER_LANE}`,
+      );
+    } else if (flakes.status === 'clean' && flakes.count !== 0) {
+      problems.push(`flake-mismatch: ${label} clean report carries flakes`);
+    } else if (flakes.status === 'passed_with_flakes' && flakes.count < 1) {
+      problems.push(`flake-mismatch: ${label} passed_with_flakes report carries no flakes`);
+    } else if (typeof flakes.report !== 'string' || flakes.report.length === 0) {
+      problems.push(`flake-mismatch: ${label} flakes.report missing`);
+    }
+  }
   problems.push(...soakArtifactProblems(record, label, cwd));
   return { problems, auth: authVerdict.auth };
 }
@@ -1124,6 +1160,7 @@ function verifyMarkers(options) {
   const lanes = {};
   const markers = {};
   const attested = {};
+  const flakeRecords = [];
   const dir = resolve(cwd, lanesDir);
   let files = [];
   if (existsSync(dir)) {
@@ -1175,7 +1212,16 @@ function verifyMarkers(options) {
       runner: record.runner,
       auth: typeof record.auth === 'string' ? record.auth : null,
       auth_verified: verdict.auth === 'verified',
+      flakes: record.flakes === undefined ? null : record.flakes,
     };
+    if (
+      verdict.problems.length === 0 &&
+      record.flakes &&
+      typeof record.flakes === 'object' &&
+      record.flakes.count > 0
+    ) {
+      flakeRecords.push({ lane: stem, ...record.flakes });
+    }
     attested[stem] = verdict.auth === 'verified';
     if (verdict.problems.length > 0) {
       lanes[stem] = verdict.problems[0].split(':')[0];
@@ -1218,6 +1264,10 @@ function verifyMarkers(options) {
     auth: authSummary,
     lanes,
     markers,
+    // Recorded flake tolerance for this run: each entry is a lane that
+    // passed with at most the bounded budget of once-retried, isolation-
+    // verified flakes. The list is evidence, never a silent allowance.
+    flakes: flakeRecords,
     problems,
   };
   if (out) {
@@ -1232,6 +1282,12 @@ function verifyMarkers(options) {
     } else {
       console.log(`FAILED ${lanes[spec.lane]} ${spec.lane}`);
     }
+  }
+  for (const entry of flakeRecords) {
+    console.log(
+      `flake ${entry.lane}: ${entry.count} tolerated flake(s) recorded (${entry.tests.join(', ')}); ` +
+        `each re-ran once in isolation and passed — see ${entry.report}`,
+    );
   }
   if (problems.length > 0) {
     for (const problem of problems) {
@@ -1468,6 +1524,59 @@ function runSelftest() {
         `verified lanes must be passed, got ${JSON.stringify(result.manifest.lanes)}`,
       );
       assert(result.manifest.markers['lane-a'].auth_verified === true, 'auth_verified must be recorded');
+    });
+    run('recorded flake tolerance surfaces and never flips a lane red', () => {
+      const record = marker('lane-a', {
+        flakes: {
+          schema: 'faktor-flake-tolerance/v1',
+          status: 'passed_with_flakes',
+          count: 1,
+          tests: ['runtime::routing_tests::malicious_semantic_text_stays_data'],
+          report: 'target/certification/flakes/lane-a.json',
+        },
+      });
+      const result = verify({ 'lane-a': record, 'lane-b': marker('lane-b') });
+      assert(result.ok, `expected pass, problems=${JSON.stringify(result.manifest.problems)}`);
+      assert(
+        result.manifest.flakes.length === 1 &&
+          result.manifest.flakes[0].lane === 'lane-a' &&
+          result.manifest.flakes[0].count === 1,
+        `the recorded flake must surface in the certification manifest, got ${JSON.stringify(result.manifest.flakes)}`,
+      );
+    });
+    run('an over-budget flake claim is refused', () => {
+      const record = marker('lane-a', {
+        flakes: {
+          schema: 'faktor-flake-tolerance/v1',
+          status: 'passed_with_flakes',
+          count: 17,
+          tests: Array.from({ length: 17 }, (_, index) => `m::flaky-${index}`),
+          report: 'target/certification/flakes/lane-a.json',
+        },
+      });
+      const result = verify({ 'lane-a': record, 'lane-b': marker('lane-b') });
+      assert(!result.ok, 'an over-budget flake claim must fail verification');
+      assert(
+        result.manifest.problems.some((problem) => problem.startsWith('flake-over-budget')),
+        `expected flake-over-budget, got ${JSON.stringify(result.manifest.problems)}`,
+      );
+    });
+    run('a flake summary count/tests mismatch is refused', () => {
+      const record = marker('lane-a', {
+        flakes: {
+          schema: 'faktor-flake-tolerance/v1',
+          status: 'passed_with_flakes',
+          count: 2,
+          tests: ['m::flaky-0'],
+          report: 'target/certification/flakes/lane-a.json',
+        },
+      });
+      const result = verify({ 'lane-a': record, 'lane-b': marker('lane-b') });
+      assert(!result.ok, 'a count/tests mismatch must fail verification');
+      assert(
+        result.manifest.problems.some((problem) => problem.startsWith('flake-mismatch')),
+        `expected flake-mismatch, got ${JSON.stringify(result.manifest.problems)}`,
+      );
     });
     run('forged marker signed with another lane token rejected', () => {
       const records = {

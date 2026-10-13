@@ -107,7 +107,7 @@ when CI migrated (historical note only, no workflow files remain under
 
 | Job | Agent | Content |
 | --- | --- | --- |
-| `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run); `doctor` smoke |
+| `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run), the test gate wrapped in the bounded, recorded flake-tolerance runner (§2.1.1); `doctor` smoke |
 | `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; frozen-contract drift gate (`cargo run -p faktor-contracts -- check` regenerates every vocabulary from the compiled serde implementation and fails on any rename/reorder in `docs/contracts/`); license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
 | `soak-smoke` | linux/amd64 | per-release accelerated churn: `scripts/soak.sh --mode churn` runs the convergence churn workload for 1800 s (30–60 min band) with the mandatory quiescent-convergence checker; records `target/certification/soak.json`; a zero-test run, a missing metric sample or ANY failed convergence metric fails the lane |
@@ -174,6 +174,62 @@ unchanged. Secret registration and the exact step `environment:` mappings
 are in `scripts/woodpecker/setup.md` §4; the rejection and forgery matrix
 (including a lane-A marker signed with lane-B's token) is proven by
 `node scripts/certification/evidence.mjs selftest`.
+
+#### 2.1.1 Recorded flake tolerance (linux test gate)
+
+The linux suite is a ~600-test workspace run on a heavily emulated runner
+shared with every other lane, where one load-sensitive test can stall past
+its budget once per run (a different test each time, each green in
+isolation) and pre-empt the dependent `vscode-e2e`/`certificate` lanes.
+Silent retries would hide regressions, so the linux lane runs its test gate
+through `python3 scripts/certification/flake-tolerance.py run --lane linux
+--max-flakes 3 -- cargo test --workspace --all-features`, whose exit
+semantics are exactly:
+
+* **suite exit 0** — status `clean`, lane green; the report is still written
+  (`target/certification/flakes/linux.json`, schema
+  `faktor-flake-tolerance/v1`) as evidence that the runner ran with zero
+  flakes.
+* **suite red, every failed name green alone** — each EXACT failed test name
+  (`-- --exact <name> --test-threads=1`, the same canonical cargo argv, so
+  cwd/env are byte-identical) is re-run **once**; a name whose isolated run
+  exits 0 **and** observably prints `test <name> ... ok` is recorded as a
+  `flake` with its name, isolation command and first failure excerpt, the
+  lane stays green, and the report is attached to the linux lane marker
+  (`--flake-file`, so its digest is in `artifacts[]` and the marker HMAC
+  covers the bounded `flakes` summary). `verify-markers` surfaces every
+  recorded flake in `target/certification/ci-certification.json`
+  (`flakes[]` + a `flake <lane>: N tolerated flake(s) ...` line), so the
+  flake list is visible in the certification artifact.
+* **anything else is red** — a name that fails again in isolation, times out,
+  or does not observably run is a persistent failure and the lane fails
+  (exit 1); the same applies to a build/tool error with no identifiable test
+  failure, failures the parser cannot account for against the
+  `test result:` counters, and an initial failure count above the flake
+  budget (3), which fails with **no retries at all** — a mass failure is a
+  regression, never flake weather.
+* **refusals (exit 2, typed)** — non-`cargo test` suite commands, any
+  `--ignored` selection, and lanes whose id carries `fault`, `soak`, `live`
+  or `perf`: the fault/soak/live proof lanes are never retried.
+* **bounds** — one retry per test name, at most `--max-flakes` (3) retried
+  names, a suite watchdog and a per-isolation timeout, process-group kill
+  (no orphans); `verify-markers` refuses a marker claiming more than 16
+  tolerated flakes.
+
+`flake-tolerance.py selftest` (34 hermetic checks through a fake `cargo`:
+flaky-passes recorded, persistent failure stays red, budget/unverified-pass
+refusals, no retry for fault/soak/live/perf lanes) runs inside the linux
+lane and in `scripts/certification/tests/selftests.sh` (dogfood §2). Gate
+parity is preserved: `scripts/certify.sh extract_ci_gate_commands`
+normalizes the wrapper to its inner canonical argv, so
+`--check-gate-parity` still proves the trusted lane executes exactly the
+canonical gate set. The fixture-level root cause of the load-sensitive
+routing test (the shared test fixtures charged pre-execution durable
+bookkeeping to a 2 s tool budget, so a stalled runner failed a benign write
+before it ran and skipped the review) is fixed in
+`crates/agent/src/runtime/tests.rs::LOAD_TOLERANT_TOOL_DEADLINE_MS`; the
+deadline-expiry semantics themselves stay pinned by the scheduler's own
+modelcheck tests.
 
 The table above is the **trusted** lane set (`.woodpecker/trusted/trusted.yaml`:
 `push`/`tag`, with the named-volume caches and the release `[perf]` budgets).
@@ -1794,7 +1850,12 @@ Exact binding rules:
   `auth`, keyed by the lane's own `faktor_lane_token_<lane>` secret. The
   verifier recomputes it whenever the token is available to the certificate
   step (missing/wrong auth then fails) and records token-less lanes as
-  `unattested` (§2.1).
+  `unattested` (§2.1). A marker may also carry the bounded `flakes` summary
+  (`{schema, status, count, tests, report}`, §2.1.1) when the lane passed
+  `--flake-file <report>`; the report file itself is recorded in
+  `artifacts[]`, the summary is MAC-covered, and `verify-markers` surfaces
+  the flake list in `ci-certification.json` (`flakes[]`) while refusing a
+  summary over the tolerance ceiling.
 
 Usage:
 
@@ -1818,7 +1879,9 @@ node scripts/certification/evidence.mjs verify-markers --workflow pr \
 # emit a lane marker + its auth through the shared helper (used by every
 # trusted/nightly lane block; pipe the lane's CMDS heredoc on stdin)
 printf '%s' "$CMDS" | scripts/certification/lane-marker.sh write \
-  --lane linux --status passed --out target/certification/lanes/linux.json
+  --lane linux --status passed \
+  --flake-file target/certification/flakes/linux.json \
+  --out target/certification/lanes/linux.json
 
 # add a signature with an offline key
 node scripts/certification/evidence.mjs sign --file target/certification/evidence/real_provider.json \
