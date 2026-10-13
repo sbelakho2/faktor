@@ -985,13 +985,25 @@ internal object ParityMatrix {
             "history" to cannedHistoryPanel()
         )
         val digests = LinkedHashMap<String, String>()
+        // Panel construction queues Swing revalidations on the EDT; under
+        // load one could land between the layout pass and the digest walk
+        // (or between panels) and drift the measured bounds. Flush what the
+        // construction queued, then take each panel's render + digest in ONE
+        // EDT runnable so nothing can interleave with the measurement.
+        java.awt.EventQueue.invokeAndWait { }
         for ((name, panel) in panels) {
-            val render = ParityAwt.render(panel)
-            val renderOk = render.width > 0 && render.height > 0 &&
-                render.distinctColors >= 4 &&
-                render.nonCornerPermille in 1..999
-            assertEquals(true, renderOk, "$name rendered a degenerate frame: $render")
-            digests[name] = ParityAwt.digest(panel, name)
+            var render: RenderStats? = null
+            var digest: String? = null
+            java.awt.EventQueue.invokeAndWait {
+                render = ParityAwt.render(panel)
+                digest = ParityAwt.digest(panel, name)
+            }
+            val stats = render ?: error("$name: no render stats")
+            val renderOk = stats.width > 0 && stats.height > 0 &&
+                stats.distinctColors >= 4 &&
+                stats.nonCornerPermille in 1..999
+            assertEquals(true, renderOk, "$name rendered a degenerate frame: $stats")
+            digests[name] = digest ?: error("$name: no digest")
         }
         val platform = visualPlatform()
         val baselineFile = File(ParityPath.repoRoot(), PARITY_BASELINE_PATH)
