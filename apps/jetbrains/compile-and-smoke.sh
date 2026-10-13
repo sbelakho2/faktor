@@ -23,6 +23,21 @@
 #   ./gradlew :frontend:smokeHostMatrixZip          # ZIP-hosted proof
 # CI images that ship kotlinc keep the self-contained, network-free path.
 #
+# Toolchain heaps are BOUNDED and explicit (the jetbrains-smoke run-66 OOM
+# class: under concurrent lane pressure the stock kotlinc launcher default
+# -Xmx512M exhausts the JVM compiling this tree):
+#   * kotlinc runs with JAVA_OPTS="-Xmx2g -Xms256m" (env override:
+#     FAKTOR_JETBRAINS_KOTLINC_JAVA_OPTS); the value is printed and folded
+#     into failure diagnostics.
+#   * the Gradle fallback pins the Kotlin daemon heap additively in
+#     gradle.properties (kotlin.daemon.jvmargs=-Xmx2g; the Gradle daemon
+#     itself keeps its existing org.gradle.jvmargs=-Xmx3g).
+# An OOM / heap-exhaustion failure in ANY toolchain step (kotlinc, Gradle,
+# the smoke JVMs, the host matrix) is reported as a TYPED
+# `environment-resource:` failure with the captured diagnostics tail and a
+# signal-kill classification; it is still a hard gate failure, never a
+# silent crash or a pass.
+#
 # Flags:
 #   --write-baselines  re-pin the visual matrix baselines from this render
 #                      (apps/jetbrains/frontend/src/test/resources/parity/
@@ -58,6 +73,41 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# ---- bounded toolchain heaps + typed environment-resource failures ---------
+# kotlinc's stock launcher defaults to -Xmx512M; under concurrent lane
+# pressure (the jetbrains-smoke run-66 OOM) that exhausts the JVM compiling
+# this tree. The bound is explicit and overridable for experiments; the
+# Gradle/Kotlin-daemon equivalents live in gradle.properties
+# (kotlin.daemon.jvmargs) next to the existing org.gradle.jvmargs.
+KOTLINC_JAVA_OPTS="${FAKTOR_JETBRAINS_KOTLINC_JAVA_OPTS:--Xmx2g -Xms256m}"
+
+# JVM heap-exhaustion / host-allocator markers (bounded grep, first match).
+ENV_RESOURCE_PATTERN='OutOfMemoryError|Java heap space|GC overhead limit exceeded|unable to create native thread|Cannot allocate memory|Could not reserve enough space|Too small maximum heap'
+
+# On a toolchain failure: always print the captured diagnostics tail, and
+# when the failure is classified as an environment-resource failure (a JVM
+# OOM marker, or a signal kill such as the host OOM killer's SIGKILL),
+# additionally emit the typed `environment-resource:` reason. This is
+# diagnostic classification only — the step remains a hard failure.
+report_toolchain_failure() { # label log rc
+  local label="$1" log="$2" rc="$3" marker klass
+  echo "[compile-and-smoke] $label FAILED (rc=$rc); diagnostics tail ($log):" >&2
+  tail -n 40 "$log" >&2 2>/dev/null || true
+  echo "[compile-and-smoke] bounded heaps: kotlinc JAVA_OPTS=$KOTLINC_JAVA_OPTS; gradle kotlin.daemon.jvmargs (gradle.properties)" >&2
+  marker="$(grep -m 1 -E "$ENV_RESOURCE_PATTERN" "$log" 2>/dev/null | head -c 400 || true)"
+  klass=""
+  if [ -n "$marker" ]; then
+    klass="java-out-of-memory"
+  elif [ "$rc" -ge 128 ]; then
+    klass="process-killed-by-signal"
+  fi
+  if [ -n "$klass" ]; then
+    echo "FAIL: environment-resource: $label classified '$klass' (rc=$rc): ${marker:-no Java marker captured; the tool ran out of host memory or was killed, not a code/compile error}" >&2
+  else
+    echo "FAIL: $label (rc=$rc)" >&2
+  fi
+}
 
 SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt
 $JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt
@@ -142,10 +192,29 @@ if [ -z "$KOTLINC" ]; then
   if [ -n "$EXTRA_JVM_ARGS" ]; then
     GRADLE_SMOKE_ARGS+=(-PwriteBaselines=true)
   fi
-  (cd "$JETBRAINS" && ./gradlew "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke) || exit $?
+  # Capture the full output to a log (tee keeps it streaming for CI) so an
+  # OOM/kill inside the Gradle/Kotlin-daemon toolchain is classified typed
+  # instead of surfacing as an opaque rc.
+  run_gradle_smoke() { # label args...
+    local label="$1"
+    shift
+    local log rc=0
+    log="$(mktemp "${TMPDIR:-/tmp}/faktor-jb-gradle.XXXXXX.log")"
+    (cd "$JETBRAINS" && ./gradlew "$@" 2>&1 | tee "$log"; exit "${PIPESTATUS[0]}") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      report_toolchain_failure "$label" "$log" "$rc"
+      rm -f "$log"
+      return "$rc"
+    fi
+    rm -f "$log"
+    return 0
+  }
+  run_gradle_smoke "gradle :backend:smoke :frontend:smoke" \
+    "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke || exit $?
   # The packaged-plugin host proof on the same Gradle-managed classpath set:
   # buildPlugin + extract + run the host matrix with the ZIP jars first.
-  (cd "$JETBRAINS" && ./gradlew --console=plain --no-daemon :frontend:smokeHostMatrixZip)
+  run_gradle_smoke "gradle :frontend:smokeHostMatrixZip" \
+    --console=plain --no-daemon :frontend:smokeHostMatrixZip
   exit $?
 fi
 
@@ -230,9 +299,9 @@ kotlinc_cmd() {
   local jdk="$1"
   shift
   if [ -n "$jdk" ]; then
-    JAVA_HOME="$jdk" PATH="$jdk/bin:$PATH" "$KOTLINC" "$@"
+    JAVA_OPTS="$KOTLINC_JAVA_OPTS" JAVA_HOME="$jdk" PATH="$jdk/bin:$PATH" "$KOTLINC" "$@"
   else
-    "$KOTLINC" "$@"
+    JAVA_OPTS="$KOTLINC_JAVA_OPTS" "$KOTLINC" "$@"
   fi
 }
 
@@ -240,8 +309,11 @@ kotlinc_cmd() {
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/faktor-jb-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SMOKE_JAR="$WORK/smoke.jar"
+KOTLINC_LOG="$WORK/kotlinc.log"
 
 # Source lists are newline-separated; word splitting below is intentional.
+# Output is captured into the log file so a heap-exhaustion failure is
+# classified typed with its diagnostics (see report_toolchain_failure).
 compile_kotlin() {
   local out rc
   out="$(kotlinc_cmd "" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
@@ -253,17 +325,17 @@ compile_kotlin() {
       $SHARED_SRC $BACKEND_SRC $TEST_SRC $FRONTEND_SRC 2>&1)"
     rc=$?
   fi
-  if [ $rc -ne 0 ]; then
-    echo "$out" >&2
-  fi
+  printf '%s\n' "$out" >"$KOTLINC_LOG"
   return $rc
 }
 
-echo "[compile-and-smoke] kotlinc: $KOTLINC"
-compile_kotlin || {
-  echo "FAIL: kotlinc compilation" >&2
+echo "[compile-and-smoke] kotlinc: $KOTLINC (JAVA_OPTS=$KOTLINC_JAVA_OPTS)"
+compile_kotlin
+COMPILE_RC=$?
+if [ "$COMPILE_RC" -ne 0 ]; then
+  report_toolchain_failure "kotlinc compilation" "$KOTLINC_LOG" "$COMPILE_RC"
   exit 1
-}
+fi
 
 # ---- 6. smokes against the real daemon --------------------------------------
 # The smokes start the real daemon (daemon logs ride the Java process stderr).
@@ -276,8 +348,7 @@ run_smoke() {
   java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $EXTRA_JVM_ARGS -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
   local rc=$?
   if [ $rc -ne 0 ]; then
-    echo "[compile-and-smoke] $name FAILED (rc=$rc); daemon stderr tail ($err):" >&2
-    tail -n 40 "$err" >&2 || true
+    report_toolchain_failure "$name (daemon stderr)" "$err" "$rc"
   fi
   return $rc
 }
@@ -335,8 +406,7 @@ echo "[compile-and-smoke] running JetBrainsHostMatrixSmoke (width/zoom/theme/key
 java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $HOST_MATRIX_ARGS -cp "$HOST_MATRIX_CP" dev.faktor.frontend.JetBrainsHostMatrixSmoke 2>"$WORK/HostMatrix.stderr"
 HOST_RC=$?
 if [ $HOST_RC -ne 0 ]; then
-  echo "[compile-and-smoke] JetBrainsHostMatrixSmoke FAILED (rc=$HOST_RC); stderr tail:" >&2
-  tail -n 40 "$WORK/HostMatrix.stderr" >&2 || true
+  report_toolchain_failure "JetBrainsHostMatrixSmoke" "$WORK/HostMatrix.stderr" "$HOST_RC"
   exit $HOST_RC
 fi
 exit 0

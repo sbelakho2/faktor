@@ -1298,6 +1298,53 @@ def run_selftest():
         check("a nonzero quiescent queue sample still fails", report, "failed",
               want_metric="writer_queue_zero")
 
+        # INJECTED STRETCH (the soak-smoke run-67 class): an emulated/loaded
+        # runner stretches the churn, so the quiescent tail is a small suffix
+        # after a LONG noisy prefix instead of landing at a fixed window
+        # position. The queue metrics must be decided by the observed marked
+        # tail wherever it lands; the same world with a nonzero marked tail
+        # (a genuinely non-draining queue) still fails.
+        def stretched_world(busy, tail, final_marked):
+            rows = [
+                {
+                    "t": i * 1000,
+                    "writer_queue": 3,
+                    "reader_queue": 2,
+                    "background_tasks": 1,
+                    "journal_us": 100,
+                    "index_us": 100,
+                }
+                for i in range(busy)
+            ]
+            for i in range(tail):
+                rows.append({
+                    "t": (busy + i) * 1000,
+                    "writer_queue": final_marked if i == tail - 1 else 0,
+                    "reader_queue": 0,
+                    "background_tasks": 0,
+                    "journal_us": 100,
+                    "index_us": 100,
+                    "quiescent": True,
+                })
+            rows.append({"t": (busy + tail) * 1000, "event": "reconnect", "ok": True})
+            return rows
+
+        work_late = os.path.join(tmp, "work-late-quiesce.jsonl")
+        for row in stretched_world(busy=200, tail=3, final_marked=0):
+            _append_jsonl(work_late, row)
+        args.samples, args.workload = samples_good, work_late
+        report = build_report(args)
+        check("a late quiescent tail after a stretched noisy churn passes",
+              report, "passed")
+
+        work_late_stuck = os.path.join(tmp, "work-late-stuck.jsonl")
+        for row in stretched_world(busy=200, tail=3, final_marked=2):
+            _append_jsonl(work_late_stuck, row)
+        args.samples, args.workload = samples_good, work_late_stuck
+        report = build_report(args)
+        check("a late but non-draining quiescent tail still fails", report,
+              "failed", want_metric="writer_queue_zero")
+
         # Latency direction check: the baseline is the run's own best window.
         # One mild tail window (2.5x best) is shared-runner load and passes;
         # a single catastrophic tail spike (30x) fails; a breach sustained
@@ -1417,7 +1464,7 @@ def run_selftest():
     if failures:
         print(f"soak-convergence selftest: FAIL ({failures} case(s))", file=sys.stderr)
         return 1
-    print("soak-convergence selftest: PASS (converged world, leaky world, missing-sample, duration-band and load-aware budget matrices)")
+    print("soak-convergence selftest: PASS (converged world, leaky world, missing-sample, duration-band, stretched-quiescence-tail and load-aware budget matrices)")
     return 0
 
 
