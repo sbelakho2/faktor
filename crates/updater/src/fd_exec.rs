@@ -33,6 +33,9 @@ use crate::error::UpdateError;
 
 /// Execute `file` with the exact argv/envp a `Command` would have used.
 /// On success this never returns; a failure is a typed launch refusal.
+// The only unsafe code in this module: the fexecve handoff primitive.
+// Registered in the static-authority unsafe-location inventory (count 1).
+#[allow(unsafe_code)]
 pub(crate) fn exec_verified_fd(
     file: &File,
     argv: &[OsString],
@@ -61,7 +64,6 @@ pub(crate) fn exec_verified_fd(
     // NUL-terminated C strings kept alive across the call. fexecve either
     // replaces this process (and never returns) or returns -1 with errno set,
     // which is read immediately below.
-    #[allow(unsafe_code)]
     let outcome =
         unsafe { libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
     if outcome == -1 {
@@ -80,7 +82,9 @@ pub(crate) fn exec_verified_fd(
                 detail: format!("exec verified fd for {}: {first}", program.display()),
             });
         }
-        #[allow(unsafe_code)]
+        // SAFETY: `file` is the same live, fully-hashed descriptor; fcntl
+        // F_SETFD only manipulates this process's descriptor flags and
+        // returns -1 with errno set on failure (checked immediately).
         let cleared = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) };
         if cleared == -1 {
             let clear_error = std::io::Error::last_os_error();
@@ -91,7 +95,9 @@ pub(crate) fn exec_verified_fd(
                 ),
             });
         }
-        #[allow(unsafe_code)]
+        // SAFETY: identical preconditions to the first fexecve above:
+        // live hashed descriptor, NUL-terminated argv/envp kept alive; it
+        // either replaces the process or returns -1 with errno set.
         let retried =
             unsafe { libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
         if retried == -1 {
