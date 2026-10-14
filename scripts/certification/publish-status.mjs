@@ -568,55 +568,101 @@ async function selftest() {
   );
 
   // Platform publish mode: signs the description with the platform's own key
-  // and refuses a success without it.
-  const savedWindowsKey = process.env.faktor_platform_status_key_windows;
-  process.env.faktor_platform_status_key_windows = keys.windows;
-  try {
-    await publish({
-      api,
-      repo: 'acme/widgets',
-      sha,
-      state: 'success',
-      context: AGGREGATE_CONTEXTS.windows,
-      platform: 'windows',
-      tree,
-      runPrefix: '700',
-      token: 'selftest-token',
+  // and refuses a success without it. Both cases run the REAL CLI as a child
+  // process with an explicitly constructed environment: every ambient
+  // FAKTOR_PLATFORM_STATUS_KEY_* secret (e.g. the trusted status-publish
+  // lane's own three real keys) is scrubbed from the child env and only the
+  // key for the case under test is planted, so the selftest is hermetic
+  // whether the real secrets are present or absent. process.env is never
+  // mutated.
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const hermeticChildEnv = (extra = {}) => {
+    const env = { ...process.env };
+    for (const name of Object.keys(env)) {
+      if (/^FAKTOR_PLATFORM_STATUS_KEY_/i.test(name)) delete env[name];
+    }
+    return { ...env, ...extra };
+  };
+  // Async on purpose: the fixture API server of this selftest lives in THIS
+  // process, so a blocking spawnSync would deadlock on the child's POST.
+  const runPublisherChild = (env) =>
+    new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [
+          fileURLToPath(import.meta.url),
+          'publish',
+          '--api', api,
+          '--repo', 'acme/widgets',
+          '--sha', sha,
+          '--state', 'success',
+          '--context', AGGREGATE_CONTEXTS.windows,
+          '--platform', 'windows',
+          '--tree', tree,
+          '--run-prefix', '700',
+        ],
+        { env, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => (stdout += chunk));
+      child.stderr.on('data', (chunk) => (stderr += chunk));
+      const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        resolve({ status: 1, stdout, stderr: `spawn-unavailable: ${error.message}` });
+      });
+      child.on('close', (status) => {
+        clearTimeout(timer);
+        resolve({ status, stdout, stderr });
+      });
     });
-    const posted = JSON.parse(requests.at(-1).body);
-    const facts = platformFacts({ description: posted.description });
-    check(
-      'platform publish signs the constructed description',
-      facts.tree === tree &&
-        facts.run === '700:windows' &&
-        facts.sig === platformSignature({ platform: 'windows', sha, tree, run: '700:windows', state: 'success', context: AGGREGATE_CONTEXTS.windows }, keys.windows),
-      posted.description,
-    );
-  } finally {
-    if (savedWindowsKey === undefined) delete process.env.faktor_platform_status_key_windows;
-    else process.env.faktor_platform_status_key_windows = savedWindowsKey;
-  }
+
   const netBeforePlatform = requests.length;
-  try {
-    await publish({
-      api,
-      repo: 'acme/widgets',
-      sha,
-      state: 'success',
-      context: AGGREGATE_CONTEXTS.windows,
-      platform: 'windows',
-      tree,
-      runPrefix: '700',
-      token: 'selftest-token',
-    });
-    check('platform publish without its own key refuses (fail closed)', false);
-  } catch (error) {
-    check(
-      'platform publish without its own key refuses (fail closed)',
-      String(error.message).includes('github-status-platform-key-missing'),
-    );
-  }
-  check('platform key refusal makes no request', requests.length === netBeforePlatform);
+  const planted = await runPublisherChild(
+    hermeticChildEnv({
+      GITHUB_STATUS_TOKEN: 'selftest-token',
+      faktor_platform_status_key_windows: keys.windows,
+    }),
+  );
+  const plantedPost = requests.length === netBeforePlatform + 1 ? JSON.parse(requests.at(-1).body) : null;
+  const plantedFacts = plantedPost ? platformFacts(plantedPost) : { tree: null, run: null, sig: null };
+  check(
+    'platform publish signs the constructed description',
+    planted.status === 0 &&
+      plantedPost !== null &&
+      plantedPost.context === AGGREGATE_CONTEXTS.windows &&
+      plantedPost.state === 'success' &&
+      plantedFacts.tree === tree &&
+      plantedFacts.run === '700:windows' &&
+      plantedFacts.sig ===
+        platformSignature(
+          { platform: 'windows', sha, tree, run: '700:windows', state: 'success', context: AGGREGATE_CONTEXTS.windows },
+          keys.windows,
+        ),
+    planted.status === 0 ? (plantedPost ? plantedPost.description : 'no request recorded') : String(planted.stderr || '').trim(),
+  );
+
+  // Refusal: the scrubbed child env carries only the OTHER platforms' keys,
+  // so this asserts "no key of its OWN", not merely "empty environment": a
+  // publisher holding linux/darwin credentials must never be able to publish
+  // a windows success, and the typed refusal happens before any request.
+  const netBeforeRefusal = requests.length;
+  const refused = await runPublisherChild(
+    hermeticChildEnv({
+      GITHUB_STATUS_TOKEN: 'selftest-token',
+      faktor_platform_status_key_linux: 'selftest-linux-key',
+      faktor_platform_status_key_darwin: 'selftest-darwin-key',
+    }),
+  );
+  check(
+    'platform publish without its own key refuses (fail closed)',
+    refused.status !== 0 &&
+      `${refused.stdout || ''}${refused.stderr || ''}`.includes('github-status-platform-key-missing'),
+    refused.status === 0 ? 'published' : String(refused.stderr || '').trim(),
+  );
+  check('platform key refusal makes no request', requests.length === netBeforeRefusal);
 
   // Polling: empty at first, complete after one sleep -> aggregate success,
   // and the published context/state are the aggregate ones.
