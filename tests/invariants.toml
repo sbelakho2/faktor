@@ -2276,3 +2276,18 @@ mutation_command = "node scripts/mutation-run.mjs INV-FINDING-PROVIDER-IDENTITY"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SANDBOX-FIRST-RUN-AUDIT-CONFIRMED"
+statement = "A durable sandbox first-run decision is effective only when confirmed by its exact append-only audit entry (event, choice, timestamp, platform, backend fact and trade-off): a hand-forged or field-flipped decision document is refused loudly and the fail-closed default remains in force, and both files are read through hard byte bounds."
+owner = "crates/cli sandbox first-run choice"
+authority = "crates/cli/src/config/first_run.rs audit_confirms + record_decision (audit-before-document)"
+script_check = ""
+unit_test = "a_forged_or_flipped_decision_document_grants_nothing"
+production_wiring = "oversized_decision_and_audit_files_fail_closed"
+fault = ""
+mutation_witness = "a_forged_or_flipped_decision_document_grants_nothing"
+mutation_command = "node scripts/mutation-run.mjs INV-SANDBOX-FIRST-RUN-AUDIT-CONFIRMED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

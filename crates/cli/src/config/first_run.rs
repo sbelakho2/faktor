@@ -21,7 +21,13 @@
 //! explicit `[sandbox] shell` config, which always wins and is reported as
 //! the explicit-config state). A corrupt or hostile decision file is a loud
 //! error and the effective state stays fail-closed — the fail-closed
-//! default is never weakened by a bad record.
+//! default is never weakened by a bad record. The decision document is
+//! confirmed against the append-only audit trail on every read (the exact
+//! choice, timestamp, platform, backend fact and trade-off must match one
+//! entry), so editing the JSON alone — a hand-forged or flipped grant —
+//! grants nothing. Both files are read through hard byte bounds (the
+//! decision document 64 KiB, the scanned trail 4 MiB): a hostile
+//! multi-gigabyte file is refused, never pulled into memory.
 //!
 //! Where a real backend exists (Linux namespaces) nothing is faked: the
 //! choice still records exactly what the operator asked for, and the spawn
@@ -37,9 +43,22 @@ pub const SANDBOX_FIRST_RUN_FILE: &str = "sandbox-first-run.json";
 /// The append-only audit file under the data dir (JSON lines).
 pub const SANDBOX_FIRST_RUN_AUDIT_FILE: &str = "sandbox-first-run-audit.jsonl";
 
-/// Rotation bound: the audit file holds at most this many bytes before the
-/// single `.1` rotation, so the whole audit trails stay bounded at ~2×.
+/// Rotation bound: the audit file holds at most this many bytes before
+/// being compacted in place (the retained complete-line tail plus the new
+/// entry), so the trail stays bounded without sidecar files.
 const AUDIT_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Hard bound on the decision document bytes: a legitimate record is a few
+/// hundred bytes; anything larger is not one and is refused WITHOUT being
+/// read into memory (a hostile multi-gigabyte file must never OOM the
+/// daemon at startup or in doctor).
+const DECISION_MAX_BYTES: u64 = 64 * 1024;
+
+/// Hard bound on the audit bytes scanned to confirm a record. The live
+/// trail is compacted at [`AUDIT_MAX_BYTES`], so a much larger file is
+/// hostile or corrupt: it is refused unread instead of being pulled
+/// wholesale into memory.
+const AUDIT_CONFIRM_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Schema version of the decision document; only 1 is accepted.
 pub const SANDBOX_FIRST_RUN_VERSION: u32 = 1;
@@ -185,16 +204,53 @@ pub fn audit_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SANDBOX_FIRST_RUN_AUDIT_FILE)
 }
 
-/// Read the durable decision. `Ok(None)` when none exists; a corrupt or
-/// schema-mismatched document is a typed error (the caller keeps the
-/// fail-closed default and surfaces the refusal).
+/// Read at most `cap` bytes, refusing (never truncating) anything larger.
+/// The file's own metadata is only a hint: the READ itself is capped, so a
+/// stat-size-zero stream file or a file growing mid-read can never exceed
+/// the bound (the bounded-read rule of audit 50e2dca).
+fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = file.take(cap + 1);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!(
+            "{}: larger than the {cap}-byte bound; refusing to read it",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// TRUE when `path` exists as a REGULAR file; `Ok(false)` when nothing is
+/// there. Anything else (a symlink, FIFO, socket or device) is hostile
+/// input at these artifact paths: refusing it typed keeps a planted FIFO
+/// from blocking every daemon start and a planted symlink from redirecting
+/// a read or write.
+fn regular_file(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "{}: not a regular file (refusing symlinks, FIFOs, sockets and devices)",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Read the durable decision. `Ok(None)` when none exists; a corrupt,
+/// oversized, non-regular or schema-mismatched document is a typed error
+/// (the caller keeps the fail-closed default and surfaces the refusal).
 pub fn load_decision(data_dir: &Path) -> Result<Option<SandboxFirstRunRecord>, String> {
     let path = decision_path(data_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+    if !regular_file(&path)? {
+        return Ok(None);
+    }
+    let bytes = read_bounded(&path, DECISION_MAX_BYTES)?;
     let record: SandboxFirstRunRecord =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if record.version != SANDBOX_FIRST_RUN_VERSION {
@@ -207,9 +263,66 @@ pub fn load_decision(data_dir: &Path) -> Result<Option<SandboxFirstRunRecord>, S
     Ok(Some(record))
 }
 
-/// Record an explicit operator choice: durable decision document (atomic
-/// replace) plus one append-only audit line, both fsynced. Returns the
-/// stored record.
+/// The audit event name of one choice: shared by the writer and the
+/// confirmation read, so a record must be backed by the event for ITS OWN
+/// choice (a flipped `choice` field can never reuse the other event).
+fn audit_event(choice: SandboxShellChoice) -> &'static str {
+    match choice {
+        SandboxShellChoice::FailClosed => "sandbox_choice_fail_closed_recorded",
+        SandboxShellChoice::NetworkCapableUserGranted => "sandbox_network_capable_shell_granted",
+    }
+}
+
+/// Confirm a decision document against the append-only trail: one entry
+/// must match its exact event, choice, timestamp, platform, backend fact
+/// and trade-off text. A document that matches no entry is UNTRUSTED — the
+/// caller keeps the fail-closed default and reports the refusal, so editing
+/// the JSON alone (a hand-forged or flipped grant) can never take effect.
+/// The scan is byte-bounded ([`AUDIT_CONFIRM_MAX_BYTES`]).
+fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(), String> {
+    let path = audit_path(data_dir);
+    let trail_problem = |detail: String| {
+        format!(
+            "the decision document {} has no auditable trail: {detail}; keeping the \
+             fail-closed default",
+            decision_path(data_dir).display()
+        )
+    };
+    match regular_file(&path) {
+        Ok(true) => {}
+        Ok(false) => return Err(trail_problem(format!("{} is absent", path.display()))),
+        Err(e) => return Err(trail_problem(e)),
+    }
+    let bytes = read_bounded(&path, AUDIT_CONFIRM_MAX_BYTES).map_err(trail_problem)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let expected_event = audit_event(record.choice);
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<SandboxFirstRunAuditEntry>(line) else {
+            continue;
+        };
+        if entry.event == expected_event
+            && entry.choice == record.choice
+            && entry.decided_at_ms == record.decided_at_ms
+            && entry.platform == record.platform
+            && entry.network_backend_available == record.network_backend_available
+            && entry.trade_off == record.trade_off
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "the decision document {} matches no audit entry in {} (an operator decision is \
+         confirmed only by its append-only record); refusing it and keeping the fail-closed \
+         default",
+        decision_path(data_dir).display(),
+        path.display(),
+    ))
+}
+
+/// Record an explicit operator choice: one append-only audit line FIRST
+/// (fsynced), then the durable decision document (atomic replace), so a
+/// readable decision is always backed by its trail. Returns the stored
+/// record.
 pub fn record_decision(
     data_dir: &Path,
     choice: SandboxShellChoice,
@@ -230,9 +343,15 @@ pub fn record_decision(
         },
     };
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
+    // The audit line lands FIRST: a decision document is only ever read as
+    // an operator decision when its append-only entry already exists, so a
+    // forged document alone can never grant anything. A crash between the
+    // two writes leaves an audit entry with the PREVIOUS (or no) decision
+    // document — the effective state stays exactly what it was, never a
+    // half grant.
+    append_audit(data_dir, &record)?;
     faktor_fs::atomic::atomic_replace(&decision_path(data_dir), &bytes)
         .map_err(|e| format!("{}: {e}", decision_path(data_dir).display()))?;
-    append_audit(data_dir, &record)?;
     Ok(record)
 }
 
@@ -243,12 +362,7 @@ pub fn record_decision(
 fn append_audit(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(), String> {
     let path = audit_path(data_dir);
     let entry = SandboxFirstRunAuditEntry {
-        event: match record.choice {
-            SandboxShellChoice::FailClosed => "sandbox_choice_fail_closed_recorded".to_string(),
-            SandboxShellChoice::NetworkCapableUserGranted => {
-                "sandbox_network_capable_shell_granted".to_string()
-            }
-        },
+        event: audit_event(record.choice).to_string(),
         choice: record.choice,
         decided_at_ms: record.decided_at_ms,
         platform: record.platform.clone(),
@@ -257,18 +371,32 @@ fn append_audit(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(), S
         pid: std::process::id(),
     };
     let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
+    regular_file(&path)?;
     let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if existing_len > AUDIT_MAX_BYTES {
         // Compact through the fs-atomic authority (never a hand-rolled
         // rename): keep the most recent half-bound of complete lines plus
         // the new entry, so the trail stays bounded while recent history
-        // survives.
-        let content = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let keep_from = content.len().saturating_sub((AUDIT_MAX_BYTES / 2) as usize);
-        let cut = content[keep_from..]
+        // survives. Only a BOUNDED TAIL of the file is ever read: the
+        // retention window is at most half the bound plus one byte, and
+        // trimming to the first newline inside it drops the possibly
+        // partial leading line — a hostile oversized audit file is never
+        // pulled into memory.
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let window = (AUDIT_MAX_BYTES / 2) as usize + 1;
+        let start = existing_len.saturating_sub(window as u64);
+        let mut file =
+            std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut content = Vec::new();
+        file.take(window as u64)
+            .read_to_end(&mut content)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let cut = content
             .iter()
             .position(|byte| *byte == b'\n')
-            .map(|offset| keep_from + offset + 1)
+            .map(|offset| offset + 1)
             .unwrap_or(content.len());
         let retained = String::from_utf8_lossy(&content[cut..]);
         let mut compacted = String::with_capacity(retained.len() + line.len() + 1);
@@ -292,13 +420,19 @@ fn append_audit(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(), S
 }
 
 /// Inspect the first-run state WITHOUT mutating the config: reads the
-/// durable record and combines it with the config's explicit `shell` value.
-/// A corrupt record yields a `Pending`/`FailClosed` state with
-/// `corrupt_reason` set — never a grant.
+/// durable record, CONFIRMS it against the append-only audit trail, and
+/// combines it with the config's explicit `shell` value. A corrupt,
+/// oversized or unconfirmed record yields a `Pending`/`FailClosed` state
+/// with `corrupt_reason` set — never a grant, and never a record presented
+/// as recorded.
 pub fn inspect(data_dir: &Path, config: &crate::config::Config) -> SandboxFirstRunState {
     let backend_available = network_backend_available();
     let (record, corrupt_reason) = match load_decision(data_dir) {
-        Ok(record) => (record, None),
+        Ok(Some(record)) => match audit_confirms(data_dir, &record) {
+            Ok(()) => (Some(record), None),
+            Err(reason) => (None, Some(reason)),
+        },
+        Ok(None) => (None, None),
         Err(reason) => (None, Some(reason)),
     };
     let decision = if config.sandbox.shell.is_some() {

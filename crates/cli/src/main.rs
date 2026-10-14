@@ -812,6 +812,19 @@ pub(crate) fn sandbox_command(
                 std::env::consts::OS,
                 state.backend_available,
             );
+            println!(
+                "decision document: {}",
+                config::decision_path(&data_dir).display()
+            );
+            println!("audit trail: {}", config::audit_path(&data_dir).display());
+            if let Some(reason) = &state.corrupt_reason {
+                // An unconfirmed or unreadable document is NEVER printed as
+                // a recorded decision: the state above already resolves
+                // fail-closed, and the loud reason tells the operator what
+                // to fix.
+                eprintln!("faktor sandbox: decision unreadable: {reason}");
+                std::process::exit(1);
+            }
             if let Some(record) = &state.record {
                 println!(
                     "recorded decision: choice={} at_ms={} platform={} backend_available={}",
@@ -824,17 +837,8 @@ pub(crate) fn sandbox_command(
                     println!("recorded trade-off: {}", record.trade_off);
                 }
             }
-            println!(
-                "decision document: {}",
-                config::decision_path(&data_dir).display()
-            );
-            println!("audit trail: {}", config::audit_path(&data_dir).display());
             if let Some(text) = config::startup_notice(&state, &data_dir) {
                 println!("{text}");
-            }
-            if let Some(reason) = &state.corrupt_reason {
-                eprintln!("faktor sandbox: decision unreadable: {reason}");
-                std::process::exit(1);
             }
         }
         SandboxAction::Choose {
