@@ -385,18 +385,30 @@ parse_counts() { # log -> "executed passed failed"
 # churn/realtime modes are REAL wall-clock targets: a successful round that
 # finished before the target extends the campaign (bounded by MAX_ROUNDS)
 # instead of ending early. `round`/`start_epoch`/`TARGET_SECONDS` are visible
-# through bash dynamic scoping. The elapsed accounting uses the workload's
-# clock class (CLOCK_MONOTONIC, see budget_elapsed) so a realtime clock step
-# on an emulated/VM runner cannot prematurely end the campaign; the reported
-# campaign duration stays realtime and is judged by the load-aware budget.
+# through bash dynamic scoping. The campaign may stop only when the target
+# window is satisfied in BOTH clock classes:
+#   * the workload's own clock (CLOCK_MONOTONIC, see budget_elapsed) — a
+#     realtime clock step on an emulated/VM runner must not be credited as
+#     sustained work;
+#   * REAL wall time (campaign_real_elapsed) — the clock class the reported
+#     campaign duration and `duration_target_met` are judged in, so a host
+#     whose CLOCK_MONOTONIC runs slightly AHEAD of CLOCK_REALTIME (measured
+#     1805 s monotonic vs 1794 s realtime on the trusted runner: the
+#     pipeline-75 class) can no longer end the campaign a few seconds under
+#     the real band with every convergence metric green.
+# The wall-budget accounting itself stays in the workload's clock class, so
+# a realtime step cannot prematurely exhaust the budget the checker's
+# load-aware derivation re-widens from the same-run clock control.
 maybe_extend_rounds() {
   local mode="${1:-$MODE}"
   if [ "$mode" != churn ] && [ "$mode" != realtime ]; then
     return 0
   fi
-  local elapsed
-  elapsed="$(budget_elapsed)"
-  if [ "$elapsed" -lt "$TARGET_SECONDS" ] && [ "$round" -lt "$MAX_ROUNDS" ]; then
+  local mono_elapsed real_time
+  mono_elapsed="$(budget_elapsed)"
+  real_time="$(campaign_real_elapsed)"
+  if { [ "$mono_elapsed" -lt "$TARGET_SECONDS" ] || [ "$real_time" -lt "$TARGET_SECONDS" ]; } &&
+    [ "$round" -lt "$MAX_ROUNDS" ]; then
     ROUNDS=$((ROUNDS + 1))
   fi
 }
@@ -416,6 +428,15 @@ budget_elapsed() {
       return 0
     fi
   fi
+  printf '%s' "$(( $(date +%s) - start_epoch ))"
+}
+
+# Real wall-clock seconds since the campaign started: the clock class of the
+# reported `duration_seconds` and of `duration_target_met`. Kept separate
+# from budget_elapsed (CLOCK_MONOTONIC) because the two genuinely drift apart
+# on emulated/VM runners and the campaign must satisfy BOTH before it may
+# stop (see maybe_extend_rounds).
+campaign_real_elapsed() {
   printf '%s' "$(( $(date +%s) - start_epoch ))"
 }
 
@@ -866,9 +887,17 @@ run_command() {
   # Scale-/convergence-awareness hook: the effective multiplier, mode, real
   # target and the convergence paths are visible to the test processes. The
   # bounded calibration workload is selected by its turn count (fixed work).
+  # The remaining target is the LARGER of the two clock-class deficits (the
+  # workload churns monotonic seconds; on a monotonic-ahead host the real
+  # deficit is the larger one, on a realtime-step host the monotonic one),
+  # so one extension round closes the gap in both classes.
   local target_left=0
   if [ "$CONVERGENCE" = required ]; then
-    target_left=$((TARGET_SECONDS - $(budget_elapsed)))
+    local mono_left real_left
+    mono_left=$((TARGET_SECONDS - $(budget_elapsed)))
+    real_left=$((TARGET_SECONDS - $(campaign_real_elapsed)))
+    target_left="$mono_left"
+    [ "$real_left" -gt "$target_left" ] && target_left="$real_left"
     [ "$target_left" -ge 1 ] || target_left=1
   fi
   local calibration_env=""
@@ -1001,6 +1030,27 @@ else
 fi
 SHIM
   chmod +x "$tmp/fakebin/date"
+  # Monotonic-ahead seam (selftest only): a passthrough python3 that scales
+  # ONLY the driver's monotonic-now one-liner when FAKE_MONO_SCALE is set,
+  # modelling a runner whose CLOCK_MONOTONIC runs AHEAD of CLOCK_REALTIME
+  # (the trusted runner measured 1805 s monotonic vs 1794 s realtime: the
+  # pipeline-75 warm-run class). Everything else (sampler, budget, checker)
+  # still runs through the real python.
+  REAL_PYTHON="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
+  cat >"$tmp/fakebin/python3" <<'SHIM'
+#!/bin/sh
+REAL_PYTHON="__FAKE_REAL_PYTHON__"
+if [ "${1:-}" = "-c" ] && [ "${2:-}" = "import time; print(int(time.monotonic()))" ] &&
+  [ -n "${FAKE_MONO_SCALE:-}" ]; then
+  now="$("$REAL_PYTHON" -c 'import time; print(int(time.monotonic()))')"
+  awk -v n="$now" -v s="$FAKE_MONO_SCALE" 'BEGIN { printf "%d\n", n * s }'
+  exit 0
+fi
+exec "$REAL_PYTHON" "$@"
+SHIM
+  sed "s|__FAKE_REAL_PYTHON__|$REAL_PYTHON|" "$tmp/fakebin/python3" >"$tmp/fakebin/python3.tmp"
+  mv "$tmp/fakebin/python3.tmp" "$tmp/fakebin/python3"
+  chmod +x "$tmp/fakebin/python3"
 
   field() { # file key
     grep -o "\"$2\":[^,}]*" "$1" 2>/dev/null | head -n 1 | sed 's/^[^:]*://' | tr -d '"'
@@ -1209,11 +1259,53 @@ SHIM
   check "adapted-budget failure is convergence-failed" "$(contains "$out/soak.json" 'convergence-failed' && echo 0 || echo 1)"
   check "adapted budget was active in the failed run" "$([ "$(field "$out/soak.json" wall_budget_seconds)" = 48 ] && echo 0 || echo 1)"
 
+  # 15. Monotonic-ahead runner (the pipeline-75 warm-run class): the
+  # workload's CLOCK_MONOTONIC advances faster than real wall time, so an
+  # extension rule that only credits the workload clock stops the campaign
+  # seconds under the REAL duration band while every convergence metric is
+  # green (measured: 1805 s monotonic vs 1794 s realtime, band failed at
+  # 1795 s / 1800 s). The campaign must keep running until the real band
+  # clock reaches the target too; early metric convergence is never an exit.
+  out="$tmp/out-mono-ahead"
+  conv_samples="$tmp/mono-ahead-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-mono-ahead.log" FAKE_CARGO_MODE=metrics-good \
+  FAKE_CARGO_SLEEP=2 FAKTOR_SOAK_PYTHON="$tmp/fakebin/python3" \
+  FAKE_MONO_SCALE=2 FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    bash "$SELF" --mode churn --churn-seconds 6 --max-wall-seconds 120 \
+    --test-timeout-seconds 60 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/mono.stdout" 2>"$tmp/mono.stderr"
+  rc=$?
+  check "monotonic-ahead runner still meets the real duration band" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+  check "monotonic-ahead run records no failed metric" \
+    "$(contains "$out/soak-convergence.json" '"failed_metrics": \[\]' && echo 0 || echo 1)"
+  check "campaign extended past the workload-clock stop point" \
+    "$([ "$(field "$out/soak.json" rounds)" -ge 2 ] && echo 0 || echo 1)"
+
+  # 16. Truncation below the documented minimum stays a failure: the round
+  # cap is pinned to 1 and the single round is shorter than the target, so
+  # the campaign cannot sustain the workload for the band. The extension
+  # keeps the target; it never deletes or weakens it.
+  out="$tmp/out-truncated"
+  conv_samples="$tmp/truncated-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-truncated.log" FAKE_CARGO_MODE=metrics-good \
+  FAKE_CARGO_SLEEP=2 FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    bash "$SELF" --mode churn --churn-seconds 10 --max-rounds 1 \
+    --max-wall-seconds 120 --test-timeout-seconds 60 --sample-interval 0.2 \
+    --convergence required --lane soak-smoke --cargo-bin "$tmp/fake-cargo" \
+    --out-dir "$out" -p faktor-tests-soak --release -- --ignored \
+    >"$tmp/trunc.stdout" 2>"$tmp/trunc.stderr"
+  rc=$?
+  check "a workload truncated below the target still fails" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "truncation fails the duration band, not a skip" \
+    "$(contains "$out/soak.json" 'duration_target_met' && contains "$out/soak.json" 'convergence-failed' && echo 0 || echo 1)"
+  check "truncated run never records passed" "$([ "$(field "$out/soak.json" status)" = failed ] && echo 0 || echo 1)"
+
   if [ "$failures" -gt 0 ]; then
     echo "soak selftest: FAIL ($failures case(s))" >&2
     return 1
   fi
-  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals; convergence metric algebra pass/fail/missing/duration; churn integration passes only on all-metrics-converged evidence; load-aware budget: same-run controls widen it under injected wall-clock stretch, the derived budget and convergence invariants keep their teeth)"
+  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals; convergence metric algebra pass/fail/missing/duration; churn integration passes only on all-metrics-converged evidence; load-aware budget: same-run controls widen it under injected wall-clock stretch, the derived budget and convergence invariants keep their teeth; duration band: a monotonic-ahead runner extends until the real band is met and a truncated workload still fails)"
   return 0
 }
 

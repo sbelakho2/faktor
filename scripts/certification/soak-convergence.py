@@ -38,7 +38,15 @@
 #        journal_latency_no_upward_trend
 #        index_latency_no_upward_trend
 #        reconnect_correct
-#        duration_target_met              (when --target-seconds is supplied)
+#        duration_target_met              (when --target-seconds is supplied;
+#                                          REAL wall-clock seconds of the
+#                                          campaign, the clock class the
+#                                          runner extends rounds in — a
+#                                          monotonic clock running ahead of
+#                                          realtime must not end the campaign
+#                                          under the band; early metric
+#                                          convergence is recorded, never an
+#                                          exit)
 #
 #      Missing samples for a metric are a FAILED metric
 #      (`missing-metric-samples`), never a skip: the samplers above exist and
@@ -960,12 +968,26 @@ def build_report(args):
         elapsed = args.elapsed_seconds if args.elapsed_seconds is not None else 0
         # The lane's wall budget is the upper edge of the band; the target is
         # the lower edge (a real 30-60 min / 12-24 h run, never a stub).
+        # `elapsed` is REAL wall time: the runner keeps extending rounds until
+        # this clock ALSO reaches the target (a CLOCK_MONOTONIC running ahead
+        # of CLOCK_REALTIME once ended a campaign at 1795 s realtime after
+        # 1805 s monotonic with every other metric green — pipeline-75 class).
+        # The sampler's own monotonic span is recorded as evidence so the two
+        # clock classes are comparable in the report.
         lower = args.target_seconds
         passed = elapsed >= lower and (args.max_seconds is None or elapsed <= args.max_seconds)
+        mono_pairs = [
+            record["mono_ms"] for record in samples
+            if isinstance(record.get("mono_ms"), (int, float))
+        ]
+        sampler_monotonic_seconds = None
+        if len(mono_pairs) >= 2:
+            sampler_monotonic_seconds = (mono_pairs[-1] - mono_pairs[0]) / 1000.0
         metrics.append(metric(
             "duration_target_met", passed,
             {"elapsed_seconds": elapsed, "target_seconds": lower,
-             "max_seconds": args.max_seconds},
+             "max_seconds": args.max_seconds,
+             "sampler_monotonic_seconds": sampler_monotonic_seconds},
             {"elapsed_seconds": f">= {lower}"},
             {"lane": args.lane, "mode": args.mode},
             reason="" if passed else "campaign-duration-out-of-band",
