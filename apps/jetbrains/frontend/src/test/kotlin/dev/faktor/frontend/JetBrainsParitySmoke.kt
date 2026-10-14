@@ -1612,7 +1612,7 @@ object JetBrainsParitySmoke {
                 assertEquals(3L, model.metrics?.runs)
                 assertEquals("Successful-Run Cost", model.metricRows.first().name)
                 assertTrue(model.metricNames().contains("Local-Final Verified Rate"))
-                assertTrue(model.metricNames().contains("Local-to-Frontier Fallback Rate"))
+                assertTrue(model.metricNames().contains("Local-to-Hosted Fallback Rate"))
                 assertEquals("not measured", model.metricValue("Avoided Hosted Inference"))
             }
             // The executable parity matrix runs NOW, inside the live

@@ -201,6 +201,10 @@ fn real_writer_prunes_the_numeric_oldest_under_equal_mtimes() {
     drop(Store::open(dir.path(), true).unwrap());
     for _ in 0..3 {
         let conn = Connection::open(&db).unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE cost_reservation DROP COLUMN execution_class",
+            [],
+        );
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
         drop(conn);
@@ -228,6 +232,10 @@ fn real_writer_prunes_the_numeric_oldest_under_equal_mtimes() {
     }
     {
         let conn = Connection::open(&db).unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE cost_reservation DROP COLUMN execution_class",
+            [],
+        );
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
     }

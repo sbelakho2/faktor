@@ -4,45 +4,60 @@
 //! registry: the production adapter for the neutral
 //! [`faktor_core::contract_compile::SystemIntelligenceProvider`] seam.
 //!
-//! The adapter is strictly ADDITIVE and honest by construction:
+//! The adapter ASKS the registry's validated providers the fixed bounded
+//! engineering questions (`docs/specs/autonomous-engineering.md` § "System
+//! intelligence") and returns their answers as
+//! [`faktor_core::contract_compile::ProviderFinding`] DATA:
 //!
-//! - It reports ONLY what a registered provider has actually validated (a
-//!   handshake-validated descriptor: its covered operations and declared
-//!   tier / fidelity / completeness / evidence dimensions). A provider whose
-//!   descriptor is not validated yet is invisible here, exactly as it is to
-//!   selection and dispatch, and a fallback-only registry yields an EMPTY
-//!   enrichment — the native contract stays byte-identical.
-//! - Every statement is a bounded DISCLOSURE risk carrying the confidence
-//!   the shared intelligence mapping derives from the declared dimensions,
-//!   with `external:semantic` provenance attached by the compiler. It never
-//!   fabricates constraints, invariants or proof obligations on the
-//!   provider's behalf, and its findings are data: native evidence still
-//!   discharges the contract's claims.
-//! - [`SemanticIntelligenceAdapter::enrich`] is total: it never errors and
+//! - Questions are consulted through the registry's own guarded dispatch,
+//!   PINNED to the provider whose validated descriptor covers `context` and
+//!   `require_provider`-bound, so the generic fallback can never answer on a
+//!   provider's behalf and every response is identity-checked (provider,
+//!   schema, workspace, snapshot, entity refs, payload bounds, provenance).
+//! - Findings are bound to the request's repository digest and to the
+//!   provider's source revision; a snapshot/workspace/provenance mismatch,
+//!   an oversized answer or a refusal is dropped with a typed
+//!   [`FindingDiagnostic`] — never guessed into a claim.
+//! - Confidence is clamped by the confidence the shared intelligence mapping
+//!   derives from the provider's DECLARED evidence dimensions: a provider
+//!   that declared no fidelity contributes nothing (tier never launders
+//!   confidence).
+//! - [`SemanticIntelligenceAdapter::findings`] is total: it never errors and
 //!   never fails a turn; a missing, unvalidated or refusing provider simply
-//!   contributes nothing.
+//!   contributes nothing. The pure compiler stays byte-identical when no
+//!   findings arrive (Tangerine is never required).
 
 use std::sync::Arc;
 
-use faktor_core::contract::RiskSeverity;
 use faktor_core::contract_compile::{
-    EnrichmentKind, EnrichmentRequest, EnrichmentStatement, SystemIntelligenceProvider,
-    MAX_STATEMENT_BYTES,
+    FindingDiagnostic, FindingDiagnosticCode, FindingsRequest, FindingsResponse,
+    IntelligenceFuture, IntelligenceQuestion, ProviderFinding, SystemIntelligenceProvider,
+    MAX_FINDING_BASIS_BYTES, MAX_FINDING_DIAGNOSTICS, MAX_FINDING_REVISION_BYTES,
+    MAX_FINDING_TEXT_BYTES,
 };
 
 use crate::intelligence::{confidence_bps_for, ConfidenceDimensions};
 use crate::registry::SemanticProviderRegistry;
-use crate::types::{SemanticCapabilities, SemanticCompleteness, SemanticFidelity, SemanticOp};
+use crate::types::{
+    SemanticCall, SemanticCapabilities, SemanticCompleteness, SemanticContextItem,
+    SemanticContextRequest, SemanticError, SemanticFidelity, SemanticProviderDescriptor,
+    SemanticSnapshotId, SEMANTIC_SCHEMA_VERSION,
+};
 
 /// Stable provider id of the registry-level adapter: every enriched
-/// statement carries `external:semantic` provenance, and the BASIS names the
-/// concrete semantic provider the disclosure came from.
+/// statement carries `external:semantic` provenance, and the finding BASIS
+/// names the concrete semantic provider the answer came from.
 pub const SEMANTIC_ENRICHMENT_PROVIDER_ID: &str = "semantic";
 
+/// Hard bound on findings asked per question per provider.
+pub const MAX_FINDINGS_PER_QUESTION: usize = 8;
+/// Hard bound on one question response's bytes.
+pub const MAX_FINDINGS_QUERY_BYTES: usize = 16 * 1024;
+
 /// The production bridge from the daemon's semantic-provider registry to the
-/// contract compiler's neutral enrichment seam. Construct it over the SAME
+/// contract compiler's neutral findings seam. Construct it over the SAME
 /// `Arc<SemanticProviderRegistry>` the agent and server introspect (one
-/// authority), so the disclosure can never describe a registry the daemon is
+/// authority), so the answers can never describe a registry the daemon is
 /// not actually serving.
 pub struct SemanticIntelligenceAdapter {
     registry: Arc<SemanticProviderRegistry>,
@@ -57,6 +72,41 @@ impl SemanticIntelligenceAdapter {
     pub fn registry(&self) -> &Arc<SemanticProviderRegistry> {
         &self.registry
     }
+
+    /// The bounded `context` consult one question is asked through: pinned to
+    /// the provider whose identity the snapshot was derived from and
+    /// provider-required, so a fallback (or another provider) can never
+    /// answer a question whose identity describes this one.
+    fn question_request(
+        &self,
+        request: &FindingsRequest<'_>,
+        provider_id: &crate::types::SemanticProviderId,
+        snapshot_id: SemanticSnapshotId,
+        revision: &str,
+        question: IntelligenceQuestion,
+    ) -> SemanticContextRequest {
+        let mut call = SemanticCall::new(
+            request.operation_id,
+            request.session_id,
+            request.workspace,
+            request.started_ms,
+            request.cancellation.clone(),
+        )
+        .requiring_provider()
+        .pinned_to(provider_id.clone());
+        if let Some(deadline) = request.deadline {
+            call = call.with_deadline(deadline);
+        }
+        SemanticContextRequest {
+            call,
+            workspace: request.workspace,
+            source_revision: revision.to_string(),
+            snapshot_id,
+            query: question.query(request.goal),
+            max_items: MAX_FINDINGS_PER_QUESTION,
+            max_bytes: MAX_FINDINGS_QUERY_BYTES,
+        }
+    }
 }
 
 impl SystemIntelligenceProvider for SemanticIntelligenceAdapter {
@@ -64,77 +114,225 @@ impl SystemIntelligenceProvider for SemanticIntelligenceAdapter {
         SEMANTIC_ENRICHMENT_PROVIDER_ID
     }
 
-    /// One bounded disclosure per (validated provider, covered operation):
-    /// the declared intelligence surface, its evidence dimensions and the
-    /// confidence the shared mapping derives — never a fabricated claim.
-    fn enrich(&self, request: &EnrichmentRequest<'_>) -> Result<Vec<EnrichmentStatement>, String> {
-        let mut statements = Vec::new();
-        for provider in self.registry.providers() {
-            let Some(descriptor) = provider.validated_descriptor() else {
+    /// Ask every validated provider the fixed bounded question set. Answers
+    /// become bounded findings; every failure along the way becomes a typed
+    /// diagnostic and contributes nothing.
+    fn findings<'a>(
+        &'a self,
+        request: &'a FindingsRequest<'a>,
+    ) -> IntelligenceFuture<'a, Result<FindingsResponse, String>> {
+        Box::pin(async move {
+            let mut response = FindingsResponse::default();
+            let Some(revision) = request.source_revision else {
+                // Identity law: without a content revision there is no
+                // snapshot identity to bind questions to — never synthesize
+                // one, never ask.
+                push_diagnostic(
+                    &mut response,
+                    SEMANTIC_ENRICHMENT_PROVIDER_ID,
+                    FindingDiagnosticCode::RevisionUnavailable,
+                    format_args!(
+                        "no workspace content revision was established; no question was asked"
+                    ),
+                );
+                return Ok(response);
+            };
+            if request.max_findings == 0 || request.questions.is_empty() {
+                return Ok(response);
+            }
+            for provider in self.registry.providers() {
+                if response.findings.len() >= request.max_findings {
+                    break;
+                }
                 // Unvalidated (e.g. an external provider before its
                 // handshake): invisible, exactly like selection.
-                continue;
-            };
-            for op in SemanticOp::ALL {
-                if statements.len() >= request.max_statements {
-                    return Ok(statements);
-                }
-                if !descriptor.covers_validated(SemanticCapabilities::for_op(op)) {
+                let Some(descriptor) = provider.validated_descriptor() else {
+                    continue;
+                };
+                if !descriptor.covers_validated(SemanticCapabilities::CONTEXT) {
                     continue;
                 }
-                let dimensions = ConfidenceDimensions::new(
-                    descriptor.fidelity.unwrap_or(SemanticFidelity::None),
-                    descriptor
-                        .completeness
-                        .unwrap_or(SemanticCompleteness::Unknown),
-                    descriptor.evidence,
-                );
-                let confidence_bps = confidence_bps_for(&dimensions);
-                if confidence_bps == 0 {
+                let ceiling = declared_confidence_ceiling(&descriptor);
+                if ceiling == 0 {
                     // An undeclared fidelity pins confidence to zero: there
-                    // is no evidence claim to disclose.
+                    // is no trustworthy answer to hand the compiler.
                     continue;
                 }
-                let tier = descriptor
-                    .intelligence_tier()
-                    .map_or_else(|| "undeclared".to_string(), |tier| tier.raw().to_string());
-                let text = bounded(
-                    &format!(
-                        "external semantic provider `{}` declares {} intelligence (tier {tier}, fidelity {:?}, completeness {:?}) at confidence {confidence_bps} bps; its findings are data only and native evidence still discharges this contract's claims",
-                        provider.id(),
-                        op.as_str(),
-                        dimensions.fidelity,
-                        dimensions.completeness,
-                    ),
-                    MAX_STATEMENT_BYTES,
+                let provider_id = provider.id();
+                let snapshot_id = SemanticSnapshotId::derive(
+                    request.workspace,
+                    revision,
+                    &provider_id,
+                    provider.version(),
+                    SEMANTIC_SCHEMA_VERSION,
                 );
-                let basis = bounded(
-                    &format!(
-                        "handshake-validated semantic provider descriptor from `{}` covering {}",
-                        provider.id(),
-                        op.as_str()
-                    ),
-                    MAX_STATEMENT_BYTES,
-                );
-                statements.push(EnrichmentStatement {
-                    kind: EnrichmentKind::Risk,
-                    text,
-                    confidence_bps,
-                    basis,
-                    evidence: None,
-                    binding: None,
-                    severity: Some(RiskSeverity::Low),
-                    advisory: false,
-                });
+                for question in request.questions {
+                    if response.findings.len() >= request.max_findings {
+                        break;
+                    }
+                    let context_request = self.question_request(
+                        request,
+                        &provider_id,
+                        snapshot_id,
+                        revision,
+                        *question,
+                    );
+                    match self.registry.context(context_request).await {
+                        Ok(envelope) => {
+                            for item in &envelope.payload.items {
+                                if response.findings.len() >= request.max_findings {
+                                    break;
+                                }
+                                collect_item(
+                                    &mut response,
+                                    *question,
+                                    provider_id.as_str(),
+                                    revision,
+                                    snapshot_id,
+                                    request.repository_digest,
+                                    ceiling,
+                                    item,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            push_diagnostic(
+                                &mut response,
+                                provider_id.as_str(),
+                                diagnostic_code_for(&error),
+                                format_args!("question {} failed: {error}", question.as_str()),
+                            );
+                            // This provider cannot serve the consult (typed
+                            // identity/refusal/absence failure): try the next
+                            // registered provider instead of re-asking it.
+                            break;
+                        }
+                    }
+                }
             }
-        }
-        Ok(statements)
+            response.findings.truncate(request.max_findings);
+            Ok(response)
+        })
     }
 }
 
-/// Truncate `text` to at most `max` bytes on a character boundary (the
-/// compiler independently enforces the bound; this keeps the adapter from
-/// ever proposing a statement the compiler must skip).
+/// The confidence ceiling one provider's declared dimensions support. An
+/// absent fidelity/completeness declaration stays conservative (zero), so a
+/// finding can never claim more trust than the provider declared.
+fn declared_confidence_ceiling(descriptor: &SemanticProviderDescriptor) -> u16 {
+    confidence_bps_for(&ConfidenceDimensions::new(
+        descriptor.fidelity.unwrap_or(SemanticFidelity::None),
+        descriptor
+            .completeness
+            .unwrap_or(SemanticCompleteness::Unknown),
+        descriptor.evidence,
+    ))
+}
+
+/// Convert one retrieved context item into a bounded finding, or a typed
+/// diagnostic when the answer cannot be honestly disclosed.
+#[allow(clippy::too_many_arguments)]
+fn collect_item(
+    response: &mut FindingsResponse,
+    question: IntelligenceQuestion,
+    provider_id: &str,
+    revision: &str,
+    snapshot_id: SemanticSnapshotId,
+    repository_digest: &str,
+    ceiling: u16,
+    item: &SemanticContextItem,
+) {
+    let excerpt = item.excerpt.trim();
+    if excerpt.is_empty() {
+        return;
+    }
+    if excerpt.len() > MAX_FINDING_TEXT_BYTES {
+        push_diagnostic(
+            response,
+            provider_id,
+            FindingDiagnosticCode::Oversized,
+            format_args!(
+                "question {} answer of {} bytes exceeds the {MAX_FINDING_TEXT_BYTES}-byte finding bound",
+                question.as_str(),
+                excerpt.len()
+            ),
+        );
+        return;
+    }
+    let relevance = item.relevance_bps.min(10_000) as u16;
+    let confidence_bps = relevance.min(ceiling);
+    if confidence_bps == 0 {
+        return;
+    }
+    let basis = bounded(
+        &format!(
+            "semantic provider {provider_id} answered question {} at {} (relevance {relevance} bps, snapshot {}, revision {revision})",
+            question.as_str(),
+            item.entity.path,
+            snapshot_id.to_hex(),
+        ),
+        MAX_FINDING_BASIS_BYTES,
+    );
+    response.findings.push(ProviderFinding {
+        question,
+        kind: question.expected_kind(),
+        text: excerpt.to_string(),
+        basis,
+        confidence_bps,
+        repository_digest: repository_digest.to_string(),
+        provider: SEMANTIC_ENRICHMENT_PROVIDER_ID.to_string(),
+        revision: Some(bounded(revision, MAX_FINDING_REVISION_BYTES)),
+        severity: None,
+    });
+}
+
+/// The typed diagnostic code of one semantic failure. Snapshot/workspace/
+/// provenance violations are their own codes; oversized payloads are
+/// `Oversized`; absence is `ProviderUnavailable`; caller deadlines and
+/// provider watchdogs are `ProviderTimedOut`.
+fn diagnostic_code_for(error: &SemanticError) -> FindingDiagnosticCode {
+    match error {
+        SemanticError::SnapshotMismatch { .. } => FindingDiagnosticCode::SnapshotMismatch,
+        SemanticError::Oversized { .. } => FindingDiagnosticCode::Oversized,
+        SemanticError::Cancelled { .. } | SemanticError::ProviderRequired { .. } => {
+            FindingDiagnosticCode::ProviderUnavailable
+        }
+        SemanticError::DeadlineExceeded { .. } | SemanticError::ProviderTimeout { .. } => {
+            FindingDiagnosticCode::ProviderTimedOut
+        }
+        SemanticError::ProviderCrashed { .. } | SemanticError::ProviderFailed { .. } => {
+            FindingDiagnosticCode::ProviderRefused
+        }
+        SemanticError::Malformed(_)
+        | SemanticError::WorkspaceMismatch { .. }
+        | SemanticError::UnsupportedSchema { .. }
+        | SemanticError::InvalidEntityRef(_)
+        | SemanticError::DuplicateEntity(_)
+        | SemanticError::Refused(_)
+        | SemanticError::PathTraversal(_)
+        | SemanticError::StaleHash { .. }
+        | SemanticError::ProviderMismatch { .. }
+        | SemanticError::InvalidIntelligenceTier { .. } => FindingDiagnosticCode::InvalidProvenance,
+    }
+}
+
+/// Append one bounded typed diagnostic, capped at [`MAX_FINDING_DIAGNOSTICS`]
+/// (a diagnostic flood must never grow memory).
+fn push_diagnostic(
+    response: &mut FindingsResponse,
+    provider: &str,
+    code: FindingDiagnosticCode,
+    detail: std::fmt::Arguments<'_>,
+) {
+    if response.diagnostics.len() >= MAX_FINDING_DIAGNOSTICS {
+        return;
+    }
+    response
+        .diagnostics
+        .push(FindingDiagnostic::new(provider, code, detail.to_string()));
+}
+
+/// Truncate `text` to at most `max` bytes on a character boundary.
 fn bounded(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -150,40 +348,127 @@ fn bounded(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::fallback::GenericSemanticFallback;
-    use crate::test_support::provider_id;
-    use crate::types::{SemanticProvider, SemanticProviderDescriptor, SEMANTIC_SCHEMA_VERSION};
+    use crate::test_support::{block_on, provider_id};
+    use crate::types::{
+        BoxFuture, SemanticContextPack, SemanticEntityId, SemanticEntityRef, SemanticEnvelope,
+        SemanticProvider, SemanticProviderDescriptor, SemanticProviderId, WorkspacePath,
+    };
+
     use faktor_core::contract::EngineeringContract;
     use faktor_core::contract_compile::{
-        compile_contract, compile_contract_with, ContractCompileRequest, RepositoryFile,
-        RepositorySnapshot,
+        compile_contract, compile_contract_with_findings_checked, findings_to_statements,
+        ContractCompileRequest, RepositoryFile, RepositorySnapshot, MAX_FINDINGS,
     };
-    use faktor_core::ContractOrigin;
+    use faktor_core::{CancellationToken, ContractOrigin, OpId, SessionId, WorkspaceId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// An in-process provider whose ONLY behaviour is a declared descriptor:
-    /// exactly the shape a visible semantic service presents to the
-    /// registry.
-    struct DeclaredProvider {
-        id: crate::types::SemanticProviderId,
-        capabilities: SemanticCapabilities,
-        fidelity: Option<SemanticFidelity>,
-        completeness: Option<SemanticCompleteness>,
-        tier: Option<u8>,
-    }
+    /// A wired gate that grants every value entitlement: the enrichment
+    /// tests exercise the org-contract apply path, which is now reachable
+    /// only through the checked entry.
+    #[derive(Debug)]
+    struct Granted;
 
-    impl DeclaredProvider {
-        fn covering_affected() -> Self {
-            Self {
-                id: provider_id("declared-affects"),
-                capabilities: SemanticCapabilities::AFFECTED,
-                fidelity: Some(SemanticFidelity::Structural),
-                completeness: Some(SemanticCompleteness::ConservativeComplete),
-                tier: Some(2),
-            }
+    impl faktor_core::entitlement::ValueEntitlementGate for Granted {
+        fn check_value_entitlement(
+            &self,
+            _entitlement: faktor_core::entitlement::ValueEntitlement,
+        ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+            Ok(())
         }
     }
 
-    impl SemanticProvider for DeclaredProvider {
-        fn id(&self) -> crate::types::SemanticProviderId {
+    fn granting_gate() -> faktor_core::entitlement::ValueGate {
+        faktor_core::entitlement::ValueGate::wired(std::sync::Arc::new(Granted))
+    }
+
+    /// One registry provider that answers the bounded questions out of its
+    /// scripted per-question excerpts — exactly the shape a real semantic
+    /// service presents over the `context` operation.
+    struct AnsweringProvider {
+        id: SemanticProviderId,
+        fidelity: Option<SemanticFidelity>,
+        completeness: Option<SemanticCompleteness>,
+        tier: Option<u8>,
+        answers: Vec<(IntelligenceQuestion, String, u32)>,
+        /// Override the snapshot the envelope claims (mismatch tests).
+        snapshot_override: Option<SemanticSnapshotId>,
+        /// Mint envelopes with UserPolicy provenance (laundering test).
+        launder_provenance: bool,
+        /// Answer with a hostile oversized excerpt.
+        oversized_excerpt: Option<String>,
+        consults: Arc<AtomicUsize>,
+    }
+
+    impl AnsweringProvider {
+        fn answering() -> Self {
+            Self {
+                id: provider_id("answers"),
+                fidelity: Some(SemanticFidelity::Structural),
+                completeness: Some(SemanticCompleteness::ConservativeComplete),
+                tier: Some(2),
+                answers: vec![
+                    (
+                        IntelligenceQuestion::AffectedComponents,
+                        "auth.refresh owns refresh-token rotation".to_string(),
+                        9_000,
+                    ),
+                    (
+                        IntelligenceQuestion::Invariants,
+                        "issued tokens stay usable until their expiry".to_string(),
+                        8_000,
+                    ),
+                    (
+                        IntelligenceQuestion::HiddenDependencies,
+                        "billing depends on token introspection".to_string(),
+                        7_500,
+                    ),
+                    (
+                        IntelligenceQuestion::BlastRadius,
+                        "session middleware breaks if the refresh shape changes".to_string(),
+                        8_500,
+                    ),
+                    (
+                        IntelligenceQuestion::HistoricalFailures,
+                        "a 2024 migration double-issued refresh tokens".to_string(),
+                        6_000,
+                    ),
+                ],
+                snapshot_override: None,
+                launder_provenance: false,
+                oversized_excerpt: None,
+                consults: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn snapshot_mismatched() -> Self {
+            let mut provider = Self::answering();
+            provider.snapshot_override = Some(SemanticSnapshotId::from_file_hash(
+                faktor_core::FileHash::from([7u8; 32]),
+            ));
+            provider
+        }
+
+        fn laundering() -> Self {
+            let mut provider = Self::answering();
+            provider.launder_provenance = true;
+            provider
+        }
+
+        fn oversized() -> Self {
+            let mut provider = Self::answering();
+            provider.oversized_excerpt = Some("x".repeat(MAX_FINDING_TEXT_BYTES + 64));
+            provider
+        }
+
+        fn question_of(query: &str) -> Option<IntelligenceQuestion> {
+            IntelligenceQuestion::ALL
+                .into_iter()
+                .find(|question| query.contains(&format!("question {}", question.as_str())))
+        }
+    }
+
+    impl SemanticProvider for AnsweringProvider {
+        fn id(&self) -> SemanticProviderId {
             self.id.clone()
         }
 
@@ -192,7 +477,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> SemanticCapabilities {
-            self.capabilities
+            SemanticCapabilities::CONTEXT
         }
 
         fn descriptor(&self) -> SemanticProviderDescriptor {
@@ -200,122 +485,183 @@ mod tests {
                 self.id.clone(),
                 self.version(),
                 SEMANTIC_SCHEMA_VERSION,
-                self.capabilities,
+                self.capabilities(),
             );
             descriptor.fidelity = self.fidelity;
             descriptor.completeness = self.completeness;
             descriptor.tier = self.tier;
             descriptor
         }
+
+        fn context(
+            &self,
+            request: SemanticContextRequest,
+        ) -> BoxFuture<'_, Result<SemanticEnvelope<SemanticContextPack>, SemanticError>> {
+            self.consults.fetch_add(1, Ordering::SeqCst);
+            let question = Self::question_of(&request.query);
+            let mut items = Vec::new();
+            if let Some(question) = question {
+                if let Some(oversized) = &self.oversized_excerpt {
+                    items.push(item(
+                        request.workspace,
+                        "src/auth/refresh.rs",
+                        oversized,
+                        9_000,
+                    ));
+                } else {
+                    for (answer_question, excerpt, relevance) in &self.answers {
+                        if *answer_question == question {
+                            items.push(item(
+                                request.workspace,
+                                "src/auth/refresh.rs",
+                                excerpt,
+                                *relevance,
+                            ));
+                        }
+                    }
+                }
+            }
+            let snapshot_id = self.snapshot_override.unwrap_or(request.snapshot_id);
+            let mut envelope = SemanticEnvelope::new(
+                self.id.clone(),
+                self.version(),
+                request.workspace,
+                snapshot_id,
+                7,
+                SemanticContextPack {
+                    total_bytes: items.iter().map(|i| i.excerpt.len()).sum(),
+                    items,
+                    truncated: false,
+                    degraded: false,
+                },
+            );
+            if self.launder_provenance {
+                envelope.provenance = faktor_evidence::types::ProvenanceSet::new([
+                    faktor_evidence::types::ProvenanceSource::UserPolicy,
+                ]);
+            }
+            Box::pin(async move { Ok(envelope) })
+        }
     }
 
-    fn registry_with(provider: Option<DeclaredProvider>) -> Arc<SemanticProviderRegistry> {
+    fn item(
+        workspace: WorkspaceId,
+        path: &str,
+        excerpt: &str,
+        relevance_bps: u32,
+    ) -> SemanticContextItem {
+        let entity = SemanticEntityRef::new(
+            workspace,
+            WorkspacePath::parse(path).expect("valid path"),
+            SemanticEntityId::parse("auth.refresh").expect("valid entity"),
+        );
+        SemanticContextItem {
+            entity,
+            relevance_bps,
+            excerpt: excerpt.to_string(),
+        }
+    }
+
+    fn registry_with(
+        provider: Option<AnsweringProvider>,
+    ) -> (Arc<SemanticProviderRegistry>, Arc<AtomicUsize>) {
         let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        let consults = provider
+            .as_ref()
+            .map(|provider| provider.consults.clone())
+            .unwrap_or_default();
         if let Some(provider) = provider {
             registry.register(Arc::new(provider));
         }
-        Arc::new(registry)
+        (Arc::new(registry), consults)
     }
 
-    fn enrich(registry: &Arc<SemanticProviderRegistry>) -> Vec<EnrichmentStatement> {
+    fn findings_request<'a>(
+        contract: &'a EngineeringContract,
+        tokens: &'a [String],
+        build_systems: &'a [String],
+        goal: &'a str,
+        digest: &'a str,
+        revision: Option<&'a str>,
+    ) -> FindingsRequest<'a> {
+        FindingsRequest {
+            operation_id: OpId::new(1),
+            session_id: SessionId::new(1),
+            workspace: WorkspaceId::new(1),
+            started_ms: 0,
+            deadline: None,
+            cancellation: CancellationToken::new(),
+            source_revision: revision,
+            goal,
+            intent_tokens: tokens,
+            build_systems,
+            repository_digest: digest,
+            native_contract: contract,
+            questions: &IntelligenceQuestion::ALL,
+            max_findings: MAX_FINDINGS,
+        }
+    }
+
+    fn consult_with_digest(
+        registry: &Arc<SemanticProviderRegistry>,
+        digest: &str,
+    ) -> FindingsResponse {
         let contract = EngineeringContract::default();
+        let tokens: Vec<String> = Vec::new();
+        let build_systems: Vec<String> = vec!["cargo".to_string()];
         let adapter = SemanticIntelligenceAdapter::new(registry.clone());
-        adapter
-            .enrich(&EnrichmentRequest {
-                goal: "fix the refresh token race",
-                intent_tokens: &[],
-                build_systems: &["cargo".to_string()],
-                repository_digest: "digest",
-                native_contract: &contract,
-                max_statements: 24,
-            })
-            .expect("the adapter is total")
-    }
-
-    #[test]
-    fn fallback_only_registry_yields_no_enrichment() {
-        let registry = registry_with(None);
-        assert!(enrich(&registry).is_empty());
-        // The adapter is also honest about its provenance id.
-        let adapter = SemanticIntelligenceAdapter::new(registry);
-        assert_eq!(adapter.provider_id(), "semantic");
-    }
-
-    #[test]
-    fn validated_provider_yields_bounded_disclosure_with_declared_dimensions() {
-        let registry = registry_with(Some(DeclaredProvider::covering_affected()));
-        let statements = enrich(&registry);
-        assert_eq!(
-            statements.len(),
-            1,
-            "only the ONE covered op is disclosed: {statements:?}"
+        let request = findings_request(
+            &contract,
+            &tokens,
+            &build_systems,
+            "fix the refresh token race",
+            digest,
+            Some("rev-1"),
         );
-        let statement = &statements[0];
-        assert_eq!(statement.kind, EnrichmentKind::Risk);
-        assert!(statement.text.contains("declared-affects"));
-        assert!(statement.text.contains("affected"));
+        block_on(adapter.findings(&request)).expect("the adapter is total")
+    }
+
+    fn consult(registry: &Arc<SemanticProviderRegistry>) -> FindingsResponse {
+        consult_with_digest(registry, "repo2:digest")
+    }
+
+    #[test]
+    fn validated_provider_answers_the_real_questions_with_typed_findings() {
+        let (registry, consults) = registry_with(Some(AnsweringProvider::answering()));
+        let response = consult(&registry);
         assert!(
-            statement.text.contains("native evidence still discharges"),
-            "{}",
-            statement.text
+            response.diagnostics.is_empty(),
+            "{:?}",
+            response.diagnostics
         );
-        assert!(statement.text.len() <= MAX_STATEMENT_BYTES);
-        assert!(statement.basis.contains("declared-affects"));
+        assert_eq!(response.findings.len(), 5);
         assert_eq!(
-            statement.severity,
-            Some(RiskSeverity::Low),
-            "a capability disclosure is never escalated"
+            consults.load(Ordering::SeqCst),
+            5,
+            "one bounded consult per question"
         );
-        // The confidence is exactly what the shared intelligence mapping
-        // derives from the DECLARED dimensions (absent evidence axes stay
-        // conservative); the tier never launders confidence.
-        let expected = confidence_bps_for(&ConfidenceDimensions::new(
-            SemanticFidelity::Structural,
-            SemanticCompleteness::ConservativeComplete,
-            Default::default(),
-        ));
-        assert!(expected > 0);
-        assert_eq!(statement.confidence_bps, expected);
+        for question in IntelligenceQuestion::ALL {
+            let finding = response
+                .findings
+                .iter()
+                .find(|finding| finding.question == question)
+                .unwrap_or_else(|| panic!("question {} must be answered", question.as_str()));
+            assert_eq!(finding.kind, question.expected_kind());
+            assert_eq!(finding.provider, SEMANTIC_ENRICHMENT_PROVIDER_ID);
+            assert_eq!(finding.repository_digest, "repo2:digest");
+            assert!(finding.confidence_bps > 0);
+            assert!(finding.basis.contains("answers"));
+            // No capability disclosure ever appears in a finding.
+            assert!(!finding.text.contains("declares"));
+        }
+        assert!(response.findings.iter().any(|finding| finding
+            .text
+            .contains("auth.refresh owns refresh-token rotation")));
     }
 
     #[test]
-    fn unvalidated_provider_is_invisible() {
-        // An out-of-range tier fails descriptor validation: the provider is
-        // not selectable and never enriches.
-        let mut provider = DeclaredProvider::covering_affected();
-        provider.tier = Some(9);
-        let registry = registry_with(Some(provider));
-        assert!(enrich(&registry).is_empty());
-    }
-
-    #[test]
-    fn undeclared_fidelity_pins_confidence_to_zero_and_discloses_nothing() {
-        let mut provider = DeclaredProvider::covering_affected();
-        provider.fidelity = None;
-        let registry = registry_with(Some(provider));
-        assert!(enrich(&registry).is_empty());
-    }
-
-    #[test]
-    fn statement_cap_is_respected() {
-        let registry = registry_with(Some(DeclaredProvider::covering_affected()));
-        let contract = EngineeringContract::default();
-        let adapter = SemanticIntelligenceAdapter::new(registry);
-        let statements = adapter
-            .enrich(&EnrichmentRequest {
-                goal: "g",
-                intent_tokens: &[],
-                build_systems: &[],
-                repository_digest: "d",
-                native_contract: &contract,
-                max_statements: 0,
-            })
-            .unwrap();
-        assert!(statements.is_empty(), "zero cap yields nothing");
-    }
-
-    #[test]
-    fn compilation_with_the_adapter_is_additive_and_native_statements_survive() {
+    fn findings_feed_the_contract_as_provenance_tagged_statements() {
+        let (registry, _) = registry_with(Some(AnsweringProvider::answering()));
         let snapshot = RepositorySnapshot::from_files(vec![
             RepositoryFile::with_content("Cargo.toml", "[package]\nname = \"auth\"\n"),
             RepositoryFile::with_content("src/auth/refresh.rs", "pub fn refresh() -> u64 { 0 }\n"),
@@ -329,59 +675,186 @@ mod tests {
             repository: snapshot,
         };
         let native = compile_contract(&request);
-        let registry = registry_with(Some(DeclaredProvider::covering_affected()));
-        let adapter = SemanticIntelligenceAdapter::new(registry);
-        let enriched = compile_contract_with(&request, Some(&adapter));
-        // The native statements are byte-identical: every native-origin
-        // statement survives unchanged and no native statement was rewritten.
+        // The questions are bound to THIS repository snapshot identity.
+        let response = consult_with_digest(&registry, &native.repository_digest);
+        let compiled = compile_contract_with_findings_checked(
+            &request,
+            "semantic",
+            &response,
+            &granting_gate(),
+        )
+        .expect("the entitled org-contract gate applies the findings");
+        // Native statements survive; external statements are the findings.
         for obligation in &native.contract.proof_obligations {
-            assert!(enriched
+            assert!(compiled
                 .contract
                 .proof_obligations
                 .iter()
                 .any(|o| o == obligation));
         }
-        for risk in &native.contract.risks {
-            assert!(enriched.contract.risks.iter().any(|r| r == risk));
-        }
-        // The added statement carries external:semantic provenance, and
-        // every external statement is one this adapter proposed.
-        let external: Vec<&faktor_core::contract::RiskHypothesis> = enriched
+        let external_risks: Vec<&faktor_core::RiskHypothesis> = compiled
             .contract
             .risks
             .iter()
-            .filter(|risk| {
-                matches!(
-                    risk.origin,
-                    ContractOrigin::External { ref provider } if provider == "semantic"
-                )
-            })
+            .filter(|risk| matches!(risk.origin, ContractOrigin::External { .. }))
             .collect();
-        assert!(!external.is_empty());
-        assert!(external.iter().all(|risk| risk
-            .description
-            .contains("native evidence still discharges")));
-        assert_eq!(enriched.enrichments.len(), 1);
-        assert_eq!(enriched.enrichments[0].provider, "semantic");
-        assert_eq!(enriched.enrichments[0].applied, external.len());
+        assert!(external_risks
+            .iter()
+            .any(|risk| risk.description.contains("affected component: ")));
+        assert!(external_risks
+            .iter()
+            .any(|risk| risk.description.contains("hidden dependency: ")));
+        assert!(external_risks
+            .iter()
+            .any(|risk| risk.description.contains("blast radius: ")));
+        assert!(external_risks
+            .iter()
+            .any(|risk| risk.description.contains("historical failure: ")));
+        assert!(compiled
+            .contract
+            .invariants
+            .iter()
+            .any(|invariant| invariant
+                .statement
+                .contains("invariant that must survive: ")));
+        assert_eq!(compiled.enrichments[0].provider, "semantic");
+        assert_eq!(compiled.enrichments[0].applied, 5);
+        assert_eq!(compiled.enrichments[0].skipped, 0);
+        // The old descriptor-disclosure text is gone.
+        for risk in &compiled.contract.risks {
+            assert!(!risk.description.contains("declares"));
+        }
     }
 
     #[test]
-    fn fallback_only_registry_compiles_byte_identical_to_native() {
-        let snapshot = RepositorySnapshot::from_files(vec![RepositoryFile::with_content(
-            "Cargo.toml",
-            "[package]\nname = \"auth\"\n",
-        )]);
-        let request = ContractCompileRequest {
-            goal: "stabilize the parser".to_string(),
-            repository: snapshot,
-        };
-        let native = compile_contract(&request);
-        let adapter = SemanticIntelligenceAdapter::new(registry_with(None));
-        let compiled = compile_contract_with(&request, Some(&adapter));
-        assert_eq!(
-            native.contract, compiled.contract,
-            "a fallback-only registry must never alter the native contract"
+    fn snapshot_mismatch_is_rejected_typed_and_contributes_nothing() {
+        let (registry, _) = registry_with(Some(AnsweringProvider::snapshot_mismatched()));
+        let response = consult(&registry);
+        assert!(response.findings.is_empty());
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == FindingDiagnosticCode::SnapshotMismatch),
+            "{:?}",
+            response.diagnostics
         );
+    }
+
+    #[test]
+    fn provenance_laundering_is_rejected_typed() {
+        let (registry, _) = registry_with(Some(AnsweringProvider::laundering()));
+        let response = consult(&registry);
+        assert!(response.findings.is_empty());
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == FindingDiagnosticCode::InvalidProvenance),
+            "{:?}",
+            response.diagnostics
+        );
+    }
+
+    #[test]
+    fn oversized_answers_are_bounded_with_a_typed_diagnostic() {
+        let (registry, _) = registry_with(Some(AnsweringProvider::oversized()));
+        let response = consult(&registry);
+        assert!(response.findings.is_empty());
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == FindingDiagnosticCode::Oversized),
+            "{:?}",
+            response.diagnostics
+        );
+    }
+
+    #[test]
+    fn fallback_only_registry_answers_nothing() {
+        let (registry, consults) = registry_with(None);
+        let response = consult(&registry);
+        assert!(response.findings.is_empty());
+        assert!(response.diagnostics.is_empty());
+        assert_eq!(consults.load(Ordering::SeqCst), 0);
+        // The adapter is also honest about its provenance id.
+        let adapter = SemanticIntelligenceAdapter::new(registry);
+        assert_eq!(adapter.provider_id(), "semantic");
+    }
+
+    #[test]
+    fn undeclared_fidelity_provider_is_invisible() {
+        let mut provider = AnsweringProvider::answering();
+        provider.fidelity = None;
+        let (registry, consults) = registry_with(Some(provider));
+        let response = consult(&registry);
+        assert!(
+            response.findings.is_empty(),
+            "a provider with no declared evidence contributes zero findings"
+        );
+        assert_eq!(
+            consults.load(Ordering::SeqCst),
+            0,
+            "an undeclared-fidelity provider is never asked"
+        );
+    }
+
+    #[test]
+    fn missing_content_revision_asks_no_question() {
+        let (registry, consults) = registry_with(Some(AnsweringProvider::answering()));
+        let contract = EngineeringContract::default();
+        let tokens: Vec<String> = Vec::new();
+        let build_systems: Vec<String> = vec!["cargo".to_string()];
+        let adapter = SemanticIntelligenceAdapter::new(registry);
+        let request = findings_request(
+            &contract,
+            &tokens,
+            &build_systems,
+            "fix the refresh token race",
+            "repo2:digest",
+            None,
+        );
+        let response = block_on(adapter.findings(&request)).expect("total");
+        assert!(response.findings.is_empty());
+        assert!(response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == FindingDiagnosticCode::RevisionUnavailable));
+        assert_eq!(consults.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn zero_finding_cap_asks_nothing() {
+        let (registry, consults) = registry_with(Some(AnsweringProvider::answering()));
+        let contract = EngineeringContract::default();
+        let tokens: Vec<String> = Vec::new();
+        let build_systems: Vec<String> = vec!["cargo".to_string()];
+        let adapter = SemanticIntelligenceAdapter::new(registry);
+        let mut request = findings_request(
+            &contract,
+            &tokens,
+            &build_systems,
+            "g",
+            "repo2:digest",
+            Some("rev-1"),
+        );
+        request.max_findings = 0;
+        let response = block_on(adapter.findings(&request)).expect("total");
+        assert!(response.findings.is_empty());
+        assert_eq!(consults.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn conversion_of_adapter_findings_rejects_a_foreign_digest() {
+        let (registry, _) = registry_with(Some(AnsweringProvider::answering()));
+        let response = consult(&registry);
+        // The same answers bound to another snapshot compile nothing.
+        let conversion = findings_to_statements("semantic", "repo2:other", 24, &response.findings);
+        assert!(conversion.statements.is_empty());
+        assert!(conversion
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == FindingDiagnosticCode::SnapshotMismatch));
     }
 }

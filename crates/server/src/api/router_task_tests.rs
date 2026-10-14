@@ -3433,7 +3433,10 @@ async fn native_task_run_cancel_aborts_a_mid_flight_in_session_run() {
         ],
         10,
     );
-    let deps = paced_test_deps(dir.path(), paced);
+    // Pin the first model call: the stream parks before its first chunk
+    // until released, so "in flight" is a deterministic observation.
+    paced.hold_first_call();
+    let deps = paced_test_deps(dir.path(), paced.clone());
     let token = deps.auth_token.clone();
     let manager = deps.session.clone();
     let handle = serve(deps, 0).await.unwrap();
@@ -3458,24 +3461,26 @@ async fn native_task_run_cancel_aborts_a_mid_flight_in_session_run() {
     assert_eq!(resp.status(), 200);
     let start: serde_json::Value = resp.json().await.unwrap();
     let run_id = start["run_id"].as_str().unwrap().to_string();
-    // Wait for the drive to be mid-flight (the session is actively
-    // working — anything but parked/terminal), then cancel at the task
-    // level.
+    // Deterministic mid-flight pinning: the provider's FIRST model call
+    // parks before its first chunk until the test releases it, so the run
+    // cannot complete while we wait for the call to be in flight and then
+    // cancel — no session/run state sampling races completion under load.
     let wait_deadline = std::time::Instant::now() + Duration::from_secs(240);
-    while std::time::Instant::now() < wait_deadline {
-        let st = manager.get_session(sid).unwrap().unwrap().state().unwrap();
-        if !st.is_terminal()
-            && !matches!(
-                st,
-                faktor_core::state::AgentState::ReadyForNextTurn
-                    | faktor_core::state::AgentState::Idle
-                    | faktor_core::state::AgentState::Suspended
-            )
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    while paced
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 0
+        && std::time::Instant::now() < wait_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(
+        paced
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the drive must reach its first (pinned) model call before cancel"
+    );
     let resp = client
         .post(format!(
             "{base}/native/session/{sid}/task-runs/{run_id}/cancel"
@@ -3488,6 +3493,8 @@ async fn native_task_run_cancel_aborts_a_mid_flight_in_session_run() {
     let ack: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(ack["run_id"], run_id);
     assert_eq!(ack["cancelled"], true);
+    // Unblock the pinned stream so the aborted drive unwinds promptly.
+    paced.release_first_call();
     // The durable outcome: task row Cancelled, session parked, task-runs
     // state Cancelled; a second cancel is a typed 409.
     let wait_deadline = std::time::Instant::now() + Duration::from_secs(240);

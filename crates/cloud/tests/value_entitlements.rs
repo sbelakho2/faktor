@@ -431,3 +431,64 @@ fn plan_validation_accepts_value_tags_and_refuses_unknown_names() {
         "a full governance plan validates (base missing is a mapping rule, not a config error)",
     );
 }
+
+/// The runtime enforcement adapter: the gate over the entitlement service
+/// answers the SAME decisions the set does (entitled = Ok, denied = the
+/// typed refusal naming entitlement, hook, cause and plan), an out-of-plan
+/// org's refusal survives the conversion into the runtime seam vocabulary,
+/// an absent gate refuses typed with `cloud_absent`, and the service-level
+/// governance capability wrapper names the capability.
+#[test]
+fn enforcement_gate_mirrors_the_set_and_converts_typed() {
+    use faktor_core::entitlement::{ValueGate as SeamGate, ValueRefusalCause as SeamCause};
+
+    let configured = org("org_configured");
+    let pro_service = service(tier_fixture(), Some(&configured));
+    subscribe(&pro_service, &configured, "pro", None);
+    let gate = pro_service.enforcement_gate(&configured);
+    assert!(gate.is_wired());
+    assert!(gate.check(ValueEntitlement::OutcomeAnalytics).is_ok());
+    let refusal = gate.check(ValueEntitlement::PrivateRunners).unwrap_err();
+    assert_eq!(refusal.entitlement, ValueEntitlement::PrivateRunners);
+    assert_eq!(refusal.hook.as_str(), "worker_placement");
+    assert_eq!(refusal.cause, SeamCause::NotInPlan);
+    assert_eq!(refusal.plan_id.as_deref(), Some("pro"));
+    assert_eq!(refusal.organization_id.as_deref(), Some("org_configured"));
+    assert!(refusal.to_string().contains("private_runners"), "{refusal}");
+
+    // A foreign organization never inherits the configured tenant's plan.
+    let foreign = org("org_foreign");
+    let foreign_gate = pro_service.enforcement_gate(&foreign);
+    let refusal = foreign_gate
+        .check(ValueEntitlement::OutcomeAnalytics)
+        .unwrap_err();
+    assert_eq!(refusal.cause, SeamCause::PlanMissing);
+    assert_eq!(refusal.plan_id, None);
+
+    // The offline default: no cloud authority => every check refuses typed.
+    let absent = SeamGate::absent();
+    let refusal = absent
+        .check(ValueEntitlement::OutcomeAnalytics)
+        .unwrap_err();
+    assert_eq!(refusal.cause, SeamCause::CloudAbsent);
+    assert_eq!(refusal.plan_id, None);
+    assert!(refusal.to_string().contains("cloud_absent"), "{refusal}");
+
+    // Service-level governance wrapper: the enterprise plan's SSO flag is
+    // enforceable; the pro plan refuses typed naming the capability.
+    let enterprise = org("org_enterprise");
+    let enterprise_service = service(tier_fixture(), Some(&enterprise));
+    subscribe(&enterprise_service, &enterprise, "enterprise", None);
+    assert!(enterprise_service
+        .check_governance_capability(&enterprise, GovernanceCapability::Sso)
+        .is_ok());
+    assert!(enterprise_service
+        .check_governance_capability(&enterprise, GovernanceCapability::Scim)
+        .is_ok());
+    let refusal = pro_service
+        .check_governance_capability(&configured, GovernanceCapability::Sso)
+        .unwrap_err();
+    assert_eq!(refusal.entitlement, ValueEntitlement::EnterpriseGovernance);
+    assert_eq!(refusal.hook.as_str(), "identity_federation");
+    assert!(refusal.to_string().contains("capability sso"), "{refusal}");
+}

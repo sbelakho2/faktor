@@ -175,13 +175,11 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
         "an open that migrates nothing must not snapshot"
     );
     // Rewind one step: the reopen must snapshot the EXACT predecessor
-    // (pre-v32, no engineering_outcome table) before applying v32.
+    // (pre-v35: no route-time execution_class column) before applying v35.
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(&format!(
-            "DROP INDEX IF EXISTS idx_engineering_outcome_task;
-                 DROP INDEX IF EXISTS idx_engineering_outcome_completed;
-                 DROP TABLE IF EXISTS engineering_outcome;
+            "ALTER TABLE cost_reservation DROP COLUMN execution_class;
                  PRAGMA user_version = {};",
             SCHEMA_HEAD - 1
         ))
@@ -206,26 +204,51 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
     assert_verified_restore_point(&newest, SCHEMA_HEAD - 1);
     let snapshot =
         Connection::open_with_flags(&newest, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let pre_v32: i64 = snapshot
+    let pre_column: i64 = snapshot
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'engineering_outcome'",
+            "SELECT COUNT(*) FROM pragma_table_info('cost_reservation') \
+             WHERE name = 'execution_class'",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
-        pre_v32, 0,
-        "the restore point is PRE-migration: v32's table must not exist in it"
+        pre_column, 0,
+        "the restore point is PRE-migration: the v35 execution_class column must not exist in it"
     );
-    let live = Connection::open(&db).unwrap();
-    let post_v32: i64 = live
+    // The predecessor already carries the v33 settlement objects.
+    let pre_settlement: i64 = snapshot
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'engineering_outcome'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'economic_settlement'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(post_v32, 1, "the live database finished the chain");
+    assert_eq!(pre_settlement, 1);
+    let live = Connection::open(&db).unwrap();
+    let post_column: i64 = live
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('cost_reservation') \
+             WHERE name = 'execution_class'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(post_column, 1, "the live database finished the chain");
+    for table in [
+        "engineering_outcome",
+        "economic_settlement",
+        "terminal_run_facts",
+    ] {
+        let count: i64 = live
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                rusqlite::params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the live database finished the chain: {table}");
+    }
 }
 
 /// Restore points are BOUNDED: an arbitrarily long upgrade history must
@@ -240,6 +263,10 @@ fn restore_points_are_bounded_and_the_newest_survive() {
     // Five rewind-reopens: snapshots #2..#6 of the predecessor cursor.
     for round in 0..5 {
         let conn = Connection::open(&db).unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE cost_reservation DROP COLUMN execution_class",
+            [],
+        );
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
         drop(conn);

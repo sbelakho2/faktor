@@ -1771,6 +1771,7 @@ impl BudgetAuthority for DebitBudget {
         _op: faktor_core::id::OpId,
         _pred: u64,
         _snap: Option<faktor_core::model::PricingSnapshot>,
+        _class: faktor_core::model::ExecutionClass,
     ) -> BudgetFut<faktor_session::ReservationId> {
         Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
     }
@@ -1782,6 +1783,7 @@ impl BudgetAuthority for DebitBudget {
         _a: faktor_core::op::ModelCallAttempt,
         _pred: u64,
         _snap: Option<faktor_core::model::PricingSnapshot>,
+        _class: faktor_core::model::ExecutionClass,
     ) -> BudgetFut<faktor_session::ReservationId> {
         Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
     }

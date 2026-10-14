@@ -633,8 +633,13 @@ const abortAckJson = { aborted: ['1'] };
 const outcomesMetricsJson = {
   runs: 2,
   verifiedChanges: 1,
-  verifiedFirstPassChanges: 1,
-  verifiedFirstPassPpm: 1000000,
+  verifiedFirstVerificationPassChanges: 1,
+  verifiedFirstVerificationPassPpm: 1000000,
+  moneyCompleteRuns: 2,
+  moneyPendingRuns: 0,
+  moneyUnavailableRuns: 0,
+  moneyIncompleteExcluded: 0,
+  verifiedChangesMoneyComplete: 1,
   totalVerifiedSpendMicro: '1262500',
   successfulRunCostMicro: '1262500',
   totalSpendMicro: '5550000',
@@ -651,11 +656,14 @@ const outcomesMetricsJson = {
   localFirstRuns: 1,
   localFirstSuccessChanges: 1,
   localFirstSuccessPpm: 1000000,
-  localToFrontierFallbackRuns: 0,
-  localToFrontierFallbackPpm: 0,
-  frontierOnlyRuns: 1,
-  frontierOnlyPpm: 500000,
-  avoidedHostedInferenceMicro: '0',
+  localToHostedFallbackRuns: 0,
+  localToHostedFallbackPpm: 0,
+  hostedOnlyRuns: 1,
+  runsWithSteps: 2,
+  hostedOnlyPpm: 500000,
+  avoidedHostedInferenceMicro: null,
+  avoidedHostedInferenceMeasurement: 'unavailable',
+  avoidedHostedMeasuredRuns: 0,
   totalWallTimeMs: 4000,
   meanTimeToVerifiedChangeMs: 4000,
   humanInterventionRuns: 1,
@@ -666,7 +674,10 @@ const outcomesMetricsJson = {
   checksRequired: 4,
   proofCoveragePpm: 750000,
   frontierEscalationRuns: 0,
-  frontierEscalationPpm: 0,
+  frontierClassedRuns: 0,
+  frontierEscalationClassedRuns: 0,
+  frontierEscalationPpm: null,
+  frontierEscalationMeasurement: 'unmeasured',
   scanned: 2,
   truncated: false,
 };
@@ -681,16 +692,32 @@ const outcomeRunJson = {
   accepted: true,
   integrated: true,
   verified: true,
-  verifiedFirstAttempt: true,
+  verifiedFirstVerificationPass: true,
   repairAttempts: 0,
   modelSequence: [
-    { provider: 'local', model: 'llama', local: true, spendMicro: '0' },
-    { provider: 'openai', model: 'gpt', local: false, spendMicro: '1262500' },
+    {
+      provider: 'local',
+      model: 'llama',
+      local: true,
+      legacyLocal: false,
+      executionClass: 'local',
+      spendMicro: '0',
+    },
+    {
+      provider: 'openai',
+      model: 'gpt',
+      local: false,
+      legacyLocal: false,
+      executionClass: 'hosted_economy',
+      spendMicro: '1262500',
+    },
   ],
   modelSpendMicro: '1262500',
   verificationSpendMicro: '0',
   reworkSpendMicro: '0',
-  avoidedHostedMicro: '0',
+  moneyState: 'complete',
+  avoidedHostedMicro: null,
+  avoidedHostedMeasurement: 'unavailable',
   wallTimeMs: 4000,
   humanInterventions: 1,
   proof: { checksPassed: 3, checksRequired: 4, coveragePpm: 750000 },
@@ -706,6 +733,30 @@ const outcomesPageJson = {
   runs: [outcomeRunJson],
   nextCursor: { completedAtMs: 1_700_000_000_000, runId: 'run-1' },
   futureMember: { note: 'additive unknown field, must be ignored' },
+};
+// The caller organization's derived value-entitlement report
+// (`GET /native/value-entitlements`): one typed decision per paid value
+// capability; `outcome_ledger` is the hook the outcomes read enforces.
+const valueEntitlementsJson = {
+  ok: true,
+  value_entitlements: {
+    organization_id: 'org_acme',
+    plan_id: 'team',
+    plan_found: true,
+    subscription_active: true,
+    plan_entitlements: ['outcome_analytics', 'shared_intelligence'],
+    governance: { sso: false, scim: false },
+    decisions: [
+      { entitlement: 'outcome_analytics', hook: 'outcome_ledger', granted: true, cause: null },
+      {
+        entitlement: 'cross_repo_intelligence',
+        hook: 'cross_repo_index',
+        granted: false,
+        cause: 'not_in_plan',
+      },
+    ],
+    now_ms: 1_700_000_000_000,
+  },
 };
 // Audits 5/6/16: a PARTIAL generation with a capped fingerprint round.
 const indexCoverageJson = {
@@ -14438,6 +14489,14 @@ async function outcomeTests() {
       before_ms: '1700000000000',
       before_run: 'run-1',
     });
+    const scoped = await client.outcomes({ limit: 25, org: 'org-acme' });
+    assertEqual(scoped.metrics.runs, 2);
+    const scopedCall = calls.filter((call) => call.path === '/native/outcomes')[2];
+    assertDeepEqual(
+      scopedCall.query,
+      { limit: '25', org: 'org-acme' },
+      'the configured organization rides the outcomes query',
+    );
     const hostile = makeClient({
       'GET /native/outcomes': () =>
         jsonResponse({ metrics: outcomesMetricsJson, runs: 'not-a-list', nextCursor: null }),
@@ -14459,6 +14518,100 @@ async function outcomeTests() {
       () => missing.client.outcomes({}),
       (error) => error instanceof nc.NativeProtocolError,
       'money must be a decimal string, never a rounded number',
+    );
+  });
+
+  await test('value entitlements client: strict report parse, hostile payload refused typed', async () => {
+    const { client } = makeClient({
+      'GET /native/value-entitlements': () => jsonResponse(clone(valueEntitlementsJson)),
+    });
+    const report = await client.valueEntitlements();
+    assertEqual(report.ok, true);
+    assertEqual(report.value_entitlements.organization_id, 'org_acme');
+    assertEqual(report.value_entitlements.plan_id, 'team');
+    assertEqual(report.value_entitlements.plan_found, true);
+    assertEqual(report.value_entitlements.decisions.length, 2);
+    assertEqual(report.value_entitlements.decisions[0].hook, 'outcome_ledger');
+    assertEqual(report.value_entitlements.decisions[0].granted, true);
+    assertEqual(report.value_entitlements.decisions[1].cause, 'not_in_plan');
+    const hostile = makeClient({
+      'GET /native/value-entitlements': () =>
+        jsonResponse({ ok: true, value_entitlements: { plan_id: 'team' } }),
+    });
+    await assertRejects(
+      () => hostile.client.valueEntitlements(),
+      (error) =>
+        error instanceof nc.NativeProtocolError &&
+        error.path.includes('GET /native/value-entitlements'),
+      'a partial value-entitlements report must be refused typed',
+    );
+  });
+
+  await test('outcomes entitlement surfacing: org guard and typed status lines', () => {
+    // The configured organization is passed ONLY with a control-plane
+    // credential; without either the frozen local read stands.
+    assertEqual(oc.outcomesOrganizationForRead(' org-acme ', true), 'org-acme');
+    assertEqual(oc.outcomesOrganizationForRead('org-acme', false), null);
+    assertEqual(oc.outcomesOrganizationForRead('', true), null);
+    assertEqual(oc.outcomesOrganizationForRead('   ', true), null);
+    assertEqual(oc.outcomesOrganizationForRead(null, true), null);
+    // The status line: resolved plan, the outcome_ledger decision and the
+    // granted/total count — all from the served report.
+    const report = nc.validateValueEntitlements(clone(valueEntitlementsJson)).value_entitlements;
+    assertEqual(
+      oc.valueEntitlementsStatusLine(report),
+      'value entitlements: plan team · outcome_ledger granted · 1/2 granted',
+    );
+    const refused = {
+      ...report,
+      plan_found: false,
+      plan_id: null,
+      decisions: report.decisions.map((decision) =>
+        decision.hook === 'outcome_ledger'
+          ? { ...decision, granted: false, cause: 'plan_missing' }
+          : decision,
+      ),
+    };
+    assertEqual(
+      oc.valueEntitlementsStatusLine(refused),
+      'value entitlements: plan unresolved · outcome_ledger refused (plan_missing) · 0/2 granted',
+    );
+    // A withheld decision renders as refused, never as a granted claim.
+    assertEqual(
+      oc.valueEntitlementsStatusLine({ ...report, decisions: [] }),
+      'value entitlements: plan team · outcome_ledger refused (no decision served) · 0/0 granted',
+    );
+    // The refusal line: billing_disabled is the exact local copy; anything
+    // else names the refusal (bounded).
+    assertEqual(
+      oc.valueEntitlementsRefusalStatusLine(
+        'billing_disabled',
+        '409 billing_disabled: commercial billing is disabled',
+      ),
+      'value entitlements: billing disabled locally',
+    );
+    assertEqual(
+      oc.valueEntitlementsRefusalStatusLine('cloud_unavailable', 'cloud unreachable'),
+      'value entitlements unavailable: cloud unreachable',
+    );
+    assert(
+      oc.valueEntitlementsRefusalStatusLine(null, 'x'.repeat(400)).length <=
+        'value entitlements unavailable: '.length + 121,
+      'the refusal reason is bounded',
+    );
+    // The view carries the status line through ok, merged and unavailable.
+    const page = oc.parseOutcomesPage(clone(outcomesPageJson));
+    const okView = oc.buildOutcomesView(page, 'value entitlements: line');
+    assertEqual(okView.entitlementsStatus, 'value entitlements: line');
+    assertEqual(
+      oc.mergeOutcomesPage(okView, page).entitlementsStatus,
+      'value entitlements: line',
+      'an older-page merge preserves the status line',
+    );
+    assertEqual(
+      oc.unavailableOutcomesView('refused', 'value_entitlement_refused', 'value entitlements: line')
+        .entitlementsStatus,
+      'value entitlements: line',
     );
   });
 
@@ -14488,13 +14641,13 @@ async function outcomeTests() {
     const expectedNames = [
       'successfulRunCostMicro',
       'verifiedCostPerSuccessfulChangeMicro',
-      'verifiedFirstPassPpm',
+      'verifiedFirstVerificationPassPpm',
       'reworkCostRatioPpm',
       'localOnlyVerifiedPpm',
       'localFinalVerifiedPpm',
       'localFirstSuccessPpm',
-      'localToFrontierFallbackPpm',
-      'frontierOnlyPpm',
+      'localToHostedFallbackPpm',
+      'hostedOnlyPpm',
       'avoidedHostedInferenceMicro',
       'meanTimeToVerifiedChangeMs',
       'humanInterventionPpm',
@@ -14519,10 +14672,10 @@ async function outcomeTests() {
       byKey.get('verifiedCostPerSuccessfulChangeMicro').detail.includes('5550000 µ$'),
       'VCSC surfaces the all-attempt spend',
     );
-    assertEqual(byKey.get('verifiedFirstPassPpm').value, '100%');
+    assertEqual(byKey.get('verifiedFirstVerificationPassPpm').value, '100%');
     assert(
-      byKey.get('verifiedFirstPassPpm').detail.startsWith('1/1 verified changes'),
-      byKey.get('verifiedFirstPassPpm').detail,
+      byKey.get('verifiedFirstVerificationPassPpm').detail.startsWith('1/1 verified changes'),
+      byKey.get('verifiedFirstVerificationPassPpm').detail,
     );
     assertEqual(byKey.get('reworkCostRatioPpm').value, '4.5045%');
     assertEqual(byKey.get('localOnlyVerifiedPpm').value, '100%');
@@ -14533,8 +14686,8 @@ async function outcomeTests() {
     assertEqual(byKey.get('localOnlyVerifiedPpm').cohort, 'local-only');
     assertEqual(byKey.get('localFinalVerifiedPpm').cohort, 'local-final');
     assertEqual(byKey.get('localFirstSuccessPpm').cohort, 'local-first');
-    assertEqual(byKey.get('localToFrontierFallbackPpm').cohort, 'local-to-frontier');
-    assertEqual(byKey.get('frontierOnlyPpm').value, '50%');
+    assertEqual(byKey.get('localToHostedFallbackPpm').cohort, 'local-to-hosted');
+    assertEqual(byKey.get('hostedOnlyPpm').value, '50%');
     assertEqual(byKey.get('avoidedHostedInferenceMicro').value, 'not measured');
     assertEqual(byKey.get('avoidedHostedInferenceMicro').unmeasured, true);
     assertEqual(byKey.get('frontierEscalationPpm').value, 'not measured');
@@ -14546,7 +14699,9 @@ async function outcomeTests() {
     assertEqual(byKey.get('meanTimeToVerifiedChangeMs').value, '4000 ms');
     assertEqual(byKey.get('humanInterventionPpm').value, '50%');
     assertEqual(byKey.get('regressionRollbackPpm').value, '0%');
-    assert(view.costNote.includes('Successful-Run Cost averages only the runs that verified'));
+    assert(
+      view.costNote.includes('Successful-Run Cost averages only the money-settled runs that verified'),
+    );
 
     // An empty verified denominator renders the exact copy, never a free run.
     const emptyPage = oc.parseOutcomesPage(
@@ -14556,8 +14711,8 @@ async function outcomeTests() {
           ...outcomesMetricsJson,
           runs: 1,
           verifiedChanges: 0,
-          verifiedFirstPassChanges: 0,
-          verifiedFirstPassPpm: 0,
+          verifiedFirstVerificationPassChanges: 0,
+          verifiedFirstVerificationPassPpm: 0,
           totalVerifiedSpendMicro: '0',
           successfulRunCostMicro: '0',
           totalSpendMicro: '0',
@@ -14582,7 +14737,7 @@ async function outcomeTests() {
     const emptyByKey = new Map(empty.metrics.map((metric) => [metric.key, metric]));
     assertEqual(emptyByKey.get('successfulRunCostMicro').value, oc.NO_VERIFIED_CHANGES);
     assertEqual(emptyByKey.get('verifiedCostPerSuccessfulChangeMicro').value, oc.NO_VERIFIED_CHANGES);
-    assertEqual(emptyByKey.get('verifiedFirstPassPpm').value, oc.NO_VERIFIED_CHANGES);
+    assertEqual(emptyByKey.get('verifiedFirstVerificationPassPpm').value, oc.NO_VERIFIED_CHANGES);
     assertEqual(emptyByKey.get('meanTimeToVerifiedChangeMs').value, oc.NO_VERIFIED_CHANGES);
     assertEqual(emptyByKey.get('localOnlyVerifiedPpm').value, '—');
     assertEqual(emptyByKey.get('proofCoveragePpm').value, '—');
@@ -14597,17 +14752,44 @@ async function outcomeTests() {
     );
     assertEqual(oc.buildOutcomesView(truncatedPage).truncated, true);
 
-    // Avoided Hosted Inference shows the SERVED value only when > 0.
+    // Avoided Hosted Inference is TYPED: `unavailable` (null) is not
+    // measured; a measured value (even zero) is the exact served fact.
     const avoidedPage = oc.parseOutcomesPage(
       clone({
         ...outcomesPageJson,
-        metrics: { ...outcomesMetricsJson, avoidedHostedInferenceMicro: '2500000' },
+        metrics: {
+          ...outcomesMetricsJson,
+          avoidedHostedInferenceMicro: '2500000',
+          avoidedHostedInferenceMeasurement: 'measured',
+          avoidedHostedMeasuredRuns: 1,
+        },
       }),
     );
     const avoided = new Map(
       oc.buildOutcomesView(avoidedPage).metrics.map((metric) => [metric.key, metric]),
     );
     assertEqual(avoided.get('avoidedHostedInferenceMicro').value, '2.5000 USD (2500000 µ$)');
+    assertEqual(avoided.get('avoidedHostedInferenceMicro').unmeasured, false);
+    const measuredZeroPage = oc.parseOutcomesPage(
+      clone({
+        ...outcomesPageJson,
+        metrics: {
+          ...outcomesMetricsJson,
+          avoidedHostedInferenceMicro: '0',
+          avoidedHostedInferenceMeasurement: 'measured',
+          avoidedHostedMeasuredRuns: 1,
+        },
+      }),
+    );
+    const measuredZero = new Map(
+      oc.buildOutcomesView(measuredZeroPage).metrics.map((metric) => [metric.key, metric]),
+    );
+    assertEqual(
+      measuredZero.get('avoidedHostedInferenceMicro').value,
+      '0.0000 USD (0 µ$)',
+      'zero is only for a MEASURED zero',
+    );
+    assertEqual(measuredZero.get('avoidedHostedInferenceMicro').unmeasured, false);
   });
 
   await test('outcomes runs: newest-first rows, advanced run id, composite cursor paging', () => {
@@ -14618,14 +14800,40 @@ async function outcomeTests() {
     assertEqual(run.completedText, '2023-11-14 22:13:20Z');
     assertEqual(run.modelSpendUsd, '1.2625 USD');
     assertEqual(run.modelSpendExact, '1262500 µ$');
-    assertEqual(run.steps, 'local:local/llama · hosted:openai/gpt');
+    assertEqual(run.steps, 'local:local/llama · hosted_economy:openai/gpt');
     assertEqual(run.runId, 'run-1', 'the run id travels as data (rendered only under Advanced details)');
     assertDeepEqual(first.nextCursor, { completedAtMs: 1_700_000_000_000, runId: 'run-1' });
+    // A pending money projection renders NO monetary value (the wire is
+    // null), never a zero; the unavailable counterfactual is not measured.
+    const pendingPage = oc.parseOutcomesPage(
+      clone({
+        ...outcomesPageJson,
+        runs: [
+          {
+            ...outcomeRunJson,
+            moneyState: 'pending',
+            modelSpendMicro: null,
+            verificationSpendMicro: null,
+            reworkSpendMicro: null,
+            modelSequence: outcomeRunJson.modelSequence.map((step) => ({
+              ...step,
+              spendMicro: null,
+            })),
+          },
+        ],
+      }),
+    );
+    const pendingRun = oc.buildOutcomesView(pendingPage).runs[0];
+    assertEqual(pendingRun.modelSpendUsd, '—');
+    assertEqual(pendingRun.modelSpendExact, '—');
+    assertEqual(pendingRun.verificationSpendExact, '—');
+    assertEqual(pendingRun.reworkSpendExact, '—');
+    assertEqual(pendingRun.avoidedHostedExact, oc.NOT_MEASURED);
     const olderPage = oc.parseOutcomesPage(
       clone({
         ...outcomesPageJson,
         runs: [
-          { ...outcomeRunJson, runId: 'run-0', verified: false, accepted: false, integrated: false, verifiedFirstAttempt: false },
+          { ...outcomeRunJson, runId: 'run-0', verified: false, accepted: false, integrated: false, verifiedFirstVerificationPass: false },
           clone(outcomeRunJson),
         ],
         nextCursor: null,
@@ -14681,13 +14889,13 @@ async function outcomeTests() {
     for (const name of [
       'Successful-Run Cost',
       'Verified Cost per Successful Change (VCSC)',
-      'Verified First-Pass Rate',
+      'Verified First Verification Pass Rate',
       'Rework Cost Ratio',
       'Local-Only Verified Rate',
       'Local-Final Verified Rate',
       'Local-First Success Rate',
-      'Local-to-Frontier Fallback Rate',
-      'Frontier-Only Rate',
+      'Local-to-Hosted Fallback Rate',
+      'Hosted-Only Rate',
       'Avoided Hosted Inference',
       'Mean Time to Verified Change',
       'Human Intervention Rate',
@@ -14698,7 +14906,7 @@ async function outcomeTests() {
       assert(text.includes(name), `the exact ledger name ${name} must render`);
     }
     assert(text.includes('not measured'), 'avoided 0 renders not measured');
-    for (const cohort of ['local-only', 'local-final', 'local-first', 'local-to-frontier']) {
+    for (const cohort of ['local-only', 'local-final', 'local-first', 'local-to-hosted']) {
       assert(
         findFake(metricsRoot, (node) => String(node.className).includes(`outcome-cohort-${cohort}`)),
         `the ${cohort} cohort carries its distinct class`,
@@ -14766,6 +14974,74 @@ async function outcomeTests() {
     // The conversation surface is untouched by the outcome read failure.
     const historyRows = dom.document.getElementById('history-list').children.length;
     assertEqual(historyRows, 1, 'the conversation listing still renders its served rows');
+  });
+
+  await test('webview outcomes: typed 403/409 refusals and the value-entitlements status line', () => {
+    const statusLine = 'value entitlements: plan team · outcome_ledger granted · 1/2 granted';
+    const snapshot = webviewSnapshot([]);
+    snapshot.sessions = [clone(sessionSummaryJson)];
+    snapshot.outcomes = oc.buildOutcomesView(
+      oc.parseOutcomesPage(clone(outcomesPageJson)),
+      statusLine,
+    );
+    const harness = runChatWebview(snapshot);
+    const { dom } = harness;
+    dom.document.getElementById('history-tab-outcomes').click();
+    const entitlementsLine = dom.document.getElementById('outcomes-entitlements');
+    assertEqual(entitlementsLine.hidden, false, 'the value-entitlements line renders with a report');
+    assertEqual(entitlementsLine.textContent, statusLine);
+    // A typed 403 refusal renders its code + message, keeps the status line
+    // and shows no monetary value.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...snapshot,
+        outcomes: oc.unavailableOutcomesView(
+          'value entitlement outcome_analytics not granted: not_in_plan (plan Some("local"))',
+          'value_entitlement_refused',
+          'value entitlements: plan local · outcome_ledger refused (not_in_plan) · 0/2 granted',
+        ),
+      },
+    });
+    const detail = dom.document.getElementById('outcomes-unavailable-detail').textContent;
+    assert(detail.includes('[value_entitlement_refused]'), detail);
+    assert(detail.includes('not_in_plan'), detail);
+    assertEqual(
+      dom.document.getElementById('outcomes-entitlements').textContent,
+      'value entitlements: plan local · outcome_ledger refused (not_in_plan) · 0/2 granted',
+    );
+    assert(
+      !fakeText(dom.document.getElementById('outcomes-metrics')).includes('USD'),
+      'a typed refusal never renders monetary values',
+    );
+    // The typed 409 renders its code and the exact disabled line.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...snapshot,
+        outcomes: oc.unavailableOutcomesView(
+          '409 billing_disabled: commercial billing is disabled (enable the [billing] section)',
+          'billing_disabled',
+          oc.valueEntitlementsRefusalStatusLine('billing_disabled', ''),
+        ),
+      },
+    });
+    const disabledDetail = dom.document.getElementById('outcomes-unavailable-detail').textContent;
+    assert(disabledDetail.includes('[billing_disabled]'), disabledDetail);
+    assertEqual(
+      dom.document.getElementById('outcomes-entitlements').textContent,
+      'value entitlements: billing disabled locally',
+    );
+    // A local read (no configured organization) carries no status line.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...snapshot,
+        outcomes: oc.buildOutcomesView(oc.parseOutcomesPage(clone(outcomesPageJson))),
+      },
+    });
+    assertEqual(dom.document.getElementById('outcomes-entitlements').hidden, true);
+    assertEqual(dom.document.getElementById('outcomes-entitlements').textContent, '');
   });
 }
 

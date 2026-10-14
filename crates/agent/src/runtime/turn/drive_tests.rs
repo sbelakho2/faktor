@@ -1772,3 +1772,195 @@ async fn turn_record_close_loss_is_marked_and_reconstructed_on_reopen() {
     );
     assert!(marker_files(manager2.store().root()).is_empty());
 }
+
+/// The single-feed invariant under a concurrent LOSING append (finding: a
+/// `Conflict` loser must resolve coverage against the durable winner record
+/// instead of re-feeding its samples per call — the winner's atomic append
+/// already absorbed ITS samples, so a per-call feed would double-count the
+/// router's `model_outcome_stats`). Two DIVERGENT derivations of ONE run
+/// (the producers drifted on wall time, not on the frozen terminal-turn
+/// sample) race the store's immediate transaction; the loser reconciles
+/// from the durable record, consuming the shared sample exactly once, and
+/// only the calls the record did NOT absorb keep the per-call feed.
+#[test]
+fn losing_concurrent_append_never_refeeds_the_winners_samples() {
+    use faktor_router::OutcomeView;
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(faktor_store::Store::open(dir.path(), true).unwrap());
+    let ledger = OutcomeLedger::new(store.clone());
+    let run_id = "tx-session-999";
+    let sample = RunVerifiedSample {
+        provider: "p".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        verified_success: true,
+        rework_cost_micro: 0,
+        rework_turns: 0,
+    };
+    let record = |wall_time_ms: u64| TerminalEngineeringOutcome {
+        schema_version: OUTCOME_RECORD_SCHEMA_V,
+        run_id: run_id.into(),
+        session_id: 999,
+        task_id: 7,
+        task_class: TaskClass::Medium,
+        risk_class: RiskBucket::Low,
+        candidate_snapshot: None,
+        final_snapshot: "tm1:final".into(),
+        accepted: true,
+        integrated: true,
+        verified_first_verification_pass: false,
+        repair_attempts: 0,
+        model_sequence: vec![RunModelStep {
+            provider: "p".into(),
+            model: "m".into(),
+            local: false,
+            execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+        }],
+        wall_time_ms,
+        human_interventions: 0,
+        proof: ProofCoverage {
+            checks_passed: 1,
+            checks_required: 1,
+        },
+        change_scale: ChangedCodeScale::default(),
+        rollback_events: 0,
+        recovery_events: 0,
+        final_basis: FinalVerificationBasis::DeterministicChecks,
+        frontier_escalations: 0,
+        completed_at_ms: 1_760_000_000_000,
+        verified_samples: vec![sample.clone()],
+    };
+    let settlement = EconomicSettlement {
+        schema_version: SETTLEMENT_SCHEMA_V,
+        run_id: run_id.into(),
+        seq: 0,
+        money_state: MoneyState::Complete,
+        reason: "test".into(),
+        model_spend_micro: Some(500_000),
+        verification_spend_micro: Some(0),
+        rework_spend_micro: Some(0),
+        avoided_hosted: MeasuredMoney::Unavailable,
+        steps: vec![SettlementStep {
+            provider: "p".into(),
+            model: "m".into(),
+            local: false,
+            execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+            spend_micro: 500_000,
+        }],
+        settled_at_ms: 1_760_000_000_000,
+    };
+    let barrier = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for wall_time_ms in [1_000u64, 2_000] {
+            let store = store.clone();
+            let settlement = settlement.clone();
+            let record = record(wall_time_ms);
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || {
+                let ledger = OutcomeLedger::new(store);
+                barrier.wait();
+                ledger.record(&record, &settlement)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let recorded = results
+        .iter()
+        .filter(|result| matches!(result, Ok(LedgerAppend::Recorded)))
+        .count();
+    let conflicts = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Err(OutcomeLedgerError::Store(
+                    faktor_store::StoreError::Conflict(_)
+                ))
+            )
+        })
+        .count();
+    assert_eq!(
+        (recorded, conflicts),
+        (1, 1),
+        "the store's immediate transaction picks exactly one winner: {results:?}"
+    );
+    let losing = results
+        .into_iter()
+        .find(|result| {
+            matches!(
+                result,
+                Err(OutcomeLedgerError::Store(
+                    faktor_store::StoreError::Conflict(_)
+                ))
+            )
+        })
+        .unwrap();
+    // The winner's atomic append absorbed the shared sample exactly once.
+    let view = crate::StoreOutcomeStore::new(store.clone());
+    let key = faktor_router::OutcomeKey {
+        provider: "p".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        task_class: TaskClass::Medium,
+        risk_bucket: RiskBucket::Low,
+    };
+    assert_eq!(view.stats(&key).unwrap().sample_count, 1);
+    // The loser resolves coverage from the DURABLE record, never from its
+    // losing call-site state.
+    let facts = TerminalRunFacts {
+        schema_version: TERMINAL_FACTS_SCHEMA_V,
+        risk_class: Some(RiskBucket::Low),
+        samples: vec![sample.clone()],
+    };
+    let mut absorbed =
+        super::drive::resolve_absorbed_samples(&ledger, run_id, losing.map(Some), &facts);
+    assert_eq!(
+        absorbed,
+        vec![sample.clone()],
+        "the durable winner's samples are the truth"
+    );
+    let call = SettledCallOutcome {
+        provider: "p".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        success: true,
+        retried: false,
+        rate_limited: false,
+        latency_ms: 10,
+        verified: Some(VerifiedCallAttribution {
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+            verified_success: true,
+            rework_cost_micro: 0,
+            rework_turns: 0,
+        }),
+    };
+    assert!(
+        super::drive::take_absorbed_sample(&mut absorbed, &call, &CompletionGate::VerifiedComplete),
+        "the winner already fed this sample: the call switches to telemetry-only"
+    );
+    assert!(absorbed.is_empty());
+    // The reconciliation is PER SAMPLE: a call the record did not absorb
+    // keeps the per-call feed (never all-or-nothing).
+    let mut divergent_call = call;
+    divergent_call.model = "m2".into();
+    assert!(!super::drive::take_absorbed_sample(
+        &mut absorbed,
+        &divergent_call,
+        &CompletionGate::VerifiedComplete
+    ));
+    // The pre-existing-record path resolves to the same durable samples.
+    let preexisting = super::drive::resolve_absorbed_samples(&ledger, run_id, Ok(None), &facts);
+    assert_eq!(preexisting, vec![sample]);
+    assert_eq!(
+        view.stats(&key).unwrap().sample_count,
+        1,
+        "the shared sample was fed exactly once"
+    );
+}

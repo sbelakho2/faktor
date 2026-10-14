@@ -1064,6 +1064,11 @@ fn migration_v25_rebuilds_attachment_references_and_preserves_rows() {
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            // The v35 route-time execution class is post-this-version too.
+            let _ = conn.execute(
+                "ALTER TABLE cost_reservation DROP COLUMN execution_class",
+                [],
+            );
             conn.execute("PRAGMA user_version = 25", []).unwrap();
         }
         s.id
@@ -1127,6 +1132,11 @@ fn migration_v28_rebuilds_artifact_identity_per_session_and_preserves_rows() {
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            // The v35 route-time execution class is post-this-version too.
+            let _ = conn.execute(
+                "ALTER TABLE cost_reservation DROP COLUMN execution_class",
+                [],
+            );
             conn.execute("PRAGMA user_version = 28", []).unwrap();
         }
         s.id

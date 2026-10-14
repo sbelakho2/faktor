@@ -5,9 +5,13 @@
 // denominators, scan honesty) so the smoke drives it without a display; the
 // Swing panel renders it. Money stays a BigInteger end-to-end (MicroMoney
 // helpers, never scientific notation); an empty verified denominator renders
-// the exact `No verified changes yet`, an unmeasured counterfactual renders
-// `not measured` (never `0` as a savings/free claim), and a read failure is
-// the T29 `Cost unavailable` state with no monetary value at all.
+// the exact `No verified changes yet`, both cost metrics are gated on the
+// MONEY-SETTLED verified cohort (`verifiedChangesMoneyComplete` — a
+// verified-but-money-pending run never renders a fabricated $0, and the
+// excluded count is surfaced), an empty rate denominator renders `—` (never
+// a measured 0 rate), an unmeasured counterfactual renders `not measured`
+// (never `0` as a savings/free claim), and a read failure is the T29
+// `Cost unavailable` state with no monetary value at all.
 package dev.faktor.frontend
 
 import dev.faktor.shared.MicroMoney
@@ -15,6 +19,7 @@ import dev.faktor.shared.ProtocolOutcomeCursor
 import dev.faktor.shared.ProtocolOutcomeMetrics
 import dev.faktor.shared.ProtocolOutcomesPage
 import dev.faktor.shared.ProtocolRunOutcome
+import dev.faktor.shared.ProtocolValueEntitlementsReport
 import java.awt.BorderLayout
 import java.math.BigInteger
 import javax.swing.BoxLayout
@@ -22,6 +27,16 @@ import javax.swing.JPanel
 
 /** Exact empty-denominator copy (never a zero rate claim). */
 const val OUTCOMES_NO_VERIFIED_CHANGES = "No verified changes yet"
+
+/**
+ * The gate copy for a verified cohort whose money is NOT settled: the served
+ * Successful-Run-Cost/VCSC values held their folded zero, which must never be
+ * rendered as a measured $0.
+ */
+const val OUTCOMES_NO_MONEY_SETTLED_CHANGES = "No money-settled verified changes yet"
+
+/** Exact empty-denominator glyph for rates (never a measured 0 rate). */
+const val OUTCOMES_UNAVAILABLE_VALUE = "\u2014"
 
 /** Exact unmeasured copy (an unrecorded counterfactual is never a 0 claim). */
 const val OUTCOMES_NOT_MEASURED = "not measured"
@@ -37,6 +52,46 @@ const val OUTCOMES_MAX_RUN_ROWS = 200
 /** The page size the panel requests from `GET /native/outcomes`. */
 const val OUTCOMES_PAGE_LIMIT = 25L
 
+/** The exact `outcome_ledger` hook the outcomes read enforces. */
+const val OUTCOMES_ENTITLEMENT_HOOK = "outcome_ledger"
+
+/**
+ * The value-entitlements status line of one successful report: the resolved
+ * plan, the `outcome_ledger` decision (granted, or refused with its exact
+ * cause) and the granted/total count. Deterministic and exact — the panel
+ * renders this string verbatim, and a missing decision renders as refused,
+ * never as a granted claim.
+ */
+fun valueEntitlementsStatusLine(report: ProtocolValueEntitlementsReport): String {
+    val plan = if (report.planFound && !report.planId.isNullOrEmpty()) {
+        report.planId
+    } else {
+        "unresolved"
+    }
+    val decision = report.decisions.firstOrNull { it.hook == OUTCOMES_ENTITLEMENT_HOOK }
+    val ledger = when {
+        decision == null -> "outcome_ledger refused (no decision served)"
+        decision.granted -> "outcome_ledger granted"
+        else -> "outcome_ledger refused (${decision.cause ?: "unknown"})"
+    }
+    val granted = report.decisions.count { it.granted }
+    return "value entitlements: plan $plan · $ledger · $granted/${report.decisions.size} granted"
+}
+
+/**
+ * The value-entitlements status line of one failed report read: a disabled
+ * billing service renders "billing disabled locally" (the shared typed 409),
+ * anything else names the refusal. The reason is bounded — the panel line is
+ * a status, not a diagnostic dump.
+ */
+fun valueEntitlementsRefusalStatusLine(code: String?, reason: String): String {
+    if (code == "billing_disabled") {
+        return "value entitlements: billing disabled locally"
+    }
+    val bounded = if (reason.length > 120) reason.take(120) + "…" else reason
+    return "value entitlements unavailable: $bounded"
+}
+
 /** One metric row: exact name, exact rendered value, served detail, definition. */
 data class OutcomeMetricRow(
     val name: String,
@@ -51,9 +106,11 @@ data class OutcomeRunRow(
     val taskClass: String,
     val riskClass: String,
     val verified: Boolean,
-    val firstAttempt: Boolean,
-    val modelSpendMicro: String,
-    val reworkSpendMicro: String,
+    val firstVerificationPass: Boolean,
+    /** Null when the money is not settled (`moneyState != complete`). */
+    val modelSpendMicro: String?,
+    /** Null when the money is not settled (`moneyState != complete`). */
+    val reworkSpendMicro: String?,
     val wallTimeMs: Long,
     val completedAtMs: Long
 )
@@ -69,7 +126,23 @@ data class OutcomesPanelModel(
     val nextCursor: ProtocolOutcomeCursor?,
     val scanned: Long,
     val truncated: Boolean,
-    val pagingExhausted: Boolean
+    val pagingExhausted: Boolean,
+    /**
+     * The typed refusal code of a failed read (`value_entitlement_refused`,
+     * `billing_disabled`, `store_error`, …); null while nothing refused. The
+     * panel renders it verbatim so a typed 403/409 is never flattened into
+     * an anonymous "unavailable".
+     */
+    val refusalCode: String? = null,
+    /**
+     * The value-entitlements status line (`GET /native/value-entitlements`)
+     * of the configured control-plane organization: the plan resolution, the
+     * `outcome_ledger` decision and the granted/total count, or the typed
+     * refusal ("billing disabled locally" for the 409). Null while no
+     * organization is configured — a local read is never dressed up as an
+     * entitlement.
+     */
+    val entitlementsStatus: String? = null
 ) {
     fun olderEnabled(): Boolean = nextCursor != null
 
@@ -81,17 +154,22 @@ data class OutcomesPanelModel(
 
     /** The bounded display lines (smoke-visible; exact metric names). */
     fun lines(): List<String> = metricRows.map { "${it.name}: ${it.value} — ${it.detail}" } +
-        runRows.map { "run ${it.runId} [$it.taskClass/$it.riskClass] verified=${it.verified}" }
+        runRows.map { "run ${it.runId} [$it.taskClass/$it.riskClass] verified=${it.verified}" } +
+        listOfNotNull(entitlementsStatus)
 }
 
 /**
  * Build the panel model from one served page plus the last refusal. A null
  * page without a refusal is the honest `not_read` state (nothing invented);
- * a refusal is the T29 `unavailable` state with NO monetary rows.
+ * a refusal is the T29 `unavailable` state with NO monetary rows; the typed
+ * refusal code and the value-entitlements status line ride the model so both
+ * are rendered verbatim.
  */
 fun outcomesPanelModelOf(
     page: ProtocolOutcomesPage?,
-    refusalReason: String? = null
+    refusalReason: String? = null,
+    refusalCode: String? = null,
+    entitlementsStatus: String? = null
 ): OutcomesPanelModel {
     if (page == null) {
         return OutcomesPanelModel(
@@ -103,7 +181,9 @@ fun outcomesPanelModelOf(
             nextCursor = null,
             scanned = 0L,
             truncated = false,
-            pagingExhausted = false
+            pagingExhausted = false,
+            refusalCode = refusalCode,
+            entitlementsStatus = entitlementsStatus
         )
     }
     val metrics = page.metrics
@@ -118,57 +198,96 @@ fun outcomesPanelModelOf(
             nextCursor = null,
             scanned = metrics.scanned,
             truncated = metrics.truncated,
-            pagingExhausted = page.nextCursor == null
+            pagingExhausted = page.nextCursor == null,
+            refusalCode = refusalCode,
+            entitlementsStatus = entitlementsStatus
         )
     }
     val rows = ArrayList<OutcomeMetricRow>()
     val verifiedDenominator = metrics.verifiedChanges
+    // The cost metrics' REAL denominator: money-settled verified changes. A
+    // verified-but-money-pending run leaves it zero and must never render the
+    // served folded zero as a measured $0; the exclusion count is surfaced.
+    val moneyCompleteDenominator = metrics.verifiedChangesMoneyComplete
+    val costGate = verifiedDenominator == 0L || moneyCompleteDenominator == 0L
+    val exclusionNote = if (metrics.moneyIncompleteExcluded > 0L) {
+        " \u00b7 " + metrics.moneyIncompleteExcluded + " run(s) excluded (money not settled)"
+    } else {
+        ""
+    }
+    val totalSpend = MicroMoney.parseDecimal(metrics.totalSpendMicro)
+    val noTotalSpend = totalSpend == null || totalSpend.signum() == 0
+    val frontierPpm = metrics.frontierEscalationPpm
 
     rows.add(
         OutcomeMetricRow(
             name = "Successful-Run Cost",
-            value = if (verifiedDenominator == 0L) {
-                OUTCOMES_NO_VERIFIED_CHANGES
-            } else {
-                moneyText(metrics.successfulRunCostMicro)
+            value = when {
+                verifiedDenominator == 0L -> OUTCOMES_NO_VERIFIED_CHANGES
+                moneyCompleteDenominator == 0L -> OUTCOMES_NO_MONEY_SETTLED_CHANGES
+                else -> moneyText(metrics.successfulRunCostMicro)
             },
-            detail = "model + verification spend over the successful (verified) runs ÷ verified changes",
-            explanation = "The average spend of a run that DID succeed — failed attempts are " +
-                "excluded from this numerator."
+            detail = when {
+                verifiedDenominator == 0L ->
+                    "model + verification spend over 0 verified changes" + exclusionNote
+                moneyCompleteDenominator == 0L ->
+                    "spend over 0 money-settled verified changes" + exclusionNote
+                else ->
+                    "model + verification spend over the successful (verified) runs \u00f7 " +
+                        moneyCompleteDenominator + " money-settled verified changes" + exclusionNote
+            },
+            explanation = "The average spend of a run that DID succeed \u2014 failed attempts " +
+                "are excluded from this numerator, and a verified run whose money is still " +
+                "pending is excluded from the denominator (never a $0 average)."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Verified Cost per Successful Change (VCSC)",
-            value = if (verifiedDenominator == 0L) {
-                OUTCOMES_NO_VERIFIED_CHANGES
-            } else {
-                moneyText(metrics.verifiedCostPerSuccessfulChangeMicro)
+            value = when {
+                verifiedDenominator == 0L -> OUTCOMES_NO_VERIFIED_CHANGES
+                moneyCompleteDenominator == 0L -> OUTCOMES_NO_MONEY_SETTLED_CHANGES
+                else -> moneyText(metrics.verifiedCostPerSuccessfulChangeMicro)
             },
-            detail = "TOTAL spend over ALL attempted work ÷ verified changes",
-            explanation = "All-in cost of one verified change: 9 failures at $10 plus 1 verified " +
-                "change at $1 reads $91 per successful change (never $1)."
+            detail = when {
+                verifiedDenominator == 0L ->
+                    "TOTAL spend over ALL attempted work \u00f7 0 verified changes" + exclusionNote
+                moneyCompleteDenominator == 0L ->
+                    "TOTAL spend over ALL attempted work \u00f7 0 money-settled verified " +
+                        "changes" + exclusionNote
+                else ->
+                    "TOTAL spend over ALL attempted work \u00f7 " + moneyCompleteDenominator +
+                        " money-settled verified changes" + exclusionNote
+            },
+            explanation = "All-in cost of one money-settled verified change: 9 failures at $10 " +
+                "plus 1 verified change at $1 reads $91 per successful change (never $1)."
         )
     )
     rows.add(
         OutcomeMetricRow(
-            name = "Verified First-Pass Rate",
+            name = "Verified First Verification Pass Rate",
             value = if (verifiedDenominator == 0L) {
                 OUTCOMES_NO_VERIFIED_CHANGES
             } else {
-                ppmPercentText(metrics.verifiedFirstPassPpm)
+                ppmPercentText(metrics.verifiedFirstVerificationPassPpm)
             },
-            detail = "${metrics.verifiedFirstPassChanges} of ${metrics.verifiedChanges} verified changes",
-            explanation = "first-attempt verified changes ÷ verified changes."
+            detail = "${metrics.verifiedFirstVerificationPassChanges} of ${metrics.verifiedChanges} verified changes",
+            explanation = "verified changes whose FIRST verification attempt passed ÷ verified changes " +
+                "(a verification-attempt measure, never an implementation-attempt claim)."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Rework Cost Ratio",
-            value = ppmPercentText(metrics.reworkCostRatioPpm),
-            detail = "rework spend " + moneyText(metrics.totalReworkSpendMicro) +
-                " of total spend " + moneyText(metrics.totalSpendMicro),
-            explanation = "rework spend ÷ (model + verification spend), all runs."
+            value = if (noTotalSpend) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.reworkCostRatioPpm),
+            detail = if (noTotalSpend) {
+                "no model + verification spend recorded; zero denominator (not measured)"
+            } else {
+                "rework spend " + moneyText(metrics.totalReworkSpendMicro) +
+                    " of total spend " + moneyText(metrics.totalSpendMicro)
+            },
+            explanation = "rework spend \u00f7 (model + verification spend), all runs; an empty " +
+                "spend denominator is not measured, never a 0% rate."
         )
     )
     rows.add(
@@ -196,82 +315,147 @@ fun outcomesPanelModelOf(
     rows.add(
         OutcomeMetricRow(
             name = "Human Intervention Rate",
-            value = ppmPercentText(metrics.humanInterventionPpm),
-            detail = "${metrics.humanInterventionRuns} of ${metrics.runs} runs",
-            explanation = "runs with at least one permission decision, manual steer or edit ÷ all runs."
+            value = if (metrics.runs == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.humanInterventionPpm),
+            detail = if (metrics.runs == 0L) {
+                "no runs recorded; zero denominator (not measured)"
+            } else {
+                "${metrics.humanInterventionRuns} of ${metrics.runs} runs"
+            },
+            explanation = "runs with at least one permission decision, manual steer or edit \u00f7 " +
+                "all runs; an empty run denominator is not measured, never a 0% rate."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Regression/Rollback Rate",
-            value = ppmPercentText(metrics.regressionRollbackPpm),
-            detail = "${metrics.rollbackRuns} of ${metrics.runs} runs",
-            explanation = "runs with at least one rollback event ÷ all runs."
+            value = if (metrics.runs == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.regressionRollbackPpm),
+            detail = if (metrics.runs == 0L) {
+                "no runs recorded; zero denominator (not measured)"
+            } else {
+                "${metrics.rollbackRuns} of ${metrics.runs} runs"
+            },
+            explanation = "runs with at least one rollback event \u00f7 all runs; an empty run " +
+                "denominator is not measured, never a 0% rate."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Proof Coverage",
             value = if (metrics.checksRequired == 0L) {
-                "no required checks"
+                OUTCOMES_UNAVAILABLE_VALUE
             } else {
                 ppmPercentText(metrics.proofCoveragePpm)
             },
-            detail = "${metrics.checksPassed} of ${metrics.checksRequired} required checks",
-            explanation = "passed checks ÷ required checks over runs that required any, clamped to 100%."
+            detail = if (metrics.checksRequired == 0L) {
+                "no required checks recorded; zero denominator (not measured)"
+            } else {
+                "${metrics.checksPassed} of ${metrics.checksRequired} required checks"
+            },
+            explanation = "passed checks \u00f7 required checks over runs that required any, " +
+                "clamped to 100%; no required checks is not measured, never a 0% rate."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Frontier Escalation Rate",
-            value = ppmPercentText(metrics.frontierEscalationPpm),
-            detail = "${metrics.frontierEscalationRuns} of ${metrics.runs} runs",
-            explanation = "runs with at least one recorded frontier escalation ÷ all runs; a hosted " +
-                "step alone is never inferred as a frontier escalation."
+            // A local binding: `frontierEscalationPpm` is a nullable property
+            // of another module, so it cannot smart-cast after the null check.
+            value = if (frontierPpm == null || metrics.runs == 0L) {
+                OUTCOMES_NOT_MEASURED
+            } else {
+                ppmPercentText(frontierPpm)
+            },
+            detail = when (metrics.frontierEscalationMeasurement) {
+                "unmeasured" ->
+                    "no durable execution-class authority records escalations; zero is unmeasured"
+                "partial" ->
+                    "${metrics.frontierEscalationClassedRuns} of " +
+                        "${metrics.frontierClassedRuns} fully-classed runs with a recorded " +
+                        "frontier escalation (partial)"
+                else ->
+                    "${metrics.frontierEscalationRuns} of ${metrics.runs} runs with a recorded " +
+                        "frontier escalation (measured)"
+            },
+            explanation = "runs with at least one recorded frontier escalation \u00f7 runs; null " +
+                "(never a fabricated 0%) unless durable execution-class authority exists; " +
+                "frontierEscalationMeasurement reports measured | partial | unmeasured, and " +
+                "partial covers exactly the fully-classed runs."
         )
     )
 
     // The distinct local cohorts: local-only / local-final / local-first /
     // fallback stay separate named rows with their own served denominators.
+    // An empty denominator renders `—` (never a measured 0% rate).
     rows.add(
         OutcomeMetricRow(
             name = "Local-Only Verified Rate",
-            value = ppmPercentText(metrics.localOnlyVerifiedPpm),
-            detail = "${metrics.localOnlyVerifiedChanges} of ${metrics.localOnlyRuns} local-only runs",
-            explanation = "Verified local-only runs ÷ runs whose model sequence is entirely local."
+            value = if (metrics.localOnlyRuns == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.localOnlyVerifiedPpm),
+            detail = if (metrics.localOnlyRuns == 0L) {
+                "no local-only runs recorded"
+            } else {
+                "${metrics.localOnlyVerifiedChanges} of ${metrics.localOnlyRuns} local-only runs"
+            },
+            explanation = "Verified local-only runs \u00f7 runs whose model sequence is entirely " +
+                "local; no local-only runs is not measured, never a 0% rate."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Local-Final Verified Rate",
-            value = ppmPercentText(metrics.localFinalVerifiedPpm),
-            detail = "${metrics.localFinalVerifiedChanges} of ${metrics.localFinalRuns} local-final runs",
-            explanation = "Verified runs whose FINAL model step is local ÷ runs whose final step is local."
+            value = if (metrics.localFinalRuns == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.localFinalVerifiedPpm),
+            detail = if (metrics.localFinalRuns == 0L) {
+                "no local-final runs recorded"
+            } else {
+                "${metrics.localFinalVerifiedChanges} of ${metrics.localFinalRuns} local-final runs"
+            },
+            explanation = "Verified runs whose FINAL model step is local \u00f7 runs whose final " +
+                "step is local; no local-final runs is not measured, never a 0% rate."
         )
     )
     rows.add(
         OutcomeMetricRow(
             name = "Local-First Success Rate",
-            value = ppmPercentText(metrics.localFirstSuccessPpm),
-            detail = "${metrics.localFirstSuccessChanges} of ${metrics.localFirstRuns} local-first runs",
-            explanation = "Local-first runs that verified on their first attempt ÷ runs whose FIRST step is local."
+            value = if (metrics.localFirstRuns == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.localFirstSuccessPpm),
+            detail = if (metrics.localFirstRuns == 0L) {
+                "no local-first runs recorded"
+            } else {
+                "${metrics.localFirstSuccessChanges} of ${metrics.localFirstRuns} local-first runs"
+            },
+            explanation = "Runs whose FIRST step is durably local, whose FINAL step is ALSO " +
+                "durably local, and whose FIRST verification attempt passed \u00f7 runs whose " +
+                "FIRST step is durably local; no local-first runs is not measured."
         )
     )
     rows.add(
         OutcomeMetricRow(
-            name = "Local-to-Frontier Fallback Rate",
-            value = ppmPercentText(metrics.localToFrontierFallbackPpm),
-            detail = "${metrics.localToFrontierFallbackRuns} of ${metrics.localFirstRuns} local-first runs",
-            explanation = "Runs that started local and ENDED hosted ÷ runs whose first step is local; " +
-                "a local-then-hosted repair is a fallback, never a local substitution."
+            name = "Local-to-Hosted Fallback Rate",
+            value = if (metrics.localFirstRuns == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.localToHostedFallbackPpm),
+            detail = if (metrics.localFirstRuns == 0L) {
+                "no local-first runs recorded"
+            } else {
+                "${metrics.localToHostedFallbackRuns} of ${metrics.localFirstRuns} local-first runs"
+            },
+            explanation = "Runs that started on a durably local step and ENDED on a durably " +
+                "hosted step \u00f7 runs whose first step is durably local; a local-then-hosted " +
+                "repair is a fallback, never a local substitution."
         )
     )
     rows.add(
         OutcomeMetricRow(
-            name = "Frontier-Only Rate",
-            value = ppmPercentText(metrics.frontierOnlyPpm),
-            detail = "${metrics.frontierOnlyRuns} of ${metrics.runs} runs",
-            explanation = "Runs with no local step at all ÷ all runs."
+            name = "Hosted-Only Rate",
+            // The SERVED denominator is runs WITH model steps (a stepless run
+            // carries no hosted evidence), so the row gates on it — never on
+            // all runs.
+            value = if (metrics.runsWithSteps == 0L) OUTCOMES_UNAVAILABLE_VALUE else ppmPercentText(metrics.hostedOnlyPpm),
+            detail = if (metrics.runsWithSteps == 0L) {
+                "no runs with model steps recorded"
+            } else {
+                "${metrics.hostedOnlyRuns} of ${metrics.runsWithSteps} runs with model steps " +
+                    "whose every step is durably hosted"
+            },
+            explanation = "Runs whose every step is durably HOSTED \u00f7 runs with steps; an " +
+                "unknown execution class is never counted as local or hosted, and no runs with " +
+                "steps is not measured, never a 0% rate."
         )
     )
 
@@ -281,7 +465,7 @@ fun outcomesPanelModelOf(
             taskClass = run.taskClass,
             riskClass = run.riskClass,
             verified = run.verified,
-            firstAttempt = run.verifiedFirstAttempt,
+            firstVerificationPass = run.verifiedFirstVerificationPass,
             modelSpendMicro = run.modelSpendMicro,
             reworkSpendMicro = run.reworkSpendMicro,
             wallTimeMs = run.wallTimeMs,
@@ -297,16 +481,19 @@ fun outcomesPanelModelOf(
         nextCursor = page.nextCursor,
         scanned = metrics.scanned,
         truncated = metrics.truncated,
-        pagingExhausted = page.nextCursor == null
+        pagingExhausted = page.nextCursor == null,
+        refusalCode = null,
+        entitlementsStatus = entitlementsStatus
     )
 }
 
-/** `0` avoided hosted inference is unmeasured, never a free-inference claim. */
+/** The TYPED avoided-hosted fact: `unavailable` (or a null value) is not
+ * measured; a MEASURED value — including a measured zero — is exact. */
 private fun avoidedValue(metrics: ProtocolOutcomeMetrics): String {
-    val parsed = MicroMoney.parseDecimal(metrics.avoidedHostedInferenceMicro)
-        ?: return OUTCOMES_NOT_MEASURED
-    if (parsed.signum() == 0) return OUTCOMES_NOT_MEASURED
-    return moneyText(metrics.avoidedHostedInferenceMicro)
+    if (metrics.avoidedHostedInferenceMeasurement != "measured") return OUTCOMES_NOT_MEASURED
+    val raw = metrics.avoidedHostedInferenceMicro ?: return OUTCOMES_NOT_MEASURED
+    if (MicroMoney.parseDecimal(raw) == null) return OUTCOMES_NOT_MEASURED
+    return moneyText(raw)
 }
 
 /** Guard: every served money value of the metrics fold parses exactly. */
@@ -316,9 +503,8 @@ private fun moneyGlyph(metrics: ProtocolOutcomeMetrics): BigInteger? {
         metrics.successfulRunCostMicro,
         metrics.totalSpendMicro,
         metrics.verifiedCostPerSuccessfulChangeMicro,
-        metrics.totalReworkSpendMicro,
-        metrics.avoidedHostedInferenceMicro
-    )
+        metrics.totalReworkSpendMicro
+    ) + listOfNotNull(metrics.avoidedHostedInferenceMicro)
     for (value in values) {
         if (MicroMoney.parseDecimal(value) == null) return null
     }
@@ -354,6 +540,12 @@ class OutcomesPanel : JPanel(BorderLayout()) {
     }
 
     private val statusLabel = WrappedLabel("outcomes: -")
+
+    /**
+     * The value-entitlements status line of the configured control-plane
+     * organization (hidden while no organization is configured).
+     */
+    private val entitlementsLabel = wrappedMutedLabel("")
 
     private val truncatedLabel = WrappedLabel("")
 
@@ -433,7 +625,10 @@ class OutcomesPanel : JPanel(BorderLayout()) {
         contentHost.isOpaque = false
         contentHost.add(contentScroll, "content")
         contentHost.add(pageScroll(unavailableCard), "unavailable")
-        add(panelHeader(statusLabel), BorderLayout.NORTH)
+        val header = pageColumn(gap = Spacing.XS, padding = 0)
+        header.add(panelHeader(statusLabel))
+        header.add(entitlementsLabel)
+        add(header, BorderLayout.NORTH)
         add(contentHost, BorderLayout.CENTER)
         setModel(null)
     }
@@ -464,11 +659,13 @@ class OutcomesPanel : JPanel(BorderLayout()) {
                 renderRuns(null)
             }
         }
-        statusLabel.text = when (value?.state) {
-            "ok" -> "outcomes: " + plural(value.metricRows.size, "metric") +
+        statusLabel.text = when {
+            value == null -> "outcomes: not read yet"
+            value.state == "ok" -> "outcomes: " + plural(value.metricRows.size, "metric") +
                 " · " + plural(value.runRows.size, "run") +
                 if (value.truncated) " · [TRUNCATED]" else ""
-            "unavailable" -> "outcomes: cost unavailable"
+            value.state == "unavailable" -> "outcomes: cost unavailable" +
+                (value.refusalCode?.let { " [" + it + "]" } ?: "")
             else -> "outcomes: not read yet"
         }
         statusLabel.foreground = if (value?.state == "unavailable") {
@@ -476,6 +673,9 @@ class OutcomesPanel : JPanel(BorderLayout()) {
         } else {
             textForeground()
         }
+        val entitlementsText = value?.entitlementsStatus ?: ""
+        entitlementsLabel.fullText = entitlementsText
+        entitlementsLabel.isVisible = entitlementsText.isNotEmpty()
         revalidate()
         repaint()
     }
@@ -537,11 +737,22 @@ class OutcomesPanel : JPanel(BorderLayout()) {
             )
             cohortColumn.add(
                 wrappedMutedLabel(
-                    "local-to-frontier fallback runs: " + metrics.localToFrontierFallbackRuns
+                    "local-to-hosted fallback runs: " + metrics.localToHostedFallbackRuns
                 )
             )
             cohortColumn.add(
-                wrappedMutedLabel("frontier-only runs (no local step): " + metrics.frontierOnlyRuns)
+                wrappedMutedLabel("hosted-only runs (every step durably hosted): " + metrics.hostedOnlyRuns)
+            )
+            cohortColumn.add(
+                wrappedMutedLabel(
+                    "runs with model steps (Hosted-Only Rate denominator): " + metrics.runsWithSteps
+                )
+            )
+            cohortColumn.add(
+                wrappedMutedLabel(
+                    "money-incomplete runs excluded from cost metrics: " +
+                        metrics.moneyIncompleteExcluded
+                )
             )
         }
         cohortColumn.revalidate()
@@ -556,13 +767,15 @@ class OutcomesPanel : JPanel(BorderLayout()) {
         } else {
             for (row in rows) {
                 val verification = if (row.verified) "verified" else "not verified"
-                val attempt = if (row.firstAttempt) "first attempt" else "after repair"
+                val attempt = if (row.firstVerificationPass) "first verification pass" else "after repair"
+                val modelSpend = row.modelSpendMicro?.let { moneyText(it) } ?: OUTCOMES_NOT_MEASURED
+                val reworkSpend = row.reworkSpendMicro?.let { moneyText(it) } ?: OUTCOMES_NOT_MEASURED
                 runsColumn.add(
                     wrappedMutedLabel(
                         row.runId + " \u00b7 " + row.taskClass + "/" + row.riskClass + " \u00b7 " +
                             verification + " (" + attempt + ") \u00b7 model spend " +
-                            moneyText(row.modelSpendMicro) + " \u00b7 rework " +
-                            moneyText(row.reworkSpendMicro) + " \u00b7 " + row.wallTimeMs + " ms"
+                            modelSpend + " \u00b7 rework " +
+                            reworkSpend + " \u00b7 " + row.wallTimeMs + " ms"
                     )
                 )
             }
@@ -615,4 +828,10 @@ class OutcomesPanel : JPanel(BorderLayout()) {
     fun viewDetailsText(): String = viewDetailsButton.text
 
     fun truncatedText(): String = truncatedLabel.fullText
+
+    /** The rendered value-entitlements status line ("" while hidden). */
+    fun entitlementsStatusText(): String = entitlementsLabel.fullText
+
+    /** The rendered status line (typed refusal codes surface here). */
+    fun statusText(): String = statusLabel.text
 }

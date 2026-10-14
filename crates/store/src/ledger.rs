@@ -12,16 +12,14 @@ pub struct MemoryFactRow {
     pub updated_ms: i64,
 }
 
-/// Cursor over the memory-fact total order `(updated_ms DESC, kind DESC,
-/// key DESC)`: the `(updated_ms, kind, key)` position of the last row of a
-/// page. Identifies a stable position — replaying it returns the same
-/// window.
+/// Cursor over the memory-fact total order `(updated_ms DESC, kind DESC, key DESC)`: the
+/// position of the last row of a page. Identifies a stable position — replaying it returns
+/// the same window.
 pub type MemoryFactCursor = (i64, String, String);
 
-/// Verification depth of [`Store::journal_session_problems`]. `Open` keeps
-/// session open bounded (point reads plus ONE covering-index aggregate);
-/// `Deep` adds the adjacent-inversion timestamp aggregate the doctor sweep
-/// runs. Both NEVER materialize the journal.
+/// [`Store::journal_session_problems`] depth: `Open` is the bounded projection check
+/// (point reads plus ONE covering-index aggregate); `Deep` adds the adjacent-inversion
+/// timestamp aggregate the doctor sweep runs. Both never materialize the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalDepth {
     Open,
@@ -493,6 +491,7 @@ mod evidence_store_tests {
                  DROP TABLE IF EXISTS evidence;
                  ALTER TABLE task DROP COLUMN attachments; ALTER TABLE task DROP COLUMN contract;
                  DROP TABLE IF EXISTS attachment;
+                 ALTER TABLE cost_reservation DROP COLUMN execution_class;
                  ALTER TABLE tool_run DROP COLUMN pre_manifest;
                  PRAGMA user_version = 21;",
             )
@@ -503,7 +502,11 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 33, "v32 is the migration head");
+            assert_eq!(
+                version,
+                crate::schema::SCHEMA_HEAD,
+                "the replay reaches the binary's migration head"
+            );
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
@@ -2268,10 +2271,9 @@ impl Store {
                 (Ok(projected), Ok(landed)) if projected == landed => {}
                 (Ok(projected), Ok(landed)) => {
                     // The ONE legal projection-ahead window: queue admission
-                    // ([`Store::admit_queue_head`]) reserves the next journal
-                    // seq for the materialized admission message and moves
-                    // the row to `preparing` in ONE transaction, while the
-                    // matching `prompt_admitted` event at that reserved seq
+                    // ([`Store::admit_queue_head`]) reserves the next journal seq and moves
+                    // the row to `preparing` in ONE transaction, while the matching event
+                    // at that reserved seq
                     // lands immediately after (the agent queue runner). A
                     // crash between the two leaves the projection exactly one
                     // reserved event AHEAD of the journal — recoverable
@@ -2313,9 +2315,8 @@ impl Store {
             }
         }
         if depth == JournalDepth::Deep {
-            // Timestamps never step backwards in seq order (the append path
-            // clamps a backward clock, so a regression is tampering). ONE
-            // adjacent-pair inversion count; never a row-by-row compare.
+            // Timestamps never step backwards in seq order (the append path clamps a backward
+            // clock, so a regression is tampering). ONE adjacent-pair inversion count.
             let inversions: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM event e
                  JOIN event p ON p.session_id = e.session_id AND p.seq = e.seq - 1
@@ -2432,8 +2433,7 @@ impl Store {
                 row.id
             ))
         })?;
-        // Preparation BEFORE enqueueing: the collision refusal diagnostic
-        // (the explicit id is caller-known).
+        // Preparation BEFORE enqueueing: the collision diagnostic id is caller-known.
         let existing_conflict = format!(
             "evidence {} already exists; refusing to overwrite a durable envelope",
             row.id
@@ -3142,8 +3142,8 @@ mod tests {
 
     #[test]
     fn malformed_prefix_segments_writes_are_refused_before_any_row_lands() {
-        // The typed API is the first gate: malformed, oversized, or
-        // shape-suspect payloads never touch a row. Every refusal is typed.
+        // The typed API is the first gate: malformed/oversized/shape-suspect payloads never
+        // touch a row; every refusal is typed.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
         let ws = store.create_workspace("/w").unwrap();

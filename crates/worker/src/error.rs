@@ -16,6 +16,12 @@ pub const WORKER_PROTOCOL_VERSION: u32 = 1;
 pub enum WorkerError {
     #[error("worker-plane store backend unavailable: {0}")]
     Backend(String),
+    /// The `private_runners` value entitlement refused claim admission: the
+    /// plan does not map it, the subscription is inactive, or no billing
+    /// authority is wired (`cloud_absent`). The typed refusal names the
+    /// entitlement, its hook, the cause and (when resolved) the plan.
+    #[error("{0}")]
+    EntitlementRefused(faktor_core::entitlement::ValueGateRefusal),
     #[error("worker-plane store refused a malformed row: {0}")]
     Malformed(String),
     /// A database written by a NEWER binary's schema ladder must never be

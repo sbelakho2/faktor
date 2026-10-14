@@ -1280,7 +1280,14 @@ async fn open_reserved_reservation_refuses_completion_and_task_stays_verifying()
     // while it holds budget.
     let ledger = ledger_for(&m);
     let r = ledger
-        .reserve(s.id, tid, m.try_next_op_id().unwrap(), 5_000, None)
+        .reserve(
+            s.id,
+            tid,
+            m.try_next_op_id().unwrap(),
+            5_000,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap();
     let (rev, rec) = finish_verifying(&s, tid);
@@ -1326,7 +1333,14 @@ async fn dispatched_open_row_refuses_completion_until_uncertain_or_settled() {
     // it sits open — the conservative close is mark_uncertain (or a
     // settle), never a refund.
     let r = ledger
-        .reserve(s.id, tid, m.try_next_op_id().unwrap(), 8_000, None)
+        .reserve(
+            s.id,
+            tid,
+            m.try_next_op_id().unwrap(),
+            8_000,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap();
     ledger.mark_dispatched(s.id, r).await.unwrap();
@@ -1381,6 +1395,7 @@ async fn uncertain_attempt_is_charged_conservatively_at_its_reserved_estimate() 
             m.try_next_op_id().unwrap(),
             12_000,
             Some(snapshot()),
+            faktor_core::model::ExecutionClass::Unknown,
         )
         .await
         .unwrap();
@@ -1415,7 +1430,14 @@ async fn uncertain_attempt_with_known_usage_reconciles_exactly_before_charging()
     let attempt =
         faktor_core::op::ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0).unwrap();
     let r = ledger
-        .reserve_attempt(s.id, tid, attempt, 60_000, Some(snapshot()))
+        .reserve_attempt(
+            s.id,
+            tid,
+            attempt,
+            60_000,
+            Some(snapshot()),
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap();
     ledger.mark_dispatched(s.id, r).await.unwrap();
@@ -1472,7 +1494,14 @@ async fn crash_at_every_completion_seam_reopens_verifying_and_reruns_converge() 
         let exact = faktor_core::op::ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0)
             .unwrap();
         let r1 = ledger
-            .reserve_attempt(s.id, tid, exact, 60_000, Some(snapshot()))
+            .reserve_attempt(
+                s.id,
+                tid,
+                exact,
+                60_000,
+                Some(snapshot()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(s.id, r1).await.unwrap();
@@ -1492,7 +1521,14 @@ async fn crash_at_every_completion_seam_reopens_verifying_and_reruns_converge() 
             .await
             .unwrap();
         let r2 = ledger
-            .reserve(s.id, tid, m.try_next_op_id().unwrap(), 7_000, None)
+            .reserve(
+                s.id,
+                tid,
+                m.try_next_op_id().unwrap(),
+                7_000,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(s.id, r2).await.unwrap();

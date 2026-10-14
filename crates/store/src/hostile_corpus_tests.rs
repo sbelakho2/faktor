@@ -2293,6 +2293,7 @@ fn store_cost_money_i64_boundaries_and_caps() {
                 *amount,
                 i as i64,
                 None,
+                faktor_core::model::ExecutionClass::Unknown,
             )
             .unwrap_or_else(|e| panic!("money case #{case} (predicted {amount}): {e}"))
         {
@@ -2332,7 +2333,15 @@ fn store_cost_money_i64_boundaries_and_caps() {
     );
     case += 1;
     match store
-        .cost_reserve_priced(sid, hostile_task, OpId::new(80), 1, 0, None)
+        .cost_reserve_priced(
+            sid,
+            hostile_task,
+            OpId::new(80),
+            1,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap_or_else(|e| {
             panic!(
                 "money case #{case}: a task holding near-i64::MAX open predictions must refuse \
@@ -2358,7 +2367,15 @@ fn store_cost_money_i64_boundaries_and_caps() {
     case += 1;
     store.cost_task_cap_set(sid, clean_task, Some(1)).unwrap();
     match store
-        .cost_reserve_priced(sid, clean_task, OpId::new(81), 1, 0, None)
+        .cost_reserve_priced(
+            sid,
+            clean_task,
+            OpId::new(81),
+            1,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         crate::CostReserveOutcome::Granted(_) => {}
@@ -2368,7 +2385,15 @@ fn store_cost_money_i64_boundaries_and_caps() {
     }
     case += 1;
     match store
-        .cost_reserve_priced(sid, clean_task, OpId::new(82), 1, 0, None)
+        .cost_reserve_priced(
+            sid,
+            clean_task,
+            OpId::new(82),
+            1,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         crate::CostReserveOutcome::Exceeded { free } => assert_eq!(
@@ -2425,7 +2450,15 @@ fn store_cost_money_i64_boundaries_and_caps() {
     case += 1;
     assert!(matches!(
         store
-            .cost_reserve_priced(sid, clean_task, OpId::new(90), u64::MAX, 0, None)
+            .cost_reserve_priced(
+                sid,
+                clean_task,
+                OpId::new(90),
+                u64::MAX,
+                0,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .unwrap(),
         crate::CostReserveOutcome::Granted(_)
     ));
@@ -2495,7 +2528,15 @@ fn store_cost_reservation_state_machine_edges() {
     );
 
     let id = match store
-        .cost_reserve_priced(sid, task, OpId::new(1), 100, 0, None)
+        .cost_reserve_priced(
+            sid,
+            task,
+            OpId::new(1),
+            100,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         crate::CostReserveOutcome::Granted(id) => id,
@@ -2537,7 +2578,15 @@ fn store_cost_reservation_state_machine_edges() {
     }
 
     let id2 = match store
-        .cost_reserve_priced(sid, task, OpId::new(2), 50, 0, None)
+        .cost_reserve_priced(
+            sid,
+            task,
+            OpId::new(2),
+            50,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         crate::CostReserveOutcome::Granted(id) => id,
@@ -2587,7 +2636,15 @@ fn store_cost_reservation_state_machine_edges() {
     ));
 
     let id3 = match store
-        .cost_reserve_priced(sid, task, OpId::new(3), 10, 0, None)
+        .cost_reserve_priced(
+            sid,
+            task,
+            OpId::new(3),
+            10,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         crate::CostReserveOutcome::Granted(id) => id,
@@ -2854,7 +2911,15 @@ fn store_paged_reads_signed_domain_boundaries() {
     }
     store.index_state_put(ws, "{}", 0, "seed").unwrap();
     store
-        .cost_reserve_priced(sid, task, OpId::new(1), 5, 0, None)
+        .cost_reserve_priced(
+            sid,
+            task,
+            OpId::new(1),
+            5,
+            0,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap();
     store
         .record_provider_call_with_prefix(

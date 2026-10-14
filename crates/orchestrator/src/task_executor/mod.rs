@@ -1726,7 +1726,12 @@ impl TaskExecutor {
     fn place_new_run(&self, spec: &PlacementSpec) -> Result<PlacementDecision, ExecError> {
         self.lock_placement()
             .place(spec)
-            .map_err(ExecError::PlacementRefused)
+            // The seam's typed refusal (an unentitled private runner, a
+            // broken plane) renders into the executor's typed refusal: the
+            // message names the entitlement and plan when the refusal is an
+            // entitlement denial, so a remote placement is never silently
+            // downgraded to local.
+            .map_err(|refusal| ExecError::PlacementRefused(refusal.to_string()))
     }
 
     /// The provider-neutral placement request of one new run: the job key is

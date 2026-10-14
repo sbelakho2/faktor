@@ -208,6 +208,28 @@ fidelity is treated as unknown, and tier claims outside `0..=5` are refused.
 Faktor must not maintain a separate competing system model; provider output
 always enters as validated data through the neutral interface.
 
+### Bounded findings protocol
+
+Before pure contract compilation the runtime ASKS the configured provider
+the fixed, bounded question set derived from the goal — affected
+components/architecture, invariants that must survive, hidden dependencies,
+blast radius, historical failures/migrations. The ask is an explicit
+asynchronous operation (`operation_id`, `session_id`, workspace, start time,
+deadline, cancellation) and is wall-bounded by the runtime; a parked or
+unresponsive provider is dropped, never awaited forever.
+
+Every answer is a typed finding (`component | invariant | dependency | risk |
+historical_failure`) bound to the repository snapshot digest and the serving
+provider identity. Findings are validated as DATA: a snapshot/revision or
+provider mismatch, invalid provenance, an oversized text/basis, an
+out-of-range confidence or an unknown kind is refused with a typed
+diagnostic and dropped. Findings never fail a turn. Accepted findings become
+immutable bounded enrichment statements carrying
+`StatementProvenance { origin: external:<provider> }` and feed the pure
+compiler; the native contract they enrich stays byte-identical when no
+findings arrive. Confidence is clamped by the provider's declared evidence
+dimensions — a tier claim never substitutes for an evidence claim.
+
 ## Verification (neutral)
 
 Faktor consumes verification through the generic `VerificationProvider`

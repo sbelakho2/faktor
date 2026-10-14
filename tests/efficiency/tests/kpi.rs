@@ -124,7 +124,15 @@ fn attempt_call(
     let attempt = ModelCallAttempt::new(OpId::new(logical), OpId::new(attempt), ordinal).unwrap();
     let reservation = match f
         .store
-        .cost_reserve_attempt(f.session, f.task, &attempt, cost, 1_000_100, None)
+        .cost_reserve_attempt(
+            f.session,
+            f.task,
+            &attempt,
+            cost,
+            1_000_100,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         faktor_store::CostReserveOutcome::Granted(id) => id,

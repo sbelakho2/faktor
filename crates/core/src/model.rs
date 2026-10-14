@@ -632,6 +632,7 @@ mod tests {
             considered: 2,
             source: ModelSource::ProviderCatalog,
             pricing_snapshot: Some(known_snapshot()),
+            execution_class: ExecutionClass::Unknown,
         };
         let v = serde_json::to_value(&decision).unwrap();
         assert_eq!(
@@ -646,6 +647,172 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("pricing_snapshot");
         let back: RouteDecision = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.pricing_snapshot, None);
+        // Additive wire default: a pre-class decision JSON parses to
+        // Unknown — never a guessed local/hosted class.
+        let mut legacy = v.clone();
+        legacy.as_object_mut().unwrap().remove("execution_class");
+        let back: RouteDecision = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.execution_class, ExecutionClass::Unknown);
+    }
+
+    #[test]
+    fn execution_class_is_authority_decided_and_never_inferred_from_zero() {
+        // LocalZero is the ONLY authority that establishes locality.
+        assert_eq!(
+            ExecutionClass::from_price_authority(PriceAuthority::LocalZero),
+            ExecutionClass::Local
+        );
+        // A hosted zero price (free tier/promotion/internal endpoint) and
+        // every other authority stay Unknown: a numeric zero is never local.
+        for authority in [
+            PriceAuthority::Exact,
+            PriceAuthority::ConservativeCeiling,
+            PriceAuthority::Unknown,
+        ] {
+            let class = ExecutionClass::from_price_authority(authority);
+            assert_eq!(class, ExecutionClass::Unknown);
+            assert!(!class.is_local() && !class.is_hosted() && !class.is_known());
+        }
+        assert!(ExecutionClass::Local.is_local() && !ExecutionClass::Local.is_hosted());
+        for hosted in [
+            ExecutionClass::HostedEconomy,
+            ExecutionClass::HostedBalanced,
+            ExecutionClass::Frontier,
+        ] {
+            assert!(hosted.is_hosted() && !hosted.is_local() && hosted.is_known());
+        }
+        assert_eq!(ExecutionClass::default(), ExecutionClass::Unknown);
+        // Frozen wire spellings + strict decode.
+        for (class, tag) in [
+            (ExecutionClass::Local, "local"),
+            (ExecutionClass::HostedEconomy, "hosted_economy"),
+            (ExecutionClass::HostedBalanced, "hosted_balanced"),
+            (ExecutionClass::Frontier, "frontier"),
+            (ExecutionClass::Unknown, "unknown"),
+        ] {
+            assert_eq!(class.as_str(), tag);
+            assert_eq!(ExecutionClass::from_tag(tag), Some(class));
+            assert_eq!(serde_json::to_value(class).unwrap(), serde_json::json!(tag));
+        }
+        assert_eq!(ExecutionClass::from_tag("free!"), None);
+        assert_eq!(ExecutionClass::from_tag(""), None);
+        assert!(serde_json::from_value::<ExecutionClass>(serde_json::json!("local")).is_ok());
+        assert!(serde_json::from_value::<ExecutionClass>(serde_json::json!("free")).is_err());
+    }
+
+    // ---- route-tier authority (economic audit item 7 P1): the hosted class
+    // is derived at decision time from the policy tier beside the frozen
+    // price authority; locality stays authority-only. ----
+
+    #[test]
+    fn route_decision_class_rides_the_policy_tier_beside_the_frozen_authority() {
+        let decision = |snapshot: Option<PricingSnapshot>| RouteDecision {
+            provider: "p".into(),
+            model: "m".into(),
+            estimated_cost_micro: 1,
+            estimated_latency_ms: 1,
+            reasoning: "r".into(),
+            considered: 1,
+            source: ModelSource::ProviderCatalog,
+            pricing_snapshot: snapshot,
+            execution_class: ExecutionClass::Unknown,
+        };
+        // The frozen mode -> tier table (frozen wire spellings).
+        for (mode, class) in [
+            (RoutingMode::Economy, ExecutionClass::HostedEconomy),
+            (RoutingMode::Balanced, ExecutionClass::HostedBalanced),
+            (RoutingMode::MaximumQuality, ExecutionClass::Frontier),
+        ] {
+            assert_eq!(ExecutionClass::from_routing_mode(&mode), class);
+        }
+        // A pinned policy establishes NO tier authority (the pin picks one
+        // explicit model, not a policy band): never a guessed tier.
+        for pinned in [
+            RoutingMode::Pinned {
+                provider: "a".into(),
+                model: "b".into(),
+            },
+            RoutingMode::Pinned {
+                provider: String::new(),
+                model: String::new(),
+            },
+        ] {
+            assert_eq!(
+                ExecutionClass::from_routing_mode(&pinned),
+                ExecutionClass::Unknown
+            );
+        }
+        // A genuinely priced hosted call takes the policy tier's class.
+        let priced = decision(Some(known_snapshot()));
+        assert_eq!(
+            priced.execution_class_for_mode(&RoutingMode::Economy),
+            ExecutionClass::HostedEconomy
+        );
+        assert_eq!(
+            priced.execution_class_for_mode(&RoutingMode::Balanced),
+            ExecutionClass::HostedBalanced
+        );
+        assert_eq!(
+            priced.execution_class_for_mode(&RoutingMode::MaximumQuality),
+            ExecutionClass::Frontier
+        );
+        assert_eq!(
+            priced.execution_class_for_mode(&RoutingMode::Pinned {
+                provider: "a".into(),
+                model: "b".into(),
+            }),
+            ExecutionClass::Unknown,
+            "a pin carries no tier authority"
+        );
+        // The conservative ceiling is a hosted authority too (a budget
+        // bound, never local): it takes the policy tier.
+        let mut ceiling = known_snapshot();
+        ceiling.authority = PriceAuthority::ConservativeCeiling;
+        assert_eq!(
+            decision(Some(ceiling)).execution_class_for_mode(&RoutingMode::Balanced),
+            ExecutionClass::HostedBalanced
+        );
+        // LocalZero is LOCAL under EVERY policy: the mode can never override
+        // the authority that establishes locality.
+        let local = decision(Some(PricingSnapshot::local_zero(1, "ollama".into())));
+        for mode in [
+            RoutingMode::Economy,
+            RoutingMode::Balanced,
+            RoutingMode::MaximumQuality,
+            RoutingMode::Pinned {
+                provider: "a".into(),
+                model: "b".into(),
+            },
+        ] {
+            assert_eq!(
+                local.execution_class_for_mode(&mode),
+                ExecutionClass::Local,
+                "{mode:?} must not override LocalZero locality"
+            );
+        }
+        // No snapshot / an Unknown authority / a corrupt Unknown-with-no-quote
+        // row stays Unknown even under a tiered policy: never fabricated.
+        for snapshot in [
+            None,
+            Some(PricingSnapshot::unknown(1, "miss".into())),
+            Some(PricingSnapshot {
+                quote: None,
+                authority: PriceAuthority::Unknown,
+                epoch: 0,
+                source_id: String::new(),
+                valid_until_ms: None,
+                conservative_ceiling: None,
+            }),
+        ] {
+            let d = decision(snapshot);
+            for mode in [RoutingMode::Economy, RoutingMode::MaximumQuality] {
+                assert_eq!(
+                    d.execution_class_for_mode(&mode),
+                    ExecutionClass::Unknown,
+                    "no authority may never become a local or hosted class"
+                );
+            }
+        }
     }
 
     // ---- performance/price split (audit item B) ----
@@ -1895,6 +2062,119 @@ pub enum PriceAuthority {
     Unknown,
 }
 
+/// The durable EXECUTION CLASS of one model call (economic audit item 7 P1
+/// classification): whether the call ran on a local runtime and — only when
+/// a route-time tier authority established it — which hosted tier served it.
+/// A numeric zero is NEVER evidence of locality: a hosted free tier, a
+/// promotion or an internal endpoint settles zero with a real hosted price
+/// authority and is NOT local. `Unknown` is the honest default and must not
+/// be counted as local or hosted by any metric.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionClass {
+    /// An authoritative local runtime: the frozen route-time pricing
+    /// authority is [`PriceAuthority::LocalZero`].
+    Local,
+    /// A hosted call routed under the economy policy.
+    HostedEconomy,
+    /// A hosted call routed under the balanced policy.
+    HostedBalanced,
+    /// A hosted call served by the frontier tier.
+    Frontier,
+    /// No durable route-time authority established the class (legacy rows,
+    /// unpriced paths). Never counted as local or hosted.
+    #[default]
+    Unknown,
+}
+
+impl ExecutionClass {
+    /// The route-time classification of one frozen pricing authority: ONLY
+    /// [`PriceAuthority::LocalZero`] establishes locality; every other
+    /// authority leaves the class `Unknown` (a hosted tier requires a
+    /// separate route-time tier authority).
+    pub const fn from_price_authority(authority: PriceAuthority) -> Self {
+        match authority {
+            PriceAuthority::LocalZero => ExecutionClass::Local,
+            PriceAuthority::Exact
+            | PriceAuthority::ConservativeCeiling
+            | PriceAuthority::Unknown => ExecutionClass::Unknown,
+        }
+    }
+
+    /// The hosted route-time tier of one routing policy: Economy ->
+    /// [`ExecutionClass::HostedEconomy`], Balanced ->
+    /// [`ExecutionClass::HostedBalanced`], MaximumQuality ->
+    /// [`ExecutionClass::Frontier`] (the maximum-verified-quality policy IS
+    /// the frontier tier). A pinned policy establishes NO tier authority —
+    /// the pin chooses one explicit model, not a policy band — so it answers
+    /// [`ExecutionClass::Unknown`] (never a guessed tier). Locality is
+    /// decided separately by [`ExecutionClass::from_price_authority`]: this
+    /// function is meaningful only beside a genuine hosted price authority.
+    pub const fn from_routing_mode(mode: &RoutingMode) -> Self {
+        match mode {
+            RoutingMode::Economy => ExecutionClass::HostedEconomy,
+            RoutingMode::Balanced => ExecutionClass::HostedBalanced,
+            RoutingMode::MaximumQuality => ExecutionClass::Frontier,
+            RoutingMode::Pinned { .. } => ExecutionClass::Unknown,
+        }
+    }
+
+    /// True only for an authoritatively local execution.
+    pub const fn is_local(self) -> bool {
+        matches!(self, ExecutionClass::Local)
+    }
+
+    /// True only for a durably-known hosted tier.
+    pub const fn is_hosted(self) -> bool {
+        matches!(
+            self,
+            ExecutionClass::HostedEconomy
+                | ExecutionClass::HostedBalanced
+                | ExecutionClass::Frontier
+        )
+    }
+
+    /// True only when a durable authority established the class.
+    pub const fn is_known(self) -> bool {
+        !matches!(self, ExecutionClass::Unknown)
+    }
+
+    /// The frozen durable/wire tag.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ExecutionClass::Local => "local",
+            ExecutionClass::HostedEconomy => "hosted_economy",
+            ExecutionClass::HostedBalanced => "hosted_balanced",
+            ExecutionClass::Frontier => "frontier",
+            ExecutionClass::Unknown => "unknown",
+        }
+    }
+
+    /// Strict tag decode; anything else is `None` (callers fail closed).
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "local" => Some(ExecutionClass::Local),
+            "hosted_economy" => Some(ExecutionClass::HostedEconomy),
+            "hosted_balanced" => Some(ExecutionClass::HostedBalanced),
+            "frontier" => Some(ExecutionClass::Frontier),
+            "unknown" => Some(ExecutionClass::Unknown),
+            _ => None,
+        }
+    }
+}
+
 /// The route-time price capture (audit wave-B items A/B): an immutable
 /// [`PriceQuote`] (per-million-token microUSD lines, exact) plus the
 /// authority/epoch/source that produced it. Captured ONCE at routing so a
@@ -2464,6 +2744,18 @@ impl ModelDescriptor {
 /// pin) and the runtime must NOT invent one — an unpriced decision under a
 /// hard task cost budget fails closed at reserve time, and without a
 /// budget its spend is recorded as Unknown, never as a fabricated number.
+///
+/// `execution_class` is the durable route-time execution classification
+/// (economic audit item 7 P1): the reserve path persists it on the cost
+/// reservation, so the outcome ledger classifies local-vs-hosted from the
+/// route-time authority instead of inferring locality from a numeric zero.
+/// Locality rides the SAME authority as `pricing_snapshot` (see
+/// [`ExecutionClass::from_price_authority`]); the HOSTED tier of a genuinely
+/// priced call is derived at decision time from the routing policy that
+/// produced the decision (see [`RouteDecision::execution_class_for_mode`] and
+/// [`ExecutionClass::from_routing_mode`]). `Unknown` is the additive wire
+/// default (legacy decision JSON, unpriced paths, pinned policies that
+/// establish no tier) and is never counted as local or hosted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteDecision {
     pub provider: String,
@@ -2476,6 +2768,37 @@ pub struct RouteDecision {
     /// `None` (additive, wire-default) = no pricing authority consulted.
     #[serde(default)]
     pub pricing_snapshot: Option<PricingSnapshot>,
+    /// `Unknown` (additive, wire-default) = no durable route-time class
+    /// authority; never lazily inferred downstream.
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
+}
+
+impl RouteDecision {
+    /// The durable route-time execution class this decision establishes
+    /// under the routing policy `mode` — the ONE authority decision-time
+    /// classification path:
+    ///
+    /// - the frozen route-time price authority decides LOCALITY only:
+    ///   [`PriceAuthority::LocalZero`] -> [`ExecutionClass::Local`] (a
+    ///   numeric zero alone NEVER does);
+    /// - a genuinely priced HOSTED call ([`PriceAuthority::Exact`] /
+    ///   [`PriceAuthority::ConservativeCeiling`]) takes the policy tier's
+    ///   hosted class from [`ExecutionClass::from_routing_mode`] (Economy ->
+    ///   `hosted_economy`, Balanced -> `hosted_balanced`, MaximumQuality ->
+    ///   `frontier`); a pinned policy establishes no tier -> `Unknown`;
+    /// - no snapshot, a missing quote or an `Unknown` authority stays
+    ///   [`ExecutionClass::Unknown`] — never a fabricated local or hosted
+    ///   class.
+    pub fn execution_class_for_mode(&self, mode: &RoutingMode) -> ExecutionClass {
+        match self.pricing_snapshot.as_ref().map(|s| s.authority) {
+            Some(PriceAuthority::LocalZero) => ExecutionClass::Local,
+            Some(PriceAuthority::Exact) | Some(PriceAuthority::ConservativeCeiling) => {
+                ExecutionClass::from_routing_mode(mode)
+            }
+            Some(PriceAuthority::Unknown) | None => ExecutionClass::Unknown,
+        }
+    }
 }
 
 /// How the daemon's economic routing policy treats every model call

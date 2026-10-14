@@ -116,6 +116,16 @@ pub trait EnterpriseStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AuditEvent>, CloudStoreError>;
     fn audit_head_seq(&self, organization: &OrganizationId) -> Result<i64, CloudStoreError>;
+    /// The last seq whose event is strictly OLDER than `before_ms` for one
+    /// organization (0 when none): the base retention window boundary is
+    /// `audit_last_older_seq + 1`. The append-only seq order is authoritative:
+    /// every seq above the returned one carries a timestamp at or after the
+    /// boundary, so a base page clamped to it can never serve old events.
+    fn audit_last_older_seq(
+        &self,
+        organization: &OrganizationId,
+        before_ms: i64,
+    ) -> Result<i64, CloudStoreError>;
 
     fn put_artifact(&self, artifact: &ArtifactRecord) -> Result<(), CloudStoreError>;
     fn artifact(&self, id: &ArtifactId) -> Result<Option<ArtifactRecord>, CloudStoreError>;
@@ -246,6 +256,24 @@ impl EnterpriseStore for MemoryControlPlaneStore {
             .audit
             .get(organization.as_str())
             .and_then(|rows| rows.keys().next_back().copied())
+            .unwrap_or(0))
+    }
+
+    fn audit_last_older_seq(
+        &self,
+        organization: &OrganizationId,
+        before_ms: i64,
+    ) -> Result<i64, CloudStoreError> {
+        let mem = mem_enterprise(self)?;
+        Ok(mem
+            .audit
+            .get(organization.as_str())
+            .and_then(|rows| {
+                rows.iter()
+                    .filter(|(_, row)| row.event.timestamp_ms < before_ms)
+                    .map(|(seq, _)| *seq)
+                    .max()
+            })
             .unwrap_or(0))
     }
 
@@ -514,6 +542,21 @@ impl EnterpriseStore for SqliteControlPlaneStore {
         conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM ent_audit_event WHERE organization_id = ?1",
             params![organization.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    }
+
+    fn audit_last_older_seq(
+        &self,
+        organization: &OrganizationId,
+        before_ms: i64,
+    ) -> Result<i64, CloudStoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM ent_audit_event
+             WHERE organization_id = ?1 AND occurred_at_ms < ?2",
+            params![organization.as_str(), before_ms],
             |row| row.get(0),
         )
         .map_err(backend)

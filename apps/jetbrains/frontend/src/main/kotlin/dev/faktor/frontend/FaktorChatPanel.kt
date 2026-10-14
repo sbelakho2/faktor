@@ -2953,9 +2953,32 @@ class FaktorChatPanel(
     }
 
     /**
+     * The value-entitlements status line of the configured organization: the
+     * typed report when the daemon can derive it, else the typed refusal
+     * (`billing_disabled` renders "billing disabled locally"). Never throws —
+     * the outcomes read itself decides the panel state.
+     */
+    private fun valueEntitlementsStatusFor(): String =
+        try {
+            valueEntitlementsStatusLine(service.valueEntitlements())
+        } catch (e: NativeApiException) {
+            valueEntitlementsRefusalStatusLine(e.code, "${e.status} ${e.code}: ${e.detail}")
+        } catch (e: Exception) {
+            valueEntitlementsRefusalStatusLine(null, e.message ?: e.javaClass.simpleName)
+        }
+
+    /**
      * One bounded newest-first outcomes page from the CURRENT cursor. A
-     * refusal renders the T29 `Cost unavailable` state (no monetary rows);
-     * the conversations listing is untouched (failure isolation).
+     * refusal renders the T29 `Cost unavailable` state (no monetary rows)
+     * with its TYPED code (`value_entitlement_refused` / `billing_disabled`
+     * / …) and the value-entitlements status line; the conversations listing
+     * is untouched (failure isolation).
+     *
+     * Entitlement surfacing: with a configured control-plane credential the
+     * identity fixes the organization, the paid `outcome_analytics` read
+     * passes `org=`, and the panel carries the value-entitlements report
+     * line. Without a credential the frozen local read stands (no org, no
+     * status line).
      */
     private fun refreshOutcomesBlocking() {
         if (!service.isRunning()) {
@@ -2963,34 +2986,45 @@ class FaktorChatPanel(
             return
         }
         val cursor = outcomesCursor
+        val configured = service.controlPlaneTokenConfigured()
         try {
+            val organization = if (configured) service.identity().organization else null
+            val entitlementsStatus = if (configured) valueEntitlementsStatusFor() else null
             val page = service.outcomes(
                 limit = OUTCOMES_PAGE_LIMIT,
                 beforeMs = cursor?.completedAtMs,
-                beforeRun = cursor?.runId
+                beforeRun = cursor?.runId,
+                organization = organization
             )
             onEdt {
-                outcomesPanel.setModel(outcomesPanelModelOf(page))
+                outcomesPanel.setModel(
+                    outcomesPanelModelOf(page, entitlementsStatus = entitlementsStatus)
+                )
                 outcomesPagingInFlight.set(false)
             }
         } catch (e: NativeApiException) {
             outcomesCursor = null
+            val entitlementsStatus = if (configured) valueEntitlementsStatusFor() else null
             onEdt {
                 outcomesPanel.setModel(
                     outcomesPanelModelOf(
                         null,
-                        "outcomes read refused (status ${e.status} ${e.code}: ${e.detail})"
+                        "outcomes read refused (status ${e.status} ${e.code}: ${e.detail})",
+                        refusalCode = e.code,
+                        entitlementsStatus = entitlementsStatus
                     )
                 )
                 outcomesPagingInFlight.set(false)
             }
         } catch (e: Exception) {
             outcomesCursor = null
+            val entitlementsStatus = if (configured) valueEntitlementsStatusFor() else null
             onEdt {
                 outcomesPanel.setModel(
                     outcomesPanelModelOf(
                         null,
-                        "outcomes read failed: ${e.message ?: e.javaClass.simpleName}"
+                        "outcomes read failed: ${e.message ?: e.javaClass.simpleName}",
+                        entitlementsStatus = entitlementsStatus
                     )
                 )
                 outcomesPagingInFlight.set(false)

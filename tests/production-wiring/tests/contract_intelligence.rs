@@ -1,11 +1,12 @@
 //! Production-wiring certification for the SYSTEM-INTELLIGENCE contract
-//! enrichment seam (`docs/specs/autonomous-engineering.md`).
+//! findings seam (`docs/specs/autonomous-engineering.md`).
 //!
 //! The production daemon's drive-start contract compilation must accept an
 //! OPTIONAL `SystemIntelligenceProvider` through the daemon's own
-//! construction path (`build_daemon_core`), so a configured provider's
-//! enrichment is additive with `external:<provider>` provenance and an
-//! absent provider leaves the native contract byte-identical.
+//! construction path (`build_daemon_core`), ASK it the fixed bounded
+//! engineering questions before the pure compile, and carry its findings
+//! additively with `external:<provider>` provenance; an absent provider
+//! leaves the native contract byte-identical.
 //!
 //! These tests build the REAL daemon graph through the production builder
 //! (`build_production_graph_with_system_intelligence` -> the executable's
@@ -13,8 +14,8 @@
 //! real workspace + session through the daemon's own session manager, and
 //! run an ORDINARY agent turn (`AgentRuntime::run_turn`). The installed spy
 //! is the ONLY seam substitution; it proves the compile path on that very
-//! turn consults the provider installed by the core, and the durable task
-//! contract attests the result.
+//! turn asked the provider installed by the core EVERY bounded question, and
+//! the durable task contract attests the typed findings.
 //!
 //! The `None` arm proves the production default: the same turn path with no
 //! injected provider produces a durable contract that carries NO
@@ -22,10 +23,13 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
 use std::sync::Arc;
 
 use faktor_core::contract_compile::{
-    EnrichmentKind, EnrichmentRequest, EnrichmentStatement, SystemIntelligenceProvider,
+    FindingsRequest, FindingsResponse, IntelligenceFuture, IntelligenceQuestion, ProviderFinding,
+    SystemIntelligenceProvider,
 };
 use faktor_core::ContractOrigin;
 use faktor_provider::testing::{MockAction, MockServer};
@@ -84,12 +88,14 @@ fn write_workspace(dir: &Path) -> std::path::PathBuf {
     root
 }
 
-/// The certification spy: counts every consult and proposes ONE bounded,
-/// well-formed disclosure risk whose text identifies the spy. It never
-/// refuses, so the compile path must apply its statement additively.
+/// The certification spy: records which bounded questions it was asked,
+/// counts consults, and ANSWERS every question with one finding bound to the
+/// request's own repository identity (the honest provider shape). It never
+/// refuses, so the compile path must apply its findings additively.
 #[derive(Default)]
 struct SpyProvider {
     calls: AtomicUsize,
+    questions: Mutex<Vec<&'static str>>,
 }
 
 impl SystemIntelligenceProvider for SpyProvider {
@@ -97,23 +103,65 @@ impl SystemIntelligenceProvider for SpyProvider {
         "spy"
     }
 
-    fn enrich(&self, request: &EnrichmentRequest<'_>) -> Result<Vec<EnrichmentStatement>, String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if request.max_statements == 0 {
-            return Ok(Vec::new());
-        }
-        Ok(vec![EnrichmentStatement {
-            kind: EnrichmentKind::Risk,
-            text: "the contract compiler consulted the configured system-intelligence spy"
-                .to_string(),
-            confidence_bps: 9_000,
-            basis: "production-wiring spy consult".to_string(),
-            evidence: None,
-            binding: None,
-            severity: Some(faktor_core::contract::RiskSeverity::Low),
-            advisory: false,
-        }])
+    fn findings<'a>(
+        &'a self,
+        request: &'a FindingsRequest<'a>,
+    ) -> IntelligenceFuture<'a, Result<FindingsResponse, String>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut seen = self
+                    .questions
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                for question in request.questions {
+                    seen.push(question.as_str());
+                }
+            }
+            if request.max_findings == 0 {
+                return Ok(FindingsResponse::default());
+            }
+            let findings = request
+                .questions
+                .iter()
+                .map(|question| ProviderFinding {
+                    question: *question,
+                    kind: question.expected_kind(),
+                    text: format!("the production spy answered {}", question.as_str()),
+                    basis: "production-wiring spy consult".to_string(),
+                    confidence_bps: 9_000,
+                    repository_digest: request.repository_digest.to_string(),
+                    provider: "spy".to_string(),
+                    revision: request.source_revision.map(str::to_string),
+                    severity: None,
+                })
+                .collect();
+            Ok(FindingsResponse {
+                findings,
+                diagnostics: Vec::new(),
+            })
+        })
     }
+}
+
+/// A wired value gate that grants every entitlement: the certification host
+/// represents an ENTITLED organization, so the paid organization-contracts
+/// consult is not refused by the commercial gate while the production
+/// question path is certified.
+#[derive(Debug)]
+struct GrantingGate;
+
+impl faktor_core::entitlement::ValueEntitlementGate for GrantingGate {
+    fn check_value_entitlement(
+        &self,
+        _entitlement: faktor_core::entitlement::ValueEntitlement,
+    ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+        Ok(())
+    }
+}
+
+fn granting_gate() -> faktor_core::entitlement::ValueGate {
+    faktor_core::entitlement::ValueGate::wired(Arc::new(GrantingGate))
 }
 
 fn external_statements(contract: &faktor_core::EngineeringContract) -> usize {
@@ -172,6 +220,10 @@ async fn build_daemon_core_installs_the_seam_and_the_turn_path_consults_it() {
             "default",
         )
         .unwrap();
+    // The certification host is an ENTITLED organization: the commercial
+    // value gate grants the organization-contracts consult, so the question
+    // path through the core is actually exercised.
+    graph.agent.set_value_gate(granting_gate());
     graph
         .agent
         .run_turn(handle.id(), "Fix the refresh-token race", &[])
@@ -180,34 +232,85 @@ async fn build_daemon_core_installs_the_seam_and_the_turn_path_consults_it() {
 
     assert!(
         spy.calls.load(Ordering::SeqCst) >= 1,
-        "the daemon's own drive-start contract compilation must consult the installed provider"
+        "the daemon's own drive-start contract compilation must ASK the installed provider"
     );
+    let asked: Vec<&str> = spy
+        .questions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    for question in IntelligenceQuestion::ALL {
+        assert!(
+            asked.contains(&question.as_str()),
+            "the daemon's compile path must ask question {}: {asked:?}",
+            question.as_str()
+        );
+    }
     let task_id = handle.task_id().expect("the turn durably created a task");
     let task = handle
         .get_task(task_id)
         .expect("the task row reads")
         .expect("the task row exists");
-    let consulted = task
-        .contract
-        .risks
-        .iter()
-        .find(|risk| {
-            matches!(
-                risk.origin,
-                ContractOrigin::External { ref provider } if provider == "spy"
-            )
-        })
-        .expect("the spy's statement must be durable in the task contract");
-    assert!(consulted.description.contains("system-intelligence spy"));
+    // The answers are durable typed statements with external:spy provenance.
+    for (label, question) in [
+        (
+            "affected component: ",
+            IntelligenceQuestion::AffectedComponents,
+        ),
+        (
+            "hidden dependency: ",
+            IntelligenceQuestion::HiddenDependencies,
+        ),
+        ("blast radius: ", IntelligenceQuestion::BlastRadius),
+        (
+            "historical failure: ",
+            IntelligenceQuestion::HistoricalFailures,
+        ),
+    ] {
+        let expected = format!("{label}the production spy answered {}", question.as_str());
+        let risk = task
+            .contract
+            .risks
+            .iter()
+            .find(|risk| risk.description == expected)
+            .unwrap_or_else(|| panic!("the spy's typed finding {expected:?} must be durable"));
+        assert_eq!(
+            risk.origin,
+            ContractOrigin::External {
+                provider: "spy".into()
+            }
+        );
+    }
+    let invariant = format!(
+        "invariant that must survive: the production spy answered {}",
+        IntelligenceQuestion::Invariants.as_str()
+    );
+    assert!(
+        task.contract
+            .invariants
+            .iter()
+            .any(|entry| entry.statement == invariant
+                && matches!(entry.origin, ContractOrigin::External { .. })),
+        "the spy's invariant answer must be durable: {:?}",
+        task.contract.invariants
+    );
+    assert!(
+        !task
+            .contract
+            .risks
+            .iter()
+            .any(|risk| risk.description.contains("declares")),
+        "a provider finding is never a capability description"
+    );
     assert!(
         !task.contract.proof_obligations.is_empty(),
-        "native statements must survive the additive enrichment: {:?}",
+        "native statements must survive the additive findings: {:?}",
         task.contract
     );
     assert_eq!(
         external_statements(&task.contract),
-        1,
-        "the spy proposes exactly one additive statement"
+        5,
+        "the spy answers the five bounded questions with exactly five statements"
     );
 }
 

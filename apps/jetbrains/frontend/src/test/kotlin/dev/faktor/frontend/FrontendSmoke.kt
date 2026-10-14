@@ -49,6 +49,7 @@ import dev.faktor.shared.parseNativeTournament
 import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
+import dev.faktor.shared.parseNativeValueEntitlements
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.parseProtocolAttachmentRef
 import dev.faktor.shared.parseProtocolOutcomesPage
@@ -5014,8 +5015,10 @@ object FrontendSmoke {
     // --------------------------------------------------------- I07 outcomes
 
     private const val OUTCOMES_METRICS_JSON = "{" +
-        "\"runs\":10,\"verifiedChanges\":2,\"verifiedFirstPassChanges\":1," +
-        "\"verifiedFirstPassPpm\":500000," +
+        "\"runs\":10,\"verifiedChanges\":2,\"verifiedFirstVerificationPassChanges\":1," +
+        "\"verifiedFirstVerificationPassPpm\":500000," +
+        "\"moneyCompleteRuns\":10,\"moneyPendingRuns\":0,\"moneyUnavailableRuns\":0," +
+        "\"moneyIncompleteExcluded\":0,\"verifiedChangesMoneyComplete\":2," +
         "\"totalVerifiedSpendMicro\":\"3000000\",\"successfulRunCostMicro\":\"1500000\"," +
         "\"totalSpendMicro\":\"90000000\"," +
         "\"verifiedCostPerSuccessfulChangeMicro\":\"45000000\"," +
@@ -5024,30 +5027,46 @@ object FrontendSmoke {
         "\"localOnlyVerifiedPpm\":333333," +
         "\"localFinalRuns\":2,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":500000," +
         "\"localFirstRuns\":5,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":200000," +
-        "\"localToFrontierFallbackRuns\":2,\"localToFrontierFallbackPpm\":400000," +
-        "\"frontierOnlyRuns\":6,\"frontierOnlyPpm\":600000," +
-        "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":100," +
+        "\"localToHostedFallbackRuns\":2,\"localToHostedFallbackPpm\":400000," +
+        "\"hostedOnlyRuns\":6,\"runsWithSteps\":10,\"hostedOnlyPpm\":600000," +
+        "\"avoidedHostedInferenceMicro\":null,\"avoidedHostedInferenceMeasurement\":\"unavailable\"," +
+        "\"avoidedHostedMeasuredRuns\":0,\"totalWallTimeMs\":100," +
         "\"meanTimeToVerifiedChangeMs\":50," +
         "\"humanInterventionRuns\":1,\"humanInterventionPpm\":100000," +
         "\"rollbackRuns\":1,\"regressionRollbackPpm\":100000," +
         "\"checksPassed\":3,\"checksRequired\":4,\"proofCoveragePpm\":750000," +
-        "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+        "\"frontierEscalationRuns\":0,\"frontierClassedRuns\":10," +
+        "\"frontierEscalationClassedRuns\":0,\"frontierEscalationPpm\":null," +
+        "\"frontierEscalationMeasurement\":\"unmeasured\"," +
         "\"scanned\":10,\"truncated\":false}"
 
     private const val OUTCOMES_PAGE_JSON = "{\"metrics\":" + OUTCOMES_METRICS_JSON + "," +
         "\"runs\":[{\"runId\":\"run-9\",\"sessionId\":1,\"taskId\":2," +
         "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
         "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":true,\"verified\":true," +
-        "\"verifiedFirstAttempt\":true,\"repairAttempts\":0," +
+        "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0," +
         "\"modelSequence\":[{\"provider\":\"local\",\"model\":\"m\",\"local\":true," +
-        "\"spendMicro\":\"1\"}]," +
+        "\"legacyLocal\":false,\"executionClass\":\"local\",\"spendMicro\":\"1\"}]," +
+        "\"moneyState\":\"complete\"," +
         "\"modelSpendMicro\":\"1\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
-        "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":5,\"humanInterventions\":0," +
+        "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
+        "\"wallTimeMs\":5,\"humanInterventions\":0," +
         "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
         "\"changeScale\":{\"files\":1,\"addedLines\":2,\"removedLines\":3}," +
         "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +
         "\"frontierEscalations\":0,\"completedAtMs\":42}]," +
         "\"nextCursor\":{\"completedAtMs\":42,\"runId\":\"run-9\"}}"
+
+    /** The caller organization's derived value-entitlement report. */
+    private const val VALUE_ENTITLEMENTS_JSON = "{\"ok\":true,\"value_entitlements\":{" +
+        "\"organization_id\":\"org-local\",\"plan_id\":\"pro\",\"plan_found\":true," +
+        "\"subscription_active\":true," +
+        "\"plan_entitlements\":[\"outcome_analytics\",\"shared_intelligence\"]," +
+        "\"governance\":{\"sso\":false,\"scim\":false},\"decisions\":[" +
+        "{\"entitlement\":\"outcome_analytics\",\"hook\":\"outcome_ledger\",\"granted\":true}," +
+        "{\"entitlement\":\"cross_repo_intelligence\",\"hook\":\"cross_repo_index\"," +
+        "\"granted\":false,\"cause\":\"not_in_plan\"}]," +
+        "\"now_ms\":1700000000000}}"
 
     /**
      * I07: exact metric names/definitions, the served counts and denominators,
@@ -5091,7 +5110,7 @@ object FrontendSmoke {
             for (name in listOf(
                 "Successful-Run Cost",
                 "Verified Cost per Successful Change (VCSC)",
-                "Verified First-Pass Rate",
+                "Verified First Verification Pass Rate",
                 "Rework Cost Ratio",
                 "Avoided Hosted Inference",
                 "Mean Time to Verified Change",
@@ -5102,19 +5121,19 @@ object FrontendSmoke {
                 "Local-Only Verified Rate",
                 "Local-Final Verified Rate",
                 "Local-First Success Rate",
-                "Local-to-Frontier Fallback Rate",
-                "Frontier-Only Rate"
+                "Local-to-Hosted Fallback Rate",
+                "Hosted-Only Rate"
             )) {
                 assertTrue(names.contains(name), "metric \"$name\" must render")
             }
             assertEquals("$1.5000 \u00b7 1500000\u00b5\$", model.metricValue("Successful-Run Cost"))
             assertEquals("$45.0000 \u00b7 45000000\u00b5\$", model.metricValue("Verified Cost per Successful Change (VCSC)"))
-            assertEquals("50.0000%", model.metricValue("Verified First-Pass Rate"))
+            assertEquals("50.0000%", model.metricValue("Verified First Verification Pass Rate"))
             assertEquals("33.3333%", model.metricValue("Local-Only Verified Rate"))
             assertEquals("50.0000%", model.metricValue("Local-Final Verified Rate"))
             assertEquals("20.0000%", model.metricValue("Local-First Success Rate"))
-            assertEquals("40.0000%", model.metricValue("Local-to-Frontier Fallback Rate"))
-            assertEquals("60.0000%", model.metricValue("Frontier-Only Rate"))
+            assertEquals("40.0000%", model.metricValue("Local-to-Hosted Fallback Rate"))
+            assertEquals("60.0000%", model.metricValue("Hosted-Only Rate"))
             assertEquals("1.1111%", model.metricValue("Rework Cost Ratio"))
             assertEquals("75.0000%", model.metricValue("Proof Coverage"))
             // The VCSC explanation names the audit example (failures included).
@@ -5129,18 +5148,33 @@ object FrontendSmoke {
             )
             assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Successful-Run Cost"))
             assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Verified Cost per Successful Change (VCSC)"))
-            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Verified First-Pass Rate"))
+            assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Verified First Verification Pass Rate"))
             assertEquals(OUTCOMES_NO_VERIFIED_CHANGES, empty.metricValue("Mean Time to Verified Change"))
-            // Zero avoided hosted inference is unmeasured, never a free claim.
+            // An UNAVAILABLE counterfactual is unmeasured, never a free claim.
             assertEquals("not measured", empty.metricValue("Avoided Hosted Inference"))
             val measured = outcomesPanelModelOf(
                 page.copy(
-                    metrics = page.metrics.copy(avoidedHostedInferenceMicro = "1234567890")
+                    metrics = page.metrics.copy(
+                        avoidedHostedInferenceMicro = "1234567890",
+                        avoidedHostedInferenceMeasurement = "measured"
+                    )
                 )
             )
             val avoided = measured.metricValue("Avoided Hosted Inference")!!
             assertTrue(avoided.contains("1234567890"), avoided)
             assertTrue(!avoided.contains("E"), "money never renders scientific notation: $avoided")
+            // A MEASURED zero stays a measured zero (zero is only measured).
+            val measuredZero = outcomesPanelModelOf(
+                page.copy(
+                    metrics = page.metrics.copy(
+                        avoidedHostedInferenceMicro = "0",
+                        avoidedHostedInferenceMeasurement = "measured"
+                    )
+                )
+            )
+            val zero = measuredZero.metricValue("Avoided Hosted Inference")!!
+            assertTrue(zero.contains("0"), zero)
+            assertTrue(!zero.contains("not measured"), zero)
         }
 
         step("I07 truncation is shown explicitly and big money renders exactly") {
@@ -5221,10 +5255,12 @@ object FrontendSmoke {
                         "\"taskClass\":\"Implementation\",\"riskClass\":\"low\"," +
                         "\"candidateSnapshot\":null,\"finalSnapshot\":\"tm1:x\"," +
                         "\"accepted\":true,\"integrated\":true,\"verified\":true," +
-                        "\"verifiedFirstAttempt\":true,\"repairAttempts\":0," +
-                        "\"modelSequence\":[],\"modelSpendMicro\":\"1\"," +
+                        "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0," +
+                        "\"modelSequence\":[],\"moneyState\":\"complete\"," +
+                        "\"modelSpendMicro\":\"1\"," +
                         "\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
-                        "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":1," +
+                        "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
+                        "\"wallTimeMs\":1," +
                         "\"humanInterventions\":0," +
                         "\"proof\":{\"checksPassed\":0,\"checksRequired\":0,\"coveragePpm\":0}," +
                         "\"changeScale\":{\"files\":0,\"addedLines\":0,\"removedLines\":0}," +
@@ -5239,6 +5275,97 @@ object FrontendSmoke {
             )
             assertEquals(250, many.runs.size)
             assertEquals(OUTCOMES_MAX_RUN_ROWS, outcomesPanelModelOf(many).runRows.size)
+        }
+
+        step("I07 typed entitlement refusals render with the value-entitlements status line") {
+            // The status line: resolved plan, the outcome_ledger decision and
+            // the granted/total count — from the served report only.
+            val report = parseNativeValueEntitlements(VALUE_ENTITLEMENTS_JSON)
+            assertEquals("org-local", report.organizationId)
+            assertEquals(
+                "value entitlements: plan pro · outcome_ledger granted · 1/2 granted",
+                valueEntitlementsStatusLine(report)
+            )
+            val refused = report.copy(
+                planFound = false,
+                planId = null,
+                decisions = report.decisions.map {
+                    if (it.hook == "outcome_ledger") {
+                        it.copy(granted = false, cause = "plan_missing")
+                    } else {
+                        it
+                    }
+                }
+            )
+            assertEquals(
+                "value entitlements: plan unresolved · outcome_ledger refused (plan_missing) · " +
+                    "0/2 granted",
+                valueEntitlementsStatusLine(refused)
+            )
+            // A withheld decision renders as refused, never granted.
+            assertTrue(
+                valueEntitlementsStatusLine(report.copy(decisions = emptyList()))
+                    .contains("outcome_ledger refused (no decision served)")
+            )
+            // The refusal line: billing_disabled is the exact local copy.
+            assertEquals(
+                "value entitlements: billing disabled locally",
+                valueEntitlementsRefusalStatusLine("billing_disabled", "409 billing_disabled")
+            )
+            assertEquals(
+                "value entitlements unavailable: cloud unreachable",
+                valueEntitlementsRefusalStatusLine("cloud_unavailable", "cloud unreachable")
+            )
+
+            // The typed 403 rides the model and renders in the panel next to
+            // the value-entitlements line; no monetary value appears.
+            val model = outcomesPanelModelOf(
+                null,
+                "outcomes read refused (status 403 value_entitlement_refused: " +
+                    "outcome_analytics not granted)",
+                refusalCode = "value_entitlement_refused",
+                entitlementsStatus = "value entitlements: plan local · outcome_ledger " +
+                    "refused (not_in_plan) · 0/2 granted"
+            )
+            assertEquals("unavailable", model.state)
+            assertEquals("value_entitlement_refused", model.refusalCode)
+            assertTrue(!model.hasMonetaryValue(), "no monetary value behind a typed refusal")
+            assertTrue(model.lines().contains(model.entitlementsStatus), model.lines().joinToString())
+            val panel = OutcomesPanel()
+            panel.setModel(model)
+            assertTrue(
+                panel.statusText().contains("value_entitlement_refused"),
+                panel.statusText()
+            )
+            assertEquals(model.entitlementsStatus, panel.entitlementsStatusText())
+
+            // The typed 409 renders its code and the disabled line.
+            val disabled = outcomesPanelModelOf(
+                null,
+                "409 billing_disabled: commercial billing is disabled",
+                refusalCode = "billing_disabled",
+                entitlementsStatus = valueEntitlementsRefusalStatusLine("billing_disabled", "")
+            )
+            val disabledPanel = OutcomesPanel()
+            disabledPanel.setModel(disabled)
+            assertTrue(
+                disabledPanel.statusText().contains("billing_disabled"),
+                disabledPanel.statusText()
+            )
+            assertEquals(
+                "value entitlements: billing disabled locally",
+                disabledPanel.entitlementsStatusText()
+            )
+
+            // No configured organization: the local read carries no status
+            // line and the panel hides it.
+            val local = outcomesPanelModelOf(
+                parseProtocolOutcomesPage(JsonCodec.parse(OUTCOMES_PAGE_JSON).view("test"))
+            )
+            assertEquals(null, local.entitlementsStatus)
+            val localPanel = OutcomesPanel()
+            localPanel.setModel(local)
+            assertEquals("", localPanel.entitlementsStatusText())
         }
     }
 

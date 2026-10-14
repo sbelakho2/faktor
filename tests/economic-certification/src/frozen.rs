@@ -39,6 +39,20 @@ pub const MAX_ATTEMPT_MS: u64 = 3_600_000;
 pub const MAX_DIFF_LINES: usize = 400;
 
 /// Which model-size/placeholder arm of the experiment a run belongs to.
+///
+/// Isolation semantics (see `docs/certification.md`):
+///
+/// - [`Arm::Baseline`] isolates the RAW model: goal + repository prompt,
+///   no Faktor machinery anywhere in the loop;
+/// - [`Arm::FaktorMachinery`] isolates the CONTRACT-CONTEXT-ENHANCED model:
+///   the compiled engineering contract + intelligence brief ride the prompt
+///   and the harness enforces the documented escalation discipline;
+/// - [`Arm::FullDaemonRuntime`] isolates the COMPLETE RUNTIME: the SAME
+///   frozen model outputs are executed by the REAL `AgentRuntime` turn loop
+///   over a real durable session (contract-gated completion, independent
+///   review, proof/gate state recorded), deterministically and without any
+///   live model call. All three arms are driven by frozen outputs; only the
+///   opt-in live-paid capture lane may produce model-quality numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Arm {
@@ -47,16 +61,31 @@ pub enum Arm {
     /// The full Faktor contract/intelligence/proof machinery in the prompt
     /// and enforcement path.
     FaktorMachinery,
+    /// The complete runtime: the same frozen outputs driven through the real
+    /// `AgentRuntime` turn loop (daemon-equivalent assembly). Replay-only in
+    /// CI; never a live model call.
+    FullDaemonRuntime,
 }
 
 impl Arm {
+    /// The two MODEL arms (the ones the live capture lane can drive).
     pub const ALL: [Arm; 2] = [Arm::Baseline, Arm::FaktorMachinery];
+    /// Every benchmark arm, the deterministic runtime arm included.
+    pub const WITH_RUNTIME: [Arm; 3] =
+        [Arm::Baseline, Arm::FaktorMachinery, Arm::FullDaemonRuntime];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Arm::Baseline => "baseline",
             Arm::FaktorMachinery => "faktor_machinery",
+            Arm::FullDaemonRuntime => "full_daemon_runtime",
         }
+    }
+
+    /// TRUE for the runtime-driven arm (frozen outputs through the real
+    /// `AgentRuntime`; no model call of any kind).
+    pub fn is_runtime(self) -> bool {
+        self == Arm::FullDaemonRuntime
     }
 }
 
@@ -190,6 +219,34 @@ pub struct FrozenVerification {
     pub millis: u64,
 }
 
+/// Deterministic runtime-drive evidence of one attempt of the
+/// `full_daemon_runtime` arm: the completion gate the REAL `AgentRuntime`
+/// classified at its genuine turn end, the independent-review verdict, and
+/// the provider-call shape of the turn. Labels only — no wall time, no op
+/// ids — so the record is replayable byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenRuntimeEvidence {
+    /// Completion-gate classification (`verified_complete`, `unverified`,
+    /// `failed_verification`, `blocked_verification`,
+    /// `verification_pending`, or `none` for a turn that claimed nothing).
+    pub completion_gate: String,
+    /// The independent completion review's verdict, when a review ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_verdict: Option<String>,
+    /// Required checks the runtime DERIVED for this turn's change (the
+    /// production multi-component derivation; honestly 0 for the minimal
+    /// manifest-less corpus repos, which is why the objective success axis
+    /// stays the task's own `verify.sh` run by the harness).
+    pub derived_checks: u64,
+    /// Model-provider calls the runtime made during the turn.
+    pub provider_calls: u64,
+    /// Review-model calls the runtime made during the turn.
+    pub review_calls: u64,
+    /// Workspace files the runtime actually applied (changed) this turn.
+    pub files_applied: u64,
+}
+
 /// One settled model attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,6 +271,10 @@ pub struct FrozenAttempt {
     pub verification: FrozenVerification,
     pub prompt_blake3: String,
     pub prompt_tokens_est: u64,
+    /// Runtime-drive evidence; `Some` exactly for the
+    /// `full_daemon_runtime` arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<FrozenRuntimeEvidence>,
 }
 
 impl FrozenAttempt {
@@ -365,6 +426,28 @@ fn validate_run(run: &FrozenRun, capture: &FrozenCapture) -> Result<(), String> 
             run.task_id
         ));
     }
+    if run.prompt.arm.is_runtime() {
+        // The runtime arm must carry the compiled-contract digest (it drives
+        // the REAL contract gate) and no RENDERED intelligence brief (the
+        // runtime's retrieval does not consume the prompt-side brief).
+        if run.prompt.contract_digest.is_none() {
+            return Err(format!(
+                "{}: full_daemon_runtime run lacks the compiled-contract digest",
+                run.task_id
+            ));
+        }
+        if run.prompt.intelligence.is_some() {
+            return Err(format!(
+                "{}: full_daemon_runtime run must not carry a rendered intelligence brief",
+                run.task_id
+            ));
+        }
+    } else if run.attempts.iter().any(|a| a.runtime.is_some()) {
+        return Err(format!(
+            "{}: only full_daemon_runtime attempts carry runtime evidence",
+            run.task_id
+        ));
+    }
     let mut passed_any = false;
     for (i, attempt) in run.attempts.iter().enumerate() {
         if attempt.index as usize != i {
@@ -391,28 +474,77 @@ fn validate_run(run: &FrozenRun, capture: &FrozenCapture) -> Result<(), String> 
                 run.task_id
             ));
         }
+        match (run.prompt.arm.is_runtime(), &attempt.runtime) {
+            (true, None) => {
+                return Err(format!(
+                    "{}: runtime attempt lacks its runtime-drive evidence",
+                    run.task_id
+                ))
+            }
+            (true, Some(evidence)) => {
+                if evidence.completion_gate.is_empty() {
+                    return Err(format!(
+                        "{}: runtime attempt carries an empty completion gate label",
+                        run.task_id
+                    ));
+                }
+                if attempt.parse_error.is_some() {
+                    return Err(format!(
+                        "{}: runtime attempts are tool-call driven and cannot carry parse errors",
+                        run.task_id
+                    ));
+                }
+            }
+            (false, Some(_)) => {
+                return Err(format!(
+                    "{}: non-runtime attempt carries runtime evidence",
+                    run.task_id
+                ))
+            }
+            (false, None) => {}
+        }
         if let Some(raw) = &attempt.raw_response {
             if raw.len() > MAX_RAW_RESPONSE_BYTES {
                 return Err(format!("{}: raw response exceeds the bound", run.task_id));
             }
         }
-        let model = capture
-            .models
-            .iter()
-            .find(|m| {
-                m.descriptor.provider == attempt.provider && m.descriptor.model == attempt.model
-            })
-            .ok_or_else(|| {
-                format!(
-                    "{}: attempt names unknown model {}/{}",
-                    run.task_id, attempt.provider, attempt.model
-                )
-            })?;
-        if model.local != attempt.local {
-            return Err(format!(
-                "{}: attempt local flag disagrees with the model table",
-                run.task_id
-            ));
+        if run.prompt.arm.is_runtime() {
+            // The runtime arm's frozen script is NOT a routable candidate: it
+            // has no model-table row. Its identity is fixed by the daemon-arm
+            // contract, and the frozen script is authoritatively local.
+            if attempt.provider != crate::daemon_arm::DAEMON_ARM_PROVIDER
+                || attempt.model != crate::daemon_arm::DAEMON_ARM_MODEL
+                || !attempt.local
+            {
+                return Err(format!(
+                    "{}: runtime attempt must name the local frozen script {}/{} (got {}/{}, local={})",
+                    run.task_id,
+                    crate::daemon_arm::DAEMON_ARM_PROVIDER,
+                    crate::daemon_arm::DAEMON_ARM_MODEL,
+                    attempt.provider,
+                    attempt.model,
+                    attempt.local
+                ));
+            }
+        } else {
+            let model = capture
+                .models
+                .iter()
+                .find(|m| {
+                    m.descriptor.provider == attempt.provider && m.descriptor.model == attempt.model
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{}: attempt names unknown model {}/{}",
+                        run.task_id, attempt.provider, attempt.model
+                    )
+                })?;
+            if model.local != attempt.local {
+                return Err(format!(
+                    "{}: attempt local flag disagrees with the model table",
+                    run.task_id
+                ));
+            }
         }
         for file in &attempt.files {
             crate::coding::validate_candidate_path(&file.path)?;

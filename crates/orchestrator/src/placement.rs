@@ -77,10 +77,31 @@ pub enum PlacementDecision {
     },
 }
 
+/// The typed refusal of one placement consultation. A seam failure is never
+/// collapsed into a string: the paid `private_runners` entitlement refusal
+/// ([`PlacementRefusal::Entitlement`]) keeps the entitlement, its hook, the
+/// cause and the resolved plan intact, so the executor's
+/// `ExecError::PlacementRefused` message names exactly why the remote
+/// placement did not happen (never a silent local fallback).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlacementRefusal {
+    /// The value-entitlement gate refused the remote (private-runner)
+    /// placement at this boundary.
+    #[error("{0}")]
+    Entitlement(#[from] faktor_core::entitlement::ValueGateRefusal),
+    /// The worker plane itself refused (unavailable, CAS race,
+    /// requirements, ...).
+    #[error("worker plane placement refused: {0}")]
+    Plane(String),
+}
+
 /// The daemon-provided placement implementation (over the worker plane).
 /// Object-safe: the executor holds one `Arc<dyn WorkerPlacementSeam>`.
+/// Implementations MUST consult the entitlement gate (when wired) BEFORE
+/// minting any job generation, so a denied placement leaves no durable job
+/// behind.
 pub trait WorkerPlacementSeam: Send + Sync {
-    fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, String>;
+    fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal>;
 }
 
 /// The executor's placement knob: disabled by default.
@@ -114,8 +135,9 @@ impl WorkerPlacement {
 
     /// Consult the seam. Disabled = local, always; enabled = the seam's
     /// decision, and a seam failure is a typed refusal (never a silent
-    /// fallback that would hide a broken plane).
-    pub fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, String> {
+    /// fallback that would hide a broken plane or an unentitled private
+    /// runner).
+    pub fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal> {
         match &self.seam {
             None => Ok(PlacementDecision::Local),
             Some(seam) => seam.place(spec),
@@ -130,7 +152,7 @@ mod tests {
     struct AlwaysRemote;
 
     impl WorkerPlacementSeam for AlwaysRemote {
-        fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, String> {
+        fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal> {
             Ok(PlacementDecision::Remote {
                 job_id: format!("job_{}", spec.job_key),
                 worker_id: "wrk_1".into(),
@@ -143,8 +165,28 @@ mod tests {
     struct Broken;
 
     impl WorkerPlacementSeam for Broken {
-        fn place(&self, _spec: &PlacementSpec) -> Result<PlacementDecision, String> {
-            Err("worker plane unavailable".into())
+        fn place(&self, _spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal> {
+            Err(PlacementRefusal::Plane("worker plane unavailable".into()))
+        }
+    }
+
+    struct DeniedByPlan;
+
+    impl WorkerPlacementSeam for DeniedByPlan {
+        fn place(&self, _spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal> {
+            Err(PlacementRefusal::Entitlement(
+                faktor_core::entitlement::ValueGateRefusal {
+                    entitlement: faktor_core::entitlement::ValueEntitlement::PrivateRunners,
+                    hook: faktor_core::entitlement::ValueEntitlement::PrivateRunners
+                        .enforcement_hook(),
+                    cause: faktor_core::entitlement::ValueRefusalCause::NotInPlan,
+                    plan_id: Some("pro".into()),
+                    organization_id: Some("org_1".into()),
+                    message:
+                        "value entitlement private_runners (hook worker_placement) not granted for organization org_1: not_in_plan (plan Some(\"pro\"))"
+                            .into(),
+                },
+            ))
         }
     }
 
@@ -193,7 +235,27 @@ mod tests {
             other => panic!("expected remote, got {other:?}"),
         }
         let broken = WorkerPlacement::enabled(Arc::new(Broken));
-        assert!(broken.place(&spec()).is_err());
+        assert!(matches!(
+            broken.place(&spec()),
+            Err(PlacementRefusal::Plane(ref message)) if message.contains("unavailable")
+        ));
+
+        // A paid-entitlement denial stays TYPED through the seam: the
+        // entitlement, hook and plan are intact at the executor boundary.
+        let denied = WorkerPlacement::enabled(Arc::new(DeniedByPlan));
+        let refusal = denied.place(&spec()).unwrap_err();
+        match refusal {
+            PlacementRefusal::Entitlement(refusal) => {
+                assert_eq!(
+                    refusal.entitlement,
+                    faktor_core::entitlement::ValueEntitlement::PrivateRunners
+                );
+                assert_eq!(refusal.hook.as_str(), "worker_placement");
+                assert_eq!(refusal.plan_id.as_deref(), Some("pro"));
+                assert!(refusal.to_string().contains("private_runners"));
+            }
+            other => panic!("expected the typed entitlement refusal, got {other:?}"),
+        }
     }
 
     #[test]

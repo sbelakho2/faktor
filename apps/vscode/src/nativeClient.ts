@@ -40,6 +40,7 @@ import {
   validateProtocolTaskRun,
   validateProtocolTaskRunCancelled,
   validateProtocolTaskRunStarted,
+  validateProtocolValueEntitlementsReport,
   ProtocolDtoError,
   type ProtocolAttachmentId,
   type ProtocolAttachmentRef,
@@ -48,6 +49,7 @@ import {
   type ProtocolTaskRun,
   type ProtocolTaskRunCancelled,
   type ProtocolTaskRunStarted,
+  type ProtocolValueEntitlementsReport,
 } from './generated/protocolDto.ts';
 import {
   readEngineeringContract,
@@ -1092,6 +1094,17 @@ export interface NativeEntitlementSnapshot {
 export interface NativeEntitlements {
   readonly ok: boolean;
   readonly entitlements: NativeEntitlementSnapshot;
+}
+
+/**
+ * `GET /native/value-entitlements` — the caller organization's DERIVED
+ * value-entitlement report: the plan resolution, the plan-mapped
+ * inference-independent value tags, the governance capability flags and one
+ * typed decision per entitlement (hook, granted, exact cause when not).
+ */
+export interface NativeValueEntitlements {
+  readonly ok: boolean;
+  readonly value_entitlements: ProtocolValueEntitlementsReport;
 }
 
 /** The caller's control-plane identity (`GET /native/identity`). */
@@ -2968,6 +2981,26 @@ export function validateEntitlements(json: Json): NativeEntitlements {
   };
 }
 
+/**
+ * The strict parse of `GET /native/value-entitlements`: the wrapped
+ * `{ok, value_entitlements}` envelope plus the generated report decoder
+ * (every known member exact; unknown additive members ignored).
+ */
+export function validateValueEntitlements(json: Json): NativeValueEntitlements {
+  const path = 'GET /native/value-entitlements';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'value_entitlements']);
+  return {
+    ok: fBool(object, 'ok', path),
+    value_entitlements: asNativeProtocol(() =>
+      validateProtocolValueEntitlementsReport(
+        field(object, 'value_entitlements', path),
+        `${path}.value_entitlements`,
+      ),
+    ),
+  };
+}
+
 export function validateIdentity(json: Json): NativeIdentityView {
   const path = 'GET /native/identity';
   const object = asObject(json, path);
@@ -3773,6 +3806,15 @@ export class NativeClient {
     this.controlToken = value !== null && value.trim().length > 0 ? value : null;
   }
 
+  /**
+   * True when a control-plane credential is configured and the next
+   * principal-scoped request will carry it. The host uses this to decide
+   * whether the organization-scope outcomes read is meaningful.
+   */
+  hasControlToken(): boolean {
+    return this.controlToken !== null;
+  }
+
   private async request<T>(method: string, path: string, options: RequestOptions<T>): Promise<T> {
     const url = new URL(this.baseUrl + path);
     if (options.query) {
@@ -4345,6 +4387,19 @@ export class NativeClient {
   }
 
   /**
+   * The caller organization's DERIVED value-entitlement report
+   * (`GET /native/value-entitlements`): one typed decision per paid value
+   * capability (hook, granted, exact cause when not). A disabled billing
+   * service answers the shared typed 409 `billing_disabled`; no usage,
+   * credits or tokens are read by the route.
+   */
+  valueEntitlements(): Promise<NativeValueEntitlements> {
+    return this.request('GET', '/native/value-entitlements', {
+      validate: validateValueEntitlements,
+    });
+  }
+
+  /**
    * Revoke the caller's control-plane session on the daemon
    * (`POST /native/sso/logout`). The route requires the daemon password
    * (`Authorization: Bearer`) AND the session's own token
@@ -4492,20 +4547,28 @@ export class NativeClient {
    * Engineering Outcome Ledger page (`GET /native/outcomes`): the durable
    * metrics fold plus one bounded newest-first run page. `beforeMs` and
    * `beforeRun` are the COMPOSITE cursor of the previous page (both or
-   * neither; the server refuses a half-given cursor typed). Unknown response
-   * fields are ignored per the additive v1 contract; every known field is
-   * validated exactly by the generated DTO.
+   * neither; the server refuses a half-given cursor typed). `org` requests
+   * the paid ORGANIZATION-scope read (`outcome_analytics`): the daemon then
+   * requires the control-plane principal to reach that organization and the
+   * plan to map the entitlement — a denial is the typed 403
+   * `value_entitlement_refused`, no billing authority is the shared typed
+   * 409 `billing_disabled`. Absent `org` the read keeps the frozen local
+   * shape and never consults the gate. Unknown response fields are ignored
+   * per the additive v1 contract; every known field is validated exactly by
+   * the generated DTO.
    */
   outcomes(request: {
     readonly limit?: number;
     readonly beforeMs?: number;
     readonly beforeRun?: string;
+    readonly org?: string;
   }): Promise<ProtocolOutcomesPage> {
     return this.request('GET', '/native/outcomes', {
       query: {
         limit: request.limit,
         before_ms: request.beforeMs,
         before_run: request.beforeRun,
+        org: request.org,
       },
       validate: (json, path) => asNativeProtocol(() => validateProtocolOutcomesPage(json, path)),
     });

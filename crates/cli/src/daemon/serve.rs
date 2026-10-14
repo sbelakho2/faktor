@@ -997,60 +997,7 @@ pub(crate) async fn serve_impl(
     // operation store, the content-addressed install layout and the checked
     // download transport (the `[sandbox]` destination policy) are built
     // here; artifacts download through the daemon's own egress policy.
-    let updater = if config.updater.enabled {
-        let db = config
-            .updater
-            .database_path(&data_dir)
-            .map_err(|e| format!("updater config: {e}"))?
-            .ok_or("updater config: enabled section resolved no database")?;
-        let install_root = config
-            .updater
-            .install_root_path(&data_dir)
-            .map_err(|e| format!("updater config: {e}"))?
-            .ok_or("updater config: enabled section resolved no install root")?;
-        let policy = config
-            .sandbox_policy()
-            .map_err(|e| format!("sandbox config: {e}"))?
-            .network
-            .installed()
-            .cloned()
-            .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
-        let store = Arc::new(
-            faktor_updater::SqliteUpdaterStore::open(&db)
-                .map_err(|e| format!("updater store {}: {e}", db.display()))?,
-        );
-        let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
-            faktor_provider::egress::CheckedHttpClient::try_with_policy(policy)
-                .map_err(|e| format!("updater egress client: {e}"))?,
-        ));
-        let updater_config = faktor_updater::UpdaterConfig {
-            channel: config
-                .updater
-                .channel()
-                .map_err(|e| format!("updater config: {e}"))?,
-            install_root,
-            keys: config
-                .updater
-                .trusted_keys()
-                .map_err(|e| format!("updater config: {e}"))?,
-            max_artifact_bytes: config.updater.max_artifact_bytes_resolved(),
-            clock_skew_ms: config.updater.clock_skew_ms_resolved(),
-            host_os: std::env::consts::OS.to_string(),
-            host_arch: std::env::consts::ARCH.to_string(),
-            local_version: faktor_core::VERSION.to_string(),
-            allow_legacy_manifests_once: config.updater.allow_legacy_manifests_once_resolved(),
-        };
-        let probe = faktor_updater::DataStoreSchemaProbe::new(
-            faktor_updater::DigestProbe,
-            data_dir.join("store").join("faktor-plus.db"),
-            faktor_store::SCHEMA_HEAD,
-        );
-        let updater = faktor_updater::Updater::new(updater_config, store, fetcher, Arc::new(probe))
-            .map_err(|e| format!("updater init: {e}"))?;
-        Some(Arc::new(updater))
-    } else {
-        None
-    };
+    let updater = build_daemon_updater(&config, &data_dir)?;
     let graph =
         build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)
             .await
@@ -1187,170 +1134,9 @@ pub(crate) async fn serve_impl(
     // the gate is consulted at the three safe boundaries only, so an
     // entitlement change can never interrupt an in-flight
     // integration/rollback/completion transaction.
-    let mut billing_gate: Option<Arc<dyn faktor_orchestrator::admission::AdmissionGate>> = None;
-    // The additive `[billing.report]` schedule (disabled by default): a
-    // durable period/cursor schedule that reports the folded usage through
-    // the vendor adapter after readiness.
-    let mut billing_report: Option<Arc<crate::billing_report::BillingReportRunner>> = None;
-    if config_billing.enabled {
-        let path = config_billing
-            .billing_path(&data_dir)
-            .map_err(|e| format!("billing config: {e}"))?;
-        let organization = config_billing
-            .organization()
-            .map_err(|e| format!("billing config: {e}"))?;
-        let account = config_billing
-            .account_id()
-            .map_err(|e| format!("billing config: {e}"))?;
-        let service_config = config_billing
-            .service_config()
-            .map_err(|e| format!("billing config: {e}"))?
-            .ok_or_else(|| {
-                "billing config: an enabled section carries a service config".to_string()
-            })?;
-        let store = {
-            let path = enabled_section_db_path("billing", path)?;
-            Arc::new(
-                faktor_cloud::SqliteControlPlaneStore::open(&path)
-                    .map_err(|e| format!("billing store {}: {e}", path.display()))?,
-            ) as Arc<dyn faktor_cloud::BillingStore>
-        };
-        let service = faktor_cloud::EntitlementService::with_system_clock_for_organization(
-            store,
-            service_config,
-            organization.clone(),
-        )
-        .map_err(|e| format!("billing service: {e}"))?;
-        // The report schedule (additive; disabled by default): strict vendor
-        // config, the durable billing store and the daemon's checked
-        // transport. A missing vendor credential env var refuses startup —
-        // never a silently unauthenticated report.
-        if let Some(report_cfg) = config_billing
-            .report
-            .as_ref()
-            .filter(|report| report.enabled)
-        {
-            let vendor_config = report_cfg.vendor_config()?;
-            let policy = report_cfg.policy()?;
-            let adapter = if report_cfg.unauthenticated() {
-                faktor_cloud::BillingVendorAdapter::new(
-                    service.clone(),
-                    vendor_config,
-                    graph.transport.clone(),
-                    None,
-                )
-            } else {
-                faktor_cloud::BillingVendorAdapter::from_env(
-                    service.clone(),
-                    vendor_config,
-                    graph.transport.clone(),
-                )
-            }
-            .map_err(|e| format!("billing report config: {e}"))?;
-            billing_report = Some(Arc::new(crate::billing_report::BillingReportRunner::new(
-                service.store().clone(),
-                adapter,
-                organization.clone(),
-                policy,
-                Arc::new(faktor_cloud::SystemClock),
-            )));
-            tracing::info!("billing report schedule enabled");
-        }
-        let account_name = config_billing
-            .account_name
-            .clone()
-            .unwrap_or_else(|| "local".to_string());
-        let managed = config_billing.managed.unwrap_or(true);
-        service
-            .ensure_account(&organization, &account, &account_name, managed)
-            .map_err(|e| format!("billing account provisioning: {e}"))?;
-        // Wave 5 residual: install the agent-side debit authority, so a
-        // Faktor-managed provider attempt opens its durable credit hold
-        // BEFORE dispatch (record-before-call) and settles/refunds with the
-        // reservation ledger; BYOK providers are classified and never
-        // debited. Without this install the agent dispatch path is exactly
-        // the pre-billing path (no debit call exists).
-        // A poisoned authority slot must refuse daemon startup (fail-closed):
-        // silently continuing would run managed traffic without the debit
-        // authority it is configured to have.
-        graph
-            .agent
-            .set_provider_debits(Some(Arc::new(billing_debits::CloudAttemptDebits::new(
-                service.clone(),
-                organization.clone(),
-                account.clone(),
-            ))))
-            .map_err(|e| format!("installing the agent debit authority: {e}"))?;
-        billing_gate = Some(Arc::new(BillingAdmissionGate::new(
-            service.clone(),
-            organization,
-        )));
-        deps = deps.with_billing(service);
-        tracing::info!("commercial billing enabled");
-    }
-    if let Some(gate) = billing_gate {
-        graph.orchestrator.set_admission_gate(gate);
-    }
-    // The additive `[workers]` section: when disabled (the default) nothing
-    // is built and no worker database is created. When enabled, the durable
-    // plane opens under the data dir, its crash recovery runs BEFORE the
-    // first request (expired leases requeue deterministically; unleased
-    // assignments are re-attempted), the worker routes are wired, and the
-    // TaskExecutor gains the placement seam so a new run is placed on an
-    // eligible registered worker instead of executing locally.
-    if config_workers.enabled {
-        let path = config_workers
-            .workers_path(&data_dir)
-            .map_err(|e| format!("workers config: {e}"))?;
-        let organization = config_workers
-            .organization()
-            .map_err(|e| format!("workers config: {e}"))?;
-        let trust_domain = config_workers
-            .trust_domain()
-            .map_err(|e| format!("workers config: {e}"))?;
-        let requirements = config_workers
-            .requirements()
-            .map_err(|e| format!("workers config: {e}"))?;
-        let store = {
-            let path = enabled_section_db_path("workers", path)?;
-            Arc::new(
-                faktor_worker::SqliteWorkerStore::open(&path)
-                    .map_err(|e| format!("worker store {}: {e}", path.display()))?,
-            ) as Arc<dyn faktor_worker::WorkerStore>
-        };
-        let plane = faktor_worker::WorkerPlane::with_system_clock(store);
-        // Crash recovery before the first request: a lease whose heartbeat
-        // window closed while the daemon was down expires (attempt terminal
-        // + bounded requeue), and an assignment committed without its lease
-        // is re-attempted. Idempotent: a clean restart reports nothing.
-        let recovery = plane
-            .recover(&organization)
-            .map_err(|e| format!("worker recovery: {e}"))?;
-        let resumed = plane
-            .resume_assignments(&organization)
-            .map_err(|e| format!("worker assignment recovery: {e}"))?;
-        if !recovery.expired.is_empty() || !resumed.reassigned.is_empty() {
-            tracing::warn!(
-                expired = recovery.expired.len(),
-                requeued = recovery.requeued.len(),
-                exhausted = recovery.exhausted.len(),
-                reassigned = resumed.reassigned.len(),
-                "worker plane recovery resolved interrupted leases/assignments"
-            );
-        }
-        graph
-            .tasks
-            .set_worker_placement(faktor_orchestrator::placement::WorkerPlacement::enabled(
-                Arc::new(WorkerPlaneAdapter {
-                    plane: plane.clone(),
-                    organization,
-                    trust_domain,
-                    requirements,
-                }),
-            ));
-        deps = deps.with_workers(plane);
-        tracing::info!("remote/vpc worker plane enabled");
-    }
+    let (deps, value_gate, billing_report) =
+        wire_billing_plane(deps, &config_billing, &data_dir, &graph)?;
+    let deps = wire_worker_plane(deps, &config_workers, &data_dir, &graph, &value_gate)?;
     // The additive `[enterprise]` section: when disabled (the default)
     // nothing is built and no enterprise database is created. When enabled,
     // the retention/audit/admin service opens its own `enterprise.db`
@@ -1360,31 +1146,7 @@ pub(crate) async fn serve_impl(
     // scanner and again at the storage layer. An enabled section requires
     // the cloud section (the principal source); the pair is refused at
     // config load, so reaching here without it is a bug.
-    if config_enterprise.enabled {
-        if deps.control_plane.is_none() {
-            return Err(
-                "enterprise: an enabled [enterprise] section requires [cloud] enabled".into(),
-            );
-        }
-        let path = config_enterprise
-            .enterprise_path(&data_dir)
-            .map_err(|e| format!("enterprise config: {e}"))?
-            .ok_or_else(|| "enterprise config: enabled without a database path".to_string())?;
-        let store = Arc::new(
-            faktor_cloud::SqliteControlPlaneStore::open(&path)
-                .map_err(|e| format!("enterprise store {}: {e}", path.display()))?,
-        ) as Arc<dyn faktor_cloud::EnterpriseStore>;
-        let service = Arc::new(
-            faktor_cloud::EnterpriseService::with_system_clock(store)
-                .map_err(|e| format!("enterprise service: {e}"))?,
-        );
-        let runtime = Arc::new(faktor_server::native::enterprise::RetentionRuntime::new(
-            deps.session.store(),
-            deps.session.cas(),
-        ));
-        deps = deps.with_enterprise(service, Some(runtime));
-        tracing::info!("enterprise retention/audit plane enabled");
-    }
+    let deps = wire_enterprise_plane(deps, &config_enterprise, &data_dir)?;
     // The signed updater (additive; disabled by default): crash recovery
     // runs BEFORE the first request — an interrupted apply is resumed or
     // rolled back, never left half-applied. The daemon probe re-hashes the
@@ -1393,25 +1155,7 @@ pub(crate) async fn serve_impl(
     // the bootstrap launcher, its verified release digest is passed to
     // recovery: a release activation whose pointer is in place is only
     // resumed as applied when the running process IS the activated release.
-    if let Some(updater) = &updater {
-        let running_release_digest = faktor_updater::running_release().map(|(_, digest)| digest);
-        match updater.recover_with_running_digest(now_ms(), running_release_digest.as_deref()) {
-            Ok(outcomes) if !outcomes.is_empty() => {
-                for outcome in &outcomes {
-                    tracing::warn!(
-                        "updater recovery resolved an interrupted operation: {outcome:?}"
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::error!("updater recovery failed: {e}"),
-        }
-        deps = deps.with_updater(updater.clone());
-        tracing::info!(
-            "signed updater enabled (channel {})",
-            updater.config().channel
-        );
-    }
+    let mut deps = recover_and_wire_updater(deps, &updater);
     // The running-build report (audit: activation must be observable as a
     // PROCESS fact, not metadata): the daemon logs one bounded JSON line to
     // stderr and — when the bootstrap launcher verified a release — folds
@@ -1600,6 +1344,359 @@ pub(crate) async fn serve_impl(
     Ok(())
 }
 
+/// Resolve and (only when enabled) BUILD the additive `[updater]` authority:
+/// disabled (the default and every pre-updater config) builds nothing — no
+/// operation database and no install root are ever created, and the daemon
+/// stays byte-identical to the pre-updater daemon. When enabled, the durable
+/// operation store, the content-addressed install layout and the checked
+/// download transport (the `[sandbox]` destination policy) are built here.
+fn build_daemon_updater(
+    config: &crate::config::Config,
+    data_dir: &std::path::Path,
+) -> Result<Option<Arc<faktor_updater::Updater>>, String> {
+    if !config.updater.enabled {
+        return Ok(None);
+    }
+    let db = config
+        .updater
+        .database_path(data_dir)
+        .map_err(|e| format!("updater config: {e}"))?
+        .ok_or("updater config: enabled section resolved no database")?;
+    let install_root = config
+        .updater
+        .install_root_path(data_dir)
+        .map_err(|e| format!("updater config: {e}"))?
+        .ok_or("updater config: enabled section resolved no install root")?;
+    let policy = config
+        .sandbox_policy()
+        .map_err(|e| format!("sandbox config: {e}"))?
+        .network
+        .installed()
+        .cloned()
+        .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
+    let store = Arc::new(
+        faktor_updater::SqliteUpdaterStore::open(&db)
+            .map_err(|e| format!("updater store {}: {e}", db.display()))?,
+    );
+    let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
+        faktor_provider::egress::CheckedHttpClient::try_with_policy(policy)
+            .map_err(|e| format!("updater egress client: {e}"))?,
+    ));
+    let updater_config = faktor_updater::UpdaterConfig {
+        channel: config
+            .updater
+            .channel()
+            .map_err(|e| format!("updater config: {e}"))?,
+        install_root,
+        keys: config
+            .updater
+            .trusted_keys()
+            .map_err(|e| format!("updater config: {e}"))?,
+        max_artifact_bytes: config.updater.max_artifact_bytes_resolved(),
+        clock_skew_ms: config.updater.clock_skew_ms_resolved(),
+        host_os: std::env::consts::OS.to_string(),
+        host_arch: std::env::consts::ARCH.to_string(),
+        local_version: faktor_core::VERSION.to_string(),
+        allow_legacy_manifests_once: config.updater.allow_legacy_manifests_once_resolved(),
+    };
+    let probe = faktor_updater::DataStoreSchemaProbe::new(
+        faktor_updater::DigestProbe,
+        data_dir.join("store").join("faktor-plus.db"),
+        faktor_store::SCHEMA_HEAD,
+    );
+    let updater = faktor_updater::Updater::new(updater_config, store, fetcher, Arc::new(probe))
+        .map_err(|e| format!("updater init: {e}"))?;
+    Ok(Some(Arc::new(updater)))
+}
+
+/// Wire the additive `[billing]` plane (Wave 3): disabled by default (no
+/// billing database is created; every billing route answers 409). When
+/// enabled, the durable usage/credit ledger opens here (its own `billing.db`
+/// through the SAME control-plane store + migration ladder), the configured
+/// account is provisioned idempotently, the agent-side debit authority and
+/// the runtime value-entitlement gate are installed, and the orchestrator's
+/// admission gate is wired to the entitlement service (consulted at the
+/// three safe boundaries only, so an entitlement change can never interrupt
+/// an in-flight integration/rollback/completion transaction). Returns the
+/// deps carrying the service, the value gate the worker plane reuses, and
+/// the optional post-readiness report schedule.
+fn wire_billing_plane(
+    mut deps: ServerDeps,
+    config_billing: &crate::config::BillingCfg,
+    data_dir: &std::path::Path,
+    graph: &DaemonGraph,
+) -> Result<
+    (
+        ServerDeps,
+        faktor_core::entitlement::ValueGate,
+        Option<Arc<crate::billing_report::BillingReportRunner>>,
+    ),
+    String,
+> {
+    // The additive `[billing.report]` schedule (disabled by default): a
+    // durable period/cursor schedule that reports the folded usage through
+    // the vendor adapter after readiness.
+    let mut billing_report: Option<Arc<crate::billing_report::BillingReportRunner>> = None;
+    // The value-entitlement enforcement gate of this daemon's tenant: absent
+    // while `[billing]` is disabled (every paid augmentation — org-contract
+    // enrichment, private runners — is refused typed `cloud_absent`; the
+    // local product path is untouched). The enabled section replaces it with
+    // the real commercial gate over the SAME service the routes use.
+    let mut value_gate = faktor_core::entitlement::ValueGate::absent();
+    if !config_billing.enabled {
+        return Ok((deps, value_gate, billing_report));
+    }
+    let path = config_billing
+        .billing_path(data_dir)
+        .map_err(|e| format!("billing config: {e}"))?;
+    let organization = config_billing
+        .organization()
+        .map_err(|e| format!("billing config: {e}"))?;
+    let account = config_billing
+        .account_id()
+        .map_err(|e| format!("billing config: {e}"))?;
+    let service_config = config_billing
+        .service_config()
+        .map_err(|e| format!("billing config: {e}"))?
+        .ok_or_else(|| "billing config: an enabled section carries a service config".to_string())?;
+    let store = {
+        let path = enabled_section_db_path("billing", path)?;
+        Arc::new(
+            faktor_cloud::SqliteControlPlaneStore::open(&path)
+                .map_err(|e| format!("billing store {}: {e}", path.display()))?,
+        ) as Arc<dyn faktor_cloud::BillingStore>
+    };
+    let service = faktor_cloud::EntitlementService::with_system_clock_for_organization(
+        store,
+        service_config,
+        organization.clone(),
+    )
+    .map_err(|e| format!("billing service: {e}"))?;
+    // The report schedule (additive; disabled by default): strict vendor
+    // config, the durable billing store and the daemon's checked transport.
+    // A missing vendor credential env var refuses startup — never a silently
+    // unauthenticated report.
+    if let Some(report_cfg) = config_billing
+        .report
+        .as_ref()
+        .filter(|report| report.enabled)
+    {
+        let vendor_config = report_cfg.vendor_config()?;
+        let policy = report_cfg.policy()?;
+        let adapter = if report_cfg.unauthenticated() {
+            faktor_cloud::BillingVendorAdapter::new(
+                service.clone(),
+                vendor_config,
+                graph.transport.clone(),
+                None,
+            )
+        } else {
+            faktor_cloud::BillingVendorAdapter::from_env(
+                service.clone(),
+                vendor_config,
+                graph.transport.clone(),
+            )
+        }
+        .map_err(|e| format!("billing report config: {e}"))?;
+        billing_report = Some(Arc::new(crate::billing_report::BillingReportRunner::new(
+            service.store().clone(),
+            adapter,
+            organization.clone(),
+            policy,
+            Arc::new(faktor_cloud::SystemClock),
+        )));
+        tracing::info!("billing report schedule enabled");
+    }
+    let account_name = config_billing
+        .account_name
+        .clone()
+        .unwrap_or_else(|| "local".to_string());
+    let managed = config_billing.managed.unwrap_or(true);
+    service
+        .ensure_account(&organization, &account, &account_name, managed)
+        .map_err(|e| format!("billing account provisioning: {e}"))?;
+    // Wave 5 residual: install the agent-side debit authority, so a
+    // Faktor-managed provider attempt opens its durable credit hold BEFORE
+    // dispatch (record-before-call) and settles/refunds with the reservation
+    // ledger; BYOK providers are classified and never debited. Without this
+    // install the agent dispatch path is exactly the pre-billing path (no
+    // debit call exists). A poisoned authority slot must refuse daemon
+    // startup (fail-closed): silently continuing would run managed traffic
+    // without the debit authority it is configured to have.
+    graph
+        .agent
+        .set_provider_debits(Some(Arc::new(billing_debits::CloudAttemptDebits::new(
+            service.clone(),
+            organization.clone(),
+            account.clone(),
+        ))))
+        .map_err(|e| format!("installing the agent debit authority: {e}"))?;
+    // The runtime value-entitlement gate (the typed refusal boundary for
+    // every paid augmentation): installed on the agent (org-contract
+    // enrichment) and reused by the worker plane (private runners). The gate
+    // reads the durable subscription + plan table only — never usage, credits
+    // or tokens.
+    value_gate = service.enforcement_gate(&organization);
+    graph.agent.set_value_gate(value_gate.clone());
+    let billing_gate: Arc<dyn faktor_orchestrator::admission::AdmissionGate> =
+        Arc::new(BillingAdmissionGate::new(service.clone(), organization));
+    deps = deps.with_billing(service);
+    tracing::info!("commercial billing enabled");
+    graph.orchestrator.set_admission_gate(billing_gate);
+    Ok((deps, value_gate, billing_report))
+}
+
+/// Wire the additive `[workers]` section: when disabled (the default)
+/// nothing is built and no worker database is created. When enabled, the
+/// durable plane opens under the data dir, its crash recovery runs BEFORE
+/// the first request (expired leases requeue deterministically; unleased
+/// assignments are re-attempted), the worker routes are wired, and the
+/// TaskExecutor gains the placement seam so a new run is placed on an
+/// eligible registered worker instead of executing locally.
+fn wire_worker_plane(
+    mut deps: ServerDeps,
+    config_workers: &crate::config::WorkersCfg,
+    data_dir: &std::path::Path,
+    graph: &DaemonGraph,
+    value_gate: &faktor_core::entitlement::ValueGate,
+) -> Result<ServerDeps, String> {
+    if !config_workers.enabled {
+        return Ok(deps);
+    }
+    let path = config_workers
+        .workers_path(data_dir)
+        .map_err(|e| format!("workers config: {e}"))?;
+    let organization = config_workers
+        .organization()
+        .map_err(|e| format!("workers config: {e}"))?;
+    let trust_domain = config_workers
+        .trust_domain()
+        .map_err(|e| format!("workers config: {e}"))?;
+    let requirements = config_workers
+        .requirements()
+        .map_err(|e| format!("workers config: {e}"))?;
+    let store = {
+        let path = enabled_section_db_path("workers", path)?;
+        Arc::new(
+            faktor_worker::SqliteWorkerStore::open(&path)
+                .map_err(|e| format!("worker store {}: {e}", path.display()))?,
+        ) as Arc<dyn faktor_worker::WorkerStore>
+    };
+    let plane = faktor_worker::WorkerPlane::with_system_clock(store);
+    // Claim ADMISSION: the private-runner entitlement is consulted before
+    // any claim is admitted (typed refusal, nothing claimed). Without
+    // billing the absent gate refuses typed `cloud_absent` — the operator's
+    // local execution path stays the community answer.
+    plane.set_claim_entitlement_gate(value_gate.clone());
+    // Crash recovery before the first request: a lease whose heartbeat
+    // window closed while the daemon was down expires (attempt terminal +
+    // bounded requeue), and an assignment committed without its lease is
+    // re-attempted. Idempotent: a clean restart reports nothing.
+    let recovery = plane
+        .recover(&organization)
+        .map_err(|e| format!("worker recovery: {e}"))?;
+    let resumed = plane
+        .resume_assignments(&organization)
+        .map_err(|e| format!("worker assignment recovery: {e}"))?;
+    if !recovery.expired.is_empty() || !resumed.reassigned.is_empty() {
+        tracing::warn!(
+            expired = recovery.expired.len(),
+            requeued = recovery.requeued.len(),
+            exhausted = recovery.exhausted.len(),
+            reassigned = resumed.reassigned.len(),
+            "worker plane recovery resolved interrupted leases/assignments"
+        );
+    }
+    graph
+        .tasks
+        .set_worker_placement(faktor_orchestrator::placement::WorkerPlacement::enabled(
+            Arc::new(WorkerPlaneAdapter {
+                plane: plane.clone(),
+                organization,
+                trust_domain,
+                requirements,
+                gate: value_gate.clone(),
+            }),
+        ));
+    deps = deps.with_workers(plane);
+    tracing::info!("remote/vpc worker plane enabled");
+    Ok(deps)
+}
+
+/// Wire the additive `[enterprise]` section: when disabled (the default)
+/// nothing is built and no enterprise database is created. When enabled, the
+/// retention/audit/admin service opens its own `enterprise.db` (through the
+/// SAME control-plane store + migration ladder; the audit table is
+/// append-only) and the GC route is wired to the daemon's REAL session store
+/// and CAS, so protected rollback material is refused at the scanner and
+/// again at the storage layer. An enabled section requires the cloud section
+/// (the principal source); the pair is refused at config load, so reaching
+/// here without it is a bug.
+fn wire_enterprise_plane(
+    mut deps: ServerDeps,
+    config_enterprise: &crate::config::EnterpriseCfg,
+    data_dir: &std::path::Path,
+) -> Result<ServerDeps, String> {
+    if !config_enterprise.enabled {
+        return Ok(deps);
+    }
+    if deps.control_plane.is_none() {
+        return Err("enterprise: an enabled [enterprise] section requires [cloud] enabled".into());
+    }
+    let path = config_enterprise
+        .enterprise_path(data_dir)
+        .map_err(|e| format!("enterprise config: {e}"))?
+        .ok_or_else(|| "enterprise config: enabled without a database path".to_string())?;
+    let store = Arc::new(
+        faktor_cloud::SqliteControlPlaneStore::open(&path)
+            .map_err(|e| format!("enterprise store {}: {e}", path.display()))?,
+    ) as Arc<dyn faktor_cloud::EnterpriseStore>;
+    let service = Arc::new(
+        faktor_cloud::EnterpriseService::with_system_clock(store)
+            .map_err(|e| format!("enterprise service: {e}"))?,
+    );
+    let runtime = Arc::new(faktor_server::native::enterprise::RetentionRuntime::new(
+        deps.session.store(),
+        deps.session.cas(),
+    ));
+    deps = deps.with_enterprise(service, Some(runtime));
+    tracing::info!("enterprise retention/audit plane enabled");
+    Ok(deps)
+}
+
+/// Updater crash recovery runs BEFORE the first request — an interrupted
+/// apply is resumed or rolled back, never left half-applied. The daemon
+/// probe re-hashes the swapped artifact (the CLI-local `faktor updater
+/// apply` runs the real doctor quick check instead). When THIS process was
+/// launched through the bootstrap launcher, its verified release digest is
+/// passed to recovery: a release activation whose pointer is in place is
+/// only resumed as applied when the running process IS the activated
+/// release. Then the authority is wired into the server deps.
+fn recover_and_wire_updater(
+    deps: ServerDeps,
+    updater: &Option<Arc<faktor_updater::Updater>>,
+) -> ServerDeps {
+    let Some(updater) = updater else {
+        return deps;
+    };
+    let running_release_digest = faktor_updater::running_release().map(|(_, digest)| digest);
+    match updater.recover_with_running_digest(now_ms(), running_release_digest.as_deref()) {
+        Ok(outcomes) if !outcomes.is_empty() => {
+            for outcome in &outcomes {
+                tracing::warn!("updater recovery resolved an interrupted operation: {outcome:?}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("updater recovery failed: {e}"),
+    }
+    let deps = deps.with_updater(updater.clone());
+    tracing::info!(
+        "signed updater enabled (channel {})",
+        updater.config().channel
+    );
+    deps
+}
+
 /// The ACP agent server (`faktor-cli acp`): build the REAL daemon graph over
 /// the data dir (config from `faktor-plus.json` in the data dir when present,
 /// else defaults; NO MCP layer — the acp surface needs the same providers,
@@ -1710,13 +1807,23 @@ pub(crate) struct WorkerPlaneAdapter {
     pub(crate) organization: faktor_cloud::OrganizationId,
     pub(crate) trust_domain: String,
     pub(crate) requirements: faktor_worker::JobRequirements,
+    /// The value-entitlement gate of the daemon's tenant: the paid
+    /// `private_runners` entitlement is consulted BEFORE any job generation
+    /// is minted. Absent = no billing authority wired: a remote placement is
+    /// refused typed `cloud_absent` (the local run stays the community path;
+    /// the refusal is never silent).
+    pub(crate) gate: faktor_core::entitlement::ValueGate,
 }
 
 impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter {
     fn place(
         &self,
         spec: &faktor_orchestrator::placement::PlacementSpec,
-    ) -> Result<faktor_orchestrator::placement::PlacementDecision, String> {
+    ) -> Result<
+        faktor_orchestrator::placement::PlacementDecision,
+        faktor_orchestrator::placement::PlacementRefusal,
+    > {
+        use faktor_orchestrator::placement::{PlacementDecision, PlacementRefusal};
         let mut requirements = self.requirements.clone();
         // The executor's spec carries the run shape; the daemon's `[workers]`
         // defaults carry the environment requirements. A spec-provided field
@@ -1745,19 +1852,27 @@ impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter 
         requirements.trust_domain = self.trust_domain.clone();
         requirements
             .normalize()
-            .map_err(|e| format!("placement requirements: {e}"))?;
+            .map_err(|e| PlacementRefusal::Plane(format!("placement requirements: {e}")))?;
         // Only mint a generation when a worker can actually take it: the
         // local run stays the answer otherwise.
         match self
             .plane
             .find_eligible(&self.organization, &self.trust_domain, &requirements)
         {
-            Ok(None) => return Ok(faktor_orchestrator::placement::PlacementDecision::Local),
+            Ok(None) => return Ok(PlacementDecision::Local),
             Ok(Some(_)) => {}
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(PlacementRefusal::Plane(e.to_string())),
         }
+        // The PRIVATE RUNNER boundary: an eligible remote worker exists, so
+        // this placement is the paid `private_runners` augmentation. The
+        // gate is consulted BEFORE the durable job is minted; a denial is
+        // the typed refusal (entitlement/hook/cause/plan) and NOTHING is
+        // scheduled — never a silent local fallback.
+        self.gate
+            .check(faktor_core::entitlement::ValueEntitlement::PrivateRunners)
+            .map_err(PlacementRefusal::Entitlement)?;
         let job_key = faktor_worker::JobKey::try_new(spec.job_key.clone())
-            .map_err(|e| format!("placement job key: {e}"))?;
+            .map_err(|e| PlacementRefusal::Plane(format!("placement job key: {e}")))?;
         let scheduled = self
             .plane
             .schedule_job(
@@ -1769,9 +1884,9 @@ impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter 
                 faktor_worker::default_requeue(),
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PlacementRefusal::Plane(e.to_string()))?;
         match scheduled.lease {
-            Some(lease) => Ok(faktor_orchestrator::placement::PlacementDecision::Remote {
+            Some(lease) => Ok(PlacementDecision::Remote {
                 job_id: scheduled.job.job_id.to_string(),
                 worker_id: lease.worker_id.to_string(),
                 generation: scheduled.generation.as_u64(),
@@ -1780,7 +1895,7 @@ impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter 
             // The CAS lost a race (the worker vanished between the
             // eligibility read and the accept): execute locally rather than
             // stranding the run.
-            None => Ok(faktor_orchestrator::placement::PlacementDecision::Local),
+            None => Ok(PlacementDecision::Local),
         }
     }
 }

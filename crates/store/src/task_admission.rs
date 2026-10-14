@@ -1377,8 +1377,9 @@ mod task_admission_tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 33,
-            "v31 (engineering contract) is the migration head"
+            version,
+            crate::schema::SCHEMA_HEAD,
+            "a fresh database carries the full migration head"
         );
         // The CHECK vocabulary refuses an unknown state at the SQL level and
         // admits the typed conflict landing.

@@ -2390,3 +2390,111 @@ fn journal_deleted_after_accept_reopen_is_duplicate_free() {
     assert_eq!(status.generations.len(), 1, "no duplicate generation");
     assert_eq!(status.lease.unwrap().lease_id, lease.lease_id);
 }
+
+/// Claim ADMISSION is gated by the `private_runners` value entitlement once
+/// the daemon installs the gate: a denied plan refuses the claim TYPED
+/// (naming the entitlement, hook and plan) and claims nothing; the entitled
+/// plan claims normally. Without a gate (the direct-construction default)
+/// the plane stays ungated.
+#[test]
+fn claim_admission_is_gated_typed_when_the_daemon_installs_a_gate() {
+    use faktor_core::entitlement::{
+        ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal, ValueRefusalCause,
+    };
+
+    #[derive(Debug)]
+    struct Denied;
+    impl ValueEntitlementGate for Denied {
+        fn check_value_entitlement(
+            &self,
+            entitlement: ValueEntitlement,
+        ) -> Result<(), ValueGateRefusal> {
+            Err(ValueGateRefusal {
+                entitlement,
+                hook: entitlement.enforcement_hook(),
+                cause: ValueRefusalCause::NotInPlan,
+                plan_id: Some("pro".into()),
+                organization_id: Some("org_1".into()),
+                message: format!(
+                    "value entitlement {} (hook {}) not granted for organization org_1: not_in_plan (plan Some(\"pro\"))",
+                    entitlement.as_str(),
+                    entitlement.enforcement_hook().as_str()
+                ),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct Entitled;
+    impl ValueEntitlementGate for Entitled {
+        fn check_value_entitlement(
+            &self,
+            _entitlement: ValueEntitlement,
+        ) -> Result<(), ValueGateRefusal> {
+            Ok(())
+        }
+    }
+
+    let h = Harness::memory();
+    // Scheduled BEFORE any worker registers: the generation stays open (no
+    // auto-lease), so the worker's own CAS accept is the claim.
+    let scheduled = h.schedule("gate-1", &digest("gate"));
+    assert!(
+        scheduled.lease.is_none(),
+        "no worker existed at schedule time"
+    );
+    let token = h.register("wrk_1", &["rust"]);
+
+    // Denied: typed refusal naming private_runners and the plan; NOTHING is
+    // claimed (the generation stays un-leased).
+    h.plane
+        .set_claim_entitlement_gate(ValueGate::wired(Arc::new(Denied)));
+    let refusal = h
+        .plane
+        .claim_next(
+            &org("org_1"),
+            &worker_id("wrk_1"),
+            &token,
+            WORKER_PROTOCOL_VERSION,
+        )
+        .unwrap_err();
+    match refusal {
+        WorkerError::EntitlementRefused(refusal) => {
+            assert_eq!(refusal.entitlement, ValueEntitlement::PrivateRunners);
+            assert_eq!(refusal.hook.as_str(), "worker_placement");
+            assert_eq!(refusal.cause, ValueRefusalCause::NotInPlan);
+            assert_eq!(refusal.plan_id.as_deref(), Some("pro"));
+        }
+        other => panic!("expected the typed entitlement refusal, got {other:?}"),
+    }
+    // Offline: an absent gate (installed explicitly) refuses cloud_absent.
+    h.plane.set_claim_entitlement_gate(ValueGate::absent());
+    let refusal = h
+        .plane
+        .claim_next(
+            &org("org_1"),
+            &worker_id("wrk_1"),
+            &token,
+            WORKER_PROTOCOL_VERSION,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        refusal,
+        WorkerError::EntitlementRefused(ref refusal) if refusal.cause == ValueRefusalCause::CloudAbsent
+    ));
+
+    // Entitled: the claim succeeds through the same CAS path.
+    h.plane
+        .set_claim_entitlement_gate(ValueGate::wired(Arc::new(Entitled)));
+    let claimed = h
+        .plane
+        .claim_next(
+            &org("org_1"),
+            &worker_id("wrk_1"),
+            &token,
+            WORKER_PROTOCOL_VERSION,
+        )
+        .unwrap()
+        .expect("an entitled worker claims the scheduled job");
+    assert_eq!(claimed.job.job_id, scheduled.job.job_id);
+}

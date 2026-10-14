@@ -1526,8 +1526,8 @@
     var facts = [
       'class ' + String(run.taskClass == null ? '—' : run.taskClass),
       'risk ' + String(run.riskClass == null ? '—' : run.riskClass),
-      run.firstPass === true
-        ? 'first-pass verified'
+      run.firstVerificationPass === true
+        ? 'first-verification-pass verified'
         : String(run.repairAttempts == null ? 0 : run.repairAttempts) + ' repair attempt(s)',
       'files ' + String(run.changeFiles == null ? 0 : run.changeFiles),
       'steps ' + String(run.steps == null ? '—' : run.steps),
@@ -1594,17 +1594,30 @@
     var metrics = byId('outcomes-metrics');
     var runs = byId('outcomes-runs');
     var status = byId('outcomes-status');
+    var entitlements = byId('outcomes-entitlements');
     var unavailable = byId('outcomes-unavailable');
     var truncated = byId('outcomes-truncated');
     if (!metrics || !runs || !status || !unavailable || !truncated) {
       return;
     }
+    // The value-entitlements status line: rendered verbatim from the host's
+    // projection; hidden while no organization is configured (null).
+    var renderEntitlementsLine = function (view) {
+      if (!entitlements) {
+        return;
+      }
+      var text =
+        view && typeof view.entitlementsStatus === 'string' ? view.entitlementsStatus : '';
+      entitlements.textContent = text;
+      entitlements.hidden = text.length === 0;
+    };
     if (view === null || view === undefined) {
       status.textContent = 'Outcomes have not been read yet.';
       metrics.hidden = true;
       runs.hidden = true;
       truncated.hidden = true;
       unavailable.hidden = true;
+      renderEntitlementsLine(null);
       updateOutcomesControls(null);
       return;
     }
@@ -1627,6 +1640,7 @@
       truncated.hidden = true;
       clear(metrics);
       clear(runs);
+      renderEntitlementsLine(view);
       updateOutcomesControls(view);
       return;
     }
@@ -1655,6 +1669,7 @@
     for (var r = 0; r < runRows.length && r < MAX_OUTCOME_RUN_ROWS; r++) {
       runs.appendChild(outcomeRunNode(runRows[r]));
     }
+    renderEntitlementsLine(view);
     updateOutcomesControls(view);
   }
 

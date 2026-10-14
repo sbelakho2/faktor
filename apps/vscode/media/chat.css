@@ -350,7 +350,7 @@ button.change-select:hover:not(:disabled) {
 }
 
 /* The four local cohorts stay visually distinct (a left accent marker per
-   cohort; the frontier-only row carries its own). */
+   cohort; the hosted-only row carries its own). */
 .outcome-cohort-local-only {
   border-left: 3px solid var(--vscode-testing-iconPassed, #3fb950);
 }
@@ -363,11 +363,11 @@ button.change-select:hover:not(:disabled) {
   border-left: 3px dotted var(--vscode-testing-iconPassed, #3fb950);
 }
 
-.outcome-cohort-local-to-frontier {
+.outcome-cohort-local-to-hosted {
   border-left: 3px dashed var(--vscode-editorWarning-foreground, #d29922);
 }
 
-.outcome-cohort-frontier-only {
+.outcome-cohort-hosted-only {
   border-left: 3px solid var(--vscode-disabledForeground, #8c8c8c);
 }
 

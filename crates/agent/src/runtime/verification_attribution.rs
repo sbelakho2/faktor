@@ -996,10 +996,12 @@ pub(crate) async fn run_independent_review_call(
     // settlement then records an honest Unknown spend instead of a
     // fabricated local price).
     let mut pricing_snapshot: Option<PricingSnapshot> = None;
+    let mut execution_class = faktor_core::model::ExecutionClass::Unknown;
     match deps.routing.route(&req) {
         Ok(d) if d.provider.is_empty() && d.model.is_empty() => {}
         Ok(d) => {
             pricing_snapshot = d.pricing_snapshot;
+            execution_class = d.execution_class;
             provider_id = d.provider.clone();
             model = d.model.clone();
         }
@@ -1021,22 +1023,7 @@ pub(crate) async fn run_independent_review_call(
             format!("review provider {provider_id:?} is not registered"),
         );
     };
-    // Bounded prompt: criteria + package + contract — nothing else.
-    let mut prompt = String::new();
-    prompt.push_str("Acceptance criteria to review against:\n");
-    for c in criteria
-        .iter()
-        .take(faktor_verify::review::REVIEW_MAX_CRITERIA_ENTRIES)
-    {
-        prompt.push_str("- ");
-        prompt.push_str(&truncate(c, 300));
-        prompt.push('\n');
-    }
-    prompt.push_str("\nStructured diff package (JSON):\n");
-    prompt.push_str(package_json);
-    prompt.push_str(
-        "\n\nNow respond with ONLY the JSON verdict object described in your instructions.",
-    );
+    let prompt = review_call_prompt(criteria, package_json);
     let op_id = match deps.session.try_next_op_id() {
         Ok(id) => id,
         Err(e) => {
@@ -1083,6 +1070,7 @@ pub(crate) async fn run_independent_review_call(
             attempt_identity,
             predicted,
             pricing_snapshot,
+            execution_class,
         )
         .await
     {
@@ -1150,56 +1138,8 @@ pub(crate) async fn run_independent_review_call(
     }
     let mut stream = provider.stream(request);
     let mut text = String::new();
-    let mut complete = false;
-    // P0-1 settlement truth: the LAST usage frame the stream carries (real
-    // transports report one) is the settlement basis; without a frame the
-    // documented chars/3 estimator stands in (interior calls never surface
-    // frames through the verdict contract).
-    let mut frame: Option<(u64, u64, u64, u64)> = None;
-    let mut frame_reported: Option<u64> = None;
-    let deadline = tokio::time::timeout(REVIEW_MODEL_CALL_TIMEOUT, async {
-        use futures::StreamExt as _;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(faktor_provider::ProviderChunk::Text { text: t })
-                | Ok(faktor_provider::ProviderChunk::Reasoning { text: t }) => {
-                    text.push_str(&t);
-                    if text.len() > REVIEW_MODEL_MAX_TEXT_CHARS {
-                        // A verdict is small; anything bigger is not one.
-                        complete = false;
-                        return;
-                    }
-                }
-                Ok(faktor_provider::ProviderChunk::Done) => {
-                    complete = true;
-                    return;
-                }
-                Ok(faktor_provider::ProviderChunk::Usage(usage)) => {
-                    // Canonical usage (audit Phase-1 item C): the adapter
-                    // split cache lines off the uncached input counter at
-                    // its boundary — consume the categories directly (last
-                    // frame wins, reasoning already rides the output line).
-                    frame = Some((
-                        usage.uncached_input_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_write_tokens,
-                        usage.output_tokens,
-                    ));
-                    if let Some(cost) = usage.reported_cost {
-                        if let Some(micro) = authoritative_reported_micro(&cost) {
-                            frame_reported = Some(micro);
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => return,
-            }
-        }
-        // Clean exhaustion after content: a clean end (same protocol as the
-        // compaction summarizer).
-        complete = !text.is_empty();
-    });
-    let _ = deadline.await;
+    let (complete, frame, frame_reported) =
+        consume_review_stream(&mut stream, &mut text, REVIEW_MODEL_CALL_TIMEOUT).await;
     if !complete || text.trim().is_empty() {
         // The stream did NOT end cleanly (provider error / timeout / max
         // chars / cancellation) or produced nothing: a POST-dispatch
@@ -1415,6 +1355,86 @@ pub(crate) async fn run_independent_review_call(
             )
         }
     }
+}
+
+/// The bounded review prompt: criteria + package + verdict contract —
+/// nothing else (no transcript, no implementation context).
+fn review_call_prompt(criteria: &[String], package_json: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Acceptance criteria to review against:\n");
+    for c in criteria
+        .iter()
+        .take(faktor_verify::review::REVIEW_MAX_CRITERIA_ENTRIES)
+    {
+        prompt.push_str("- ");
+        prompt.push_str(&truncate(c, 300));
+        prompt.push('\n');
+    }
+    prompt.push_str("\nStructured diff package (JSON):\n");
+    prompt.push_str(package_json);
+    prompt.push_str(
+        "\n\nNow respond with ONLY the JSON verdict object described in your instructions.",
+    );
+    prompt
+}
+
+/// One bounded review-stream consumption (P0-1 settlement truth): the LAST
+/// usage frame the stream carries (real transports report one) is the
+/// settlement basis; without a frame the documented chars/3 estimator stands
+/// in (interior calls never surface frames through the verdict contract).
+/// `complete` is true only on a clean `Done`/clean exhaustion after content.
+async fn consume_review_stream(
+    stream: &mut faktor_provider::ProviderStream,
+    text: &mut String,
+    timeout: Duration,
+) -> (bool, Option<(u64, u64, u64, u64)>, Option<u64>) {
+    let mut complete = false;
+    let mut frame: Option<(u64, u64, u64, u64)> = None;
+    let mut frame_reported: Option<u64> = None;
+    let deadline = tokio::time::timeout(timeout, async {
+        use futures::StreamExt as _;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(faktor_provider::ProviderChunk::Text { text: t })
+                | Ok(faktor_provider::ProviderChunk::Reasoning { text: t }) => {
+                    text.push_str(&t);
+                    if text.len() > REVIEW_MODEL_MAX_TEXT_CHARS {
+                        // A verdict is small; anything bigger is not one.
+                        complete = false;
+                        return;
+                    }
+                }
+                Ok(faktor_provider::ProviderChunk::Done) => {
+                    complete = true;
+                    return;
+                }
+                Ok(faktor_provider::ProviderChunk::Usage(usage)) => {
+                    // Canonical usage (audit Phase-1 item C): the adapter
+                    // split cache lines off the uncached input counter at
+                    // its boundary — consume the categories directly (last
+                    // frame wins, reasoning already rides the output line).
+                    frame = Some((
+                        usage.uncached_input_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.output_tokens,
+                    ));
+                    if let Some(cost) = usage.reported_cost {
+                        if let Some(micro) = authoritative_reported_micro(&cost) {
+                            frame_reported = Some(micro);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        // Clean exhaustion after content: a clean end (same protocol as the
+        // compaction summarizer).
+        complete = !text.is_empty();
+    });
+    let _ = deadline.await;
+    (complete, frame, frame_reported)
 }
 
 /// Gate reasons from an end-of-turn review value (audits 6/7: the

@@ -106,7 +106,7 @@ use faktor_core::event::{Event, EventKind, JournalInvariants};
 use faktor_core::id::{
     EventSeq, OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
-use faktor_core::model::{PricingSnapshot, RiskBucket, RouterPhase, TaskClass};
+use faktor_core::model::{ExecutionClass, PricingSnapshot, RiskBucket, RouterPhase, TaskClass};
 use faktor_core::state::{
     AgentState, CheckExecution, CriterionVerification, FileStateEvidence, SessionLifecycle,
     TaskState, VerificationStatus,

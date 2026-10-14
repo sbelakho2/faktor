@@ -153,8 +153,11 @@ import {
   OUTCOMES_PAGE_LIMIT,
   buildOutcomesView,
   mergeOutcomesPage,
+  outcomesOrganizationForRead,
   parseOutcomesReadRequest,
   unavailableOutcomesView,
+  valueEntitlementsRefusalStatusLine,
+  valueEntitlementsStatusLine,
 } from './outcomes';
 import {
   SessionBindings,
@@ -3287,11 +3290,35 @@ async function reviewChange(message: ChatMessage): Promise<void> {
 // ------------------------------------------------------------ I07 outcomes
 
 /**
+ * The value-entitlements status line of the configured organization: the
+ * typed report when the daemon can derive it, else the typed refusal
+ * (`billing_disabled` renders "billing disabled locally"). Never throws —
+ * the outcomes read itself decides the panel state.
+ */
+async function valueEntitlementsStatusFor(client: NativeClient): Promise<string> {
+  try {
+    const report = await client.valueEntitlements();
+    return valueEntitlementsStatusLine(report.value_entitlements);
+  } catch (error) {
+    return valueEntitlementsRefusalStatusLine(
+      error instanceof NativeApiError ? error.code : null,
+      messageOf(error),
+    );
+  }
+}
+
+/**
  * One bounded, explicitly requested outcome-ledger read. The read is
  * LAZY (only the History / Outcomes tab asks for it) and failure-isolated:
  * a refusal patches ONLY the outcomes view to its `Cost unavailable` state
  * and never touches the conversation surface. A cursor read appends the
  * older page; a top read replaces the list.
+ *
+ * Entitlement surfacing: with a configured control-plane credential the read
+ * passes the configured organization (`org=`) — the paid `outcome_analytics`
+ * boundary — and the panel carries the value-entitlements status line; a
+ * typed 403 `value_entitlement_refused` / 409 `billing_disabled` renders as
+ * the refusal (never a fabricated local fallback).
  */
 async function readOutcomes(message: ChatMessage): Promise<void> {
   const client = active.client;
@@ -3307,9 +3334,16 @@ async function readOutcomes(message: ChatMessage): Promise<void> {
     return;
   }
   const generation = lifecycle.current();
+  const org = outcomesOrganizationForRead(
+    controlPlaneScope()?.organization ?? null,
+    client.hasControlToken(),
+  );
   try {
+    const entitlementsStatus =
+      org === null ? null : await valueEntitlementsStatusFor(client);
     const page = await client.outcomes({
       limit: OUTCOMES_PAGE_LIMIT,
+      ...(org !== null ? { org } : {}),
       ...(cursor.beforeMs !== null && cursor.beforeRun !== null
         ? { beforeMs: cursor.beforeMs, beforeRun: cursor.beforeRun }
         : {}),
@@ -3319,17 +3353,20 @@ async function readOutcomes(message: ChatMessage): Promise<void> {
     }
     const view =
       cursor.beforeMs === null
-        ? buildOutcomesView(page)
-        : mergeOutcomesPage(store.snapshot().outcomes, page);
+        ? buildOutcomesView(page, entitlementsStatus)
+        : mergeOutcomesPage(store.snapshot().outcomes, page, entitlementsStatus);
     store.patch({ outcomes: view });
   } catch (error) {
     if (!lifecycle.isCurrent(generation) || active.client !== client) {
       return;
     }
+    const entitlementsStatus =
+      org === null ? null : await valueEntitlementsStatusFor(client);
     store.patch({
       outcomes: unavailableOutcomesView(
         messageOf(error),
         error instanceof NativeApiError ? error.code : null,
+        entitlementsStatus,
       ),
     });
   }

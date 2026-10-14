@@ -25,9 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_agent::{
-    ChangedCodeScale, FinalVerificationBasis, OutcomeLedger, OutcomeLedgerMetrics, ProofCoverage,
-    RunModelStep, RunOutcomeRecord, RunVerifiedSample, OUTCOME_RECORD_SCHEMA_V,
+    ChangedCodeScale, EconomicSettlement, FinalVerificationBasis, MeasuredMoney, MoneyState,
+    OutcomeLedger, OutcomeLedgerEntry, OutcomeLedgerMetrics, ProofCoverage, RunModelStep,
+    RunVerifiedSample, SettlementStep, TerminalEngineeringOutcome, OUTCOME_RECORD_SCHEMA_V,
 };
+use faktor_core::model::ExecutionClass;
 use faktor_store::Store;
 use serde::Serialize;
 
@@ -64,7 +66,7 @@ pub struct ArmMetrics {
     pub local_only_verified_ppm: u32,
     pub local_failure_runs: u64,
     pub fallback_runs: u64,
-    pub local_to_frontier_fallback_ppm: u32,
+    pub local_to_hosted_fallback_ppm: u32,
     pub frontier_escalations: u64,
     pub frontier_escalation_ppm: u32,
     pub ledger: OutcomeLedgerMetrics,
@@ -180,10 +182,37 @@ pub fn write_replay_report(report: &ReplayReport, path: &Path) -> std::io::Resul
     }
 }
 
-/// One replayed run plus its durable record.
+/// One replayed run plus its durable outcome + settlement projection.
 struct ReplayedRun {
     run: FrozenRun,
-    record: RunOutcomeRecord,
+    record: OutcomeLedgerEntry,
+}
+
+/// Append one replayed run's record through the durable ledger and demand the
+/// read-back equals it (an exactly-once append is a no-op; a replayed append
+/// still reads back identical).
+fn append_and_read_back(
+    ledger: &OutcomeLedger,
+    record: &OutcomeLedgerEntry,
+    task_id: &str,
+) -> Result<(), String> {
+    ledger
+        .record(&record.outcome, &record.settlement)
+        .map_err(|e| format!("{task_id}: ledger append: {e}"))?;
+    let read_back = ledger
+        .get(&record.outcome.run_id)
+        .map_err(|e| format!("{task_id}: ledger read-back: {e}"))?;
+    let read_settlement = ledger
+        .settlement(&record.outcome.run_id)
+        .map_err(|e| format!("{task_id}: settlement read-back: {e}"))?;
+    if read_back.as_ref() != Some(&record.outcome)
+        || read_settlement.as_ref() != Some(&record.settlement)
+    {
+        return Err(format!(
+            "{task_id}: durable ledger record differs from the replayed record"
+        ));
+    }
+    Ok(())
 }
 
 /// Replay ONE capture set: integrity, routing reproduction, re-verification,
@@ -209,8 +238,10 @@ pub fn replay_capture(
     let ledger = OutcomeLedger::new(store);
     // ONE routing engine per arm, fed in captured order exactly like the
     // capture run did, so every recomputed decision sees the same
-    // verified-outcome history.
+    // verified-outcome history. The runtime arm needs no routing engine: it
+    // re-drives the REAL AgentRuntime over the artifact's frozen outputs.
     let mut engines: BTreeMap<Arm, RouteEngine> = BTreeMap::new();
+    let mut daemon_env: Option<crate::daemon_arm::DaemonArmEnv> = None;
     let mut replayed = Vec::with_capacity(capture.runs.len());
     for run in &capture.runs {
         let task = corpus
@@ -225,26 +256,54 @@ pub fn replay_capture(
                 task.runtime.as_str()
             ));
         }
+        if run.prompt.arm.is_runtime() {
+            let env = match &daemon_env {
+                Some(env) => env,
+                None => {
+                    // Each replay starts from an EMPTY durable runtime store:
+                    // the evidence authority / retrieval ladder is durable
+                    // state, so reusing a store across replays would let
+                    // earlier replays' learned evidence shift the context the
+                    // runtime compiles (a replay must reproduce the capture
+                    // from the artifact alone).
+                    let env_root = scratch.join("replay-daemon-env").join(&capture.capture_id);
+                    if env_root.exists() {
+                        fs::remove_dir_all(&env_root)
+                            .map_err(|e| crate::io_err("clear replay daemon env", e))?;
+                    }
+                    daemon_env = Some(crate::daemon_arm::DaemonArmEnv::open(&env_root)?);
+                    daemon_env.as_ref().expect("daemon env was just installed")
+                }
+            };
+            let workspace = crate::daemon_arm::redrive_runtime_run(
+                env,
+                &capture.capture_id,
+                task,
+                run,
+                scratch,
+            )?;
+            let verified_index = run.attempts.iter().position(|a| a.passed());
+            if verified_index.is_some() != run.verified {
+                return Err(format!(
+                    "{}: runtime verified flag disagrees with its attempts",
+                    run.task_id
+                ));
+            }
+            let record = build_record(capture, task, run, verified_index, &workspace)?;
+            append_and_read_back(&ledger, &record, &run.task_id)?;
+            replayed.push(ReplayedRun {
+                run: run.clone(),
+                record,
+            });
+            continue;
+        }
         let engine = engines
             .entry(run.prompt.arm)
             .or_insert_with(|| RouteEngine::new(capture.models.clone()));
         engine.begin_task();
         let replayed_run = replay_run(capture, task, run, engine, scratch)
             .map_err(|e| format!("{}: {e}", run.task_id))?;
-        match ledger.record(&replayed_run.record) {
-            Ok(_) => {}
-            Err(e) => return Err(format!("{}: ledger append: {e}", run.task_id)),
-        }
-        let read_back = ledger
-            .get(&replayed_run.record.run_id)
-            .map_err(|e| format!("{}: ledger read-back: {e}", run.task_id))?
-            .ok_or_else(|| format!("{}: ledger lost the appended record", run.task_id))?;
-        if read_back != replayed_run.record {
-            return Err(format!(
-                "{}: durable ledger record differs from the replayed record",
-                run.task_id
-            ));
-        }
+        append_and_read_back(&ledger, &replayed_run.record, &run.task_id)?;
         replayed.push(replayed_run);
     }
     // The cohort metric comes from the DURABLE ledger fold (the wired path).
@@ -413,8 +472,20 @@ fn build_record(
     run: &FrozenRun,
     verified_index: Option<usize>,
     workspace: &Path,
-) -> Result<RunOutcomeRecord, String> {
+) -> Result<OutcomeLedgerEntry, String> {
     let verified = verified_index.is_some();
+    // The durable execution class of one frozen attempt: a local step's
+    // frozen LocalZero authority establishes `local`; a fixture stand-in
+    // model has no durable route-time tier authority, so its class is
+    // `unknown` (counted as NEITHER local nor hosted by the ledger — the
+    // honest pre-tier state, never a fabricated hosted tier).
+    let class_of = |local: bool| {
+        if local {
+            ExecutionClass::Local
+        } else {
+            ExecutionClass::Unknown
+        }
+    };
     let model_sequence: Vec<RunModelStep> = run
         .attempts
         .iter()
@@ -422,10 +493,21 @@ fn build_record(
             provider: a.provider.clone(),
             model: a.model.clone(),
             local: a.local,
+            execution_class: class_of(a.local),
+        })
+        .collect();
+    let steps: Vec<SettlementStep> = run
+        .attempts
+        .iter()
+        .map(|a| SettlementStep {
+            provider: a.provider.clone(),
+            model: a.model.clone(),
+            local: a.local,
+            execution_class: class_of(a.local),
             spend_micro: a.spend_micro,
         })
         .collect();
-    let model_spend_micro = model_sequence.iter().map(|s| s.spend_micro).sum::<u64>();
+    let model_spend_micro = steps.iter().map(|s| s.spend_micro).sum::<u64>();
     let rework_spend_micro = run
         .attempts
         .iter()
@@ -433,14 +515,24 @@ fn build_record(
         .map(|a| a.spend_micro)
         .sum::<u64>();
     let frontier_price = capture.models.iter().find(|m| !m.local).map(|m| &m.pricing);
-    let avoided_hosted_micro = run
-        .attempts
-        .iter()
-        .filter(|a| a.local)
-        .filter_map(|a| {
-            frontier_price.and_then(|p| p.snapshot().settle_cost(a.tokens_in, 0, 0, a.tokens_out))
-        })
-        .sum::<u64>();
+    // The runtime arm's attempts are the deterministic frozen script (a
+    // local, zero-cost plumbing model): no counterfactual measurement exists
+    // for it, so its avoided-hosted fact is UNAVAILABLE (never a fabricated
+    // zero — v2 settlement semantics).
+    let avoided_hosted = if run.prompt.arm.is_runtime() {
+        MeasuredMoney::Unavailable
+    } else {
+        MeasuredMoney::measured(
+            run.attempts
+                .iter()
+                .filter(|a| a.local)
+                .filter_map(|a| {
+                    frontier_price
+                        .and_then(|p| p.snapshot().settle_cost(a.tokens_in, 0, 0, a.tokens_out))
+                })
+                .sum::<u64>(),
+        )
+    };
     let total_attempts = run.attempts.len() as u64;
     let repair_attempts = if verified {
         total_attempts.saturating_sub(1)
@@ -471,14 +563,15 @@ fn build_record(
         })
         .collect();
     let change_scale = change_scale(task, workspace)?;
-    Ok(RunOutcomeRecord {
+    let run_id = format!(
+        "econ-bench/{}/{}/{}",
+        capture.capture_id,
+        task.id,
+        run.prompt.arm.as_str()
+    );
+    let outcome = TerminalEngineeringOutcome {
         schema_version: OUTCOME_RECORD_SCHEMA_V,
-        run_id: format!(
-            "econ-bench/{}/{}/{}",
-            capture.capture_id,
-            task.id,
-            run.prompt.arm.as_str()
-        ),
+        run_id: run_id.clone(),
         session_id: 1_000 + u64::from(task.order),
         task_id: 2_000 + u64::from(task.order),
         task_class: task.task_class,
@@ -487,13 +580,12 @@ fn build_record(
         final_snapshot: run.final_tree_blake3.clone(),
         accepted: verified,
         integrated: verified,
-        verified_first_attempt: verified && total_attempts == 1,
+        // In this benchmark's model every attempt ends in a verification:
+        // the single-attempt-verified runs are exactly the runs whose FIRST
+        // verification attempt passed (the ledger field's honest meaning).
+        verified_first_verification_pass: verified && total_attempts == 1,
         repair_attempts,
         model_sequence,
-        model_spend_micro,
-        verification_spend_micro: 0,
-        rework_spend_micro,
-        avoided_hosted_micro,
         wall_time_ms: run.wall_time_ms,
         human_interventions: 0,
         proof: if verified {
@@ -518,6 +610,27 @@ fn build_record(
         frontier_escalations,
         completed_at_ms: run.completed_at_ms,
         verified_samples,
+    };
+    // The settlement projection: the frozen run's exact recorded money
+    // (fixture price table / local zero / runtime-script zero), classified
+    // `complete` because every attempt's spend was measured by the capture
+    // lane (never estimated at replay time).
+    let settlement = EconomicSettlement {
+        schema_version: faktor_agent::outcome_ledger::SETTLEMENT_SCHEMA_V,
+        run_id,
+        seq: 0,
+        money_state: MoneyState::Complete,
+        reason: "frozen capture: per-attempt spend recorded by the capture lane (fixture price table / local zero)".into(),
+        model_spend_micro: Some(model_spend_micro),
+        verification_spend_micro: Some(0),
+        rework_spend_micro: Some(rework_spend_micro),
+        avoided_hosted,
+        steps,
+        settled_at_ms: run.completed_at_ms,
+    };
+    Ok(OutcomeLedgerEntry {
+        outcome,
+        settlement,
     })
 }
 
@@ -549,7 +662,7 @@ fn change_scale(task: &CodingTaskSpec, workspace: &Path) -> Result<ChangedCodeSc
 
 fn arm_metrics(replayed: &[ReplayedRun]) -> BTreeMap<String, ArmMetrics> {
     let mut arms = BTreeMap::new();
-    for arm in Arm::ALL {
+    for arm in Arm::WITH_RUNTIME {
         let runs: Vec<&ReplayedRun> = replayed
             .iter()
             .filter(|r| r.run.prompt.arm == arm)
@@ -557,8 +670,8 @@ fn arm_metrics(replayed: &[ReplayedRun]) -> BTreeMap<String, ArmMetrics> {
         if runs.is_empty() {
             continue;
         }
-        let records: Vec<RunOutcomeRecord> = runs.iter().map(|r| r.record.clone()).collect();
-        let ledger = OutcomeLedgerMetrics::compute(&records);
+        let entries: Vec<OutcomeLedgerEntry> = runs.iter().map(|r| r.record.clone()).collect();
+        let ledger = OutcomeLedgerMetrics::compute(&entries);
         let verified = runs.iter().filter(|r| r.run.verified).count() as u64;
         let first_pass = runs
             .iter()
@@ -585,11 +698,15 @@ fn arm_metrics(replayed: &[ReplayedRun]) -> BTreeMap<String, ArmMetrics> {
             .flat_map(|r| r.run.attempts.iter())
             .map(|a| a.spend_micro)
             .sum();
-        let rework_spend_micro: u64 = runs.iter().map(|r| r.record.rework_spend_micro).sum();
+        let rework_spend_micro: u64 = runs
+            .iter()
+            .map(|r| r.record.settlement.rework_spend_micro.unwrap_or(0))
+            .sum();
         let rework_turns: u64 = runs
             .iter()
             .map(|r| {
                 r.record
+                    .outcome
                     .verified_samples
                     .iter()
                     .map(|s| s.rework_turns)
@@ -665,7 +782,7 @@ fn arm_metrics(replayed: &[ReplayedRun]) -> BTreeMap<String, ArmMetrics> {
                 local_only_verified_ppm: ppm(local_only_verified, verified),
                 local_failure_runs,
                 fallback_runs,
-                local_to_frontier_fallback_ppm: ppm(fallback_runs, local_failure_runs),
+                local_to_hosted_fallback_ppm: ppm(fallback_runs, local_failure_runs),
                 frontier_escalations,
                 frontier_escalation_ppm: ppm(frontier_escalations, runs.len() as u64),
                 ledger,
@@ -697,7 +814,7 @@ fn comparison(arms: &BTreeMap<String, ArmMetrics>) -> ArmComparison {
         local_only_verified_ppm: 0,
         local_failure_runs: 0,
         fallback_runs: 0,
-        local_to_frontier_fallback_ppm: 0,
+        local_to_hosted_fallback_ppm: 0,
         frontier_escalations: 0,
         frontier_escalation_ppm: 0,
         ledger: OutcomeLedgerMetrics::default(),

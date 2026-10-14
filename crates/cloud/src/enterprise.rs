@@ -59,6 +59,12 @@ pub const MAX_DELETION_MANIFEST: usize = 10_000;
 pub const MAX_ARTIFACT_PAGE: usize = 200;
 /// Hard bound on one audit export page.
 pub const MAX_AUDIT_PAGE: usize = 200;
+/// The base retention window of the enterprise audit read: events OLDER
+/// than this window are only readable with the `audit_retention_history`
+/// paid entitlement. The base (ungated) read is bounded to the window; the
+/// extended/historical read requires the entitlement. See
+/// [`EnterpriseService::with_audit_base_window_ms`].
+pub const DEFAULT_AUDIT_BASE_WINDOW_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 /// Smallest accepted retention TTL (one minute): the policy floor.
 pub const MIN_RETENTION_TTL_MS: i64 = 60_000;
 /// Domain separation of the deletion-manifest digest.
@@ -893,6 +899,24 @@ pub struct AuditExport {
     pub head_seq: i64,
 }
 
+/// The base retention window of one organization's audit ledger: the
+/// inclusive start of the UNGATED base window and the last ledger seq strictly
+/// older than it. Events with `seq > last_out_of_window_seq` are inside the
+/// base window; reading any older event is gated on the
+/// `audit_retention_history` entitlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditWindow {
+    pub organization_id: OrganizationId,
+    pub now_ms: i64,
+    /// Inclusive start of the base window (`now_ms - window_ms`).
+    pub window_start_ms: i64,
+    /// The last seq whose event is OLDER than the window (0 when none):
+    /// every seq in `last_out_of_window_seq + 1 ..= head_seq` has a timestamp
+    /// inside the window.
+    pub last_out_of_window_seq: i64,
+    pub head_seq: i64,
+}
+
 // -------------------------------------------------------------- deletion
 
 /// What a deletion job removes: the whole tenant, or one account's data.
@@ -1256,12 +1280,14 @@ pub struct EnterpriseService {
     store: Arc<dyn EnterpriseStore>,
     clock: Arc<dyn crate::service::Clock>,
     policies: BTreeMap<RetentionClass, RetentionPolicy>,
+    audit_base_window_ms: i64,
 }
 
 impl EnterpriseService {
-    /// Build the service with the default class policy table. The durable
-    /// admission-freeze set is replayed from the store, so a restart keeps a
-    /// running deletion job's freeze intact.
+    /// Build the service with the default class policy table and the default
+    /// audit base retention window ([`DEFAULT_AUDIT_BASE_WINDOW_MS`]). The
+    /// durable admission-freeze set is replayed from the store, so a restart
+    /// keeps a running deletion job's freeze intact.
     pub fn new(
         store: Arc<dyn EnterpriseStore>,
         clock: Arc<dyn crate::service::Clock>,
@@ -1274,12 +1300,66 @@ impl EnterpriseService {
             store,
             clock,
             policies,
+            audit_base_window_ms: DEFAULT_AUDIT_BASE_WINDOW_MS,
         })
     }
 
     /// The production constructor (wall clock).
     pub fn with_system_clock(store: Arc<dyn EnterpriseStore>) -> Result<Self, ControlPlaneError> {
         Self::new(store, Arc::new(crate::service::SystemClock))
+    }
+
+    /// Override the audit base retention window (operator config): base
+    /// audit reads are bounded to `now - window_ms`; older events require
+    /// the `audit_retention_history` entitlement. A non-positive window is
+    /// refused typed.
+    pub fn with_audit_base_window_ms(mut self, window_ms: i64) -> Result<Self, ControlPlaneError> {
+        if window_ms <= 0 {
+            return Err(ControlPlaneError::Malformed(format!(
+                "audit base retention window must be >= 1 ms, got {window_ms}"
+            )));
+        }
+        self.audit_base_window_ms = window_ms;
+        Ok(self)
+    }
+
+    /// The configured audit base retention window in milliseconds.
+    pub fn audit_base_window_ms(&self) -> i64 {
+        self.audit_base_window_ms
+    }
+
+    /// The organization's audit base retention window (role-gated audit
+    /// read): the inclusive window start and the last seq older than it.
+    /// This is the ONE boundary both the base read clamp and the
+    /// beyond-window gate consult, so they can never disagree.
+    pub fn audit_window(
+        &self,
+        principal: &Principal,
+        organization: &OrganizationId,
+    ) -> Result<AuditWindow, ControlPlaneError> {
+        authorize(
+            principal,
+            organization,
+            Resource::Enterprise,
+            Action::AuditRead,
+        )?;
+        let now_ms = self.clock.now_ms();
+        let window_start_ms = now_ms.saturating_sub(self.audit_base_window_ms);
+        let last_out_of_window_seq = self
+            .store
+            .audit_last_older_seq(organization, window_start_ms)
+            .map_err(ControlPlaneError::from)?;
+        let head_seq = self
+            .store
+            .audit_head_seq(organization)
+            .map_err(ControlPlaneError::from)?;
+        Ok(AuditWindow {
+            organization_id: organization.clone(),
+            now_ms,
+            window_start_ms,
+            last_out_of_window_seq,
+            head_seq,
+        })
     }
 
     pub fn policy_table(&self) -> &BTreeMap<RetentionClass, RetentionPolicy> {

@@ -347,7 +347,8 @@ async fn ledger_and_memory_record_real_turn_data() {
 #[tokio::test]
 async fn failed_alone_mints_no_learning_and_a_verified_recovery_mines_one() {
     use faktor_learning::{
-        LearningService, LearningStore as _, SessionLearningStore, DEFAULT_MEMORY_CAPACITY,
+        LearningService, LearningStore as _, OrganizationId, SessionLearningStore,
+        SingleOrganizationBinding, DEFAULT_MEMORY_CAPACITY,
     };
 
     let (manager, session, _dir) = verified_shared_env();
@@ -449,7 +450,11 @@ async fn failed_alone_mints_no_learning_and_a_verified_recovery_mines_one() {
         !stored.pattern.recovery_actions.is_empty(),
         "the learning carries the recovery chain from the PASSED record"
     );
-    let index = service.omission_risk_index();
+    let index = service
+        .omission_risk_index(&SingleOrganizationBinding::new(
+            OrganizationId::try_new("org_test").unwrap(),
+        ))
+        .unwrap();
     assert!(
         index[&stored.pattern_digest()] > faktor_learning::OMISSION_RISK_NEUTRAL,
         "the corpus index keys the pattern digest non-neutrally"

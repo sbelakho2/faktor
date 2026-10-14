@@ -16,6 +16,9 @@
 //! - resource classes and budgets
 //! - sandbox capabilities and permission decisions
 //! - model capabilities (provider behavior lives here, not in the agent)
+//! - the value-entitlement enforcement seam (typed refusal vocabulary the
+//!   runtime capability boundaries consult; the commercial decision itself
+//!   lives in faktor-cloud)
 
 pub mod attachment;
 pub mod authority;
@@ -26,6 +29,7 @@ pub mod command;
 pub mod completion;
 pub mod contract;
 pub mod contract_compile;
+pub mod entitlement;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -73,11 +77,19 @@ pub use contract::{
     Requirement, RiskHypothesis, RiskSeverity, SubjectSnapshot, VerificationDepth,
 };
 pub use contract_compile::{
-    compile_contract, compile_contract_with, intent_tokens, AcquisitionGap, AcquisitionGapKind,
-    CompiledContract, ContractCompileRequest, ContractUncertainty, EnrichmentKind,
-    EnrichmentOutcome, EnrichmentRequest, EnrichmentStatement, RepositoryAcquisition,
-    RepositoryFile, RepositorySnapshot, StatementKind, StatementOrigin, StatementProvenance,
-    SystemIntelligenceProvider,
+    compile_contract, compile_contract_with_findings_checked, finding_to_statement,
+    findings_to_statements, intent_tokens, AcquisitionGap, AcquisitionGapKind, CompiledContract,
+    ContractCompileRequest, ContractUncertainty, EnrichmentKind, EnrichmentOutcome,
+    EnrichmentStatement, FindingDiagnostic, FindingDiagnosticCode, FindingKind, FindingRejection,
+    FindingsConversion, FindingsRequest, FindingsResponse, IntelligenceFuture,
+    IntelligenceQuestion, ProviderFinding, RepositoryAcquisition, RepositoryFile,
+    RepositorySnapshot, StatementKind, StatementOrigin, StatementProvenance,
+    SystemIntelligenceProvider, MAX_FINDINGS, MAX_FINDING_BASIS_BYTES, MAX_FINDING_DIAGNOSTICS,
+    MAX_FINDING_DIAGNOSTIC_BYTES, MAX_FINDING_REVISION_BYTES, MAX_FINDING_TEXT_BYTES,
+};
+pub use entitlement::{
+    EnforcementHook, ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal,
+    ValueRefusalCause,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};

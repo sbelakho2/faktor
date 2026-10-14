@@ -1,0 +1,10 @@
+{
+  "id": "INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL",
+  "file": "crates/server/src/native/outcomes.rs",
+  "find": "    match service.check_value_entitlement(\n        &organization,\n        faktor_cloud::ValueEntitlement::OutcomeAnalytics,\n    ) {\n        Ok(()) => Ok(()),\n        Err(refusal) => Err(wire_status(value_entitlement_refused(refusal))),\n    }\n",
+  "replace": "    let _ = service;\n    Ok(())\n",
+  "gate": "cargo test -p faktor-tests-production-wiring --test new_guard_entitlement_and_producers",
+  "expect": "must refuse, not short-circuit",
+  "timeout_ms": 3600000,
+  "note": "Short-circuiting the paid outcome_analytics boundary lets an unentitled organization read the analytics fold; the new server-surface refusal gate must catch it."
+}

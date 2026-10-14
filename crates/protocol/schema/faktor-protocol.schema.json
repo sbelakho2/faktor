@@ -963,7 +963,7 @@
     },
     {
       "name": "OutcomeMetrics",
-      "doc": "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm.",
+      "doc": "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = \"unavailable\"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`.",
       "unknown_fields": "ignore",
       "shape": {
         "kind": "struct",
@@ -985,7 +985,7 @@
             "optional": false
           },
           {
-            "name": "verifiedFirstPassChanges",
+            "name": "verifiedFirstVerificationPassChanges",
             "type": {
               "kind": "i64"
             },
@@ -993,7 +993,47 @@
             "optional": false
           },
           {
-            "name": "verifiedFirstPassPpm",
+            "name": "verifiedFirstVerificationPassPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "moneyCompleteRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "moneyPendingRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "moneyUnavailableRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "moneyIncompleteExcluded",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedChangesMoneyComplete",
             "type": {
               "kind": "i64"
             },
@@ -1129,7 +1169,7 @@
             "optional": false
           },
           {
-            "name": "localToFrontierFallbackRuns",
+            "name": "localToHostedFallbackRuns",
             "type": {
               "kind": "i64"
             },
@@ -1137,7 +1177,7 @@
             "optional": false
           },
           {
-            "name": "localToFrontierFallbackPpm",
+            "name": "localToHostedFallbackPpm",
             "type": {
               "kind": "i64"
             },
@@ -1145,7 +1185,7 @@
             "optional": false
           },
           {
-            "name": "frontierOnlyRuns",
+            "name": "hostedOnlyRuns",
             "type": {
               "kind": "i64"
             },
@@ -1153,7 +1193,15 @@
             "optional": false
           },
           {
-            "name": "frontierOnlyPpm",
+            "name": "runsWithSteps",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "hostedOnlyPpm",
             "type": {
               "kind": "i64"
             },
@@ -1164,6 +1212,22 @@
             "name": "avoidedHostedInferenceMicro",
             "type": {
               "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "avoidedHostedInferenceMeasurement",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "avoidedHostedMeasuredRuns",
+            "type": {
+              "kind": "i64"
             },
             "nullable": false,
             "optional": false
@@ -1249,9 +1313,33 @@
             "optional": false
           },
           {
+            "name": "frontierClassedRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierEscalationClassedRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
             "name": "frontierEscalationPpm",
             "type": {
               "kind": "i64"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "frontierEscalationMeasurement",
+            "type": {
+              "kind": "string"
             },
             "nullable": false,
             "optional": false
@@ -1277,7 +1365,7 @@
     },
     {
       "name": "RunOutcomeModelStep",
-      "doc": "One provider/model step of a completed run's execution sequence (money as a decimal string).",
+      "doc": "One provider/model step of a completed run's execution sequence. `executionClass` is the durable route-time classification (`local` | `hosted_economy` | `hosted_balanced` | `frontier` | `unknown`); `local` is CLASS-DERIVED — true only when the class is `local`. A step with no durable class authority (`unknown`: a pre-class legacy payload or an unpriced path) exposes its recorded pre-class local bit as `legacyLocal` (true only for a classless step whose stored row recorded a local execution); a class-carrying step always reports `legacyLocal` false, and the legacy bit is never promoted to a class claim. `unknown` is counted as neither local nor hosted by the metrics. `spendMicro` is a decimal string only when the run's money is settled (`complete`); null otherwise — the money is not final, never a fabricated zero.",
       "unknown_fields": "ignore",
       "shape": {
         "kind": "struct",
@@ -1307,11 +1395,27 @@
             "optional": false
           },
           {
-            "name": "spendMicro",
+            "name": "legacyLocal",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "executionClass",
             "type": {
               "kind": "string"
             },
             "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "spendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
             "optional": false
           }
         ]
@@ -1387,7 +1491,7 @@
     },
     {
       "name": "RunOutcome",
-      "doc": "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis.",
+      "doc": "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == \"complete\"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = \"unavailable\"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim).",
       "unknown_fields": "ignore",
       "shape": {
         "kind": "struct",
@@ -1473,7 +1577,7 @@
             "optional": false
           },
           {
-            "name": "verifiedFirstAttempt",
+            "name": "verifiedFirstVerificationPass",
             "type": {
               "kind": "bool"
             },
@@ -1501,11 +1605,19 @@
             "optional": false
           },
           {
-            "name": "modelSpendMicro",
+            "name": "moneyState",
             "type": {
               "kind": "string"
             },
             "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "modelSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
             "optional": false
           },
           {
@@ -1513,7 +1625,7 @@
             "type": {
               "kind": "string"
             },
-            "nullable": false,
+            "nullable": true,
             "optional": false
           },
           {
@@ -1521,11 +1633,19 @@
             "type": {
               "kind": "string"
             },
-            "nullable": false,
+            "nullable": true,
             "optional": false
           },
           {
             "name": "avoidedHostedMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "avoidedHostedMeasurement",
             "type": {
               "kind": "string"
             },

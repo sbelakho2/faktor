@@ -1,0 +1,9 @@
+{
+  "id": "INV-VCSC-MONEY-COMPLETE-COHORT",
+  "file": "crates/agent/src/outcome_ledger.rs",
+  "find": "            if entry.settlement.money_state == MoneyState::Complete {\n                let model = entry.settlement.model_spend_micro.unwrap_or(0);\n",
+  "replace": "            if entry.settlement.money_state != MoneyState::Unavailable {\n                let model = entry.settlement.model_spend_micro.unwrap_or(0);\n",
+  "gate": "cargo test -p faktor-tests-economy --test new_guard_fold_properties",
+  "expect": "leaked into the eligible cohort",
+  "note": "Folding pending rows into the monetary cohort lets an incomplete settlement contaminate total spend and VCSC; the new exclusion property must catch it."
+}

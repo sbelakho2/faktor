@@ -51,202 +51,21 @@ use crate::entitlements::EntitlementService;
 use crate::error::ControlPlaneError;
 use crate::ids::OrganizationId;
 
-// ------------------------------------------------------------- feature tags
-
-/// Plan feature tags: one per value entitlement, plus the two enterprise
-/// governance capability flags. They are the ONLY plan-mapping keys; the
-/// plan table is the only place a grant comes from.
-pub const FEATURE_ADVANCED_VERIFICATION_POLICY: &str = "advanced_verification_policy";
-pub const FEATURE_ORGANIZATION_CONTRACTS: &str = "organization_contracts";
-pub const FEATURE_SHARED_INTELLIGENCE: &str = "shared_intelligence";
-pub const FEATURE_CROSS_REPO_INTELLIGENCE: &str = "cross_repo_intelligence";
-pub const FEATURE_OUTCOME_ANALYTICS: &str = "outcome_analytics";
-pub const FEATURE_SIGNED_PROOF_PROVENANCE: &str = "signed_proof_provenance";
-pub const FEATURE_AUDIT_RETENTION_HISTORY: &str = "audit_retention_history";
-pub const FEATURE_MODEL_OPTIMIZATION_LEARNING: &str = "model_optimization_learning";
-pub const FEATURE_PRIVATE_RUNNERS: &str = "private_runners";
-pub const FEATURE_ENTERPRISE_GOVERNANCE: &str = "enterprise_governance";
-pub const FEATURE_GOVERNANCE_SSO: &str = "governance_sso";
-pub const FEATURE_GOVERNANCE_SCIM: &str = "governance_scim";
-
-/// Every legal value-centric plan feature tag (the 10 entitlements plus the
-/// 2 governance capability flags). [`crate::billing::ALL_FEATURES`] folds
-/// these in, so an unknown tag stays a strict config error.
-pub const VALUE_FEATURE_TAGS: &[&str] = &[
-    FEATURE_ADVANCED_VERIFICATION_POLICY,
-    FEATURE_ORGANIZATION_CONTRACTS,
-    FEATURE_SHARED_INTELLIGENCE,
-    FEATURE_CROSS_REPO_INTELLIGENCE,
-    FEATURE_OUTCOME_ANALYTICS,
-    FEATURE_SIGNED_PROOF_PROVENANCE,
-    FEATURE_AUDIT_RETENTION_HISTORY,
-    FEATURE_MODEL_OPTIMIZATION_LEARNING,
-    FEATURE_PRIVATE_RUNNERS,
-    FEATURE_ENTERPRISE_GOVERNANCE,
-    FEATURE_GOVERNANCE_SSO,
-    FEATURE_GOVERNANCE_SCIM,
-];
-
 // -------------------------------------------------------------- vocabulary
 
-/// The typed value-centric paid entitlements. Each one is plan-mapped and
-/// inference-independent: it gates product value, never token volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueEntitlement {
-    /// Advanced verification policy (verification depth floors, claim-bound
-    /// proof obligations and quality gates beyond the local default).
-    AdvancedVerificationPolicy,
-    /// Organization contracts: org-authored executable contracts compiled
-    /// into the verification spine.
-    OrganizationContracts,
-    /// Shared intelligence: organization-scoped federated context/insights.
-    SharedIntelligence,
-    /// Cross-repo intelligence: indexing/search knowledge spanning
-    /// repositories of the organization.
-    CrossRepoIntelligence,
-    /// Outcome analytics: the engineering outcome ledger reads/aggregates.
-    OutcomeAnalytics,
-    /// Signed proof/provenance: externally verifiable attestations of
-    /// finished work.
-    SignedProofProvenance,
-    /// Audit retention history: durable long-horizon audit trail reads.
-    AuditRetentionHistory,
-    /// Model-optimization learning: shared outcome learning that tunes
-    /// routing/model choice from organization outcomes.
-    ModelOptimizationLearning,
-    /// Private/self-hosted runners: organization-owned execution workers.
-    PrivateRunners,
-    /// Enterprise governance: the ONE entitlement behind the SSO/SCIM
-    /// capability flags (flags only — no protocol implementation here).
-    EnterpriseGovernance,
-}
-
-impl ValueEntitlement {
-    /// Every value entitlement, in stable tag order.
-    pub const ALL: [ValueEntitlement; 10] = [
-        ValueEntitlement::AdvancedVerificationPolicy,
-        ValueEntitlement::OrganizationContracts,
-        ValueEntitlement::SharedIntelligence,
-        ValueEntitlement::CrossRepoIntelligence,
-        ValueEntitlement::OutcomeAnalytics,
-        ValueEntitlement::SignedProofProvenance,
-        ValueEntitlement::AuditRetentionHistory,
-        ValueEntitlement::ModelOptimizationLearning,
-        ValueEntitlement::PrivateRunners,
-        ValueEntitlement::EnterpriseGovernance,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ValueEntitlement::AdvancedVerificationPolicy => FEATURE_ADVANCED_VERIFICATION_POLICY,
-            ValueEntitlement::OrganizationContracts => FEATURE_ORGANIZATION_CONTRACTS,
-            ValueEntitlement::SharedIntelligence => FEATURE_SHARED_INTELLIGENCE,
-            ValueEntitlement::CrossRepoIntelligence => FEATURE_CROSS_REPO_INTELLIGENCE,
-            ValueEntitlement::OutcomeAnalytics => FEATURE_OUTCOME_ANALYTICS,
-            ValueEntitlement::SignedProofProvenance => FEATURE_SIGNED_PROOF_PROVENANCE,
-            ValueEntitlement::AuditRetentionHistory => FEATURE_AUDIT_RETENTION_HISTORY,
-            ValueEntitlement::ModelOptimizationLearning => FEATURE_MODEL_OPTIMIZATION_LEARNING,
-            ValueEntitlement::PrivateRunners => FEATURE_PRIVATE_RUNNERS,
-            ValueEntitlement::EnterpriseGovernance => FEATURE_ENTERPRISE_GOVERNANCE,
-        }
-    }
-
-    /// The plan feature tag that grants this entitlement (identical to
-    /// [`Self::as_str`] by construction).
-    pub const fn feature_tag(self) -> &'static str {
-        self.as_str()
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|e| e.as_str() == raw)
-    }
-
-    /// The ONE runtime enforcement hook this entitlement gates. The cloud
-    /// half decides; the named runtime seam enforces.
-    pub const fn enforcement_hook(self) -> EnforcementHook {
-        match self {
-            ValueEntitlement::AdvancedVerificationPolicy => EnforcementHook::VerificationPolicy,
-            ValueEntitlement::OrganizationContracts => EnforcementHook::ContractCompiler,
-            ValueEntitlement::SharedIntelligence => EnforcementHook::IntelligenceFederation,
-            ValueEntitlement::CrossRepoIntelligence => EnforcementHook::CrossRepoIndex,
-            ValueEntitlement::OutcomeAnalytics => EnforcementHook::OutcomeLedger,
-            ValueEntitlement::SignedProofProvenance => EnforcementHook::ProofAttestation,
-            ValueEntitlement::AuditRetentionHistory => EnforcementHook::AuditHistory,
-            ValueEntitlement::ModelOptimizationLearning => EnforcementHook::OutcomeLearning,
-            ValueEntitlement::PrivateRunners => EnforcementHook::WorkerPlacement,
-            ValueEntitlement::EnterpriseGovernance => EnforcementHook::IdentityFederation,
-        }
-    }
-
-    /// The stable tag of [`Self::enforcement_hook`].
-    pub const fn hook_tag(self) -> &'static str {
-        self.enforcement_hook().as_str()
-    }
-}
-
-impl std::fmt::Display for ValueEntitlement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The typed runtime seam one value entitlement gates (see
-/// [`ValueEntitlement::enforcement_hook`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnforcementHook {
-    /// The verification-policy seam (faktor-verify).
-    VerificationPolicy,
-    /// The contract-compiler seam.
-    ContractCompiler,
-    /// The shared-intelligence seam.
-    IntelligenceFederation,
-    /// The cross-repository index seam.
-    CrossRepoIndex,
-    /// The engineering outcome ledger seam.
-    OutcomeLedger,
-    /// The signed proof/provenance attestation seam.
-    ProofAttestation,
-    /// The audit retention history seam.
-    AuditHistory,
-    /// The model-optimization / shared outcome learning seam.
-    OutcomeLearning,
-    /// The worker placement seam (private/self-hosted runners).
-    WorkerPlacement,
-    /// The identity federation seam (enterprise governance SSO/SCIM).
-    IdentityFederation,
-}
-
-impl EnforcementHook {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            EnforcementHook::VerificationPolicy => "verification_policy",
-            EnforcementHook::ContractCompiler => "contract_compiler",
-            EnforcementHook::IntelligenceFederation => "intelligence_federation",
-            EnforcementHook::CrossRepoIndex => "cross_repo_index",
-            EnforcementHook::OutcomeLedger => "outcome_ledger",
-            EnforcementHook::ProofAttestation => "proof_attestation",
-            EnforcementHook::AuditHistory => "audit_history",
-            EnforcementHook::OutcomeLearning => "outcome_learning",
-            EnforcementHook::WorkerPlacement => "worker_placement",
-            EnforcementHook::IdentityFederation => "identity_federation",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        ValueEntitlement::ALL
-            .into_iter()
-            .map(|e| e.enforcement_hook())
-            .find(|hook| hook.as_str() == raw)
-    }
-}
-
-impl std::fmt::Display for EnforcementHook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// The value-entitlement vocabulary is the SHARED runtime enforcement seam
+// vocabulary (faktor-core): the plan-mapping half here and the runtime
+// capability boundaries consult the same types, so a tag can never drift.
+// The commercial decision stays HERE; faktor-core owns the typed refusal
+// shape and the gate handle the seams hold.
+pub use faktor_core::entitlement::{
+    EnforcementHook, ValueEntitlement, ValueRefusalCause, FEATURE_ADVANCED_VERIFICATION_POLICY,
+    FEATURE_AUDIT_RETENTION_HISTORY, FEATURE_CROSS_REPO_INTELLIGENCE,
+    FEATURE_ENTERPRISE_GOVERNANCE, FEATURE_GOVERNANCE_SCIM, FEATURE_GOVERNANCE_SSO,
+    FEATURE_MODEL_OPTIMIZATION_LEARNING, FEATURE_ORGANIZATION_CONTRACTS, FEATURE_OUTCOME_ANALYTICS,
+    FEATURE_PRIVATE_RUNNERS, FEATURE_SHARED_INTELLIGENCE, FEATURE_SIGNED_PROOF_PROVENANCE,
+    VALUE_FEATURE_TAGS,
+};
 
 /// One enterprise-governance capability flag. These are HOOKS as capability
 /// flags, not implementations: the crate never speaks SAML/OIDC/SCIM; it
@@ -305,56 +124,6 @@ impl GovernanceCapabilities {
             GovernanceCapability::Sso => self.sso,
             GovernanceCapability::Scim => self.scim,
         }
-    }
-}
-
-/// The typed cause of a value-entitlement refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueRefusalCause {
-    /// No cloud/billing authority is wired at all (the offline default):
-    /// every value entitlement is denied while the local product stays
-    /// fully functional.
-    CloudAbsent,
-    /// A cloud authority exists but its plan/subscription read failed; the
-    /// gate fails closed (never grants on an unreadable authority).
-    CloudUnavailable,
-    /// No plan resolved for the organization (unprovisioned tenant, or a
-    /// named-but-undefined plan): value grants are never guessed.
-    PlanMissing,
-    /// The plan is resolved but its subscription is expired/canceled.
-    SubscriptionInactive,
-    /// The plan is resolved and active but does not map this entitlement.
-    NotInPlan,
-}
-
-impl ValueRefusalCause {
-    pub const ALL: [ValueRefusalCause; 5] = [
-        ValueRefusalCause::CloudAbsent,
-        ValueRefusalCause::CloudUnavailable,
-        ValueRefusalCause::PlanMissing,
-        ValueRefusalCause::SubscriptionInactive,
-        ValueRefusalCause::NotInPlan,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ValueRefusalCause::CloudAbsent => "cloud_absent",
-            ValueRefusalCause::CloudUnavailable => "cloud_unavailable",
-            ValueRefusalCause::PlanMissing => "plan_missing",
-            ValueRefusalCause::SubscriptionInactive => "subscription_inactive",
-            ValueRefusalCause::NotInPlan => "not_in_plan",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.as_str() == raw)
-    }
-}
-
-impl std::fmt::Display for ValueRefusalCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -680,6 +449,86 @@ impl EntitlementService {
                 cause: ValueRefusalCause::CloudUnavailable,
                 plan_id: None,
                 governance_capability: None,
+                now_ms: self.now_ms(),
+            }),
+        }
+    }
+}
+
+// ------------------------------------------------------- enforcement gate
+
+/// The refusal conversion into the runtime seam vocabulary: the seam keeps
+/// the same entitlement/hook/cause/plan identity and the diagnosable
+/// message (including the governance capability when one was named).
+impl From<ValueEntitlementRefused> for faktor_core::entitlement::ValueGateRefusal {
+    fn from(refused: ValueEntitlementRefused) -> Self {
+        faktor_core::entitlement::ValueGateRefusal {
+            entitlement: refused.entitlement,
+            hook: refused.hook,
+            cause: refused.cause,
+            plan_id: refused.plan_id.clone(),
+            organization_id: Some(refused.organization_id.to_string()),
+            message: refused.to_string(),
+        }
+    }
+}
+
+/// The per-organization runtime enforcement gate over the entitlement
+/// service: THE adapter the daemon and embedded hosts wire into runtime
+/// seams (verification policy, contract enrichment, federated index,
+/// worker placement, ...). Every decision reads the durable subscription +
+/// the configured plan table only — never usage, credits or tokens.
+#[derive(Debug)]
+pub struct OrganizationValueGate {
+    service: std::sync::Arc<EntitlementService>,
+    organization: OrganizationId,
+}
+
+impl faktor_core::entitlement::ValueEntitlementGate for OrganizationValueGate {
+    fn check_value_entitlement(
+        &self,
+        entitlement: ValueEntitlement,
+    ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+        self.service
+            .check_value_entitlement(&self.organization, entitlement)
+            .map_err(Into::into)
+    }
+}
+
+impl EntitlementService {
+    /// The runtime enforcement gate for one organization: a wired
+    /// [`faktor_core::entitlement::ValueGate`] over this service. Wire it
+    /// into a seam to enforce the org's plan at the capability boundary; a
+    /// seam with no gate refuses every paid augmentation typed
+    /// (`cloud_absent`) while the local product path keeps working.
+    pub fn enforcement_gate(
+        self: &std::sync::Arc<Self>,
+        organization: &OrganizationId,
+    ) -> faktor_core::entitlement::ValueGate {
+        faktor_core::entitlement::ValueGate::wired(std::sync::Arc::new(OrganizationValueGate {
+            service: self.clone(),
+            organization: organization.clone(),
+        }))
+    }
+
+    /// Check one governance capability flag (SSO/SCIM) for an organization,
+    /// typed: the base [`ValueEntitlement::EnterpriseGovernance`] must be
+    /// enforceable AND the plan must carry the capability tag. An unreadable
+    /// authority fails closed (`cloud_unavailable`).
+    pub fn check_governance_capability(
+        &self,
+        organization: &OrganizationId,
+        capability: GovernanceCapability,
+    ) -> Result<(), ValueEntitlementRefused> {
+        match self.value_entitlements(organization) {
+            Ok(set) => set.check_governance_capability(capability),
+            Err(_) => Err(ValueEntitlementRefused {
+                organization_id: organization.clone(),
+                entitlement: ValueEntitlement::EnterpriseGovernance,
+                hook: ValueEntitlement::EnterpriseGovernance.enforcement_hook(),
+                cause: ValueRefusalCause::CloudUnavailable,
+                plan_id: None,
+                governance_capability: Some(capability),
                 now_ms: self.now_ms(),
             }),
         }

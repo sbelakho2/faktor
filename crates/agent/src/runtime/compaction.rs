@@ -495,7 +495,13 @@ impl AgentRuntime {
                 }
             };
             let (summarizer, reservation, machine, trace) = self
-                .budgeted_summarizer(handle, built, before, None)
+                .budgeted_summarizer(
+                    handle,
+                    built,
+                    before,
+                    None,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
                 .await?;
             (summarizer, reservation, machine, trace)
         } else {
@@ -529,9 +535,16 @@ impl AgentRuntime {
                         }
                     };
                     // P0-1: the routed compaction call freezes the route
-                    // decision's price capture on its reservation.
-                    self.budgeted_summarizer(handle, built, before, d.pricing_snapshot)
-                        .await?
+                    // decision's price capture on its reservation; P1: the
+                    // decision's execution class rides it too.
+                    self.budgeted_summarizer(
+                        handle,
+                        built,
+                        before,
+                        d.pricing_snapshot,
+                        d.execution_class,
+                    )
+                    .await?
                 }
                 Err(f) => {
                     // Fail closed: no model may compact, and the turn must
@@ -555,103 +568,7 @@ impl AgentRuntime {
         // checks from the VerificationRecord rows. The transcript can lie;
         // these rows cannot. (The projection is not written back: compaction
         // has no ledger write authority.)
-        let projection = {
-            use faktor_context::ledger::{
-                DurableTaskRows, ProjectedCheck, ProjectedChild, ProjectedDecision,
-                TaskContextProjection,
-            };
-            let task_id = handle.task_id()?;
-            let durable_task = handle.get_task(task_id)?;
-            let head = handle.ledger_ensure_head()?;
-            let records = handle
-                .list_verification_records(task_id)
-                .map_err(faktor_core::Error::from)?;
-            let checks: Vec<ProjectedCheck> = match records.last() {
-                Some(record) => record
-                    .checks
-                    .iter()
-                    .map(|c| ProjectedCheck {
-                        name: c.check.clone(),
-                        status: format!("{:?}", c.status).to_lowercase(),
-                        summary: c.summary.clone().unwrap_or_default(),
-                    })
-                    .collect(),
-                None => head
-                    .last_verify
-                    .as_ref()
-                    .map(|v| {
-                        v.checks
-                            .iter()
-                            .map(|c| ProjectedCheck {
-                                name: c.id.clone(),
-                                status: if c.passed { "passed" } else { "failed" }.to_string(),
-                                summary: String::new(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-            let decisions = head
-                .decisions
-                .iter()
-                .map(|d| ProjectedDecision {
-                    step: d.step.clone(),
-                    choice: d.choice.clone(),
-                    rationale: d.rationale.clone(),
-                })
-                .collect();
-            let children = head
-                .children
-                .iter()
-                .map(|c| ProjectedChild {
-                    purpose: c.purpose.clone(),
-                    outcome: c.outcome.clone(),
-                })
-                .collect();
-            let goal = durable_task
-                .as_ref()
-                .map(|t| t.goal.clone())
-                .filter(|g| !g.is_empty())
-                .or_else(|| (!head.goal.is_empty()).then(|| head.goal.clone()))
-                .unwrap_or_else(|| ledger.goal.clone());
-            let criteria = durable_task
-                .as_ref()
-                .map(|t| t.acceptance_criteria.clone())
-                .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| {
-                    if !head.criteria.is_empty() {
-                        head.criteria.clone()
-                    } else {
-                        ledger.constraints.clone()
-                    }
-                });
-            let plan_steps = durable_task
-                .as_ref()
-                .map(|t| t.plan.clone())
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| {
-                    if !head.plan_steps.is_empty() {
-                        head.plan_steps.iter().map(|s| s.text.clone()).collect()
-                    } else {
-                        ledger.open_steps.clone()
-                    }
-                });
-            let task_state = durable_task
-                .as_ref()
-                .map(|t| format!("{:?}", t.state))
-                .unwrap_or_else(|| "unknown".to_string());
-            TaskContextProjection::from_durable_rows(DurableTaskRows {
-                task_state,
-                goal,
-                criteria,
-                plan_steps,
-                decisions,
-                checks,
-                children,
-                known_failures: ledger.known_failures.clone(),
-                changed_files: ledger.changed_files.clone(),
-            })
-        };
+        let projection = Self::compaction_projection(handle, ledger)?;
         let mut plan = compactor
             .compact_projected(
                 recent,
@@ -946,6 +863,113 @@ impl AgentRuntime {
         Ok(Some(plan))
     }
 
+    /// Build the READ-ONLY durable projection a compaction summarizes against
+    /// (audits 70/71): goal/criteria/plan/state from the typed Task row,
+    /// decisions + child progress from the typed session ledger, checks from
+    /// the VerificationRecord rows. The transcript can lie; these rows cannot.
+    /// (The projection is not written back: compaction has no ledger write
+    /// authority.)
+    fn compaction_projection(
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+    ) -> faktor_core::Result<faktor_context::ledger::TaskContextProjection> {
+        use faktor_context::ledger::{
+            DurableTaskRows, ProjectedCheck, ProjectedChild, ProjectedDecision,
+            TaskContextProjection,
+        };
+        let task_id = handle.task_id()?;
+        let durable_task = handle.get_task(task_id)?;
+        let head = handle.ledger_ensure_head()?;
+        let records = handle
+            .list_verification_records(task_id)
+            .map_err(faktor_core::Error::from)?;
+        let checks: Vec<ProjectedCheck> = match records.last() {
+            Some(record) => record
+                .checks
+                .iter()
+                .map(|c| ProjectedCheck {
+                    name: c.check.clone(),
+                    status: format!("{:?}", c.status).to_lowercase(),
+                    summary: c.summary.clone().unwrap_or_default(),
+                })
+                .collect(),
+            None => head
+                .last_verify
+                .as_ref()
+                .map(|v| {
+                    v.checks
+                        .iter()
+                        .map(|c| ProjectedCheck {
+                            name: c.id.clone(),
+                            status: if c.passed { "passed" } else { "failed" }.to_string(),
+                            summary: String::new(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let decisions = head
+            .decisions
+            .iter()
+            .map(|d| ProjectedDecision {
+                step: d.step.clone(),
+                choice: d.choice.clone(),
+                rationale: d.rationale.clone(),
+            })
+            .collect();
+        let children = head
+            .children
+            .iter()
+            .map(|c| ProjectedChild {
+                purpose: c.purpose.clone(),
+                outcome: c.outcome.clone(),
+            })
+            .collect();
+        let goal = durable_task
+            .as_ref()
+            .map(|t| t.goal.clone())
+            .filter(|g| !g.is_empty())
+            .or_else(|| (!head.goal.is_empty()).then(|| head.goal.clone()))
+            .unwrap_or_else(|| ledger.goal.clone());
+        let criteria = durable_task
+            .as_ref()
+            .map(|t| t.acceptance_criteria.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| {
+                if !head.criteria.is_empty() {
+                    head.criteria.clone()
+                } else {
+                    ledger.constraints.clone()
+                }
+            });
+        let plan_steps = durable_task
+            .as_ref()
+            .map(|t| t.plan.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                if !head.plan_steps.is_empty() {
+                    head.plan_steps.iter().map(|s| s.text.clone()).collect()
+                } else {
+                    ledger.open_steps.clone()
+                }
+            });
+        let task_state = durable_task
+            .as_ref()
+            .map(|t| format!("{:?}", t.state))
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(TaskContextProjection::from_durable_rows(DurableTaskRows {
+            task_state,
+            goal,
+            criteria,
+            plan_steps,
+            decisions,
+            checks,
+            children,
+            known_failures: ledger.known_failures.clone(),
+            changed_files: ledger.changed_files.clone(),
+        }))
+    }
+
     /// Record the durable provenance of one ACCEPTED context-compression
     /// output (audit item 3). Only a
     /// [`crate::OutputTrust::ContextCompression`] output may author a
@@ -1012,6 +1036,7 @@ impl AgentRuntime {
         built: Option<StreamingSummarizer>,
         before: usize,
         pricing_snapshot: Option<PricingSnapshot>,
+        execution_class: faktor_core::model::ExecutionClass,
     ) -> faktor_core::Result<BudgetedSummarizer> {
         let Some(mut s) = built else {
             return Ok((None, None, None, None));
@@ -1040,6 +1065,7 @@ impl AgentRuntime {
                 attempt_identity,
                 predicted,
                 pricing_snapshot,
+                execution_class,
             )
             .await
         {

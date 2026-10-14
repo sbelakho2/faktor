@@ -8,6 +8,10 @@
 //! a Bearer. The pre-cutover Basic compatibility arm is gone — see
 //! [`auth`]'s migration note.
 
+// The native outcomes projection is one (large, bounded) serde_json::json!
+// literal; the default macro recursion limit is too small for it.
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod auth;
 pub mod native;

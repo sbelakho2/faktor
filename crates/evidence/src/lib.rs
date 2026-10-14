@@ -5,6 +5,7 @@
 //! gain instruction authority, compression policies hardcoded by kind,
 //! and retrieval by typed selector — never whole-blob auto-dumps.
 
+pub mod attestation;
 pub mod compress;
 pub mod normalize;
 pub mod provenance;

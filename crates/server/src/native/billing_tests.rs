@@ -327,6 +327,7 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
                 cost + 1_000,
                 NOW_MS,
                 None,
+                faktor_core::model::ExecutionClass::Unknown,
             )
             .unwrap();
         let reservation = match granted {
@@ -375,7 +376,15 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
     let refund_attempt =
         faktor_core::op::ModelCallAttempt::new(OpId::new(50), OpId::new(51), 9).unwrap();
     let refundable = match store
-        .cost_reserve_attempt(sess.id(), task.task_id, &refund_attempt, 777, NOW_MS, None)
+        .cost_reserve_attempt(
+            sess.id(),
+            task.task_id,
+            &refund_attempt,
+            777,
+            NOW_MS,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap()
     {
         faktor_store::CostReserveOutcome::Granted(id) => id,

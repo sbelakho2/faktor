@@ -42,12 +42,24 @@ impl TaskExecutor {
     }
 
     /// Record the ONE engineering-outcome row of a terminal run (see
-    /// [`Self::settle_run`]). Not-terminal runs record nothing (the run is
-    /// still in flight; completion is the ledger's boundary). A concurrent
-    /// producer that already won the run id leaves a byte-different row only
-    /// when late settlement movement changed a derived money fact — the
-    /// append-only identity stands and the existing record is authoritative
-    /// (loud, never overwritten, never a second sample).
+    /// [`Self::settle_run`]), then finalize its economic settlement. Not
+    /// terminal runs record nothing (the run is still in flight; completion
+    /// is the ledger's boundary).
+    ///
+    /// Economic-truth P1: before deriving the row, the conservative
+    /// task-completion accounting the drive performs best-effort at the
+    /// completion gate is retried here (idempotent): every outstanding
+    /// UNCERTAIN reservation settles at its reserved estimate, so the
+    /// monetary projection can reach `complete` instead of freezing a
+    /// `pending` (or missing) exact fact. A retry failure is loud but never
+    /// fails the settlement: the projection stays `pending`/`unavailable`
+    /// and a later settlement pass moves it, and VCSC excludes the row and
+    /// counts the exclusion in the meantime. The record itself is derived
+    /// from durable facts ONLY (the terminal-turn facts outbox), so a
+    /// concurrent agent-path producer at the completion gate derives the
+    /// byte-identical row; the append-only identity stands and the existing
+    /// record is authoritative (loud, never overwritten, never a second
+    /// sample).
     pub(super) fn record_terminal_run_outcome(
         &self,
         parent: SessionId,
@@ -69,10 +81,54 @@ impl TaskExecutor {
         if !task.state.is_terminal() {
             return Ok(());
         }
+        let budget = faktor_session::DurableBudgetLedger::new(self.session.clone());
+        match budget.reconcile_uncertain_now(parent, task_id) {
+            Ok(report) if report.settled > 0 || report.closed_unknown > 0 => {
+                tracing::info!(
+                    session = %parent,
+                    task = %task_id,
+                    settled = report.settled,
+                    closed_unknown = report.closed_unknown,
+                    charged_micro = report.charged_micro,
+                    "terminal settlement reconciled uncertain reservation(s)"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session = %parent,
+                    task = %task_id,
+                    %error,
+                    "terminal settlement uncertain reconcile failed; the monetary projection \
+                     stays pending/unavailable and a later settlement retries"
+                );
+            }
+        }
+        match budget.finalize_uncertain_now(parent, task_id) {
+            Ok(report) if report.settled > 0 => {
+                tracing::info!(
+                    session = %parent,
+                    task = %task_id,
+                    settled = report.settled,
+                    charged_micro = report.charged_micro,
+                    "terminal settlement finalized uncertain reservation(s) at their reserved \
+                     estimates"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session = %parent,
+                    task = %task_id,
+                    %error,
+                    "terminal settlement uncertain finalize failed; the monetary projection \
+                     stays pending/unavailable and a later settlement retries"
+                );
+            }
+        }
         let ledger = faktor_agent::OutcomeLedger::new(self.session.store());
-        match ledger.record_terminal_run(&handle, run_id, faktor_agent::TerminalRunFacts::default())
-        {
-            Ok(_) => Ok(()),
+        match ledger.record_terminal_run(&handle, run_id) {
+            Ok(_) => {}
             Err(faktor_agent::OutcomeLedgerError::Store(faktor_store::StoreError::Conflict(
                 detail,
             ))) => {
@@ -83,10 +139,21 @@ impl TaskExecutor {
                     "terminal outcome record already exists under the run id (a concurrent \
                      producer won); the append-only record stays authoritative"
                 );
-                Ok(())
             }
+            Err(e) => {
+                return Err(ExecError::Internal(format!(
+                    "terminal outcome record of run {run_id}: {e}"
+                )));
+            }
+        }
+        // Late economic settlement finalization: the INITIAL event may be
+        // `pending` (the reconcile/finalize above failed or landed late);
+        // re-derive and append the next event so the latest settled
+        // projection is what every read (VCSC included) sees.
+        match ledger.finalize_economic_settlement(&handle, run_id) {
+            Ok(_) => Ok(()),
             Err(e) => Err(ExecError::Internal(format!(
-                "terminal outcome record of run {run_id}: {e}"
+                "economic settlement finalize of run {run_id}: {e}"
             ))),
         }
     }

@@ -8,28 +8,41 @@ use std::sync::Arc;
 use crate::api::tests::test_deps;
 use crate::{serve, ServerHandle};
 use faktor_agent::{
-    ChangedCodeScale, FinalVerificationBasis, OutcomeLedger, ProofCoverage, RunModelStep,
-    RunOutcomeRecord, RunVerifiedSample, OUTCOME_RECORD_SCHEMA_V,
+    ChangedCodeScale, EconomicSettlement, FinalVerificationBasis, MeasuredMoney, MoneyState,
+    OutcomeLedger, ProofCoverage, RunModelStep, RunVerifiedSample, SettlementStep,
+    TerminalEngineeringOutcome, OUTCOME_RECORD_SCHEMA_V,
 };
-use faktor_core::model::{RiskBucket, RouterPhase, TaskClass};
+use faktor_core::model::{ExecutionClass, RiskBucket, RouterPhase, TaskClass};
 use faktor_session::SessionManager;
 
-fn step(provider: &str, model: &str, local: bool, spend_micro: u64) -> RunModelStep {
+fn step(provider: &str, model: &str, execution_class: ExecutionClass) -> RunModelStep {
     RunModelStep {
         provider: provider.into(),
         model: model.into(),
-        local,
-        spend_micro,
+        local: execution_class.is_local(),
+        execution_class,
     }
 }
 
-fn record(run_id: &str, completed_at_ms: i64, local: bool) -> RunOutcomeRecord {
-    let (provider, model, spend) = if local {
-        ("ollama", "local-7b", 0u64)
+/// One fixture run: a local-zero run (class `local`) or a durably-hosted run
+/// (class `hosted_economy`); every step carries a durable execution class,
+/// so the frontier metric is measured over the whole fixture.
+fn record(
+    run_id: &str,
+    completed_at_ms: i64,
+    local: bool,
+) -> (TerminalEngineeringOutcome, EconomicSettlement) {
+    let (provider, model, model_spend, class) = if local {
+        ("ollama", "local-7b", 0u64, ExecutionClass::Local)
     } else {
-        ("hosted", "m-standard", 1_000_000)
+        (
+            "hosted",
+            "m-standard",
+            1_000_000u64,
+            ExecutionClass::HostedEconomy,
+        )
     };
-    RunOutcomeRecord {
+    let outcome = TerminalEngineeringOutcome {
         schema_version: OUTCOME_RECORD_SCHEMA_V,
         run_id: run_id.into(),
         session_id: 3,
@@ -40,13 +53,9 @@ fn record(run_id: &str, completed_at_ms: i64, local: bool) -> RunOutcomeRecord {
         final_snapshot: "tm1:final".into(),
         accepted: true,
         integrated: true,
-        verified_first_attempt: true,
+        verified_first_verification_pass: true,
         repair_attempts: 0,
-        model_sequence: vec![step(provider, model, local, spend)],
-        model_spend_micro: spend,
-        verification_spend_micro: 100_000,
-        rework_spend_micro: 0,
-        avoided_hosted_micro: if local { 250_000 } else { 0 },
+        model_sequence: vec![step(provider, model, class)],
         wall_time_ms: 1_000,
         human_interventions: 0,
         proof: ProofCoverage {
@@ -71,20 +80,44 @@ fn record(run_id: &str, completed_at_ms: i64, local: bool) -> RunOutcomeRecord {
             rework_cost_micro: 0,
             rework_turns: 0,
         }],
-    }
+    };
+    let settlement = EconomicSettlement {
+        schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
+        run_id: run_id.into(),
+        seq: 0,
+        money_state: MoneyState::Complete,
+        reason: "fixture".into(),
+        model_spend_micro: Some(model_spend),
+        verification_spend_micro: Some(100_000),
+        rework_spend_micro: Some(0),
+        avoided_hosted: if local {
+            MeasuredMoney::Measured(250_000)
+        } else {
+            MeasuredMoney::Unavailable
+        },
+        steps: vec![SettlementStep {
+            provider: provider.into(),
+            model: model.into(),
+            local,
+            execution_class: class,
+            spend_micro: model_spend,
+        }],
+        settled_at_ms: completed_at_ms,
+    };
+    (outcome, settlement)
 }
 
 async fn outcomes_deps(
     root: &std::path::Path,
-    records: &[RunOutcomeRecord],
+    records: &[(TerminalEngineeringOutcome, EconomicSettlement)],
 ) -> (ServerHandle, String, Arc<SessionManager>) {
     let deps = test_deps(root);
     let token = deps.auth_token.clone();
     let session = deps.session.clone();
     let ledger = OutcomeLedger::new(session.store());
-    for record in records {
+    for (outcome, settlement) in records {
         ledger
-            .record(record)
+            .record(outcome, settlement)
             .expect("fixture record is valid and records exactly once");
     }
     let handle = serve(deps, 0).await.unwrap();
@@ -148,20 +181,26 @@ async fn empty_ledger_answers_zero_metrics_and_no_runs() {
     let metrics = &body["metrics"];
     assert_eq!(metrics["runs"], 0);
     assert_eq!(metrics["verifiedChanges"], 0);
-    assert_eq!(metrics["verifiedFirstPassPpm"], 0);
+    assert_eq!(metrics["verifiedFirstVerificationPassPpm"], 0);
     assert_eq!(metrics["reworkCostRatioPpm"], 0);
     assert_eq!(metrics["successfulRunCostMicro"], "0");
     assert_eq!(metrics["verifiedCostPerSuccessfulChangeMicro"], "0");
     assert_eq!(metrics["localOnlyVerifiedPpm"], 0);
     assert_eq!(metrics["localFinalVerifiedPpm"], 0);
     assert_eq!(metrics["localFirstSuccessPpm"], 0);
-    assert_eq!(metrics["localToFrontierFallbackPpm"], 0);
-    assert_eq!(metrics["frontierOnlyPpm"], 0);
+    assert_eq!(metrics["localToHostedFallbackPpm"], 0);
+    assert_eq!(metrics["hostedOnlyPpm"], 0);
     assert_eq!(metrics["meanTimeToVerifiedChangeMs"], 0);
     assert_eq!(metrics["humanInterventionPpm"], 0);
     assert_eq!(metrics["regressionRollbackPpm"], 0);
     assert_eq!(metrics["proofCoveragePpm"], 0);
-    assert_eq!(metrics["frontierEscalationPpm"], 0);
+    // No records carry execution-class authority: the frontier rate is
+    // UNMEASURED (null), never a fabricated 0%.
+    assert!(
+        metrics["frontierEscalationPpm"].is_null(),
+        "an empty ledger has no frontier authority"
+    );
+    assert_eq!(metrics["frontierEscalationMeasurement"], "unmeasured");
     assert_eq!(metrics["truncated"], false);
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
     assert!(body["nextCursor"].is_null());
@@ -192,8 +231,8 @@ async fn ledger_metrics_and_run_page_match_the_durable_records() {
     // A (hosted 1_100_000) + B (local 100_000) + C (hosted 1_100_000).
     assert_eq!(metrics["runs"], 3);
     assert_eq!(metrics["verifiedChanges"], 3);
-    assert_eq!(metrics["verifiedFirstPassChanges"], 3);
-    assert_eq!(metrics["verifiedFirstPassPpm"], 1_000_000);
+    assert_eq!(metrics["verifiedFirstVerificationPassChanges"], 3);
+    assert_eq!(metrics["verifiedFirstVerificationPassPpm"], 1_000_000);
     assert_eq!(metrics["totalVerifiedSpendMicro"], "2300000");
     assert_eq!(metrics["successfulRunCostMicro"], "766667"); // ceil
     assert_eq!(metrics["totalSpendMicro"], "2300000");
@@ -212,27 +251,37 @@ async fn ledger_metrics_and_run_page_match_the_durable_records() {
     assert_eq!(metrics["localFirstRuns"], 1);
     assert_eq!(metrics["localFirstSuccessChanges"], 1);
     assert_eq!(metrics["localFirstSuccessPpm"], 1_000_000);
-    assert_eq!(metrics["localToFrontierFallbackRuns"], 0);
-    assert_eq!(metrics["localToFrontierFallbackPpm"], 0);
-    assert_eq!(metrics["frontierOnlyRuns"], 2);
-    assert_eq!(metrics["frontierOnlyPpm"], 666_666);
+    assert_eq!(metrics["localToHostedFallbackRuns"], 0);
+    assert_eq!(metrics["localToHostedFallbackPpm"], 0);
+    assert_eq!(metrics["hostedOnlyRuns"], 2);
+    assert_eq!(metrics["hostedOnlyPpm"], 666_666);
     assert_eq!(metrics["avoidedHostedInferenceMicro"], "250000");
     assert_eq!(metrics["totalWallTimeMs"], 3_000);
     assert_eq!(metrics["meanTimeToVerifiedChangeMs"], 1_000);
     assert_eq!(metrics["humanInterventionPpm"], 0);
     assert_eq!(metrics["regressionRollbackPpm"], 0);
     assert_eq!(metrics["proofCoveragePpm"], 1_000_000);
+    // Every fixture step carries a durable class: the frontier rate is a
+    // REAL 0% (measured), not an unmeasured null.
+    assert_eq!(metrics["frontierEscalationRuns"], 0);
     assert_eq!(metrics["frontierEscalationPpm"], 0);
+    assert_eq!(metrics["frontierEscalationMeasurement"], "measured");
     assert_eq!(metrics["scanned"], 3);
     assert_eq!(metrics["truncated"], false);
     let runs = body["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 2, "bounded page");
     assert_eq!(runs[0]["runId"], "run-c");
     assert_eq!(runs[0]["verified"], true);
+    assert_eq!(runs[0]["verifiedFirstVerificationPass"], true);
     assert_eq!(runs[0]["modelSpendMicro"], "1000000");
     assert_eq!(runs[0]["modelSequence"][0]["local"], false);
+    assert_eq!(
+        runs[0]["modelSequence"][0]["executionClass"],
+        "hosted_economy"
+    );
     assert_eq!(runs[1]["runId"], "run-b");
     assert_eq!(runs[1]["modelSequence"][0]["local"], true);
+    assert_eq!(runs[1]["modelSequence"][0]["executionClass"], "local");
     assert_eq!(runs[1]["avoidedHostedMicro"], "250000");
     assert_eq!(runs[1]["finalBasis"], "deterministic_checks");
     let next = &body["nextCursor"];
@@ -292,6 +341,63 @@ async fn strict_query_and_page_bounds_are_typed_refusals() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
+    handle.request_shutdown();
+}
+
+/// Legacy wire semantics (item 2): the schema says `local` is CLASS-DERIVED
+/// (true only for `executionClass == "local"`), so a pre-class row that
+/// recorded a local execution (class `unknown`, `local: true`) must NOT
+/// promote the recorded bit to `local` on the wire — it rides the explicit
+/// `legacyLocal` marker instead, and the metrics count it as neither local
+/// nor hosted.
+#[tokio::test]
+async fn classless_legacy_local_step_is_never_promoted_on_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut outcome, mut settlement) = record("run-legacy", 1_000, true);
+    // The stored pre-class Row: class unknown (decoded as the serde default
+    // on a payload that predates the field) with the recorded local bit.
+    outcome.model_sequence = vec![RunModelStep {
+        provider: "ollama".into(),
+        model: "local-legacy".into(),
+        local: true,
+        execution_class: ExecutionClass::Unknown,
+    }];
+    settlement.steps = vec![SettlementStep {
+        provider: "ollama".into(),
+        model: "local-legacy".into(),
+        local: true,
+        execution_class: ExecutionClass::Unknown,
+        spend_micro: 0,
+    }];
+    settlement.model_spend_micro = Some(0);
+    let (handle, token, _session) = outcomes_deps(dir.path(), &[(outcome, settlement)]).await;
+    let base = format!("http://{}", handle.addr);
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/native/outcomes"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let step = &body["runs"][0]["modelSequence"][0];
+    assert_eq!(step["executionClass"], "unknown");
+    assert_eq!(
+        step["local"], false,
+        "an unknown-class step is never wire-local: {step}"
+    );
+    assert_eq!(
+        step["legacyLocal"], true,
+        "the recorded pre-class local bit rides the legacy marker: {step}"
+    );
+    // The metrics classify by the durable class only: the run is neither
+    // local nor hosted, and it still counts toward the runs-with-steps
+    // denominator (it has a step).
+    let metrics = &body["metrics"];
+    assert_eq!(metrics["localRuns"], 0);
+    assert_eq!(metrics["localOnlyRuns"], 0);
+    assert_eq!(metrics["hostedOnlyRuns"], 0);
+    assert_eq!(metrics["runsWithSteps"], 1);
     handle.request_shutdown();
 }
 

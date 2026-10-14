@@ -59,6 +59,7 @@
 
 pub mod capture;
 pub mod coding;
+pub mod daemon_arm;
 pub mod fixture;
 pub mod frozen;
 pub mod pipeline;

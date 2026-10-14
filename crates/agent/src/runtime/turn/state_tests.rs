@@ -3131,17 +3131,38 @@ async fn crash_reopen_reconciles_each_uncertain_attempt_from_its_own_completed_r
             })
             .unwrap();
         r1 = ledger
-            .reserve_attempt(sid, tid, attempt1, 2_000, Some(snapshot.clone()))
+            .reserve_attempt(
+                sid,
+                tid,
+                attempt1,
+                2_000,
+                Some(snapshot.clone()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(sid, r1).await.unwrap();
         r2 = ledger
-            .reserve_attempt(sid, tid, attempt2, 3_000, Some(snapshot.clone()))
+            .reserve_attempt(
+                sid,
+                tid,
+                attempt2,
+                3_000,
+                Some(snapshot.clone()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(sid, r2).await.unwrap();
         r3 = ledger
-            .reserve_attempt(sid, tid, attempt3, 900, Some(snapshot.clone()))
+            .reserve_attempt(
+                sid,
+                tid,
+                attempt3,
+                900,
+                Some(snapshot.clone()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(sid, r3).await.unwrap();

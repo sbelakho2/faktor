@@ -324,33 +324,50 @@ private const val EVIDENCE_RETRIEVAL_JSON = "{" +
  * rate (both must be typed refusals, never silent metrics).
  */
 private const val OUTCOMES_JSON = "{" +
-    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstPassChanges\":1," +
-    "\"verifiedFirstPassPpm\":1000000,\"totalVerifiedSpendMicro\":\"5\"," +
+    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstVerificationPassChanges\":1," +
+    "\"verifiedFirstVerificationPassPpm\":1000000,\"moneyCompleteRuns\":3," +
+    "\"moneyPendingRuns\":0,\"moneyUnavailableRuns\":0,\"moneyIncompleteExcluded\":0," +
+    "\"verifiedChangesMoneyComplete\":1,\"totalVerifiedSpendMicro\":\"5\"," +
     "\"successfulRunCostMicro\":\"5\",\"totalSpendMicro\":\"9\"," +
     "\"verifiedCostPerSuccessfulChangeMicro\":\"9\",\"totalReworkSpendMicro\":\"1\"," +
     "\"reworkCostRatioPpm\":111111,\"localRuns\":1,\"localOnlyRuns\":1," +
     "\"localOnlyVerifiedChanges\":1,\"localOnlyVerifiedPpm\":1000000," +
     "\"localFinalRuns\":1,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":1000000," +
     "\"localFirstRuns\":1,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":1000000," +
-    "\"localToFrontierFallbackRuns\":0,\"localToFrontierFallbackPpm\":0," +
-    "\"frontierOnlyRuns\":2,\"frontierOnlyPpm\":666666," +
-    "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":10," +
+    "\"localToHostedFallbackRuns\":0,\"localToHostedFallbackPpm\":0," +
+    "\"hostedOnlyRuns\":2,\"runsWithSteps\":3,\"hostedOnlyPpm\":666666," +
+    "\"avoidedHostedInferenceMicro\":\"0\",\"avoidedHostedInferenceMeasurement\":\"measured\"," +
+    "\"avoidedHostedMeasuredRuns\":1,\"totalWallTimeMs\":10," +
     "\"meanTimeToVerifiedChangeMs\":10,\"humanInterventionRuns\":0," +
     "\"humanInterventionPpm\":0,\"rollbackRuns\":0,\"regressionRollbackPpm\":0," +
     "\"checksPassed\":1,\"checksRequired\":1,\"proofCoveragePpm\":1000000," +
-    "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+    "\"frontierEscalationRuns\":0,\"frontierClassedRuns\":0," +
+    "\"frontierEscalationClassedRuns\":0,\"frontierEscalationPpm\":null," +
+    "\"frontierEscalationMeasurement\":\"unmeasured\"," +
     "\"scanned\":3,\"truncated\":false}," +
     "\"runs\":[{\"runId\":\"run-1\",\"sessionId\":1,\"taskId\":2," +
     "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
     "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":false,\"verified\":true," +
-    "\"verifiedFirstAttempt\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"moneyState\":\"complete\"," +
     "\"modelSpendMicro\":\"5\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
-    "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":10,\"humanInterventions\":0," +
+    "\"avoidedHostedMicro\":\"0\",\"avoidedHostedMeasurement\":\"measured\"," +
+    "\"wallTimeMs\":10,\"humanInterventions\":0," +
     "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
     "\"changeScale\":{\"files\":1,\"addedLines\":1,\"removedLines\":0}," +
     "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +
     "\"frontierEscalations\":0,\"completedAtMs\":10}]," +
     "\"nextCursor\":null}"
+
+private const val VALUE_ENTITLEMENTS_JSON = "{" +
+    "\"ok\":true,\"value_entitlements\":{\"organization_id\":\"org-local\"," +
+    "\"plan_id\":\"pro\",\"plan_found\":true,\"subscription_active\":true," +
+    "\"plan_entitlements\":[\"outcome_analytics\",\"shared_intelligence\"]," +
+    "\"governance\":{\"sso\":false,\"scim\":false},\"decisions\":[" +
+    "{\"entitlement\":\"outcome_analytics\",\"hook\":\"outcome_ledger\",\"granted\":true}," +
+    "{\"entitlement\":\"cross_repo_intelligence\",\"hook\":\"cross_repo_index\"," +
+    "\"granted\":false,\"cause\":\"not_in_plan\"}]," +
+    "\"now_ms\":1700000000000}}"
 
 private const val MESSAGES_JSON = "{" +
     "\"sessionId\":\"7\",\"messages\":[" +
@@ -1244,11 +1261,14 @@ private fun assertClientRoutes() {
         } else if (request.query["limit"] == "667") {
             response.json(
                 200,
-                OUTCOMES_JSON.replace("\"verifiedFirstPassPpm\":1000000", "\"verifiedFirstPassPpm\":1000001")
+                OUTCOMES_JSON.replace("\"verifiedFirstVerificationPassPpm\":1000000", "\"verifiedFirstVerificationPassPpm\":1000001")
             )
         } else {
             response.json(200, OUTCOMES_JSON)
         }
+    }
+    daemon.on("GET", "/native/value-entitlements") { _, response ->
+        response.json(200, VALUE_ENTITLEMENTS_JSON)
     }
     daemon.on("GET", "/native/permissions") { _, response ->
         response.json(200, PERMISSIONS_JSON)
@@ -1331,8 +1351,39 @@ private fun assertClientRoutes() {
             client.outcomes(limit = 667L)
             fail("an out-of-range ppm must refuse typed")
         } catch (e: NativeProtocolException) {
-            assertTrue(e.message!!.contains("verifiedFirstPassPpm"), e.message!!)
+            assertTrue(e.message!!.contains("verifiedFirstVerificationPassPpm"), e.message!!)
         }
+
+        // The organization-scope outcomes read: the configured org rides the
+        // query; an unconfigured read must not send `org` at all.
+        val scoped = client.outcomes(limit = 2L, organization = "org-local")
+        assertEquals(3L, scoped.metrics.runs)
+        val scopedRead = daemon.requests.last {
+            it.method == "GET" && it.path == "/native/outcomes"
+        }
+        assertEquals(
+            "org-local",
+            scopedRead.query["org"],
+            "the configured organization must ride the outcomes query"
+        )
+        assertEquals(
+            null,
+            daemon.requests.first { it.method == "GET" && it.path == "/native/outcomes" }
+                .query["org"],
+            "an unconfigured read must not send org"
+        )
+
+        // The value-entitlements report parses strictly: the plan resolution
+        // and the typed per-hook decisions (outcome_ledger granted; a foreign
+        // hook refused with its exact cause).
+        val valueEntitlements = client.valueEntitlements()
+        assertEquals("org-local", valueEntitlements.organizationId)
+        assertEquals("pro", valueEntitlements.planId)
+        assertEquals(true, valueEntitlements.planFound)
+        assertEquals(2, valueEntitlements.decisions.size)
+        assertEquals("outcome_ledger", valueEntitlements.decisions[0].hook)
+        assertEquals(true, valueEntitlements.decisions[0].granted)
+        assertEquals("not_in_plan", valueEntitlements.decisions[1].cause)
 
         // Permissions: the pending list carries the OWNING session per entry;
         // the reply body is the strict session-scoped DTO.

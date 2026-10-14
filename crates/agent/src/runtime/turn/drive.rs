@@ -572,7 +572,7 @@ impl AgentRuntime {
         // this skeleton is the phase order of the logical-turn loop, a
         // mechanical move of the single-function original (same statements,
         // same order, same semantics).
-        let mut st = TurnDriveState::new(self, handle, op_id, cancel, model_override)?;
+        let mut st = TurnDriveState::new(self, handle, op_id, cancel, model_override).await?;
         loop {
             match self.turn_phase_boundary(&mut st).await? {
                 PhaseFlow::Continue => {}
@@ -877,8 +877,89 @@ impl AgentRuntime {
             );
             gate = refuse_unattributed_gate(gate, &detail);
         }
+        // Economic-truth P1 (dual producers, ONE durable truth): the
+        // terminal-turn facts (risk class + explicit verified samples) are
+        // persisted into the durable `terminal_run_facts` outbox BEFORE the
+        // task row can reach a terminal state, so BOTH producers of the
+        // run's engineering-outcome record — this completion gate and the
+        // task executor's settlement — derive ONE byte-identical row from
+        // durable facts. Facts that will never be consumed (a refusal below)
+        // are corrected right after the gate lands; a persistence failure
+        // only skips THIS site's record attempt: the settled calls keep the
+        // per-call verified feed and the next settlement retries the record
+        // with the facts that exist.
+        let pre_terminal = self
+            .session_task(handle)?
+            .is_some_and(|task| task.state.is_terminal());
+        let mut terminal_facts: Option<TerminalRunFacts> = None;
+        if !pre_terminal
+            && !settled_calls.is_empty()
+            && matches!(gate, Some(CompletionGate::VerifiedComplete))
+        {
+            let mut samples = Vec::new();
+            let mut risk: Option<RiskBucket> = None;
+            for (settled, risk_byte) in settled_calls.iter() {
+                let bucket = risk_bucket_of(*risk_byte);
+                risk = Some(bucket);
+                samples.push(RunVerifiedSample {
+                    provider: settled.provider.clone(),
+                    model: settled.model.clone(),
+                    phase: settled.phase,
+                    verified_success: true,
+                    rework_cost_micro: 0,
+                    rework_turns: 0,
+                });
+            }
+            samples.truncate(MAX_RUN_VERIFIED_SAMPLES);
+            let facts = TerminalRunFacts {
+                schema_version: TERMINAL_FACTS_SCHEMA_V,
+                risk_class: risk,
+                samples,
+            };
+            match TerminalRunFactsOutbox::new(self.deps.session.store())
+                .persist(&session_terminal_run_id(handle.id()), &facts)
+            {
+                Ok(()) => terminal_facts = Some(facts),
+                Err(error) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        %error,
+                        "persisting the terminal-run facts before the completion gate failed; \
+                         this site skips the record and the next settlement retries"
+                    );
+                }
+            }
+        }
         let gate_landed =
             self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?;
+        if let (Some(facts), Some(_refusal)) = (&terminal_facts, &gate_landed) {
+            // The completion claim was refused AFTER the facts were
+            // persisted: keep the terminal-turn facts TRUTHFUL — this
+            // turn's calls did not verify. A later completing turn
+            // overwrites them (allowed until the record exists).
+            let corrected = TerminalRunFacts {
+                schema_version: TERMINAL_FACTS_SCHEMA_V,
+                risk_class: facts.risk_class,
+                samples: facts
+                    .samples
+                    .iter()
+                    .map(|sample| RunVerifiedSample {
+                        verified_success: false,
+                        ..sample.clone()
+                    })
+                    .collect(),
+            };
+            if let Err(error) = TerminalRunFactsOutbox::new(self.deps.session.store())
+                .persist(&session_terminal_run_id(handle.id()), &corrected)
+            {
+                tracing::error!(
+                    session = %handle.id(),
+                    %error,
+                    "correcting the refused terminal-run facts failed; a later settlement may \
+                     read the pre-refusal facts"
+                );
+            }
+        }
         if gate_landed.is_none() && matches!(gate, Some(CompletionGate::VerifiedComplete)) {
             // P0-2 task-completion backstop: the task is terminal, so every
             // outstanding UNCERTAIN reservation (a crashed daemon may have
@@ -961,10 +1042,8 @@ impl AgentRuntime {
             // ledger append) instead of the per-call verified feed — a
             // sample is never fed twice and never dropped.
             let mut attributed: Vec<SettledCallOutcome> = Vec::with_capacity(settled_calls.len());
-            let mut turn_risk: Option<RiskBucket> = None;
             for (settled, risk) in settled_calls.drain(..) {
                 let bucket = risk_bucket_of(risk);
-                turn_risk = Some(bucket);
                 let mut call = settled;
                 call.verified = Some(VerifiedCallAttribution {
                     // The runtime has no per-task class dimension (every
@@ -990,56 +1069,59 @@ impl AgentRuntime {
             };
             // A run whose task just reached its terminal state records the
             // ONE durable engineering-outcome row HERE (idempotent when an
-            // earlier settlement already recorded it). The record derivation
-            // is fully durable; the samples are the terminal turn's explicit
-            // attributed calls.
+            // earlier settlement already recorded it). The record is derived
+            // from durable facts ONLY — including the terminal-turn facts
+            // persisted BEFORE the terminal transition — so the executor's
+            // concurrent settlement produces the byte-identical row.
             let terminal = self
                 .session_task(handle)?
                 .is_some_and(|task| task.state == TaskState::VerifiedComplete);
-            let mut ledger_recorded = 0usize;
+            // Single feed: the durable record's atomic append already
+            // absorbed ITS samples (ours, or a concurrent winner's), so only
+            // the samples the durable record does NOT carry may still be fed
+            // per call. Resolving this per sample — never all-or-nothing —
+            // is what keeps a LOSING append (Conflict: the winner already
+            // absorbed the samples) from double-counting the router stats.
+            let mut absorbed: Vec<RunVerifiedSample> = Vec::new();
             if terminal && !attributed.is_empty() {
-                let samples: Vec<RunVerifiedSample> = attributed
-                    .iter()
-                    .filter_map(|call| {
-                        let verified = call.verified?;
-                        Some(RunVerifiedSample {
-                            provider: call.provider.clone(),
-                            model: call.model.clone(),
-                            phase: call.phase,
-                            verified_success: verified.verified_success,
-                            rework_cost_micro: verified.rework_cost_micro,
-                            rework_turns: verified.rework_turns,
-                        })
-                    })
-                    .collect();
-                // A pathological turn settling more samples than one record
-                // carries splits at the cap: the record feeds the first
-                // `MAX_RUN_VERIFIED_SAMPLES`, the remainder still feeds
-                // per-call (never dropped, never doubled).
-                let recorded = samples.len().min(MAX_RUN_VERIFIED_SAMPLES);
-                let ledger = OutcomeLedger::new(self.deps.session.store());
-                match ledger.record_terminal_run(
-                    handle,
-                    &session_terminal_run_id(handle.id()),
-                    TerminalRunFacts {
-                        risk_class: turn_risk,
-                        samples: samples[..recorded].to_vec(),
-                    },
-                ) {
-                    Ok(Some(_recorded_append)) => ledger_recorded = recorded,
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::error!(
-                            session = %handle.id(),
-                            %error,
-                            "terminal run outcome record failed; the settled calls keep their \
-                             per-call verified feed and the next settlement retries the record"
-                        );
+                if let Some(facts) = &terminal_facts {
+                    let run_id = session_terminal_run_id(handle.id());
+                    let ledger = OutcomeLedger::new(self.deps.session.store());
+                    let attempt = ledger.record_terminal_run(handle, &run_id);
+                    if let Err(error) = &attempt {
+                        match error {
+                            crate::outcome_ledger::OutcomeLedgerError::Store(
+                                faktor_store::StoreError::Conflict(_),
+                            ) => {
+                                tracing::warn!(
+                                    session = %handle.id(),
+                                    %error,
+                                    "a concurrent producer won the terminal outcome append; the \
+                                     durable record stays authoritative and its samples are fed \
+                                     at most once"
+                                );
+                            }
+                            _ => {
+                                tracing::error!(
+                                    session = %handle.id(),
+                                    %error,
+                                    "terminal run outcome record failed; the settled calls keep \
+                                     their per-call verified feed and the next settlement retries \
+                                     the record"
+                                );
+                            }
+                        }
                     }
+                    absorbed = resolve_absorbed_samples(&ledger, &run_id, attempt, facts);
                 }
+                // `None`: the facts were never persisted for this terminal
+                // transition (or the task was terminal before this turn):
+                // never record from call-site state; the settled calls keep
+                // their per-call verified feed and a later settlement retries
+                // the record.
             }
-            for (index, call) in attributed.iter().enumerate() {
-                if index < ledger_recorded {
+            for call in attributed.iter() {
+                if take_absorbed_sample(&mut absorbed, call, gate) {
                     feed_telemetry_only(call);
                 } else {
                     feed_per_call(call);
@@ -2029,5 +2111,78 @@ impl AgentRuntime {
         Ok(crate::runtime::contract_eval::contract_verification_policy(
             &contract,
         ))
+    }
+}
+
+/// The samples a durable engineering record has ALREADY absorbed after one
+/// `record_terminal_run` attempt (the single-feed rule): the record's
+/// `verified_samples` when a record exists — ours (`Ok(Some(_))`), a
+/// pre-existing one (`Ok(None)`), or a CONCURRENT winner's
+/// ([`Conflict`](faktor_store::StoreError::Conflict), whose atomic append
+/// absorbed ITS samples) — and nothing when no record exists or the attempt
+/// failed for any other reason.
+pub(super) fn resolve_absorbed_samples(
+    ledger: &OutcomeLedger,
+    run_id: &str,
+    attempt: Result<
+        Option<crate::outcome_ledger::LedgerAppend>,
+        crate::outcome_ledger::OutcomeLedgerError,
+    >,
+    facts: &TerminalRunFacts,
+) -> Vec<RunVerifiedSample> {
+    let durable_samples = || {
+        ledger
+            .get(run_id)
+            .ok()
+            .flatten()
+            .map(|record| record.verified_samples)
+            .unwrap_or_default()
+    };
+    match attempt {
+        // The append (or its byte-identical replay) carried exactly the
+        // facts' samples.
+        Ok(Some(_)) => facts.samples.clone(),
+        // The record pre-existed: its durable samples are the truth.
+        Ok(None) => durable_samples(),
+        // A CONCURRENT producer won with a different row: its atomic append
+        // already absorbed ITS samples, so the loser must resolve coverage
+        // against the durable record rather than re-feeding per call.
+        Err(crate::outcome_ledger::OutcomeLedgerError::Store(
+            faktor_store::StoreError::Conflict(_),
+        )) => durable_samples(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The explicit verified sample one attributed settled call contributes to
+/// the durable record (the terminal-facts build site shape: rework is not
+/// attributable here, 0 = unmeasured).
+fn attributed_sample(call: &SettledCallOutcome, gate: &CompletionGate) -> RunVerifiedSample {
+    RunVerifiedSample {
+        provider: call.provider.clone(),
+        model: call.model.clone(),
+        phase: call.phase,
+        verified_success: matches!(gate, CompletionGate::VerifiedComplete),
+        rework_cost_micro: 0,
+        rework_turns: 0,
+    }
+}
+
+/// Consume ONE absorbed sample matching `call` (multiset semantics: a record
+/// may carry several byte-identical samples from the capped terminal turn)
+/// and report whether the durable record already fed it. A call the record
+/// did NOT absorb keeps the per-call feed — never dropped, never doubled.
+pub(super) fn take_absorbed_sample(
+    absorbed: &mut Vec<RunVerifiedSample>,
+    call: &SettledCallOutcome,
+    gate: &CompletionGate,
+) -> bool {
+    let sample = attributed_sample(call, gate);
+    match absorbed.iter().position(|absorbed| *absorbed == sample) {
+        Some(index) => {
+            absorbed.swap_remove(index);
+            true
+        }
+        None => false,
     }
 }

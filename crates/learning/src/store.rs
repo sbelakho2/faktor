@@ -98,8 +98,9 @@ pub trait LearningStore {
     /// Stored learnings in one scope.
     fn len_for_scope(&self, scope: &ProjectScope) -> usize;
 
-    /// Every stored learning, across scopes, for the corpus-level failure
-    /// prior (`LearningService::omission_risk_index`). Order is
+    /// Every stored learning, across scopes, for the organization-scoped
+    /// corpus-level failure prior (`LearningService::omission_risk_index`,
+    /// which folds only the caller organization's scopes). Order is
     /// unspecified. Bounded by the store's own capacity — a store is
     /// required to return at most its configured bound, never to walk an
     /// unbounded corpus. The default is EMPTY: an adapter that cannot
@@ -1031,7 +1032,10 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(service.len(), 1);
         let stored = service.page(&scope, 0, 1)[0].clone();
-        let index = service.omission_risk_index();
+        let binding = crate::service::SingleOrganizationBinding::new(
+            crate::service::OrganizationId::try_new("org_test").unwrap(),
+        );
+        let index = service.omission_risk_index(&binding).unwrap();
         assert!(index.contains_key(&stored.pattern_digest()));
         assert!(index.contains_key(&stored.pattern.failure.digest()));
         assert!(index[&stored.pattern_digest()] > OMISSION_RISK_NEUTRAL);

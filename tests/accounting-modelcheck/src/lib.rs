@@ -839,7 +839,14 @@ async fn apply_durable(
             let snapshot = priced.then(|| snapshot_for(known_usage));
             let real = fixture
                 .ledger
-                .reserve_attempt(fixture.session, task, attempt, predicted, snapshot)
+                .reserve_attempt(
+                    fixture.session,
+                    task,
+                    attempt,
+                    predicted,
+                    snapshot,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
                 .await;
             let effect = apply_model(model, op);
             match (&effect, &real) {

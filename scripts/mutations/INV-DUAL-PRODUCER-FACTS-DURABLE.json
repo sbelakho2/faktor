@@ -1,0 +1,10 @@
+{
+  "id": "INV-DUAL-PRODUCER-FACTS-DURABLE",
+  "file": "crates/agent/src/outcome_ledger.rs",
+  "find": "        self.store.terminal_run_facts_upsert(run_id, &payload)?;\n",
+  "replace": "        let _ = (run_id, payload); // (planted mutation) persistence removed\n",
+  "gate": "cargo test -p faktor-tests-production-wiring --test new_guard_entitlement_and_producers",
+  "expect": "left the risk class underivable|lost the verified samples",
+  "timeout_ms": 3600000,
+  "note": "Removing the pre-terminal facts persistence makes both producers derive their record from nothing: risk class and verified samples vanish and the producers diverge from the persisted truth."
+}

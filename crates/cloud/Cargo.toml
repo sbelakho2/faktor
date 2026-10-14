@@ -12,6 +12,7 @@ base64 = "0.22"
 ring = "0.17"
 jsonwebtoken = "9"
 blake3.workspace = true
+faktor-core.workspace = true
 faktor-provider.workspace = true
 faktor-security.workspace = true
 serde.workspace = true

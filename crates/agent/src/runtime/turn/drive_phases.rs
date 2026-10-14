@@ -77,7 +77,7 @@ impl<'a> TurnDriveState<'a> {
     /// Build the drive state from the durable session (the `drive_turn_inner`
     /// preparation block, unchanged): ledger load/heal, task-row restore,
     /// provider + capabilities + context budget, per-turn envelope defaults.
-    pub(crate) fn new(
+    pub(crate) async fn new(
         rt: &AgentRuntime,
         handle: &'a faktor_session::SessionHandle,
         op_id: OpId,
@@ -132,7 +132,7 @@ impl<'a> TurnDriveState<'a> {
         // seeded only when absent or stale — never duplicated) and heals the
         // row's spend from durable sources. A missing row is created from
         // the goal so gates always have a row to update.
-        rt.restore_task_rows(handle, &ledger)?;
+        rt.restore_task_rows(handle, &ledger).await?;
         // Layered lifetimes (audit 26): this drive is ONE turn_budget_ms
         // slice. Wall-clock is measured from the drive's start; expiry is
         // evaluated at every iteration boundary so no single future spans

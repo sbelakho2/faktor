@@ -296,20 +296,55 @@ The create-session contract validates BOTH the provider and the model against th
   metrics (`successfulRunCostMicro` — spend on successful runs / successes;
   `verifiedCostPerSuccessfulChangeMicro` — TOTAL eligible-cohort spend over
   successful verified changes, so 9 failures at $10 plus 1 success at $1
-  reads $91/change; `verifiedFirstPassPpm`, `reworkCostRatioPpm`, the local
+  reads $91/change; both over the MONEY-COMPLETE cohort only, with
+  `moneyCompleteRuns`/`moneyPendingRuns`/`moneyUnavailableRuns`,
+  `moneyIncompleteExcluded` and `verifiedChangesMoneyComplete` naming the
+  cohort and the exclusion count;
+  `verifiedFirstVerificationPassPpm` (Verified First Verification Pass
+  Rate: verified changes whose FIRST verification
+  attempt passed — a verification-attempt measure, never an
+  implementation-attempt claim), `reworkCostRatioPpm`, the local
   split `localOnlyVerifiedPpm` / `localFinalVerifiedPpm` /
-  `localFirstSuccessPpm` / `localToFrontierFallbackPpm` / `frontierOnlyPpm`
-  with their counts, `avoidedHostedInferenceMicro`,
+  `localFirstSuccessPpm` / `localToHostedFallbackPpm` / `hostedOnlyPpm`
+  with their counts (every local/hosted split is decided by each step's
+  durable `executionClass`: `unknown` counts as neither local nor hosted),
+  `avoidedHostedInferenceMicro` (null with
+  `avoidedHostedInferenceMeasurement = "unavailable"` unless a run carried
+  a MEASURED counterfactual; zero is only a measured zero),
   `meanTimeToVerifiedChangeMs`, `humanInterventionPpm`,
-  `regressionRollbackPpm`, `proofCoveragePpm`, `frontierEscalationPpm`)
+  `regressionRollbackPpm`, `proofCoveragePpm`, `frontierEscalationPpm` —
+  `null` (never a fabricated 0%) unless durable execution-class authority
+  exists, with `frontierEscalationMeasurement` = `measured` | `partial` |
+  `unmeasured`)
   plus their exact totals and the fold's scan
   honesty (`scanned`/`truncated`); `runs` is a page of the ledger rows
-  with the full record shape; `nextCursor` is the composite
+  with the immutable engineering record plus the LATEST settlement
+  projection (`moneyState`; money fields are decimal strings only when
+  `moneyState == "complete"` and null otherwise — a pending/unavailable
+  money fact is never a zero; per-step `spendMicro` follows the same rule;
+  every `modelSequence` step carries its durable `executionClass`
+  (`local` | `hosted_economy` | `hosted_balanced` | `frontier` |
+  `unknown`, with `local` true only for `local` — the wire `local` is
+  CLASS-DERIVED, so a pre-class row that recorded a local execution keeps
+  `local: false` and exposes its recorded bit as `legacyLocal: true`
+  instead of promoting it to a class claim);
+  `avoidedHostedMicro` is null with
+  `avoidedHostedMeasurement = "unavailable"` when no counterfactual
+  authority exists); `nextCursor` is the composite
   `{completedAtMs, runId}` continuation. Query (strict DTO): `limit`
   (1..=200, oversized rejected), `before_ms` + `before_run` given
-  together. Money fields are decimal strings (`*Micro`); rates are
-  integer ppm. A corrupt or payload/projection-drifted ledger row is a
-  typed 500, never a fabricated metric. See `docs/outcome-ledger.md`.
+  together; `org=<organization id>` requests the paid ORGANIZATION-scope
+  read (`outcome_analytics`): the caller's control-plane principal must
+  reach that organization (`BillingRead`, viewer+) and the organization's
+  plan must map the entitlement — a denial is the typed 403
+  `value_entitlement_refused` naming the entitlement, its `hook`
+  (`outcome_ledger`), the `cause` and the resolved plan; with no
+  `[billing]` authority wired the org-scope read answers the shared typed
+  409 `billing_disabled`. The org-less read keeps the frozen local shape
+  and never consults the gate. Money fields are decimal strings
+  (`*Micro`); rates are integer ppm. A corrupt or
+  payload/projection-drifted ledger row is a typed 500, never a fabricated
+  metric. See `docs/outcome-ledger.md`.
 - `GET /native/value-entitlements` — the caller organization's DERIVED
   value-centric entitlement report: the plan-mapped paid value features
   that are independent of inference volume. The response's
@@ -333,6 +368,35 @@ The create-session contract validates BOTH the provider and the model against th
   `[billing]` section — answers the shared typed 409 `billing_disabled`
   while the local product stays fully functional). Control-plane principal
   required (`BillingRead`, viewer and above).
+
+  The report is descriptive: the DECISION is cloud-owned and ENFORCEMENT
+  lives at the runtime capability boundaries, one seam per `hook`, each
+  consulted before the paid side effect and refusing typed — never a
+  silent empty result. `verification_policy` = the advanced
+  verification-policy constructor (`[verification] advanced = true`; a
+  denied plan refuses the daemon build typed and the default local policy
+  is never gated); `contract_compiler` = consulting the organization's
+  system-intelligence provider at drive-start contract compilation
+  (denied: the provider is NOT consulted, the native contract stands
+  byte-identically and the typed refusal is logged); `intelligence_federation`
+  / `cross_repo_index` = the federated index query (one workspace =
+  shared intelligence, several workspaces = cross-repo intelligence);
+  `outcome_ledger` = `GET /native/outcomes?org=...`; `proof_attestation`
+  = the signed proof/provenance attestation entry (entitlement checked
+  before validation and before the injected signer runs); `audit_history`
+  = `GET /native/enterprise/audit?extended=true` (the extended historical
+  page; base reads are never gated); `outcome_learning` = the shared
+  organizational learning feed; `worker_placement` = private-runner
+  placement (checked before any job generation is minted; the 403
+  `value_entitlement_refused` refusal is typed through the executor) and
+  worker claim admission (the same 403 on the worker claim route);
+  `identity_federation` = the SSO entry
+  (`POST /native/sso/start` and `/callback`) behind the
+  `enterprise_governance` entitlement AND the capability flag (the flag
+  gates the entry, not an implementation). With no `[billing]` authority
+  every paid augmentation is refused typed (`cloud_absent` on runtime
+  seams, 409 `billing_disabled` on HTTP surfaces) while community/local
+  behavior is byte-identical.
 - `GET /native/session/{id}/turns` — the session's durable turn records,
   newest first: `[{opId, status, provider, model, variant?, toolMode?,
   startedAt, updatedMs, queueSeq?, promptMessageId?}]` (`status` =

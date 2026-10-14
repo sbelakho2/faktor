@@ -1364,11 +1364,11 @@ async fn hostile_inputs_are_errs_never_panics() {
 fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.json");
-    // Sane values parse (strictly) and drive the daemon service: the
+    // Sane LOCAL values parse (strictly) and drive the daemon service: the
     // derived per-check budget is the configured cap.
     std::fs::write(
         &path,
-        r#"{"verification": {"quick_max_s": 30, "unit_max_s": 120, "full_as_background": false}}"#,
+        r#"{"verification": {"quick_max_s": 30, "unit_max_s": 120}}"#,
     )
     .unwrap();
     let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
@@ -1377,12 +1377,14 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
         &cfg.verification,
         &supervisor,
         faktor_terminal::NetworkIsolationRequirement::Inherit,
-    );
+        &faktor_core::entitlement::ValueGate::absent(),
+    )
+    .expect("the default (non-advanced) profile is never gated");
     assert!(!service.is_disabled());
     let policy = service.policy();
     assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
     assert_eq!(policy.unit_max, std::time::Duration::from_secs(120));
-    assert!(!policy.full_as_background);
+    assert!(policy.full_as_background);
     // Budget probe through the service (same decision the genuine-end
     // site applies per check category).
     let quick = faktor_verify::exec::CheckSpec::new(
@@ -1396,6 +1398,46 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
     assert_eq!(
         service.budget_for(&quick),
         faktor_verify::exec::BudgetDecision::RunInline(std::time::Duration::from_secs(30))
+    );
+    // HOSTILE BYPASS: numbers that reach the advanced profile (full checks
+    // inline or the advanced floors) refuse the daemon TYPED without the
+    // entitlement — never a silent construction of the paid profile.
+    std::fs::write(
+        &path,
+        r#"{"verification": {"quick_max_s": 30, "unit_max_s": 120, "full_as_background": false}}"#,
+    )
+    .unwrap();
+    let cfg = serve_config(Some(path.clone())).expect("the config itself parses");
+    let refusal = daemon_verification(
+        &cfg.verification,
+        &supervisor,
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
+        &faktor_core::entitlement::ValueGate::absent(),
+    )
+    .map(|_| ())
+    .expect_err("an ungated advanced numeric combination must refuse the daemon");
+    assert!(
+        refusal.contains("advanced_verification_policy"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("cloud_absent"), "{refusal}");
+    std::fs::write(
+        &path,
+        r#"{"verification": {"quick_max_s": 120, "unit_max_s": 1800}}"#,
+    )
+    .unwrap();
+    let cfg = serve_config(Some(path.clone())).expect("the config itself parses");
+    let refusal = daemon_verification(
+        &cfg.verification,
+        &supervisor,
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
+        &faktor_core::entitlement::ValueGate::absent(),
+    )
+    .map(|_| ())
+    .expect_err("advanced floor numbers must refuse the daemon ungated");
+    assert!(
+        refusal.contains("advanced_verification_policy"),
+        "{refusal}"
     );
     // An explicit unknown field inside [verification] fails startup.
     std::fs::write(&path, r#"{"verification": {"bogus": 1}}"#).unwrap();
@@ -1413,7 +1455,9 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
         &cfg.verification,
         &supervisor,
         faktor_terminal::NetworkIsolationRequirement::Inherit,
-    );
+        &faktor_core::entitlement::ValueGate::absent(),
+    )
+    .expect("the default (non-advanced) profile is never gated");
     assert!(
         service.is_disabled(),
         "quick_max_s = 0 must disable verification (fail closed)"

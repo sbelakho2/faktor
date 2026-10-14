@@ -8,6 +8,7 @@ description = "Remote/VPC worker plane: durable worker registration, immutable j
 
 [dependencies]
 faktor-cloud.workspace = true
+faktor-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -1350,7 +1350,11 @@ fn verification_section_defaults_partial_objects_and_zero_disables() {
     assert_eq!(cfg.verification.quick_max_s, 60);
     assert_eq!(cfg.verification.unit_max_s, 600);
     assert!(cfg.verification.full_as_background);
-    let policy = cfg.verification.policy().expect("defaults stay enabled");
+    let policy = cfg
+        .verification
+        .policy()
+        .expect("the local defaults are never advanced")
+        .expect("defaults stay enabled");
     use faktor_verify::exec::{budget_for, BudgetDecision, CheckCategory, CheckKind, CheckSpec};
     let spec = CheckSpec::new(
         "q",
@@ -1374,30 +1378,90 @@ fn verification_section_defaults_partial_objects_and_zero_disables() {
         BudgetDecision::RunAsTaskOwnedOperation,
         "full checks go background by default"
     );
-    // Partial objects fill per-key defaults (60/600/true), never 0.
+    // Partial objects fill per-key defaults (60/600/true), never 0 — and a
+    // raised LOCAL budget below the advanced floors stays ungated.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.json");
-    std::fs::write(
-        &path,
-        r#"{"verification": {"full_as_background": false, "unit_max_s": 120}}"#,
-    )
-    .unwrap();
+    std::fs::write(&path, r#"{"verification": {"unit_max_s": 120}}"#).unwrap();
     let cfg = Config::load(&path).unwrap();
     assert_eq!(
         cfg.verification.quick_max_s, 60,
         "partial keeps quick default"
     );
     assert_eq!(cfg.verification.unit_max_s, 120);
-    assert!(!cfg.verification.full_as_background);
-    let policy = cfg.verification.policy().unwrap();
+    let policy = cfg
+        .verification
+        .policy()
+        .expect("a local unit budget below the advanced floor is never gated")
+        .unwrap();
     assert_eq!(
         budget_for(CheckCategory::Quick, &policy, None),
         BudgetDecision::RunInline(std::time::Duration::from_secs(60))
     );
     assert_eq!(
         budget_for(CheckCategory::Full, &policy, None),
-        BudgetDecision::RunInline(std::time::Duration::from_secs(120)),
-        "full_as_background: false keeps full checks inline under unit_max"
+        BudgetDecision::RunAsTaskOwnedOperation,
+        "full checks stay background unless the entitlement is granted"
+    );
+    // HOSTILE BYPASS: numeric combinations that reach the advanced profile
+    // (full checks inline, or the advanced floors) refuse typed on the
+    // UNGATED projection — the paid profile is reachable only through the
+    // checked gate.
+    for bypass in [
+        r#"{"verification": {"full_as_background": false, "unit_max_s": 120}}"#,
+        r#"{"verification": {"quick_max_s": 120, "unit_max_s": 1800}}"#,
+        r#"{"verification": {"quick_max_s": 99999, "unit_max_s": 99999}}"#,
+    ] {
+        std::fs::write(&path, bypass).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(
+            cfg.verification.implies_advanced(),
+            "the numeric combination must be classified as advanced: {bypass}"
+        );
+        let refusal = cfg
+            .verification
+            .policy()
+            .expect_err("an ungated advanced numeric combination must refuse");
+        assert!(refusal.contains("advanced"), "{refusal}");
+        // The gated path refuses typed with no entitlement wired…
+        let refusal = cfg
+            .verification
+            .policy_checked(&faktor_core::entitlement::ValueGate::absent())
+            .expect_err("an absent gate refuses the advanced profile");
+        assert!(
+            refusal.contains("advanced_verification_policy"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("cloud_absent"), "{refusal}");
+    }
+    // …and an ENTITLED gate constructs the advanced profile for the same
+    // numeric combination (never the raw local numbers).
+    #[derive(Debug)]
+    struct Granted;
+    impl faktor_core::entitlement::ValueEntitlementGate for Granted {
+        fn check_value_entitlement(
+            &self,
+            _entitlement: faktor_core::entitlement::ValueEntitlement,
+        ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+            Ok(())
+        }
+    }
+    std::fs::write(
+        &path,
+        r#"{"verification": {"full_as_background": false, "unit_max_s": 120}}"#,
+    )
+    .unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let gate = faktor_core::entitlement::ValueGate::wired(std::sync::Arc::new(Granted));
+    let advanced = cfg
+        .verification
+        .policy_checked(&gate)
+        .expect("an entitled numeric combination resolves")
+        .expect("enabled");
+    assert!(advanced.implies_advanced());
+    assert_eq!(
+        advanced.quick_max,
+        faktor_verify::exec::VerificationPolicy::ADVANCED_QUICK_MAX
     );
     // quick_max_s = 0 disables the service: the mapping yields None
     // (fail closed), on the parse path AND the daemon mapping path.
@@ -1407,7 +1471,13 @@ fn verification_section_defaults_partial_objects_and_zero_disables() {
     )
     .unwrap();
     let cfg = Config::load(&path).unwrap();
-    assert_eq!(cfg.verification.policy(), None, "quick 0 -> disabled");
+    assert!(
+        cfg.verification
+            .policy()
+            .expect("a disabled service is never advanced")
+            .is_none(),
+        "quick 0 -> disabled"
+    );
 }
 
 #[test]

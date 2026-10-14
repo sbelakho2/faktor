@@ -942,7 +942,7 @@ internal object ParityMatrix {
                         "Local-Only Verified Rate",
                         "Local-Final Verified Rate",
                         "Local-First Success Rate",
-                        "Local-to-Frontier Fallback Rate"
+                        "Local-to-Hosted Fallback Rate"
                     )) {
                         assertTrue(model.metricNames().contains(name), name)
                     }
@@ -1938,28 +1938,35 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
  * avoided counterfactual (which must render `not measured`).
  */
 internal const val PARITY_OUTCOMES_PAGE_JSON = "{" +
-    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstPassChanges\":1," +
-    "\"verifiedFirstPassPpm\":1000000,\"totalVerifiedSpendMicro\":\"5\"," +
+    "\"metrics\":{\"runs\":3,\"verifiedChanges\":1,\"verifiedFirstVerificationPassChanges\":1," +
+    "\"verifiedFirstVerificationPassPpm\":1000000,\"moneyCompleteRuns\":3," +
+    "\"moneyPendingRuns\":0,\"moneyUnavailableRuns\":0,\"moneyIncompleteExcluded\":0," +
+    "\"verifiedChangesMoneyComplete\":1,\"totalVerifiedSpendMicro\":\"5\"," +
     "\"successfulRunCostMicro\":\"5\",\"totalSpendMicro\":\"9\"," +
     "\"verifiedCostPerSuccessfulChangeMicro\":\"9\",\"totalReworkSpendMicro\":\"1\"," +
     "\"reworkCostRatioPpm\":111111,\"localRuns\":1,\"localOnlyRuns\":1," +
     "\"localOnlyVerifiedChanges\":1,\"localOnlyVerifiedPpm\":1000000," +
     "\"localFinalRuns\":1,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":1000000," +
     "\"localFirstRuns\":1,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":1000000," +
-    "\"localToFrontierFallbackRuns\":0,\"localToFrontierFallbackPpm\":0," +
-    "\"frontierOnlyRuns\":2,\"frontierOnlyPpm\":666666," +
-    "\"avoidedHostedInferenceMicro\":\"0\",\"totalWallTimeMs\":10," +
+    "\"localToHostedFallbackRuns\":0,\"localToHostedFallbackPpm\":0," +
+    "\"hostedOnlyRuns\":2,\"runsWithSteps\":3,\"hostedOnlyPpm\":666666," +
+    "\"avoidedHostedInferenceMicro\":null,\"avoidedHostedInferenceMeasurement\":\"unavailable\"," +
+    "\"avoidedHostedMeasuredRuns\":0,\"totalWallTimeMs\":10," +
     "\"meanTimeToVerifiedChangeMs\":10,\"humanInterventionRuns\":0," +
     "\"humanInterventionPpm\":0,\"rollbackRuns\":0,\"regressionRollbackPpm\":0," +
     "\"checksPassed\":1,\"checksRequired\":1,\"proofCoveragePpm\":1000000," +
-    "\"frontierEscalationRuns\":0,\"frontierEscalationPpm\":0," +
+    "\"frontierEscalationRuns\":0,\"frontierClassedRuns\":0," +
+    "\"frontierEscalationClassedRuns\":0,\"frontierEscalationPpm\":null," +
+    "\"frontierEscalationMeasurement\":\"unmeasured\"," +
     "\"scanned\":3,\"truncated\":false}," +
     "\"runs\":[{\"runId\":\"run-1\",\"sessionId\":1,\"taskId\":2," +
     "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
     "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":false,\"verified\":true," +
-    "\"verifiedFirstAttempt\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"moneyState\":\"complete\"," +
     "\"modelSpendMicro\":\"5\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
-    "\"avoidedHostedMicro\":\"0\",\"wallTimeMs\":10,\"humanInterventions\":0," +
+    "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
+    "\"wallTimeMs\":10,\"humanInterventions\":0," +
     "\"proof\":{\"checksPassed\":1,\"checksRequired\":1,\"coveragePpm\":1000000}," +
     "\"changeScale\":{\"files\":1,\"addedLines\":1,\"removedLines\":0}," +
     "\"rollbackEvents\":0,\"recoveryEvents\":0,\"finalBasis\":\"deterministic_checks\"," +

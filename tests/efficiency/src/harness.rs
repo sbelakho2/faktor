@@ -720,8 +720,15 @@ pub fn run_scripted_task(
             // Attempt-keyed path (v18): reservation by attempt identity.
             let attempt = ModelCallAttempt::new(logical_op, attempt_op, call)
                 .ok_or_else(|| EfficiencyError::Malformed("attempt op ids collided".into()))?;
-            let reservation =
-                match store.cost_reserve_attempt(session.id, task_row_id, &attempt, cost, created, None)? {
+            let reservation = match store.cost_reserve_attempt(
+                session.id,
+                task_row_id,
+                &attempt,
+                cost,
+                created,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )? {
                     faktor_store::CostReserveOutcome::Granted(id) => id,
                     faktor_store::CostReserveOutcome::Exceeded { free } => {
                         return Err(EfficiencyError::Malformed(format!(

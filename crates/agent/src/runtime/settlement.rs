@@ -506,12 +506,6 @@ impl AgentRuntime {
         detector: &LoopDetector,
     ) -> faktor_core::Result<bool> {
         let mut tripped = false;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "dbg-loop: progress={} failures={:?}",
-            turn_made_progress(turn_summary),
-            turn_summary.failures
-        );
         if turn_made_progress(turn_summary) {
             // Some calls succeeded this batch: the task is making progress;
             // do not punish isolated failures.
@@ -1139,8 +1133,10 @@ impl AgentRuntime {
     /// the runtime's memory-fact set and heal the row's spend. Runs on every
     /// drive (fresh or crash-restarted), idempotently — an existing fact is
     /// only rewritten when its value differs from the row, so facts are
-    /// never duplicated. A missing row is created from the goal.
-    pub(crate) fn restore_task_rows(
+    /// never duplicated. A missing row is created from the goal. ASYNC
+    /// because a row without a contract compiles one through the bounded
+    /// asynchronous system-intelligence consult before the pure compile.
+    pub(crate) async fn restore_task_rows(
         &self,
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
@@ -1171,7 +1167,7 @@ impl AgentRuntime {
                 // the row-creation path too: a fresh row compiles from the
                 // goal + bounded repository state before the first turn.
                 if created.contract.is_empty() && !created.state.is_terminal() {
-                    self.compile_baseline_contract(handle, &created);
+                    self.compile_baseline_contract(handle, &created).await;
                 }
                 return Ok(());
             }
@@ -1200,7 +1196,7 @@ impl AgentRuntime {
         // replay is a no-op). Best-effort by contract: every failure is
         // logged and retried on the next drive; it never fails the turn.
         if healed.contract.is_empty() && !healed.state.is_terminal() {
-            self.compile_baseline_contract(handle, &healed);
+            self.compile_baseline_contract(handle, &healed).await;
         }
         let state_str = serde_json::to_value(healed.state)
             .ok()

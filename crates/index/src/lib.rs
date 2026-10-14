@@ -18,6 +18,7 @@ use faktor_core::id::WorkspaceId;
 pub mod cold;
 pub mod coverage;
 pub mod embedding;
+pub mod federation;
 pub mod generation;
 pub mod service;
 pub mod state;

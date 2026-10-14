@@ -22,7 +22,9 @@ async fn boundary_phase_cancel_is_terminal_and_never_reaches_the_provider() {
     let op_id = runtime.deps.session.try_next_op_id().unwrap();
     let cancel = CancellationToken::new();
     assert!(cancel.cancel());
-    let mut st = TurnDriveState::new(&runtime, &handle, op_id, cancel, None).unwrap();
+    let mut st = TurnDriveState::new(&runtime, &handle, op_id, cancel, None)
+        .await
+        .unwrap();
     let flow = runtime.turn_phase_boundary(&mut st).await.unwrap();
     assert!(matches!(flow, PhaseFlow::End));
     assert_eq!(st.outcome.final_state, AgentState::Cancelled);
@@ -57,6 +59,7 @@ async fn phase_pipeline_drives_a_text_turn_to_its_genuine_end() {
         receipt.op_meta.cancellation.clone(),
         None,
     )
+    .await
     .unwrap();
     assert!(matches!(
         runtime.turn_phase_boundary(&mut st).await.unwrap(),

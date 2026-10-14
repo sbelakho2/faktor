@@ -73,13 +73,13 @@ pub use billing_store::{
 pub use enterprise::config_layer_digest;
 pub use enterprise::{
     ArtifactKind, ArtifactRecord, ArtifactReference, AuditAction, AuditEvent, AuditExport,
-    AuditPrincipal, AuditPrincipalKind, BlobDeletion, BlobStoreError, ClassPolicyView, DeletionJob,
-    DeletionJobState, DeletionManifest, DeletionScope, DeletionState, DeletionStep,
+    AuditPrincipal, AuditPrincipalKind, AuditWindow, BlobDeletion, BlobStoreError, ClassPolicyView,
+    DeletionJob, DeletionJobState, DeletionManifest, DeletionScope, DeletionState, DeletionStep,
     EnterpriseService, EnterpriseStatus, GcOutcome, GcReport, ManifestEntry, NewArtifact,
     NewAuditEvent, NoReferences, OrgSettings, ReferenceKind, ReferenceScanError,
     RetentionBlobStore, RetentionClass, RetentionPolicy, RetentionReferenceOracle, SsoConfigRef,
-    Tombstone, DIGEST_HEX_BYTES, MAX_ARTIFACT_PAGE, MAX_AUDIT_PAGE, MAX_DELETION_MANIFEST,
-    MAX_ENTERPRISE_TEXT_BYTES, MAX_GC_PASS,
+    Tombstone, DEFAULT_AUDIT_BASE_WINDOW_MS, DIGEST_HEX_BYTES, MAX_ARTIFACT_PAGE, MAX_AUDIT_PAGE,
+    MAX_DELETION_MANIFEST, MAX_ENTERPRISE_TEXT_BYTES, MAX_GC_PASS,
 };
 pub use enterprise_store::{EnterpriseStore, StoredConfigLayer, ENTERPRISE_SCHEMA_V3};
 pub use entitlements::{
@@ -132,13 +132,14 @@ pub use store::{
     MAX_IDEMPOTENT_RESPONSE_BYTES,
 };
 pub use value::{
-    EnforcementHook, GovernanceCapabilities, GovernanceCapability, ValueEntitlement,
-    ValueEntitlementDecision, ValueEntitlementRefused, ValueEntitlementSet, ValueGate,
-    ValueRefusalCause, FEATURE_ADVANCED_VERIFICATION_POLICY, FEATURE_AUDIT_RETENTION_HISTORY,
-    FEATURE_CROSS_REPO_INTELLIGENCE, FEATURE_ENTERPRISE_GOVERNANCE, FEATURE_GOVERNANCE_SCIM,
-    FEATURE_GOVERNANCE_SSO, FEATURE_MODEL_OPTIMIZATION_LEARNING, FEATURE_ORGANIZATION_CONTRACTS,
-    FEATURE_OUTCOME_ANALYTICS, FEATURE_PRIVATE_RUNNERS, FEATURE_SHARED_INTELLIGENCE,
-    FEATURE_SIGNED_PROOF_PROVENANCE, VALUE_FEATURE_TAGS,
+    EnforcementHook, GovernanceCapabilities, GovernanceCapability, OrganizationValueGate,
+    ValueEntitlement, ValueEntitlementDecision, ValueEntitlementRefused, ValueEntitlementSet,
+    ValueGate, ValueRefusalCause, FEATURE_ADVANCED_VERIFICATION_POLICY,
+    FEATURE_AUDIT_RETENTION_HISTORY, FEATURE_CROSS_REPO_INTELLIGENCE,
+    FEATURE_ENTERPRISE_GOVERNANCE, FEATURE_GOVERNANCE_SCIM, FEATURE_GOVERNANCE_SSO,
+    FEATURE_MODEL_OPTIMIZATION_LEARNING, FEATURE_ORGANIZATION_CONTRACTS, FEATURE_OUTCOME_ANALYTICS,
+    FEATURE_PRIVATE_RUNNERS, FEATURE_SHARED_INTELLIGENCE, FEATURE_SIGNED_PROOF_PROVENANCE,
+    VALUE_FEATURE_TAGS,
 };
 pub use vendor::{
     BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,
