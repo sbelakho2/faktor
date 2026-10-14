@@ -28,6 +28,74 @@ pub(crate) struct NativeOutcomesQuery {
     before_run: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    /// The paid ORGANIZATION-scope read (`outcome_analytics`): with `org`
+    /// given, the caller's control-plane principal must be a member of that
+    /// organization AND the organization's plan must map
+    /// `outcome_analytics`. A denial is the typed 403
+    /// `value_entitlement_refused` naming the entitlement, its hook, the
+    /// cause and the resolved plan; no billing authority wired = the shared
+    /// typed 409 `billing_disabled`. Without `org` the route keeps its
+    /// frozen local shape and never consults the gate.
+    #[serde(default)]
+    org: Option<String>,
+}
+
+/// The organization-scope authorization of one outcome read (the
+/// `outcome_analytics` paid boundary): the principal must reach `org`
+/// (Billing read, viewer+), a billing authority must be wired, and the
+/// plan must map the entitlement. `Ok(())` continues into the same bounded
+/// fold + page read; a denial is typed. The denial IS an HTTP response, so
+/// the error stays inline here (the response is the point, not a payload).
+#[allow(clippy::result_large_err)]
+fn authorize_outcomes_organization(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw_org: &str,
+) -> Result<(), Response> {
+    let principal = match require_principal(state, headers) {
+        Ok(principal) => principal,
+        Err(e) => return Err(wire_status(e)),
+    };
+    let organization = match faktor_cloud::OrganizationId::try_new(raw_org.to_string()) {
+        Ok(organization) => organization,
+        Err(_) => {
+            return Err(wire_status(malformed_body(
+                "organization must be a bounded printable id",
+            )))
+        }
+    };
+    let Some(service) = state.deps.billing.as_ref() else {
+        return Err(wire_status(billing_disabled()));
+    };
+    if let Err(denied) = faktor_cloud::authorize(
+        &principal,
+        &organization,
+        faktor_cloud::Resource::Billing,
+        faktor_cloud::Action::BillingRead,
+    ) {
+        return Err(wire_status(billing_err(denied.into())));
+    }
+    match service.check_value_entitlement(
+        &organization,
+        faktor_cloud::ValueEntitlement::OutcomeAnalytics,
+    ) {
+        Ok(()) => Ok(()),
+        Err(refusal) => Err(wire_status(value_entitlement_refused(refusal))),
+    }
+}
+
+/// Map one typed value-entitlement refusal onto the frozen API error: a
+/// non-retryable 403 whose message names the entitlement, its hook, the
+/// exact cause and (when resolved) the plan — never an empty result.
+pub(crate) fn value_entitlement_refused(
+    refusal: faktor_cloud::ValueEntitlementRefused,
+) -> ApiError {
+    ApiError {
+        code: "value_entitlement_refused",
+        message: refusal.to_string(),
+        http_status: 403,
+        retryable: false,
+    }
 }
 
 /// Map one typed ledger failure onto the wire: durable store failures keep
@@ -41,20 +109,36 @@ fn ledger_api_err(e: faktor_agent::OutcomeLedgerError) -> Response {
     }
 }
 
-/// The wire projection of one metrics fold.
+/// The wire projection of one metrics fold. Zero is only for a MEASURED
+/// zero: `avoidedHostedInferenceMicro` is null (never `"0"`) when no run
+/// carried a measured counterfactual, and its `*Measurement` token says so.
+/// The object is assembled from three bounded literals so the `json!`
+/// macro's expansion stays under the crate recursion limit.
 fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json::Value {
     let m = &report.metrics;
-    serde_json::json!({
+    let avoided_measurement = if m.avoided_hosted_inference_micro.is_some() {
+        "measured"
+    } else {
+        "unavailable"
+    };
+    let mut out = serde_json::json!({
         "runs": m.runs,
         "verifiedChanges": m.verified_changes,
-        "verifiedFirstPassChanges": m.verified_first_pass_changes,
-        "verifiedFirstPassPpm": m.verified_first_pass_ppm,
+        "verifiedFirstVerificationPassChanges": m.verified_first_verification_pass_changes,
+        "verifiedFirstVerificationPassPpm": m.verified_first_verification_pass_ppm,
+        "moneyCompleteRuns": m.money_complete_runs,
+        "moneyPendingRuns": m.money_pending_runs,
+        "moneyUnavailableRuns": m.money_unavailable_runs,
+        "moneyIncompleteExcluded": m.money_incomplete_excluded,
+        "verifiedChangesMoneyComplete": m.verified_changes_money_complete,
         "totalVerifiedSpendMicro": m.total_verified_spend_micro,
         "successfulRunCostMicro": m.successful_run_cost_micro,
         "totalSpendMicro": m.total_spend_micro,
         "verifiedCostPerSuccessfulChangeMicro": m.verified_cost_per_successful_change_micro,
         "totalReworkSpendMicro": m.total_rework_spend_micro,
         "reworkCostRatioPpm": m.rework_cost_ratio_ppm,
+    });
+    let tail = serde_json::json!({
         "localRuns": m.local_runs,
         "localOnlyRuns": m.local_only_runs,
         "localOnlyVerifiedChanges": m.local_only_verified_changes,
@@ -65,11 +149,16 @@ fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json
         "localFirstRuns": m.local_first_runs,
         "localFirstSuccessChanges": m.local_first_success_changes,
         "localFirstSuccessPpm": m.local_first_success_ppm,
-        "localToFrontierFallbackRuns": m.local_to_frontier_fallback_runs,
-        "localToFrontierFallbackPpm": m.local_to_frontier_fallback_ppm,
-        "frontierOnlyRuns": m.frontier_only_runs,
-        "frontierOnlyPpm": m.frontier_only_ppm,
-        "avoidedHostedInferenceMicro": m.avoided_hosted_inference_micro,
+        "localToHostedFallbackRuns": m.local_to_hosted_fallback_runs,
+        "localToHostedFallbackPpm": m.local_to_hosted_fallback_ppm,
+        "hostedOnlyRuns": m.hosted_only_runs,
+        "runsWithSteps": m.runs_with_steps,
+        "hostedOnlyPpm": m.hosted_only_ppm,
+    });
+    let frontier = serde_json::json!({
+        "avoidedHostedInferenceMicro": m.avoided_hosted_inference_micro.map(|v| v.to_string()),
+        "avoidedHostedInferenceMeasurement": avoided_measurement,
+        "avoidedHostedMeasuredRuns": m.avoided_hosted_measured_runs,
         "totalWallTimeMs": m.total_wall_time_ms,
         "meanTimeToVerifiedChangeMs": m.mean_time_to_verified_change_ms,
         "humanInterventionRuns": m.human_intervention_runs,
@@ -80,26 +169,84 @@ fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json
         "checksRequired": m.checks_required,
         "proofCoveragePpm": m.proof_coverage_ppm,
         "frontierEscalationRuns": m.frontier_escalation_runs,
+        "frontierClassedRuns": m.frontier_classed_runs,
+        "frontierEscalationClassedRuns": m.frontier_escalation_classed_runs,
         "frontierEscalationPpm": m.frontier_escalation_ppm,
+        "frontierEscalationMeasurement": m.frontier_measurement.as_str(),
         "scanned": report.scanned,
         "truncated": report.truncated,
-    })
+    });
+    let object = out.as_object_mut().expect("json object literal");
+    for (key, value) in tail.as_object().into_iter().flatten() {
+        object.insert(key.clone(), value.clone());
+    }
+    for (key, value) in frontier.as_object().into_iter().flatten() {
+        object.insert(key.clone(), value.clone());
+    }
+    out
 }
 
-/// The wire projection of one run record (money keys ride `*Micro`).
-fn run_json(record: &faktor_agent::RunOutcomeRecord) -> serde_json::Value {
-    let model_sequence: Vec<serde_json::Value> = record
-        .model_sequence
-        .iter()
-        .map(|step| {
-            serde_json::json!({
-                "provider": step.provider,
-                "model": step.model,
-                "local": step.local,
-                "spendMicro": step.spend_micro,
+/// The wire projection of one run entry: the immutable engineering outcome
+/// plus the LATEST settled financial projection. Money keys ride `*Micro`
+/// and are decimal strings — or NULL when the money is not settled (only a
+/// `complete` projection carries amounts; zero is only a measured zero).
+/// Every `modelSequence` step carries the CLASS-DERIVED `local` (true only
+/// when `executionClass` is `local`) plus the documented `legacyLocal`
+/// marker: a classless step (pre-class payload or unpriced path) exposes its
+/// recorded legacy local bit there — the legacy bit is never promoted to a
+/// class claim.
+fn run_json(entry: &faktor_agent::OutcomeLedgerEntry) -> serde_json::Value {
+    use faktor_agent::MoneyState;
+    let record = &entry.outcome;
+    let settlement = &entry.settlement;
+    let complete = settlement.money_state == MoneyState::Complete;
+    // Complete projections expose the settled per-step spend; a
+    // not-yet-settled run exposes the engineering step identity with a null
+    // spend (the money is not final, never a fabricated zero).
+    let model_sequence: Vec<serde_json::Value> = if complete && !settlement.steps.is_empty() {
+        settlement
+            .steps
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "provider": step.provider,
+                    "model": step.model,
+                    // The wire `local` is CLASS-DERIVED (true only for a
+                    // durably local step); a pre-class recorded local bit
+                    // rides the documented `legacyLocal` marker instead of
+                    // contradicting the schema's class-only claim.
+                    "local": step.execution_class.is_local(),
+                    "legacyLocal": !step.execution_class.is_known() && step.local,
+                    "executionClass": step.execution_class.as_str(),
+                    "spendMicro": step.spend_micro.to_string(),
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        record
+            .model_sequence
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "provider": step.provider,
+                    "model": step.model,
+                    // Class-derived locality + the legacy marker (see the
+                    // settled branch above).
+                    "local": step.wire_local(),
+                    "legacyLocal": step.legacy_local(),
+                    "executionClass": step.execution_class.as_str(),
+                    "spendMicro": serde_json::Value::Null,
+                })
+            })
+            .collect()
+    };
+    let money = |value: Option<u64>| -> Option<String> {
+        if complete {
+            value.map(|v| v.to_string())
+        } else {
+            None
+        }
+    };
     serde_json::json!({
         "runId": record.run_id,
         "sessionId": record.session_id,
@@ -111,13 +258,15 @@ fn run_json(record: &faktor_agent::RunOutcomeRecord) -> serde_json::Value {
         "accepted": record.accepted,
         "integrated": record.integrated,
         "verified": record.verified(),
-        "verifiedFirstAttempt": record.verified_first_attempt,
+        "verifiedFirstVerificationPass": record.verified_first_verification_pass,
         "repairAttempts": record.repair_attempts,
         "modelSequence": model_sequence,
-        "modelSpendMicro": record.model_spend_micro,
-        "verificationSpendMicro": record.verification_spend_micro,
-        "reworkSpendMicro": record.rework_spend_micro,
-        "avoidedHostedMicro": record.avoided_hosted_micro,
+        "moneyState": settlement.money_state.as_str(),
+        "modelSpendMicro": money(settlement.model_spend_micro),
+        "verificationSpendMicro": money(settlement.verification_spend_micro),
+        "reworkSpendMicro": money(settlement.rework_spend_micro),
+        "avoidedHostedMicro": settlement.avoided_hosted.value().map(|v| v.to_string()),
+        "avoidedHostedMeasurement": settlement.avoided_hosted.measurement_str(),
         "wallTimeMs": record.wall_time_ms,
         "humanInterventions": record.human_interventions,
         "proof": {
@@ -156,6 +305,13 @@ pub(crate) async fn native_outcomes(
         Ok(query) => query,
         Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
+    // The org-scope read is the paid `outcome_analytics` boundary; the
+    // org-less local read below is never gated.
+    if let Some(raw_org) = query.org.as_deref() {
+        if let Err(response) = authorize_outcomes_organization(&state, &headers, raw_org) {
+            return response;
+        }
+    }
     let limit = match page_limit(query.limit, MAX_NATIVE_CURSOR_PAGE) {
         Ok(limit) => limit,
         Err(e) => return wire_status(e),
@@ -185,7 +341,7 @@ pub(crate) async fn native_outcomes(
         Ok(page) => page,
         Err(e) => return ledger_api_err(e),
     };
-    let runs: Vec<serde_json::Value> = page.records.iter().map(run_json).collect();
+    let runs: Vec<serde_json::Value> = page.entries.iter().map(run_json).collect();
     let next_cursor = page.next.as_ref().map(|next| {
         serde_json::json!({
             "completedAtMs": next.completed_at_ms,

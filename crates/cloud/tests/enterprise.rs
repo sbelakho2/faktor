@@ -617,6 +617,99 @@ fn audit_rows_live_in_their_own_table_and_never_mix_with_proof_rows() {
     assert_eq!(count, 2);
 }
 
+/// The base retention window boundary is EXACT on the durable store: the
+/// event 1 ms older than the window start is OUT (its seq is included in
+/// `last_out_of_window_seq`); the event whose timestamp EQUALS the window
+/// start is IN. The boundary is organization-scoped, role-gated and survives
+/// a store reopen, so a restart can never widen or shift the ungated window.
+#[test]
+fn audit_window_boundary_is_exact_on_the_durable_store_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cp.db");
+    let window_ms;
+    {
+        let store: Arc<dyn EnterpriseStore> =
+            Arc::new(SqliteControlPlaneStore::open(&path).unwrap());
+        let clock = Arc::new(ManualClock::new(T0));
+        let service = EnterpriseService::new(store, clock.clone()).unwrap();
+        window_ms = service.audit_base_window_ms();
+        let admin = principal_with(Role::Admin);
+        clock.advance(-1);
+        service
+            .record_mutation(
+                &admin,
+                &org("org_1"),
+                AuditAction::SecretAccessed,
+                "secret",
+                "older",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        clock.advance(1);
+        service
+            .record_mutation(
+                &admin,
+                &org("org_1"),
+                AuditAction::SecretAccessed,
+                "secret",
+                "boundary",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        clock.advance(window_ms);
+        service
+            .record_mutation(
+                &admin,
+                &org("org_1"),
+                AuditAction::SecretAccessed,
+                "secret",
+                "fresh",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let window = service.audit_window(&admin, &org("org_1")).unwrap();
+        assert_eq!(window.window_start_ms, T0, "now - window_ms is the start");
+        assert_eq!(window.last_out_of_window_seq, 1, "only seq 1 is older");
+        assert_eq!(window.head_seq, 3);
+        // Isolation: another organization is a FOREIGN TENANT for this
+        // principal — the org binding refuses it typed (byte-identical to a
+        // missing organization), never an empty window.
+        let denied = service.audit_window(&admin, &org("org_2")).unwrap_err();
+        assert!(
+            matches!(denied, faktor_cloud::ControlPlaneError::NotFound(_)),
+            "a foreign org must be refused typed: {denied:?}"
+        );
+        // An admin OF org_2 sees its own (empty) window: the boundary is
+        // organization-scoped, never global.
+        let admin_2 = Principal::user(UserId::try_new("usr_2").unwrap(), org("org_2"), Role::Admin);
+        let foreign = service.audit_window(&admin_2, &org("org_2")).unwrap();
+        assert_eq!(foreign.last_out_of_window_seq, 0);
+        assert_eq!(foreign.head_seq, 0);
+        // Role gate: a member below the audit-read matrix cannot even compute
+        // the window.
+        assert!(service
+            .audit_window(&principal_with(Role::Member), &org("org_1"))
+            .is_err());
+    }
+    // Reopen with the same wall time: the durable seq prefix pins the same
+    // boundary (no in-memory skew, no shift).
+    let store: Arc<dyn EnterpriseStore> = Arc::new(SqliteControlPlaneStore::open(&path).unwrap());
+    let service =
+        EnterpriseService::new(store, Arc::new(ManualClock::new(T0 + window_ms))).unwrap();
+    let window = service
+        .audit_window(&principal_with(Role::Admin), &org("org_1"))
+        .unwrap();
+    assert_eq!(window.window_start_ms, T0);
+    assert_eq!(window.last_out_of_window_seq, 1);
+    assert_eq!(window.head_seq, 3);
+}
+
 #[test]
 fn hostile_page_limit_is_refused_typed_without_wrapping() {
     let dir = tempfile::tempdir().unwrap();

@@ -810,13 +810,16 @@ pub(crate) fn tool_completed_statuses(
 }
 
 /// Wait until the LIVE queue runner of `session` has STARTED `passes`
-/// bounded passes (`0` when no runner is live).
+/// bounded passes (`0` when no runner is live). Observable-condition wait
+/// with a deadlock-only ceiling: a pass can legitimately take its full
+/// (possibly load-stretched) budget to start, so the bound only fails a
+/// genuinely wedged runner, never a slow host.
 pub(crate) async fn wait_for_runner_passes(
     runtime: &AgentRuntime,
     session: SessionId,
     passes: u64,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let current = runtime
             .runners
@@ -1987,6 +1990,7 @@ impl BudgetAuthority for ReadFailingBudget {
         _op: OpId,
         _pred: u64,
         _snap: Option<PricingSnapshot>,
+        _class: faktor_core::model::ExecutionClass,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -2007,6 +2011,7 @@ impl BudgetAuthority for ReadFailingBudget {
         _a: ModelCallAttempt,
         _pred: u64,
         _snap: Option<PricingSnapshot>,
+        _class: faktor_core::model::ExecutionClass,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<

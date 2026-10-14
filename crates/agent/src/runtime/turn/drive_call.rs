@@ -445,6 +445,14 @@ impl AgentRuntime {
                 st.routed_decision
                     .as_ref()
                     .and_then(|d| d.pricing_snapshot.clone()),
+                // P1 classification: the route decision's durable execution
+                // class rides the reservation beside its snapshot (Unknown
+                // when no decision/authority exists — never a guessed local
+                // or hosted class).
+                st.routed_decision
+                    .as_ref()
+                    .map(|d| d.execution_class)
+                    .unwrap_or(faktor_core::model::ExecutionClass::Unknown),
             )
             .await
         {

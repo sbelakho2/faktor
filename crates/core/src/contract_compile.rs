@@ -33,11 +33,20 @@
 //!    [`EvidenceBinding::Category`] is never emitted.
 //!
 //! A [`SystemIntelligenceProvider`] (the neutral seam named by
-//! `docs/specs/autonomous-engineering.md`) may ENRICH the same IR: enrichment
-//! is strictly ADDITIVE, every enriched statement carries
-//! `external:<provider>` provenance, and a missing, refusing or empty
-//! provider leaves the native contract byte-identical (Tangerine is never
-//! required).
+//! `docs/specs/autonomous-engineering.md`) may be asked the fixed bounded
+//! engineering QUESTION set ([`IntelligenceQuestion`]) BEFORE the pure
+//! compile. The runtime performs that consult asynchronously (the provider
+//! is an external service), binds every ask to an explicit operation
+//! identity, and feeds the bounded [`ProviderFinding`] answers into
+//! [`compile_contract_with_findings_checked`]: enrichment is strictly
+//! ADDITIVE, every enriched statement carries `external:<provider>`
+//! provenance, and a missing, refusing, timing-out or empty provider leaves
+//! the native contract byte-identical (Tangerine is never required). The
+//! checked entry enforces the `organization_contracts` value entitlement
+//! before the apply; the raw apply stays private. Provider output is
+//! validated DATA: findings bound to another snapshot/revision or another
+//! provider, oversized findings, unknown kinds and malformed payloads are
+//! dropped with typed [`FindingDiagnostic`]s and can never fail a turn.
 //!
 //! Statement ids replicate [`faktor_session`](../../session)'s user-authored
 //! id scheme (`faktor.contract.{c1,i1,r1}.v1` + text, BLAKE3, 16 hex chars)
@@ -46,11 +55,14 @@
 //! ids come from [`EngineeringContract::obligation_id`].
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::contract::{
     AcceptedStrength, Constraint, ContractOrigin, EngineeringContract, EvidenceBinding, Invariant,
     ProofEvidenceKind, Requirement, RiskHypothesis, RiskSeverity,
 };
+use crate::{CancellationToken, Deadline, OpId, SessionId, WorkspaceId};
 
 /// Hard bound on repository files one compile considers (paths beyond it are
 /// dropped and the snapshot is reported incomplete by the CALLER; the pure
@@ -92,8 +104,24 @@ pub const MAX_RISKS: usize = 16;
 pub const MAX_UNCERTAINTIES: usize = 16;
 /// Hard bound on enrichment statements applied per compile.
 pub const MAX_ENRICHMENT_STATEMENTS: usize = 24;
+/// Hard bound on provider findings asked for/accepted in one consult.
+pub const MAX_FINDINGS: usize = MAX_ENRICHMENT_STATEMENTS;
+/// Hard bound on ONE finding's provider-supplied text (UTF-8 bytes). Kept
+/// below [`MAX_STATEMENT_BYTES`] so the compiler's typed `"<question>: "`
+/// prefix can never push an accepted statement past the statement bound.
+pub const MAX_FINDING_TEXT_BYTES: usize = 320;
+/// Hard bound on one finding's provider-supplied basis (UTF-8 bytes).
+pub const MAX_FINDING_BASIS_BYTES: usize = MAX_STATEMENT_BYTES;
+/// Hard bound on one finding's revision label (UTF-8 bytes).
+pub const MAX_FINDING_REVISION_BYTES: usize = 128;
+/// Hard bound on one typed finding diagnostic's detail.
+pub const MAX_FINDING_DIAGNOSTIC_BYTES: usize = 200;
+/// Hard bound on typed diagnostics kept per finding batch.
+pub const MAX_FINDING_DIAGNOSTICS: usize = 8;
 /// Longest enrichment diagnostic kept.
 const MAX_DIAGNOSTIC_BYTES: usize = 200;
+/// Longest goal excerpt embedded in a neutral question query.
+const MAX_QUESTION_GOAL_BYTES: usize = 160;
 /// Longest goal excerpt embedded in an uncertainty statement.
 const MAX_GOAL_EXCERPT: usize = 120;
 /// Lines scanned per file for test attributes / symbols.
@@ -378,13 +406,21 @@ impl RepositorySnapshot {
     }
 }
 
-/// The compiled statements' kinds.
+/// The compiled statements' kinds. The first four are the contract IR's own
+/// vector kinds; the last three preserve the finer typed kind of an
+/// external finding whose disclosure is applied through the risk vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
     Constraint,
     Invariant,
     Risk,
     ProofObligation,
+    /// An affected-component finding.
+    Component,
+    /// A hidden-dependency finding.
+    Dependency,
+    /// A historical failure/migration finding.
+    HistoricalFailure,
 }
 
 impl StatementKind {
@@ -394,6 +430,9 @@ impl StatementKind {
             Self::Invariant => "invariant",
             Self::Risk => "risk",
             Self::ProofObligation => "proof_obligation",
+            Self::Component => "component",
+            Self::Dependency => "dependency",
+            Self::HistoricalFailure => "historical_failure",
         }
     }
 }
@@ -505,17 +544,346 @@ pub struct ContractCompileRequest {
     pub repository: RepositorySnapshot,
 }
 
-/// The neutral enrichment request handed to a
-/// [`SystemIntelligenceProvider`]: the native analysis results, never a
-/// prescription of the answer.
+/// One bounded engineering question the runtime asks a
+/// [`SystemIntelligenceProvider`] before the pure compile
+/// (`docs/specs/autonomous-engineering.md` § "System intelligence").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IntelligenceQuestion {
+    /// Which components/architecture does the objective actually touch?
+    AffectedComponents,
+    /// Which system invariants must survive the change?
+    Invariants,
+    /// Which hidden dependencies connect the change surface to the rest?
+    HiddenDependencies,
+    /// How far does the change propagate (blast radius)?
+    BlastRadius,
+    /// Which historical failures/migrations are relevant to this objective?
+    HistoricalFailures,
+}
+
+impl IntelligenceQuestion {
+    /// The fixed, bounded question set: every consult asks exactly these.
+    pub const ALL: [IntelligenceQuestion; 5] = [
+        IntelligenceQuestion::AffectedComponents,
+        IntelligenceQuestion::Invariants,
+        IntelligenceQuestion::HiddenDependencies,
+        IntelligenceQuestion::BlastRadius,
+        IntelligenceQuestion::HistoricalFailures,
+    ];
+
+    /// Stable wire/diagnostic name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AffectedComponents => "affected_components",
+            Self::Invariants => "invariants",
+            Self::HiddenDependencies => "hidden_dependencies",
+            Self::BlastRadius => "blast_radius",
+            Self::HistoricalFailures => "historical_failures",
+        }
+    }
+
+    /// Short human-readable label used as the statement prefix.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AffectedComponents => "affected component",
+            Self::Invariants => "invariant that must survive",
+            Self::HiddenDependencies => "hidden dependency",
+            Self::BlastRadius => "blast radius",
+            Self::HistoricalFailures => "historical failure",
+        }
+    }
+
+    /// The finding kind an answer to this question must carry.
+    pub const fn expected_kind(self) -> FindingKind {
+        match self {
+            Self::AffectedComponents => FindingKind::Component,
+            Self::Invariants => FindingKind::Invariant,
+            Self::HiddenDependencies => FindingKind::Dependency,
+            Self::BlastRadius => FindingKind::Risk,
+            Self::HistoricalFailures => FindingKind::HistoricalFailure,
+        }
+    }
+
+    /// The bounded neutral question text a retrieval-style provider is
+    /// asked. Deterministic: the same goal renders byte-identically.
+    pub fn query(self, goal: &str) -> String {
+        let goal = bounded(goal, MAX_QUESTION_GOAL_BYTES);
+        match self {
+            Self::AffectedComponents => format!(
+                "objective: {goal}; question affected_components: which components and architecture does this objective directly affect?"
+            ),
+            Self::Invariants => format!(
+                "objective: {goal}; question invariants: which system invariants must survive this change?"
+            ),
+            Self::HiddenDependencies => format!(
+                "objective: {goal}; question hidden_dependencies: which hidden dependencies connect this change to the rest of the system?"
+            ),
+            Self::BlastRadius => format!(
+                "objective: {goal}; question blast_radius: how far does this change propagate and what can it break?"
+            ),
+            Self::HistoricalFailures => format!(
+                "objective: {goal}; question historical_failures: which historical failures or migrations are relevant to this objective?"
+            ),
+        }
+    }
+}
+
+/// The typed kind of one provider finding answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FindingKind {
+    /// An affected component / architecture surface.
+    Component,
+    /// A system invariant that must survive.
+    Invariant,
+    /// A hidden dependency.
+    Dependency,
+    /// A blast-radius risk hypothesis.
+    Risk,
+    /// A relevant historical failure/migration.
+    HistoricalFailure,
+}
+
+impl FindingKind {
+    /// Stable wire/diagnostic name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Component => "component",
+            Self::Invariant => "invariant",
+            Self::Dependency => "dependency",
+            Self::Risk => "risk",
+            Self::HistoricalFailure => "historical_failure",
+        }
+    }
+}
+
+/// One bounded finding a provider returns: DATA, never a prescription. The
+/// runtime validates provider identity, snapshot/revision binding, kind,
+/// confidence and bounds before it can ever reach the contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnrichmentRequest<'a> {
+pub struct ProviderFinding {
+    /// The question this finding answers.
+    pub question: IntelligenceQuestion,
+    /// The answer kind (must be [`IntelligenceQuestion::expected_kind`]).
+    pub kind: FindingKind,
+    /// The bounded finding text.
+    pub text: String,
+    /// The concrete basis that justifies it.
+    pub basis: String,
+    /// Confidence in basis points.
+    pub confidence_bps: u16,
+    /// Identity of the repository snapshot the finding was derived from: it
+    /// must equal the consult's [`FindingsRequest::repository_digest`].
+    pub repository_digest: String,
+    /// The provider that stands behind the claim: it must equal the id of
+    /// the provider the runtime asked.
+    pub provider: String,
+    /// The provider's source revision label, when it declares one
+    /// (diagnostics only; the DIGEST above is the binding).
+    pub revision: Option<String>,
+    /// Risk severity for risk-shaped findings (defaults at the compiler).
+    pub severity: Option<RiskSeverity>,
+}
+
+/// Why one prospective finding was refused. Every variant is a stable typed
+/// code; the compiler records them as diagnostics and drops the finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindingRejection {
+    /// The finding names a provider other than the one that was asked.
+    ProviderMismatch { expected: String, actual: String },
+    /// The finding is bound to another snapshot/revision than the consult.
+    DigestMismatch { expected: String, actual: String },
+    /// The finding kind does not answer the question it claims.
+    KindMismatch {
+        question: IntelligenceQuestion,
+        kind: FindingKind,
+    },
+    /// The finding's text is empty.
+    EmptyText,
+    /// The finding's text exceeds [`MAX_FINDING_TEXT_BYTES`].
+    TextTooLong { bytes: usize, max: usize },
+    /// The finding's basis is empty.
+    EmptyBasis,
+    /// The finding's basis exceeds [`MAX_FINDING_BASIS_BYTES`].
+    BasisTooLong { bytes: usize, max: usize },
+    /// The confidence is outside `0..=10_000` bps.
+    ConfidenceOutOfRange { bps: u16 },
+    /// The revision label exceeds [`MAX_FINDING_REVISION_BYTES`].
+    RevisionTooLong { bytes: usize, max: usize },
+}
+
+impl FindingRejection {
+    /// Stable typed diagnostic code.
+    pub const fn code(&self) -> FindingDiagnosticCode {
+        match self {
+            Self::ProviderMismatch { .. } => FindingDiagnosticCode::ProviderMismatch,
+            Self::DigestMismatch { .. } => FindingDiagnosticCode::SnapshotMismatch,
+            Self::KindMismatch { .. } => FindingDiagnosticCode::InvalidFinding,
+            Self::EmptyText | Self::EmptyBasis => FindingDiagnosticCode::InvalidFinding,
+            Self::TextTooLong { .. } | Self::BasisTooLong { .. } | Self::RevisionTooLong { .. } => {
+                FindingDiagnosticCode::Oversized
+            }
+            Self::ConfidenceOutOfRange { .. } => FindingDiagnosticCode::InvalidFinding,
+        }
+    }
+
+    /// Bounded human-readable detail.
+    pub fn detail(&self) -> String {
+        bounded(
+            &match self {
+                Self::ProviderMismatch { expected, actual } => {
+                    format!("finding claims provider {actual:?}, expected {expected:?}")
+                }
+                Self::DigestMismatch { expected, actual } => {
+                    format!("finding is bound to snapshot {actual:?}, expected {expected:?}")
+                }
+                Self::KindMismatch { question, kind } => format!(
+                    "question {} cannot be answered by a {} finding",
+                    question.as_str(),
+                    kind.as_str()
+                ),
+                Self::EmptyText => "finding text is empty".to_string(),
+                Self::TextTooLong { bytes, max } => {
+                    format!("finding text of {bytes} bytes exceeds the {max}-byte bound")
+                }
+                Self::EmptyBasis => "finding basis is empty".to_string(),
+                Self::BasisTooLong { bytes, max } => {
+                    format!("finding basis of {bytes} bytes exceeds the {max}-byte bound")
+                }
+                Self::ConfidenceOutOfRange { bps } => {
+                    format!("finding confidence {bps} bps is outside 0..=10000")
+                }
+                Self::RevisionTooLong { bytes, max } => {
+                    format!("finding revision of {bytes} bytes exceeds the {max}-byte bound")
+                }
+            },
+            MAX_FINDING_DIAGNOSTIC_BYTES,
+        )
+    }
+}
+
+/// The typed class of one finding diagnostic (stable codes: tests and
+/// operators branch on these, never on prose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FindingDiagnosticCode {
+    /// The whole consult was refused by the provider.
+    ProviderRefused,
+    /// The consult exceeded the runtime's wall bound.
+    ProviderTimedOut,
+    /// The finding names another provider than the one asked.
+    ProviderMismatch,
+    /// The finding is bound to another snapshot/revision.
+    SnapshotMismatch,
+    /// The provider response carried invalid provenance/workspace identity.
+    InvalidProvenance,
+    /// No workspace content revision could be established for the questions.
+    RevisionUnavailable,
+    /// A bounded payload was exceeded.
+    Oversized,
+    /// The finding is otherwise malformed.
+    InvalidFinding,
+    /// No provider could serve the consult (absent/cooling/incompatible).
+    ProviderUnavailable,
+    /// The statement/entry cap was reached.
+    CapReached,
+}
+
+impl FindingDiagnosticCode {
+    /// Stable code string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderRefused => "provider_refused",
+            Self::ProviderTimedOut => "provider_timed_out",
+            Self::ProviderMismatch => "provider_mismatch",
+            Self::SnapshotMismatch => "snapshot_mismatch",
+            Self::InvalidProvenance => "invalid_provenance",
+            Self::RevisionUnavailable => "revision_unavailable",
+            Self::Oversized => "oversized",
+            Self::InvalidFinding => "invalid_finding",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::CapReached => "cap_reached",
+        }
+    }
+}
+
+/// One typed finding diagnostic: what was dropped and why. Diagnostics are
+/// disclosure only — they never alter the native contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingDiagnostic {
+    pub provider: String,
+    pub code: FindingDiagnosticCode,
+    pub detail: String,
+}
+
+impl FindingDiagnostic {
+    pub fn new(
+        provider: impl Into<String>,
+        code: FindingDiagnosticCode,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            code,
+            detail: bounded(&detail.into(), MAX_FINDING_DIAGNOSTIC_BYTES),
+        }
+    }
+}
+
+/// The bounded answer to one findings consult: findings plus the typed
+/// diagnostics of everything dropped along the way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FindingsResponse {
+    pub findings: Vec<ProviderFinding>,
+    pub diagnostics: Vec<FindingDiagnostic>,
+}
+
+/// The explicit async-operation envelope of one findings consult
+/// (commandment 2: `operation_id, session_id, started_ms, deadline,
+/// cancellation_token` are carried, never implicit), plus the neutral
+/// engineering inputs, never a prescription of the answer.
+#[derive(Debug, Clone)]
+pub struct FindingsRequest<'a> {
+    pub operation_id: OpId,
+    pub session_id: SessionId,
+    pub workspace: WorkspaceId,
+    pub started_ms: i64,
+    pub deadline: Option<Deadline>,
+    pub cancellation: CancellationToken,
+    /// The workspace content revision the questions are bound to, when the
+    /// runtime could establish one. `None` means no content identity exists:
+    /// a provider must not answer (identity law — no synthetic revision).
+    pub source_revision: Option<&'a str>,
     pub goal: &'a str,
     pub intent_tokens: &'a [String],
     pub build_systems: &'a [String],
     pub repository_digest: &'a str,
     pub native_contract: &'a EngineeringContract,
-    pub max_statements: usize,
+    /// The fixed question set; always [`IntelligenceQuestion::ALL`].
+    pub questions: &'a [IntelligenceQuestion],
+    /// Hard bound on findings the provider may return.
+    pub max_findings: usize,
+}
+
+/// Boxed future returned by the findings seam. Standard library only: this
+/// crate carries no async runtime.
+pub type IntelligenceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The neutral system-intelligence seam (`docs/specs/autonomous-engineering.md`).
+/// The runtime ASKS bounded questions before the pure compile; the provider
+/// never touches the compiler and is never required: an absent provider, a
+/// refusal or a timeout leaves the native contract byte-identical.
+pub trait SystemIntelligenceProvider: Send + Sync {
+    /// Stable provider id used as the `external:<provider>` provenance tag.
+    fn provider_id(&self) -> &str;
+
+    /// Answer the fixed bounded question set. `Err` is diagnosed but never
+    /// alters the contract. The default answers nothing.
+    fn findings<'a>(
+        &'a self,
+        request: &'a FindingsRequest<'a>,
+    ) -> IntelligenceFuture<'a, Result<FindingsResponse, String>> {
+        let _ = request;
+        Box::pin(async { Ok(FindingsResponse::default()) })
+    }
 }
 
 /// What an enrichment provider may add. Obligations MUST carry a bound
@@ -527,6 +895,13 @@ pub enum EnrichmentKind {
     Invariant,
     Risk,
     ProofObligation,
+    /// An affected-component finding (applied as an external risk
+    /// disclosure unless the provider supplied a stronger kind).
+    Component,
+    /// A hidden-dependency finding.
+    Dependency,
+    /// A historical failure/migration finding.
+    HistoricalFailure,
 }
 
 /// One enrichment statement proposed by an external provider.
@@ -544,16 +919,6 @@ pub struct EnrichmentStatement {
     pub severity: Option<RiskSeverity>,
     /// Proof obligations: TRUE for a disclosure-only (Advisory) claim.
     pub advisory: bool,
-}
-
-/// The neutral system-intelligence seam (`docs/specs/autonomous-engineering.md`).
-/// A provider may enrich the SAME IR additively; it is never required, and
-/// an absent/refusing provider cannot alter the native contract.
-pub trait SystemIntelligenceProvider {
-    /// Stable provider id used as the `external:<provider>` provenance tag.
-    fn provider_id(&self) -> &str;
-    /// Bounded enrichment. `Err` is diagnosed but never alters the contract.
-    fn enrich(&self, request: &EnrichmentRequest<'_>) -> Result<Vec<EnrichmentStatement>, String>;
 }
 
 /// Normalize a goal into deterministic intent tokens: lowercase ASCII
@@ -577,27 +942,102 @@ pub fn intent_tokens(goal: &str) -> Vec<String> {
     tokens.into_iter().collect()
 }
 
-/// Compile the native baseline contract (no external enrichment).
+/// Compile the native baseline contract (no external findings).
 pub fn compile_contract(request: &ContractCompileRequest) -> CompiledContract {
-    compile_contract_with(request, None)
-}
-
-/// Compile the native baseline contract and, when a provider is configured,
-/// let it ENRICH the same IR additively. With `None` (or an empty/refusing
-/// provider) the contract is byte-identical to [`compile_contract`].
-pub fn compile_contract_with(
-    request: &ContractCompileRequest,
-    provider: Option<&dyn SystemIntelligenceProvider>,
-) -> CompiledContract {
     let intent = intent_tokens(&request.goal);
     let files = normalize_files(&request.repository.files);
     let build_systems = detect_build_systems(&files);
     let selectors = discover_test_selectors(&files);
-    let mut compiled = NativeCompile::run(request, &intent, &files, &build_systems, &selectors);
-    if let Some(provider) = provider {
-        apply_enrichment(&mut compiled, request, provider);
+    NativeCompile::run(request, &intent, &files, &build_systems, &selectors)
+}
+
+/// Compile the native baseline contract and apply the bounded findings the
+/// runtime already asked the provider for. The function stays PURE: findings
+/// are DATA, every one is re-validated against `request`'s own identity
+/// (defense in depth), and an empty/malformed/refusing answer leaves the
+/// native contract byte-identical to [`compile_contract`].
+///
+/// PRIVATE on purpose: this is the raw apply path. External callers reach it
+/// ONLY through [`compile_contract_with_findings_checked`], which enforces
+/// the `organization_contracts` value entitlement first — an embedder must
+/// not be able to bypass the org gate by calling the pure apply directly.
+/// In-crate unit tests exercise the raw path directly.
+fn compile_contract_with_findings(
+    request: &ContractCompileRequest,
+    provider_id: &str,
+    response: &FindingsResponse,
+) -> CompiledContract {
+    let mut compiled = compile_contract(request);
+    let Some(provider_id) = sanitized_provider_id(provider_id) else {
+        compiled.enrichments.push(EnrichmentOutcome {
+            provider: provider_id.to_string(),
+            applied: 0,
+            skipped: 0,
+            diagnostic: Some("provider id is empty after sanitization; findings refused".into()),
+        });
+        return compiled;
+    };
+    let conversion = findings_to_statements(
+        &provider_id,
+        &compiled.repository_digest,
+        MAX_ENRICHMENT_STATEMENTS,
+        &response.findings,
+    );
+    let origin = StatementOrigin::External {
+        provider: provider_id.clone(),
+    };
+    let mut outcome = EnrichmentOutcome {
+        provider: provider_id,
+        applied: 0,
+        skipped: 0,
+        diagnostic: None,
+    };
+    let mut skip_reasons: Vec<String> = Vec::new();
+    for diagnostic in &response.diagnostics {
+        push_skip_reason(&mut skip_reasons, diagnostic.code.as_str());
     }
+    for diagnostic in &conversion.diagnostics {
+        push_skip_reason(&mut skip_reasons, diagnostic.code.as_str());
+    }
+    outcome.skipped = conversion.rejected;
+    for statement in conversion.statements {
+        match apply_enrichment_statement(&mut compiled, &origin, statement) {
+            Ok(()) => outcome.applied += 1,
+            Err(reason) => {
+                outcome.skipped += 1;
+                push_skip_reason(&mut skip_reasons, &reason);
+            }
+        }
+    }
+    if !skip_reasons.is_empty() {
+        outcome.diagnostic = Some(bounded(
+            &format!("dropped findings: {}", skip_reasons.join("; ")),
+            MAX_DIAGNOSTIC_BYTES,
+        ));
+    }
+    compiled.enrichments.push(outcome);
     compiled
+}
+
+/// The ONLY public entry of the findings-enrichment path: the
+/// `organization_contracts` value entitlement is an ENFORCED parameter, not
+/// a convention. A refusal is the typed
+/// [`crate::entitlement::ValueGateRefusal`] naming the entitlement, its
+/// hook, the cause and (when resolved) the plan — the caller keeps the
+/// native contract ([`compile_contract`] output) standing. With a granting
+/// gate the output is byte-identical to the raw apply path.
+pub fn compile_contract_with_findings_checked(
+    request: &ContractCompileRequest,
+    provider_id: &str,
+    response: &FindingsResponse,
+    gate: &crate::entitlement::ValueGate,
+) -> Result<CompiledContract, crate::entitlement::ValueGateRefusal> {
+    gate.check(crate::entitlement::ValueEntitlement::OrganizationContracts)?;
+    Ok(compile_contract_with_findings(
+        request,
+        provider_id,
+        response,
+    ))
 }
 
 struct NativeCompile<'a> {
@@ -1176,78 +1616,177 @@ impl<'a> NativeCompile<'a> {
     }
 }
 
-/// Apply one provider's enrichment: validate every statement, append the
-/// valid ones with `external:<provider>` provenance, and diagnose the rest.
-fn apply_enrichment(
-    compiled: &mut CompiledContract,
-    request: &ContractCompileRequest,
-    provider: &dyn SystemIntelligenceProvider,
-) {
-    let Some(provider_id) = sanitized_provider_id(provider.provider_id()) else {
-        compiled.enrichments.push(EnrichmentOutcome {
-            provider: provider.provider_id().to_string(),
-            applied: 0,
-            skipped: 0,
-            diagnostic: Some("provider id is empty after sanitization; enrichment refused".into()),
-        });
-        return;
-    };
-    let origin = StatementOrigin::External {
-        provider: provider_id.clone(),
-    };
-    let max_statements = MAX_ENRICHMENT_STATEMENTS;
-    let enrichment_request = EnrichmentRequest {
-        goal: &request.goal,
-        intent_tokens: &compiled.intent_tokens,
-        build_systems: &compiled.build_systems,
-        repository_digest: &compiled.repository_digest,
-        native_contract: &compiled.contract,
-        max_statements,
-    };
-    let mut outcome = EnrichmentOutcome {
-        provider: provider_id,
-        applied: 0,
-        skipped: 0,
-        diagnostic: None,
-    };
-    let mut skip_reasons: Vec<String> = Vec::new();
-    match provider.enrich(&enrichment_request) {
-        Ok(statements) => {
-            for statement in statements {
-                if outcome.applied + outcome.skipped >= max_statements {
-                    outcome.skipped += 1;
-                    push_skip_reason(&mut skip_reasons, "statement cap reached");
-                    continue;
-                }
-                match apply_enrichment_statement(compiled, &origin, statement) {
-                    Ok(()) => outcome.applied += 1,
-                    Err(reason) => {
-                        outcome.skipped += 1;
-                        push_skip_reason(&mut skip_reasons, &reason);
-                    }
+/// The pure conversion of one bounded finding batch: the accepted
+/// enrichment statements plus one typed diagnostic per refused finding.
+/// Deterministic in input order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FindingsConversion {
+    pub statements: Vec<EnrichmentStatement>,
+    pub diagnostics: Vec<FindingDiagnostic>,
+    /// Findings refused (by validation or the bound).
+    pub rejected: usize,
+}
+
+/// Validate + convert a bounded batch of findings against the consult's
+/// identity. Pure and total: hostile input yields typed diagnostics, never
+/// an error and never a statement the compiler must skip.
+pub fn findings_to_statements(
+    expected_provider: &str,
+    expected_digest: &str,
+    max_findings: usize,
+    findings: &[ProviderFinding],
+) -> FindingsConversion {
+    let mut out = FindingsConversion::default();
+    let mut cap_diagnosed = false;
+    for (index, finding) in findings.iter().enumerate() {
+        if index >= max_findings {
+            out.rejected += 1;
+            if !cap_diagnosed && out.diagnostics.len() < MAX_FINDING_DIAGNOSTICS {
+                cap_diagnosed = true;
+                out.diagnostics.push(FindingDiagnostic::new(
+                    expected_provider,
+                    FindingDiagnosticCode::CapReached,
+                    format!("more than {max_findings} findings returned; the excess was dropped"),
+                ));
+            }
+            continue;
+        }
+        match finding_to_statement(finding, expected_provider, expected_digest) {
+            Ok(statement) => out.statements.push(statement),
+            Err(rejection) => {
+                out.rejected += 1;
+                if out.diagnostics.len() < MAX_FINDING_DIAGNOSTICS {
+                    out.diagnostics.push(FindingDiagnostic::new(
+                        expected_provider,
+                        rejection.code(),
+                        format!("{}: {}", finding.kind.as_str(), rejection.detail()),
+                    ));
                 }
             }
         }
-        Err(error) => {
-            outcome.diagnostic = Some(bounded(
-                &format!("provider refused: {error}"),
-                MAX_DIAGNOSTIC_BYTES,
-            ));
+    }
+    out
+}
+
+/// Validate ONE finding against the consult's identity and convert it to an
+/// immutable bounded enrichment statement. Every refusal is typed.
+pub fn finding_to_statement(
+    finding: &ProviderFinding,
+    expected_provider: &str,
+    expected_digest: &str,
+) -> Result<EnrichmentStatement, FindingRejection> {
+    if finding.provider != expected_provider {
+        return Err(FindingRejection::ProviderMismatch {
+            expected: expected_provider.to_string(),
+            actual: finding.provider.clone(),
+        });
+    }
+    if finding.repository_digest != expected_digest {
+        return Err(FindingRejection::DigestMismatch {
+            expected: expected_digest.to_string(),
+            actual: finding.repository_digest.clone(),
+        });
+    }
+    if finding.kind != finding.question.expected_kind() {
+        return Err(FindingRejection::KindMismatch {
+            question: finding.question,
+            kind: finding.kind,
+        });
+    }
+    if finding.text.trim().is_empty() {
+        return Err(FindingRejection::EmptyText);
+    }
+    if finding.text.len() > MAX_FINDING_TEXT_BYTES {
+        return Err(FindingRejection::TextTooLong {
+            bytes: finding.text.len(),
+            max: MAX_FINDING_TEXT_BYTES,
+        });
+    }
+    if finding.basis.trim().is_empty() {
+        return Err(FindingRejection::EmptyBasis);
+    }
+    if finding.basis.len() > MAX_FINDING_BASIS_BYTES {
+        return Err(FindingRejection::BasisTooLong {
+            bytes: finding.basis.len(),
+            max: MAX_FINDING_BASIS_BYTES,
+        });
+    }
+    if finding.confidence_bps > 10_000 {
+        return Err(FindingRejection::ConfidenceOutOfRange {
+            bps: finding.confidence_bps,
+        });
+    }
+    if let Some(revision) = &finding.revision {
+        if revision.len() > MAX_FINDING_REVISION_BYTES {
+            return Err(FindingRejection::RevisionTooLong {
+                bytes: revision.len(),
+                max: MAX_FINDING_REVISION_BYTES,
+            });
         }
     }
-    if !skip_reasons.is_empty() && outcome.diagnostic.is_none() {
-        outcome.diagnostic = Some(bounded(
-            &format!("skipped statements: {}", skip_reasons.join("; ")),
-            MAX_DIAGNOSTIC_BYTES,
-        ));
-    }
-    compiled.enrichments.push(outcome);
+    let (kind, severity) = match finding.kind {
+        FindingKind::Component => (
+            EnrichmentKind::Component,
+            finding.severity.or(Some(RiskSeverity::Low)),
+        ),
+        FindingKind::Invariant => (EnrichmentKind::Invariant, finding.severity),
+        FindingKind::Dependency => (EnrichmentKind::Dependency, finding.severity),
+        FindingKind::Risk => (EnrichmentKind::Risk, finding.severity),
+        FindingKind::HistoricalFailure => (EnrichmentKind::HistoricalFailure, finding.severity),
+    };
+    let text = bounded(
+        &format!("{}: {}", finding.question.label(), finding.text.trim()),
+        MAX_STATEMENT_BYTES,
+    );
+    Ok(EnrichmentStatement {
+        kind,
+        text,
+        confidence_bps: finding.confidence_bps,
+        basis: bounded(&finding.basis, MAX_FINDING_BASIS_BYTES),
+        evidence: None,
+        binding: None,
+        severity,
+        advisory: false,
+    })
 }
 
 fn push_skip_reason(reasons: &mut Vec<String>, reason: &str) {
     if reasons.len() < 3 && !reasons.iter().any(|seen| seen == reason) {
         reasons.push(reason.to_string());
     }
+}
+
+/// Apply one external risk-vector statement (a risk, or a typed finding kind
+/// disclosed through the risk vector) with bounded caps and provenance.
+fn push_enriched_risk(
+    compiled: &mut CompiledContract,
+    origin: &StatementOrigin,
+    kind: StatementKind,
+    text: String,
+    basis: String,
+    statement: &EnrichmentStatement,
+) -> Result<(), String> {
+    if compiled.contract.risks.len() >= MAX_RISKS {
+        return Err("risk cap reached".into());
+    }
+    let id = entry_id("r1", &text);
+    if compiled.contract.risks.iter().any(|r| r.id == id) {
+        return Err("duplicate risk id".into());
+    }
+    compiled.contract.risks.push(RiskHypothesis {
+        id: id.clone(),
+        description: text,
+        severity: statement.severity.unwrap_or(RiskSeverity::Medium),
+        origin: origin.contract_origin(),
+    });
+    compiled.provenance.push(StatementProvenance {
+        statement_id: id,
+        kind,
+        origin: origin.clone(),
+        confidence_bps: statement.confidence_bps.min(10_000),
+        basis,
+    });
+    Ok(())
 }
 
 fn apply_enrichment_statement(
@@ -1312,28 +1851,27 @@ fn apply_enrichment_statement(
             });
             Ok(())
         }
-        EnrichmentKind::Risk => {
-            if compiled.contract.risks.len() >= MAX_RISKS {
-                return Err("risk cap reached".into());
-            }
-            let id = entry_id("r1", &text);
-            if compiled.contract.risks.iter().any(|r| r.id == id) {
-                return Err("duplicate risk id".into());
-            }
-            compiled.contract.risks.push(RiskHypothesis {
-                id: id.clone(),
-                description: text,
-                severity: statement.severity.unwrap_or(RiskSeverity::Medium),
-                origin: origin.contract_origin(),
-            });
-            compiled.provenance.push(StatementProvenance {
-                statement_id: id,
-                kind: StatementKind::Risk,
-                origin: origin.clone(),
-                confidence_bps: statement.confidence_bps.min(10_000),
-                basis,
-            });
-            Ok(())
+        EnrichmentKind::Risk => push_enriched_risk(
+            compiled,
+            origin,
+            StatementKind::Risk,
+            text,
+            basis,
+            &statement,
+        ),
+        // Finding kinds without a dedicated IR vector apply as external risk
+        // DISCLOSURES (never as constraints/invariants: a component/dependency
+        // finding is data, and the finer typed kind survives in provenance).
+        EnrichmentKind::Component
+        | EnrichmentKind::Dependency
+        | EnrichmentKind::HistoricalFailure => {
+            let statement_kind = match statement.kind {
+                EnrichmentKind::Component => StatementKind::Component,
+                EnrichmentKind::Dependency => StatementKind::Dependency,
+                EnrichmentKind::HistoricalFailure => StatementKind::HistoricalFailure,
+                _ => unreachable!("arm matched above"),
+            };
+            push_enriched_risk(compiled, origin, statement_kind, text, basis, &statement)
         }
         EnrichmentKind::ProofObligation => {
             if compiled.contract.proof_obligations.len()
@@ -2213,107 +2751,187 @@ fn replayed_refresh_token_fails() {}
         );
     }
 
-    struct NoopProvider;
-    impl SystemIntelligenceProvider for NoopProvider {
-        fn provider_id(&self) -> &str {
-            "tangerine"
-        }
-        fn enrich(
-            &self,
-            _request: &EnrichmentRequest<'_>,
-        ) -> Result<Vec<EnrichmentStatement>, String> {
-            Ok(Vec::new())
-        }
-    }
-
-    struct FailingProvider;
-    impl SystemIntelligenceProvider for FailingProvider {
-        fn provider_id(&self) -> &str {
-            "tangerine"
-        }
-        fn enrich(
-            &self,
-            _request: &EnrichmentRequest<'_>,
-        ) -> Result<Vec<EnrichmentStatement>, String> {
-            Err("provider unavailable".into())
-        }
-    }
-
-    struct AddingProvider;
-    impl SystemIntelligenceProvider for AddingProvider {
-        fn provider_id(&self) -> &str {
-            "tangerine"
-        }
-        fn enrich(
-            &self,
-            _request: &EnrichmentRequest<'_>,
-        ) -> Result<Vec<EnrichmentStatement>, String> {
-            Ok(vec![
-                EnrichmentStatement {
-                    kind: EnrichmentKind::ProofObligation,
-                    text: "the refresh endpoint rejects replayed tokens".into(),
-                    confidence_bps: 9_500,
-                    basis: "provider architecture analysis".into(),
-                    evidence: Some(ProofEvidenceKind::TestExecution),
-                    binding: Some(EvidenceBinding::TestSelector(
-                        "auth::refresh::tests::replay_is_rejected".into(),
-                    )),
-                    severity: None,
-                    advisory: false,
-                },
-                EnrichmentStatement {
-                    kind: EnrichmentKind::Risk,
-                    text: "token rotation may desynchronize legacy clients".into(),
-                    confidence_bps: 8_000,
-                    basis: "provider architecture analysis".into(),
-                    evidence: None,
-                    binding: None,
-                    severity: Some(RiskSeverity::High),
-                    advisory: false,
-                },
-                EnrichmentStatement {
-                    kind: EnrichmentKind::Constraint,
-                    text: "existing API clients cannot break".into(),
-                    confidence_bps: 8_500,
-                    basis: "provider contract analysis".into(),
-                    evidence: None,
-                    binding: None,
-                    severity: None,
-                    advisory: false,
-                },
-            ])
+    /// One finding against the request's own snapshot identity.
+    fn finding(
+        question: IntelligenceQuestion,
+        text: &str,
+        digest: &str,
+        provider: &str,
+    ) -> ProviderFinding {
+        ProviderFinding {
+            question,
+            kind: question.expected_kind(),
+            text: text.to_string(),
+            basis: "provider engineering analysis".to_string(),
+            confidence_bps: 8_000,
+            repository_digest: digest.to_string(),
+            provider: provider.to_string(),
+            revision: Some("rev-1".to_string()),
+            severity: None,
         }
     }
 
     #[test]
-    fn enrichment_is_additive_with_external_provenance_and_no_provider_equivalence() {
-        let native = compile_contract(&request(REFRESH_GOAL, refresh_snapshot()));
-        let noop = compile_contract_with(
-            &request(REFRESH_GOAL, refresh_snapshot()),
-            Some(&NoopProvider),
+    fn finding_validation_rejects_identity_bounds_and_kind_mismatches_typed() {
+        let digest = "repo2:test";
+        let good = finding(
+            IntelligenceQuestion::AffectedComponents,
+            "auth.refresh owns token rotation",
+            digest,
+            "tangerine",
+        );
+        assert!(finding_to_statement(&good, "tangerine", digest).is_ok());
+
+        let mut wrong_provider = good.clone();
+        wrong_provider.provider = "other".into();
+        let rejection = finding_to_statement(&wrong_provider, "tangerine", digest).unwrap_err();
+        assert_eq!(rejection.code(), FindingDiagnosticCode::ProviderMismatch);
+
+        let mut stale = good.clone();
+        stale.repository_digest = "repo2:stale".into();
+        let rejection = finding_to_statement(&stale, "tangerine", digest).unwrap_err();
+        assert_eq!(
+            rejection.code(),
+            FindingDiagnosticCode::SnapshotMismatch,
+            "a stale snapshot/revision binding is refused typed"
+        );
+
+        let mut wrong_kind = good.clone();
+        wrong_kind.kind = FindingKind::Risk;
+        let rejection = finding_to_statement(&wrong_kind, "tangerine", digest).unwrap_err();
+        assert!(matches!(rejection, FindingRejection::KindMismatch { .. }));
+
+        let mut oversized = good.clone();
+        oversized.text = "x".repeat(MAX_FINDING_TEXT_BYTES + 1);
+        assert_eq!(
+            finding_to_statement(&oversized, "tangerine", digest)
+                .unwrap_err()
+                .code(),
+            FindingDiagnosticCode::Oversized
+        );
+        let mut empty = good.clone();
+        empty.text = "   ".into();
+        assert_eq!(
+            finding_to_statement(&empty, "tangerine", digest)
+                .unwrap_err()
+                .code(),
+            FindingDiagnosticCode::InvalidFinding
+        );
+        let mut baseless = good.clone();
+        baseless.basis = String::new();
+        assert!(finding_to_statement(&baseless, "tangerine", digest).is_err());
+        let mut overconfident = good.clone();
+        overconfident.confidence_bps = 10_001;
+        assert_eq!(
+            finding_to_statement(&overconfident, "tangerine", digest)
+                .unwrap_err()
+                .code(),
+            FindingDiagnosticCode::InvalidFinding
+        );
+
+        // A batch beyond the cap is bounded: one typed CapReached diagnostic,
+        // every excess finding counted as rejected, never an error.
+        let many: Vec<ProviderFinding> = (0..(MAX_FINDINGS + 5))
+            .map(|i| {
+                finding(
+                    IntelligenceQuestion::BlastRadius,
+                    &format!("risk {i}"),
+                    digest,
+                    "tangerine",
+                )
+            })
+            .collect();
+        let conversion = findings_to_statements("tangerine", digest, MAX_FINDINGS, &many);
+        assert_eq!(conversion.statements.len(), MAX_FINDINGS);
+        assert_eq!(conversion.rejected, 5);
+        assert!(conversion
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == FindingDiagnosticCode::CapReached));
+    }
+
+    #[test]
+    fn findings_are_additive_with_external_provenance_and_no_findings_equivalence() {
+        let native_request = request(REFRESH_GOAL, refresh_snapshot());
+        let native = compile_contract(&native_request);
+        assert!(native.enrichments.is_empty());
+
+        // No findings: byte-identical to the native compile.
+        let empty = compile_contract_with_findings(
+            &native_request,
+            "tangerine",
+            &FindingsResponse::default(),
         );
         assert_eq!(
-            native.contract, noop.contract,
-            "an empty provider changes nothing"
+            serde_json::to_vec(&empty.contract).unwrap(),
+            serde_json::to_vec(&native.contract).unwrap(),
+            "no findings must compile byte-identically to the native path"
         );
-        let failing = compile_contract_with(
-            &request(REFRESH_GOAL, refresh_snapshot()),
-            Some(&FailingProvider),
-        );
-        assert_eq!(
-            native.contract, failing.contract,
-            "a refusing provider never alters the contract"
-        );
-        assert!(failing.enrichments[0]
+        assert!(empty
+            .provenance
+            .iter()
+            .all(|entry| !matches!(entry.origin, StatementOrigin::External { .. })));
+
+        // A consult refusal is diagnosed and never alters the contract.
+        let refused = FindingsResponse {
+            findings: Vec::new(),
+            diagnostics: vec![FindingDiagnostic::new(
+                "tangerine",
+                FindingDiagnosticCode::ProviderRefused,
+                "provider unavailable",
+            )],
+        };
+        let refused_compile =
+            compile_contract_with_findings(&native_request, "tangerine", &refused);
+        assert_eq!(refused_compile.contract, native.contract);
+        let outcome = &refused_compile.enrichments[0];
+        assert_eq!(outcome.applied, 0);
+        assert!(outcome
             .diagnostic
             .as_deref()
             .unwrap()
-            .contains("provider unavailable"));
-        let enriched = compile_contract_with(
-            &request(REFRESH_GOAL, refresh_snapshot()),
-            Some(&AddingProvider),
-        );
-        // Native statements are preserved byte-for-byte.
+            .contains("provider_refused"));
+
+        // Real findings answer the questions: the contract gains
+        // provenance-tagged statements, NOT capability descriptions.
+        let digest = native.repository_digest.clone();
+        let response = FindingsResponse {
+            findings: vec![
+                finding(
+                    IntelligenceQuestion::AffectedComponents,
+                    "auth.refresh owns token rotation",
+                    &digest,
+                    "tangerine",
+                ),
+                finding(
+                    IntelligenceQuestion::Invariants,
+                    "issued tokens stay usable until expiry",
+                    &digest,
+                    "tangerine",
+                ),
+                finding(
+                    IntelligenceQuestion::HiddenDependencies,
+                    "billing depends on token introspection",
+                    &digest,
+                    "tangerine",
+                ),
+                finding(
+                    IntelligenceQuestion::BlastRadius,
+                    "session middleware breaks if the refresh shape changes",
+                    &digest,
+                    "tangerine",
+                ),
+                finding(
+                    IntelligenceQuestion::HistoricalFailures,
+                    "a prior migration double-issued refresh tokens",
+                    &digest,
+                    "tangerine",
+                ),
+            ],
+            diagnostics: Vec::new(),
+        };
+        let enriched = compile_contract_with_findings(&native_request, "tangerine", &response);
+        // Native statements are preserved verbatim.
         for obligation in &native.contract.proof_obligations {
             assert!(enriched
                 .contract
@@ -2324,129 +2942,178 @@ fn replayed_refresh_token_fails() {}
         for risk in &native.contract.risks {
             assert!(enriched.contract.risks.iter().any(|r| r == risk));
         }
-        // The external statements carry external:<provider> provenance.
-        let external = enriched
+        // Component/dependency/blast-radius/historical-failure answers are
+        // external risk hypotheses; the invariant answer becomes an
+        // external invariant. Every entry names its provider.
+        for (label, text) in [
+            ("affected component", "auth.refresh owns token rotation"),
+            (
+                r#"hidden dependency"#,
+                "billing depends on token introspection",
+            ),
+            (
+                "blast radius",
+                "session middleware breaks if the refresh shape changes",
+            ),
+            (
+                "historical failure",
+                "a prior migration double-issued refresh tokens",
+            ),
+        ] {
+            let risk = enriched
+                .contract
+                .risks
+                .iter()
+                .find(|risk| risk.description.contains(text))
+                .unwrap_or_else(|| panic!("missing external risk for {label}"));
+            assert!(
+                risk.description.starts_with(&format!("{label}: ")),
+                "typed question label must survive: {}",
+                risk.description
+            );
+            assert_eq!(
+                risk.origin,
+                ContractOrigin::External {
+                    provider: "tangerine".into()
+                }
+            );
+        }
+        let invariant = enriched
             .contract
-            .proof_obligations
+            .invariants
             .iter()
-            .find(|o| o.claim == "the refresh endpoint rejects replayed tokens")
-            .expect("the enriched obligation");
+            .find(|invariant| invariant.statement.contains("issued tokens stay usable"))
+            .expect("the invariant finding lands as an external invariant");
         assert_eq!(
-            external.origin,
+            invariant.origin,
             ContractOrigin::External {
                 provider: "tangerine".into()
             }
         );
-        let entry = enriched
+        // The finer typed kinds survive in provenance.
+        let external_kinds: Vec<StatementKind> = enriched
             .provenance
             .iter()
-            .find(|entry| entry.statement_id == external.id)
-            .unwrap();
-        assert_eq!(entry.origin.as_str(), "external:tangerine");
-        assert!(enriched
-            .contract
-            .risks
-            .iter()
-            .any(|risk| risk.description == "token rotation may desynchronize legacy clients"));
-        assert!(enriched
-            .contract
-            .constraints
-            .iter()
-            .any(|constraint| constraint.statement == "existing API clients cannot break"));
-        assert_eq!(enriched.enrichments[0].applied, 3);
-        assert_eq!(enriched.enrichments[0].skipped, 0);
-    }
-
-    struct HostileProvider;
-    impl SystemIntelligenceProvider for HostileProvider {
-        fn provider_id(&self) -> &str {
-            "hostile provider"
+            .filter(|entry| {
+                matches!(
+                    entry.origin,
+                    StatementOrigin::External { ref provider } if provider == "tangerine"
+                )
+            })
+            .map(|entry| entry.kind)
+            .collect();
+        for expected in [
+            StatementKind::Component,
+            StatementKind::Invariant,
+            StatementKind::Dependency,
+            StatementKind::Risk,
+            StatementKind::HistoricalFailure,
+        ] {
+            assert!(
+                external_kinds.contains(&expected),
+                "missing typed provenance kind {expected:?}: {external_kinds:?}"
+            );
         }
-        fn enrich(
-            &self,
-            _request: &EnrichmentRequest<'_>,
-        ) -> Result<Vec<EnrichmentStatement>, String> {
-            let mut statements = vec![
-                EnrichmentStatement {
-                    kind: EnrichmentKind::ProofObligation,
-                    text: "category-bound fabrication".into(),
-                    confidence_bps: 10_000,
-                    basis: String::new(),
-                    evidence: Some(ProofEvidenceKind::Compile),
-                    binding: Some(EvidenceBinding::Category),
-                    severity: None,
-                    advisory: false,
-                },
-                EnrichmentStatement {
-                    kind: EnrichmentKind::ProofObligation,
-                    text: "bindingless fabrication".into(),
-                    confidence_bps: 10_000,
-                    basis: String::new(),
-                    evidence: Some(ProofEvidenceKind::Compile),
-                    binding: None,
-                    severity: None,
-                    advisory: false,
-                },
-                EnrichmentStatement {
-                    kind: EnrichmentKind::Constraint,
-                    text: "   ".into(),
-                    confidence_bps: 10_000,
-                    basis: String::new(),
-                    evidence: None,
-                    binding: None,
-                    severity: None,
-                    advisory: false,
-                },
-                EnrichmentStatement {
-                    kind: EnrichmentKind::Risk,
-                    text: "x".repeat(MAX_STATEMENT_BYTES + 1),
-                    confidence_bps: 10_000,
-                    basis: String::new(),
-                    evidence: None,
-                    binding: None,
-                    severity: None,
-                    advisory: false,
-                },
-            ];
-            for index in 0..40 {
-                statements.push(EnrichmentStatement {
-                    kind: EnrichmentKind::Risk,
-                    text: format!("hostile risk {index}"),
-                    confidence_bps: 10_000,
-                    basis: "hostile".into(),
-                    evidence: None,
-                    binding: None,
-                    severity: Some(RiskSeverity::High),
-                    advisory: false,
-                });
+        for entry in &enriched.provenance {
+            if matches!(entry.origin, StatementOrigin::External { .. }) {
+                assert!(entry.confidence_bps <= 10_000);
+                assert!(!entry.basis.is_empty());
             }
-            Ok(statements)
         }
+        assert_eq!(enriched.enrichments[0].applied, 5);
+        assert_eq!(enriched.enrichments[0].skipped, 0);
+        assert!(enriched.enrichments[0].diagnostic.is_none());
     }
 
     #[test]
-    fn hostile_enrichment_is_skipped_never_emitted() {
-        let compiled = compile_contract_with(
-            &request(REFRESH_GOAL, refresh_snapshot()),
-            Some(&HostileProvider),
-        );
+    fn hostile_findings_are_bounded_and_never_emitted() {
+        let native_request = request(REFRESH_GOAL, refresh_snapshot());
+        let digest = compile_contract(&native_request).repository_digest;
+        let mut findings: Vec<ProviderFinding> = vec![
+            {
+                let mut oversized = finding(
+                    IntelligenceQuestion::AffectedComponents,
+                    "oversized",
+                    &digest,
+                    "hostile provider",
+                );
+                oversized.text = "x".repeat(MAX_FINDING_TEXT_BYTES + 1);
+                oversized
+            },
+            {
+                let mut stale = finding(
+                    IntelligenceQuestion::BlastRadius,
+                    "stale snapshot fabrication",
+                    "repo2:other",
+                    "hostile provider",
+                );
+                stale.revision = Some("y".repeat(MAX_FINDING_REVISION_BYTES + 1));
+                stale
+            },
+            {
+                let mut wrong_provider = finding(
+                    IntelligenceQuestion::BlastRadius,
+                    "provider laundering",
+                    &digest,
+                    "somebody-else",
+                );
+                wrong_provider.provider = "somebody-else".into();
+                wrong_provider
+            },
+            {
+                let mut empty = finding(
+                    IntelligenceQuestion::Invariants,
+                    "   ",
+                    &digest,
+                    "hostile provider",
+                );
+                empty.basis = String::new();
+                empty
+            },
+        ];
+        for index in 0..(MAX_FINDINGS + 16) {
+            findings.push(finding(
+                IntelligenceQuestion::BlastRadius,
+                &format!("hostile risk {index}"),
+                &digest,
+                "hostile provider",
+            ));
+        }
+        let response = FindingsResponse {
+            findings,
+            diagnostics: vec![FindingDiagnostic::new(
+                "hostile provider",
+                FindingDiagnosticCode::Oversized,
+                "a provider response payload exceeded the bound",
+            )],
+        };
+        let compiled =
+            compile_contract_with_findings(&native_request, "hostile provider", &response);
         let outcome = &compiled.enrichments[0];
         assert_eq!(outcome.provider, "hostile_provider");
         assert!(outcome.applied <= MAX_ENRICHMENT_STATEMENTS);
-        assert!(outcome.skipped >= 24);
-        for obligation in &compiled.contract.proof_obligations {
-            assert!(
-                obligation.evidence_binding.is_bound(),
-                "a hostile provider must never smuggle a Category binding"
-            );
-            assert!(!obligation.claim.contains("fabrication"));
-        }
+        assert!(outcome.applied <= MAX_RISKS);
+        assert!(outcome.skipped >= 16, "the cap verdict is counted");
+        assert!(outcome.diagnostic.is_some());
         assert!(compiled.contract.risks.len() <= MAX_RISKS);
         assert!(!compiled
             .contract
-            .constraints
+            .risks
             .iter()
-            .any(|constraint| constraint.statement.trim().is_empty()));
+            .any(|risk| risk.description.contains("fabrication")));
+        assert!(!compiled
+            .contract
+            .invariants
+            .iter()
+            .any(|invariant| invariant.statement.trim().is_empty()));
+        // Every external entry is bounded and typed; none came from the
+        // stale/provider-mismatched fabrications.
+        for risk in &compiled.contract.risks {
+            if matches!(risk.origin, ContractOrigin::External { .. }) {
+                assert!(risk.description.len() <= MAX_STATEMENT_BYTES);
+                assert!(risk.description.starts_with("blast radius: "));
+            }
+        }
     }
 
     #[test]

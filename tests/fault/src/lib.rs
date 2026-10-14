@@ -938,6 +938,7 @@ mod accounting_campaign {
                 acct.manager.try_next_op_id().unwrap(),
                 predicted,
                 snapshot,
+                faktor_core::model::ExecutionClass::Unknown,
             )
             .await
             .unwrap()
@@ -951,7 +952,14 @@ mod accounting_campaign {
         let at = attempt(n);
         let rid = acct
             .ledger
-            .reserve_attempt(acct.session, acct.task, at, predicted, Some(snapshot()))
+            .reserve_attempt(
+                acct.session,
+                acct.task,
+                at,
+                predicted,
+                Some(snapshot()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         (rid, at)
@@ -1313,6 +1321,7 @@ mod accounting_campaign {
                 acct.manager.try_next_op_id().unwrap(),
                 over,
                 None,
+                faktor_core::model::ExecutionClass::Unknown,
             )
             .await
         {
@@ -1341,6 +1350,7 @@ mod accounting_campaign {
                     acct.manager.try_next_op_id().unwrap(),
                     1,
                     None,
+                    faktor_core::model::ExecutionClass::Unknown,
                 )
                 .await
                 .unwrap();
@@ -1673,7 +1683,14 @@ async fn completion_gate_refuses_a_raced_reservation_and_stays_verifying() {
     // The reservation is admitted while the task still permits provider
     // work; it then races the verification transition.
     let rid = ledger
-        .reserve(session, task, OpId::new(1), 100, None)
+        .reserve(
+            session,
+            task,
+            OpId::new(1),
+            100,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap();
     let rev = handle.task_revision(task).unwrap();
@@ -1799,7 +1816,14 @@ async fn reserve_transaction_refuses_in_a_final_task_state() {
         .unwrap();
     let ledger = DurableBudgetLedger::new(manager.clone());
     let err = ledger
-        .reserve(session, task, OpId::new(7), 1, None)
+        .reserve(
+            session,
+            task,
+            OpId::new(7),
+            1,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1808,7 +1832,14 @@ async fn reserve_transaction_refuses_in_a_final_task_state() {
     );
     let attempt = ModelCallAttempt::new(OpId::new(8), OpId::new(9), 0).unwrap();
     let err = ledger
-        .reserve_attempt(session, task, attempt, 1, None)
+        .reserve_attempt(
+            session,
+            task,
+            attempt,
+            1,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap_err();
     assert!(

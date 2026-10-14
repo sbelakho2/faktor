@@ -385,6 +385,16 @@ pub fn build_prompt(task: &CodingTaskSpec, arm: Arm) -> Result<PromptArtifacts, 
     let mut intelligence = None;
     let system = match arm {
         Arm::Baseline => SYSTEM_BASELINE.to_string(),
+        Arm::FullDaemonRuntime => {
+            // The runtime arm has no prompt-side artifact: the frozen outputs
+            // are driven through the real AgentRuntime (`daemon_arm`), never
+            // through this prompt pipeline.
+            return Err(format!(
+                "{}: the full_daemon_runtime arm is driven through the AgentRuntime, \
+                 not the prompt pipeline",
+                task.id
+            ));
+        }
         Arm::FaktorMachinery => {
             let files: Vec<RepositoryFile> = task
                 .repo_files
@@ -455,7 +465,7 @@ pub fn build_prompt(task: &CodingTaskSpec, arm: Arm) -> Result<PromptArtifacts, 
 }
 
 /// Digest of the compiled contract + repository view (machinery evidence).
-fn contract_digest_of(compiled: &faktor_core::CompiledContract) -> String {
+pub(crate) fn contract_digest_of(compiled: &faktor_core::CompiledContract) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"faktor.coding.contract.v1\0");
     hasher.update(compiled.repository_digest.as_bytes());
@@ -679,6 +689,7 @@ pub fn run_arm(
                 },
                 prompt_blake3: prompt.blake3(),
                 prompt_tokens_est: prompt.tokens_est(),
+                runtime: None,
             });
             facts.push(fact);
             if passed {

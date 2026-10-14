@@ -1546,8 +1546,8 @@ fn doctor_deep_flags_orphan_child_rows_and_a_missing_worktree_dir() {
 #[test]
 fn doctor_reports_the_engineering_outcome_ledger_honestly() {
     use faktor_agent::{
-        ChangedCodeScale, FinalVerificationBasis, OutcomeLedger, ProofCoverage, RunModelStep,
-        RunOutcomeRecord,
+        ChangedCodeScale, EconomicSettlement, FinalVerificationBasis, MeasuredMoney, MoneyState,
+        OutcomeLedger, ProofCoverage, RunModelStep, SettlementStep, TerminalEngineeringOutcome,
     };
     use faktor_core::model::{RiskBucket, TaskClass};
 
@@ -1569,7 +1569,7 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
         "{:?}",
         report.lines
     );
-    let record = RunOutcomeRecord {
+    let record = TerminalEngineeringOutcome {
         schema_version: faktor_agent::OUTCOME_RECORD_SCHEMA_V,
         run_id: "doctor-run-1".into(),
         session_id: 1,
@@ -1580,18 +1580,14 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
         final_snapshot: "tm1:final".into(),
         accepted: true,
         integrated: true,
-        verified_first_attempt: true,
+        verified_first_verification_pass: true,
         repair_attempts: 0,
         model_sequence: vec![RunModelStep {
             provider: "ollama".into(),
             model: "local-7b".into(),
             local: true,
-            spend_micro: 0,
+            execution_class: faktor_core::model::ExecutionClass::Local,
         }],
-        model_spend_micro: 0,
-        verification_spend_micro: 40_000,
-        rework_spend_micro: 0,
-        avoided_hosted_micro: 250_000,
         wall_time_ms: 900,
         human_interventions: 0,
         proof: ProofCoverage {
@@ -1610,11 +1606,30 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
         completed_at_ms: 1_700_000_000_000,
         verified_samples: vec![],
     };
+    let settlement = EconomicSettlement {
+        schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
+        run_id: "doctor-run-1".into(),
+        seq: 0,
+        money_state: MoneyState::Complete,
+        reason: "doctor test".into(),
+        model_spend_micro: Some(0),
+        verification_spend_micro: Some(40_000),
+        rework_spend_micro: Some(0),
+        avoided_hosted: MeasuredMoney::measured(250_000),
+        steps: vec![SettlementStep {
+            provider: "ollama".into(),
+            model: "local-7b".into(),
+            local: true,
+            execution_class: faktor_core::model::ExecutionClass::Local,
+            spend_micro: 0,
+        }],
+        settled_at_ms: 1_700_000_000_000,
+    };
     {
         let session =
             SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
         OutcomeLedger::new(session.store())
-            .record(&record)
+            .record(&record, &settlement)
             .expect("a valid fixture record records exactly once");
     }
     let report = doctor_run(dir.path(), false);
@@ -1625,7 +1640,7 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
         .find(|l| l.starts_with("outcomes: "))
         .expect("ledger line");
     assert!(line.contains("1 run(s), 1 verified"), "{line}");
-    assert!(line.contains("first-pass 100.0%"), "{line}");
+    assert!(line.contains("first-verification-pass 100.0%"), "{line}");
     assert!(
         line.contains("successful-run cost 40000 microUSD"),
         "{line}"
@@ -1633,6 +1648,229 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
     assert!(
         line.contains("all-in cost/verified change 40000 microUSD"),
         "{line}"
+    );
+    assert!(
+        !line.contains("money-incomplete excluded"),
+        "a fully settled cohort excludes nothing: {line}"
+    );
+
+    // A second run whose money is still pending: excluded and counted, and
+    // when NO run's money is settled the doctor says `unavailable`, never a
+    // fabricated zero.
+    let mut pending_record = record.clone();
+    pending_record.run_id = "doctor-run-2".into();
+    pending_record.model_sequence = vec![];
+    let pending_settlement = EconomicSettlement {
+        schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
+        run_id: "doctor-run-2".into(),
+        seq: 0,
+        money_state: MoneyState::Pending,
+        reason: "doctor test pending".into(),
+        model_spend_micro: None,
+        verification_spend_micro: None,
+        rework_spend_micro: None,
+        avoided_hosted: MeasuredMoney::Unavailable,
+        steps: vec![],
+        settled_at_ms: 0,
+    };
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        OutcomeLedger::new(session.store())
+            .record(&pending_record, &pending_settlement)
+            .expect("the pending fixture records exactly once");
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("outcomes: "))
+        .expect("ledger line");
+    assert!(line.contains("2 run(s), 2 verified"), "{line}");
+    assert!(
+        line.contains("1 money-incomplete excluded (money metrics over 1 complete run(s))"),
+        "{line}"
+    );
+    assert!(
+        line.contains("successful-run cost 40000 microUSD"),
+        "the complete cohort's money is unchanged by the excluded row: {line}"
+    );
+}
+
+/// Item 6 (classification/parity): the doctor's cost lines are gated on
+/// their OWN served denominators like the IDE panels — a money-complete run
+/// that did NOT verify can never render the folded `0` as a measured cost,
+/// and neither can a zero money-complete spend render a `0.0%` rework ratio.
+/// A measured zero (verified money-complete changes with genuinely zero
+/// spend) still renders as an exact zero, never `unavailable`.
+#[test]
+fn doctor_cost_lines_guard_their_real_denominators_never_a_fabricated_zero() {
+    use faktor_agent::{
+        ChangedCodeScale, EconomicSettlement, FinalVerificationBasis, MeasuredMoney, MoneyState,
+        OutcomeLedger, ProofCoverage, RunModelStep, SettlementStep, TerminalEngineeringOutcome,
+    };
+    use faktor_core::model::{RiskBucket, TaskClass};
+
+    fn record(
+        run_id: &str,
+        verified_basis: FinalVerificationBasis,
+        spend: u64,
+        rework: u64,
+    ) -> (TerminalEngineeringOutcome, EconomicSettlement) {
+        let outcome = TerminalEngineeringOutcome {
+            schema_version: faktor_agent::OUTCOME_RECORD_SCHEMA_V,
+            run_id: run_id.into(),
+            session_id: 1,
+            task_id: 1,
+            task_class: TaskClass::Medium,
+            risk_class: RiskBucket::Low,
+            candidate_snapshot: None,
+            final_snapshot: "tm1:final".into(),
+            accepted: true,
+            integrated: true,
+            // Only a deterministic basis is a verified change; a review-only
+            // run must never claim a first-verification-pass.
+            verified_first_verification_pass: verified_basis.is_deterministic_verified(),
+            repair_attempts: 0,
+            model_sequence: vec![RunModelStep {
+                provider: "hosted".into(),
+                model: "m".into(),
+                local: false,
+                execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+            }],
+            wall_time_ms: 900,
+            human_interventions: 0,
+            proof: ProofCoverage {
+                checks_passed: 3,
+                checks_required: 3,
+            },
+            change_scale: ChangedCodeScale {
+                files: 1,
+                added_lines: 5,
+                removed_lines: 1,
+            },
+            rollback_events: 0,
+            recovery_events: 0,
+            final_basis: verified_basis,
+            frontier_escalations: 0,
+            completed_at_ms: 1_700_000_000_000,
+            verified_samples: vec![],
+        };
+        let settlement = EconomicSettlement {
+            schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
+            run_id: run_id.into(),
+            seq: 0,
+            money_state: MoneyState::Complete,
+            reason: "doctor denominator test".into(),
+            model_spend_micro: Some(spend),
+            verification_spend_micro: Some(0),
+            rework_spend_micro: Some(rework.min(spend)),
+            avoided_hosted: MeasuredMoney::Unavailable,
+            steps: vec![SettlementStep {
+                provider: "hosted".into(),
+                model: "m".into(),
+                local: false,
+                execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+                spend_micro: spend,
+            }],
+            settled_at_ms: 1_700_000_000_000,
+        };
+        (outcome, settlement)
+    }
+
+    // Case 1: one money-complete run that did NOT verify (review-only basis)
+    // with real spend. Every verified-denominator figure is `unavailable`;
+    // the rework ratio still measures over the complete cohort's spend.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        session
+            .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap();
+    }
+    let (outcome, settlement) = record(
+        "doctor-unverified-1",
+        FinalVerificationBasis::ReviewOnly,
+        40_000,
+        0,
+    );
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        OutcomeLedger::new(session.store())
+            .record(&outcome, &settlement)
+            .expect("the unverified fixture records");
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("outcomes: "))
+        .expect("ledger line");
+    assert!(
+        line.contains("first-verification-pass unavailable"),
+        "zero verified changes is an empty denominator: {line}"
+    );
+    assert!(
+        line.contains("successful-run cost unavailable"),
+        "no money-complete verified change must never render a folded $0: {line}"
+    );
+    assert!(
+        line.contains("all-in cost/verified change unavailable"),
+        "VCSC's denominator is verified money-complete changes, not complete runs: {line}"
+    );
+    assert!(
+        line.contains("rework ratio 0.0%"),
+        "a nonzero complete-cohort spend measures a real zero rework ratio: {line}"
+    );
+
+    // Case 2: one money-complete VERIFIED run whose spend is a measured zero
+    // — the cost lines render the exact zero (measured), while the rework
+    // ratio's empty spend denominator is `unavailable`.
+    let zero_dir = tempfile::tempdir().unwrap();
+    {
+        let session =
+            SessionManager::open_quick(zero_dir.path().join("store"), zero_dir.path().join("cas"))
+                .unwrap();
+        session
+            .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap();
+    }
+    let (outcome, settlement) = record(
+        "doctor-local-zero-1",
+        FinalVerificationBasis::DeterministicChecks,
+        0,
+        0,
+    );
+    {
+        let session =
+            SessionManager::open_quick(zero_dir.path().join("store"), zero_dir.path().join("cas"))
+                .unwrap();
+        OutcomeLedger::new(session.store())
+            .record(&outcome, &settlement)
+            .expect("the local-zero fixture records");
+    }
+    let report = doctor_run(zero_dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("outcomes: "))
+        .expect("ledger line");
+    assert!(
+        line.contains("first-verification-pass 100.0%"),
+        "a verified cohort measures the real rate: {line}"
+    );
+    assert!(
+        line.contains("successful-run cost 0 microUSD"),
+        "a measured zero is an exact zero, never `unavailable`: {line}"
+    );
+    assert!(
+        line.contains("rework ratio unavailable"),
+        "zero complete-cohort spend is an empty rework denominator: {line}"
     );
 }
 

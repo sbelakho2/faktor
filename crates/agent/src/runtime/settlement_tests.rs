@@ -212,14 +212,25 @@ async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once()
     let provider = Arc::new(InspectingProvider::new(base, |_, _| Ok(())));
     let (deps, _dir) = deps_with(provider.clone(), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
-    // A bounded pass budget that the runner can actually wait out while the
-    // active turn is mid-flight. This is a SCHEDULING envelope, not the
-    // subject under test: the contract is arm-on-kick + drain-exactly-once.
-    // 250ms was tight enough that a loaded host could deschedule the test
-    // task past both passes (A completed after the runner exited, B stayed
-    // queued); 5s keeps the deterministic boundary (pass 1 expires before A
-    // is driven) while giving the test task a real window to drive A.
-    runtime.set_turn_budget_ms(5000);
+    // Two clock roles, both load-aware (the original 250ms/5s fixed windows
+    // made this test a wall-clock race: under extreme host load the test
+    // task could be descheduled past both pass budgets, A completed after
+    // the runner exited and B stayed queued):
+    // - PASS1_BUDGET_MS is a SCHEDULING ENVELOPE whose expiry is the
+    //   boundary EVENT under test (it promotes the armed kick into pass 2).
+    //   It never needs to outlast the test task: the arm below is executed
+    //   in the same poll as the pass-1 observation (`yield_now` parks the
+    //   runner first), so no wall-clock window can drop the kick.
+    // - ARMED_PASS_BUDGET_MS is the deadlock-only ceiling for pass 2: the
+    //   test drives A on its own schedule, so the armed pass must never
+    //   expire under load (it still fails loudly if the queue wedges).
+    const PASS1_BUDGET_MS: u64 = 1_000;
+    const ARMED_PASS_BUDGET_MS: u64 = 60_000;
+    // A's own operation deadline (fixed at submit from the then-current
+    // budget) must never expire before the test drives it: give the prompt
+    // the deadlock-only ceiling. The pass-1 envelope below is switched in
+    // AFTER submission, so only the runner's scheduling envelope is short.
+    runtime.set_turn_budget_ms(ARMED_PASS_BUDGET_MS);
     let session = new_session(runtime.deps());
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
     // A is the active logical turn (submitted, not driven); B queues.
@@ -227,16 +238,23 @@ async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once()
     assert!(!receipt_a.queued);
     let _receipt_b = runtime.submit(session, "B prompt", &[]).unwrap();
     assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+    runtime.set_turn_budget_ms(PASS1_BUDGET_MS);
 
-    // runner1 owns the gate and waits on the mid-turn session.
+    // runner1 owns the gate and parks in its first bounded pass (the yield
+    // lets it reach its wait before the test task proceeds, so the arm
+    // below is ordered strictly after the gate exists).
     let runner1 = runtime.clone();
     let t1 = tokio::spawn(async move { runner1.run_session_queue(session).await });
+    tokio::task::yield_now().await;
     wait_for_runner_passes(&runtime, session, 1).await;
 
     // The settle-path kick arrives while runner1 is still gated: it must
     // ARM the live runner, never start a second one and never be lost.
+    // Pass 1 already captured its envelope; pass 2 will read the armed
+    // pass's deadlock-only ceiling instead.
     let kicker = runtime.clone();
     kicker.run_session_queue(session).await;
+    runtime.set_turn_budget_ms(ARMED_PASS_BUDGET_MS);
     assert!(
         !t1.is_finished(),
         "the kick must arm the live runner, not replace it"
@@ -251,7 +269,7 @@ async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once()
         "the armed pass must keep the same runner alive (kick not lost)"
     );
 
-    // A ends exactly at the boundary while runner1 is inside its armed
+    // A ends on the test's own schedule while runner1 is inside its armed
     // pass; the pass admits B and drives it exactly once.
     let outcome = runtime
         .drive_receipt(&handle, receipt_a, None)
@@ -260,6 +278,25 @@ async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once()
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     t1.await.unwrap();
 
+    // `drive_receipt` is the low-level drive and does NOT fire the
+    // runtime's settle-path kick; an ordinary turn completion always does.
+    // Issue the same kick the settle path would (arming an alive runner,
+    // otherwise starting a fresh one — a lost kick drains nothing), then
+    // wait bounded for the daemon's own durable drain signal. The
+    // exactly-once assertions below pin that this kick can never
+    // double-drive B.
+    runtime.run_session_queue(session).await;
+    // Deadlock-only drain ceiling: the durable signal is the assertion, the
+    // bound only fails a genuinely wedged queue under host load.
+    let drain_deadline = Instant::now() + Duration::from_secs(60);
+    while handle.queued_prompt_count().unwrap() != 0 {
+        assert!(
+            Instant::now() < drain_deadline,
+            "the queue runner never drained B (kick lost): {:?}",
+            handle.queue_status_counts().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(handle.queued_prompt_count().unwrap(), 0, "B drained");
     let counts = handle.queue_status_counts().unwrap();
     assert_eq!(

@@ -152,10 +152,11 @@
 //!     cap retires the entry (a stale entry is red). Function spans are
 //!     measured on the same comment/string mask and `#[cfg(test)]`-stripped
 //!     ranges as every other scan; `fn` signatures without a body and
-//!     function-pointer types are not functions. The seven remaining giants
-//!     (turn verification, tool loop, serve, index build, protocol schema,
-//!     compaction, independent review) are grandfathered with their exact
-//!     sizes; a planted giant fails the scan.
+//!     function-pointer types are not functions. The three remaining giants
+//!     (turn verification, tool loop, index build) are grandfathered with
+//!     their exact sizes; a planted giant fails the scan. Retired by
+//!     phase/cohesion splits: serve, protocol schema, compaction and
+//!     independent review.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1982,9 +1983,10 @@ mod scans {
     ///   CLI/server site may build a parallel authority over the same rows.
     /// - `DurableBudgetLedger::new`: the CLI graph's ONE ledger, the
     ///   per-task/per-session view constructions in the session crate, the
-    ///   orchestrator's two cap-seeding sites, and the server crate's
-    ///   `ServerDeps::new` embedded/test seam (the daemon assembles through
-    ///   `new_with` over the graph's ledger).
+    ///   orchestrator's two cap-seeding sites plus its terminal-settlement
+    ///   accounting retry (the P1 completion-accounting backstop), and the
+    ///   server crate's `ServerDeps::new` embedded/test seam (the daemon
+    ///   assembles through `new_with` over the graph's ledger).
     /// - `SemanticProviderRegistry::new`: the agent fallback constructor
     ///   (embedded/test hosts) and the CLI graph builder; the native
     ///   introspection surface inspects `deps.semantic` only.
@@ -2011,6 +2013,7 @@ mod scans {
             &[
                 ("crates/cli/src/daemon/builder.rs", 1),
                 ("crates/orchestrator/src/task_executor/mod.rs", 2),
+                ("crates/orchestrator/src/task_executor/settlement.rs", 1),
                 ("crates/server/src/api/deps.rs", 1),
                 ("crates/session/src/manager.rs", 1),
                 ("crates/session/src/task/mod.rs", 2),
@@ -7743,7 +7746,6 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/orchestrator/src/runtime_tests.rs", 5259),
         ("crates/provider/src/egress.rs", 5699),
         ("crates/scheduler/src/lib.rs", 4176),
-        ("crates/session/src/budget.rs", 4010),
     ];
 
     /// Every Rust source in scope for the ceiling: `crates/**` plus
@@ -8779,24 +8781,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             max_lines: 752,
         },
         Grandfathered {
-            rel: "crates/cli/src/daemon/serve.rs",
-            name: "serve_impl",
-            max_lines: 688,
-        },
-        Grandfathered {
             rel: "crates/index/src/service/mod.rs",
             name: "run_build",
             max_lines: 546,
-        },
-        Grandfathered {
-            rel: "crates/agent/src/runtime/compaction.rs",
-            name: "try_compact",
-            max_lines: 521,
-        },
-        Grandfathered {
-            rel: "crates/agent/src/runtime/verification_attribution.rs",
-            name: "run_independent_review_call",
-            max_lines: 516,
         },
     ];
 
@@ -8969,7 +8956,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     #[test]
     fn no_production_function_exceeds_the_cap_outside_the_shrink_only_grandfathers() {
         let inventory = long_function_inventory();
-        // Liveness: the seven recorded giants must be FOUND by the scanner —
+        // Liveness: the three recorded giants must be FOUND by the scanner —
         // the exact-list check below fails loudly if the mask/swing logic
         // silently stops detecting functions, so an empty scan can never
         // pass as "no offenders".

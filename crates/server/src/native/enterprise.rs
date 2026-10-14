@@ -34,9 +34,40 @@ use faktor_cloud::{
 };
 use faktor_protocol::error::ApiError;
 
+use super::billing::billing_disabled;
 use super::control_plane::{control_plane_err, require_idempotency_key, require_principal};
-use super::{authed, malformed_body, wire_status};
+use super::{authed, malformed_body, value_entitlement_refused, wire_status};
 use crate::api::AppState;
+
+/// The extended historical read bound of `/native/enterprise/audit`
+/// (`extended=true`): the `audit_retention_history` paid entitlement permits
+/// one deeper historical response — assembled from the service's bounded
+/// pages (each <= `faktor_cloud::MAX_AUDIT_PAGE`) — up to this many events.
+pub(crate) const MAX_EXTENDED_AUDIT_PAGE: u64 = 2000;
+
+/// The strict query of `/native/enterprise/audit`: the base cursor export
+/// (bounded to the configured retention window) plus the `extended`
+/// historical read.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnterpriseAuditQuery {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    /// Request the EXTENDED historical read (the
+    /// `audit_retention_history` paid value entitlement): the single-page
+    /// bound rises to [`MAX_EXTENDED_AUDIT_PAGE`] and events older than the
+    /// configured base retention window become readable. Without the
+    /// entitlement the request is refused typed 403
+    /// `value_entitlement_refused`; with no billing authority wired it is
+    /// the shared typed 409 `billing_disabled`. Base
+    /// (`extended` absent/false) reads are bounded to the window: an
+    /// explicit cursor older than the window is gated exactly the same way
+    /// (and answers 400 `audit_window_requires_extended` once entitled).
+    #[serde(default)]
+    extended: Option<bool>,
+}
 
 /// The enterprise page bound (mirrors the control-plane cap; kept local so
 /// the two surfaces evolve independently).
@@ -332,12 +363,41 @@ pub(crate) async fn native_enterprise_status(
     }
 }
 
+/// The `audit_retention_history` paid boundary of the enterprise audit
+/// read: the entitlement is consulted BEFORE any ledger read (a denial is
+/// the typed 403 `value_entitlement_refused`; no billing authority is the
+/// shared typed 409 `billing_disabled`).
+fn retention_history_gate(
+    state: &AppState,
+    principal: &faktor_cloud::Principal,
+) -> Result<(), Box<Response>> {
+    let Some(billing) = state.deps.billing.as_ref() else {
+        return Err(Box::new(wire_status(billing_disabled())));
+    };
+    billing
+        .check_value_entitlement(
+            &principal.organization,
+            faktor_cloud::ValueEntitlement::AuditRetentionHistory,
+        )
+        .map_err(|refusal| Box::new(wire_status(value_entitlement_refused(refusal))))
+}
+
 /// `GET /native/enterprise/audit` — one cursor page of the enterprise audit
 /// ledger (separate from every engineering proof row).
+///
+/// Retention gate: the BASE read is bounded to the configured retention
+/// window ([`EnterpriseService::audit_window`]) — items older than the
+/// window are never served without the `audit_retention_history` paid
+/// entitlement. The `extended=true` historical read (up to
+/// [`MAX_EXTENDED_AUDIT_PAGE`]) and any explicit base cursor older than the
+/// window are gated: denied plans are the typed 403
+/// `value_entitlement_refused`, no billing authority is the shared typed 409
+/// `billing_disabled`. An entitled plan pages older history with
+/// `extended=true`.
 pub(crate) async fn native_enterprise_audit(
     State(state): State<AppState>,
     headers: HeaderMap,
-    query: Result<Query<CursorQuery>, axum::extract::rejection::QueryRejection>,
+    query: Result<Query<EnterpriseAuditQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
@@ -350,9 +410,30 @@ pub(crate) async fn native_enterprise_audit(
         Ok(p) => p,
         Err(e) => return wire_status(e),
     };
-    let limit = match enterprise_page_limit(query.limit) {
-        Ok(limit) => limit,
-        Err(e) => return wire_status(e),
+    let extended = query.extended.unwrap_or(false);
+    if extended {
+        // The paid EXTENDED historical read boundary: entitlement BEFORE any
+        // ledger read.
+        if let Err(response) = retention_history_gate(&state, &principal) {
+            return *response;
+        }
+    }
+    let limit = if extended {
+        match query.limit {
+            None => MAX_EXTENDED_AUDIT_PAGE as usize,
+            Some(0) => return wire_status(malformed_body("limit must be >= 1")),
+            Some(limit) if limit > MAX_EXTENDED_AUDIT_PAGE => {
+                return wire_status(malformed_body(&format!(
+                    "limit {limit} exceeds the extended audit page bound {MAX_EXTENDED_AUDIT_PAGE}"
+                )))
+            }
+            Some(limit) => limit as usize,
+        }
+    } else {
+        match enterprise_page_limit(query.limit) {
+            Ok(limit) => limit,
+            Err(e) => return wire_status(e),
+        }
     };
     let service = match service(&state) {
         Ok(service) => service,
@@ -365,12 +446,85 @@ pub(crate) async fn native_enterprise_audit(
             _ => return wire_status(malformed_body("cursor must be a non-negative integer")),
         },
     };
-    match service.audit_export(&principal, &principal.organization, cursor, limit) {
+    if extended {
+        // The EXTENDED historical read: one deeper response assembled from
+        // the service's bounded pages (each <= its own MAX_AUDIT_PAGE cap),
+        // up to the extended bound — never an unbounded ledger scan.
+        let mut events: Vec<faktor_cloud::AuditEvent> = Vec::new();
+        let mut after = cursor;
+        let mut head_seq = 0i64;
+        while events.len() < limit {
+            let page = (limit - events.len()).min(faktor_cloud::MAX_AUDIT_PAGE);
+            match service.audit_export(&principal, &principal.organization, after, page) {
+                Ok(export) => {
+                    head_seq = export.head_seq;
+                    let next = export.next_cursor;
+                    events.extend(export.events);
+                    match next {
+                        Some(raw) => after = raw.parse::<i64>().ok(),
+                        None => break,
+                    }
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                Err(e) => return wire_status(control_plane_err(e)),
+            }
+        }
+        let next_cursor = events
+            .last()
+            .filter(|event| event.seq < head_seq)
+            .map(|event| event.seq.to_string());
+        return Json(serde_json::json!({
+            "ok": true,
+            "items": events,
+            "nextCursor": next_cursor,
+            "headSeq": head_seq,
+        }))
+        .into_response();
+    }
+    // The BASE read is bounded to the configured retention window: the ONE
+    // window computation decides the clamp AND the gate, so a caller can
+    // never address an event older than the window without the entitlement.
+    let window = match service.audit_window(&principal, &principal.organization) {
+        Ok(window) => window,
+        Err(e) => return wire_status(control_plane_err(e)),
+    };
+    let beyond_window = cursor
+        .map(|cursor| cursor < window.last_out_of_window_seq)
+        .unwrap_or(false);
+    if beyond_window {
+        // An explicit cursor older than the window asks for pre-window
+        // history on the base read: the paid boundary. A denial is typed
+        // here; an entitled plan pages older history with `extended=true`.
+        if let Err(response) = retention_history_gate(&state, &principal) {
+            return *response;
+        }
+        return wire_status(ApiError {
+            code: "audit_window_requires_extended",
+            message: format!(
+                "events older than the base retention window ({} ms) require extended=true",
+                service.audit_base_window_ms()
+            ),
+            http_status: 400,
+            retryable: false,
+        });
+    }
+    // A fresh base walk (no cursor) starts at the oldest IN-WINDOW event: the
+    // clamp makes the base read usable without the entitlement while never
+    // serving older history.
+    let effective_cursor = match cursor {
+        Some(cursor) if cursor >= window.last_out_of_window_seq => Some(cursor),
+        _ => Some(window.last_out_of_window_seq),
+    };
+    match service.audit_export(&principal, &principal.organization, effective_cursor, limit) {
         Ok(export) => Json(serde_json::json!({
             "ok": true,
             "items": export.events,
             "nextCursor": export.next_cursor,
             "headSeq": export.head_seq,
+            "baseWindowStartMs": window.window_start_ms,
+            "olderEventsGated": window.last_out_of_window_seq > 0,
         }))
         .into_response(),
         Err(e) => wire_status(control_plane_err(e)),

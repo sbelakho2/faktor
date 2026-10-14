@@ -7,19 +7,34 @@
 // scripts/selftest.mjs drives every formatting and honesty rule directly.
 //
 // Honesty rules encoded here:
+//   - both cost metrics are gated on the MONEY-COMPLETE verified cohort
+//     (`verifiedChangesMoneyComplete`, the served denominator): a
+//     verified-but-money-pending run never renders a fabricated $0, and the
+//     excluded-run count is surfaced in the detail;
 //   - an empty verified denominator renders the exact `No verified changes
 //     yet` copy (the served numeric zero stays in the data, but is never
 //     called a free run);
-//   - `avoidedHostedMicro` 0 is `not measured` (the runtime has no
-//     counterfactual recorder), never a savings claim; nonzero shows the
-//     exact served value;
+//   - money is settled money: `moneyState != complete` renders the money as
+//     unavailable (`—`) — a pending/unavailable money fact is null on the
+//     wire and is NEVER rendered as a zero;
+//   - `avoidedHostedMicro` / `avoidedHostedInferenceMicro` are typed:
+//     `measurement == unavailable` (null value) renders `not measured` —
+//     the runtime has no counterfactual recorder; a MEASURED zero renders
+//     as the exact served zero (zero is only a measured zero);
 //   - the Frontier Escalation Rate at zero is `not measured` (no
-//     frontier-tier authority records escalations), never `0%`;
-//   - every other empty denominator renders `—`, never `0`;
+//     frontier-tier authority records escalations), never `0%`; its detail
+//     names the served denominator (`runs` when measured, the fully-classed
+//     `frontierClassedRuns` when partial);
+//   - every rate renders its SERVED denominator (`runsWithSteps` for the
+//     Hosted-Only Rate, the local cohort counts, `checksRequired`, …) and an
+//     empty denominator renders `—`, never `0`;
 //   - rates render exactly from the served floor ppm (`86.4%`, never
 //     rounded up, never scientific); money renders through money.ts exact
 //     decimal strings (no float, huge micro values stay exact), with the
-//     exact micro string in the detail line.
+//     exact micro string in the detail line;
+//   - `modelSequence` steps label by the durable `executionClass`; a
+//     classless step's recorded pre-class local bit renders as the explicit
+//     `legacy-local` tag (never as a class-derived `local`).
 
 import {
   validateProtocolOutcomesPage,
@@ -28,6 +43,7 @@ import {
   type ProtocolOutcomeMetrics,
   type ProtocolOutcomesPage,
   type ProtocolRunOutcome,
+  type ProtocolValueEntitlementsReport,
 } from './generated/protocolDto.ts';
 import { microFromDecimal, microToString, microUsdText } from './money.ts';
 
@@ -37,6 +53,7 @@ export const OUTCOMES_PAGE_LIMIT = 50;
 export const MAX_OUTCOME_RUNS = 200;
 
 export const NO_VERIFIED_CHANGES = 'No verified changes yet';
+export const NO_MONEY_SETTLED_CHANGES = 'No money-settled verified changes yet';
 export const NOT_MEASURED = 'not measured';
 export const UNAVAILABLE_VALUE = '—';
 export const TRUNCATED_SAMPLE_NOTE = 'Truncated sample';
@@ -53,8 +70,8 @@ export interface OutcomeMetricView {
     | 'local-only'
     | 'local-final'
     | 'local-first'
-    | 'local-to-frontier'
-    | 'frontier-only'
+    | 'local-to-hosted'
+    | 'hosted-only'
     | null;
   readonly value: string;
   /** The served counts/denominators behind the value. */
@@ -73,7 +90,7 @@ export interface OutcomeRunView {
   readonly accepted: boolean;
   readonly integrated: boolean;
   readonly verified: boolean;
-  readonly firstPass: boolean;
+  readonly firstVerificationPass: boolean;
   readonly repairAttempts: number;
   readonly completedText: string;
   readonly modelSpendUsd: string;
@@ -107,11 +124,20 @@ export interface OutcomesView {
   readonly runs: readonly OutcomeRunView[];
   readonly nextCursor: { readonly completedAtMs: number; readonly runId: string } | null;
   readonly pageCount: number;
+  /**
+   * The value-entitlements status line (`GET /native/value-entitlements`) of
+   * the configured control-plane organization: the plan resolution, the
+   * `outcome_ledger` decision and the granted/total count, or the typed
+   * refusal when the report could not be read (`billing_disabled` renders
+   * "billing disabled locally"). Null while no organization is configured —
+   * the local read is never dressed up as an entitlement.
+   */
+  readonly entitlementsStatus: string | null;
 }
 
 const COST_NOTE =
-  'Successful-Run Cost averages only the runs that verified; ' +
-  'Verified Cost per Successful Change (VCSC) charges every attempted run ' +
+  'Successful-Run Cost averages only the money-settled runs that verified; ' +
+  'Verified Cost per Successful Change (VCSC) charges every attempted money-settled run ' +
   '(failed and cancelled included) to the changes that landed.';
 
 /**
@@ -186,12 +212,32 @@ function metric(input: {
 export function outcomeMetricViews(m: ProtocolOutcomeMetrics): OutcomeMetricView[] {
   const verifiedChanges = m.verifiedChanges;
   const noVerified = !Number.isSafeInteger(verifiedChanges) || verifiedChanges === 0;
+  // The cost metrics' REAL denominator: verified changes whose money is
+  // settled. A verified-but-money-pending run leaves this at zero and the
+  // served successfulRunCostMicro/verifiedCostPerSuccessfulChangeMicro hold
+  // their folded zero — which must NEVER be rendered as a measured $0.
+  const verifiedMoneyComplete = m.verifiedChangesMoneyComplete;
+  const noMoneyCompleteVerified =
+    !Number.isSafeInteger(verifiedMoneyComplete) || verifiedMoneyComplete === 0;
+  const moneyCompleteGate = noVerified || noMoneyCompleteVerified;
+  const incompleteExcluded = m.moneyIncompleteExcluded;
+  const exclusionNote =
+    Number.isSafeInteger(incompleteExcluded) && incompleteExcluded > 0
+      ? ` · ${count(incompleteExcluded)} run(s) excluded (money not settled)`
+      : '';
   const runs = m.runs;
   const noRuns = !Number.isSafeInteger(runs) || runs === 0;
+  // The Hosted-Only Rate's SERVED denominator: runs with at least one model
+  // step (a stepless run carries no hosted evidence).
+  const runsWithSteps = m.runsWithSteps;
+  const noRunsWithSteps = !Number.isSafeInteger(runsWithSteps) || runsWithSteps === 0;
   const totalSpend = microFromDecimal(m.totalSpendMicro);
   const noTotalSpend = totalSpend === null || totalSpend === 0n;
-  const avoided = microFromDecimal(m.avoidedHostedInferenceMicro);
-  const avoidedRecorded = avoided !== null && avoided > 0n;
+  const avoidedRaw = m.avoidedHostedInferenceMicro;
+  const avoidedMeasured =
+    m.avoidedHostedInferenceMeasurement === 'measured' &&
+    avoidedRaw !== null &&
+    microFromDecimal(avoidedRaw) !== null;
   const rows: OutcomeMetricView[] = [];
 
   rows.push(
@@ -199,37 +245,52 @@ export function outcomeMetricViews(m: ProtocolOutcomeMetrics): OutcomeMetricView
       key: 'successfulRunCostMicro',
       label: 'Successful-Run Cost',
       group: 'cost',
-      value: noVerified ? NO_VERIFIED_CHANGES : moneyValue(m.successfulRunCostMicro),
+      value: noVerified
+        ? NO_VERIFIED_CHANGES
+        : noMoneyCompleteVerified
+          ? NO_MONEY_SETTLED_CHANGES
+          : moneyValue(m.successfulRunCostMicro),
       detail: noVerified
-        ? `${exactMoney(m.totalVerifiedSpendMicro)} verified-run spend · 0 verified changes`
-        : `${exactMoney(m.totalVerifiedSpendMicro)} verified-run spend ÷ ${count(verifiedChanges)} verified changes`,
+        ? `${exactMoney(m.totalVerifiedSpendMicro)} verified-run spend · 0 verified changes${exclusionNote}`
+        : noMoneyCompleteVerified
+          ? `${exactMoney(m.totalVerifiedSpendMicro)} verified-run spend · 0 money-settled verified changes${exclusionNote}`
+          : `${exactMoney(m.totalVerifiedSpendMicro)} verified-run spend ÷ ${count(verifiedMoneyComplete)} money-settled verified changes${exclusionNote}`,
       definition:
-        'Model + verification spend over the successful (verified) runs divided by verified ' +
-        'changes, rounded up — the average spend of a run that DID succeed.',
+        'Model + verification spend over the money-settled successful (verified) runs divided ' +
+        'by money-settled verified changes, rounded up — the average spend of a run that DID ' +
+        'succeed. A verified run whose money is still pending is excluded (never a $0 average).',
       // The exact copy is honest absence, not a measured zero.
-      unmeasured: noVerified,
+      unmeasured: moneyCompleteGate,
     }),
     metric({
       key: 'verifiedCostPerSuccessfulChangeMicro',
       label: 'Verified Cost per Successful Change (VCSC)',
       group: 'cost',
-      value: noVerified ? NO_VERIFIED_CHANGES : moneyValue(m.verifiedCostPerSuccessfulChangeMicro),
+      value: noVerified
+        ? NO_VERIFIED_CHANGES
+        : noMoneyCompleteVerified
+          ? NO_MONEY_SETTLED_CHANGES
+          : moneyValue(m.verifiedCostPerSuccessfulChangeMicro),
       detail: noVerified
-        ? `${exactMoney(m.totalSpendMicro)} all-attempt spend · 0 verified changes`
-        : `${exactMoney(m.totalSpendMicro)} all-attempt spend ÷ ${count(verifiedChanges)} verified changes`,
+        ? `${exactMoney(m.totalSpendMicro)} all-attempt spend · 0 verified changes${exclusionNote}`
+        : noMoneyCompleteVerified
+          ? `${exactMoney(m.totalSpendMicro)} all-attempt spend · 0 money-settled verified changes${exclusionNote}`
+          : `${exactMoney(m.totalSpendMicro)} all-attempt spend ÷ ${count(verifiedMoneyComplete)} money-settled verified changes${exclusionNote}`,
       definition:
-        'TOTAL eligible-cohort spend over ALL attempted work (failed and cancelled runs ' +
-        'included) divided by verified changes, rounded up. Distinct from Successful-Run Cost.',
-      unmeasured: noVerified,
+        'TOTAL eligible-cohort spend over ALL attempted money-settled work (failed and ' +
+        'cancelled runs included) divided by money-settled verified changes, rounded up. ' +
+        'Distinct from Successful-Run Cost; money-incomplete runs never participate.',
+      unmeasured: moneyCompleteGate,
     }),
     metric({
-      key: 'verifiedFirstPassPpm',
-      label: 'Verified First-Pass Rate',
+      key: 'verifiedFirstVerificationPassPpm',
+      label: 'Verified First Verification Pass Rate',
       group: 'rate',
-      value: noVerified ? NO_VERIFIED_CHANGES : formatPpm(m.verifiedFirstPassPpm),
-      detail: `${count(m.verifiedFirstPassChanges)}/${count(verifiedChanges)} verified changes`,
+      value: noVerified ? NO_VERIFIED_CHANGES : formatPpm(m.verifiedFirstVerificationPassPpm),
+      detail: `${count(m.verifiedFirstVerificationPassChanges)}/${count(verifiedChanges)} verified changes`,
       definition:
-        'First-attempt verified changes ÷ verified changes (floor ppm: the true rate is at least this).',
+        'Verified changes whose FIRST verification attempt passed ÷ verified changes (floor ppm: the '
+        + 'true rate is at least this). A verification-attempt measure, never an implementation-attempt claim.',
       unmeasured: noVerified,
     }),
     metric({
@@ -295,38 +356,41 @@ export function outcomeMetricViews(m: ProtocolOutcomeMetrics): OutcomeMetricView
           ? `${count(m.localFirstSuccessChanges)}/${count(m.localFirstRuns)} runs starting on a local step`
           : 'no local-first runs recorded',
       definition:
-        'Local-first runs that verified on their FIRST attempt ÷ runs whose first model step is local.',
+        'Runs whose FIRST step is durably local, whose FINAL step is ALSO durably local, and whose FIRST verification attempt passed ÷ runs whose FIRST step is durably local.',
       unmeasured: !(Number.isSafeInteger(m.localFirstRuns) && m.localFirstRuns > 0),
     }),
     metric({
-      key: 'localToFrontierFallbackPpm',
-      label: 'Local-to-Frontier Fallback Rate',
+      key: 'localToHostedFallbackPpm',
+      label: 'Local-to-Hosted Fallback Rate',
       group: 'local',
-      cohort: 'local-to-frontier',
+      cohort: 'local-to-hosted',
       value:
         Number.isSafeInteger(m.localFirstRuns) && m.localFirstRuns > 0
-          ? formatPpm(m.localToFrontierFallbackPpm)
+          ? formatPpm(m.localToHostedFallbackPpm)
           : UNAVAILABLE_VALUE,
       detail:
         Number.isSafeInteger(m.localFirstRuns) && m.localFirstRuns > 0
-          ? `${count(m.localToFrontierFallbackRuns)}/${count(m.localFirstRuns)} runs starting on a local step`
+          ? `${count(m.localToHostedFallbackRuns)}/${count(m.localFirstRuns)} runs starting on a local step`
           : 'no local-first runs recorded',
       definition:
-        'Runs that started local and ENDED hosted ÷ runs whose first step is local. A ' +
-        'local-then-hosted repair is a FALLBACK, never a local substitution.',
+        'Runs that started on a durably local step and ENDED on a durably hosted step ÷ runs ' +
+        'whose first step is durably local. A local-then-hosted repair is a FALLBACK, never a ' +
+        'local substitution.',
       unmeasured: !(Number.isSafeInteger(m.localFirstRuns) && m.localFirstRuns > 0),
     }),
     metric({
-      key: 'frontierOnlyPpm',
-      label: 'Frontier-Only Rate',
+      key: 'hostedOnlyPpm',
+      label: 'Hosted-Only Rate',
       group: 'local',
-      cohort: 'frontier-only',
-      value: noRuns ? UNAVAILABLE_VALUE : formatPpm(m.frontierOnlyPpm),
-      detail: noRuns
-        ? 'no runs recorded'
-        : `${count(m.frontierOnlyRuns)}/${count(runs)} runs with no local step`,
-      definition: 'Runs with no local step at all ÷ all runs.',
-      unmeasured: noRuns,
+      cohort: 'hosted-only',
+      value: noRunsWithSteps ? UNAVAILABLE_VALUE : formatPpm(m.hostedOnlyPpm),
+      detail: noRunsWithSteps
+        ? 'no runs with model steps recorded'
+        : `${count(m.hostedOnlyRuns)}/${count(runsWithSteps)} runs with model steps whose every step is durably hosted`,
+      definition:
+        'Runs whose every step is durably HOSTED ÷ runs with steps. An `unknown` execution ' +
+        'class is never counted as local or hosted.',
+      unmeasured: noRunsWithSteps,
     }),
   );
 
@@ -335,15 +399,17 @@ export function outcomeMetricViews(m: ProtocolOutcomeMetrics): OutcomeMetricView
       key: 'avoidedHostedInferenceMicro',
       label: 'Avoided Hosted Inference',
       group: 'cost',
-      value: avoidedRecorded
-        ? `${moneyValue(m.avoidedHostedInferenceMicro)} (${exactMoney(m.avoidedHostedInferenceMicro)})`
-        : NOT_MEASURED,
-      detail: avoidedRecorded
-        ? 'recorded counterfactual hosted inference avoided by local substitution'
-        : 'no counterfactual recorder has supplied an avoided reduction; never a savings claim',
+      value:
+        avoidedMeasured && avoidedRaw !== null
+          ? `${moneyValue(avoidedRaw)} (${exactMoney(avoidedRaw)})`
+          : NOT_MEASURED,
+      detail: avoidedMeasured
+        ? 'measured counterfactual hosted inference avoided by local substitution'
+        : 'no counterfactual authority exists (value unavailable, never a zero)',
       definition:
-        'Sum of recorded avoided_hosted_micro over all runs. 0 means unmeasured, never "no savings".',
-      unmeasured: !avoidedRecorded,
+        'Sum of MEASURED avoided-hosted counterfactuals over all runs. `unavailable` (null) means ' +
+        'unmeasured — zero is only a measured zero, never a savings claim.',
+      unmeasured: !avoidedMeasured,
     }),
     metric({
       key: 'meanTimeToVerifiedChangeMs',
@@ -399,19 +465,20 @@ export function outcomeMetricViews(m: ProtocolOutcomeMetrics): OutcomeMetricView
       label: 'Frontier Escalation Rate',
       group: 'flow',
       value:
-        Number.isSafeInteger(m.frontierEscalationRuns) && m.frontierEscalationRuns > 0 && !noRuns
+        m.frontierEscalationPpm !== null && !noRuns
           ? formatPpm(m.frontierEscalationPpm)
           : NOT_MEASURED,
       detail:
-        Number.isSafeInteger(m.frontierEscalationRuns) && m.frontierEscalationRuns > 0 && !noRuns
-          ? `${count(m.frontierEscalationRuns)}/${count(runs)} runs with a recorded frontier escalation`
-          : 'no frontier-tier authority records escalations; zero is unmeasured',
+        m.frontierEscalationMeasurement === 'unmeasured'
+          ? 'no durable execution-class authority records escalations; zero is unmeasured'
+          : m.frontierEscalationMeasurement === 'partial'
+            ? `${count(m.frontierEscalationClassedRuns)}/${count(m.frontierClassedRuns)} fully-classed runs with a recorded frontier escalation (partial)`
+            : `${count(m.frontierEscalationRuns)}/${count(runs)} runs with a recorded frontier escalation (measured)`,
       definition:
-        'Runs with at least one recorded frontier escalation ÷ all runs. No frontier-tier ' +
-        'authority records escalations today, so zero renders not measured.',
-      unmeasured: !(
-        Number.isSafeInteger(m.frontierEscalationRuns) && m.frontierEscalationRuns > 0 && !noRuns
-      ),
+        'Runs with at least one recorded frontier escalation ÷ runs; null (never a ' +
+        'fabricated 0%) unless durable execution-class authority exists. The measurement token ' +
+        'reports measured | partial | unmeasured; `partial` covers exactly the fully-classed runs.',
+      unmeasured: m.frontierEscalationPpm === null,
     }),
   );
   return rows;
@@ -421,7 +488,16 @@ function stepLabel(step: ProtocolRunOutcome['modelSequence'][number]): string {
   const provider = step.provider.trim();
   const model = step.model.trim();
   const name = model.length > 0 ? (provider.length > 0 ? `${provider}/${model}` : model) : provider;
-  return `${step.local ? 'local' : 'hosted'}:${name.length > 0 ? name : 'unnamed'}`;
+  // Label by the durable class when present; a classless step's recorded
+  // pre-class local bit is the explicit `legacy-local` marker, never a
+  // class-derived `local` claim.
+  const classTag =
+    step.executionClass === 'unknown'
+      ? step.legacyLocal
+        ? 'legacy-local'
+        : 'unknown'
+      : step.executionClass;
+  return `${classTag}:${name.length > 0 ? name : 'unnamed'}`;
 }
 
 function completedText(ms: number): string {
@@ -445,7 +521,10 @@ export function outcomeRunView(run: ProtocolRunOutcome): OutcomeRunView {
         ? 'accepted; not integrated'
         : 'not accepted';
   const steps = run.modelSequence.map(stepLabel).join(' · ');
-  const spend = microFromDecimal(run.modelSpendMicro);
+  const settled = run.moneyState === 'complete';
+  const spend = settled && run.modelSpendMicro !== null ? microFromDecimal(run.modelSpendMicro) : null;
+  const exactSettled = (raw: string | null): string =>
+    raw === null ? UNAVAILABLE_VALUE : exactMoney(raw);
   return {
     runId: run.runId,
     taskClass: run.taskClass,
@@ -454,14 +533,17 @@ export function outcomeRunView(run: ProtocolRunOutcome): OutcomeRunView {
     accepted: run.accepted,
     integrated: run.integrated,
     verified: run.verified,
-    firstPass: run.verifiedFirstAttempt,
+    firstVerificationPass: run.verifiedFirstVerificationPass,
     repairAttempts: run.repairAttempts,
     completedText: completedText(run.completedAtMs),
     modelSpendUsd: spend === null ? UNAVAILABLE_VALUE : `${microUsdText(spend)} USD`,
-    modelSpendExact: exactMoney(run.modelSpendMicro),
-    verificationSpendExact: exactMoney(run.verificationSpendMicro),
-    reworkSpendExact: exactMoney(run.reworkSpendMicro),
-    avoidedHostedExact: exactMoney(run.avoidedHostedMicro),
+    modelSpendExact: exactSettled(settled ? run.modelSpendMicro : null),
+    verificationSpendExact: exactSettled(settled ? run.verificationSpendMicro : null),
+    reworkSpendExact: exactSettled(settled ? run.reworkSpendMicro : null),
+    avoidedHostedExact:
+      run.avoidedHostedMeasurement === 'measured' && run.avoidedHostedMicro !== null
+        ? exactMoney(run.avoidedHostedMicro)
+        : NOT_MEASURED,
     wallText: Number.isSafeInteger(run.wallTimeMs) ? `${run.wallTimeMs} ms` : UNAVAILABLE_VALUE,
     changeFiles: run.changeScale.files,
     addedLines: run.changeScale.addedLines,
@@ -484,7 +566,10 @@ function cursorView(cursor: ProtocolOutcomeCursor | null): OutcomesView['nextCur
 }
 
 /** Build the view from one freshly read page (newest-first). */
-export function buildOutcomesView(page: ProtocolOutcomesPage): OutcomesView {
+export function buildOutcomesView(
+  page: ProtocolOutcomesPage,
+  entitlementsStatus: string | null = null,
+): OutcomesView {
   const metrics = page.metrics;
   const runs = page.runs.slice(0, MAX_OUTCOME_RUNS).map(outcomeRunView);
   return {
@@ -498,6 +583,7 @@ export function buildOutcomesView(page: ProtocolOutcomesPage): OutcomesView {
     runs,
     nextCursor: cursorView(page.nextCursor),
     pageCount: 1,
+    entitlementsStatus,
   };
 }
 
@@ -509,9 +595,10 @@ export function buildOutcomesView(page: ProtocolOutcomesPage): OutcomesView {
 export function mergeOutcomesPage(
   previous: OutcomesView | null,
   page: ProtocolOutcomesPage,
+  entitlementsStatus: string | null = null,
 ): OutcomesView {
   if (previous === null || previous.state !== 'ok') {
-    return buildOutcomesView(page);
+    return buildOutcomesView(page, entitlementsStatus);
   }
   const seen = new Set(previous.runs.map((run) => run.runId));
   const appended: OutcomeRunView[] = [];
@@ -534,11 +621,17 @@ export function mergeOutcomesPage(
     runs,
     nextCursor: cursorView(page.nextCursor),
     pageCount: previous.pageCount + 1,
+    entitlementsStatus:
+      entitlementsStatus ?? (previous.state === 'ok' ? previous.entitlementsStatus : null),
   };
 }
 
 /** The explicit read-failure state (T29): no monetary value is rendered. */
-export function unavailableOutcomesView(reason: string, reasonCode: string | null): OutcomesView {
+export function unavailableOutcomesView(
+  reason: string,
+  reasonCode: string | null,
+  entitlementsStatus: string | null = null,
+): OutcomesView {
   return {
     state: 'unavailable',
     reason: reason.length > 240 ? `${reason.slice(0, 240)}…` : reason,
@@ -550,7 +643,65 @@ export function unavailableOutcomesView(reason: string, reasonCode: string | nul
     runs: [],
     nextCursor: null,
     pageCount: 0,
+    entitlementsStatus,
   };
+}
+
+/**
+ * The organization passed to `GET /native/outcomes` when present: the
+ * configured control-plane organization is only meaningful with a
+ * control-plane credential, so a missing/blank token or organization keeps
+ * the frozen local read. Pure so the host rule is selftest-pinned.
+ */
+export function outcomesOrganizationForRead(
+  configuredOrganization: string | null,
+  hasControlToken: boolean,
+): string | null {
+  if (!hasControlToken) {
+    return null;
+  }
+  const trimmed = configuredOrganization === null ? '' : configuredOrganization.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** The exact `outcome_ledger` hook the outcomes read enforces. */
+export const OUTCOME_LEDGER_HOOK = 'outcome_ledger';
+
+/**
+ * The value-entitlements status line of one successful report: the resolved
+ * plan, the `outcome_ledger` decision (granted, or refused with its exact
+ * cause) and the granted/total count. Deterministic and exact — the panel
+ * renders this string verbatim, and a withheld/unknown decision renders as
+ * refused, never as a granted claim.
+ */
+export function valueEntitlementsStatusLine(report: ProtocolValueEntitlementsReport): string {
+  const plan =
+    report.plan_found && report.plan_id !== null && report.plan_id.length > 0
+      ? report.plan_id
+      : 'unresolved';
+  const decision = report.decisions.find((entry) => entry.hook === OUTCOME_LEDGER_HOOK);
+  const ledger =
+    decision === undefined
+      ? `outcome_ledger refused (no decision served)`
+      : decision.granted
+        ? `outcome_ledger granted`
+        : `outcome_ledger refused (${decision.cause ?? 'unknown'})`;
+  const granted = report.decisions.filter((entry) => entry.granted).length;
+  return `value entitlements: plan ${plan} · ${ledger} · ${granted}/${report.decisions.length} granted`;
+}
+
+/**
+ * The value-entitlements status line of one failed report read: a disabled
+ * billing service renders "billing disabled locally" (the shared typed 409),
+ * anything else names the refusal. The reason is bounded — the panel line is
+ * a status, not a diagnostic dump.
+ */
+export function valueEntitlementsRefusalStatusLine(code: string | null, reason: string): string {
+  if (code === 'billing_disabled') {
+    return 'value entitlements: billing disabled locally';
+  }
+  const bounded = reason.length > 120 ? `${reason.slice(0, 120)}…` : reason;
+  return `value entitlements unavailable: ${bounded}`;
 }
 
 /**

@@ -39,12 +39,17 @@ faktor-provider.workspace = true
 faktor-ollama.workspace = true
 faktor-openai.workspace = true
 faktor-security.workspace = true
+faktor-session.workspace = true
+faktor-fs.workspace = true
+faktor-edit.workspace = true
+faktor-snapshot.workspace = true
+faktor-instructions.workspace = true
 blake3.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "net", "macros"] }
 
 [lints]
 workspace = true

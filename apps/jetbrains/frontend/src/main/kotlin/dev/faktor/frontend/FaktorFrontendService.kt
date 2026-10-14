@@ -63,6 +63,7 @@ import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.ProtocolAttachmentRef
+import dev.faktor.shared.ProtocolValueEntitlementsReport
 import java.math.BigInteger
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicBoolean
@@ -671,6 +672,10 @@ class FaktorFrontendService(
 
     fun entitlements(): NativeEntitlementSnapshot = clientOrThrow().entitlements()
 
+    /** The caller organization's DERIVED value-entitlement report. */
+    fun valueEntitlements(): ProtocolValueEntitlementsReport =
+        clientOrThrow().valueEntitlements()
+
     /** One cursor page of the organization's usage fold. */
     fun billingUsage(
         organization: String,
@@ -692,15 +697,20 @@ class FaktorFrontendService(
     /**
      * One bounded newest-first page of the Engineering Outcome Ledger
      * (`GET /native/outcomes`): the durable metrics fold plus run rows and
-     * the composite older-page cursor. Money and rates are validated by the
-     * client; a refusal propagates typed.
+     * the composite older-page cursor. `organization` requests the paid
+     * ORGANIZATION-scope read (`outcome_analytics`): the daemon requires the
+     * control-plane principal to reach that organization and the plan to
+     * map the entitlement — typed 403 `value_entitlement_refused` on a
+     * denial, 409 `billing_disabled` with no billing authority. Money and
+     * rates are validated by the client; a refusal propagates typed.
      */
     fun outcomes(
         limit: Long? = null,
         beforeMs: Long? = null,
-        beforeRun: String? = null
+        beforeRun: String? = null,
+        organization: String? = null
     ): dev.faktor.shared.ProtocolOutcomesPage =
-        clientOrThrow().outcomes(limit, beforeMs, beforeRun)
+        clientOrThrow().outcomes(limit, beforeMs, beforeRun, organization)
 
     fun taskVerification(taskId: String): NativeTaskVerification =
         clientOrThrow().taskVerification(requireSession(), taskId)

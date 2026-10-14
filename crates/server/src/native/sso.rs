@@ -20,21 +20,33 @@
 //!   foreign-organization session id is the same typed 404 a missing one
 //!   answers.
 //!
+//! PRINCIPAL LAW (oracle closure): start and callback require a
+//! control-plane PRINCIPAL (`x-faktor-control-token`), and the body's
+//! `organization` must equal the PRINCIPAL's own organization. The daemon
+//! password alone is not a principal: an unauthenticated daemon-password
+//! caller can no longer probe arbitrary organization ids (plan/SSO-existence
+//! oracle). A mismatch answers the SAME typed refusal as a nonexistent
+//! organization and names only the CALLER's own organization — never the
+//! requested one.
+//!
 //! All routes ride the daemon password. With no SSO authority wired,
 //! start/callback answer a typed 409 `sso_disabled`; with no control plane
-//! wired, logout answers a typed 409 `cloud_disabled`; an organization
-//! without an enabled `[enterprise]` SSO configuration answers a typed 409
+//! wired, 409 `cloud_disabled`; an organization without an enabled
+//! `[enterprise]` SSO configuration answers a typed 409
 //! `sso_not_configured`.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faktor_cloud::{AuthSessionId, OidcError, OrganizationId, SsoConfigRef};
+use faktor_cloud::{AuthSessionId, GovernanceCapability, OidcError, OrganizationId, SsoConfigRef};
 use faktor_protocol::error::ApiError;
 
-use super::control_plane::{control_plane_err, CONTROL_TOKEN_HEADER, MAX_CONTROL_HEADER_BYTES};
-use super::{authed, malformed_body, wire_status};
+use super::billing::billing_disabled;
+use super::control_plane::{
+    control_plane_err, require_principal, CONTROL_TOKEN_HEADER, MAX_CONTROL_HEADER_BYTES,
+};
+use super::{authed, malformed_body, value_entitlement_refused, wire_status};
 use crate::api::AppState;
 
 fn sso_disabled() -> ApiError {
@@ -119,6 +131,52 @@ fn parse_organization(raw: &str) -> Result<OrganizationId, ApiError> {
         .map_err(|_| malformed_body("organization must be a bounded printable id"))
 }
 
+/// Require the presented control-plane PRINCIPAL and BIND the request to its
+/// organization: the named organization must be the principal's own. A
+/// mismatch — whether the named organization exists or not — answers the
+/// SAME typed refusal and names only the CALLER's own organization, so the
+/// route can never be a plan/existence oracle for daemon-password callers.
+fn require_own_organization(
+    state: &AppState,
+    headers: &HeaderMap,
+    named: &OrganizationId,
+) -> Result<(), ApiError> {
+    let principal = require_principal(state, headers)?;
+    if principal.organization != *named {
+        return Err(ApiError {
+            code: "not_found",
+            message: format!(
+                "organization {} is not in the caller's scope",
+                principal.organization.as_str()
+            ),
+            http_status: 404,
+            retryable: false,
+        });
+    }
+    Ok(())
+}
+
+/// The IDENTITY-FEDERATION ENTRY gate (`enterprise_governance`): the
+/// organization's plan must map the base entitlement AND carry the
+/// capability flag (`sso`; `scim` is the same capability vocabulary for a
+/// future SCIM entry). The gate runs BEFORE any login state exists: a
+/// denial is the typed 403 `value_entitlement_refused` naming
+/// `enterprise_governance` (and the capability), and no billing authority
+/// wired answers the shared typed 409 `billing_disabled` — the flag gates
+/// the entry, never an implementation.
+fn authorize_identity_federation(
+    state: &AppState,
+    organization: &OrganizationId,
+    capability: GovernanceCapability,
+) -> Result<(), ApiError> {
+    let Some(service) = state.deps.billing.as_ref() else {
+        return Err(billing_disabled());
+    };
+    service
+        .check_governance_capability(organization, capability)
+        .map_err(value_entitlement_refused)
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SsoStartBody {
@@ -149,14 +207,24 @@ pub(crate) async fn native_sso_start(
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid sso start body (strict DTO)")),
     };
-    let authority = match sso_authority(&state) {
-        Ok(authority) => authority,
-        Err(e) => return wire_status(e),
-    };
     let organization = match parse_organization(&body.organization) {
         Ok(organization) => organization,
         Err(e) => return wire_status(e),
     };
+    // Principal law: the daemon password alone cannot probe organizations —
+    // the presented control-plane principal must own the named organization
+    // (the scope refusal names only the caller's own data).
+    if let Err(e) = require_own_organization(&state, &headers, &organization) {
+        return wire_status(e);
+    }
+    let authority = match sso_authority(&state) {
+        Ok(authority) => authority,
+        Err(e) => return wire_status(e),
+    };
+    if let Err(e) = authorize_identity_federation(&state, &organization, GovernanceCapability::Sso)
+    {
+        return wire_status(e);
+    }
     let sso = match resolve_sso(&state, &organization) {
         Ok(sso) => sso,
         Err(e) => return wire_status(e),
@@ -194,10 +262,15 @@ pub(crate) async fn native_sso_callback(
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid sso callback body (strict DTO)")),
     };
-    let authority = match sso_authority(&state) {
-        Ok(authority) => authority,
+    let organization = match parse_organization(&body.organization) {
+        Ok(organization) => organization,
         Err(e) => return wire_status(e),
     };
+    // Principal law: identical to `start` — the principal must own the named
+    // organization before any login state, plan or settings row is read.
+    if let Err(e) = require_own_organization(&state, &headers, &organization) {
+        return wire_status(e);
+    }
     let Some(control_plane) = state.deps.control_plane.as_ref() else {
         return wire_status(ApiError {
             code: "cloud_disabled",
@@ -206,10 +279,14 @@ pub(crate) async fn native_sso_callback(
             retryable: false,
         });
     };
-    let organization = match parse_organization(&body.organization) {
-        Ok(organization) => organization,
+    let authority = match sso_authority(&state) {
+        Ok(authority) => authority,
         Err(e) => return wire_status(e),
     };
+    if let Err(e) = authorize_identity_federation(&state, &organization, GovernanceCapability::Sso)
+    {
+        return wire_status(e);
+    }
     let sso = match resolve_sso(&state, &organization) {
         Ok(sso) => sso,
         Err(e) => return wire_status(e),

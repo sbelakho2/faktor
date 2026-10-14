@@ -172,6 +172,58 @@ impl VerificationPolicy {
             min_inline: Duration::ZERO,
         }
     }
+
+    /// Advanced-profile floors (see [`Self::advanced`]): the quick budget
+    /// never drops below this much wall time.
+    pub const ADVANCED_QUICK_MAX: Duration = Duration::from_secs(120);
+    /// Advanced-profile floor: the unit/full budget never drops below this.
+    pub const ADVANCED_UNIT_MAX: Duration = Duration::from_secs(1800);
+    /// Advanced-profile floor: inline checks below this remaining budget
+    /// still go background (the base floor, raised).
+    pub const ADVANCED_MIN_INLINE: Duration = Duration::from_secs(15);
+
+    /// The ADVANCED verification-policy profile — the
+    /// `advanced_verification_policy` paid augmentation: verification runs
+    /// DEEPER than the local default. Full-repository checks are no longer
+    /// silently demoted to a background operation: they run with the unit
+    /// budget inline, and the quick/unit budgets and the inline floor sit at
+    /// their advanced constants. The constructor is PRIVATE: the profile is
+    /// reachable only through the checked gate
+    /// ([`Self::advanced_checked`]); the LOCAL paths (`Default`, config
+    /// policy, [`Self::disabled`]) are never gated.
+    const fn advanced() -> Self {
+        Self {
+            quick_max: Self::ADVANCED_QUICK_MAX,
+            unit_max: Self::ADVANCED_UNIT_MAX,
+            full_as_background: false,
+            min_inline: Self::ADVANCED_MIN_INLINE,
+        }
+    }
+
+    /// TRUE when this policy reaches the ADVANCED (paid) profile's depth in
+    /// any sold dimension: a quick budget at/above the advanced floor, a
+    /// unit budget at/above the advanced floor, or full checks no longer
+    /// demoted to background. Such a policy IS the `advanced_verification_policy`
+    /// augmentation and must be constructed through [`Self::advanced_checked`]
+    /// (config numeric combinations that imply it are refused ungated).
+    pub const fn implies_advanced(&self) -> bool {
+        self.quick_max.as_nanos() >= Self::ADVANCED_QUICK_MAX.as_nanos()
+            || self.unit_max.as_nanos() >= Self::ADVANCED_UNIT_MAX.as_nanos()
+            || !self.full_as_background
+    }
+
+    /// The ONE gated constructor of the advanced profile: it succeeds ONLY
+    /// when the injected gate maps `advanced_verification_policy`; a denial
+    /// is the typed [`faktor_core::entitlement::ValueGateRefusal`] naming
+    /// the entitlement, its hook and (when resolved) the plan. An absent
+    /// gate refuses `cloud_absent` — the local default policy stays the
+    /// community answer.
+    pub fn advanced_checked(
+        gate: &faktor_core::entitlement::ValueGate,
+    ) -> Result<Self, faktor_core::entitlement::ValueGateRefusal> {
+        gate.check(faktor_core::entitlement::ValueEntitlement::AdvancedVerificationPolicy)?;
+        Ok(Self::advanced())
+    }
 }
 
 /// How a check should be executed given its category and the turn's
@@ -1334,6 +1386,104 @@ mod tests {
             budget_for(CheckCategory::Quick, &off, None),
             BudgetDecision::RunAsTaskOwnedOperation
         );
+    }
+
+    // -------------------------------------------- advanced policy (gated)
+
+    #[test]
+    fn advanced_policy_constructor_is_gated_typed() {
+        use faktor_core::entitlement::{
+            ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal, ValueRefusalCause,
+        };
+
+        #[derive(Debug)]
+        struct Entitled;
+        impl ValueEntitlementGate for Entitled {
+            fn check_value_entitlement(
+                &self,
+                _entitlement: ValueEntitlement,
+            ) -> Result<(), ValueGateRefusal> {
+                Ok(())
+            }
+        }
+
+        #[derive(Debug)]
+        struct Denied;
+        impl ValueEntitlementGate for Denied {
+            fn check_value_entitlement(
+                &self,
+                entitlement: ValueEntitlement,
+            ) -> Result<(), ValueGateRefusal> {
+                Err(ValueGateRefusal {
+                    entitlement,
+                    hook: entitlement.enforcement_hook(),
+                    cause: ValueRefusalCause::NotInPlan,
+                    plan_id: Some("team".into()),
+                    organization_id: Some("org_acme".into()),
+                    message: format!(
+                        "value entitlement {} not granted for organization org_acme: not_in_plan (plan Some(\"team\"))",
+                        entitlement.as_str()
+                    ),
+                })
+            }
+        }
+
+        // The entitled plan constructs the ADVANCED profile: deeper than the
+        // local default (full checks inline, raised floors).
+        let advanced =
+            VerificationPolicy::advanced_checked(&ValueGate::wired(std::sync::Arc::new(Entitled)))
+                .unwrap();
+        assert_eq!(advanced, VerificationPolicy::advanced());
+        assert_eq!(advanced.quick_max, VerificationPolicy::ADVANCED_QUICK_MAX);
+        assert_eq!(advanced.unit_max, VerificationPolicy::ADVANCED_UNIT_MAX);
+        assert!(!advanced.full_as_background);
+        assert_eq!(
+            budget_for(CheckCategory::Full, &advanced, None),
+            BudgetDecision::RunInline(VerificationPolicy::ADVANCED_UNIT_MAX)
+        );
+        assert!(advanced.quick_max > VerificationPolicy::default().quick_max);
+        // The advanced profile (and anything at/above its floors, or full
+        // checks inline) is classified as implying the paid augmentation;
+        // the local default and the disabled policy never are.
+        assert!(advanced.implies_advanced());
+        assert!(!VerificationPolicy::default().implies_advanced());
+        assert!(!VerificationPolicy::disabled().implies_advanced());
+        let deeper = VerificationPolicy {
+            quick_max: VerificationPolicy::ADVANCED_QUICK_MAX,
+            ..VerificationPolicy::default()
+        };
+        assert!(
+            deeper.implies_advanced(),
+            "a quick budget at the advanced floor implies the paid profile"
+        );
+        let inline_full = VerificationPolicy {
+            full_as_background: false,
+            ..VerificationPolicy::default()
+        };
+        assert!(
+            inline_full.implies_advanced(),
+            "inline full checks imply the paid profile"
+        );
+
+        // The denied plan is refused typed AT THE CONSTRUCTOR, naming the
+        // entitlement and the resolved plan.
+        let refusal =
+            VerificationPolicy::advanced_checked(&ValueGate::wired(std::sync::Arc::new(Denied)))
+                .unwrap_err();
+        assert_eq!(
+            refusal.entitlement,
+            ValueEntitlement::AdvancedVerificationPolicy
+        );
+        assert_eq!(refusal.hook.as_str(), "verification_policy");
+        assert_eq!(refusal.cause, ValueRefusalCause::NotInPlan);
+        assert_eq!(refusal.plan_id.as_deref(), Some("team"));
+        assert!(refusal.to_string().contains("advanced_verification_policy"));
+
+        // Offline (no gate) refuses typed `cloud_absent` — the local default
+        // policy stays the community answer.
+        let refusal = VerificationPolicy::advanced_checked(&ValueGate::absent()).unwrap_err();
+        assert_eq!(refusal.cause, ValueRefusalCause::CloudAbsent);
+        assert_eq!(refusal.plan_id, None);
     }
 
     // ---------------------------------------------------- typed derivation

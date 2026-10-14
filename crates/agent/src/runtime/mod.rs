@@ -91,7 +91,8 @@ use crate::tool_json::ToolCallMode;
 use crate::{
     session_terminal_run_id, FactSource, ModelOutput, OutcomeLedger, OutputTrust, RiskBucket,
     RouteDecision, RouterPhase, RunVerifiedSample, SettledCallOutcome, TaskClass, TerminalRunFacts,
-    TrustRefusal, VerifiedCallAttribution, MAX_RUN_VERIFIED_SAMPLES,
+    TerminalRunFactsOutbox, TrustRefusal, VerifiedCallAttribution, MAX_RUN_VERIFIED_SAMPLES,
+    TERMINAL_FACTS_SCHEMA_V,
 };
 
 mod request;

@@ -1670,8 +1670,9 @@ mod tests {
         use faktor_core::id::VerificationRecordId;
         use faktor_learning::{
             ActionDescriptor, ActionFingerprint, EnvironmentFingerprint, EpisodeId,
-            FailureDescriptor, FailureEpisode, FailureFingerprint, LearningService, ProjectScope,
-            SessionLearningStore, TaskClass, DEFAULT_MEMORY_CAPACITY,
+            FailureDescriptor, FailureEpisode, FailureFingerprint, LearningService, OrganizationId,
+            ProjectScope, SessionLearningStore, SingleOrganizationBinding, TaskClass,
+            DEFAULT_MEMORY_CAPACITY,
         };
 
         /// The production-shaped prior: key a durable omission-risk index by
@@ -1716,7 +1717,11 @@ mod tests {
         service.mine_and_store(&[episode]).unwrap();
         let stored = service.page(&scope, 0, 1)[0].clone();
         let key = stored.pattern.failure.digest();
-        let risks = service.omission_risk_index();
+        let risks = service
+            .omission_risk_index(&SingleOrganizationBinding::new(
+                OrganizationId::try_new("org_test").unwrap(),
+            ))
+            .unwrap();
         assert_eq!(risks[&key], 1.4, "one verified sample is 400k ppm");
 
         // Two equal-priced evidence blocks compete for exactly one slot;
@@ -1773,7 +1778,13 @@ mod tests {
             &unkeyed,
             &b,
             &cache,
-            Some(&KeyedRiskPrior(service.omission_risk_index())),
+            Some(&KeyedRiskPrior(
+                service
+                    .omission_risk_index(&SingleOrganizationBinding::new(
+                        OrganizationId::try_new("org_test").unwrap(),
+                    ))
+                    .unwrap(),
+            )),
         );
         assert!(plain.system.contains("### src/b.rs"));
         assert!(service.len() == 1);

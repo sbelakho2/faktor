@@ -1,0 +1,9 @@
+{
+  "id": "INV-FINDING-PROVIDER-IDENTITY",
+  "file": "crates/core/src/contract_compile.rs",
+  "find": "    if finding.provider != expected_provider {\n",
+  "replace": "    if false {\n",
+  "gate": "cargo test -p faktor-tests-economy --test new_guard_findings_validation",
+  "expect": "unwrap_err|must never become a statement|must never be applied",
+  "note": "Skipping the provider-identity validation accepts a finding under another provider's name as if it answered the consult."
+}

@@ -738,3 +738,344 @@ async fn register_artifact_strictness_and_edit_txn_protection() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].deletion_state, faktor_cloud::DeletionState::Deleted);
 }
+
+// ------------------------------------------------ extended audit (gated)
+
+/// [`enterprise_deps`] with the Wave 5 billing authority wired: the
+/// bootstrapped organization is subscribed to `plan_id` mapping `features`
+/// (`None` = no billing authority wired at all). Used by the
+/// `audit_retention_history` extended-read tests.
+async fn enterprise_deps_with_billing(
+    root: &std::path::Path,
+    plan: Option<(&str, &[&str])>,
+) -> Env {
+    use faktor_cloud::{
+        BillingConfig, EntitlementService, MemoryBillingStore, PlanConfig, Subscription,
+        SubscriptionId, SubscriptionStatus,
+    };
+    let control_plane = Arc::new(ControlPlane::new(
+        Arc::new(MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let service = Arc::new(
+        EnterpriseService::new(
+            Arc::new(MemoryControlPlaneStore::new()) as Arc<dyn faktor_cloud::EnterpriseStore>,
+            clock.clone(),
+        )
+        .unwrap(),
+    );
+    let mut deps = test_deps(root)
+        .with_control_plane(control_plane.clone())
+        .with_enterprise(service.clone(), None);
+    let boot = control_plane
+        .bootstrap_organization("acme", "owner@acme.test", "Owner", "boot-audit")
+        .unwrap();
+    let organization = boot.organization.id.as_str().to_string();
+    let owner_token = boot.token.expect("first issuance").expose().to_string();
+    if let Some((plan_id, features)) = plan {
+        let mut config = BillingConfig::default();
+        config.plans.insert(
+            plan_id.to_string(),
+            PlanConfig {
+                plan_id: plan_id.to_string(),
+                features: features.iter().map(|f| f.to_string()).collect(),
+                limits: Default::default(),
+            },
+        );
+        let billing = EntitlementService::new_for_organization(
+            Arc::new(MemoryBillingStore::new()),
+            clock.clone(),
+            config,
+            None,
+        )
+        .unwrap();
+        billing
+            .set_subscription(&Subscription {
+                id: SubscriptionId::try_new("sub_audit").unwrap(),
+                organization: boot.organization.id.clone(),
+                plan_id: plan_id.to_string(),
+                status: SubscriptionStatus::Active,
+                started_ms: 0,
+                expires_ms: None,
+                updated_ms: NOW_MS,
+            })
+            .unwrap();
+        deps = deps.with_billing(billing);
+    }
+    let token = deps.auth_token.clone();
+    let session = deps.session.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    Env {
+        handle,
+        daemon_token: token.as_str().to_string(),
+        owner_token,
+        organization,
+        control_plane,
+        service,
+        session,
+        clock,
+    }
+}
+
+/// The extended historical audit read is the `audit_retention_history` paid
+/// boundary: an entitled plan receives the deeper page; a denied plan is a
+/// typed 403 naming the entitlement; no billing authority = the shared typed
+/// 409 `billing_disabled`; the BASE read is never gated.
+#[tokio::test]
+async fn extended_audit_read_is_gated_by_the_retention_entitlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    // Entitled: `extended=true` answers the deeper page; the base read keeps
+    // its bound (an oversized base limit is still a 400).
+    let env = enterprise_deps_with_billing(
+        dir.path(),
+        Some(("audit", &[faktor_cloud::FEATURE_AUDIT_RETENTION_HISTORY])),
+    )
+    .await;
+    let resp = client
+        .get(url(
+            &env,
+            "/native/enterprise/audit?extended=true&limit=500",
+        ))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the entitled extended read answers");
+    let resp = client
+        .get(url(
+            &env,
+            &format!("/native/enterprise/audit?extended=true&limit={}", 2001),
+        ))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "beyond the extended bound is a 400");
+    let resp = client
+        .get(url(&env, "/native/enterprise/audit?extended=true"))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "extended without a limit uses the extended default bound"
+    );
+    drop(env);
+
+    // Denied: the same request is refused typed at the boundary, naming the
+    // entitlement and hook.
+    let dir2 = tempfile::tempdir().unwrap();
+    let env = enterprise_deps_with_billing(dir2.path(), Some(("local", &[]))).await;
+    let resp = client
+        .get(url(&env, "/native/enterprise/audit?extended=true"))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "value_entitlement_refused");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("audit_retention_history"), "{message}");
+    assert!(message.contains("audit_history"), "{message}");
+    // The BASE read is unchanged and ungated.
+    let resp = client
+        .get(url(&env, "/native/enterprise/audit?limit=10"))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the base read never consults the gate");
+    drop(env);
+
+    // Offline: no billing authority => the shared typed 409.
+    let dir3 = tempfile::tempdir().unwrap();
+    let env = enterprise_deps_with_billing(dir3.path(), None).await;
+    let resp = client
+        .get(url(&env, "/native/enterprise/audit?extended=true"))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "billing_disabled");
+}
+
+/// Append one deterministically-keyed audit row through the real service
+/// (owner principal; `PolicyChanged` needs no before/after reference).
+fn seed_audit(env: &Env, object: &str) {
+    let organization = faktor_cloud::OrganizationId::try_new(env.organization.clone()).unwrap();
+    let owner = faktor_cloud::Principal::user(
+        faktor_cloud::UserId::try_new("owner@acme.test").unwrap(),
+        organization.clone(),
+        CloudRole::Owner,
+    );
+    env.service
+        .record_mutation(
+            &owner,
+            &organization,
+            faktor_cloud::AuditAction::PolicyChanged,
+            "settings",
+            object,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+}
+
+/// One base audit read: the served event objects + the window fields.
+async fn base_audit_read(
+    client: &reqwest::Client,
+    env: &Env,
+    query: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let resp = client
+        .get(url(env, &format!("/native/enterprise/audit{query}")))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap())
+}
+
+fn served_objects(body: &serde_json::Value) -> Vec<&str> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["object"].as_str().unwrap())
+        .collect()
+}
+
+/// The BASE audit read is bounded to the configured retention window. The
+/// window boundary is EXACT: the event whose timestamp equals the window
+/// start is readable, the event 1 ms older is not. A denied plan can never
+/// page beyond the window (base clamp OR typed 403 on a pre-window cursor OR
+/// 403 on `extended`); an entitled plan reads older history with
+/// `extended=true` and gets the typed 400 naming `extended=true` on a
+/// pre-window base cursor.
+#[tokio::test]
+async fn base_audit_read_is_bounded_to_the_retention_window() {
+    let window = faktor_cloud::DEFAULT_AUDIT_BASE_WINDOW_MS;
+    let client = reqwest::Client::new();
+
+    // Denied plan (`local` maps no value entitlements).
+    let dir = tempfile::tempdir().unwrap();
+    let env = enterprise_deps_with_billing(dir.path(), Some(("local", &[]))).await;
+    // Seed: one event 1 ms OLDER than the window start, one exactly AT the
+    // boundary (timestamp == window start), one fresh. The clock moves with
+    // the appends, so the seam boundary is deterministic.
+    env.clock.advance(-1);
+    seed_audit(&env, "older-than-window");
+    env.clock.advance(1);
+    seed_audit(&env, "window-boundary");
+    env.clock.advance(window);
+    seed_audit(&env, "fresh");
+
+    // A fresh base walk clamps to the window boundary: the old event is never
+    // served, the boundary event (seq == last_out_of_window_seq + 1) is.
+    let (status, body) = base_audit_read(&client, &env, "?limit=10").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(served_objects(&body), vec!["window-boundary", "fresh"]);
+    assert_eq!(body["olderEventsGated"], true, "{body}");
+    assert_eq!(
+        body["baseWindowStartMs"].as_i64().unwrap(),
+        NOW_MS,
+        "{body}"
+    );
+    assert!(body["nextCursor"].is_null(), "{body}");
+
+    // Cursor == the last OLD seq is the EXACT boundary: the next event
+    // (timestamp == window start) is inside the window, ungated.
+    let (status, body) = base_audit_read(&client, &env, "?cursor=1&limit=10").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(served_objects(&body), vec!["window-boundary", "fresh"]);
+
+    // Cursor == the boundary - 1 addresses the pre-window event: refused
+    // typed, naming the entitlement and hook; the ledger is never read.
+    let (status, body) = base_audit_read(&client, &env, "?cursor=0&limit=10").await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "value_entitlement_refused");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("audit_retention_history"), "{message}");
+    assert!(message.contains("audit_history"), "{message}");
+
+    // `extended=true` (the historical read) is refused for the denied plan.
+    let (status, body) = base_audit_read(&client, &env, "?extended=true").await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "value_entitlement_refused");
+    drop(env);
+
+    // Entitled plan: older pages are readable with `extended=true`; the BASE
+    // read still never serves them and names the extended form typed.
+    let dir2 = tempfile::tempdir().unwrap();
+    let env = enterprise_deps_with_billing(
+        dir2.path(),
+        Some(("audit", &[faktor_cloud::FEATURE_AUDIT_RETENTION_HISTORY])),
+    )
+    .await;
+    env.clock.advance(-1);
+    seed_audit(&env, "older-than-window");
+    env.clock.advance(1);
+    seed_audit(&env, "window-boundary");
+    env.clock.advance(window);
+    seed_audit(&env, "fresh");
+
+    let resp = client
+        .get(url(
+            &env,
+            "/native/enterprise/audit?extended=true&cursor=0&limit=10",
+        ))
+        .bearer_auth(&env.daemon_token)
+        .header("x-faktor-control-token", &env.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the entitled historical read answers");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        served_objects(&body),
+        vec!["older-than-window", "window-boundary", "fresh"]
+    );
+
+    let (status, body) = base_audit_read(&client, &env, "?cursor=0&limit=10").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "audit_window_requires_extended");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("extended=true"), "{message}");
+    // The fresh base walk stays bounded for the entitled plan too.
+    let (status, body) = base_audit_read(&client, &env, "?limit=10").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(served_objects(&body), vec!["window-boundary", "fresh"]);
+    drop(env);
+
+    // Offline (no billing authority): a pre-window base cursor is the shared
+    // typed 409, never a silent read; the in-window base walk still works.
+    let dir3 = tempfile::tempdir().unwrap();
+    let env = enterprise_deps_with_billing(dir3.path(), None).await;
+    env.clock.advance(-1);
+    seed_audit(&env, "older-than-window");
+    env.clock.advance(window + 1);
+    seed_audit(&env, "fresh");
+    let (status, body) = base_audit_read(&client, &env, "?cursor=0&limit=10").await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "billing_disabled");
+    let (status, body) = base_audit_read(&client, &env, "?limit=10").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(served_objects(&body), vec!["fresh"]);
+}

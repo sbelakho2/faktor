@@ -623,17 +623,46 @@ fn queue_file_array_predicate_is_pinned_against_mutation() {
 /// the append, tail read after) and report a false projection disagreement
 /// on a legitimately in-flight transition. While a writer hammers appends,
 /// validation must never report that disagreement.
+///
+/// Load-robust by construction (the old shape raced an UNBOUNDED writer
+/// against a fixed validation count: a descheduled reader let the journal
+/// grow without bound and the race could go unattested):
+/// - the writer's volume is bounded (`WRITER_TARGET`), so the journal stays
+///   small no matter how the host schedules the two threads;
+/// - the validations only start after the writer has durably interleaved
+///   `MIN_INTERLEAVED` appends (observable condition) — a starved writer can
+///   never make this test vacuously green;
+/// - the ceiling only fails a genuinely wedged host or writer.
+///
+/// Every validation still asserts the invariant (teeth unchanged).
 #[test]
 fn journal_open_validation_never_tears_under_concurrent_append() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Bounded writer volume: enough to interleave with the validations
+    /// under any scheduling, small enough that the journal stays a few MB
+    /// when the reader is descheduled.
+    const WRITER_TARGET: u64 = 5_000;
+    /// Validations to run while the writer is (at least initially) racing.
+    const MIN_VALIDATIONS: u64 = 2_000;
+    /// Completed appends that must be observed before validations count:
+    /// without them the race was never exercised and the run is refused.
+    const MIN_INTERLEAVED: u64 = 100;
+    /// Deadlock-only ceiling for the interleaving gate.
+    const DEADLINE: Duration = Duration::from_secs(120);
+
     let (_d, store) = tmp_store();
     let ws = store.create_workspace("/w").unwrap();
     let session = store.create_session(ws, "c", "p", "m").unwrap();
     let sid = session.id;
     let store = std::sync::Arc::new(store);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appended = std::sync::Arc::new(AtomicU64::new(0));
     let writer = {
         let store = store.clone();
         let stop = stop.clone();
+        let appended = appended.clone();
         std::thread::spawn(move || {
             let states = [
                 AgentState::BuildingContext,
@@ -641,7 +670,8 @@ fn journal_open_validation_never_tears_under_concurrent_append() {
                 AgentState::Streaming,
             ];
             let mut i = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) && appended.load(Ordering::Relaxed) < WRITER_TARGET
+            {
                 let state = states[(i % 3) as usize];
                 store
                     .append_event(
@@ -653,11 +683,23 @@ fn journal_open_validation_never_tears_under_concurrent_append() {
                         None,
                     )
                     .unwrap();
+                appended.fetch_add(1, Ordering::Relaxed);
                 i += 1;
             }
         })
     };
-    for _ in 0..2_000 {
+    // Interleaving gate: wait (bounded, observable) until the writer has
+    // actually appended against the store the validations will read.
+    let deadline = Instant::now() + DEADLINE;
+    while appended.load(Ordering::Relaxed) < MIN_INTERLEAVED {
+        assert!(
+            Instant::now() < deadline,
+            "the append writer never interleaved ({} appends); wedged host or writer",
+            appended.load(Ordering::Relaxed)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for _ in 0..MIN_VALIDATIONS {
         let problems = store
             .journal_session_problems(sid, JournalDepth::Open)
             .unwrap();

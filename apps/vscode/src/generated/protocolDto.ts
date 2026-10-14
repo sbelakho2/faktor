@@ -344,12 +344,17 @@ export interface ProtocolSessionPromptReceipt {
   readonly queued: boolean;
 }
 
-/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm. (unknown_fields: ignore) */
+/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = "unavailable"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. (unknown_fields: ignore) */
 export interface ProtocolOutcomeMetrics {
   readonly runs: number;
   readonly verifiedChanges: number;
-  readonly verifiedFirstPassChanges: number;
-  readonly verifiedFirstPassPpm: number;
+  readonly verifiedFirstVerificationPassChanges: number;
+  readonly verifiedFirstVerificationPassPpm: number;
+  readonly moneyCompleteRuns: number;
+  readonly moneyPendingRuns: number;
+  readonly moneyUnavailableRuns: number;
+  readonly moneyIncompleteExcluded: number;
+  readonly verifiedChangesMoneyComplete: number;
   readonly totalVerifiedSpendMicro: string;
   readonly successfulRunCostMicro: string;
   readonly totalSpendMicro: string;
@@ -366,11 +371,14 @@ export interface ProtocolOutcomeMetrics {
   readonly localFirstRuns: number;
   readonly localFirstSuccessChanges: number;
   readonly localFirstSuccessPpm: number;
-  readonly localToFrontierFallbackRuns: number;
-  readonly localToFrontierFallbackPpm: number;
-  readonly frontierOnlyRuns: number;
-  readonly frontierOnlyPpm: number;
-  readonly avoidedHostedInferenceMicro: string;
+  readonly localToHostedFallbackRuns: number;
+  readonly localToHostedFallbackPpm: number;
+  readonly hostedOnlyRuns: number;
+  readonly runsWithSteps: number;
+  readonly hostedOnlyPpm: number;
+  readonly avoidedHostedInferenceMicro: string | null;
+  readonly avoidedHostedInferenceMeasurement: string;
+  readonly avoidedHostedMeasuredRuns: number;
   readonly totalWallTimeMs: number;
   readonly meanTimeToVerifiedChangeMs: number;
   readonly humanInterventionRuns: number;
@@ -381,17 +389,22 @@ export interface ProtocolOutcomeMetrics {
   readonly checksRequired: number;
   readonly proofCoveragePpm: number;
   readonly frontierEscalationRuns: number;
-  readonly frontierEscalationPpm: number;
+  readonly frontierClassedRuns: number;
+  readonly frontierEscalationClassedRuns: number;
+  readonly frontierEscalationPpm: number | null;
+  readonly frontierEscalationMeasurement: string;
   readonly scanned: number;
   readonly truncated: boolean;
 }
 
-/** One provider/model step of a completed run's execution sequence (money as a decimal string). (unknown_fields: ignore) */
+/** One provider/model step of a completed run's execution sequence. `executionClass` is the durable route-time classification (`local` | `hosted_economy` | `hosted_balanced` | `frontier` | `unknown`); `local` is CLASS-DERIVED — true only when the class is `local`. A step with no durable class authority (`unknown`: a pre-class legacy payload or an unpriced path) exposes its recorded pre-class local bit as `legacyLocal` (true only for a classless step whose stored row recorded a local execution); a class-carrying step always reports `legacyLocal` false, and the legacy bit is never promoted to a class claim. `unknown` is counted as neither local nor hosted by the metrics. `spendMicro` is a decimal string only when the run's money is settled (`complete`); null otherwise — the money is not final, never a fabricated zero. (unknown_fields: ignore) */
 export interface ProtocolRunOutcomeModelStep {
   readonly provider: string;
   readonly model: string;
   readonly local: boolean;
-  readonly spendMicro: string;
+  readonly legacyLocal: boolean;
+  readonly executionClass: string;
+  readonly spendMicro: string | null;
 }
 
 /** One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm. (unknown_fields: ignore) */
@@ -408,7 +421,7 @@ export interface ProtocolRunOutcomeChangeScale {
   readonly removedLines: number;
 }
 
-/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. (unknown_fields: ignore) */
+/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == "complete"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = "unavailable"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). (unknown_fields: ignore) */
 export interface ProtocolRunOutcome {
   readonly runId: string;
   readonly sessionId: number;
@@ -420,13 +433,15 @@ export interface ProtocolRunOutcome {
   readonly accepted: boolean;
   readonly integrated: boolean;
   readonly verified: boolean;
-  readonly verifiedFirstAttempt: boolean;
+  readonly verifiedFirstVerificationPass: boolean;
   readonly repairAttempts: number;
   readonly modelSequence: readonly ProtocolRunOutcomeModelStep[];
-  readonly modelSpendMicro: string;
-  readonly verificationSpendMicro: string;
-  readonly reworkSpendMicro: string;
-  readonly avoidedHostedMicro: string;
+  readonly moneyState: string;
+  readonly modelSpendMicro: string | null;
+  readonly verificationSpendMicro: string | null;
+  readonly reworkSpendMicro: string | null;
+  readonly avoidedHostedMicro: string | null;
+  readonly avoidedHostedMeasurement: string;
   readonly wallTimeMs: number;
   readonly humanInterventions: number;
   readonly proof: ProtocolRunOutcomeProof;
@@ -789,15 +804,20 @@ export function validateProtocolSessionPromptReceipt(value: ProtocolJson, path =
 
 export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "ProtocolOutcomeMetrics"): ProtocolOutcomeMetrics {
   const object = dtoObject(value, path);
-  const required = ["runs","verifiedChanges","verifiedFirstPassChanges","verifiedFirstPassPpm","totalVerifiedSpendMicro","successfulRunCostMicro","totalSpendMicro","verifiedCostPerSuccessfulChangeMicro","totalReworkSpendMicro","reworkCostRatioPpm","localRuns","localOnlyRuns","localOnlyVerifiedChanges","localOnlyVerifiedPpm","localFinalRuns","localFinalVerifiedChanges","localFinalVerifiedPpm","localFirstRuns","localFirstSuccessChanges","localFirstSuccessPpm","localToFrontierFallbackRuns","localToFrontierFallbackPpm","frontierOnlyRuns","frontierOnlyPpm","avoidedHostedInferenceMicro","totalWallTimeMs","meanTimeToVerifiedChangeMs","humanInterventionRuns","humanInterventionPpm","rollbackRuns","regressionRollbackPpm","checksPassed","checksRequired","proofCoveragePpm","frontierEscalationRuns","frontierEscalationPpm","scanned","truncated"];
+  const required = ["runs","verifiedChanges","verifiedFirstVerificationPassChanges","verifiedFirstVerificationPassPpm","moneyCompleteRuns","moneyPendingRuns","moneyUnavailableRuns","moneyIncompleteExcluded","verifiedChangesMoneyComplete","totalVerifiedSpendMicro","successfulRunCostMicro","totalSpendMicro","verifiedCostPerSuccessfulChangeMicro","totalReworkSpendMicro","reworkCostRatioPpm","localRuns","localOnlyRuns","localOnlyVerifiedChanges","localOnlyVerifiedPpm","localFinalRuns","localFinalVerifiedChanges","localFinalVerifiedPpm","localFirstRuns","localFirstSuccessChanges","localFirstSuccessPpm","localToHostedFallbackRuns","localToHostedFallbackPpm","hostedOnlyRuns","runsWithSteps","hostedOnlyPpm","avoidedHostedInferenceMicro","avoidedHostedInferenceMeasurement","avoidedHostedMeasuredRuns","totalWallTimeMs","meanTimeToVerifiedChangeMs","humanInterventionRuns","humanInterventionPpm","rollbackRuns","regressionRollbackPpm","checksPassed","checksRequired","proofCoveragePpm","frontierEscalationRuns","frontierClassedRuns","frontierEscalationClassedRuns","frontierEscalationPpm","frontierEscalationMeasurement","scanned","truncated"];
   for (const key of required) {
     dtoRequired(object, key, path);
   }
   return {
     runs: dtoI64(object, "runs", path),
     verifiedChanges: dtoI64(object, "verifiedChanges", path),
-    verifiedFirstPassChanges: dtoI64(object, "verifiedFirstPassChanges", path),
-    verifiedFirstPassPpm: dtoI64(object, "verifiedFirstPassPpm", path),
+    verifiedFirstVerificationPassChanges: dtoI64(object, "verifiedFirstVerificationPassChanges", path),
+    verifiedFirstVerificationPassPpm: dtoI64(object, "verifiedFirstVerificationPassPpm", path),
+    moneyCompleteRuns: dtoI64(object, "moneyCompleteRuns", path),
+    moneyPendingRuns: dtoI64(object, "moneyPendingRuns", path),
+    moneyUnavailableRuns: dtoI64(object, "moneyUnavailableRuns", path),
+    moneyIncompleteExcluded: dtoI64(object, "moneyIncompleteExcluded", path),
+    verifiedChangesMoneyComplete: dtoI64(object, "verifiedChangesMoneyComplete", path),
     totalVerifiedSpendMicro: dtoString(object, "totalVerifiedSpendMicro", path),
     successfulRunCostMicro: dtoString(object, "successfulRunCostMicro", path),
     totalSpendMicro: dtoString(object, "totalSpendMicro", path),
@@ -814,11 +834,14 @@ export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "Prot
     localFirstRuns: dtoI64(object, "localFirstRuns", path),
     localFirstSuccessChanges: dtoI64(object, "localFirstSuccessChanges", path),
     localFirstSuccessPpm: dtoI64(object, "localFirstSuccessPpm", path),
-    localToFrontierFallbackRuns: dtoI64(object, "localToFrontierFallbackRuns", path),
-    localToFrontierFallbackPpm: dtoI64(object, "localToFrontierFallbackPpm", path),
-    frontierOnlyRuns: dtoI64(object, "frontierOnlyRuns", path),
-    frontierOnlyPpm: dtoI64(object, "frontierOnlyPpm", path),
-    avoidedHostedInferenceMicro: dtoString(object, "avoidedHostedInferenceMicro", path),
+    localToHostedFallbackRuns: dtoI64(object, "localToHostedFallbackRuns", path),
+    localToHostedFallbackPpm: dtoI64(object, "localToHostedFallbackPpm", path),
+    hostedOnlyRuns: dtoI64(object, "hostedOnlyRuns", path),
+    runsWithSteps: dtoI64(object, "runsWithSteps", path),
+    hostedOnlyPpm: dtoI64(object, "hostedOnlyPpm", path),
+    avoidedHostedInferenceMicro: dtoNullableString(object, "avoidedHostedInferenceMicro", path),
+    avoidedHostedInferenceMeasurement: dtoString(object, "avoidedHostedInferenceMeasurement", path),
+    avoidedHostedMeasuredRuns: dtoI64(object, "avoidedHostedMeasuredRuns", path),
     totalWallTimeMs: dtoI64(object, "totalWallTimeMs", path),
     meanTimeToVerifiedChangeMs: dtoI64(object, "meanTimeToVerifiedChangeMs", path),
     humanInterventionRuns: dtoI64(object, "humanInterventionRuns", path),
@@ -829,7 +852,10 @@ export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "Prot
     checksRequired: dtoI64(object, "checksRequired", path),
     proofCoveragePpm: dtoI64(object, "proofCoveragePpm", path),
     frontierEscalationRuns: dtoI64(object, "frontierEscalationRuns", path),
-    frontierEscalationPpm: dtoI64(object, "frontierEscalationPpm", path),
+    frontierClassedRuns: dtoI64(object, "frontierClassedRuns", path),
+    frontierEscalationClassedRuns: dtoI64(object, "frontierEscalationClassedRuns", path),
+    frontierEscalationPpm: dtoNullableI64(object, "frontierEscalationPpm", path),
+    frontierEscalationMeasurement: dtoString(object, "frontierEscalationMeasurement", path),
     scanned: dtoI64(object, "scanned", path),
     truncated: dtoBool(object, "truncated", path),
   };
@@ -837,7 +863,7 @@ export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "Prot
 
 export function validateProtocolRunOutcomeModelStep(value: ProtocolJson, path = "ProtocolRunOutcomeModelStep"): ProtocolRunOutcomeModelStep {
   const object = dtoObject(value, path);
-  const required = ["provider","model","local","spendMicro"];
+  const required = ["provider","model","local","legacyLocal","executionClass","spendMicro"];
   for (const key of required) {
     dtoRequired(object, key, path);
   }
@@ -845,7 +871,9 @@ export function validateProtocolRunOutcomeModelStep(value: ProtocolJson, path = 
     provider: dtoString(object, "provider", path),
     model: dtoString(object, "model", path),
     local: dtoBool(object, "local", path),
-    spendMicro: dtoString(object, "spendMicro", path),
+    legacyLocal: dtoBool(object, "legacyLocal", path),
+    executionClass: dtoString(object, "executionClass", path),
+    spendMicro: dtoNullableString(object, "spendMicro", path),
   };
 }
 
@@ -877,7 +905,7 @@ export function validateProtocolRunOutcomeChangeScale(value: ProtocolJson, path 
 
 export function validateProtocolRunOutcome(value: ProtocolJson, path = "ProtocolRunOutcome"): ProtocolRunOutcome {
   const object = dtoObject(value, path);
-  const required = ["runId","sessionId","taskId","taskClass","riskClass","candidateSnapshot","finalSnapshot","accepted","integrated","verified","verifiedFirstAttempt","repairAttempts","modelSequence","modelSpendMicro","verificationSpendMicro","reworkSpendMicro","avoidedHostedMicro","wallTimeMs","humanInterventions","proof","changeScale","rollbackEvents","recoveryEvents","finalBasis","frontierEscalations","completedAtMs"];
+  const required = ["runId","sessionId","taskId","taskClass","riskClass","candidateSnapshot","finalSnapshot","accepted","integrated","verified","verifiedFirstVerificationPass","repairAttempts","modelSequence","moneyState","modelSpendMicro","verificationSpendMicro","reworkSpendMicro","avoidedHostedMicro","avoidedHostedMeasurement","wallTimeMs","humanInterventions","proof","changeScale","rollbackEvents","recoveryEvents","finalBasis","frontierEscalations","completedAtMs"];
   for (const key of required) {
     dtoRequired(object, key, path);
   }
@@ -892,13 +920,15 @@ export function validateProtocolRunOutcome(value: ProtocolJson, path = "Protocol
     accepted: dtoBool(object, "accepted", path),
     integrated: dtoBool(object, "integrated", path),
     verified: dtoBool(object, "verified", path),
-    verifiedFirstAttempt: dtoBool(object, "verifiedFirstAttempt", path),
+    verifiedFirstVerificationPass: dtoBool(object, "verifiedFirstVerificationPass", path),
     repairAttempts: dtoI64(object, "repairAttempts", path),
     modelSequence: dtoList(object, "modelSequence", path).map((item, index) => validateProtocolRunOutcomeModelStep(item, path + ".modelSequence[" + index + "]")),
-    modelSpendMicro: dtoString(object, "modelSpendMicro", path),
-    verificationSpendMicro: dtoString(object, "verificationSpendMicro", path),
-    reworkSpendMicro: dtoString(object, "reworkSpendMicro", path),
-    avoidedHostedMicro: dtoString(object, "avoidedHostedMicro", path),
+    moneyState: dtoString(object, "moneyState", path),
+    modelSpendMicro: dtoNullableString(object, "modelSpendMicro", path),
+    verificationSpendMicro: dtoNullableString(object, "verificationSpendMicro", path),
+    reworkSpendMicro: dtoNullableString(object, "reworkSpendMicro", path),
+    avoidedHostedMicro: dtoNullableString(object, "avoidedHostedMicro", path),
+    avoidedHostedMeasurement: dtoString(object, "avoidedHostedMeasurement", path),
     wallTimeMs: dtoI64(object, "wallTimeMs", path),
     humanInterventions: dtoI64(object, "humanInterventions", path),
     proof: validateProtocolRunOutcomeProof(dtoRequired(object, "proof", path), path + ".proof"),

@@ -69,6 +69,7 @@ import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.ProtocolOutcomesPage
+import dev.faktor.shared.ProtocolValueEntitlementsReport
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
@@ -112,6 +113,7 @@ import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeUsage
+import dev.faktor.shared.parseNativeValueEntitlements
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.parseProtocolAttachmentRef
 import dev.faktor.shared.parseProtocolErrorEnvelope
@@ -717,6 +719,15 @@ class NativeClient(
         parseNativeEntitlements(request("GET", "/native/entitlements"))
 
     /**
+     * The caller organization's DERIVED value-entitlement report
+     * (`GET /native/value-entitlements`): one typed decision per paid value
+     * capability (hook, granted, exact cause when not). A disabled billing
+     * service answers the shared typed 409 `billing_disabled`.
+     */
+    fun valueEntitlements(): ProtocolValueEntitlementsReport =
+        parseNativeValueEntitlements(request("GET", "/native/value-entitlements"))
+
+    /**
      * The organization's usage fold plus ONE cursor page of its usage events.
      * `since` is the exclusive cursor a previous page returned as
      * `nextCursor`; the daemon bounds the page size (1..=200).
@@ -787,15 +798,21 @@ class NativeClient(
      * One bounded newest-first page of the Engineering Outcome Ledger plus
      * its durable metrics fold (`GET /native/outcomes`). `beforeMs` and
      * `beforeRun` are the composite cursor of a previous page and must be
-     * given together. Money fields are validated as exact decimal strings
-     * and rates as ppm in 0..=1_000_000 before the model layer consumes
-     * them: a malformed served number is a typed refusal, never a
-     * fabricated metric.
+     * given together. `organization` requests the paid ORGANIZATION-scope
+     * read (`outcome_analytics`): the daemon then requires the control-plane
+     * principal to reach that organization and the plan to map the
+     * entitlement — a denial is the typed 403 `value_entitlement_refused`,
+     * no billing authority is the shared typed 409 `billing_disabled`.
+     * Absent/blank, the read keeps the frozen local shape. Money fields are
+     * validated as exact decimal strings and rates as ppm in 0..=1_000_000
+     * before the model layer consumes them: a malformed served number is a
+     * typed refusal, never a fabricated metric.
      */
     fun outcomes(
         limit: Long? = null,
         beforeMs: Long? = null,
-        beforeRun: String? = null
+        beforeRun: String? = null,
+        organization: String? = null
     ): ProtocolOutcomesPage {
         val path = "GET /native/outcomes"
         if ((beforeMs == null) != (beforeRun == null)) {
@@ -808,7 +825,8 @@ class NativeClient(
                     query(
                         "limit" to limit?.toString(),
                         "before_ms" to beforeMs?.toString(),
-                        "before_run" to beforeRun
+                        "before_run" to beforeRun,
+                        "org" to organization?.takeIf { it.isNotBlank() }
                     )
                 )
             ).view(path)
@@ -825,8 +843,7 @@ class NativeClient(
             "successfulRunCostMicro" to metrics.successfulRunCostMicro,
             "totalSpendMicro" to metrics.totalSpendMicro,
             "verifiedCostPerSuccessfulChangeMicro" to metrics.verifiedCostPerSuccessfulChangeMicro,
-            "totalReworkSpendMicro" to metrics.totalReworkSpendMicro,
-            "avoidedHostedInferenceMicro" to metrics.avoidedHostedInferenceMicro
+            "totalReworkSpendMicro" to metrics.totalReworkSpendMicro
         )
         for ((field, value) in money) {
             if (MicroMoney.parseDecimal(value) == null) {
@@ -836,18 +853,27 @@ class NativeClient(
                 )
             }
         }
+        // A measured counterfactual must be an exact decimal; null is the
+        // typed unavailable absence (never a fabricated zero).
+        metrics.avoidedHostedInferenceMicro?.let { value ->
+            if (MicroMoney.parseDecimal(value) == null) {
+                throw NativeProtocolException(
+                    path,
+                    "the outcome metric avoidedHostedInferenceMicro is not an exact decimal money string: \"$value\""
+                )
+            }
+        }
         val rates = linkedMapOf(
-            "verifiedFirstPassPpm" to metrics.verifiedFirstPassPpm,
+            "verifiedFirstVerificationPassPpm" to metrics.verifiedFirstVerificationPassPpm,
             "reworkCostRatioPpm" to metrics.reworkCostRatioPpm,
             "localOnlyVerifiedPpm" to metrics.localOnlyVerifiedPpm,
             "localFinalVerifiedPpm" to metrics.localFinalVerifiedPpm,
             "localFirstSuccessPpm" to metrics.localFirstSuccessPpm,
-            "localToFrontierFallbackPpm" to metrics.localToFrontierFallbackPpm,
-            "frontierOnlyPpm" to metrics.frontierOnlyPpm,
+            "localToHostedFallbackPpm" to metrics.localToHostedFallbackPpm,
+            "hostedOnlyPpm" to metrics.hostedOnlyPpm,
             "humanInterventionPpm" to metrics.humanInterventionPpm,
             "regressionRollbackPpm" to metrics.regressionRollbackPpm,
-            "proofCoveragePpm" to metrics.proofCoveragePpm,
-            "frontierEscalationPpm" to metrics.frontierEscalationPpm
+            "proofCoveragePpm" to metrics.proofCoveragePpm
         )
         for ((field, value) in rates) {
             if (value < 0L || value > 1_000_000L) {
@@ -857,10 +883,20 @@ class NativeClient(
                 )
             }
         }
+        // The frontier escalation rate is NULL unless durable execution-class
+        // authority exists (never a fabricated 0%); a present value is a rate.
+        metrics.frontierEscalationPpm?.let { value ->
+            if (value < 0L || value > 1_000_000L) {
+                throw NativeProtocolException(
+                    path,
+                    "the outcome rate frontierEscalationPpm must be ppm in 0..=1000000, got $value"
+                )
+            }
+        }
         val counters = linkedMapOf(
             "runs" to metrics.runs,
             "verifiedChanges" to metrics.verifiedChanges,
-            "verifiedFirstPassChanges" to metrics.verifiedFirstPassChanges,
+            "verifiedFirstVerificationPassChanges" to metrics.verifiedFirstVerificationPassChanges,
             "localRuns" to metrics.localRuns,
             "localOnlyRuns" to metrics.localOnlyRuns,
             "localOnlyVerifiedChanges" to metrics.localOnlyVerifiedChanges,
@@ -868,8 +904,9 @@ class NativeClient(
             "localFinalVerifiedChanges" to metrics.localFinalVerifiedChanges,
             "localFirstRuns" to metrics.localFirstRuns,
             "localFirstSuccessChanges" to metrics.localFirstSuccessChanges,
-            "localToFrontierFallbackRuns" to metrics.localToFrontierFallbackRuns,
-            "frontierOnlyRuns" to metrics.frontierOnlyRuns,
+            "localToHostedFallbackRuns" to metrics.localToHostedFallbackRuns,
+            "hostedOnlyRuns" to metrics.hostedOnlyRuns,
+            "runsWithSteps" to metrics.runsWithSteps,
             "totalWallTimeMs" to metrics.totalWallTimeMs,
             "meanTimeToVerifiedChangeMs" to metrics.meanTimeToVerifiedChangeMs,
             "humanInterventionRuns" to metrics.humanInterventionRuns,
@@ -877,6 +914,8 @@ class NativeClient(
             "checksPassed" to metrics.checksPassed,
             "checksRequired" to metrics.checksRequired,
             "frontierEscalationRuns" to metrics.frontierEscalationRuns,
+            "frontierClassedRuns" to metrics.frontierClassedRuns,
+            "frontierEscalationClassedRuns" to metrics.frontierEscalationClassedRuns,
             "scanned" to metrics.scanned
         )
         for ((field, value) in counters) {
@@ -885,26 +924,98 @@ class NativeClient(
             }
         }
         for (run in page.runs) {
-            val runMoney = linkedMapOf(
+            if (run.moneyState !in setOf("complete", "pending", "unavailable")) {
+                throw NativeProtocolException(
+                    path,
+                    "run ${run.runId}: unknown moneyState \"${run.moneyState}\""
+                )
+            }
+            val settled = run.moneyState == "complete"
+            val settledMoney = linkedMapOf(
                 "modelSpendMicro" to run.modelSpendMicro,
                 "verificationSpendMicro" to run.verificationSpendMicro,
-                "reworkSpendMicro" to run.reworkSpendMicro,
-                "avoidedHostedMicro" to run.avoidedHostedMicro
+                "reworkSpendMicro" to run.reworkSpendMicro
             )
-            for ((field, value) in runMoney) {
-                if (MicroMoney.parseDecimal(value) == null) {
+            for ((field, value) in settledMoney) {
+                if (settled) {
+                    if (value == null || MicroMoney.parseDecimal(value) == null) {
+                        throw NativeProtocolException(
+                            path,
+                            "run ${run.runId}: $field must be an exact decimal money string " +
+                                "when moneyState is complete"
+                        )
+                    }
+                } else if (value != null) {
                     throw NativeProtocolException(
                         path,
-                        "run ${run.runId}: $field is not an exact decimal money string: \"$value\""
+                        "run ${run.runId}: $field must be null unless moneyState is complete " +
+                            "(money not settled is never a fabricated zero)"
                     )
                 }
             }
-            for (step in run.modelSequence) {
-                if (MicroMoney.parseDecimal(step.spendMicro) == null) {
+            when (run.avoidedHostedMeasurement) {
+                "measured" -> {
+                    val value = run.avoidedHostedMicro
+                    if (value == null || MicroMoney.parseDecimal(value) == null) {
+                        throw NativeProtocolException(
+                            path,
+                            "run ${run.runId}: a measured avoidedHostedMicro must be an exact " +
+                                "decimal money string"
+                        )
+                    }
+                }
+                "unavailable" -> if (run.avoidedHostedMicro != null) {
                     throw NativeProtocolException(
                         path,
-                        "run ${run.runId}: model step spendMicro is not an exact decimal money " +
-                            "string: \"${step.spendMicro}\""
+                        "run ${run.runId}: an unavailable avoidedHosted counterfactual must " +
+                            "carry a null value"
+                    )
+                }
+                else -> throw NativeProtocolException(
+                    path,
+                    "run ${run.runId}: unknown avoidedHostedMeasurement " +
+                        "\"${run.avoidedHostedMeasurement}\""
+                )
+            }
+            for (step in run.modelSequence) {
+                val value = step.spendMicro
+                if (settled) {
+                    if (value == null || MicroMoney.parseDecimal(value) == null) {
+                        throw NativeProtocolException(
+                            path,
+                            "run ${run.runId}: model step spendMicro must be an exact decimal " +
+                                "money string when moneyState is complete"
+                        )
+                    }
+                } else if (value != null) {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: model step spendMicro must be null unless moneyState " +
+                            "is complete"
+                    )
+                }
+                // The wire local bit is CLASS-DERIVED (true only for class
+                // `local`); a classless step's recorded pre-class bit rides
+                // the `legacyLocal` marker and is never promoted to a class.
+                if (step.executionClass !in
+                    setOf("local", "hosted_economy", "hosted_balanced", "frontier", "unknown")
+                ) {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: unknown executionClass \"${step.executionClass}\""
+                    )
+                }
+                if (step.local != (step.executionClass == "local")) {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: step local=${step.local} contradicts class " +
+                            "\"${step.executionClass}\" (local is class-derived)"
+                    )
+                }
+                if (step.legacyLocal && step.executionClass != "unknown") {
+                    throw NativeProtocolException(
+                        path,
+                        "run ${run.runId}: a class-carrying step must not report legacyLocal"
                     )
                 }
             }

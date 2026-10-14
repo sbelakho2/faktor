@@ -1,0 +1,9 @@
+{
+  "id": "INV-LOCALZERO-CLASSIFICATION-AUTHORITY",
+  "file": "crates/session/src/billing_read.rs",
+  "find": "        match self.price_authority {\n            Some(PriceAuthority::LocalZero) => ExecutionClass::Local,\n            _ => ExecutionClass::Unknown,\n        }\n",
+  "replace": "        if self.provider_cost_micro == 0 {\n            return ExecutionClass::Local;\n        }\n        match self.price_authority {\n            Some(PriceAuthority::LocalZero) => ExecutionClass::Local,\n            _ => ExecutionClass::Unknown,\n        }\n",
+  "gate": "cargo test -p faktor-tests-accounting-modelcheck --test new_guard_money_state_and_classification",
+  "expect": "classified LOCAL|classification drifted",
+  "note": "Planting the old cost==0 locality heuristic classifies a zero-cost hosted/unpriced row as Local; the new exhaustive classification gate must catch it."
+}

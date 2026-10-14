@@ -4,31 +4,45 @@
 //!
 //! The pure compiler lives in `faktor-core`; this module owns the I/O half:
 //! a deterministic, bounded walk of the session's effective workspace root
-//! that yields a [`RepositorySnapshot`], and the drive-start hook that
-//! compiles the baseline contract from the task goal + that snapshot and
-//! merges it durably through [`SessionHandle::merge_task_contract`].
+//! that yields a [`RepositorySnapshot`], the asynchronous bounded findings
+//! consult of the OPTIONAL system-intelligence provider, and the drive-start
+//! hook that compiles the baseline contract from the task goal + that
+//! snapshot and merges it durably through
+//! [`SessionHandle::merge_task_contract`].
 //!
 //! Contract of the wiring:
 //! * It runs at most once per task: only when the durable row still carries
 //!   NO contract at all. A compiled contract (even an uncertainty-only one)
 //!   is durable, and a deterministic re-compile would merge to a no-op.
 //! * It is best-effort and never fails a turn: an unresolvable root, an
-//!   unreadable store or a refused merge is logged with its typed reason and
-//!   retried on the next drive.
+//!   unreadable store, a refused merge or a refusing/timing-out provider is
+//!   logged with its typed reason (the provider one as a typed finding
+//!   diagnostic) and retried on the next drive.
 //! * It scans deterministically: sorted directory entries, sorted candidate
 //!   paths, bounded depth/entries/reads/bytes; two scans of an unchanged
 //!   tree produce byte-identical snapshots.
+//! * It asks deterministically: one bounded consult of the fixed question
+//!   set per drive-start compile, wall-bounded and identity-bound; findings
+//!   are validated data and can only ever ADD `external:<provider>`
+//!   statements to the pure compiler's output.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use faktor_core::contract_compile::{
-    compile_contract_with, AcquisitionGap, AcquisitionGapKind, ContractCompileRequest,
-    RepositoryAcquisition, RepositoryFile, RepositorySnapshot, SystemIntelligenceProvider,
+    compile_contract, compile_contract_with_findings_checked, AcquisitionGap, AcquisitionGapKind,
+    ContractCompileRequest, FindingDiagnostic, FindingDiagnosticCode, FindingsRequest,
+    FindingsResponse, IntelligenceQuestion, RepositoryAcquisition, RepositoryFile,
+    RepositorySnapshot, SystemIntelligenceProvider, MAX_FINDINGS, MAX_FINDING_DIAGNOSTICS,
 };
+use faktor_core::{CancellationToken, Deadline};
 use faktor_session::{SessionHandle, Task};
 
 use super::AgentRuntime;
+
+/// Hard wall bound of ONE findings consult: a parked provider is dropped,
+/// diagnosed and the native contract stands (never a stalled or failed turn).
+const FINDINGS_CONSULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 /// Longest directory depth walked.
 const MAX_SCAN_DEPTH: usize = 12;
@@ -456,7 +470,17 @@ impl AgentRuntime {
     /// bounded repository state and merge it durably. Best-effort: every
     /// failure is logged with its typed reason and retried on the next
     /// drive; the turn never fails because of it.
-    pub(crate) fn compile_baseline_contract(&self, handle: &SessionHandle, task: &Task) {
+    ///
+    /// BEFORE the compile the runtime asks the OPTIONAL system-intelligence
+    /// provider the fixed bounded engineering questions (asynchronous, wall
+    /// bounded, cancellation/deadline carrying): the answers are validated
+    /// DATA converted into `external:<provider>` enrichment statements and
+    /// fed into the PURE [`compile_contract_with_findings_checked`] entry
+    /// (the raw apply is private; the checked wrapper enforces the
+    /// `organization_contracts` entitlement). A refusal,
+    /// timeout, oversized or invalid answer is dropped with a typed
+    /// diagnostic and the native contract stands byte-identically.
+    pub(crate) async fn compile_baseline_contract(&self, handle: &SessionHandle, task: &Task) {
         let session = handle.id();
         if task.goal.trim().is_empty() {
             return;
@@ -480,23 +504,78 @@ impl AgentRuntime {
         };
         let tokens = faktor_core::contract_compile::intent_tokens(&task.goal);
         let repository = scan_repository_snapshot(&root, &tokens);
-        // The OPTIONAL system-intelligence provider (daemon-installed): the
-        // compile is the SAME native contract plus, when a provider is
-        // installed and stands behind a validated capability, its strictly
-        // additive `external:<provider>` statements. `None` is the
-        // byte-identical native path; a refusing/erroring provider leaves the
-        // native contract untouched and is diagnosed below — never a failed
-        // turn.
+        let request = ContractCompileRequest {
+            goal: task.goal.clone(),
+            repository,
+        };
+        // The native compile establishes the neutral identity (intent
+        // tokens, build systems, repository digest, native contract) the
+        // questions are built from; it is pure and bounded.
+        let native = compile_contract(&request);
         let provider = self.system_intelligence_provider();
-        let compiled = compile_contract_with(
-            &ContractCompileRequest {
-                goal: task.goal.clone(),
-                repository,
-            },
-            provider
-                .as_ref()
-                .map(|provider| provider.as_ref() as &dyn SystemIntelligenceProvider),
-        );
+        let compiled = match &provider {
+            Some(provider) => {
+                // The organization-contract enrichment BOUNDARY: consulting
+                // the org's system-intelligence provider (and applying its
+                // findings) is the paid `organization_contracts`
+                // augmentation. The gate is consulted BEFORE the provider
+                // side effect; a denial is a typed refusal logged loudly and
+                // the native contract stands (the local product path).
+                match self
+                    .value_gate()
+                    .check(faktor_core::entitlement::ValueEntitlement::OrganizationContracts)
+                {
+                    Ok(()) => {
+                        let response = self
+                            .ask_system_intelligence(
+                                handle,
+                                &root,
+                                &request,
+                                &native,
+                                provider.as_ref(),
+                            )
+                            .await;
+                        // The ONE public apply entry: the org-contract
+                        // entitlement is an ENFORCED parameter (the check
+                        // above gates the provider side effect; this one
+                        // gates the apply itself, defense in depth).
+                        match compile_contract_with_findings_checked(
+                            &request,
+                            provider.provider_id(),
+                            &response,
+                            &self.value_gate(),
+                        ) {
+                            Ok(compiled) => compiled,
+                            Err(refusal) => {
+                                tracing::warn!(
+                                    session = %session,
+                                    task_id = task.task_id.raw(),
+                                    entitlement = %refusal.entitlement,
+                                    hook = %refusal.hook,
+                                    cause = %refusal.cause,
+                                    "organization contract enrichment refused typed at the apply boundary; the native contract stands"
+                                );
+                                native
+                            }
+                        }
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(
+                            session = %session,
+                            task_id = task.task_id.raw(),
+                            entitlement = %refusal.entitlement,
+                            hook = %refusal.hook,
+                            cause = %refusal.cause,
+                            plan = ?refusal.plan_id,
+                            "organization contract enrichment refused typed; the native contract stands"
+                        );
+                        native
+                    }
+                }
+            }
+            // No provider installed: the exact native contract bytes.
+            None => native,
+        };
         for outcome in &compiled.enrichments {
             match &outcome.diagnostic {
                 Some(diagnostic) => tracing::warn!(
@@ -506,7 +585,7 @@ impl AgentRuntime {
                     applied = outcome.applied,
                     skipped = outcome.skipped,
                     diagnostic = %diagnostic,
-                    "system-intelligence enrichment left the native contract untouched"
+                    "system-intelligence findings left the native contract untouched"
                 ),
                 None if outcome.applied > 0 => tracing::info!(
                     session = %session,
@@ -514,7 +593,7 @@ impl AgentRuntime {
                     provider = %outcome.provider,
                     applied = outcome.applied,
                     skipped = outcome.skipped,
-                    "native baseline engineering contract additively enriched"
+                    "native baseline engineering contract additively enriched with findings"
                 ),
                 None => {}
             }
@@ -542,5 +621,107 @@ impl AgentRuntime {
                 "baseline engineering contract could not be merged: {error}"
             ),
         }
+    }
+
+    /// The bounded asynchronous findings consult: build the explicit
+    /// operation envelope, ask the provider the fixed question set under a
+    /// wall bound, and reduce every outcome (answers, refusal, timeout,
+    /// oversized/invalid findings) to a bounded [`FindingsResponse`]. Total:
+    /// no path here fails the drive, and no provider failure can alter the
+    /// native contract.
+    async fn ask_system_intelligence(
+        &self,
+        handle: &SessionHandle,
+        root: &Path,
+        request: &ContractCompileRequest,
+        native: &faktor_core::contract_compile::CompiledContract,
+        provider: &dyn SystemIntelligenceProvider,
+    ) -> FindingsResponse {
+        let provider_id = provider.provider_id();
+        let workspace = match handle.row() {
+            Ok(row) => row.workspace_id,
+            Err(error) => {
+                return refused(
+                    provider_id,
+                    FindingDiagnosticCode::ProviderUnavailable,
+                    format!("session workspace identity unavailable: {error}"),
+                );
+            }
+        };
+        let operation_id = match self.deps.session.try_next_op_id() {
+            Ok(id) => id,
+            Err(error) => {
+                return refused(
+                    provider_id,
+                    FindingDiagnosticCode::ProviderUnavailable,
+                    format!("operation id allocation failed: {error}"),
+                );
+            }
+        };
+        let started_ms = self.deps.clock.now_ms();
+        let revision = crate::semantic_tool::semantic_source_revision(Some(root));
+        let findings_request = FindingsRequest {
+            operation_id,
+            session_id: handle.id(),
+            workspace,
+            started_ms,
+            deadline: Some(Deadline::at(
+                started_ms.saturating_add(FINDINGS_CONSULT_MAX_WAIT.as_millis() as i64),
+            )),
+            cancellation: CancellationToken::new(),
+            source_revision: revision.as_deref(),
+            goal: &request.goal,
+            intent_tokens: &native.intent_tokens,
+            build_systems: &native.build_systems,
+            repository_digest: &native.repository_digest,
+            native_contract: &native.contract,
+            questions: &IntelligenceQuestion::ALL,
+            max_findings: MAX_FINDINGS,
+        };
+        match tokio::time::timeout(
+            FINDINGS_CONSULT_MAX_WAIT,
+            provider.findings(&findings_request),
+        )
+        .await
+        {
+            Ok(Ok(mut response)) => {
+                if response.findings.len() > MAX_FINDINGS {
+                    let excess = response.findings.len() - MAX_FINDINGS;
+                    response.findings.truncate(MAX_FINDINGS);
+                    if response.diagnostics.len() < MAX_FINDING_DIAGNOSTICS {
+                        response.diagnostics.push(FindingDiagnostic::new(
+                            provider_id,
+                            FindingDiagnosticCode::CapReached,
+                            format!(
+                                "{excess} findings beyond the {MAX_FINDINGS} bound were dropped"
+                            ),
+                        ));
+                    }
+                }
+                response.diagnostics.truncate(MAX_FINDING_DIAGNOSTICS);
+                response
+            }
+            Ok(Err(refusal)) => refused(
+                provider_id,
+                FindingDiagnosticCode::ProviderRefused,
+                format!("provider refused: {refusal}"),
+            ),
+            Err(_) => refused(
+                provider_id,
+                FindingDiagnosticCode::ProviderTimedOut,
+                format!(
+                    "consult exceeded the {}ms wall budget; the native contract stands",
+                    FINDINGS_CONSULT_MAX_WAIT.as_millis()
+                ),
+            ),
+        }
+    }
+}
+
+/// One-finding-diagnostic response for a consult that produced no findings.
+fn refused(provider: &str, code: FindingDiagnosticCode, detail: String) -> FindingsResponse {
+    FindingsResponse {
+        findings: Vec::new(),
+        diagnostics: vec![FindingDiagnostic::new(provider, code, detail)],
     }
 }

@@ -147,11 +147,50 @@ impl RecoveryReport {
 pub struct WorkerPlane {
     store: Arc<dyn WorkerStore>,
     clock: Arc<dyn Clock>,
+    /// The OPTIONAL claim-admission gate (`private_runners`). `None` = the
+    /// operator built this plane directly (the documented self-hosted
+    /// ungated construction used by tests and embedded hosts). The daemon
+    /// installs the commercial gate through
+    /// [`WorkerPlane::set_claim_entitlement_gate`]: claim admission then
+    /// consults `private_runners` FIRST and a denial is the typed
+    /// [`WorkerError::EntitlementRefused`] — never a silent claim.
+    claim_gate: std::sync::RwLock<Option<faktor_core::entitlement::ValueGate>>,
 }
 
 impl WorkerPlane {
     pub fn new(store: Arc<dyn WorkerStore>, clock: Arc<dyn Clock>) -> Arc<Self> {
-        Arc::new(Self { store, clock })
+        Arc::new(Self {
+            store,
+            clock,
+            claim_gate: std::sync::RwLock::new(None),
+        })
+    }
+
+    /// Install the claim-admission value-entitlement gate (`private_runners`).
+    /// Additive: without an install the plane keeps its direct-construction
+    /// behavior (ungated); with one, every `claim_next` consults the gate
+    /// first and a refusal is typed, admitting nothing.
+    pub fn set_claim_entitlement_gate(&self, gate: faktor_core::entitlement::ValueGate) {
+        *self
+            .claim_gate
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(gate);
+    }
+
+    /// The claim-admission check: `Ok(())` while no gate is installed; the
+    /// typed refusal otherwise.
+    fn admit_claim(&self) -> Result<(), WorkerError> {
+        let gate = self
+            .claim_gate
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        match gate {
+            None => Ok(()),
+            Some(gate) => gate
+                .check(faktor_core::entitlement::ValueEntitlement::PrivateRunners)
+                .map_err(WorkerError::EntitlementRefused),
+        }
     }
 
     /// The production construction path (system clock).
@@ -623,6 +662,10 @@ impl WorkerPlane {
         if worker.organization_id != organization.as_str() {
             return Err(WorkerError::UnknownWorker(worker_id.clone()));
         }
+        // Claim ADMISSION (the `private_runners` paid augmentation): when the
+        // daemon installed a gate, the refusal is typed and nothing is
+        // claimed. No gate = the operator's direct construction (ungated).
+        self.admit_claim()?;
         let now = self.now_ms();
         let mut after: Option<i64> = None;
         let mut scanned: usize = 0;

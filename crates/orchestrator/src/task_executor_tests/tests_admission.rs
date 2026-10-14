@@ -316,7 +316,14 @@ pub(crate) async fn a_pre_acceptance_failure_releases_the_key_and_the_retry_exec
     let h = env.manager.get_session(env.parent).unwrap().unwrap();
     let task_id = h.task_id().unwrap();
     DurableBudgetLedger::new(env.manager.clone())
-        .reserve(env.parent, task_id, OpId::new(7_000_001), 60_000, None)
+        .reserve(
+            env.parent,
+            task_id,
+            OpId::new(7_000_001),
+            60_000,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .expect("reserve under the cap");
 

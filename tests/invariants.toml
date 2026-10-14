@@ -2141,3 +2141,138 @@ mutation_command = "node scripts/mutation-run.mjs INV-KIWI-OPTIONAL-ADAPTER"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SETTLEMENT-MONEY-STATE-LEGALITY"
+statement = "The durable settlement lifecycle admits only pending -> complete|unavailable, unavailable -> complete|pending and complete -> complete corrections: every other append is a typed Conflict, a complete projection is terminal (complete -> unavailable can never land), and a refused append leaves the latest row byte-identical."
+owner = "crates/store economic settlement lifecycle"
+authority = "crates/store/src/outcome_ledger.rs settlement_transition_legal"
+script_check = ""
+unit_test = "terminal_money_state_is_immutable_through_the_durable_store"
+production_wiring = "settlement_lifecycle_only_legal_transitions_over_exhaustive_and_seeded_sequences"
+fault = ""
+mutation_witness = "settlement_lifecycle_only_legal_transitions_over_exhaustive_and_seeded_sequences"
+mutation_command = "node scripts/mutation-run.mjs INV-SETTLEMENT-MONEY-STATE-LEGALITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-LOCALZERO-CLASSIFICATION-AUTHORITY"
+statement = "Execution-class locality is established ONLY by a route-time PriceAuthority::LocalZero or a known persisted class: a numeric zero on an unpriced or hosted row is never Local, and an Unknown class is counted as neither local nor hosted."
+owner = "crates/session billing read + crates/core model"
+authority = "crates/session/src/billing_read.rs DurableSpendRow::effective_execution_class; crates/core/src/model.rs ExecutionClass::from_price_authority"
+script_check = ""
+unit_test = "localzero_classification_is_pinned_against_the_cost_zero_heuristic"
+production_wiring = "effective_execution_class_never_infers_locality_from_a_numeric_zero"
+fault = ""
+mutation_witness = "route_time_authority_mapping_is_localzero_only"
+mutation_command = "node scripts/mutation-run.mjs INV-LOCALZERO-CLASSIFICATION-AUTHORITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VCSC-MONEY-COMPLETE-COHORT"
+statement = "VCSC and every monetary metric fold ONLY complete settlements: incomplete (pending/unavailable) rows never contribute to spend, verified spend, rework, run counts or the VCSC numerator/denominator even with hostile amounts, and VCSC is exactly the ceiling of the eligible-cohort spend."
+owner = "crates/agent outcome ledger metrics"
+authority = "crates/agent/src/outcome_ledger.rs OutcomeLedgerMetrics::compute"
+script_check = ""
+unit_test = "vcsc_excludes_incomplete_rows_even_with_hostile_amounts"
+production_wiring = "monetary_metrics_move_exactly_as_settlements_land"
+fault = ""
+mutation_witness = "vcsc_excludes_incomplete_rows_even_with_hostile_amounts"
+mutation_command = "node scripts/mutation-run.mjs INV-VCSC-MONEY-COMPLETE-COHORT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-AVOIDED-HOSTED-UNMEASURED-NULL"
+statement = "The avoided-hosted counterfactual is null until at least one measured counterfactual exists: an unmeasured projection is never coerced to a fabricated zero, a measured zero stays a measured zero, and the measured-run count moves with the measurement."
+owner = "crates/agent outcome ledger metrics"
+authority = "crates/agent/src/outcome_ledger.rs OutcomeLedgerMetrics::compute avoided_hosted fold"
+script_check = ""
+unit_test = "unmeasured_avoided_hosted_is_null_never_a_fabricated_zero"
+production_wiring = "unmeasured_avoided_hosted_is_null_never_a_fabricated_zero"
+fault = ""
+mutation_witness = "unmeasured_avoided_hosted_is_null_never_a_fabricated_zero"
+mutation_command = "node scripts/mutation-run.mjs INV-AVOIDED-HOSTED-UNMEASURED-NULL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL"
+statement = "An organization-scope outcome-analytics read evaluates the paid value entitlement and refuses typed (403 value_entitlement_refused naming entitlement, hook and plan) when the plan does not map it - never short-circuiting into the fold - while the org-less local read is never gated."
+owner = "crates/server native outcomes + crates/cloud entitlements"
+authority = "crates/server/src/native/outcomes.rs check_value_entitlement(OutcomeAnalytics)"
+script_check = ""
+unit_test = "organization_outcomes_read_refuses_unentitled_plan_typed"
+production_wiring = "entitled_organization_read_answers_and_local_read_is_never_gated"
+fault = ""
+mutation_witness = "organization_outcomes_read_refuses_unentitled_plan_typed"
+mutation_command = "node scripts/mutation-run.mjs INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PRIVATE-RUNNERS-PLACEMENT-REFUSAL"
+statement = "The production worker-placement adapter consults the private_runners value gate BEFORE minting a job generation: a denied plan is the typed entitlement refusal with no durable job, and the same plane places remotely once entitled."
+owner = "crates/cli daemon placement + crates/orchestrator placement"
+authority = "crates/cli/src/daemon/serve.rs production placement adapter ValueGate::check(PrivateRunners)"
+script_check = ""
+unit_test = "remote_placement_denied_by_plan_refuses_typed_and_mints_no_job"
+production_wiring = "remote_placement_denied_by_plan_refuses_typed_and_mints_no_job"
+fault = ""
+mutation_witness = "remote_placement_denied_by_plan_refuses_typed_and_mints_no_job"
+mutation_command = "node scripts/mutation-run.mjs INV-PRIVATE-RUNNERS-PLACEMENT-REFUSAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DUAL-PRODUCER-FACTS-DURABLE"
+statement = "The terminal-run facts persisted before the task row becomes terminal are the one durable truth both producers derive from: the agent-path record and the executor settlement yield the byte-identical outcome record, preserving risk class and verified samples."
+owner = "crates/agent outcome ledger + crates/store terminal facts"
+authority = "crates/agent/src/outcome_ledger.rs TerminalRunFactsOutbox::persist; crates/store/src/outcome_ledger.rs terminal_run_facts_upsert"
+script_check = ""
+unit_test = "persisted_terminal_facts_are_the_durable_truth_both_producers_derive"
+production_wiring = "persisted_terminal_facts_are_the_durable_truth_both_producers_derive"
+fault = ""
+mutation_witness = "persisted_terminal_facts_are_the_durable_truth_both_producers_derive"
+mutation_command = "node scripts/mutation-run.mjs INV-DUAL-PRODUCER-FACTS-DURABLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-FINDING-DIGEST-BINDING"
+statement = "A provider finding whose repository_digest does not match the consult's snapshot binding is refused typed, counted rejected and never applied: the compiled contract stays byte-identical to the no-findings baseline."
+owner = "crates/core contract compile findings"
+authority = "crates/core/src/contract_compile.rs finding_to_statement repository_digest binding"
+script_check = ""
+unit_test = "finding_bound_to_another_snapshot_is_rejected_typed"
+production_wiring = "finding_validation_is_exhaustive_over_rejection_kinds"
+fault = ""
+mutation_witness = "finding_validation_is_exhaustive_over_rejection_kinds"
+mutation_command = "node scripts/mutation-run.mjs INV-FINDING-DIGEST-BINDING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-FINDING-PROVIDER-IDENTITY"
+statement = "A provider finding carrying another provider's identity is refused typed and never applied; validation is exhaustive over rejection kinds and the excess beyond the batch bound is rejected, never partially applied."
+owner = "crates/core contract compile findings"
+authority = "crates/core/src/contract_compile.rs finding_to_statement provider identity binding"
+script_check = ""
+unit_test = "findings_claiming_another_provider_are_rejected_typed"
+production_wiring = "finding_batch_bound_rejects_the_excess_never_partially_applies_it"
+fault = ""
+mutation_witness = "findings_claiming_another_provider_are_rejected_typed"
+mutation_command = "node scripts/mutation-run.mjs INV-FINDING-PROVIDER-IDENTITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

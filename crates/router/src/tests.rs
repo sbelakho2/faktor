@@ -2289,9 +2289,45 @@ fn local_zero_is_exactly_zero_by_authority() {
     let snap = d.pricing_snapshot.expect("snapshot");
     assert_eq!(snap.authority, PriceAuthority::LocalZero);
     assert_eq!(
+        d.execution_class,
+        ExecutionClass::Local,
+        "the LocalZero route IS local at route time"
+    );
+    assert!(d.execution_class.is_local());
+    assert_eq!(
         snap.settle_cost(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
         Some(0)
     );
+}
+
+/// A hosted FREE tier (or promotion/internal endpoint) freezes an exact
+/// zero quote — that is a REAL hosted price authority, not locality: the
+/// decision's execution class must stay `Unknown` (never inferred from the
+/// numeric zero), and the reservation persists it as such.
+#[test]
+fn hosted_zero_price_decision_is_not_local() {
+    let hosted = candidate(
+        perf_desc("hosted", "free-tier", true, 2_000_000, 64_000, 90, 90),
+        PricingState::Known(PricingSnapshot::exact(
+            PriceQuote::ZERO,
+            1,
+            "hosted-free-tier".into(),
+        )),
+    );
+    let req = priced_req(1_000_000, 10_000, 50);
+    let svc = RouterService::with_route_candidates(vec![hosted], Arc::new(EmptyOutcomeStore));
+    let d = svc.route(&req, &[]).unwrap();
+    assert_eq!(d.estimated_cost_micro, 0, "the hosted zero quote is zero");
+    assert_eq!(
+        d.pricing_snapshot.expect("snapshot").authority,
+        PriceAuthority::Exact
+    );
+    assert_eq!(
+        d.execution_class,
+        ExecutionClass::Unknown,
+        "a zero price is NEVER evidence of locality"
+    );
+    assert!(!d.execution_class.is_local() && !d.execution_class.is_hosted());
 }
 
 #[test]

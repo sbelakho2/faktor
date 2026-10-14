@@ -1,0 +1,10 @@
+{
+  "id": "INV-PRIVATE-RUNNERS-PLACEMENT-REFUSAL",
+  "file": "crates/cli/src/daemon/serve.rs",
+  "find": "        self.gate\n            .check(faktor_core::entitlement::ValueEntitlement::PrivateRunners)\n            .map_err(PlacementRefusal::Entitlement)?;\n",
+  "replace": "        // (planted mutation) the private_runners placement gate is removed\n",
+  "gate": "cargo test -p faktor-tests-production-wiring --test new_guard_entitlement_and_producers",
+  "expect": "expected the typed entitlement refusal",
+  "timeout_ms": 3600000,
+  "note": "Removing the private_runners gate makes the production placement adapter mint and lease a remote job for an unentitled plan; the new placement gate must catch it."
+}

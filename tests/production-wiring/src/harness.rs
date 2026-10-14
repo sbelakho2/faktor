@@ -85,6 +85,28 @@ pub fn build_production_graph_with_system_intelligence(
     build_daemon_with_system_intelligence(data_dir, Some(config), provider)
 }
 
+/// The daemon's worker-plane placement adapter — the LITERAL production
+/// construction `serve_impl` performs when `[workers]` is enabled: the same
+/// struct, the same field values, over the caller's real `WorkerPlane` and
+/// the daemon-tenant value-entitlement gate. Tests use this to drive the
+/// production placement seam (entitlement first, before any job is minted)
+/// without a look-alike adapter.
+pub fn production_worker_plane_adapter(
+    plane: Arc<faktor_worker::WorkerPlane>,
+    organization: faktor_cloud::OrganizationId,
+    trust_domain: String,
+    requirements: faktor_worker::JobRequirements,
+    gate: faktor_core::entitlement::ValueGate,
+) -> Arc<dyn faktor_orchestrator::placement::WorkerPlacementSeam> {
+    Arc::new(crate::daemon::serve::WorkerPlaneAdapter {
+        plane,
+        organization,
+        trust_domain,
+        requirements,
+        gate,
+    })
+}
+
 /// The daemon's ONE commerce service when `[commerce]` was enabled at build
 /// time (`None` is the disabled-parity graph).
 pub fn commerce_service(

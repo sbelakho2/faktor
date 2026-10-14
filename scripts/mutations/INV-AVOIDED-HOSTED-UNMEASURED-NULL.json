@@ -1,0 +1,9 @@
+{
+  "id": "INV-AVOIDED-HOSTED-UNMEASURED-NULL",
+  "file": "crates/agent/src/outcome_ledger.rs",
+  "find": "        m.avoided_hosted_inference_micro = if avoided_measured_runs == 0 {\n            None\n        } else {\n",
+  "replace": "        m.avoided_hosted_inference_micro = if avoided_measured_runs == 0 {\n            Some(0)\n        } else {\n",
+  "gate": "cargo test -p faktor-tests-economy --test new_guard_fold_properties",
+  "expect": "coerced into a zero",
+  "note": "Defaulting an unmeasured avoided-hosted counterfactual to a fabricated zero; the new null-propagation property must catch it."
+}

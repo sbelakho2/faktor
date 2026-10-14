@@ -952,6 +952,109 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON engineering_outcome(task_id, completed_at_ms);
      CREATE INDEX IF NOT EXISTS idx_engineering_outcome_completed
         ON engineering_outcome(completed_at_ms, run_id);",
+    // v33 — economic settlement finality (P1 economic-truth: engineering
+    // truth vs financial finality; schema target 34; array index 33). Three
+    // changes, one transaction:
+    //
+    // 1. `engineering_outcome` is REBUILT without its four money columns:
+    //    the terminal engineering record is immutable IMMEDIATELY and must
+    //    never freeze a monetary fact that settlements may still move. The
+    //    row keeps every engineering projection column; legacy v1 payloads
+    //    keep their money inside the payload (read compatibly) and new
+    //    payloads carry none.
+    // 2. `terminal_run_facts` — the durable terminal-turn "outbox": the
+    //    agent path persists the terminal turn's risk class + explicit
+    //    verified samples BEFORE the task row can reach a terminal state,
+    //    and every producer (agent completion gate / TaskExecutor
+    //    settlement) derives ONE byte-identical engineering row from it.
+    //    Upserts are refused once the engineering row exists (facts are
+    //    frozen at record time).
+    // 3. `economic_settlement` — the append-only settlement lifecycle:
+    //    `(run_id, seq)` events with a typed state
+    //    (`complete` | `pending` | `unavailable`), money amounts NULL
+    //    unless measured (zero is only for measured zero), the settled
+    //    step projection and the store-enforced transition legality
+    //    (pending -> complete|unavailable; unavailable -> complete|pending;
+    //    complete -> complete corrections only; byte-identical replays are
+    //    Duplicates). The latest event is the settled financial projection;
+    //    VCSC reads only `complete` rows and reports the exclusion count.
+    "CREATE TABLE IF NOT EXISTS engineering_outcome_v33 (
+        run_id TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL CHECK (session_id >= 0),
+        task_id INTEGER NOT NULL CHECK (task_id >= 0),
+        payload TEXT NOT NULL,
+        payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
+        completed_at_ms INTEGER NOT NULL,
+        verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+        verified_first_pass INTEGER NOT NULL CHECK (verified_first_pass IN (0, 1)),
+        integrated INTEGER NOT NULL CHECK (integrated IN (0, 1)),
+        local_used INTEGER NOT NULL CHECK (local_used IN (0, 1)),
+        frontier_used INTEGER NOT NULL CHECK (frontier_used IN (0, 1)),
+        wall_time_ms INTEGER NOT NULL CHECK (wall_time_ms >= 0),
+        human_interventions INTEGER NOT NULL CHECK (human_interventions >= 0),
+        rollback_events INTEGER NOT NULL CHECK (rollback_events >= 0),
+        recovery_events INTEGER NOT NULL CHECK (recovery_events >= 0),
+        repair_attempts INTEGER NOT NULL CHECK (repair_attempts >= 0),
+        risk_class TEXT NOT NULL,
+        changed_files INTEGER NOT NULL CHECK (changed_files >= 0),
+        changed_lines INTEGER NOT NULL CHECK (changed_lines >= 0),
+        checks_passed INTEGER NOT NULL CHECK (checks_passed >= 0),
+        checks_required INTEGER NOT NULL CHECK (checks_required >= 0),
+        CHECK (verified_first_pass <= verified),
+        CHECK (checks_passed <= checks_required)
+     );
+     INSERT INTO engineering_outcome_v33 (run_id, session_id, task_id, payload, payload_bytes,
+        completed_at_ms, verified, verified_first_pass, integrated, local_used, frontier_used,
+        wall_time_ms, human_interventions, rollback_events, recovery_events, repair_attempts,
+        risk_class, changed_files, changed_lines, checks_passed, checks_required)
+        SELECT run_id, session_id, task_id, payload, payload_bytes, completed_at_ms, verified,
+        verified_first_pass, integrated, local_used, frontier_used, wall_time_ms,
+        human_interventions, rollback_events, recovery_events, repair_attempts, risk_class,
+        changed_files, changed_lines, checks_passed, checks_required
+        FROM engineering_outcome;
+     DROP TABLE engineering_outcome;
+     ALTER TABLE engineering_outcome_v33 RENAME TO engineering_outcome;
+     CREATE INDEX IF NOT EXISTS idx_engineering_outcome_task
+        ON engineering_outcome(task_id, completed_at_ms);
+     CREATE INDEX IF NOT EXISTS idx_engineering_outcome_completed
+        ON engineering_outcome(completed_at_ms, run_id);
+     CREATE TABLE IF NOT EXISTS terminal_run_facts (
+        run_id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
+        updated_ms INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS economic_settlement (
+        run_id TEXT NOT NULL,
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        schema_version INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('complete', 'pending', 'unavailable')),
+        reason TEXT NOT NULL,
+        model_spend_micro INTEGER CHECK (model_spend_micro IS NULL OR model_spend_micro >= 0),
+        verification_spend_micro INTEGER
+            CHECK (verification_spend_micro IS NULL OR verification_spend_micro >= 0),
+        rework_spend_micro INTEGER CHECK (rework_spend_micro IS NULL OR rework_spend_micro >= 0),
+        avoided_hosted_micro INTEGER
+            CHECK (avoided_hosted_micro IS NULL OR avoided_hosted_micro >= 0),
+        avoided_hosted_measured INTEGER NOT NULL CHECK (avoided_hosted_measured IN (0, 1)),
+        steps_json TEXT NOT NULL,
+        settled_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (run_id, seq)
+     );
+     CREATE INDEX IF NOT EXISTS idx_economic_settlement_settled
+        ON economic_settlement(settled_at_ms, run_id, seq);",
+    // v34 — route-time execution class on the reservation ledger (economic
+    // audit item 7 P1 classification; schema target 35; array index 34). ONE
+    // ADDITIVE nullable column: the durable execution class the ROUTE froze
+    // for the reservation's call (`local` | `hosted_economy` |
+    // `hosted_balanced` | `frontier`), persisted from route time so the
+    // outcome ledger can classify local-vs-hosted from durable authority
+    // instead of inferring locality from a numeric zero. NULL = no durable
+    // authority established a class (legacy rows, unpriced paths): readers
+    // MUST treat NULL as Unknown and never as local or hosted. The store
+    // validates the tag on write and fails closed on an unknown tag at read;
+    // a zero-cost HOSTED row keeps its hosted authority (it is never local).
+    "ALTER TABLE cost_reservation ADD COLUMN execution_class TEXT;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

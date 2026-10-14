@@ -675,7 +675,14 @@ mod tests {
         );
         ledger.set_task_max_cost(sid, tid, Some(1_000_000)).unwrap();
         let reserved = ledger
-            .reserve(sid, tid, OpId::new(31), 500_000, None)
+            .reserve(
+                sid,
+                tid,
+                OpId::new(31),
+                500_000,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .await
             .unwrap();
         assert_eq!(

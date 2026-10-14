@@ -17,6 +17,13 @@
 //!   settlement folds cache reads/writes and reasoning into them BEFORE
 //!   persistence), and the prefix-cache observation's cacheable-prefix
 //!   token count is carried separately;
+//! - the CLASSIFICATION comes from durable route-time authority only: the
+//!   reservation's frozen [`PriceAuthority`] (`LocalZero` is the ONLY
+//!   authority that establishes locality — a zero-cost hosted row is never
+//!   local) plus the reservation row's durable
+//!   [`ExecutionClass`](faktor_core::model::ExecutionClass) (schema v34);
+//!   `Unknown` means no authority established the class and must not be
+//!   counted as local or hosted;
 //! - a settled reservation with no attributable call row (a conservative
 //!   finalize or a crash reconciliation) still carries its exact money with
 //!   the honest `UNATTRIBUTED` provenance label.
@@ -26,6 +33,7 @@
 //! picture.
 
 use faktor_core::id::TaskId;
+use faktor_core::model::{ExecutionClass, PriceAuthority};
 
 use crate::handle::SessionHandle;
 use crate::SessionError;
@@ -68,6 +76,15 @@ pub struct DurableSpendRow {
     pub provider_cost_micro: u64,
     /// The provider-reported amount when the settlement saw one.
     pub provider_reported_micro: u64,
+    /// The reservation's frozen ROUTE-TIME price authority (schema v15/v18
+    /// `pricing_snapshot_json`): `Some(LocalZero)` is the only authority
+    /// that establishes locality; `None` = no pricing authority was
+    /// consulted (never local, never hosted).
+    pub price_authority: Option<PriceAuthority>,
+    /// The reservation's durable route-time execution class (schema v34).
+    /// `Unknown` on legacy/NULL rows and unpriced paths — never counted as
+    /// local or hosted.
+    pub execution_class: ExecutionClass,
     /// The durable reservation state tag (`settled`).
     pub state: String,
     /// The settlement time (`settled_ms`), else the reservation creation
@@ -75,6 +92,25 @@ pub struct DurableSpendRow {
     pub occurred_at_ms: i64,
     /// The source operation tag of the projection.
     pub source_operation: String,
+}
+
+impl DurableSpendRow {
+    /// The durable execution classification of this settled row: the
+    /// persisted route-time class when one exists, else `Local` only when
+    /// the reservation's frozen pricing authority is
+    /// [`PriceAuthority::LocalZero`] (pre-v34 rows whose class column is
+    /// NULL), else `Unknown`. A numeric zero NEVER implies locality: a
+    /// hosted zero-price row (free tier/promotion) keeps `Unknown` and is
+    /// counted as neither local nor hosted.
+    pub fn effective_execution_class(&self) -> ExecutionClass {
+        if self.execution_class.is_known() {
+            return self.execution_class;
+        }
+        match self.price_authority {
+            Some(PriceAuthority::LocalZero) => ExecutionClass::Local,
+            _ => ExecutionClass::Unknown,
+        }
+    }
 }
 
 /// The amount one settled reservation actually folded: the v18 canonical
@@ -172,6 +208,8 @@ impl SessionHandle {
                 prefix_cache_tokens: call.and_then(|c| c.prompt_tokens).unwrap_or(0),
                 provider_cost_micro: reservation_folded_micro(reservation),
                 provider_reported_micro: reservation_provider_reported_micro(reservation),
+                price_authority: reservation.pricing_snapshot.as_ref().map(|s| s.authority),
+                execution_class: reservation.execution_class,
                 state: reservation.status.clone(),
                 occurred_at_ms: reservation.settled_ms.unwrap_or(reservation.created_ms),
                 source_operation: "session.cost_reservation.settled".to_string(),
@@ -215,7 +253,14 @@ mod tests {
         )
         .unwrap();
         let reservation = runtime
-            .block_on(ledger.reserve_attempt(s.id, task, settled, 100, None))
+            .block_on(ledger.reserve_attempt(
+                s.id,
+                task,
+                settled,
+                100,
+                None,
+                ExecutionClass::Unknown,
+            ))
             .unwrap();
         let folded = runtime
             .block_on(ledger.settle_usage(s.id, reservation, 10, 2, 1, 5, Some(77), None))
@@ -230,7 +275,14 @@ mod tests {
         )
         .unwrap();
         let refunded_row = runtime
-            .block_on(ledger.reserve_attempt(s.id, task, refunded, 50, None))
+            .block_on(ledger.reserve_attempt(
+                s.id,
+                task,
+                refunded,
+                50,
+                None,
+                ExecutionClass::Unknown,
+            ))
             .unwrap();
         runtime.block_on(ledger.refund(s.id, refunded_row)).unwrap();
         let rows = s.durable_spend_rows(task, 100).unwrap();
@@ -287,6 +339,7 @@ mod tests {
                 provider_reported_cost_micro: None,
                 estimated_cost_micro: None,
                 settled_cost_micro: settled,
+                execution_class: ExecutionClass::Unknown,
             }
         };
         assert_eq!(
@@ -299,6 +352,103 @@ mod tests {
         assert_eq!(
             reservation_provider_reported_micro(&row(None, Some(9), None)),
             9
+        );
+    }
+
+    #[test]
+    fn execution_class_comes_from_frozen_route_authority_never_from_a_zero_cost() {
+        use faktor_core::model::{PriceAuthority, PriceQuote, PricingSnapshot};
+
+        let (_dir, manager) = test_manager();
+        let s = session(&manager);
+        let task = seeded_task(&s);
+        let ledger = DurableBudgetLedger::new(s.manager.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let attempt = |logical: u64, physical: u64, ordinal: u32| {
+            faktor_core::op::ModelCallAttempt::new(
+                faktor_core::id::OpId::new(logical),
+                faktor_core::id::OpId::new(physical),
+                ordinal,
+            )
+            .unwrap()
+        };
+        // (1) A HOSTED zero-price authority (free tier / promotion /
+        // internal endpoint): a numeric zero is NOT locality — the durable
+        // class stays Unknown and is counted as neither local nor hosted.
+        let hosted = runtime
+            .block_on(ledger.reserve_attempt(
+                s.id,
+                task,
+                attempt(1, 2, 1),
+                10,
+                Some(PricingSnapshot::exact(
+                    PriceQuote::ZERO,
+                    1,
+                    "hosted-free-tier".into(),
+                )),
+                ExecutionClass::from_price_authority(PriceAuthority::Exact),
+            ))
+            .unwrap();
+        runtime
+            .block_on(ledger.settle_usage(s.id, hosted, 5, 0, 0, 5, None, None))
+            .unwrap();
+        // (2) An authoritative LOCAL zero: LocalZero IS local.
+        let local = runtime
+            .block_on(ledger.reserve_attempt(
+                s.id,
+                task,
+                attempt(3, 4, 2),
+                10,
+                Some(PricingSnapshot::local_zero(1, "ollama".into())),
+                ExecutionClass::from_price_authority(PriceAuthority::LocalZero),
+            ))
+            .unwrap();
+        runtime
+            .block_on(ledger.settle_usage(s.id, local, 5, 0, 0, 5, None, None))
+            .unwrap();
+        // (3) No pricing authority at all: Unknown — never local/hosted.
+        let unpriced = runtime
+            .block_on(ledger.reserve_attempt(
+                s.id,
+                task,
+                attempt(5, 6, 3),
+                10,
+                None,
+                ExecutionClass::Unknown,
+            ))
+            .unwrap();
+        runtime
+            .block_on(ledger.settle_usage(s.id, unpriced, 5, 0, 0, 5, None, None))
+            .unwrap();
+
+        let mut rows = s.durable_spend_rows(task, 100).unwrap();
+        rows.sort_by_key(|r| r.reservation_id);
+        assert_eq!(rows.len(), 3);
+        let hosted_row = &rows[0];
+        assert_eq!(
+            hosted_row.provider_cost_micro, 0,
+            "the hosted free tier folds a real zero"
+        );
+        assert_eq!(hosted_row.price_authority, Some(PriceAuthority::Exact));
+        assert_eq!(
+            hosted_row.effective_execution_class(),
+            ExecutionClass::Unknown,
+            "a zero-cost hosted row is NOT local"
+        );
+        assert!(!hosted_row.effective_execution_class().is_local());
+        assert!(!hosted_row.effective_execution_class().is_hosted());
+        let local_row = &rows[1];
+        assert_eq!(local_row.price_authority, Some(PriceAuthority::LocalZero));
+        assert_eq!(
+            local_row.effective_execution_class(),
+            ExecutionClass::Local,
+            "a LocalZero reservation IS local"
+        );
+        let unpriced_row = &rows[2];
+        assert_eq!(unpriced_row.price_authority, None);
+        assert_eq!(
+            unpriced_row.effective_execution_class(),
+            ExecutionClass::Unknown
         );
     }
 }

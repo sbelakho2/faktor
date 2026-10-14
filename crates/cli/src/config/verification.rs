@@ -16,6 +16,17 @@ pub struct VerificationCfg {
     pub unit_max_s: u64,
     #[serde(default = "default_full_as_background")]
     pub full_as_background: bool,
+    /// Opt into the ADVANCED verification-policy profile (the
+    /// `advanced_verification_policy` paid value entitlement): full
+    /// repository checks run with a real inline budget instead of being
+    /// silently demoted to background, and the quick/unit budgets sit at
+    /// their advanced floors. Default `false` = the local profile, never
+    /// gated. Requesting the advanced profile on a plan that does not map
+    /// the entitlement refuses daemon startup TYPED at the policy
+    /// constructor (naming the entitlement and the resolved plan) — never a
+    /// silent local downgrade. Requires `quick_max_s > 0`.
+    #[serde(default)]
+    pub advanced: bool,
     /// The OPTIONAL external (Kiwi-shaped) verification provider. Disabled
     /// by default: an absent subsection — or `enabled = false` — leaves the
     /// verification registry with the native baseline only.
@@ -112,18 +123,70 @@ impl Default for VerificationCfg {
             quick_max_s: default_quick_max_s(),
             unit_max_s: default_unit_max_s(),
             full_as_background: default_full_as_background(),
+            advanced: false,
             kiwi: KiwiCfg::default(),
         }
     }
 }
 
 impl VerificationCfg {
-    /// The verification policy this section resolves to. `None` when
-    /// `quick_max_s` is 0: the verification service is DISABLED (fail
-    /// closed — mutating turns classify Unverified, never silently
-    /// complete). Sane values map onto the crate policy whose per-category
-    /// budgets gate every check (`budget_for`).
-    pub fn policy(&self) -> Option<faktor_verify::exec::VerificationPolicy> {
+    /// The verification policy this section resolves to WITHOUT any value
+    /// gate. A numeric combination that reaches the ADVANCED (paid) profile's
+    /// depth — `quick_max_s`/`unit_max_s` at the advanced floors, or
+    /// `full_as_background = false` (full checks inline) — refuses typed
+    /// here: the advanced profile is reachable ONLY through
+    /// [`Self::policy_checked`] with the `advanced_verification_policy`
+    /// entitlement. `quick_max_s == 0` stays `Ok(None)` (disabled, never
+    /// advanced). The default local profile (60/600/background) is never
+    /// refused.
+    pub fn policy(&self) -> Result<Option<faktor_verify::exec::VerificationPolicy>, String> {
+        let Some(policy) = self.local_policy() else {
+            return Ok(None);
+        };
+        if policy.implies_advanced() {
+            return Err(
+                "verification.quick_max_s/unit_max_s/full_as_background reach the ADVANCED \
+                 verification profile, which is the advanced_verification_policy paid value \
+                 entitlement; construct it through the entitled gate (set [verification] \
+                 advanced = true with a plan that maps the entitlement)"
+                    .to_string(),
+            );
+        }
+        Ok(Some(policy))
+    }
+
+    /// The daemon's GATED resolution: `advanced = true` OR any numerically
+    /// implied-advanced combination constructs the advanced profile ONLY
+    /// through the checked constructor; a denial is the typed refusal
+    /// (naming the entitlement, its hook, the cause and the resolved plan).
+    pub fn policy_checked(
+        &self,
+        gate: &faktor_core::entitlement::ValueGate,
+    ) -> Result<Option<faktor_verify::exec::VerificationPolicy>, String> {
+        if self.quick_max_s == 0 {
+            return Ok(None);
+        }
+        if self.advanced || self.implies_advanced() {
+            return faktor_verify::exec::VerificationPolicy::advanced_checked(gate)
+                .map(Some)
+                .map_err(|refusal| format!("verification advanced profile refused: {refusal}"));
+        }
+        Ok(self.local_policy())
+    }
+
+    /// TRUE when the configured numbers (without `advanced = true`) already
+    /// reach the advanced profile's depth: they still require the
+    /// entitlement.
+    pub fn implies_advanced(&self) -> bool {
+        self.local_policy()
+            .is_some_and(|policy| policy.implies_advanced())
+    }
+
+    /// The pure local projection (never gated, never advanced by itself):
+    /// `None` when `quick_max_s` is 0 (the verification service is DISABLED,
+    /// fail closed — mutating turns classify Unverified, never silently
+    /// complete).
+    fn local_policy(&self) -> Option<faktor_verify::exec::VerificationPolicy> {
         if self.quick_max_s == 0 {
             return None;
         }

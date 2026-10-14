@@ -495,7 +495,15 @@ mod typed_ledger_tests {
             // accounting pass raced.
             seed_task(&store, s.id, task_id, vec![], TaskState::Running);
             let rid = match store
-                .cost_reserve_priced(s.id, task_id, OpId::new(100 + n as u64), 77, now_ms(), None)
+                .cost_reserve_priced(
+                    s.id,
+                    task_id,
+                    OpId::new(100 + n as u64),
+                    77,
+                    now_ms(),
+                    None,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
                 .unwrap()
             {
                 CostReserveOutcome::Granted(id) => id,
@@ -1010,13 +1018,29 @@ mod typed_ledger_tests {
         let a1 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(701), 0).unwrap();
         let a2 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(702), 1).unwrap();
         let CostReserveOutcome::Granted(r1) = store
-            .cost_reserve_attempt(s.id, tid, &a1, 1_000, now, None)
+            .cost_reserve_attempt(
+                s.id,
+                tid,
+                &a1,
+                1_000,
+                now,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .unwrap()
         else {
             panic!("attempt 1 reserve granted")
         };
         let CostReserveOutcome::Granted(r2) = store
-            .cost_reserve_attempt(s.id, tid, &a2, 2_000, now, None)
+            .cost_reserve_attempt(
+                s.id,
+                tid,
+                &a2,
+                2_000,
+                now,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
             .unwrap()
         else {
             panic!("attempt 2 reserve granted")

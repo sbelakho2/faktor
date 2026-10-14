@@ -9,8 +9,9 @@ use crate::runtime::tests::*;
 use crate::*;
 
 use faktor_core::contract_compile::{
-    compile_contract, intent_tokens, AcquisitionGapKind, ContractCompileRequest, EnrichmentKind,
-    EnrichmentRequest, EnrichmentStatement, RepositoryAcquisition, SystemIntelligenceProvider,
+    compile_contract, intent_tokens, AcquisitionGapKind, ContractCompileRequest, FindingsRequest,
+    FindingsResponse, IntelligenceFuture, IntelligenceQuestion, ProviderFinding,
+    RepositoryAcquisition, SystemIntelligenceProvider,
 };
 
 const REFRESH_SOURCE: &str = r#"
@@ -245,7 +246,7 @@ async fn drive_start_compiles_persists_and_replays_the_baseline_contract() {
         ..Default::default()
     };
 
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert!(
@@ -274,7 +275,7 @@ async fn drive_start_compiles_persists_and_replays_the_baseline_contract() {
     // Replayed drive start: the deterministic compile merges to a no-op and
     // the durable revision does not move.
     let revision = handle.task_revision(task_id).unwrap();
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     assert_eq!(handle.task_revision(task_id).unwrap(), revision);
     let replayed = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(replayed.contract, task.contract);
@@ -301,7 +302,7 @@ async fn drive_start_records_uncertainty_when_nothing_is_derivable() {
         ..Default::default()
     };
 
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert!(task.contract.proof_obligations.is_empty());
@@ -355,7 +356,7 @@ async fn an_existing_contract_is_never_recompiled_over() {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(
         task.contract, user_contract,
@@ -363,31 +364,76 @@ async fn an_existing_contract_is_never_recompiled_over() {
     );
 }
 
-/// A spy that proposes ONE additive disclosure risk: the production seam's
-/// happy path.
-struct AddingIntel;
+/// A spy that ANSWERS every bounded question with a real finding bound to
+/// the request's own repository identity, records which questions it was
+/// asked, and counts consults: the production seam's happy path.
+#[derive(Default)]
+struct AnsweringIntel {
+    consults: std::sync::atomic::AtomicUsize,
+    questions: std::sync::Mutex<Vec<&'static str>>,
+}
 
-impl SystemIntelligenceProvider for AddingIntel {
+impl SystemIntelligenceProvider for AnsweringIntel {
     fn provider_id(&self) -> &str {
         "spy-intel"
     }
 
-    fn enrich(&self, request: &EnrichmentRequest<'_>) -> Result<Vec<EnrichmentStatement>, String> {
-        if request.max_statements == 0 {
-            return Ok(Vec::new());
-        }
-        Ok(vec![EnrichmentStatement {
-            kind: EnrichmentKind::Risk,
-            text: "the drive-start runtime consulted the installed system-intelligence provider"
-                .to_string(),
-            confidence_bps: 8_800,
-            basis: "runtime contract-compiler test spy".to_string(),
-            evidence: None,
-            binding: None,
-            severity: Some(faktor_core::RiskSeverity::Low),
-            advisory: false,
-        }])
+    fn findings<'a>(
+        &'a self,
+        request: &'a FindingsRequest<'a>,
+    ) -> IntelligenceFuture<'a, Result<FindingsResponse, String>> {
+        Box::pin(async move {
+            self.consults
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            {
+                let mut seen = self
+                    .questions
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                for question in request.questions {
+                    seen.push(question.as_str());
+                }
+            }
+            let findings = request
+                .questions
+                .iter()
+                .map(|question| ProviderFinding {
+                    question: *question,
+                    kind: question.expected_kind(),
+                    text: format!("the installed provider answered {}", question.as_str()),
+                    basis: "runtime contract-compiler test spy".to_string(),
+                    confidence_bps: 8_800,
+                    repository_digest: request.repository_digest.to_string(),
+                    provider: "spy-intel".to_string(),
+                    revision: request.source_revision.map(str::to_string),
+                    severity: None,
+                })
+                .collect();
+            Ok(FindingsResponse {
+                findings,
+                diagnostics: Vec::new(),
+            })
+        })
     }
+}
+
+/// A wired value gate that grants every entitlement (the commercial
+/// authority is present and entitled): the paid organization-contracts
+/// consult is not what these tests exercise.
+#[derive(Debug)]
+struct GrantingGate;
+
+impl faktor_core::entitlement::ValueEntitlementGate for GrantingGate {
+    fn check_value_entitlement(
+        &self,
+        _entitlement: faktor_core::entitlement::ValueEntitlement,
+    ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+        Ok(())
+    }
+}
+
+fn granting_gate() -> faktor_core::entitlement::ValueGate {
+    faktor_core::entitlement::ValueGate::wired(Arc::new(GrantingGate))
 }
 
 /// A provider that refuses every consult: the contract must stay native-only
@@ -399,8 +445,11 @@ impl SystemIntelligenceProvider for RefusingIntel {
         "refusing-intel"
     }
 
-    fn enrich(&self, _request: &EnrichmentRequest<'_>) -> Result<Vec<EnrichmentStatement>, String> {
-        Err("no intelligence capability".to_string())
+    fn findings<'a>(
+        &'a self,
+        _request: &'a FindingsRequest<'a>,
+    ) -> IntelligenceFuture<'a, Result<FindingsResponse, String>> {
+        Box::pin(async move { Err("no intelligence capability".to_string()) })
     }
 }
 
@@ -457,7 +506,7 @@ fn external_count(contract: &faktor_core::EngineeringContract) -> usize {
 }
 
 #[tokio::test]
-async fn installed_provider_enriches_the_durable_contract_additively() {
+async fn installed_provider_answers_the_bounded_questions_into_the_durable_contract() {
     let dir = tempdir().unwrap();
     let repo = dir.path().join("repo");
     write_refresh_repo(&repo);
@@ -466,45 +515,93 @@ async fn installed_provider_enriches_the_durable_contract_additively() {
     let (deps, _keep) =
         deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
-    runtime.set_system_intelligence_provider(Arc::new(AddingIntel));
+    let spy = Arc::new(AnsweringIntel::default());
+    runtime.set_system_intelligence_provider(spy.clone());
+    runtime.set_value_gate(granting_gate());
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
     let ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
 
-    // The provider's statement is durable with `external:<provider>`
-    // provenance, and the native remainder is byte-identical to the native
-    // compile: enrichment is strictly additive.
-    let external = task
+    // The runtime actually ASKED the provider the bounded questions.
+    assert!(spy.consults.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    let asked: Vec<&str> = spy
+        .questions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    for question in IntelligenceQuestion::ALL {
+        assert!(
+            asked.contains(&question.as_str()),
+            "question {} was never asked: {asked:?}",
+            question.as_str()
+        );
+    }
+
+    // The answers are durable `external:<provider>` statements of their
+    // typed kinds, NOT capability descriptions; the native remainder is
+    // byte-identical: enrichment is strictly additive.
+    for (label, question) in [
+        (
+            "affected component: ",
+            IntelligenceQuestion::AffectedComponents,
+        ),
+        (
+            "hidden dependency: ",
+            IntelligenceQuestion::HiddenDependencies,
+        ),
+        ("blast radius: ", IntelligenceQuestion::BlastRadius),
+        (
+            "historical failure: ",
+            IntelligenceQuestion::HistoricalFailures,
+        ),
+    ] {
+        let expected = format!(
+            "{label}the installed provider answered {}",
+            question.as_str()
+        );
+        let risk = task
+            .contract
+            .risks
+            .iter()
+            .find(|risk| risk.description == expected)
+            .unwrap_or_else(|| panic!("missing typed risk statement {expected:?}"));
+        assert_eq!(
+            risk.origin,
+            faktor_core::ContractOrigin::External {
+                provider: "spy-intel".into()
+            }
+        );
+    }
+    let invariant = format!(
+        "invariant that must survive: the installed provider answered {}",
+        IntelligenceQuestion::Invariants.as_str()
+    );
+    assert!(
+        task.contract
+            .invariants
+            .iter()
+            .any(|entry| entry.statement == invariant
+                && matches!(entry.origin, faktor_core::ContractOrigin::External { .. })),
+        "the invariant answer must be a durable external invariant: {:?}",
+        task.contract.invariants
+    );
+    assert_eq!(external_count(&task.contract), 5);
+    assert!(!task
         .contract
         .risks
         .iter()
-        .find(|risk| {
-            matches!(
-                &risk.origin,
-                faktor_core::ContractOrigin::External { provider } if provider == "spy-intel"
-            )
-        })
-        .expect("the installed provider's risk statement is durable");
-    assert!(external
-        .description
-        .contains("system-intelligence provider"));
-    assert_eq!(external_count(&task.contract), 1);
+        .any(|risk| risk.description.contains("declares")));
     let native = native_contract_for(&repo, &ledger.goal);
-    assert_eq!(
-        task.contract.constraints, native.constraints,
-        "native constraints are byte-identical under enrichment"
-    );
-    assert_eq!(task.contract.invariants, native.invariants);
     assert_eq!(
         strip_external(&task.contract),
         native,
-        "removing external statements yields the exact native contract"
+        "removing external findings yields the exact native contract"
     );
     assert!(
         !native.proof_obligations.is_empty(),
@@ -523,6 +620,7 @@ async fn refusing_provider_leaves_the_native_contract_and_never_fails_the_drive(
         deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
     runtime.set_system_intelligence_provider(Arc::new(RefusingIntel));
+    runtime.set_value_gate(granting_gate());
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
     let ledger = TaskLedger {
@@ -530,7 +628,7 @@ async fn refusing_provider_leaves_the_native_contract_and_never_fails_the_drive(
         ..Default::default()
     };
     // The drive is not failed by the refusal...
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     // ...and the durable contract is exactly the native one.
@@ -558,7 +656,7 @@ async fn no_provider_is_byte_identical_to_the_native_compile() {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).unwrap();
+    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(external_count(&task.contract), 0);
@@ -572,4 +670,81 @@ async fn no_provider_is_byte_identical_to_the_native_compile() {
         serde_json::to_vec(&native_contract_for(&repo, &ledger.goal)).unwrap(),
         "byte-identical, not merely equal"
     );
+}
+
+/// A wired value gate that DENIES the organization-contracts entitlement
+/// (the plan does not map it): the typed refusal names the entitlement and
+/// plan.
+#[derive(Debug)]
+struct DenyingContracts;
+
+impl faktor_core::entitlement::ValueEntitlementGate for DenyingContracts {
+    fn check_value_entitlement(
+        &self,
+        entitlement: faktor_core::entitlement::ValueEntitlement,
+    ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+        Err(faktor_core::entitlement::ValueGateRefusal {
+            entitlement,
+            hook: entitlement.enforcement_hook(),
+            cause: faktor_core::entitlement::ValueRefusalCause::NotInPlan,
+            plan_id: Some("free".into()),
+            organization_id: Some("org_local".into()),
+            message: format!(
+                "value entitlement {} (hook {}) not granted for organization org_local: not_in_plan (plan Some(\"free\"))",
+                entitlement.as_str(),
+                entitlement.hook_tag()
+            ),
+        })
+    }
+}
+
+/// The organization-contract enrichment BOUNDARY: a denied plan (and the
+/// offline absent gate) must refuse the enrichment TYPED at the runtime —
+/// the provider is NEVER consulted, the native contract stands byte-for-byte,
+/// and no `external:` provenance is minted. The local compile path is
+/// untouched.
+#[tokio::test]
+async fn denied_organization_contracts_refuse_enrichment_typed_before_the_provider() {
+    for (label, gate) in [
+        (
+            "denied plan",
+            faktor_core::entitlement::ValueGate::wired(Arc::new(DenyingContracts)),
+        ),
+        (
+            "offline absent gate",
+            faktor_core::entitlement::ValueGate::absent(),
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        write_refresh_repo(&repo);
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (deps, _keep) =
+            deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let spy = Arc::new(AnsweringIntel::default());
+        runtime.set_system_intelligence_provider(spy.clone());
+        runtime.set_value_gate(gate);
+        let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let ledger = TaskLedger {
+            goal: "Fix the refresh-token race".to_string(),
+            ..Default::default()
+        };
+        runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+        let task_id = handle.task_id().unwrap();
+        let task = handle.get_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            spy.consults.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{label}: the paid provider consult must never happen under a refusal"
+        );
+        assert_eq!(external_count(&task.contract), 0, "{label}");
+        assert_eq!(
+            task.contract,
+            native_contract_for(&repo, &ledger.goal),
+            "{label}: the native contract stands"
+        );
+    }
 }

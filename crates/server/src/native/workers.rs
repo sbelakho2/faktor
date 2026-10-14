@@ -71,6 +71,9 @@ pub(crate) fn worker_err(e: WorkerError) -> ApiError {
     let (code, http_status, retryable) = match &e {
         WorkerError::Backend(_) => ("internal", 500, true),
         WorkerError::Malformed(_) => ("malformed", 400, false),
+        // The paid `private_runners` entitlement refused claim admission:
+        // the typed refusal (entitlement/hook/cause/plan) rides the message.
+        WorkerError::EntitlementRefused(_) => ("value_entitlement_refused", 403, false),
         WorkerError::UnknownToken => ("unknown_worker_token", 401, false),
         WorkerError::TokenRevoked => ("worker_token_revoked", 401, false),
         WorkerError::TokenAlreadyUsed(_) => ("worker_token_reused", 409, false),

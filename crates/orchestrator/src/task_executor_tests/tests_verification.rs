@@ -1455,18 +1455,20 @@ pub(crate) async fn poisoned_completion_step_policy_refuses_mutations_typed() {
 // start nothing locally, and a broken seam that refuses typed instead of
 // silently running locally.
 
-use crate::placement::{PlacementDecision, PlacementSpec, WorkerPlacement, WorkerPlacementSeam};
+use crate::placement::{
+    PlacementDecision, PlacementRefusal, PlacementSpec, WorkerPlacement, WorkerPlacementSeam,
+};
 
 /// One recording seam: answers a scripted decision and counts/captures
 /// every consultation.
 pub(crate) struct RecordingSeam {
-    pub(crate) decision: StdMutex<Result<PlacementDecision, String>>,
+    pub(crate) decision: StdMutex<Result<PlacementDecision, PlacementRefusal>>,
     pub(crate) calls: AtomicUsize,
     pub(crate) specs: StdMutex<Vec<PlacementSpec>>,
 }
 
 impl RecordingSeam {
-    fn new(decision: Result<PlacementDecision, String>) -> Arc<Self> {
+    fn new(decision: Result<PlacementDecision, PlacementRefusal>) -> Arc<Self> {
         Arc::new(Self {
             decision: StdMutex::new(decision),
             calls: AtomicUsize::new(0),
@@ -1480,7 +1482,7 @@ impl RecordingSeam {
 }
 
 impl WorkerPlacementSeam for RecordingSeam {
-    fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, String> {
+    fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, PlacementRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.specs.lock().unwrap().push(spec.clone());
         self.decision.lock().unwrap().clone()
@@ -1599,7 +1601,9 @@ pub(crate) async fn placement_enabled_failure_refuses_typed_and_starts_nothing()
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(&dir.path().join("a"), done_script());
-    let seam = RecordingSeam::new(Err("worker plane store unavailable".into()));
+    let seam = RecordingSeam::new(Err(PlacementRefusal::Plane(
+        "worker plane store unavailable".into(),
+    )));
     env.executor
         .set_worker_placement(WorkerPlacement::enabled(seam.clone()));
     let req = request(

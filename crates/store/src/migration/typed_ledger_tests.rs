@@ -303,7 +303,15 @@ fn migration_v16_renames_legacy_abandoned_reservations_to_uncertain_and_adds_the
     // 1000 - 800 (uncertain) - 100 (reserved) = 100 free — a 101
     // reserve refuses with the typed exceeded outcome.
     let out = store
-        .cost_reserve_priced(sid, tid, OpId::new(5), 101, now_ms(), None)
+        .cost_reserve_priced(
+            sid,
+            tid,
+            OpId::new(5),
+            101,
+            now_ms(),
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .unwrap();
     assert!(
         matches!(out, CostReserveOutcome::Exceeded { free: 100 }),

@@ -590,18 +590,28 @@ pub struct AgentRuntime {
     /// (Kiwi-shaped) providers.
     pub(crate) verification_providers:
         std::sync::Mutex<Option<Arc<faktor_verify::VerificationRegistry>>>,
-    /// The OPTIONAL neutral system-intelligence enrichment provider (the
-    /// `compile_contract_with` seam). `None` (the default, and any daemon
-    /// with no configured external semantic provider) keeps drive-start
-    /// contract compilation on the byte-identical native path. Installed by
-    /// the daemon through [`AgentRuntime::set_system_intelligence_provider`]
-    /// — the semantic-registry adapter when `[semantic] providers` is
-    /// configured, or the production-wiring certification's spy through the
-    /// builder seam. Enrichment is strictly additive with
+    /// The OPTIONAL neutral system-intelligence findings provider (the
+    /// `findings` seam). `None` (the default, and any daemon with no
+    /// configured external semantic provider) keeps drive-start contract
+    /// compilation on the byte-identical native path. Installed by the daemon
+    /// through [`AgentRuntime::set_system_intelligence_provider`] — the
+    /// semantic-registry adapter when `[semantic] providers` is configured,
+    /// or the production-wiring certification's spy through the builder seam.
+    /// The runtime asks it the fixed bounded question set before the pure
+    /// compile; its validated findings are strictly additive with
     /// `external:<provider>` provenance and can never fail a turn.
     pub(crate) system_intelligence: std::sync::Mutex<
         Option<Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>>,
     >,
+    /// The value-entitlement enforcement gate of this runtime: consulted
+    /// BEFORE every paid augmentation side effect (today: organization
+    /// contract enrichment). The default is
+    /// [`faktor_core::entitlement::ValueGate::absent`] — every paid
+    /// augmentation is refused typed (`cloud_absent`) while the local
+    /// product behavior is unchanged. The daemon installs the commercial
+    /// gate through [`AgentRuntime::set_value_gate`] when `[billing]` is
+    /// enabled.
+    pub(crate) value_gate: std::sync::Mutex<faktor_core::entitlement::ValueGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -1921,6 +1931,7 @@ impl AgentRuntime {
             retry_policy_override: std::sync::Mutex::new(None),
             verification_providers: std::sync::Mutex::new(None),
             system_intelligence: std::sync::Mutex::new(None),
+            value_gate: std::sync::Mutex::new(faktor_core::entitlement::ValueGate::absent()),
         }))
     }
 
@@ -1945,12 +1956,13 @@ impl AgentRuntime {
             .clone()
     }
 
-    /// Install the OPTIONAL neutral system-intelligence enrichment provider
-    /// consulted at drive-start contract compilation
-    /// (`compile_contract_with`). Additive: a runtime without one compiles
-    /// exactly the native contract byte-for-byte; an installed provider's
-    /// statements are appended with `external:<provider>` provenance, and a
-    /// refusing/erroring provider leaves the native contract untouched (it is
+    /// Install the OPTIONAL neutral system-intelligence findings provider
+    /// asked the fixed bounded question set at drive-start contract
+    /// compilation (before the pure `compile_contract_with_findings_checked`).
+    /// Additive: a runtime without one compiles exactly the native contract
+    /// byte-for-byte; an installed provider's validated findings are appended
+    /// with `external:<provider>` provenance, and a refusing/timing-out or
+    /// malformed provider leaves the native contract untouched (it is
     /// diagnosed in the compile outcome, never a failed turn).
     pub fn set_system_intelligence_provider(
         &self,
@@ -1968,6 +1980,25 @@ impl AgentRuntime {
     ) -> Option<Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>>
     {
         self.system_intelligence
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Install the value-entitlement enforcement gate (the daemon's
+    /// commercial adapter when `[billing]` is enabled). Additive: without an
+    /// install the runtime keeps the absent gate — every paid augmentation
+    /// is refused typed (`cloud_absent`) and the local path is unchanged.
+    pub fn set_value_gate(&self, gate: faktor_core::entitlement::ValueGate) {
+        *self
+            .value_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = gate;
+    }
+
+    /// The installed value-entitlement gate (absent by default).
+    pub(crate) fn value_gate(&self) -> faktor_core::entitlement::ValueGate {
+        self.value_gate
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()

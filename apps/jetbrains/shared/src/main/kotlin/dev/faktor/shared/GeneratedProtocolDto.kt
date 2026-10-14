@@ -180,12 +180,17 @@ data class ProtocolSessionPromptReceipt(
     val queued: Boolean
 )
 
-/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm. (unknown_fields: ignore) */
+/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = "unavailable"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. (unknown_fields: ignore) */
 data class ProtocolOutcomeMetrics(
     val runs: Long,
     val verifiedChanges: Long,
-    val verifiedFirstPassChanges: Long,
-    val verifiedFirstPassPpm: Long,
+    val verifiedFirstVerificationPassChanges: Long,
+    val verifiedFirstVerificationPassPpm: Long,
+    val moneyCompleteRuns: Long,
+    val moneyPendingRuns: Long,
+    val moneyUnavailableRuns: Long,
+    val moneyIncompleteExcluded: Long,
+    val verifiedChangesMoneyComplete: Long,
     val totalVerifiedSpendMicro: String,
     val successfulRunCostMicro: String,
     val totalSpendMicro: String,
@@ -202,11 +207,14 @@ data class ProtocolOutcomeMetrics(
     val localFirstRuns: Long,
     val localFirstSuccessChanges: Long,
     val localFirstSuccessPpm: Long,
-    val localToFrontierFallbackRuns: Long,
-    val localToFrontierFallbackPpm: Long,
-    val frontierOnlyRuns: Long,
-    val frontierOnlyPpm: Long,
-    val avoidedHostedInferenceMicro: String,
+    val localToHostedFallbackRuns: Long,
+    val localToHostedFallbackPpm: Long,
+    val hostedOnlyRuns: Long,
+    val runsWithSteps: Long,
+    val hostedOnlyPpm: Long,
+    val avoidedHostedInferenceMicro: String?,
+    val avoidedHostedInferenceMeasurement: String,
+    val avoidedHostedMeasuredRuns: Long,
     val totalWallTimeMs: Long,
     val meanTimeToVerifiedChangeMs: Long,
     val humanInterventionRuns: Long,
@@ -217,17 +225,22 @@ data class ProtocolOutcomeMetrics(
     val checksRequired: Long,
     val proofCoveragePpm: Long,
     val frontierEscalationRuns: Long,
-    val frontierEscalationPpm: Long,
+    val frontierClassedRuns: Long,
+    val frontierEscalationClassedRuns: Long,
+    val frontierEscalationPpm: Long?,
+    val frontierEscalationMeasurement: String,
     val scanned: Long,
     val truncated: Boolean
 )
 
-/** One provider/model step of a completed run's execution sequence (money as a decimal string). (unknown_fields: ignore) */
+/** One provider/model step of a completed run's execution sequence. `executionClass` is the durable route-time classification (`local` | `hosted_economy` | `hosted_balanced` | `frontier` | `unknown`); `local` is CLASS-DERIVED — true only when the class is `local`. A step with no durable class authority (`unknown`: a pre-class legacy payload or an unpriced path) exposes its recorded pre-class local bit as `legacyLocal` (true only for a classless step whose stored row recorded a local execution); a class-carrying step always reports `legacyLocal` false, and the legacy bit is never promoted to a class claim. `unknown` is counted as neither local nor hosted by the metrics. `spendMicro` is a decimal string only when the run's money is settled (`complete`); null otherwise — the money is not final, never a fabricated zero. (unknown_fields: ignore) */
 data class ProtocolRunOutcomeModelStep(
     val provider: String,
     val model: String,
     val local: Boolean,
-    val spendMicro: String
+    val legacyLocal: Boolean,
+    val executionClass: String,
+    val spendMicro: String?
 )
 
 /** One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm. (unknown_fields: ignore) */
@@ -244,7 +257,7 @@ data class ProtocolRunOutcomeChangeScale(
     val removedLines: Long
 )
 
-/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. (unknown_fields: ignore) */
+/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == "complete"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = "unavailable"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). (unknown_fields: ignore) */
 data class ProtocolRunOutcome(
     val runId: String,
     val sessionId: Long,
@@ -256,13 +269,15 @@ data class ProtocolRunOutcome(
     val accepted: Boolean,
     val integrated: Boolean,
     val verified: Boolean,
-    val verifiedFirstAttempt: Boolean,
+    val verifiedFirstVerificationPass: Boolean,
     val repairAttempts: Long,
     val modelSequence: List<ProtocolRunOutcomeModelStep>,
-    val modelSpendMicro: String,
-    val verificationSpendMicro: String,
-    val reworkSpendMicro: String,
-    val avoidedHostedMicro: String,
+    val moneyState: String,
+    val modelSpendMicro: String?,
+    val verificationSpendMicro: String?,
+    val reworkSpendMicro: String?,
+    val avoidedHostedMicro: String?,
+    val avoidedHostedMeasurement: String,
     val wallTimeMs: Long,
     val humanInterventions: Long,
     val proof: ProtocolRunOutcomeProof,
@@ -576,8 +591,13 @@ fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
     return ProtocolOutcomeMetrics(
         runs = v.field("runs").long(),
         verifiedChanges = v.field("verifiedChanges").long(),
-        verifiedFirstPassChanges = v.field("verifiedFirstPassChanges").long(),
-        verifiedFirstPassPpm = v.field("verifiedFirstPassPpm").long(),
+        verifiedFirstVerificationPassChanges = v.field("verifiedFirstVerificationPassChanges").long(),
+        verifiedFirstVerificationPassPpm = v.field("verifiedFirstVerificationPassPpm").long(),
+        moneyCompleteRuns = v.field("moneyCompleteRuns").long(),
+        moneyPendingRuns = v.field("moneyPendingRuns").long(),
+        moneyUnavailableRuns = v.field("moneyUnavailableRuns").long(),
+        moneyIncompleteExcluded = v.field("moneyIncompleteExcluded").long(),
+        verifiedChangesMoneyComplete = v.field("verifiedChangesMoneyComplete").long(),
         totalVerifiedSpendMicro = v.field("totalVerifiedSpendMicro").string(),
         successfulRunCostMicro = v.field("successfulRunCostMicro").string(),
         totalSpendMicro = v.field("totalSpendMicro").string(),
@@ -594,11 +614,14 @@ fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
         localFirstRuns = v.field("localFirstRuns").long(),
         localFirstSuccessChanges = v.field("localFirstSuccessChanges").long(),
         localFirstSuccessPpm = v.field("localFirstSuccessPpm").long(),
-        localToFrontierFallbackRuns = v.field("localToFrontierFallbackRuns").long(),
-        localToFrontierFallbackPpm = v.field("localToFrontierFallbackPpm").long(),
-        frontierOnlyRuns = v.field("frontierOnlyRuns").long(),
-        frontierOnlyPpm = v.field("frontierOnlyPpm").long(),
-        avoidedHostedInferenceMicro = v.field("avoidedHostedInferenceMicro").string(),
+        localToHostedFallbackRuns = v.field("localToHostedFallbackRuns").long(),
+        localToHostedFallbackPpm = v.field("localToHostedFallbackPpm").long(),
+        hostedOnlyRuns = v.field("hostedOnlyRuns").long(),
+        runsWithSteps = v.field("runsWithSteps").long(),
+        hostedOnlyPpm = v.field("hostedOnlyPpm").long(),
+        avoidedHostedInferenceMicro = v.optionalField("avoidedHostedInferenceMicro")?.string(),
+        avoidedHostedInferenceMeasurement = v.field("avoidedHostedInferenceMeasurement").string(),
+        avoidedHostedMeasuredRuns = v.field("avoidedHostedMeasuredRuns").long(),
         totalWallTimeMs = v.field("totalWallTimeMs").long(),
         meanTimeToVerifiedChangeMs = v.field("meanTimeToVerifiedChangeMs").long(),
         humanInterventionRuns = v.field("humanInterventionRuns").long(),
@@ -609,7 +632,10 @@ fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
         checksRequired = v.field("checksRequired").long(),
         proofCoveragePpm = v.field("proofCoveragePpm").long(),
         frontierEscalationRuns = v.field("frontierEscalationRuns").long(),
-        frontierEscalationPpm = v.field("frontierEscalationPpm").long(),
+        frontierClassedRuns = v.field("frontierClassedRuns").long(),
+        frontierEscalationClassedRuns = v.field("frontierEscalationClassedRuns").long(),
+        frontierEscalationPpm = v.optionalField("frontierEscalationPpm")?.long(),
+        frontierEscalationMeasurement = v.field("frontierEscalationMeasurement").string(),
         scanned = v.field("scanned").long(),
         truncated = v.field("truncated").bool()
     )
@@ -620,7 +646,9 @@ fun parseProtocolRunOutcomeModelStep(v: JsonView): ProtocolRunOutcomeModelStep {
         provider = v.field("provider").string(),
         model = v.field("model").string(),
         local = v.field("local").bool(),
-        spendMicro = v.field("spendMicro").string()
+        legacyLocal = v.field("legacyLocal").bool(),
+        executionClass = v.field("executionClass").string(),
+        spendMicro = v.optionalField("spendMicro")?.string()
     )
 }
 
@@ -652,13 +680,15 @@ fun parseProtocolRunOutcome(v: JsonView): ProtocolRunOutcome {
         accepted = v.field("accepted").bool(),
         integrated = v.field("integrated").bool(),
         verified = v.field("verified").bool(),
-        verifiedFirstAttempt = v.field("verifiedFirstAttempt").bool(),
+        verifiedFirstVerificationPass = v.field("verifiedFirstVerificationPass").bool(),
         repairAttempts = v.field("repairAttempts").long(),
         modelSequence = v.field("modelSequence").array().map { parseProtocolRunOutcomeModelStep(it) },
-        modelSpendMicro = v.field("modelSpendMicro").string(),
-        verificationSpendMicro = v.field("verificationSpendMicro").string(),
-        reworkSpendMicro = v.field("reworkSpendMicro").string(),
-        avoidedHostedMicro = v.field("avoidedHostedMicro").string(),
+        moneyState = v.field("moneyState").string(),
+        modelSpendMicro = v.optionalField("modelSpendMicro")?.string(),
+        verificationSpendMicro = v.optionalField("verificationSpendMicro")?.string(),
+        reworkSpendMicro = v.optionalField("reworkSpendMicro")?.string(),
+        avoidedHostedMicro = v.optionalField("avoidedHostedMicro")?.string(),
+        avoidedHostedMeasurement = v.field("avoidedHostedMeasurement").string(),
         wallTimeMs = v.field("wallTimeMs").long(),
         humanInterventions = v.field("humanInterventions").long(),
         proof = parseProtocolRunOutcomeProof(v.field("proof")),

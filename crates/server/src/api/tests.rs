@@ -389,6 +389,10 @@ pub(crate) struct PacedScriptedProvider {
     pub(crate) script_index: std::sync::atomic::AtomicUsize,
     pub(crate) request_count: std::sync::atomic::AtomicUsize,
     pub(crate) chunk_delay_ms: u64,
+    /// When set, the FIRST call's stream parks before its first chunk until
+    /// one permit is released: cancel tests pin a run deterministically
+    /// mid-model-call instead of racing completion under load.
+    hold_first_call: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl PacedScriptedProvider {
@@ -403,7 +407,20 @@ impl PacedScriptedProvider {
             script_index: std::sync::atomic::AtomicUsize::new(0),
             request_count: std::sync::atomic::AtomicUsize::new(0),
             chunk_delay_ms,
+            hold_first_call: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Park the first call's stream until [`Self::release_first_call`].
+    pub(crate) fn hold_first_call(&self) {
+        *self.hold_first_call.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Release a parked first call (the stream then proceeds normally).
+    pub(crate) fn release_first_call(&self) {
+        if let Some(hold) = self.hold_first_call.lock().unwrap().as_ref() {
+            hold.add_permits(1);
+        }
     }
 }
 
@@ -432,27 +449,44 @@ impl faktor_provider::Provider for PacedScriptedProvider {
             .cloned()
             .unwrap_or_else(|| vec![faktor_provider::ScriptedResponse::End]);
         let delay = self.chunk_delay_ms;
-        let stream = futures_util::stream::iter(script).then(move |s| async move {
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            match s {
-                faktor_provider::ScriptedResponse::Text(t) => {
-                    Ok(faktor_provider::ProviderChunk::Text { text: t })
+        let hold = self.hold_first_call.lock().unwrap().clone();
+        let first_call = i == 0;
+        let stream = futures_util::stream::iter(script)
+            .enumerate()
+            .then(move |(idx, s)| {
+                let hold = hold.clone();
+                async move {
+                    // The deterministic mid-call gate: ONLY the first call's
+                    // stream parks (before its first chunk) until one permit.
+                    if first_call && idx == 0 {
+                        if let Some(hold) = hold {
+                            let permit = hold.acquire().await.expect("semaphore never closed");
+                            permit.forget();
+                        }
+                    }
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    match s {
+                        faktor_provider::ScriptedResponse::Text(t) => {
+                            Ok(faktor_provider::ProviderChunk::Text { text: t })
+                        }
+                        faktor_provider::ScriptedResponse::ToolCall { id, name, input } => {
+                            Ok(faktor_provider::ProviderChunk::ToolCall {
+                                id,
+                                name,
+                                input,
+                                complete: true,
+                            })
+                        }
+                        faktor_provider::ScriptedResponse::Die(e) => Err(e),
+                        faktor_provider::ScriptedResponse::End => {
+                            Ok(faktor_provider::ProviderChunk::Done)
+                        }
+                        faktor_provider::ScriptedResponse::Reasoning(_) => unreachable!(),
+                    }
                 }
-                faktor_provider::ScriptedResponse::ToolCall { id, name, input } => {
-                    Ok(faktor_provider::ProviderChunk::ToolCall {
-                        id,
-                        name,
-                        input,
-                        complete: true,
-                    })
-                }
-                faktor_provider::ScriptedResponse::Die(e) => Err(e),
-                faktor_provider::ScriptedResponse::End => Ok(faktor_provider::ProviderChunk::Done),
-                faktor_provider::ScriptedResponse::Reasoning(_) => unreachable!(),
-            }
-        });
+            });
         Box::pin(stream)
     }
 }

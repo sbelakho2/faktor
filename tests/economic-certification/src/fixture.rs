@@ -166,7 +166,7 @@ pub fn generate_fixture_capture(scratch: &Path) -> Result<FrozenCapture, String>
         .cloned()
         .map(|m| Arc::new(FixtureModel::new(m)) as Arc<dyn CodingModel>)
         .collect();
-    let mut runs = Vec::with_capacity(corpus.tasks.len() * Arm::ALL.len());
+    let mut runs = Vec::with_capacity(corpus.tasks.len() * Arm::WITH_RUNTIME.len());
     for arm in Arm::ALL {
         let arm_offset = if arm == Arm::FaktorMachinery { 1000 } else { 0 };
         let mut arm_runs = run_arm(
@@ -181,6 +181,13 @@ pub fn generate_fixture_capture(scratch: &Path) -> Result<FrozenCapture, String>
         )?;
         runs.append(&mut arm_runs);
     }
+    // The third arm: the SAME frozen corpus and frozen scripted outputs,
+    // executed by the REAL AgentRuntime turn loop (deterministic; no model
+    // call of any kind — see `daemon_arm`). Its scripted model is NOT a
+    // routable candidate, so it never enters the model table the two prompt
+    // arms route over.
+    let mut runtime_runs = crate::daemon_arm::run_runtime_arm(&corpus, scratch)?;
+    runs.append(&mut runtime_runs);
     FrozenCapture {
         schema: crate::frozen::FROZEN_SCHEMA.to_string(),
         capture_id: "fixture".into(),

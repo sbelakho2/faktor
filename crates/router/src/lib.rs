@@ -61,9 +61,10 @@ fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 use std::sync::{Arc, Mutex};
 
 use faktor_core::model::{
-    unix_now_ms, EffectivePriceState, ModelDescriptor, ModelEconomics, ModelPerformance,
-    PriceAuthority, PricingSnapshot, PricingState, QualityAuthority, QualityStatement,
-    RateLimitState, RiskBucket, RouteDecision, RouterPhase, TaskClass, TokenUsage, VerifiedOutcome,
+    unix_now_ms, EffectivePriceState, ExecutionClass, ModelDescriptor, ModelEconomics,
+    ModelPerformance, PriceAuthority, PricingSnapshot, PricingState, QualityAuthority,
+    QualityStatement, RateLimitState, RiskBucket, RouteDecision, RouterPhase, TaskClass,
+    TokenUsage, VerifiedOutcome,
 };
 
 /// MODEL-CHECK-ONLY journaled task-budget ledger (micro-units) with
@@ -1545,6 +1546,9 @@ impl Router {
             // catalog-aware RouterService path stamps the entry's real
             // snapshot (see `RouterService::with_pricing`).
             pricing_snapshot: None,
+            // No pricing authority consulted: no execution-class authority
+            // either (never inferred from a descriptor number).
+            execution_class: ExecutionClass::Unknown,
         })
     }
 }
@@ -2071,6 +2075,10 @@ impl RouterService {
             reasoning,
             considered: self.priced.len(),
             source: chosen.descriptor.source,
+            // The execution class rides the SAME frozen authority as the
+            // snapshot: LocalZero is the only authority that establishes
+            // locality (a hosted zero price is never local).
+            execution_class: ExecutionClass::from_price_authority(effective.authority()),
             pricing_snapshot: Some(effective.snapshot()),
         })
     }
@@ -2285,6 +2293,9 @@ impl RouterService {
                 reasoning,
                 considered: self.priced.len(),
                 source: chosen.descriptor.source,
+                // The execution class rides the SAME frozen authority as the
+                // snapshot (see `route_priced`).
+                execution_class: ExecutionClass::from_price_authority(effective.authority()),
                 pricing_snapshot: Some(effective.snapshot()),
             },
             plan: Some(CandidatePlan {
@@ -2429,6 +2440,9 @@ impl RouterService {
                 considered: 1,
                 source: chosen.descriptor.source,
                 pricing_snapshot: None,
+                // Descriptor-only pinned path: no pricing authority was
+                // consulted, so there is no execution-class authority.
+                execution_class: ExecutionClass::Unknown,
             });
         }
         self.route_pinned(provider, model, req, cache, now_ms, self.outcomes.as_ref())
@@ -2476,6 +2490,7 @@ impl RouterService {
             source: pinned
                 .map(|c| c.descriptor.source)
                 .unwrap_or(faktor_core::model::ModelSource::ConservativeDefault),
+            execution_class: ExecutionClass::from_price_authority(effective.authority()),
             pricing_snapshot: Some(effective.snapshot()),
         })
     }
@@ -2547,6 +2562,14 @@ impl RouterService {
                 .pricing
                 .get(&(chosen.provider.clone(), chosen.model.clone()))
                 .cloned(),
+            // The class rides the same catalog authority: LocalZero is the
+            // only one that establishes locality.
+            execution_class: ExecutionClass::from_price_authority(
+                self.pricing
+                    .get(&(chosen.provider.clone(), chosen.model.clone()))
+                    .map(|s| s.authority)
+                    .unwrap_or(PriceAuthority::Unknown),
+            ),
         })
     }
 

@@ -39,6 +39,21 @@ impl faktor_agent::PermissionRequester for AlwaysAllow {
     }
 }
 
+/// A test value gate that GRANTS every entitlement: the worker-plane e2e
+/// exercises placement/claim execution, not the entitlement decision (the
+/// decision itself is covered by the production-wiring seam tests).
+#[derive(Debug)]
+struct GrantAllEntitlements;
+
+impl faktor_core::entitlement::ValueEntitlementGate for GrantAllEntitlements {
+    fn check_value_entitlement(
+        &self,
+        _entitlement: faktor_core::entitlement::ValueEntitlement,
+    ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+        Ok(())
+    }
+}
+
 /// Minimal REAL daemon AgentDeps over an open session manager: text-only
 /// turns, no MCP/verifier/supervisor (nothing here ever runs a process).
 pub(crate) fn test_agent(
@@ -1549,6 +1564,7 @@ async fn worker_transport_round_trip_settles_the_parent_run() {
                 organization: organization.clone(),
                 trust_domain: "org_local".into(),
                 requirements,
+                gate: faktor_core::entitlement::ValueGate::wired(Arc::new(GrantAllEntitlements)),
             }),
         ));
 

@@ -526,6 +526,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <button id="btn-outcomes-refresh" class="secondary" type="button" title="Re-read the ledger metrics and the newest run page">Refresh</button>
         </div>
         <div id="outcomes-status" class="muted" role="status"></div>
+        <div id="outcomes-entitlements" class="muted outcomes-entitlements" role="status" hidden></div>
         <div id="outcomes-truncated" class="outcomes-truncated" role="note" hidden>Truncated sample</div>
         <div id="outcomes-metrics" class="outcomes-metrics"></div>
         <div id="outcomes-runs" class="outcomes-runs"></div>

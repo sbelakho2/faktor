@@ -152,12 +152,12 @@ fn fixture_capture_is_frozen_and_regenerates_identically() {
     if let Some(diff) = first_json_diff(&generated_value, &committed_value, String::new()) {
         panic!("the committed fixture drifted from regeneration at {diff}; re-bless with FAKTOR_ECON_BLESS=1");
     }
-    // Every task appears in both arms exactly once.
+    // Every task appears in every arm exactly once.
     for task in load_coding_corpus(&ecc::coding::coding_corpus_root())
         .expect("corpus")
         .tasks
     {
-        for arm in Arm::ALL {
+        for arm in Arm::WITH_RUNTIME {
             assert!(
                 committed.run(&task.id, arm).is_some(),
                 "fixture misses ({}, {})",
@@ -192,14 +192,29 @@ fn replay_is_deterministic_and_reports_from_the_wired_ledger() {
     assert_eq!(fixture.source, "fixture");
     assert_eq!(fixture.wall_time_basis, "fixture");
     assert_eq!(fixture.token_basis, "estimate");
-    assert_eq!(fixture.runs_replayed, 18, "9 tasks x 2 arms");
+    assert_eq!(fixture.runs_replayed, 27, "9 tasks x 3 arms");
     let baseline = fixture.arms.get("baseline").expect("baseline arm");
     let machinery = fixture.arms.get("faktor_machinery").expect("machinery arm");
+    let runtime = fixture
+        .arms
+        .get("full_daemon_runtime")
+        .expect("full_daemon_runtime arm");
     assert_eq!(baseline.runs, 9);
     assert_eq!(machinery.runs, 9);
-    // The unsolvable fixture run (order 6) can never verify in either arm.
+    assert_eq!(runtime.runs, 9);
+    // The unsolvable fixture run (order 6) can never verify in any arm.
     assert_eq!(baseline.verified, 8);
     assert_eq!(machinery.verified, 8);
+    assert_eq!(
+        runtime.verified, machinery.verified,
+        "the runtime arm drives the SAME frozen outputs: its objective success axis must match the machinery arm exactly"
+    );
+    // The runtime arm is the frozen script: no hosted attempts, no spend.
+    assert_eq!(runtime.frontier_attempts, 0);
+    assert_eq!(runtime.inference_spend_micro, 0);
+    assert_eq!(runtime.frontier_escalations, 0);
+    assert_eq!(runtime.attempts, runtime.local_attempts);
+    assert!(runtime.attempts > 9, "some runtime runs must rework");
     // Rework and fallback paths are exercised by the plan.
     assert!(baseline.attempts > 9, "some runs must rework");
     assert!(baseline.rework_spend_micro > 0 || baseline.rework_turns > 0);
@@ -208,8 +223,8 @@ fn replay_is_deterministic_and_reports_from_the_wired_ledger() {
         "the plan encodes a local first-attempt failure"
     );
     // The cohort metric is the wired ledger's fold, not a re-derivation.
-    assert_eq!(fixture.cohort_ledger.runs, 18);
-    assert_eq!(fixture.cohort_ledger.verified_changes, 16);
+    assert_eq!(fixture.cohort_ledger.runs, 27);
+    assert_eq!(fixture.cohort_ledger.verified_changes, 24);
     assert!(
         fixture
             .cohort_ledger
@@ -234,7 +249,7 @@ fn replay_is_deterministic_and_reports_from_the_wired_ledger() {
         "plan encodes a rescued fallback"
     );
     assert!(
-        fixture.cohort_ledger.local_to_frontier_fallback_runs
+        fixture.cohort_ledger.local_to_hosted_fallback_runs
             <= baseline.local_failure_runs + machinery.local_failure_runs,
         "fallback accounting is bounded by local failures"
     );
@@ -471,6 +486,107 @@ fn selection_helpers_expose_expected_shapes() {
         !candidate.files.contains_key("verify.sh"),
         "candidates never touch the verifier"
     );
+}
+
+// ------------------------------------------------- full_daemon_runtime arm
+
+#[test]
+fn full_daemon_runtime_arm_is_deterministic_and_runtime_gated() {
+    let corpus = corpus();
+    let scratch_a = tempfile::TempDir::new().expect("scratch a");
+    let first = ecc::daemon_arm::run_runtime_arm(&corpus, scratch_a.path()).expect("drive once");
+    let scratch_b = tempfile::TempDir::new().expect("scratch b");
+    let second = ecc::daemon_arm::run_runtime_arm(&corpus, scratch_b.path()).expect("drive twice");
+    assert_eq!(first.len(), 9, "the runtime arm covers the frozen corpus");
+    let first_value = serde_json::to_value(&first).expect("first json");
+    let second_value = serde_json::to_value(&second).expect("second json");
+    if let Some(diff) = first_json_diff(&first_value, &second_value, String::new()) {
+        panic!("driving the REAL runtime twice must be byte-identical; drifted at {diff}");
+    }
+    for run in &first {
+        assert_eq!(run.prompt.arm, Arm::FullDaemonRuntime);
+        assert!(
+            run.prompt.contract_digest.is_some(),
+            "{}: the runtime arm carries the compiled contract digest",
+            run.task_id
+        );
+        assert!(
+            run.prompt.intelligence.is_none(),
+            "{}: the runtime arm records no rendered prompt-side brief",
+            run.task_id
+        );
+        assert!(!run.attempts.is_empty());
+        for attempt in &run.attempts {
+            let evidence = attempt
+                .runtime
+                .as_ref()
+                .expect("every runtime attempt carries runtime evidence");
+            assert_eq!(attempt.provider, "frozen-runtime");
+            assert_eq!(attempt.model, "frozen-plan");
+            assert_eq!(attempt.spend_micro, 0, "no monetary claim on this lane");
+            assert_eq!(attempt.cost_source, ecc::frozen::CostSource::Fixture);
+            assert!(
+                [
+                    "verified_complete",
+                    "unverified",
+                    "failed_verification",
+                    "blocked_verification",
+                    "verification_pending",
+                    "none"
+                ]
+                .contains(&evidence.completion_gate.as_str()),
+                "{}: unknown gate label {}",
+                run.task_id,
+                evidence.completion_gate
+            );
+            // The runtime made at least one model call (its frozen script) and
+            // the derived-check state is recorded honestly.
+            assert!(evidence.provider_calls >= 1);
+            assert!(
+                evidence.review_calls <= evidence.provider_calls,
+                "review calls are a subset of the turn's provider calls"
+            );
+        }
+    }
+}
+
+#[test]
+fn runtime_evidence_tampering_is_rejected_at_replay() {
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let generated = ecc::fixture::generate_fixture_capture(scratch.path()).expect("generate");
+    let mut tampered = generated.clone();
+    let runtime_run = tampered
+        .runs
+        .iter_mut()
+        .find(|r| r.prompt.arm == Arm::FullDaemonRuntime)
+        .expect("fixture carries runtime runs");
+    let evidence = runtime_run.attempts[0]
+        .runtime
+        .as_mut()
+        .expect("runtime evidence");
+    evidence.completion_gate = "verified_complete".into();
+    let tampered = tampered.finish().expect("re-seal");
+    let err = replay_capture(&tampered, &corpus(), scratch.path()).expect_err("replay rejects");
+    assert!(
+        err.contains("runtime gate/review evidence drifted"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn tampered_runtime_prompt_hash_is_rejected_at_redrive() {
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let generated = ecc::fixture::generate_fixture_capture(scratch.path()).expect("generate");
+    let mut tampered = generated.clone();
+    let runtime_run = tampered
+        .runs
+        .iter_mut()
+        .find(|r| r.prompt.arm == Arm::FullDaemonRuntime)
+        .expect("fixture carries runtime runs");
+    runtime_run.attempts[0].prompt_blake3 = "0".repeat(64);
+    let tampered = tampered.finish().expect("re-seal");
+    let err = replay_capture(&tampered, &corpus(), scratch.path()).expect_err("replay rejects");
+    assert!(err.contains("runtime prompt drifted"), "unexpected: {err}");
 }
 
 fn corpus() -> ecc::coding::CodingCorpus {

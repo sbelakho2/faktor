@@ -3,13 +3,14 @@
 use super::*;
 
 /// The shared trait-object handle of the OPTIONAL system-intelligence
-/// enrichment seam (the contract compiler's `compile_contract_with`
-/// provider). Every production entry passes `None`, so drive-start contract
-/// compilation keeps the byte-identical native path; a daemon whose
-/// `[semantic]` section configures external providers installs the
+/// findings seam (the provider the runtime asks the fixed bounded questions
+/// before the pure `compile_contract_with_findings`). Every production entry
+/// passes `None`, so drive-start contract compilation keeps the
+/// byte-identical native path; a daemon whose `[semantic]` section configures
+/// external providers installs the
 /// [`faktor_semantic::SemanticIntelligenceAdapter`] over its ONE registry,
 /// and the production-wiring certification injects a spy through
-/// [`build_daemon_with_system_intelligence`] to prove the seam is consulted
+/// [`build_daemon_with_system_intelligence`] to prove the seam is asked
 /// through the real `build_daemon_core` assembly. There is no config key,
 /// environment variable or CLI flag for this seam.
 pub type SystemIntelligenceHandle =
@@ -761,17 +762,75 @@ pub(crate) fn daemon_verification(
     section: &config::VerificationCfg,
     supervisor: &Arc<ProcessSupervisor>,
     network_requirement: faktor_terminal::NetworkIsolationRequirement,
-) -> Arc<faktor_agent::VerificationService> {
-    match section.policy() {
-        Some(policy) => faktor_agent::VerificationService::new(
-            Arc::new(
-                faktor_verify::exec::AsyncCheckExecutor::from_supervisor(supervisor.clone())
-                    .with_network_requirement(network_requirement),
-            ),
-            policy,
+    value_gate: &faktor_core::entitlement::ValueGate,
+) -> Result<Arc<faktor_agent::VerificationService>, String> {
+    // The LOCAL profile path is never gated. The ADVANCED profile (a paid
+    // value entitlement) is constructed through the ONE gated constructor —
+    // whether it was requested explicitly (`advanced = true`) or implied by
+    // the configured numbers (advanced floors or full checks inline): a plan
+    // that does not map `advanced_verification_policy` refuses the daemon
+    // TYPED here, naming the entitlement and the resolved plan — never a
+    // silent downgrade to the local profile.
+    let policy = if section.advanced && section.quick_max_s == 0 {
+        return Err(
+            "verification.advanced requires an enabled verification service (quick_max_s > 0)"
+                .to_string(),
+        );
+    } else {
+        match section.policy_checked(value_gate)? {
+            Some(policy) => policy,
+            None => return Ok(faktor_agent::VerificationService::disabled()),
+        }
+    };
+    Ok(faktor_agent::VerificationService::new(
+        Arc::new(
+            faktor_verify::exec::AsyncCheckExecutor::from_supervisor(supervisor.clone())
+                .with_network_requirement(network_requirement),
         ),
-        None => faktor_agent::VerificationService::disabled(),
+        policy,
+    ))
+}
+
+/// The boot-time value-entitlement gate for the daemon's configured billing
+/// organization: with no `[billing]` section the gate is ABSENT (every paid
+/// augmentation is refused typed `cloud_absent`; the local product is
+/// untouched). With `[billing]` enabled the SAME real constructor `serve`
+/// uses reads the durable plan/subscription rows and answers the decision —
+/// no grant is ever guessed from config alone.
+pub(crate) fn daemon_boot_value_gate(
+    config: &config::Config,
+    data_dir: &std::path::Path,
+) -> Result<faktor_core::entitlement::ValueGate, String> {
+    if !config.billing.enabled {
+        return Ok(faktor_core::entitlement::ValueGate::absent());
     }
+    let path = config
+        .billing
+        .billing_path(data_dir)
+        .map_err(|e| format!("billing config: {e}"))?;
+    let organization = config
+        .billing
+        .organization()
+        .map_err(|e| format!("billing config: {e}"))?;
+    let service_config = config
+        .billing
+        .service_config()
+        .map_err(|e| format!("billing config: {e}"))?
+        .ok_or_else(|| "billing config: an enabled section carries a service config".to_string())?;
+    let store = {
+        let path = enabled_section_db_path("billing", path)?;
+        Arc::new(
+            faktor_cloud::SqliteControlPlaneStore::open(&path)
+                .map_err(|e| format!("billing store {}: {e}", path.display()))?,
+        ) as Arc<dyn faktor_cloud::BillingStore>
+    };
+    let service = faktor_cloud::EntitlementService::with_system_clock_for_organization(
+        store,
+        service_config,
+        organization.clone(),
+    )
+    .map_err(|e| format!("billing service: {e}"))?;
+    Ok(service.enforcement_gate(&organization))
 }
 
 /// The workspace-root authority of the native verification provider: the
@@ -1197,11 +1256,24 @@ pub(crate) fn build_daemon_core(
     // runtime. Budgets come from the configured [verification] section
     // (defaults: quick <= 60 s, unit <= 600 s inline, full = durable
     // background verification jobs; quick_max_s 0 = disabled + fail closed).
+    // The boot-time value-entitlement gate: constructed (through the real
+    // billing constructor over the durable plan rows) ONLY when the
+    // verification section opts into the advanced paid profile — explicitly
+    // (`advanced = true`) or through numeric combinations that reach the
+    // advanced depth; every default daemon keeps the absent gate without
+    // opening billing.db.
+    let verification_value_gate =
+        if config.verification.advanced || config.verification.implies_advanced() {
+            daemon_boot_value_gate(&config, data_dir)?
+        } else {
+            faktor_core::entitlement::ValueGate::absent()
+        };
     let verification = daemon_verification(
         &config.verification,
         &supervisor,
         sandbox_policy.spawn_network_requirement(),
-    );
+        &verification_value_gate,
+    )?;
     // The generic verification PROVIDER registry (native baseline always;
     // the optional external Kiwi provider only when configured) rides the
     // SAME supervisor and the daemon's checked egress transport. It is

@@ -49,11 +49,13 @@ pub use faktor_session::VerificationRecord;
 pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
 pub use outcome_ledger::{
-    session_terminal_run_id, ChangedCodeScale, FinalVerificationBasis, LedgerAppend, OutcomeCursor,
-    OutcomeLedger, OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport,
-    OutcomeLedgerPage, ProofCoverage, RunModelStep, RunOutcomeRecord, RunVerifiedSample,
-    TerminalRunFacts, MAX_LEDGER_PAGE, MAX_METRICS_RECORDS, MAX_RUN_VERIFIED_SAMPLES,
-    OUTCOME_RECORD_SCHEMA_V,
+    session_terminal_run_id, ChangedCodeScale, EconomicSettlement, FinalVerificationBasis,
+    LedgerAppend, MeasuredMoney, MoneyState, OutcomeCursor, OutcomeLedger, OutcomeLedgerEntry,
+    OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport, OutcomeLedgerPage,
+    ProofCoverage, RunModelStep, RunVerifiedSample, SettlementFinalize, SettlementStep,
+    TerminalEngineeringOutcome, TerminalRunFacts, TerminalRunFactsOutbox, MAX_LEDGER_PAGE,
+    MAX_METRICS_RECORDS, MAX_RUN_VERIFIED_SAMPLES, OUTCOME_RECORD_SCHEMA_V, SETTLEMENT_SCHEMA_V,
+    TERMINAL_FACTS_SCHEMA_V,
 };
 pub use runtime::{
     review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,
@@ -990,6 +992,15 @@ impl EconomicRoutingPolicy {
     /// `planner` present the router's candidate-sized entry runs and the
     /// winning plan crosses back; without one the plain consult runs
     /// byte-identically.
+    ///
+    /// Route-tier authority (economic audit item 7 P1): EVERY decision leaves
+    /// this funnel with its durable execution class re-derived at decision
+    /// time from the frozen price authority (locality) beside THIS policy's
+    /// mode (the hosted tier) — `Local` for an authoritative local-zero
+    /// route, `hosted_economy`/`hosted_balanced`/`frontier` for a genuinely
+    /// priced hosted call under Economy/Balanced/MaximumQuality, and `Unknown`
+    /// wherever no authority establishes a class. The mode can never override
+    /// locality, and no tier is ever fabricated for an unpriced call.
     #[allow(clippy::too_many_arguments)] // one explicit axis per parameter, mirroring the router
     fn consult_at_with_plans(
         &self,
@@ -1013,7 +1024,7 @@ impl EconomicRoutingPolicy {
         // probe reuse the same candidate lookups; absent one, the service's
         // own registry is consulted exactly as before.
         let stable_floor = faktor_router::stability::DEFAULT_STABILITY_FLOOR;
-        match (planner, prefix_history, outcomes) {
+        let consulted = match (planner, prefix_history, outcomes) {
             (Some(planner), None, Some(o)) => {
                 self.service
                     .route_with_candidate_plans_at_with(&routed, &[], planner, now_ms, o)
@@ -1065,7 +1076,11 @@ impl EconomicRoutingPolicy {
                 .service
                 .route_with_prefix_stability(&routed, &[], stable_floor, Some(history))
                 .map(faktor_router::SizedRouteDecision::without_plan),
-        }
+        };
+        consulted.map(|mut sized| {
+            sized.decision.execution_class = sized.decision.execution_class_for_mode(&self.mode);
+            sized
+        })
     }
 
     fn route_economy_sized(
@@ -1301,7 +1316,12 @@ impl EconomicRoutingPolicy {
                 return Err(self.map_denial(&e, req));
             }
         };
-        let decision = decision.expect("routed above");
+        let mut decision = decision.expect("routed above");
+        // Route-tier authority: a pin establishes NO policy tier, so only the
+        // frozen price authority can classify it — `Local` for an
+        // authoritative local-zero pin, `Unknown` for every hosted pin (never
+        // a guessed tier). Documented in `RouteDecision::execution_class_for_mode`.
+        decision.execution_class = decision.execution_class_for_mode(&self.mode);
         if decision.provider == provider && decision.model == model {
             Ok(decision)
         } else {
@@ -1568,8 +1588,10 @@ pub fn empty_passthrough_decision() -> RouteDecision {
         // P0-1: NO pricing authority was consulted for a passthrough — the
         // snapshot stays None (never a fabricated price), so an unpriced
         // decision under a hard task cost budget fails closed at settle and
-        // records Unknown spend without one.
+        // records Unknown spend without one. The execution class stays
+        // Unknown too: there is no route-time authority to establish it.
         pricing_snapshot: None,
+        execution_class: faktor_core::model::ExecutionClass::Unknown,
     }
 }
 
@@ -3596,3 +3618,6 @@ pub(crate) async fn poll_evidence_with_wall_budget_outcome(
 
 #[cfg(test)]
 mod lib_tests;
+
+#[cfg(test)]
+mod lib_tests_quality;

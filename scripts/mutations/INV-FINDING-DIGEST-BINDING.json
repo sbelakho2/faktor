@@ -1,0 +1,9 @@
+{
+  "id": "INV-FINDING-DIGEST-BINDING",
+  "file": "crates/core/src/contract_compile.rs",
+  "find": "    if finding.repository_digest != expected_digest {\n",
+  "replace": "    if false {\n",
+  "gate": "cargo test -p faktor-tests-economy --test new_guard_findings_validation",
+  "expect": "unwrap_err|must never become a statement|must never be applied|must never reach",
+  "note": "Skipping the snapshot-digest validation accepts an unvalidated provider finding bound to another repository state and applies it to the contract."
+}

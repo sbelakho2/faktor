@@ -51,6 +51,7 @@ pub(crate) async fn single_item_task_max_cost_micro_lands_on_the_task_row_cap_an
             faktor_core::id::OpId::new(7_000_001),
             60_000,
             None,
+            faktor_core::model::ExecutionClass::Unknown,
         )
         .await
         .expect("reserve under the cap");

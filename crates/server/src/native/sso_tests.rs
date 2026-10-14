@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use faktor_cloud::{
-    ControlPlane, EnterpriseService, FakeOidcAdapter, ManualClock, MemoryControlPlaneStore,
-    OidcClaims, OrgSettings, Role, SsoConfigRef, SsoLogin,
+    BillingConfig, ControlPlane, EnterpriseService, EntitlementService, FakeOidcAdapter,
+    ManualClock, MemoryBillingStore, MemoryControlPlaneStore, OidcClaims, OrgSettings, PlanConfig,
+    Role, SsoConfigRef, SsoLogin, Subscription, SubscriptionId, SubscriptionStatus,
+    FEATURE_ENTERPRISE_GOVERNANCE, FEATURE_GOVERNANCE_SCIM, FEATURE_GOVERNANCE_SSO,
 };
 
 use crate::api::tests::test_deps;
@@ -27,7 +29,16 @@ struct Harness {
     session_id: String,
 }
 
-async fn harness(root: &std::path::Path, sso: bool, configured: bool) -> Harness {
+/// `plan` = the billing plan the enterprise organization is subscribed to
+/// (`None` = no billing authority wired). The SSO ENTRY is gated by the
+/// `enterprise_governance` entitlement + the `governance_sso` capability
+/// flag, so the success tests subscribe the org to a governance plan.
+async fn harness(
+    root: &std::path::Path,
+    sso: bool,
+    configured: bool,
+    plan: Option<&str>,
+) -> Harness {
     let clock = Arc::new(ManualClock::new(NOW_MS));
     let store = Arc::new(MemoryControlPlaneStore::new());
     let control_plane = Arc::new(ControlPlane::new(store.clone(), clock.clone()));
@@ -56,6 +67,45 @@ async fn harness(root: &std::path::Path, sso: bool, configured: bool) -> Harness
     let mut deps = test_deps(root)
         .with_control_plane(control_plane.clone())
         .with_enterprise(enterprise, None);
+    if let Some(plan) = plan {
+        let features: Vec<&str> = match plan {
+            "enterprise" => vec![
+                FEATURE_ENTERPRISE_GOVERNANCE,
+                FEATURE_GOVERNANCE_SSO,
+                FEATURE_GOVERNANCE_SCIM,
+            ],
+            "governance-no-sso" => vec![FEATURE_ENTERPRISE_GOVERNANCE],
+            _ => vec![],
+        };
+        let mut config = BillingConfig::default();
+        config.plans.insert(
+            plan.to_string(),
+            PlanConfig {
+                plan_id: plan.to_string(),
+                features: features.into_iter().map(str::to_string).collect(),
+                limits: Default::default(),
+            },
+        );
+        let billing = EntitlementService::new_for_organization(
+            Arc::new(MemoryBillingStore::new()),
+            clock.clone(),
+            config,
+            Some(boot.organization.id.clone()),
+        )
+        .unwrap();
+        billing
+            .set_subscription(&Subscription {
+                id: SubscriptionId::try_new("sub_sso").unwrap(),
+                organization: boot.organization.id.clone(),
+                plan_id: plan.to_string(),
+                status: SubscriptionStatus::Active,
+                started_ms: 0,
+                expires_ms: None,
+                updated_ms: NOW_MS,
+            })
+            .unwrap();
+        deps = deps.with_billing(billing);
+    }
     if sso {
         deps = deps.with_sso(Arc::new(SsoLogin::new(fake.clone(), clock)));
     } else {
@@ -86,12 +136,13 @@ fn start_body(org: &str) -> serde_json::Value {
 #[tokio::test]
 async fn sso_disabled_parity() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), false, true).await;
+    let h = harness(dir.path(), false, true, None).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     let resp = client
         .post(format!("{base}/native/sso/start"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&start_body(&h.org))
         .send()
         .await
@@ -102,6 +153,7 @@ async fn sso_disabled_parity() {
     let resp = client
         .post(format!("{base}/native/sso/callback"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&serde_json::json!({
             "organization": h.org,
             "redirect_uri": "https://app.example/callback",
@@ -121,12 +173,13 @@ async fn sso_disabled_parity() {
 #[tokio::test]
 async fn sso_not_configured_is_a_typed_refusal() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), true, false).await;
+    let h = harness(dir.path(), true, false, Some("enterprise")).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     let resp = client
         .post(format!("{base}/native/sso/start"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&start_body(&h.org))
         .send()
         .await
@@ -142,12 +195,13 @@ async fn sso_not_configured_is_a_typed_refusal() {
 #[tokio::test]
 async fn sso_start_callback_mints_a_control_plane_session() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), true, true).await;
+    let h = harness(dir.path(), true, true, Some("enterprise")).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     let resp = client
         .post(format!("{base}/native/sso/start"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&start_body(&h.org))
         .send()
         .await
@@ -180,6 +234,7 @@ async fn sso_start_callback_mints_a_control_plane_session() {
     let resp = client
         .post(format!("{base}/native/sso/callback"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&serde_json::json!({
             "organization": h.org,
             "redirect_uri": "https://app.example/callback",
@@ -201,6 +256,7 @@ async fn sso_start_callback_mints_a_control_plane_session() {
     let resp = client
         .post(format!("{base}/native/sso/callback"))
         .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
         .json(&serde_json::json!({
             "organization": h.org,
             "redirect_uri": "https://app.example/callback",
@@ -230,7 +286,7 @@ fn logout_body(org: &str, session_id: &str) -> serde_json::Value {
 #[tokio::test]
 async fn logout_invalidates_the_session_and_later_use_is_401() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), false, false).await;
+    let h = harness(dir.path(), false, false, None).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     // The session works before logout.
@@ -276,7 +332,7 @@ async fn logout_invalidates_the_session_and_later_use_is_401() {
 #[tokio::test]
 async fn logout_is_idempotent_typed() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), false, false).await;
+    let h = harness(dir.path(), false, false, None).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     for (expected_revoked, expected_already) in [(true, false), (false, true)] {
@@ -301,7 +357,7 @@ async fn logout_is_idempotent_typed() {
 #[tokio::test]
 async fn logout_refuses_foreign_and_mismatched_sessions() {
     let dir = tempfile::tempdir().unwrap();
-    let h = harness(dir.path(), false, false).await;
+    let h = harness(dir.path(), false, false, None).await;
     let other = h
         .control_plane
         .bootstrap_organization("globex", "owner@globex.test", "Owner", "boot-globex")
@@ -389,4 +445,201 @@ async fn logout_without_control_plane_is_cloud_disabled() {
     assert_eq!(resp.status(), 409);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "cloud_disabled");
+}
+
+/// The identity-federation ENTRY is gated by the `enterprise_governance`
+/// value entitlement + the `governance_sso` capability flag: a plan that
+/// maps neither is refused TYPED at start and callback (naming the
+/// entitlement and the capability), and a governance plan without the SSO
+/// flag is refused naming the capability.
+#[tokio::test]
+async fn sso_entry_is_refused_typed_without_the_governance_entitlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path(), true, true, Some("local")).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", h.handle.addr);
+    for route in ["start", "callback"] {
+        let resp = client
+            .post(format!("{base}/native/sso/{route}"))
+            .bearer_auth(&h.daemon_token)
+            .header("x-faktor-control-token", &h.owner_token)
+            .json(&if route == "start" {
+                start_body(&h.org)
+            } else {
+                serde_json::json!({
+                    "organization": h.org,
+                    "redirect_uri": "https://app.example/callback",
+                    "code": "c",
+                    "state": "s",
+                })
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{route}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "value_entitlement_refused");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("enterprise_governance"), "{message}");
+        assert!(message.contains("identity_federation"), "{message}");
+        assert!(message.contains("capability sso"), "{message}");
+    }
+}
+
+/// A governance plan WITHOUT the `governance_sso` capability flag: the base
+/// entitlement is granted but the flag gates the entry — typed refusal
+/// naming the capability.
+#[tokio::test]
+async fn sso_entry_requires_the_sso_capability_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path(), true, true, Some("governance-no-sso")).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", h.handle.addr);
+    let resp = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
+        .json(&start_body(&h.org))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "value_entitlement_refused");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("capability sso"), "{message}");
+}
+
+/// Offline (no billing authority wired): the SSO entry is refused typed
+/// `billing_disabled` — never a silent login.
+#[tokio::test]
+async fn sso_entry_refuses_typed_when_no_billing_authority_is_wired() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path(), true, true, None).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", h.handle.addr);
+    let resp = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
+        .json(&start_body(&h.org))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "billing_disabled");
+}
+
+/// ORACLE CLOSURE: start/callback require a control-plane PRINCIPAL and the
+/// named organization must be the principal's OWN. A daemon-password caller
+/// without a principal cannot probe organizations at all, and a foreign
+/// organization — existing or not — answers the SAME typed refusal naming
+/// only the CALLER's own organization, so the surface is never a
+/// plan/existence oracle.
+#[tokio::test]
+async fn sso_start_requires_a_principal_and_closes_the_organization_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path(), true, true, Some("enterprise")).await;
+    // A second organization EXISTS in the same control plane (with no SSO
+    // settings): its existence must not be distinguishable through the SSO
+    // surface.
+    let globex = h
+        .control_plane
+        .bootstrap_organization("globex", "owner@globex.test", "Owner", "boot-globex")
+        .unwrap();
+    let globex_org = globex.organization.id.as_str().to_string();
+    let globex_token = globex.token.expect("first issuance").expose().to_string();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", h.handle.addr);
+
+    // 1. Daemon password alone (no principal): 401 BEFORE any organization,
+    // plan or settings row is read.
+    let resp = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .json(&start_body(&h.org))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "the daemon password alone is not a principal"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+
+    // 2. The acme owner naming globex (which EXISTS) and naming a MISSING
+    // organization: byte-identical typed refusals, naming only the caller's
+    // own organization.
+    let foreign = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
+        .json(&start_body("globex"))
+        .send()
+        .await
+        .unwrap();
+    let missing = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
+        .json(&start_body("missingorg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 404);
+    assert_eq!(missing.status(), 404);
+    let foreign_body = foreign.text().await.unwrap();
+    let missing_body = missing.text().await.unwrap();
+    assert_eq!(
+        foreign_body, missing_body,
+        "an existing and a missing foreign organization must answer identically"
+    );
+    assert!(!foreign_body.contains("globex"), "{foreign_body}");
+    assert!(!foreign_body.contains("missingorg"), "{foreign_body}");
+    assert!(
+        foreign_body.contains(&h.org),
+        "the refusal names only the caller's own organization: {foreign_body}"
+    );
+
+    // 3. The mirrored callback refusal: the globex principal naming acme is
+    // the same scope refusal naming globex's OWN organization id as its own
+    // data — never the requested one.
+    let mirrored = client
+        .post(format!("{base}/native/sso/callback"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &globex_token)
+        .json(&serde_json::json!({
+            "organization": h.org,
+            "redirect_uri": "https://app.example/callback",
+            "code": "c",
+            "state": "s",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mirrored.status(), 404);
+    let mirrored_body = mirrored.text().await.unwrap();
+    assert!(mirrored_body.contains(&globex_org), "{mirrored_body}");
+    assert!(!mirrored_body.contains(&h.org), "{mirrored_body}");
+
+    // 4. No refusal minted or consumed anything: the caller's OWN
+    // organization still starts and both principals stay valid.
+    let own = client
+        .post(format!("{base}/native/sso/start"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &h.owner_token)
+        .json(&start_body(&h.org))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own.status(),
+        200,
+        "the caller's own organization still starts"
+    );
+    assert!(h.control_plane.authenticate(&h.owner_token).is_ok());
+    assert!(h.control_plane.authenticate(&globex_token).is_ok());
 }

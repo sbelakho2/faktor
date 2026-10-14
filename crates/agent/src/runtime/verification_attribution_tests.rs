@@ -3393,8 +3393,8 @@ async fn semantic_high_risk_upgrades_review_strength_tier_and_parallelism() {
 
 /// The production producer (economic audit item 7 P1): a real terminal
 /// VerifiedComplete turn appends ONE engineering-outcome record from its
-/// durable facts — identity, acceptance/integration, first-pass/repair,
-/// proof coverage, final basis and the settled model sequence — and the
+/// durable facts — identity, acceptance/integration, first-verification-pass/
+/// repair, proof coverage, final basis and the settled model sequence — and the
 /// terminal turn's explicit verified samples ride the record's atomic
 /// append (never also the per-call feed, never twice).
 #[tokio::test]
@@ -3439,17 +3439,26 @@ async fn terminal_verified_turn_produces_one_derived_engineering_outcome_record(
     assert_eq!(record.task_id, handle.task_id().unwrap().raw());
     assert!(record.accepted && record.integrated, "{record:?}");
     assert!(record.verified(), "the record must be a verified change");
-    assert!(record.verified_first_attempt);
+    assert!(record.verified_first_verification_pass);
     assert_eq!(record.repair_attempts, 0);
     assert!(record.final_basis.is_deterministic_verified());
     assert!(record.proof.checks_required >= 1, "{record:?}");
     assert_eq!(record.proof.checks_passed, record.proof.checks_required);
-    let step_sum: u64 = record
-        .model_sequence
+    // Money is the settlement's dimension, not the immutable record: a fully
+    // settled completed run carries a measured `complete` projection.
+    let settlement = ledger.settlement(&run_id).unwrap().unwrap();
+    assert_eq!(settlement.money_state, MoneyState::Complete);
+    let settlement_step_sum: u64 = settlement
+        .steps
         .iter()
         .map(|s| s.spend_micro)
         .fold(0u64, u64::saturating_add);
-    assert_eq!(step_sum, record.model_spend_micro);
+    assert_eq!(settlement_step_sum, settlement.model_spend_micro.unwrap());
+    assert_eq!(
+        settlement.avoided_hosted,
+        MeasuredMoney::Unavailable,
+        "no counterfactual authority exists in production: unavailable, never zero"
+    );
     assert!(
         !record.verified_samples.is_empty(),
         "the terminal turn's explicit samples ride the record: {record:?}"
@@ -3473,12 +3482,7 @@ async fn terminal_verified_turn_produces_one_derived_engineering_outcome_record(
         .phase_stats("fake", "m", RouterPhase::Implement)
         .is_none());
     // A replay of the terminal settlement never re-derives or re-feeds.
-    assert_eq!(
-        ledger
-            .record_terminal_run(&handle, &run_id, TerminalRunFacts::default())
-            .unwrap(),
-        None
-    );
+    assert_eq!(ledger.record_terminal_run(&handle, &run_id).unwrap(), None);
     assert_eq!(ledger.count().unwrap(), 1);
 }
 

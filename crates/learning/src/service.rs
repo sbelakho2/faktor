@@ -25,8 +25,17 @@
 //! `1 + confidence_ppm/1e6` (clamped to `[1, 2]`), and anything else is
 //! neutral `1.0`. The adapter itself lives with the consumer (this crate
 //! must not depend on the planner types).
+//!
+//! BOTH organization-shared surfaces ([`LearningService::shared_feed`] and
+//! [`LearningService::omission_risk_index`]) are bound through
+//! [`ScopeOwnershipBinding`]: the caller's organization is DERIVED from the
+//! authenticated principal and each scope's owner from durable scope state,
+//! never from caller-supplied data alone. A scope owned by another
+//! organization refuses the whole read typed ([`SharedFeedRefusal`]); it is
+//! never partially folded.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Write as _;
 
 use faktor_core::hash::FileHash;
@@ -51,6 +60,137 @@ pub const OMISSION_RISK_NEUTRAL: f64 = 1.0;
 /// (`base * clamp(risk, 1, 2)`), mirrored here so values produced by this
 /// crate are already inside the planner's accepted range.
 pub const OMISSION_RISK_MAX: f64 = 2.0;
+
+// ------------------------------------------- organization binding (shared)
+
+/// Bound on one organization id (mirrors the durable enterprise text bound).
+pub const MAX_ORGANIZATION_ID_BYTES: usize = 256;
+
+/// Bounded organization identity of the learning sharing seams. This crate
+/// is cloud-free by dependency direction, so the type mirrors the durable
+/// organization-id shape (non-empty printable ASCII, at most
+/// [`MAX_ORGANIZATION_ID_BYTES`]) instead of importing the commercial type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OrganizationId(String);
+
+impl OrganizationId {
+    pub fn try_new(raw: &str) -> Result<Self, LearningError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(LearningError::Malformed("organization id is empty".into()));
+        }
+        if trimmed.len() > MAX_ORGANIZATION_ID_BYTES {
+            return Err(LearningError::Oversized {
+                what: "organization id".into(),
+                max: MAX_ORGANIZATION_ID_BYTES,
+                actual: trimmed.len(),
+            });
+        }
+        if !trimmed.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+            return Err(LearningError::Malformed(
+                "organization id must be printable ASCII".into(),
+            ));
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OrganizationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The DURABLE organization binding of the learning sharing seams. Callers
+/// NEVER supply the organization as a bare argument: the seam resolves the
+/// caller's organization from the authenticated principal and each scope's
+/// owner from durable scope state through this authority, then refuses any
+/// scope that belongs to another organization. A binding whose caller
+/// resolution fails fails the read closed (never a silent local read).
+pub trait ScopeOwnershipBinding: Send + Sync {
+    /// The organization of the authenticated caller (principal / durable
+    /// session state), never request data.
+    fn caller_organization(&self) -> Result<OrganizationId, LearningError>;
+    /// The organization owning one project scope, from durable scope state.
+    fn scope_organization(&self, scope: &ProjectScope) -> Result<OrganizationId, LearningError>;
+}
+
+/// Deterministic single-organization binding: every scope resolves to the
+/// same organization. This is the shape of a LOCAL single-tenant corpus (the
+/// daemon's per-session store); a multi-tenant embedder must implement the
+/// trait over its durable scope registry instead.
+#[derive(Debug, Clone)]
+pub struct SingleOrganizationBinding {
+    organization: OrganizationId,
+}
+
+impl SingleOrganizationBinding {
+    pub fn new(organization: OrganizationId) -> Self {
+        Self { organization }
+    }
+}
+
+impl ScopeOwnershipBinding for SingleOrganizationBinding {
+    fn caller_organization(&self) -> Result<OrganizationId, LearningError> {
+        Ok(self.organization.clone())
+    }
+
+    fn scope_organization(&self, _scope: &ProjectScope) -> Result<OrganizationId, LearningError> {
+        Ok(self.organization.clone())
+    }
+}
+
+/// The typed refusal of one organization-shared learning read. `Entitlement`
+/// is the cloud-owned paid decision; the other variants are the durable
+/// binding refusing to serve a scope that is not the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedFeedRefusal {
+    /// The paid `model_optimization_learning` entitlement was not granted.
+    Entitlement(faktor_core::entitlement::ValueGateRefusal),
+    /// The caller organization could not be resolved from durable state:
+    /// fail closed, never fall through to a local read.
+    UnboundCaller { reason: String },
+    /// A requested scope's owner could not be resolved from durable state.
+    UnboundScope { scope: ProjectScope, reason: String },
+    /// A requested scope is owned by ANOTHER organization: the whole read is
+    /// refused before any page is served (never a partial cross-tenant fold).
+    ForeignScope {
+        caller: OrganizationId,
+        owner: OrganizationId,
+        scope: ProjectScope,
+    },
+}
+
+impl fmt::Display for SharedFeedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SharedFeedRefusal::Entitlement(refusal) => write!(f, "{refusal}"),
+            SharedFeedRefusal::UnboundCaller { reason } => {
+                write!(f, "learning scope binding: caller organization unresolved: {reason}")
+            }
+            SharedFeedRefusal::UnboundScope { scope, reason } => write!(
+                f,
+                "learning scope binding: scope (workspace {}) owner unresolved: {reason}",
+                scope.workspace_id.raw()
+            ),
+            SharedFeedRefusal::ForeignScope {
+                caller,
+                owner,
+                scope,
+            } => write!(
+                f,
+                "learning scope binding: scope (workspace {}) belongs to organization {owner}, not the caller organization {caller}",
+                scope.workspace_id.raw()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SharedFeedRefusal {}
 
 /// Deterministic conservative token estimate: one token per four UTF-8
 /// bytes, rounded up. An upper-bound estimator is intentional for
@@ -274,6 +414,69 @@ impl<S: LearningStore> LearningService<S> {
         self.store.page_for_scope(scope, offset, limit)
     }
 
+    /// The organization-shared learning feed — the `model_optimization_learning`
+    /// paid augmentation over the LOCAL per-project feed ([`Self::page`],
+    /// never gated): the caller names project scopes and receives one bounded
+    /// head page per scope, concatenated in the caller's scope order and
+    /// truncated to `limit`.
+    ///
+    /// The wired gate is consulted FIRST. A denial is the typed
+    /// [`SharedFeedRefusal::Entitlement`] naming the entitlement, its hook
+    /// and (when resolved) the plan; an absent gate refuses `cloud_absent`.
+    /// The local per-project feed keeps working without any gate — this
+    /// entry is the sharing boundary.
+    ///
+    /// Org binding: the caller's organization is DERIVED through `binding`
+    /// (principal / durable session state) and every scope's owner through
+    /// durable scope state BEFORE any page is read. A scope owned by another
+    /// organization refuses the WHOLE feed
+    /// ([`SharedFeedRefusal::ForeignScope`]); an unresolvable caller or scope
+    /// fails closed. The caller can never widen its organization by passing
+    /// scopes.
+    pub fn shared_feed(
+        &self,
+        gate: &faktor_core::entitlement::ValueGate,
+        binding: &dyn ScopeOwnershipBinding,
+        scopes: &[ProjectScope],
+        limit: usize,
+    ) -> Result<Vec<&ProjectLearning>, SharedFeedRefusal> {
+        gate.check(faktor_core::entitlement::ValueEntitlement::ModelOptimizationLearning)
+            .map_err(SharedFeedRefusal::Entitlement)?;
+        let caller =
+            binding
+                .caller_organization()
+                .map_err(|error| SharedFeedRefusal::UnboundCaller {
+                    reason: error.to_string(),
+                })?;
+        // Resolve EVERY scope owner BEFORE reading any page: a foreign scope
+        // refuses the whole request, so a partial cross-tenant fold can never
+        // be assembled.
+        for scope in scopes {
+            let owner = binding.scope_organization(scope).map_err(|error| {
+                SharedFeedRefusal::UnboundScope {
+                    scope: scope.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            if owner != caller {
+                return Err(SharedFeedRefusal::ForeignScope {
+                    caller,
+                    owner,
+                    scope: scope.clone(),
+                });
+            }
+        }
+        let mut out: Vec<&ProjectLearning> = Vec::new();
+        for scope in scopes {
+            if out.len() >= limit {
+                break;
+            }
+            out.extend(self.store.page_for_scope(scope, 0, limit));
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
     pub fn len(&self) -> usize {
         self.store.len()
     }
@@ -282,22 +485,38 @@ impl<S: LearningStore> LearningService<S> {
         self.store.is_empty()
     }
 
-    /// Corpus-level omission-risk index for the audit-68 failure prior
-    /// ([`crate::omission_risk_of`]). Every learning is addressable by BOTH
-    /// its pattern digest and its failure digest — the two identities a
-    /// planner candidate can name. When several learnings share a key the
-    /// MAXIMUM risk wins (protection is monotone). Work is bounded by the
-    /// store's `all()`: at most its configured capacity, one pass, no page
-    /// walk. A store whose adapter cannot enumerate contributes nothing and
-    /// every lookup stays neutral (parity, never a wrong demotion).
+    /// Organization-scoped corpus-level omission-risk index for the audit-68
+    /// failure prior ([`crate::omission_risk_of`]). Every learning is
+    /// addressable by BOTH its pattern digest and its failure digest — the
+    /// two identities a planner candidate can name. When several learnings
+    /// share a key the MAXIMUM risk wins (protection is monotone). Work is
+    /// bounded by the store's `all()`: at most its configured capacity, one
+    /// pass, no page walk.
+    ///
+    /// Org binding: the caller's organization is DERIVED through `binding`
+    /// and only learnings whose durable scope owner is the caller's
+    /// organization are folded into the index. Another organization's
+    /// learnings are excluded (their digests/risks never leak into the
+    /// caller's prior); a scope whose owner cannot be resolved fails the
+    /// whole build closed. A store whose adapter cannot enumerate
+    /// contributes nothing and every lookup stays neutral (parity, never a
+    /// wrong demotion).
     ///
     /// The index is a SNAPSHOT: build it once per corpus revision (the
     /// daemon builds it when it constructs the prior handle) and reuse it
     /// for every candidate; rebuilding it per candidate would repeat the
     /// bounded scan.
-    pub fn omission_risk_index(&self) -> HashMap<FileHash, f64> {
+    pub fn omission_risk_index(
+        &self,
+        binding: &dyn ScopeOwnershipBinding,
+    ) -> Result<HashMap<FileHash, f64>, LearningError> {
+        let caller = binding.caller_organization()?;
         let mut index = HashMap::new();
         for learning in self.store.all() {
+            let owner = binding.scope_organization(learning.project())?;
+            if owner != caller {
+                continue;
+            }
             let risk = omission_risk_of(learning.confidence_ppm);
             for key in [learning.pattern_digest(), learning.pattern.failure.digest()] {
                 index
@@ -306,7 +525,7 @@ impl<S: LearningStore> LearningService<S> {
                     .or_insert(risk);
             }
         }
-        index
+        Ok(index)
     }
 
     /// The omission risk of one candidate key: a 64-char hex digest of a
@@ -314,15 +533,20 @@ impl<S: LearningStore> LearningService<S> {
     /// [`OMISSION_RISK_NEUTRAL`] when the key is not a digest or names no
     /// stored learning. Convenience for one-off lookups — a production
     /// prior builds [`Self::omission_risk_index`] once and looks up per
-    /// candidate.
-    pub fn omission_risk(&self, candidate_key: &str) -> f64 {
+    /// candidate. The index is organization-scoped exactly like
+    /// [`Self::omission_risk_index`].
+    pub fn omission_risk(
+        &self,
+        binding: &dyn ScopeOwnershipBinding,
+        candidate_key: &str,
+    ) -> Result<f64, LearningError> {
         match FileHash::from_hex(candidate_key) {
-            Some(digest) => self
-                .omission_risk_index()
+            Some(digest) => Ok(self
+                .omission_risk_index(binding)?
                 .get(&digest)
                 .copied()
-                .unwrap_or(OMISSION_RISK_NEUTRAL),
-            None => OMISSION_RISK_NEUTRAL,
+                .unwrap_or(OMISSION_RISK_NEUTRAL)),
+            None => Ok(OMISSION_RISK_NEUTRAL),
         }
     }
 
@@ -599,6 +823,287 @@ mod tests {
     }
 
     #[test]
+    fn shared_organization_feed_is_gated_typed_and_local_feed_is_not() {
+        use faktor_core::entitlement::{
+            ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal, ValueRefusalCause,
+        };
+
+        #[derive(Debug)]
+        struct Entitled;
+        impl ValueEntitlementGate for Entitled {
+            fn check_value_entitlement(
+                &self,
+                _entitlement: ValueEntitlement,
+            ) -> Result<(), ValueGateRefusal> {
+                Ok(())
+            }
+        }
+
+        let alpha = project(1, "alpha");
+        let beta = project(2, "beta");
+        let binding = SingleOrganizationBinding::new(OrganizationId::try_new("org_acme").unwrap());
+        let mut service = LearningService::new(MemoryLearningStore::new());
+        service
+            .mine_and_store(&[
+                verified_episode(1, 1, "alpha", 1),
+                verified_episode(2, 2, "beta", 2),
+            ])
+            .unwrap();
+
+        // The LOCAL per-project feed is never gated: it answers with the
+        // absent gate exactly as before.
+        assert_eq!(service.page(&alpha, 0, 16).len(), 1);
+
+        // The shared organization feed consults the gate FIRST: an absent
+        // cloud refuses typed `cloud_absent`...
+        let refusal = service
+            .shared_feed(
+                &ValueGate::absent(),
+                &binding,
+                &[alpha.clone(), beta.clone()],
+                16,
+            )
+            .unwrap_err();
+        let SharedFeedRefusal::Entitlement(refusal) = refusal else {
+            panic!("the gate is consulted before the binding: {refusal}");
+        };
+        assert_eq!(refusal.cause, ValueRefusalCause::CloudAbsent);
+        assert_eq!(
+            refusal.entitlement,
+            ValueEntitlement::ModelOptimizationLearning
+        );
+        assert_eq!(refusal.hook.as_str(), "outcome_learning");
+
+        // ...a denied plan names the entitlement and the plan...
+        #[derive(Debug)]
+        struct Denied;
+        impl ValueEntitlementGate for Denied {
+            fn check_value_entitlement(
+                &self,
+                entitlement: ValueEntitlement,
+            ) -> Result<(), ValueGateRefusal> {
+                Err(ValueGateRefusal {
+                    entitlement,
+                    hook: entitlement.enforcement_hook(),
+                    cause: ValueRefusalCause::NotInPlan,
+                    plan_id: Some("pro".into()),
+                    organization_id: Some("org_acme".into()),
+                    message: format!("value entitlement {entitlement} not granted: not_in_plan"),
+                })
+            }
+        }
+        let refusal = service
+            .shared_feed(
+                &ValueGate::wired(std::sync::Arc::new(Denied)),
+                &binding,
+                &[alpha.clone(), beta.clone()],
+                16,
+            )
+            .unwrap_err();
+        let SharedFeedRefusal::Entitlement(refusal) = refusal else {
+            panic!("expected the entitlement refusal: {refusal}");
+        };
+        assert_eq!(refusal.cause, ValueRefusalCause::NotInPlan);
+        assert_eq!(refusal.plan_id.as_deref(), Some("pro"));
+
+        // ...and an entitled plan receives the bounded cross-project head
+        // pages.
+        let feed = service
+            .shared_feed(
+                &ValueGate::wired(std::sync::Arc::new(Entitled)),
+                &binding,
+                &[alpha, beta],
+                16,
+            )
+            .unwrap();
+        assert_eq!(feed.len(), 2);
+        assert_eq!(
+            service
+                .shared_feed(
+                    &ValueGate::wired(std::sync::Arc::new(Entitled)),
+                    &binding,
+                    &[],
+                    16,
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// The sharing seams must resolve BOTH sides of the organization binding
+    /// from durable state: a scope owned by another organization refuses the
+    /// whole feed (never a partial fold, gate or no gate), an unresolvable
+    /// scope fails closed, and the corpus risk index folds ONLY the caller's
+    /// organization (another org's digests never reach the prior).
+    #[test]
+    fn shared_feed_and_risk_index_are_organization_bound() {
+        use faktor_core::entitlement::{ValueEntitlement, ValueEntitlementGate, ValueGate};
+        use std::collections::HashMap;
+
+        #[derive(Debug)]
+        struct Entitled;
+        impl ValueEntitlementGate for Entitled {
+            fn check_value_entitlement(
+                &self,
+                _entitlement: ValueEntitlement,
+            ) -> Result<(), faktor_core::entitlement::ValueGateRefusal> {
+                Ok(())
+            }
+        }
+
+        struct MapBinding {
+            caller: OrganizationId,
+            owners: HashMap<u64, OrganizationId>,
+        }
+
+        impl ScopeOwnershipBinding for MapBinding {
+            fn caller_organization(&self) -> Result<OrganizationId, LearningError> {
+                Ok(self.caller.clone())
+            }
+
+            fn scope_organization(
+                &self,
+                scope: &ProjectScope,
+            ) -> Result<OrganizationId, LearningError> {
+                self.owners
+                    .get(&scope.workspace_id.raw())
+                    .cloned()
+                    .ok_or_else(|| {
+                        LearningError::Refused(format!(
+                            "workspace {} has no durable owner",
+                            scope.workspace_id.raw()
+                        ))
+                    })
+            }
+        }
+
+        let org_a = OrganizationId::try_new("org_a").unwrap();
+        let org_b = OrganizationId::try_new("org_b").unwrap();
+        let alpha = project(1, "alpha");
+        let beta = project(2, "beta");
+        let mut service = LearningService::new(MemoryLearningStore::new());
+        service
+            .mine_and_store(&[
+                verified_episode(1, 1, "alpha", 1),
+                verified_episode(2, 2, "beta", 2),
+            ])
+            .unwrap();
+        let alpha_digest = service.page(&alpha, 0, 1)[0].pattern_digest();
+        let beta_digest = service.page(&beta, 0, 1)[0].pattern_digest();
+        let gate = ValueGate::wired(std::sync::Arc::new(Entitled));
+
+        let caller_a = MapBinding {
+            caller: org_a.clone(),
+            owners: HashMap::from([(1u64, org_a.clone()), (2u64, org_b.clone())]),
+        };
+
+        // Same organization: the feed serves exactly its own scope.
+        let feed = service
+            .shared_feed(&gate, &caller_a, std::slice::from_ref(&alpha), 16)
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].pattern_digest(), alpha_digest);
+
+        // Cross-organization scope: refused typed, naming both organizations,
+        // with zero pages served (no partial fold).
+        let refusal = service
+            .shared_feed(&gate, &caller_a, &[alpha.clone(), beta.clone()], 16)
+            .unwrap_err();
+        let message = refusal.to_string();
+        let SharedFeedRefusal::ForeignScope {
+            caller,
+            owner,
+            scope,
+        } = refusal
+        else {
+            panic!("expected the typed foreign-scope refusal: {message}");
+        };
+        assert_eq!(caller, org_a);
+        assert_eq!(owner, org_b);
+        assert_eq!(scope.workspace_id, beta.workspace_id);
+        assert!(message.contains("org_b"), "{message}");
+        assert!(message.contains("org_a"), "{message}");
+
+        // The gate is still consulted first: a denied/absent plan refuses the
+        // entitlement even when the scope set is foreign.
+        let refusal = service
+            .shared_feed(
+                &ValueGate::absent(),
+                &caller_a,
+                std::slice::from_ref(&beta),
+                16,
+            )
+            .unwrap_err();
+        assert!(matches!(refusal, SharedFeedRefusal::Entitlement(_)));
+
+        // An unresolvable owner fails closed (never a silent local read) and
+        // never touches the store.
+        let unknown = project(3, "gamma");
+        let refusal = service
+            .shared_feed(&gate, &caller_a, std::slice::from_ref(&unknown), 16)
+            .unwrap_err();
+        let SharedFeedRefusal::UnboundScope { scope, reason } = refusal else {
+            panic!("expected the typed unbound-scope refusal: {refusal}");
+        };
+        assert_eq!(scope.workspace_id, unknown.workspace_id);
+        assert!(reason.contains("no durable owner"), "{reason}");
+
+        // The other organization sees its own scope and refuses ours.
+        let caller_b = MapBinding {
+            caller: org_b.clone(),
+            owners: HashMap::from([(1u64, org_a.clone()), (2u64, org_b.clone())]),
+        };
+        let feed = service
+            .shared_feed(&gate, &caller_b, std::slice::from_ref(&beta), 16)
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].pattern_digest(), beta_digest);
+        assert!(matches!(
+            service
+                .shared_feed(&gate, &caller_b, std::slice::from_ref(&alpha), 16)
+                .unwrap_err(),
+            SharedFeedRefusal::ForeignScope { .. }
+        ));
+
+        // The risk index folds ONLY the caller's organization: another org's
+        // digests never leak into the caller's prior.
+        let index_a = service.omission_risk_index(&caller_a).unwrap();
+        let index_b = service.omission_risk_index(&caller_b).unwrap();
+        assert!(index_a.contains_key(&alpha_digest));
+        assert!(!index_a.contains_key(&beta_digest));
+        assert!(index_b.contains_key(&beta_digest));
+        assert!(!index_b.contains_key(&alpha_digest));
+        assert_eq!(
+            service
+                .omission_risk(&caller_a, &alpha_digest.to_hex())
+                .unwrap(),
+            1.4
+        );
+        assert_eq!(
+            service
+                .omission_risk(&caller_a, &beta_digest.to_hex())
+                .unwrap(),
+            1.0,
+            "the foreign digest stays neutral, never folded"
+        );
+
+        // A store scope the binding cannot resolve fails the index build
+        // closed (never a silent fold of unowned learnings).
+        let narrowed = MapBinding {
+            caller: org_a.clone(),
+            owners: HashMap::from([(1u64, org_a.clone())]),
+        };
+        assert!(service.omission_risk_index(&narrowed).is_err());
+
+        // The local single-organization binding folds the whole corpus (the
+        // daemon's per-session store shape).
+        let local = SingleOrganizationBinding::new(org_a);
+        let index = service.omission_risk_index(&local).unwrap();
+        assert!(index.contains_key(&alpha_digest) && index.contains_key(&beta_digest));
+    }
+
+    #[test]
     fn stale_source_drops_learning_end_to_end() {
         let first = FileHash::from([1; 32]);
         let second = FileHash::from([2; 32]);
@@ -662,12 +1167,13 @@ mod tests {
         }
 
         // Empty corpus: every lookup neutral, index empty.
+        let binding = SingleOrganizationBinding::new(OrganizationId::try_new("org_test").unwrap());
         let empty = LearningService::new(MemoryLearningStore::new());
-        assert!(empty.omission_risk_index().is_empty());
-        assert_eq!(empty.omission_risk(&"0".repeat(64)), 1.0);
-        assert_eq!(empty.omission_risk("src/lib.rs"), 1.0);
-        assert_eq!(empty.omission_risk(""), 1.0);
-        assert_eq!(empty.omission_risk(&"z".repeat(64)), 1.0);
+        assert!(empty.omission_risk_index(&binding).unwrap().is_empty());
+        assert_eq!(empty.omission_risk(&binding, &"0".repeat(64)).unwrap(), 1.0);
+        assert_eq!(empty.omission_risk(&binding, "src/lib.rs").unwrap(), 1.0);
+        assert_eq!(empty.omission_risk(&binding, "").unwrap(), 1.0);
+        assert_eq!(empty.omission_risk(&binding, &"z".repeat(64)).unwrap(), 1.0);
 
         // Real corpus: one mined learning keys BOTH its pattern and failure
         // digests with 1 + confidence (one verified sample is 400k ppm).
@@ -680,16 +1186,27 @@ mod tests {
         assert_eq!(stored.confidence_ppm, 400_000);
         let pattern = stored.pattern_digest();
         let failure = stored.pattern.failure.digest();
-        let index = service.omission_risk_index();
+        let index = service.omission_risk_index(&binding).unwrap();
         assert_eq!(index.len(), 2);
         assert_eq!(index[&pattern], 1.4);
         assert_eq!(index[&failure], 1.4);
-        assert_eq!(service.omission_risk(&pattern.to_hex()), 1.4);
-        // Hex parsing is case-insensitive (FileHash::from_hex accepts A-F).
-        assert_eq!(service.omission_risk(&failure.to_hex().to_uppercase()), 1.4);
-        assert_eq!(service.omission_risk(&"a".repeat(64)), 1.0);
         assert_eq!(
-            service.omission_risk_index(),
+            service.omission_risk(&binding, &pattern.to_hex()).unwrap(),
+            1.4
+        );
+        // Hex parsing is case-insensitive (FileHash::from_hex accepts A-F).
+        assert_eq!(
+            service
+                .omission_risk(&binding, &failure.to_hex().to_uppercase())
+                .unwrap(),
+            1.4
+        );
+        assert_eq!(
+            service.omission_risk(&binding, &"a".repeat(64)).unwrap(),
+            1.0
+        );
+        assert_eq!(
+            service.omission_risk_index(&binding).unwrap(),
             index,
             "rebuild is deterministic"
         );
@@ -705,7 +1222,7 @@ mod tests {
         merged.upsert(stored).unwrap();
         merged.upsert(second).unwrap();
         let merged = LearningService::new(merged);
-        let index = merged.omission_risk_index();
+        let index = merged.omission_risk_index(&binding).unwrap();
         assert_eq!(index[&shared_failure], 2.0, "max risk wins");
         assert_eq!(index[&pattern], 1.4);
     }
@@ -716,12 +1233,13 @@ mod tests {
     #[test]
     fn omission_risk_for_keys_is_max_neutral_and_total_on_hostile_keys() {
         let scope = project(1, "alpha");
+        let binding = SingleOrganizationBinding::new(OrganizationId::try_new("org_test").unwrap());
         let mut service = LearningService::new(MemoryLearningStore::new());
         service
             .mine_and_store(&[verified_episode(1, 1, "alpha", 11)])
             .unwrap();
         let stored = service.page(&scope, 0, 1)[0].clone();
-        let index = service.omission_risk_index();
+        let index = service.omission_risk_index(&binding).unwrap();
 
         assert_eq!(omission_risk_for_keys(&index, &[]), 1.0);
         assert_eq!(

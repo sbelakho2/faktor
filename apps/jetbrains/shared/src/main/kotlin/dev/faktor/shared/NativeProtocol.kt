@@ -2379,6 +2379,20 @@ fun parseNativeEntitlements(json: String): NativeEntitlementSnapshot {
     )
 }
 
+/**
+ * The caller organization's DERIVED value-entitlement report
+ * (`GET /native/value-entitlements`): the plan resolution, the plan-mapped
+ * value tags, the governance capability flags and one typed decision per
+ * value entitlement (hook, granted, exact cause when not). The report never
+ * folds usage, credits or tokens.
+ */
+fun parseNativeValueEntitlements(json: String): ProtocolValueEntitlementsReport {
+    val v = JsonCodec.parse(json)
+        .view("GET /native/value-entitlements")
+        .field("value_entitlements")
+    return parseProtocolValueEntitlementsReport(v)
+}
+
 fun parseNativeIdentity(json: String): NativeIdentity {
     val v = JsonCodec.parse(json).view("GET /native/identity").field("identity")
     return NativeIdentity(

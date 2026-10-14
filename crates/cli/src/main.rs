@@ -1942,17 +1942,62 @@ pub(crate) fn doctor_outcome_ledger_line(
                 lines.push("outcomes: no completed runs recorded".into());
                 return;
             }
+            // Economic-truth P1: monetary figures describe the
+            // money-complete cohort ONLY. Each figure is gated on its OWN
+            // served denominator (the same rule the IDE panels apply): the
+            // cost figures on `verifiedChangesMoneyComplete`, the rework
+            // ratio on the money-complete cohort's total spend, the
+            // first-verification-pass rate on verified changes — an empty
+            // denominator says `unavailable`, never a fabricated zero, and
+            // the excluded rows are always counted.
+            let money_text = |ready: bool, value: u64| -> String {
+                if ready {
+                    format!("{value} microUSD")
+                } else {
+                    "unavailable".into()
+                }
+            };
+            let verified_money_complete = m.verified_changes_money_complete > 0;
+            let success_cost = money_text(verified_money_complete, m.successful_run_cost_micro);
+            let all_in_cost = money_text(
+                verified_money_complete,
+                m.verified_cost_per_successful_change_micro,
+            );
+            // Rework = rework spend ÷ (model + verification) spend; a zero
+            // money-complete spend is an empty denominator (unmeasured),
+            // exactly like the panels' `totalSpendMicro` gate.
+            let rework = if m.total_spend_micro > 0 {
+                format!("{}%", doctor_ppm_percent(m.rework_cost_ratio_ppm))
+            } else {
+                "unavailable".into()
+            };
+            let first_pass = if m.verified_changes > 0 {
+                format!(
+                    "{}%",
+                    doctor_ppm_percent(m.verified_first_verification_pass_ppm)
+                )
+            } else {
+                "unavailable".into()
+            };
+            let exclusion = if m.money_incomplete_excluded > 0 {
+                format!(
+                    ", {} money-incomplete excluded (money metrics over {} complete run(s))",
+                    m.money_incomplete_excluded, m.money_complete_runs
+                )
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "outcomes: {} run(s), {} verified, first-pass {}%, successful-run cost {} \
-                 microUSD, all-in cost/verified change {} microUSD, rework ratio {}%, rollback {}%{}",
+                "outcomes: {} run(s), {} verified, first-verification-pass {}, successful-run cost {}, \
+                 all-in cost/verified change {}, rework ratio {}, rollback {}%{exclusion}{truncated}",
                 m.runs,
                 m.verified_changes,
-                doctor_ppm_percent(m.verified_first_pass_ppm),
-                m.successful_run_cost_micro,
-                m.verified_cost_per_successful_change_micro,
-                doctor_ppm_percent(m.rework_cost_ratio_ppm),
+                first_pass,
+                success_cost,
+                all_in_cost,
+                rework,
                 doctor_ppm_percent(m.regression_rollback_ppm),
-                if report.truncated {
+                truncated = if report.truncated {
                     format!(" (metrics folded the newest {} runs)", report.scanned)
                 } else {
                     String::new()

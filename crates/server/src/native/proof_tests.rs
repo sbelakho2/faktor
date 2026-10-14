@@ -182,7 +182,14 @@ async fn fixture(task_id: u64) -> Fixture {
         .set_task_max_cost(handle.id(), task_id, Some(1_000_000))
         .unwrap();
     let reservation = budgets
-        .reserve(handle.id(), task_id, OpId::new(901), 500, None)
+        .reserve(
+            handle.id(),
+            task_id,
+            OpId::new(901),
+            500,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
         .await
         .unwrap();
     budgets
