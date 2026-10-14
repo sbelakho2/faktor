@@ -658,6 +658,29 @@ fn settlement_transition_legal(latest: &str, next: &str) -> bool {
     }
 }
 
+/// Whether a `complete -> complete` CORRECTION keeps the documented
+/// monotone-repair semantics (P1 economic-truth closure): every measured
+/// amount present on the latest event must stay present on the correction
+/// and may only move UP (append-only settlements can add spend, never
+/// remove it), and a measured avoided-hosted counterfactual never becomes
+/// unmeasured. Pure metadata (reason, clock, step labels) may still move.
+fn settlement_correction_monotone(latest: &RawSettlementRow, next: &EconomicSettlementRow) -> bool {
+    let amount_upward = |previous: Option<i64>, candidate: Option<i64>| match (previous, candidate)
+    {
+        (Some(previous), Some(candidate)) => candidate >= previous,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    amount_upward(latest.model_spend_micro, next.model_spend_micro)
+        && amount_upward(
+            latest.verification_spend_micro,
+            next.verification_spend_micro,
+        )
+        && amount_upward(latest.rework_spend_micro, next.rework_spend_micro)
+        && amount_upward(latest.avoided_hosted_micro, next.avoided_hosted_micro)
+        && (!(latest.avoided_hosted_measured != 0) || next.avoided_hosted_measured)
+}
+
 /// What one settlement writer job did: a fresh event at `seq`, or the
 /// existing latest row (compared and classified by the caller AFTER the job
 /// — the job writes nothing on that path).
@@ -868,6 +891,12 @@ impl Store {
              complete -> complete corrections only",
             settlement.run_id, settlement.state
         );
+        let correction_message = format!(
+            "economic settlement of run {:?} may not move a complete projection's measured \
+             amounts downward (or re-unmeasure its counterfactual); complete -> complete \
+             corrections repair measured amounts upward only",
+            settlement.run_id
+        );
         let unknown_state_corrupt: Vec<String> = vec![
             "economic_settlement: the latest event holds a state outside the lifecycle; the \
              stream is corrupt"
@@ -895,6 +924,17 @@ impl Store {
                         }
                         if !settlement_transition_legal(&latest.state, &settlement.state) {
                             return Err(StoreError::Conflict(illegal_transition_message));
+                        }
+                        // complete -> complete is the correction path: it may
+                        // repair measured amounts UPWARD only (the store is
+                        // the monotonicity authority — a downward correction
+                        // is refused here even though the monotone finalize
+                        // never derives one).
+                        if latest.state == "complete"
+                            && settlement.state == "complete"
+                            && !settlement_correction_monotone(latest, &settlement)
+                        {
+                            return Err(StoreError::Conflict(correction_message));
                         }
                         latest
                             .seq
@@ -1503,6 +1543,81 @@ mod tests {
         assert_eq!(latest.seq, 3);
         assert_eq!(latest.rework_spend_micro, Some(250));
         assert_eq!(latest.reason, "corrected after reconciliation");
+    }
+
+    /// The store is the monotonicity authority for `complete -> complete`
+    /// corrections: a downward repair of any measured amount (or a
+    /// re-unmeasured counterfactual) is refused typed, while an upward
+    /// repair lands. The monotone finalize never derives a downward
+    /// correction, but the raw store API must not accept one either.
+    #[test]
+    fn complete_to_complete_corrections_repair_measured_amounts_upward_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let complete = settlement("run-corr", 0, "complete");
+        store
+            .engineering_outcome_append(&row("run-corr", 5), &[], &complete)
+            .unwrap();
+        // Upward repair: model spend 1000 -> 1200 (its step projection
+        // moves with it) and rework 0 -> 100.
+        let mut upward = complete.clone();
+        upward.model_spend_micro = Some(1_200);
+        upward.rework_spend_micro = Some(100);
+        upward.steps_json = steps_json(&[("p", "m", false, 1_200)]);
+        assert_eq!(
+            store.economic_settlement_append(&upward).unwrap(),
+            EconomicSettlementAppend::Appended(1)
+        );
+        // A downward repair of the model spend is refused typed.
+        let mut downward = upward.clone();
+        downward.model_spend_micro = Some(500);
+        downward.rework_spend_micro = Some(0);
+        downward.steps_json = steps_json(&[("p", "m", false, 500)]);
+        let err = store.economic_settlement_append(&downward).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+        // A downward repair of ANY other measured amount is refused too.
+        for field in ["verification", "rework"] {
+            let mut per_field = upward.clone();
+            match field {
+                "verification" => per_field.verification_spend_micro = Some(100),
+                _ => per_field.rework_spend_micro = Some(1),
+            }
+            let err = store.economic_settlement_append(&per_field).unwrap_err();
+            assert!(
+                matches!(err, StoreError::Conflict(_)),
+                "{field}: got {err:?}"
+            );
+        }
+        // A measured avoided-hosted counterfactual lands…
+        let mut measured = upward.clone();
+        measured.avoided_hosted_micro = Some(5);
+        measured.avoided_hosted_measured = true;
+        assert_eq!(
+            store.economic_settlement_append(&measured).unwrap(),
+            EconomicSettlementAppend::Appended(2)
+        );
+        // …and can never become unmeasured (the counterfactual only improves).
+        let mut unmeasured = measured.clone();
+        unmeasured.avoided_hosted_micro = None;
+        unmeasured.avoided_hosted_measured = false;
+        let err = store.economic_settlement_append(&unmeasured).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+        // An equal-amounts correction (metadata only) still lands.
+        let mut re_reasoned = measured.clone();
+        re_reasoned.reason = "corrected after reconciliation".into();
+        assert_eq!(
+            store.economic_settlement_append(&re_reasoned).unwrap(),
+            EconomicSettlementAppend::Appended(3)
+        );
+        // The refused downward corrections wrote NOTHING: the latest event
+        // is the last accepted correction.
+        let latest = store
+            .economic_settlement_latest("run-corr")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.seq, 3);
+        assert_eq!(latest.model_spend_micro, Some(1_200));
+        assert_eq!(latest.avoided_hosted_micro, Some(5));
     }
 
     #[test]

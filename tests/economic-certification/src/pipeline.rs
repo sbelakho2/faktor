@@ -689,6 +689,10 @@ pub fn run_arm(
                 },
                 prompt_blake3: prompt.blake3(),
                 prompt_tokens_est: prompt.tokens_est(),
+                // The two prompt arms hash their rendered prompt WITHOUT the
+                // runtime-arm volatile normalization, so they never record
+                // exclusions.
+                volatile: Vec::new(),
                 runtime: None,
             });
             facts.push(fact);

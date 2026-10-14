@@ -34,6 +34,15 @@
 #                                           recorded, persistent failure red,
 #                                           budget/unverified-pass/no-retry
 #                                           refusals (fault/soak/live/perf)
+#   scripts/certification/publish-status.py selftest
+#                                           stdlib GitHub status publisher:
+#                                           validation + fail-closed POST,
+#                                           pinned platform signature vector,
+#                                           and the HERMETIC platform-key
+#                                           cases (real CLI child invocations
+#                                           with explicit scrub/plant child
+#                                           envs; ambient os.environ never read
+#                                           or mutated)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -63,6 +72,7 @@ run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --self
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
 run "soak-convergence.py selftest" python3 scripts/certification/soak-convergence.py selftest
 run "flake-tolerance.py selftest" python3 scripts/certification/flake-tolerance.py selftest
+run "publish-status.py selftest" python3 scripts/certification/publish-status.py selftest
 
 printf '\n=====================\n'
 if [ "$failures" -eq 0 ]; then

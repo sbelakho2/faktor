@@ -251,7 +251,7 @@ fn agent_home_defaults_to_scratch_and_operator_grant_parses_strictly() {
 // ---------------------------------------------------------------------------
 
 /// A well-formed grant document EXACTLY as `record_decision` writes it, but
-/// with no audit trail behind it.
+/// with no audit trail behind it and no valid MAC (a hand-forged document).
 fn forged_grant_record() -> Vec<u8> {
     serde_json::to_vec_pretty(&SandboxFirstRunRecord {
         version: SANDBOX_FIRST_RUN_VERSION,
@@ -260,6 +260,7 @@ fn forged_grant_record() -> Vec<u8> {
         platform: std::env::consts::OS.to_string(),
         network_backend_available: network_backend_available(),
         trade_off: NETWORK_CAPABLE_SHELL_TRADE_OFF.to_string(),
+        mac: String::new(),
     })
     .unwrap()
 }
@@ -292,7 +293,7 @@ fn a_forged_or_flipped_decision_document_grants_nothing() {
         .corrupt_reason
         .as_deref()
         .unwrap_or("")
-        .contains("audit"));
+        .contains("HMAC"));
     assert_eq!(cfg.sandbox.shell, None, "no forge path may set the mode");
     assert_eq!(
         cfg.sandbox.network_guarantee,
@@ -468,4 +469,320 @@ fn audit_compaction_of_a_hostile_oversized_file_stays_bounded() {
     assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
     assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
     assert!(state.record.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Keyed tamper evidence (HMAC-SHA256): the daemon-local key, the decision
+// document MAC and the chained audit MACs.
+// ---------------------------------------------------------------------------
+
+/// First use creates the key ONCE (32 random bytes, owner-only on unix) and
+/// reuses it for every later record; removing it over an existing decision
+/// is a typed refusal on every read (no grant), and `record_decision` never
+/// silently mints a fresh key over that decision. A fresh data dir still
+/// onboards normally.
+#[test]
+fn missing_key_is_created_once_on_first_use_and_removal_fails_closed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let key = std::fs::read(key_path(data_dir)).expect("first use creates the key");
+    assert_eq!(key.len(), 32, "the key is 32 random bytes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(key_path(data_dir))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the key is owner-only");
+    }
+
+    // A second record reuses the exact same key (never re-created).
+    record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 2).unwrap();
+    assert_eq!(std::fs::read(key_path(data_dir)).unwrap(), key);
+
+    // Removal: every read refuses typed (fail closed), and recording over
+    // the keyless decision is refused instead of silently re-keying.
+    std::fs::remove_file(key_path(data_dir)).unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(
+        state.record.is_none(),
+        "a keyless decision is not presented"
+    );
+    assert!(
+        state
+            .corrupt_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("integrity key"),
+        "{:?}",
+        state.corrupt_reason
+    );
+    assert_eq!(cfg.sandbox.shell, None, "no grant without the key");
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 3).unwrap_err();
+    assert!(err.contains("refusing to mint"), "{err}");
+
+    // A fresh directory still onboards on first use.
+    let fresh = tmp();
+    record_decision(fresh.path(), SandboxShellChoice::FailClosed, 4).unwrap();
+    assert!(key_path(fresh.path()).is_file());
+}
+
+/// A decision document whose fields were edited (or whose MAC was stripped)
+/// fails its HMAC typed: fail-closed, never a grant — and restoring the
+/// exact recorded document verifies again.
+#[test]
+fn tampered_decision_document_fails_its_hmac_and_grants_nothing() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    let recorded =
+        record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 42).unwrap();
+    assert!(
+        recorded.mac.len() == 64 && recorded.mac.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the record carries an HMAC"
+    );
+
+    let refuse = |flip: fn(&mut SandboxFirstRunRecord)| {
+        let mut forged = recorded.clone();
+        flip(&mut forged);
+        std::fs::write(
+            decision_path(data_dir),
+            serde_json::to_vec_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        let state = apply_effective_choice(&mut cfg, data_dir);
+        assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+        assert!(state.record.is_none(), "no tampered document is presented");
+        assert!(
+            state
+                .corrupt_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("integrity verification"),
+            "{:?}",
+            state.corrupt_reason
+        );
+        assert_eq!(cfg.sandbox.shell, None, "no forge path may set the mode");
+    };
+
+    // One flipped field (the backend fact), the timestamp bumped, and the
+    // MAC stripped entirely: every mutation refuses typed.
+    refuse(|r| r.network_backend_available = !r.network_backend_available);
+    refuse(|r| r.decided_at_ms += 1);
+    refuse(|r| r.mac = String::new());
+
+    // Restoring the exact recorded document is accepted again (the check is
+    // exact, never a blanket refusal).
+    std::fs::write(
+        decision_path(data_dir),
+        serde_json::to_vec_pretty(&recorded).unwrap(),
+    )
+    .unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(state.record.as_ref(), Some(&recorded));
+}
+
+/// Editing any audit entry, reordering them, or deleting one from the
+/// middle breaks the HMAC chain typed (fail closed); restoring the exact
+/// trail verifies again.
+#[test]
+fn tampered_or_reordered_audit_chain_fails_typed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let recorded =
+        record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 2).unwrap();
+    let original = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    let lines: Vec<serde_json::Value> = original
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+
+    let write_lines = |lines: &[serde_json::Value]| {
+        let text: String = lines
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(audit_path(data_dir), text).unwrap();
+    };
+    let assert_refused = || {
+        let mut cfg = Config::default();
+        let state = apply_effective_choice(&mut cfg, data_dir);
+        assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+        assert!(state.record.is_none());
+        assert!(
+            state
+                .corrupt_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("integrity verification"),
+            "{:?}",
+            state.corrupt_reason
+        );
+        assert_eq!(cfg.sandbox.shell, None);
+    };
+
+    // (1) Edit a field of the entry backing the live decision.
+    let mut edited = lines.clone();
+    let pid = edited[1]["pid"].as_u64().unwrap();
+    edited[1]["pid"] = serde_json::json!(pid + 1);
+    write_lines(&edited);
+    assert_refused();
+
+    // (2) Edit a field of an EARLIER entry: the chain of the entry after it
+    // (and every recomputation) breaks.
+    let mut edited = lines.clone();
+    edited[0]["trade_off"] = serde_json::json!("forged trade-off");
+    write_lines(&edited);
+    assert_refused();
+
+    // (3) Reorder the entries: the linkage no longer matches.
+    let mut reordered = lines.clone();
+    reordered.swap(0, 1);
+    write_lines(&reordered);
+    assert_refused();
+
+    // (4) A forged MAC on any entry refuses (a same-user attacker without
+    // the key cannot recompute).
+    let mut forged = lines.clone();
+    forged[1]["mac"] = serde_json::json!("a".repeat(64));
+    write_lines(&forged);
+    assert_refused();
+
+    // (5) Restoring the exact trail verifies again.
+    std::fs::write(audit_path(data_dir), &original).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(state.record.as_ref(), Some(&recorded));
+}
+
+/// A rolled-back trail cannot back the live decision: restoring an earlier
+/// audit snapshot, truncating the backing entry, or deleting a middle entry
+/// all leave the document unmatched or the chain broken — typed refusal,
+/// fail closed; the untampered trail verifies again.
+#[test]
+fn rolled_back_or_truncated_audit_chain_fails_typed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let pre_grant = std::fs::read(audit_path(data_dir)).unwrap();
+    record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 2).unwrap();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 3).unwrap();
+    let full_trail = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    let live_lines: Vec<&str> = full_trail.lines().collect();
+    assert_eq!(live_lines.len(), 3, "three recorded decisions");
+
+    let assert_refused = || {
+        let mut cfg = Config::default();
+        let state = apply_effective_choice(&mut cfg, data_dir);
+        assert_eq!(
+            state.decision,
+            SandboxFirstRunDecision::FailClosed,
+            "a rolled-back trail never grants"
+        );
+        assert!(state.corrupt_reason.is_some());
+        assert_eq!(cfg.sandbox.shell, None);
+    };
+
+    // (1) Roll the trail back to before the non-default decisions: the live
+    // document matches no chain-verified entry.
+    std::fs::write(audit_path(data_dir), &pre_grant).unwrap();
+    assert_refused();
+
+    // (2) Truncate the last entry (a rollback that leaves the rest intact):
+    // the live decision's entry is gone.
+    std::fs::write(
+        audit_path(data_dir),
+        live_lines[..live_lines.len() - 1].join("\n") + "\n",
+    )
+    .unwrap();
+    assert_refused();
+
+    // (3) Delete a MIDDLE entry: the chain linkage of everything after it
+    // breaks.
+    let mut middle_deleted = live_lines.clone();
+    middle_deleted.remove(1);
+    std::fs::write(audit_path(data_dir), middle_deleted.join("\n") + "\n").unwrap();
+    assert_refused();
+
+    // (4) The untampered current trail verifies again (the check is exact).
+    std::fs::write(audit_path(data_dir), &full_trail).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert!(state.record.is_some());
+}
+
+/// A trail that no longer authenticates under the CURRENT key (a forged
+/// well-formed entry, or a replaced key) refuses further recording typed:
+/// a successful `record_decision` never produces a result that cannot
+/// verify. Deliberate re-onboarding (removing the artifacts) starts a fresh
+/// authenticated chain.
+#[test]
+fn recording_over_an_unauthenticated_or_rotated_key_trail_is_refused() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+
+    // (1) A forged entry with well-formed-shaped MACs appended to the
+    // authentic trail: reads refuse, and recording refuses (no poisoning).
+    let forged = serde_json::json!({
+        "event": "sandbox_network_capable_shell_granted",
+        "choice": "network_capable_user_granted",
+        "decided_at_ms": 2,
+        "platform": std::env::consts::OS,
+        "network_backend_available": false,
+        "trade_off": NETWORK_CAPABLE_SHELL_TRADE_OFF,
+        "pid": 1,
+        "prev_mac": "a".repeat(64),
+        "mac": "b".repeat(64),
+    });
+    let mut trail = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    trail.push_str(&serde_json::to_string(&forged).unwrap());
+    trail.push('\n');
+    std::fs::write(audit_path(data_dir), trail).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some(), "the forgery is reported");
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 3).unwrap_err();
+    assert!(err.contains("refusing to record"), "{err}");
+
+    // (2) A replaced key: the same typed refusal, and reads stay fail-closed.
+    let fresh = tmp();
+    record_decision(fresh.path(), SandboxShellChoice::FailClosed, 4).unwrap();
+    let mut rotated = [0u8; 32];
+    rotated[0] = 7;
+    std::fs::write(key_path(fresh.path()), rotated).unwrap();
+    let state = inspect(fresh.path(), &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some());
+    let err = record_decision(fresh.path(), SandboxShellChoice::FailClosed, 5).unwrap_err();
+    assert!(err.contains("refusing to record"), "{err}");
+
+    // (3) Deliberate re-onboarding: removing the artifacts lets first use
+    // start a fresh authenticated chain.
+    std::fs::remove_file(decision_path(fresh.path())).unwrap();
+    std::fs::remove_file(audit_path(fresh.path())).unwrap();
+    std::fs::remove_file(key_path(fresh.path())).unwrap();
+    record_decision(
+        fresh.path(),
+        SandboxShellChoice::NetworkCapableUserGranted,
+        6,
+    )
+    .unwrap();
+    let state = inspect(fresh.path(), &Config::default());
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted
+    );
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
 }

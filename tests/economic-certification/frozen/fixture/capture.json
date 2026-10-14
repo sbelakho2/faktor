@@ -1341,6 +1341,13 @@
           },
           "prompt_blake3": "386d67c9fdcc160c555e0a41f0387cfb3850b80f84048c6ac34f5079ae029a42",
           "prompt_tokens_est": 403,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### run.sh\ntoken `print` × 1\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1395,6 +1402,13 @@
           },
           "prompt_blake3": "d9784450c8b0326a6a64fef011a5171cd35ec7877ed40c19f2a23b2d38f4e3c2",
           "prompt_tokens_est": 585,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.sh\npath match: migrate.sh\n\n### verify.sh\ntoken `migrate` × 2\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1449,6 +1463,13 @@
           },
           "prompt_blake3": "f0582bb919226eae08f083a8c60dd18b007423ab851cc8afaf7cc7c26bfabf80",
           "prompt_tokens_est": 539,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `backup` × 4\n\n### backup.sh\npath match: backup.sh\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1484,6 +1505,18 @@
           },
           "prompt_blake3": "37d339bd98b0fd7ab6cd1152877ddfc6908181933508773ebfb3c9c7452cd7ad",
           "prompt_tokens_est": 1271,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `backup` × 4\n\n### backup.sh\npath match: backup.sh\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `backup` × 4\n\n### backup.sh\npath match: backup.sh\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1549,6 +1582,13 @@
           },
           "prompt_blake3": "9df1c3817f2d602cbae262190f133c5447f9610221a39be395a9a77ba1032ad5",
           "prompt_tokens_est": 614,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `app1` × 2\n\n### app1.sh\npath match: app1.sh\n\n### app2.sh\npath match: app2.sh\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1603,6 +1643,13 @@
           },
           "prompt_blake3": "988503ef69b14e1da2cfac7e6e24c71ff33273780a9d59d31aeaa8bd45d58238",
           "prompt_tokens_est": 471,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `parse` × 1\n\n### parse.py\npath match: parse.py\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1657,6 +1704,13 @@
           },
           "prompt_blake3": "420a776f485c5e593ed97d06c4dc29de00d062fdf5b20f67de4c95de93faf479",
           "prompt_tokens_est": 617,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1692,6 +1746,18 @@
           },
           "prompt_blake3": "4fd8cd462eaa9e42dbee5a5e282b9a15f5964807f343bc32747d3fc641f4cfad",
           "prompt_tokens_est": 1717,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1727,6 +1793,18 @@
           },
           "prompt_blake3": "653ea51d3df02423fa26edf8491aa248f5e30a6c91c438001117ab1790d33a4e",
           "prompt_tokens_est": 2773,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1762,6 +1840,18 @@
           },
           "prompt_blake3": "34b3ec7b118576ee0343ae8a06d1bfcd2cb749279f1a985cd09d7cab5a2e5fe5",
           "prompt_tokens_est": 3829,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### migrate.py\nfn migrate at line 6\n\n### verify.sh\ntoken `migrate` × 3\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1822,6 +1912,13 @@
           },
           "prompt_blake3": "febb602c133d82a969207695a60596bfefb6aec27a1e425f857c3fe8639add93",
           "prompt_tokens_est": 813,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### reader.py\npath match: reader.py\n\n### verify.sh\ntoken `reader` × 3\n\n### data/readme.txt\npath match: data/readme.txt\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1887,6 +1984,13 @@
           },
           "prompt_blake3": "e09d6694efe181b0fd5dd8fce45c1fca09b71a018a6d787869235f175e505293",
           "prompt_tokens_est": 696,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### app_a.py\nfn normalize at line 5\n\n### app_b.py\nfn normalize at line 5\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1934,6 +2038,18 @@
           },
           "prompt_blake3": "6ef4c9077594bd2b1a1f5e366ef2c22d9a89b10415513806c4164bd99cf149b7",
           "prompt_tokens_est": 1754,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### app_a.py\nimport normalize at line 4\n\n### app_b.py\nfn normalize at line 5\n\n### common.py\nfn normalize at line 4\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### app_a.py\nimport normalize at line 4\n\n### app_b.py\nfn normalize at line 5\n\n### common.py\nfn normalize at line 4\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -1988,6 +2104,13 @@
           },
           "prompt_blake3": "8c1243e0cf4f6eb35bdc4b0455e4c915ed70bfc9c811746212fe2787c63f5ba6",
           "prompt_tokens_est": 396,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `table` × 2\n\n### sum.awk\ntoken `table` × 1\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -2023,6 +2146,18 @@
           },
           "prompt_blake3": "21e4cf9a617cdb30d88dfb72ed9936d0fc9ef55e6dc6d63d2138ffe23960d3d1",
           "prompt_tokens_est": 899,
+          "volatile": [
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `table` × 2\n\n### sum.awk\ntoken `table` × 1\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            },
+            {
+              "name": "retrieved_evidence_block",
+              "extract": "## Retrieved evidence\n\n### verify.sh\ntoken `table` × 2\n\n### sum.awk\ntoken `table` × 1\n",
+              "rationale": "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / index-readiness path and can legitimately serve the previous hop's cached package under load; its bytes are not a property of the frozen output"
+            }
+          ],
           "runtime": {
             "completion_gate": "unverified",
             "derived_checks": 0,
@@ -2039,5 +2174,5 @@
       "completed_at_ms": 1700000542000
     }
   ],
-  "digest": "33e5883a0e962062d269a5c598e6f65660a79c7775d1a472c877d33c75613ea2"
+  "digest": "c0259bbee668e395b10796b93d0baede9fe33f442add5c8d9737c782d1649bd1"
 }

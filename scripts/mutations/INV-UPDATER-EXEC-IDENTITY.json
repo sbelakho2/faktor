@@ -1,11 +1,20 @@
 {
   "id": "INV-UPDATER-EXEC-IDENTITY",
-  "file": "crates/updater/src/release.rs",
-  "find": "        crate::fd_exec::exec_verified_fd(&file, &argv, &env, &target.binary)",
-  "replace": "        crate::fd_exec::exec_verified_fd(&fs::File::open(&target.binary).unwrap(), &argv, &env, &target.binary)",
+  "files": [
+    {
+      "file": "crates/updater/src/release.rs",
+      "find": "        crate::fd_exec::exec_verified_fd(&file, &argv, &env, &target.binary)",
+      "replace": "        crate::fd_exec::exec_verified_fd(&fs::File::open(&target.binary).unwrap(), &argv, &env, &target.binary)"
+    },
+    {
+      "file": "crates/updater/src/release.rs",
+      "find": "    let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {\n        detail: format!(\"hash {} before exec: {e}\", target.binary.display()),\n    })?;\n    if actual != target.digest {\n        return Err(UpdateError::LaunchRefused {\n            detail: format!(\n                \"release digest changed between verification and exec: expected {}, found {actual}\",\n                target.digest\n            ),\n        });\n    }\n",
+      "replace": ""
+    }
+  ],
   "gate": "cargo test -p faktor-updater --lib a_binary_swapped_between_verification_and_exec_never_executes",
-  "note": "Reopens the release by PATH after the digest check: the verified inode is no longer what executes.",
   "capabilities": [
     "updater.authority"
-  ]
+  ],
+  "note": "Reopens the release by PATH after the digest check on the fd-exec platforms (the verified inode is no longer what executes) AND drops the Darwin /dev/fd fallback's pathname re-hash, so the fallback execs the swapped path unchecked: on every platform the swapped-in stand-in must never execute."
 }

@@ -147,11 +147,46 @@ fn fixture_capture_is_frozen_and_regenerates_identically() {
     }
     let committed = load_capture(&path).expect("committed fixture loads");
     assert_eq!(committed.source, CaptureSource::Fixture);
-    let generated_value = serde_json::to_value(&generated).expect("generated json");
-    let committed_value = serde_json::to_value(&committed).expect("committed json");
+    let mut generated_value = serde_json::to_value(&generated).expect("generated json");
+    let mut committed_value = serde_json::to_value(&committed).expect("committed json");
+    // The recorded volatile normalization evidence is EXCLUDED from the
+    // regeneration identity: its extracts are scheduling-dependent by design
+    // (that is why the rules exist — under load the evidence refresh can
+    // serve the previous hop's cached package), while the identity itself is
+    // the normalized `prompt_blake3`. The recorded vocabulary is still gated
+    // (asserted below and by `frozen::validate_run`).
+    strip_volatile_evidence(&mut generated_value);
+    strip_volatile_evidence(&mut committed_value);
     if let Some(diff) = first_json_diff(&generated_value, &committed_value, String::new()) {
         panic!("the committed fixture drifted from regeneration at {diff}; re-bless with FAKTOR_ECON_BLESS=1");
     }
+    // The committed runtime attempts DO record their normalization
+    // exclusions, and every recorded rule is one of the documented ones (a
+    // new normalization rule that reached the committed artifact without the
+    // vocabulary being extended fails here).
+    let mut recorded_sections = 0usize;
+    for run in &committed.runs {
+        for attempt in &run.attempts {
+            for section in &attempt.volatile {
+                assert!(
+                    ecc::daemon_arm::documented_volatile_rule(&section.name, &section.rationale),
+                    "{}: committed volatile section names an undocumented rule {}",
+                    run.task_id,
+                    section.name
+                );
+                assert!(
+                    !section.extract.is_empty(),
+                    "{}: a recorded normalization exclusion must carry its extract",
+                    run.task_id
+                );
+                recorded_sections += 1;
+            }
+        }
+    }
+    assert!(
+        recorded_sections > 0,
+        "the committed runtime fixture records its normalized-out evidence explicitly"
+    );
     // Every task appears in every arm exactly once.
     for task in load_coding_corpus(&ecc::coding::coding_corpus_root())
         .expect("corpus")
@@ -498,8 +533,31 @@ fn full_daemon_runtime_arm_is_deterministic_and_runtime_gated() {
     let scratch_b = tempfile::TempDir::new().expect("scratch b");
     let second = ecc::daemon_arm::run_runtime_arm(&corpus, scratch_b.path()).expect("drive twice");
     assert_eq!(first.len(), 9, "the runtime arm covers the frozen corpus");
-    let first_value = serde_json::to_value(&first).expect("first json");
-    let second_value = serde_json::to_value(&second).expect("second json");
+    // Every recorded normalization exclusion is DOCUMENTED (rule name +
+    // rationale) and carries its exact extract; the pinned unit test proves
+    // the extracts are exactly the excluded bytes.
+    for run in first.iter().chain(second.iter()) {
+        for attempt in &run.attempts {
+            for section in &attempt.volatile {
+                assert!(
+                    ecc::daemon_arm::documented_volatile_rule(&section.name, &section.rationale),
+                    "{}: recorded rule {} is not documented",
+                    run.task_id,
+                    section.name
+                );
+                assert!(!section.extract.is_empty());
+            }
+        }
+    }
+    let mut first_value = serde_json::to_value(&first).expect("first json");
+    let mut second_value = serde_json::to_value(&second).expect("second json");
+    // The recorded volatile evidence is excluded from this byte-identity
+    // claim: its extracts are the scheduling-dependent bytes normalization
+    // dropped from the HASH by design (the identity lives in
+    // `prompt_blake3`, which stays under the comparison); the rule
+    // vocabulary is checked above.
+    strip_volatile_evidence(&mut first_value);
+    strip_volatile_evidence(&mut second_value);
     if let Some(diff) = first_json_diff(&first_value, &second_value, String::new()) {
         panic!("driving the REAL runtime twice must be byte-identical; drifted at {diff}");
     }
@@ -589,8 +647,92 @@ fn tampered_runtime_prompt_hash_is_rejected_at_redrive() {
     assert!(err.contains("runtime prompt drifted"), "unexpected: {err}");
 }
 
+/// The recorded volatile normalization evidence is itself gated: an
+/// UNDOCUMENTED rule (a new normalization rule that never extended the
+/// vocabulary) and an empty extract (an exclusion hiding no bytes) are both
+/// refused at artifact validation, before any replay.
+#[test]
+fn tampered_volatile_evidence_is_rejected_at_artifact_validation() {
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let generated = ecc::fixture::generate_fixture_capture(scratch.path()).expect("generate");
+    assert!(
+        generated
+            .runs
+            .iter()
+            .filter(|r| r.prompt.arm == Arm::FullDaemonRuntime)
+            .flat_map(|r| r.attempts.iter())
+            .any(|a| !a.volatile.is_empty()),
+        "the fixture records its normalization exclusions"
+    );
+
+    let mut tampered = generated.clone();
+    let runtime_run = tampered
+        .runs
+        .iter_mut()
+        .find(|r| r.prompt.arm == Arm::FullDaemonRuntime)
+        .expect("fixture carries runtime runs");
+    let attempt = runtime_run
+        .attempts
+        .iter_mut()
+        .find(|a| !a.volatile.is_empty())
+        .expect("a recorded exclusion");
+    attempt.volatile[0].name = "custom_rule".into();
+    let tampered = tampered.finish().expect("re-seal");
+    let err = replay_capture(&tampered, &corpus(), scratch.path()).expect_err("replay rejects");
+    assert!(err.contains("UNDOCUMENTED"), "unexpected: {err}");
+
+    let mut tampered = generated.clone();
+    let runtime_run = tampered
+        .runs
+        .iter_mut()
+        .find(|r| r.prompt.arm == Arm::FullDaemonRuntime)
+        .expect("fixture carries runtime runs");
+    let attempt = runtime_run
+        .attempts
+        .iter_mut()
+        .find(|a| !a.volatile.is_empty())
+        .expect("a recorded exclusion");
+    attempt.volatile[0].extract = String::new();
+    let tampered = tampered.finish().expect("re-seal");
+    let err = replay_capture(&tampered, &corpus(), scratch.path()).expect_err("replay rejects");
+    assert!(err.contains("extract is empty"), "unexpected: {err}");
+}
+
 fn corpus() -> ecc::coding::CodingCorpus {
     load_coding_corpus(&ecc::coding::coding_corpus_root()).expect("corpus")
+}
+
+/// Remove every attempt's recorded `volatile` normalization evidence from a
+/// capture JSON value (and, for a capture object, the top-level `digest`,
+/// which is computed over the full serialization INCLUDING those volatile
+/// extracts; both sides are independently digest-validated by `finish()` /
+/// `load_capture`). The extracts are capture-time scheduling-dependent bytes
+/// (that is why normalization exists); identity comparisons over the
+/// normalized hash stay intact, and the recorded vocabulary is checked
+/// separately against the documented rules. Accepts both shapes used in this
+/// suite: a `FrozenCapture` object (its `runs`) and a bare run array.
+fn strip_volatile_evidence(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(object) = value {
+        object.remove("digest");
+    }
+    let runs: Option<&mut Vec<serde_json::Value>> = match value {
+        serde_json::Value::Array(runs) => Some(runs),
+        serde_json::Value::Object(object) => object.get_mut("runs").and_then(|v| v.as_array_mut()),
+        _ => None,
+    };
+    let Some(runs) = runs else {
+        return;
+    };
+    for run in runs {
+        let Some(attempts) = run.get_mut("attempts").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for attempt in attempts {
+            if let Some(object) = attempt.as_object_mut() {
+                object.remove("volatile");
+            }
+        }
+    }
 }
 
 /// First structural difference between two JSON values with a bounded

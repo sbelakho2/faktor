@@ -2419,7 +2419,7 @@ impl AgentRuntime {
         for spec in specs.iter().filter(|s| s.required) {
             let budget = match service.budget_for(spec) {
                 BudgetDecision::RunInline(budget) => budget,
-                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max(),
             };
             if budget.is_zero() {
                 unavailable.push((spec.id.clone(), spec.program.to_string_lossy().into_owned()));
@@ -2818,13 +2818,13 @@ impl AgentRuntime {
                         .collect(),
                     spec_json: serde_json::to_string(spec)
                         .map_err(|e| format!("job spec serialization: {e}"))?,
-                    budget_ms: service.policy().unit_max.as_millis() as u64,
+                    budget_ms: service.policy().unit_max().as_millis() as u64,
                 });
                 continue;
             }
             let budget = match service.budget_for(spec) {
                 BudgetDecision::RunInline(budget) => budget,
-                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max(),
             };
             if budget.is_zero() {
                 unavailable.push((spec.id.clone(), command.clone()));

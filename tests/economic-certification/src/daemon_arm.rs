@@ -46,9 +46,14 @@
 //!   can observe a temp file mid-write; the destination write itself is an
 //!   atomic rename) and the `## Retrieved evidence` block (whose refresh
 //!   goes through the runtime's async cold ladder / index-readiness path and
-//!   can serve the previous hop's cached package under load). Instructions,
-//!   task state, the synchronously re-resolved repository map, messages and
-//!   tool specs all stay under the hash byte-for-byte.
+//!   can serve the previous hop's cached package under load). Every
+//!   normalized-out section is EXPLICITLY RECORDED in the attempt's
+//!   `volatile` field (rule name, exact extracted bytes, frozen rationale),
+//!   so the exclusion is provable evidence instead of hidden bytes, and a
+//!   pinned test proves the recorded extracts are exactly the excluded
+//!   bytes. Instructions, task state, the synchronously re-resolved
+//!   repository map, messages and tool specs all stay under the hash
+//!   byte-for-byte.
 //! - **No model-quality claim.** All of this is machinery proof; real model
 //!   numbers exist only in opt-in `capture_source = live` artifacts.
 
@@ -128,6 +133,10 @@ struct TurnScript {
     review_calls: u64,
     tokens_in: u64,
     tokens_out: u64,
+    /// Every normalization exclusion applied while hashing this turn's wire
+    /// requests, in provider call order (recorded in the artifact as
+    /// explicit evidence, never silently dropped).
+    volatile: Vec<VolatileSection>,
 }
 
 /// The deterministic statistics of one driven turn (frozen-output evidence).
@@ -143,6 +152,9 @@ pub struct TurnStats {
     /// (normalized system + messages + tool specs; never the op/meta
     /// envelope). A replay must reproduce this byte-for-byte.
     pub prompt_blake3: String,
+    /// Every normalization exclusion applied this turn (recorded in the
+    /// artifact so the exclusion is provable, never hidden).
+    pub volatile: Vec<VolatileSection>,
 }
 
 /// The deterministic frozen-output model: a pure function of the request.
@@ -187,6 +199,7 @@ impl FrozenOutputProvider {
             tokens_in: st.tokens_in,
             tokens_out: st.tokens_out,
             prompt_blake3: hasher.finalize().to_hex().to_string(),
+            volatile: std::mem::take(&mut st.volatile),
         };
         *st = TurnScript::default();
         stats
@@ -199,48 +212,130 @@ impl Default for FrozenOutputProvider {
     }
 }
 
-/// Drop the two VOLATILE workspace-derived sections the runtime itself
+/// Rule name of the transient atomic-writer entry exclusion.
+pub const VOLATILE_RULE_ATOMIC_TEMP_ENTRY: &str = "atomic_temp_writer_entry";
+/// Frozen rationale of the transient atomic-writer entry exclusion.
+pub const VOLATILE_RATIONALE_ATOMIC_TEMP_ENTRY: &str =
+    "transient .faktor-tmp-* atomic-writer entry: the between-hop workspace scans can observe \
+     a temp file while a tool is physically mid-write, so its name/content visibility is \
+     scheduling-dependent, not a property of the frozen output (the destination write itself \
+     is an atomic rename)";
+/// Rule name of the retrieved-evidence block exclusion.
+pub const VOLATILE_RULE_RETRIEVED_EVIDENCE: &str = "retrieved_evidence_block";
+/// Frozen rationale of the retrieved-evidence block exclusion.
+pub const VOLATILE_RATIONALE_RETRIEVED_EVIDENCE: &str =
+    "## Retrieved evidence block: its refresh goes through the runtime's async cold ladder / \
+     index-readiness path and can legitimately serve the previous hop's cached package under \
+     load; its bytes are not a property of the frozen output";
+
+/// TRUE when (`name`, `rationale`) is one of the two DOCUMENTED normalization
+/// rules. Adding a third normalization rule requires extending this
+/// vocabulary AND the pinned `volatile_evidence_records_every_excluded_byte_
+/// and_only_those` test; an undocumented rule already fails artifact
+/// validation (`frozen::validate_run`).
+pub fn documented_volatile_rule(name: &str, rationale: &str) -> bool {
+    matches!(
+        (name, rationale),
+        (
+            VOLATILE_RULE_ATOMIC_TEMP_ENTRY,
+            VOLATILE_RATIONALE_ATOMIC_TEMP_ENTRY
+        ) | (
+            VOLATILE_RULE_RETRIEVED_EVIDENCE,
+            VOLATILE_RATIONALE_RETRIEVED_EVIDENCE
+        )
+    )
+}
+
+/// One normalized-out wire section: the rule name, the EXACT bytes removed
+/// (so the exclusion is provable, never hidden) and the frozen rationale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolatileSection {
+    pub name: &'static str,
+    pub extract: String,
+    pub rationale: &'static str,
+}
+
+/// The result of one wire-section normalization: the text under the hash and
+/// every exclusion applied to produce it, in text order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedSystem<'a> {
+    pub normalized: std::borrow::Cow<'a, str>,
+    pub volatile: Vec<VolatileSection>,
+}
+
+/// Remove ONLY the two DOCUMENTED volatile regions the runtime itself
 /// refreshes with its own timing before hashing a wire request:
 ///
-/// - transient `.faktor-tmp-*` atomic-writer entries: the workspace scans the
-///   runtime re-runs between hops can observe a temp file while a tool is
-///   physically mid-write, and that visibility is scheduling-dependent, not a
-///   property of the frozen output (the DESTINATION write is an atomic
-///   rename, so the destination is never observed partially — only the temp's
-///   name/content can leak into a scan);
-/// - the `## Retrieved evidence` block, whose refresh goes through the
-///   runtime's async cold ladder / index-readiness path and can legitimately
-///   serve the previous hop's cached package under load.
+/// - [`VOLATILE_RULE_ATOMIC_TEMP_ENTRY`]: each whole line containing
+///   `.faktor-tmp` (exact line bytes, trailing newline included);
+/// - [`VOLATILE_RULE_RETRIEVED_EVIDENCE`]: the exact `## Retrieved evidence`
+///   block, from its heading line through the last line before the next
+///   `## ` heading (or EOF).
 ///
-/// Everything else — instructions, task state, the synchronously re-resolved
-/// repository map, messages and tool specs — stays under the hash
-/// byte-for-byte.
-fn normalize_volatile_wire_sections(text: &str) -> std::borrow::Cow<'_, str> {
-    let mut out: Option<String> = None;
-    if text.contains(".faktor-tmp") {
-        let current = out.get_or_insert_with(String::new);
-        for line in text.split_inclusive('\n') {
-            if !line.contains(".faktor-tmp") {
-                current.push_str(line);
+/// The removal is a PURE byte deletion: the removed ranges are recorded
+/// verbatim as [`VolatileSection`] extracts, so `normalized` plus the
+/// extracts, re-inserted in order at the recorded positions, reconstruct the
+/// input byte-for-byte — the recorded extracts are provably the ONLY
+/// excluded bytes. Everything else (instructions, task state, the
+/// synchronously re-resolved repository map, messages, tool specs) stays
+/// under the hash byte-for-byte.
+fn normalize_volatile_wire_sections(text: &str) -> NormalizedSystem<'_> {
+    let mut volatile: Vec<VolatileSection> = Vec::new();
+    let mut normalized = String::with_capacity(text.len());
+    let mut offset = 0usize;
+    // The active `## Retrieved evidence` block: its start offset and the
+    // exact bytes accumulated so far (dropped lines of the heading + body).
+    let mut evidence: Option<(usize, String)> = None;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if let Some((_, extract)) = evidence.as_mut() {
+            if content.starts_with("## ") {
+                // The block ended immediately before this heading line.
+                let (_, extract) = evidence.take().expect("evidence is active");
+                volatile.push(VolatileSection {
+                    name: VOLATILE_RULE_RETRIEVED_EVIDENCE,
+                    extract,
+                    rationale: VOLATILE_RATIONALE_RETRIEVED_EVIDENCE,
+                });
+                // Fall through: this heading line is NOT part of the block.
+            } else {
+                extract.push_str(line);
+                continue;
             }
         }
-    }
-    let source = out.as_deref().unwrap_or(text);
-    const EVIDENCE: &str = "\n## Retrieved evidence\n";
-    if let Some(start) = source.find(EVIDENCE) {
-        let rest = &source[start + EVIDENCE.len()..];
-        let end = rest.find("\n## ").map(|i| start + EVIDENCE.len() + i + 1);
-        let mut stripped = String::with_capacity(source.len());
-        stripped.push_str(&source[..start]);
-        stripped.push('\n');
-        if let Some(end) = end {
-            stripped.push_str(&source[end..]);
+        if content == "## Retrieved evidence" {
+            evidence = Some((line_start, line.to_string()));
+            continue;
         }
-        return std::borrow::Cow::Owned(stripped);
+        if line.contains(".faktor-tmp") {
+            volatile.push(VolatileSection {
+                name: VOLATILE_RULE_ATOMIC_TEMP_ENTRY,
+                extract: line.to_string(),
+                rationale: VOLATILE_RATIONALE_ATOMIC_TEMP_ENTRY,
+            });
+            continue;
+        }
+        normalized.push_str(line);
     }
-    match out {
-        Some(s) => std::borrow::Cow::Owned(s),
-        None => std::borrow::Cow::Borrowed(text),
+    if let Some((_, extract)) = evidence.take() {
+        volatile.push(VolatileSection {
+            name: VOLATILE_RULE_RETRIEVED_EVIDENCE,
+            extract,
+            rationale: VOLATILE_RATIONALE_RETRIEVED_EVIDENCE,
+        });
+    }
+    if volatile.is_empty() {
+        NormalizedSystem {
+            normalized: std::borrow::Cow::Borrowed(text),
+            volatile,
+        }
+    } else {
+        NormalizedSystem {
+            normalized: std::borrow::Cow::Owned(normalized),
+            volatile,
+        }
     }
 }
 
@@ -255,9 +350,9 @@ fn normalize_volatile_wire_sections(text: &str) -> std::borrow::Cow<'_, str> {
 /// feature off, so workspace `cargo test --workspace` runs saw a phantom
 /// "runtime prompt drifted" red). Key order is not model-visible semantics;
 /// every other byte stays under the hash.
-fn request_blake3(req: &GenericAgentRequest) -> String {
+fn request_blake3(normalized: &NormalizedSystem<'_>, req: &GenericAgentRequest) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(normalize_volatile_wire_sections(&req.system).as_bytes());
+    hasher.update(normalized.normalized.as_bytes());
     hasher.update(&[0]);
     hasher.update(&canonical_json_bytes(&req.messages));
     hasher.update(&[0]);
@@ -302,8 +397,8 @@ fn sort_json_keys(value: &mut serde_json::Value) {
 /// Deterministic request token estimate: the NORMALIZED system + message
 /// text + tool specs (same normalization as the recorded request hash, so
 /// the accounting never depends on the volatile workspace-scan sections).
-fn request_tokens_est(req: &GenericAgentRequest) -> u64 {
-    let mut total = estimate_tokens(&normalize_volatile_wire_sections(&req.system));
+fn request_tokens_est(normalized: &NormalizedSystem<'_>, req: &GenericAgentRequest) -> u64 {
+    let mut total = estimate_tokens(normalized.normalized.as_ref());
     for message in &req.messages {
         for part in &message.content {
             if let Ok(value) = serde_json::to_value(part) {
@@ -347,8 +442,10 @@ impl Provider for FrozenOutputProvider {
         let mut chunks: Vec<Result<ProviderChunk, faktor_provider::ProviderError>> = Vec::new();
         let mut st = self.state.lock().expect("provider state");
         st.calls += 1;
-        st.request_hashes.push(request_blake3(&req));
-        let input_est = request_tokens_est(&req);
+        let normalized = normalize_volatile_wire_sections(&req.system);
+        st.request_hashes.push(request_blake3(&normalized, &req));
+        st.volatile.extend(normalized.volatile.iter().cloned());
+        let input_est = request_tokens_est(&normalized, &req);
         let is_review = req.system.starts_with(REVIEW_SYSTEM_MARKER);
         let (text_out, tool_calls) = if is_review {
             st.review_calls += 1;
@@ -840,6 +937,15 @@ pub fn drive_task(
             .and_then(|r| r.get("verdict"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let volatile: Vec<crate::frozen::FrozenVolatileSection> = stats
+            .volatile
+            .iter()
+            .map(|section| crate::frozen::FrozenVolatileSection {
+                name: section.name.to_string(),
+                extract: section.extract.clone(),
+                rationale: section.rationale.to_string(),
+            })
+            .collect();
         attempts.push(FrozenAttempt {
             index: attempt,
             provider: DAEMON_ARM_PROVIDER.into(),
@@ -863,6 +969,7 @@ pub fn drive_task(
             },
             prompt_blake3: stats.prompt_blake3,
             prompt_tokens_est: stats.tokens_in,
+            volatile,
             runtime: Some(FrozenRuntimeEvidence {
                 completion_gate: gate_label(outcome.completion.as_ref()),
                 review_verdict,
@@ -1012,6 +1119,11 @@ pub fn redrive_runtime_run(
                 task.id, recorded.index
             ));
         }
+        // `volatile` is deliberately NOT compared: it records the
+        // scheduling-dependent bytes normalization excluded at CAPTURE time
+        // (that is exactly why the rules exist), while the identity check
+        // above is the normalized `prompt_blake3`; the rule vocabulary is
+        // pinned by artifact validation and the normalization unit test.
         if replayed.tokens_in != recorded.tokens_in
             || replayed.tokens_out != recorded.tokens_out
             || replayed.provider != recorded.provider
@@ -1165,26 +1277,146 @@ mod tests {
         assert!(stats.tokens_in > 0 && stats.tokens_out > 0);
     }
 
+    /// The recorded extracts are EXACTLY the excluded bytes — no more, no
+    /// less: `normalized` plus the extracts, re-inserted in order, rebuilds
+    /// the input byte-for-byte, and both the extraction and the normalized
+    /// output are PINNED. A new (or widened) normalization rule changes one
+    /// of the pinned assertions and fails here unless the documented rule
+    /// vocabulary, this test and `frozen::validate_run` are deliberately
+    /// extended together.
     #[test]
-    fn volatile_wire_sections_are_normalized() {
-        let text = "head\n## Repository map\na.sh\nlib/\n\n## Retrieved evidence\n\n### a.sh\ntoken `x` × 1\n\n## Task progress\nSTEPS\n";
+    fn volatile_evidence_records_every_excluded_byte_and_only_those() {
+        let text = "instructions\n\
+## Repository map\n\
+a.sh\n\
+lib/.log.sh.faktor-tmp-1-ab\n\
+b.sh\n\
+\n\
+## Retrieved evidence\n\
+\n\
+### a.sh\n\
+token `x` × 1\n\
+pid 12345\n\
+\n\
+## Task progress\n\
+STEPS\n\
+## Current errors\n\
+none\n";
         let out = normalize_volatile_wire_sections(text);
-        assert!(out.contains("## Repository map"));
-        assert!(out.contains("## Task progress"));
-        assert!(out.contains("STEPS"));
-        assert!(!out.contains("Retrieved evidence"));
-        assert!(!out.contains("token `x`"));
-
-        let with_temp = "line one\nlib/.log.sh.faktor-tmp-1-ab\ntail\n";
+        // (1) Completeness: every byte missing from `normalized` is part of
+        //     the next recorded extract, in order; no extract is unused and
+        //     `normalized` adds nothing.
+        assert_excluded_bytes_are_exactly_the_extracts(text, &out.normalized, &out.volatile);
+        // (2) The extraction is pinned exactly (a widened region or a new
+        //     rule fails): one temp line and one evidence block, in text
+        //     order, byte-for-byte.
+        assert_eq!(out.volatile.len(), 2);
+        assert_eq!(out.volatile[0].name, VOLATILE_RULE_ATOMIC_TEMP_ENTRY);
+        assert_eq!(out.volatile[0].extract, "lib/.log.sh.faktor-tmp-1-ab\n");
         assert_eq!(
-            normalize_volatile_wire_sections(with_temp).as_ref(),
-            "line one\ntail\n"
+            out.volatile[0].rationale,
+            VOLATILE_RATIONALE_ATOMIC_TEMP_ENTRY
         );
-
-        let untouched = "plain system text\n";
+        assert_eq!(out.volatile[1].name, VOLATILE_RULE_RETRIEVED_EVIDENCE);
         assert_eq!(
-            normalize_volatile_wire_sections(untouched).as_ref(),
-            untouched
+            out.volatile[1].extract,
+            "## Retrieved evidence\n\n### a.sh\ntoken `x` × 1\npid 12345\n\n"
+        );
+        assert_eq!(
+            out.volatile[1].rationale,
+            VOLATILE_RATIONALE_RETRIEVED_EVIDENCE
+        );
+        // (3) The normalized text is pinned byte-for-byte: only the documented
+        //     regions are gone; `## Task progress`, `## Current errors` and
+        //     the timestamp-free decoys all stay under the hash.
+        assert_eq!(
+            out.normalized.as_ref(),
+            "instructions\n## Repository map\na.sh\nb.sh\n\n## Task progress\nSTEPS\n## Current errors\nnone\n"
+        );
+        // (4) The document rules are the ONLY documented vocabulary.
+        for section in &out.volatile {
+            assert!(
+                documented_volatile_rule(section.name, section.rationale),
+                "recorded rule {} must be documented",
+                section.name
+            );
+        }
+
+        // An evidence block at EOF: exactly its own bytes, nothing else.
+        let at_eof = "head\n## Retrieved evidence\nbody\n";
+        let out = normalize_volatile_wire_sections(at_eof);
+        assert_excluded_bytes_are_exactly_the_extracts(at_eof, &out.normalized, &out.volatile);
+        assert_eq!(out.normalized.as_ref(), "head\n");
+        assert_eq!(out.volatile.len(), 1);
+        assert_eq!(out.volatile[0].extract, "## Retrieved evidence\nbody\n");
+
+        // A tmp-only text: the whole line only; a line that merely mentions
+        // the marker word in DATA is the documented line rule (dropped), so
+        // decoys that must survive contain no marker at all.
+        let with_temp = "line one\nlib/.log.sh.faktor-tmp-1-ab\ntail\n";
+        let out = normalize_volatile_wire_sections(with_temp);
+        assert_excluded_bytes_are_exactly_the_extracts(with_temp, &out.normalized, &out.volatile);
+        assert_eq!(out.normalized.as_ref(), "line one\ntail\n");
+        assert_eq!(out.volatile.len(), 1);
+
+        // Untouched text: borrowed, zero exclusions (no normalization fired).
+        let untouched = "plain system text\n";
+        let out = normalize_volatile_wire_sections(untouched);
+        assert!(matches!(out.normalized, std::borrow::Cow::Borrowed(_)));
+        assert!(out.volatile.is_empty());
+        assert_eq!(out.normalized.as_ref(), untouched);
+    }
+
+    /// Decomposition proof for "the recorded extracts are the ONLY excluded
+    /// bytes": search the lockstep positions with memoized backtracking
+    /// (kept-byte steps and whole-extract steps) for a path that consumes
+    /// the original and the normalized text together with EVERY recorded
+    /// extract, in order. A byte dropped without a recorded extract, or a
+    /// recorded extract that does not match the original bytes at its
+    /// position, has no path and fails here.
+    fn assert_excluded_bytes_are_exactly_the_extracts(
+        original: &str,
+        normalized: &str,
+        volatile: &[VolatileSection],
+    ) {
+        let orig = original.as_bytes();
+        let norm = normalized.as_bytes();
+        let extracts: Vec<&[u8]> = volatile
+            .iter()
+            .map(|section| {
+                assert!(
+                    !section.extract.is_empty(),
+                    "recorded extracts are never empty"
+                );
+                section.extract.as_bytes()
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(0usize, 0usize, 0usize)];
+        while let Some(state) = stack.pop() {
+            let (i, j, k) = state;
+            if i == orig.len() && j == norm.len() && k == extracts.len() {
+                return;
+            }
+            if !seen.insert(state) {
+                continue;
+            }
+            if i < orig.len() && j < norm.len() && orig[i] == norm[j] {
+                stack.push((i + 1, j + 1, k));
+            }
+            if k < extracts.len() {
+                let extract = extracts[k];
+                if orig[i..].starts_with(extract) {
+                    stack.push((i + extract.len(), j, k + 1));
+                }
+            }
+        }
+        panic!(
+            "the recorded extracts are not exactly the excluded bytes \
+             (original {} bytes, normalized {} bytes, {} recorded sections)",
+            orig.len(),
+            norm.len(),
+            extracts.len()
         );
     }
 

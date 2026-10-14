@@ -61,6 +61,11 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+# The first-run sandbox decision's tamper evidence: HMAC-SHA256 over the
+# decision document and the append-only audit chain, keyed by a daemon-local
+# 0600 key created on first use (same crates the SCM webhook signer uses).
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 faktor-provider = { workspace = true, features = ["test-utils"] }

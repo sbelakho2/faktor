@@ -3701,3 +3701,99 @@ fn daemon_sigkill_kills_descendants_of_an_exited_supervisor_leader() {
     let marker = format!("faktor-terminal-sim-reaped-{}", std::process::id());
     run_daemon_sigkill_case(&marker, true);
 }
+
+// ============ platform-honest confinement contract oracles ============
+//
+// The confinement MAPPING (requirement -> exact spawn demand/tag) and the
+// demanded-spawn TYPED-REFUSAL mapping are platform-neutral production
+// behavior. Their oracles live here (the unix test module) instead of the
+// Landlock-only corpus, so the planted mutations behind
+// INV-FS-CONFINEMENT-LANDLOCK-DEMAND and INV-SANDBOX-PRIVILEGE-DROP are
+// detected on every host — not only where the real Landlock/unshare
+// backends compile. The real-backend oracles stay Linux-only.
+
+/// The additive mode/requirement/tag contract is exact: defaults are
+/// Inherit, `for_requirement` maps both workspace levels, and no conversion
+/// can silently produce a `workspace` tag from Inherit.
+#[test]
+fn filesystem_isolation_mapping_and_tags_are_exact() {
+    assert_eq!(
+        SpawnConfig::default().filesystem_isolation,
+        FilesystemIsolation::Inherit,
+        "the additive confinement field must default to Inherit"
+    );
+    let roots = vec![std::path::PathBuf::from("/tmp/faktor-fs-map")];
+    for (requirement, tag, required) in [
+        (
+            FilesystemIsolationRequirement::Workspace { best_effort: false },
+            "workspace",
+            true,
+        ),
+        (
+            FilesystemIsolationRequirement::Workspace { best_effort: true },
+            "workspace_best_effort",
+            false,
+        ),
+        (FilesystemIsolationRequirement::Inherit, "inherit", false),
+    ] {
+        let isolation = FilesystemIsolation::for_requirement(requirement, roots.clone());
+        assert_eq!(isolation.as_tag(), tag, "{requirement:?}");
+        assert_eq!(isolation.is_required(), required, "{requirement:?}");
+        if requirement == FilesystemIsolationRequirement::Inherit {
+            assert!(isolation.roots().is_empty(), "Inherit carries no roots");
+        } else {
+            assert_eq!(isolation.roots(), roots, "{requirement:?} carries roots");
+        }
+    }
+    // The raw carry without roots is never a workspace claim.
+    assert_eq!(
+        FilesystemIsolation::for_requirement(
+            FilesystemIsolationRequirement::Workspace { best_effort: false },
+            Vec::new(),
+        )
+        .as_tag(),
+        "workspace",
+        "the tag is the DEMAND; the spawn layer owns the typed refusal"
+    );
+}
+
+/// A spawn failure under a demanded confinement (`DenyAll`/`BrokerOnly` or
+/// a Required workspace demand) is a TYPED permission refusal naming the
+/// demand — never an untyped internal error, and never a silent unenforced
+/// run. A failure WITHOUT a demand keeps the historic `not_found` mapping.
+/// This is the platform-neutral half of the real-spawn oracle
+/// [`deny_all_spawn_isolates_the_child_or_refuses_typed`] (Linux-only): the
+/// same fail-closed refusal contract, provable on hosts with no isolation
+/// backend of their own.
+#[test]
+fn spawn_failure_under_a_demand_refuses_typed() {
+    let mut cfg = SpawnConfig {
+        cmd: "faktor-demand-probe".into(),
+        ..Default::default()
+    };
+    cfg.network_isolation = NetworkIsolation::DenyAll;
+    let err = spawn_failure(&cfg, std::io::Error::from_raw_os_error(libc::EPERM));
+    assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+    assert!(
+        err.message.contains("sandbox unavailable")
+            && err.message.contains("NetworkIsolation::DenyAll")
+            && err.message.contains("never running it unenforced"),
+        "the refusal must name the sandbox and the demand: {err:?}"
+    );
+    cfg.network_isolation = NetworkIsolation::Inherit;
+    cfg.filesystem_isolation = FilesystemIsolation::Workspace {
+        roots: vec![std::path::PathBuf::from("/tmp/faktor-demand-probe")],
+        required: true,
+    };
+    let err = spawn_failure(&cfg, std::io::Error::from_raw_os_error(libc::ENOENT));
+    assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+    assert!(
+        err.message
+            .contains("FilesystemIsolation::Workspace(required)"),
+        "the refusal must name the required workspace demand: {err:?}"
+    );
+    // No demand: the historic not_found mapping is untouched.
+    cfg.filesystem_isolation = FilesystemIsolation::Inherit;
+    let err = spawn_failure(&cfg, std::io::Error::from_raw_os_error(libc::ENOENT));
+    assert_eq!(err.kind, ErrorKind::NotFound, "{err:?}");
+}

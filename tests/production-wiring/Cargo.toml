@@ -76,6 +76,12 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+# Regular-dep mirror of crates/cli (the lib splices its sources at the crate
+# root and is built WITHOUT cfg(test)): the first-run sandbox decision's
+# tamper evidence imports these in production code. Keep in lockstep with
+# crates/cli/Cargo.toml.
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 faktor-provider = { workspace = true, features = ["test-utils"] }

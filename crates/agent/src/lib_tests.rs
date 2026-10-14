@@ -2123,7 +2123,7 @@ mod verification_service_tests {
         // The disabled backend is scripted: it can never persist jobs and
         // its zero budget fails closed under the unit cap.
         assert!(!off.can_persist_jobs());
-        assert!(off.policy().unit_max.is_zero());
+        assert!(off.policy().unit_max().is_zero());
     }
 
     #[test]
