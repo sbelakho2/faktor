@@ -1382,9 +1382,9 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
     .expect("the default (non-advanced) profile is never gated");
     assert!(!service.is_disabled());
     let policy = service.policy();
-    assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
-    assert_eq!(policy.unit_max, std::time::Duration::from_secs(120));
-    assert!(policy.full_as_background);
+    assert_eq!(policy.quick_max(), std::time::Duration::from_secs(30));
+    assert_eq!(policy.unit_max(), std::time::Duration::from_secs(120));
+    assert!(policy.full_as_background());
     // Budget probe through the service (same decision the genuine-end
     // site applies per check category).
     let quick = faktor_verify::exec::CheckSpec::new(

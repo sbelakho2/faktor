@@ -860,6 +860,13 @@ pub struct OutcomeLedger {
     /// reads. Compiled out of every non-test build.
     #[cfg(test)]
     after_reservation_read: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test-only read-fault injector: while the counter is positive, every
+    /// [`OutcomeLedger::load_stored`] read consumes one unit and fails with
+    /// a typed store error, so an adversarial test can exercise the
+    /// conflict-loser reconciliation's bounded retry and its
+    /// non-double-counting fallback. Compiled out of every non-test build.
+    #[cfg(test)]
+    failed_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl std::fmt::Debug for OutcomeLedger {
@@ -876,6 +883,8 @@ impl OutcomeLedger {
             store,
             #[cfg(test)]
             after_reservation_read: None,
+            #[cfg(test)]
+            failed_reads: None,
         }
     }
 
@@ -891,6 +900,19 @@ impl OutcomeLedger {
         Self {
             store,
             after_reservation_read: Some(probe),
+            failed_reads: None,
+        }
+    }
+
+    /// Test-only: the FIRST `failures` durable row reads fail with a typed
+    /// store error (a positive counter consumes one failure per read).
+    /// Used by the conflict-loser fault-injection test.
+    #[cfg(test)]
+    pub(crate) fn with_failed_reads(store: Arc<Store>, failures: usize) -> Self {
+        Self {
+            store,
+            after_reservation_read: None,
+            failed_reads: Some(Arc::new(std::sync::atomic::AtomicUsize::new(failures))),
         }
     }
 
@@ -1063,6 +1085,22 @@ impl OutcomeLedger {
 
     /// Load and decode one stored row (legacy v1 or v2 payload).
     fn load_stored(&self, run_id: &str) -> Result<Option<StoredOutcome>, OutcomeLedgerError> {
+        // Test-only fault injector: consume one armed failure per read (see
+        // `with_failed_reads`). Compiled out of every non-test build.
+        #[cfg(test)]
+        if let Some(failures) = &self.failed_reads {
+            use std::sync::atomic::Ordering;
+            if failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(OutcomeLedgerError::Store(faktor_store::StoreError::Busy(
+                    format!("injected durable read failure for {run_id}"),
+                )));
+            }
+        }
         self.store
             .engineering_outcome_get(run_id)?
             .map(|row| decode_record_row(&row))

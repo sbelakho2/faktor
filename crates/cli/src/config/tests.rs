@@ -1460,7 +1460,7 @@ fn verification_section_defaults_partial_objects_and_zero_disables() {
         .expect("enabled");
     assert!(advanced.implies_advanced());
     assert_eq!(
-        advanced.quick_max,
+        advanced.quick_max(),
         faktor_verify::exec::VerificationPolicy::ADVANCED_QUICK_MAX
     );
     // quick_max_s = 0 disables the service: the mapping yields None

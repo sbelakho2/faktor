@@ -140,19 +140,7 @@ impl VerificationCfg {
     /// advanced). The default local profile (60/600/background) is never
     /// refused.
     pub fn policy(&self) -> Result<Option<faktor_verify::exec::VerificationPolicy>, String> {
-        let Some(policy) = self.local_policy() else {
-            return Ok(None);
-        };
-        if policy.implies_advanced() {
-            return Err(
-                "verification.quick_max_s/unit_max_s/full_as_background reach the ADVANCED \
-                 verification profile, which is the advanced_verification_policy paid value \
-                 entitlement; construct it through the entitled gate (set [verification] \
-                 advanced = true with a plan that maps the entitlement)"
-                    .to_string(),
-            );
-        }
-        Ok(Some(policy))
+        self.local_policy()
     }
 
     /// The daemon's GATED resolution: `advanced = true` OR any numerically
@@ -171,30 +159,46 @@ impl VerificationCfg {
                 .map(Some)
                 .map_err(|refusal| format!("verification advanced profile refused: {refusal}"));
         }
-        Ok(self.local_policy())
+        self.local_policy()
     }
 
     /// TRUE when the configured numbers (without `advanced = true`) already
     /// reach the advanced profile's depth: they still require the
-    /// entitlement.
+    /// entitlement. Pure numeric classification (`quick_max_s == 0` is the
+    /// disabled service, never advanced).
     pub fn implies_advanced(&self) -> bool {
-        self.local_policy()
-            .is_some_and(|policy| policy.implies_advanced())
+        if self.quick_max_s == 0 {
+            return false;
+        }
+        faktor_verify::exec::VerificationPolicy::implies_advanced_params(
+            std::time::Duration::from_secs(self.quick_max_s),
+            std::time::Duration::from_secs(self.unit_max_s),
+            self.full_as_background,
+        )
     }
 
     /// The pure local projection (never gated, never advanced by itself):
     /// `None` when `quick_max_s` is 0 (the verification service is DISABLED,
     /// fail closed — mutating turns classify Unverified, never silently
-    /// complete).
-    fn local_policy(&self) -> Option<faktor_verify::exec::VerificationPolicy> {
+    /// complete). The policy is built through the checked LOCAL constructor,
+    /// so an advanced-depth combination refuses typed instead of yielding an
+    /// ungated paid profile.
+    fn local_policy(&self) -> Result<Option<faktor_verify::exec::VerificationPolicy>, String> {
         if self.quick_max_s == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(faktor_verify::exec::VerificationPolicy {
-            quick_max: std::time::Duration::from_secs(self.quick_max_s),
-            unit_max: std::time::Duration::from_secs(self.unit_max_s),
-            full_as_background: self.full_as_background,
-            min_inline: std::time::Duration::from_secs(5),
+        faktor_verify::exec::VerificationPolicy::local_checked(
+            std::time::Duration::from_secs(self.quick_max_s),
+            std::time::Duration::from_secs(self.unit_max_s),
+            self.full_as_background,
+            std::time::Duration::from_secs(5),
+        )
+        .map(Some)
+        .map_err(|refusal| {
+            format!(
+                "verification.quick_max_s/unit_max_s/full_as_background: {refusal}; set \
+                 [verification] advanced = true with a plan that maps the entitlement"
+            )
         })
     }
 }

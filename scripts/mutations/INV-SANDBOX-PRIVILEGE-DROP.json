@@ -3,8 +3,8 @@
   "file": "crates/terminal/src/lib.rs",
   "find": "    Error::permission(format!(\n        \"sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \\\n         created ({e}); never running it unenforced\",",
   "replace": "    Error::internal(format!(\n        \"sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \\\n         created ({e}); never running it unenforced\",",
-  "gate": "cargo test -p faktor-terminal --lib deny_all_spawn_isolates_the_child_or_refuses_typed",
-  "note": "Planted at the typed-refusal authority: a failed confinement/drop now refuses UNTYPED (internal), so the oracle's Permission+message contract fails. HONEST LIMIT: the literal 'skip the capset' variant is unobservable on hosts where the isolation backend is refused before the drop runs (this host), because the oracle then only exercises the refusal path; this mutation attacks that same fail-closed contract on every host.",
+  "gate": "cargo test -p faktor-terminal --lib -- deny_all_spawn_isolates_the_child_or_refuses_typed spawn_failure_under_a_demand_refuses_typed",
+  "note": "Planted at the typed-refusal authority: a failed confinement/drop now refuses UNTYPED (internal), so the oracle's Permission+message contract fails. The gate filter runs BOTH oracles: the real-spawn one where the isolation backend compiles (Linux) and the platform-neutral demanded-spawn-failure oracle (spawn_failure_under_a_demand_refuses_typed) on every host, so the fail-closed refusal contract is attacked wherever the campaign runs.",
   "capabilities": [
     "terminal.authority"
   ]

@@ -580,7 +580,14 @@ enforced as tests):
   synchronously re-resolved repository map, messages and tool specs stay
   under the hash — and the frozen script declares
   sequential tool execution so multi-file tool results stay in submit
-  order); runs are written through the same wired
+  order). Nothing is hidden by that normalization: every normalized-out
+  section is recorded explicitly in the attempt's `volatile` field (the
+  documented rule name, the EXACT extracted bytes and the frozen rationale),
+  a pinned test proves the recorded extracts are precisely the excluded
+  bytes (a new normalization rule that does not extend the documented
+  vocabulary fails artifact validation and the test), and the removal is a
+  pure byte deletion so `normalized` plus the extracts reconstructs the wire
+  text byte-for-byte; runs are written through the same wired
   Engineering Outcome Ledger and reported on the same axes. The arm's
   per-attempt runtime evidence (`completion_gate`, `review_verdict`,
   `derived_checks`, provider/review call counts, applied files) is recorded

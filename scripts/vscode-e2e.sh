@@ -338,7 +338,20 @@ fail() {
 # ------------------------------------------------------------- download/extract
 has_sha256() { [ -n "$1" ] && printf '%s' "$1" | grep -qE '^[0-9a-f]{64}$'; }
 
-sha_of() { sha256sum "$1" | awk '{print $1}'; }
+# Portable SHA-256 helper: GNU `sha256sum` first (Linux lanes unchanged),
+# then the POSIX `shasum -a 256` that macOS ships (the selftest and the
+# pin check must run on darwin hosts too). Absence of both is a loud typed
+# failure, never an empty digest that would silently fail every pin.
+sha_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "vscode-e2e: no sha256 tool (sha256sum/shasum) on PATH" >&2
+    return 1
+  fi
+}
 
 download_file() { # url dest
   local url="$1" dest="$2"
@@ -395,7 +408,9 @@ verify_tarball() {
   *) fail "pin-invalid: download URL does not embed the pinned commit $VSCODE_COMMIT" ;;
   esac
   local actual
-  actual="$(sha_of "$TARBALL")"
+  if ! actual="$(sha_of "$TARBALL")"; then
+    fail "sha256-tool-missing: neither sha256sum nor shasum is on PATH"
+  fi
   if [ "$actual" != "$EXPECTED_SHA" ]; then
     if [ "${TARBALL_FROM_CACHE:-0}" = "1" ]; then
       rm -f "$TARBALL"
@@ -440,7 +455,9 @@ code_cli() { # args...
   if [ "$NO_SANDBOX" -eq 1 ] || [ "$(id -u)" -eq 0 ]; then
     extra=(--no-sandbox)
   fi
-  "$CODE_BIN" "${extra[@]}" --user-data-dir "$WORK_DIR/cli-user-data" --extensions-dir "$WORK_DIR/cli-extensions" "$@"
+  # bash 3.2 (macOS /bin/bash) treats `"${extra[@]}"` on an EMPTY array as
+  # unbound under `set -u`; the `+` guard expands nothing in that case.
+  "$CODE_BIN" ${extra[@]+"${extra[@]}"} --user-data-dir "$WORK_DIR/cli-user-data" --extensions-dir "$WORK_DIR/cli-extensions" "$@"
 }
 
 run_cli_checks() {
@@ -564,10 +581,10 @@ launch_host() { # timeout_s logfile runtime_dir dev_path tests_path [NAME=VALUE.
   local -a args
   # shellcheck disable=SC2206,SC2207 # args are a fixed internal word list
   args=($(host_launch_args))
-  args+=("${code_args[@]}")
+  args+=(${code_args[@]+"${code_args[@]}"})
   args+=(--user-data-dir "$rt_dir/user-data" --extensions-dir "$rt_dir/extensions" \
     --extensionDevelopmentPath="$dev_path" --extensionTestsPath="$tests_path")
-  run_host_process "$timeout_s" "$log" env "${envp[@]}" "$CODE_BIN" "${args[@]}"
+  run_host_process "$timeout_s" "$log" env ${envp[@]+"${envp[@]}"} "$CODE_BIN" "${args[@]}"
 }
 
 # ------------------------------------------------- child lifecycle + Xvfb
@@ -956,7 +973,7 @@ run_extension_host() {
       "FAKTOR_VSCODE_E2E_TIMEOUT_SECONDS=$EFFECTIVE_HOST_TIMEOUT" \
       "FAKTOR_VSCODE_E2E_WAIT_FACTOR=$WAIT_FACTOR" \
       "FAKTOR_VSCODE_E2E_CALIBRATION_MS=${CONTROL_MS:-0}" \
-      -- "${code_args[@]}" || rc=$?
+      -- ${code_args[@]+"${code_args[@]}"} || rc=$?
     kill_xvfb
     local stage_at_exit
     stage_at_exit="$(last_stage_of "$progress")"
@@ -1139,6 +1156,11 @@ selftest() {
   local tmp failures=0
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-vscode-e2e-selftest.XXXXXX")"
   trap 'rm -rf "${tmp:-}"' EXIT
+  # Marker for the child invocations this suite drives: every case runs the
+  # REAL script against a fake `code` fixture, so the linux-x64 HOST guard
+  # (a production pin fact, not a fixture fact) must not refuse the selftest
+  # on a darwin/arm64 host. Production runs never carry the marker.
+  export FAKTOR_VSCODE_E2E_SELFTEST=1
   make_fake_code "$tmp/extracted"
   mkdir -p "$tmp/extension/out"
   printf '{"name":"faktor","publisher":"faktor"}\n' >"$tmp/extension/package.json"
@@ -1148,7 +1170,10 @@ selftest() {
   cp "$tmp/extracted/bin/code" "$tmp/pack/VSCode-linux-x64/bin/code"
   tar -czf "$tmp/code.tar.gz" -C "$tmp/pack" VSCode-linux-x64
   local sha
-  sha="$(sha_of "$tmp/code.tar.gz")"
+  if ! sha="$(sha_of "$tmp/code.tar.gz")"; then
+    echo "vscode-e2e selftest: no sha256 tool (sha256sum/shasum) on PATH" >&2
+    exit 1
+  fi
 
   check() { # label rc
     if [ "$2" -eq 0 ]; then
@@ -1377,7 +1402,8 @@ if [ "$PRINT_PIN" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+if [ "${FAKTOR_VSCODE_E2E_SELFTEST:-0}" != "1" ] &&
+  { [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; }; then
   echo "vscode-e2e: linux-x64 only (got $(uname -s)/$(uname -m))" >&2
   exit 2
 fi

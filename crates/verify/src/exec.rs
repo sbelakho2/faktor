@@ -137,19 +137,41 @@ pub enum CheckRunStatus {
     Unavailable,
 }
 
-/// Policy for verification budgets (P0-10).
+/// Policy for verification budgets (P0-10). Every field is PRIVATE: a
+/// checkout policy can be built only through the LOCAL checked constructor
+/// ([`Self::local_checked`] — refuses any combination that reaches the
+/// ADVANCED paid profile's depth), the [`Default`]/[`Self::disabled`] local
+/// profiles, or the gated [`Self::advanced_checked`]. A cross-crate struct
+/// literal can no longer construct the paid profile ungated; read the
+/// fields through the typed accessors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationPolicy {
-    /// Quick checks get at most this much wall time.
-    pub quick_max: Duration,
-    /// Unit checks get at most this much wall time inline.
-    pub unit_max: Duration,
-    /// Full-repository checks run as a task-owned background operation with
-    /// progress instead of blocking the turn.
-    pub full_as_background: bool,
-    /// Below this much remaining turn budget, checks are not run inline.
-    pub min_inline: Duration,
+    quick_max: Duration,
+    unit_max: Duration,
+    full_as_background: bool,
+    min_inline: Duration,
 }
+
+/// A local (ungated) [`VerificationPolicy`] construction was REFUSED: the
+/// requested numbers reach the ADVANCED (paid) profile's depth, which is the
+/// `advanced_verification_policy` value entitlement. The caller must route
+/// the request through [`VerificationPolicy::advanced_checked`] with an
+/// entitlement gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvancedPolicyRequested;
+
+impl std::fmt::Display for AdvancedPolicyRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the requested verification policy reaches the ADVANCED verification profile, which \
+             is the advanced_verification_policy paid value entitlement; construct it through \
+             the entitled gate"
+        )
+    }
+}
+
+impl std::error::Error for AdvancedPolicyRequested {}
 
 impl Default for VerificationPolicy {
     fn default() -> Self {
@@ -164,6 +186,27 @@ impl Default for VerificationPolicy {
 
 /// A policy of zero budget fails closed: nothing runs inline.
 impl VerificationPolicy {
+    /// Quick checks get at most this much wall time.
+    pub const fn quick_max(&self) -> Duration {
+        self.quick_max
+    }
+
+    /// Unit checks get at most this much wall time inline.
+    pub const fn unit_max(&self) -> Duration {
+        self.unit_max
+    }
+
+    /// Full-repository checks run as a task-owned background operation with
+    /// progress instead of blocking the turn.
+    pub const fn full_as_background(&self) -> bool {
+        self.full_as_background
+    }
+
+    /// Below this much remaining turn budget, checks are not run inline.
+    pub const fn min_inline(&self) -> Duration {
+        self.min_inline
+    }
+
     pub fn disabled() -> Self {
         Self {
             quick_max: Duration::ZERO,
@@ -171,6 +214,32 @@ impl VerificationPolicy {
             full_as_background: true,
             min_inline: Duration::ZERO,
         }
+    }
+
+    /// The ONE checked constructor of a LOCAL (checkout) policy: it builds
+    /// the requested numbers ONLY when the combination stays below the
+    /// ADVANCED paid profile's depth. A combination that reaches it (quick
+    /// or unit budget at/above the advanced floor, full checks inline) is
+    /// the `advanced_verification_policy` augmentation and must go through
+    /// [`Self::advanced_checked`]; the refusal is typed
+    /// ([`AdvancedPolicyRequested`]). The LOCAL paths (`Default`,
+    /// [`Self::disabled`], config policy under the floors) are never gated.
+    pub fn local_checked(
+        quick_max: Duration,
+        unit_max: Duration,
+        full_as_background: bool,
+        min_inline: Duration,
+    ) -> Result<Self, AdvancedPolicyRequested> {
+        let policy = Self {
+            quick_max,
+            unit_max,
+            full_as_background,
+            min_inline,
+        };
+        if policy.implies_advanced() {
+            return Err(AdvancedPolicyRequested);
+        }
+        Ok(policy)
     }
 
     /// Advanced-profile floors (see [`Self::advanced`]): the quick budget
@@ -207,9 +276,20 @@ impl VerificationPolicy {
     /// augmentation and must be constructed through [`Self::advanced_checked`]
     /// (config numeric combinations that imply it are refused ungated).
     pub const fn implies_advanced(&self) -> bool {
-        self.quick_max.as_nanos() >= Self::ADVANCED_QUICK_MAX.as_nanos()
-            || self.unit_max.as_nanos() >= Self::ADVANCED_UNIT_MAX.as_nanos()
-            || !self.full_as_background
+        Self::implies_advanced_params(self.quick_max, self.unit_max, self.full_as_background)
+    }
+
+    /// The pure numeric predicate behind [`Self::implies_advanced`] and
+    /// [`Self::local_checked`]: config layers can classify raw numbers
+    /// (seconds) WITHOUT constructing a policy.
+    pub const fn implies_advanced_params(
+        quick_max: Duration,
+        unit_max: Duration,
+        full_as_background: bool,
+    ) -> bool {
+        quick_max.as_nanos() >= Self::ADVANCED_QUICK_MAX.as_nanos()
+            || unit_max.as_nanos() >= Self::ADVANCED_UNIT_MAX.as_nanos()
+            || !full_as_background
     }
 
     /// The ONE gated constructor of the advanced profile: it succeeds ONLY
@@ -247,13 +327,13 @@ pub fn budget_for(
     policy: &VerificationPolicy,
     remaining_turn_budget: Option<Duration>,
 ) -> BudgetDecision {
-    if policy.quick_max.is_zero() && policy.unit_max.is_zero() {
+    if policy.quick_max().is_zero() && policy.unit_max().is_zero() {
         return BudgetDecision::RunAsTaskOwnedOperation;
     }
     let (cap, background) = match category {
-        CheckCategory::Quick => (policy.quick_max, false),
-        CheckCategory::Unit => (policy.unit_max, false),
-        CheckCategory::Full => (policy.unit_max, policy.full_as_background),
+        CheckCategory::Quick => (policy.quick_max(), false),
+        CheckCategory::Unit => (policy.unit_max(), false),
+        CheckCategory::Full => (policy.unit_max(), policy.full_as_background()),
     };
     if background {
         return BudgetDecision::RunAsTaskOwnedOperation;
@@ -265,7 +345,7 @@ pub fn budget_for(
         Some(remaining) => cap.min(remaining),
         None => cap,
     };
-    if budget < policy.min_inline {
+    if budget < policy.min_inline() {
         return BudgetDecision::RunAsTaskOwnedOperation;
     }
     BudgetDecision::RunInline(budget)
@@ -1434,35 +1514,53 @@ mod tests {
             VerificationPolicy::advanced_checked(&ValueGate::wired(std::sync::Arc::new(Entitled)))
                 .unwrap();
         assert_eq!(advanced, VerificationPolicy::advanced());
-        assert_eq!(advanced.quick_max, VerificationPolicy::ADVANCED_QUICK_MAX);
-        assert_eq!(advanced.unit_max, VerificationPolicy::ADVANCED_UNIT_MAX);
-        assert!(!advanced.full_as_background);
+        assert_eq!(advanced.quick_max(), VerificationPolicy::ADVANCED_QUICK_MAX);
+        assert_eq!(advanced.unit_max(), VerificationPolicy::ADVANCED_UNIT_MAX);
+        assert!(!advanced.full_as_background());
         assert_eq!(
             budget_for(CheckCategory::Full, &advanced, None),
             BudgetDecision::RunInline(VerificationPolicy::ADVANCED_UNIT_MAX)
         );
-        assert!(advanced.quick_max > VerificationPolicy::default().quick_max);
+        assert!(advanced.quick_max() > VerificationPolicy::default().quick_max());
         // The advanced profile (and anything at/above its floors, or full
         // checks inline) is classified as implying the paid augmentation;
         // the local default and the disabled policy never are.
         assert!(advanced.implies_advanced());
         assert!(!VerificationPolicy::default().implies_advanced());
         assert!(!VerificationPolicy::disabled().implies_advanced());
-        let deeper = VerificationPolicy {
-            quick_max: VerificationPolicy::ADVANCED_QUICK_MAX,
-            ..VerificationPolicy::default()
-        };
-        assert!(
-            deeper.implies_advanced(),
+        // The checked LOCAL constructor refuses both numeric shapes that
+        // reach the advanced depth: none of them can be built ungated.
+        let default = VerificationPolicy::default();
+        assert_eq!(
+            VerificationPolicy::local_checked(
+                VerificationPolicy::ADVANCED_QUICK_MAX,
+                default.unit_max(),
+                default.full_as_background(),
+                default.min_inline(),
+            ),
+            Err(AdvancedPolicyRequested),
             "a quick budget at the advanced floor implies the paid profile"
         );
-        let inline_full = VerificationPolicy {
-            full_as_background: false,
-            ..VerificationPolicy::default()
-        };
-        assert!(
-            inline_full.implies_advanced(),
+        assert_eq!(
+            VerificationPolicy::local_checked(
+                default.quick_max(),
+                default.unit_max(),
+                false,
+                default.min_inline(),
+            ),
+            Err(AdvancedPolicyRequested),
             "inline full checks imply the paid profile"
+        );
+        // The plain local default numbers stay constructible ungated.
+        assert_eq!(
+            VerificationPolicy::local_checked(
+                default.quick_max(),
+                default.unit_max(),
+                default.full_as_background(),
+                default.min_inline(),
+            )
+            .unwrap(),
+            default
         );
 
         // The denied plan is refused typed AT THE CONSTRUCTOR, naming the

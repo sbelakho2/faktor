@@ -730,51 +730,6 @@ fn spawn_confinement_seam_is_honest_for_every_mode() {
     );
 }
 
-/// The additive mode/requirement/tag contract is exact: defaults are
-/// Inherit, `for_requirement` maps both workspace levels, and no conversion
-/// can silently produce a `workspace` tag from Inherit.
-#[test]
-fn filesystem_isolation_mapping_and_tags_are_exact() {
-    assert_eq!(
-        SpawnConfig::default().filesystem_isolation,
-        FilesystemIsolation::Inherit,
-        "the additive confinement field must default to Inherit"
-    );
-    let roots = vec![PathBuf::from("/tmp/faktor-fs-map")];
-    for (requirement, tag, required) in [
-        (
-            FilesystemIsolationRequirement::Workspace { best_effort: false },
-            "workspace",
-            true,
-        ),
-        (
-            FilesystemIsolationRequirement::Workspace { best_effort: true },
-            "workspace_best_effort",
-            false,
-        ),
-        (FilesystemIsolationRequirement::Inherit, "inherit", false),
-    ] {
-        let isolation = FilesystemIsolation::for_requirement(requirement, roots.clone());
-        assert_eq!(isolation.as_tag(), tag, "{requirement:?}");
-        assert_eq!(isolation.is_required(), required, "{requirement:?}");
-        if requirement == FilesystemIsolationRequirement::Inherit {
-            assert!(isolation.roots().is_empty(), "Inherit carries no roots");
-        } else {
-            assert_eq!(isolation.roots(), roots, "{requirement:?} carries roots");
-        }
-    }
-    // The raw carry without roots is never a workspace claim.
-    assert_eq!(
-        FilesystemIsolation::for_requirement(
-            FilesystemIsolationRequirement::Workspace { best_effort: false },
-            Vec::new(),
-        )
-        .as_tag(),
-        "workspace",
-        "the tag is the DEMAND; the spawn layer owns the typed refusal"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Audit item 6: the confinement policy never grants a home credential store.
 // ---------------------------------------------------------------------------

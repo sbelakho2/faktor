@@ -1709,9 +1709,9 @@ impl AgentRuntime {
             let budget = match service.budget_for(&spec) {
                 BudgetDecision::RunInline(budget) => budget,
                 BudgetDecision::RunAsTaskOwnedOperation if !background_service => {
-                    service.policy().unit_max
+                    service.policy().unit_max()
                 }
-                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max(),
             };
             let background_job = background_service
                 && matches!(
@@ -1818,7 +1818,7 @@ impl AgentRuntime {
                         .map(|a| a.to_string_lossy().into_owned())
                         .collect(),
                     spec_json: serde_json::to_string(spec).unwrap_or_default(),
-                    budget_ms: service.policy().unit_max.as_millis() as u64,
+                    budget_ms: service.policy().unit_max().as_millis() as u64,
                 })
                 .collect();
             // Schema v2 (audits 94/116/117): fingerprint the environment the
@@ -2114,13 +2114,25 @@ impl AgentRuntime {
     }
 }
 
+/// Bounded attempts of the durable-record re-read that resolves absorbed
+/// samples. A transient store failure must not silently collapse into an
+/// empty absorbed set (which would re-feed every sample per call and
+/// double-count the router's `model_outcome_stats`).
+const ABSORBED_SAMPLES_READ_ATTEMPTS: usize = 3;
+
 /// The samples a durable engineering record has ALREADY absorbed after one
 /// `record_terminal_run` attempt (the single-feed rule): the record's
 /// `verified_samples` when a record exists — ours (`Ok(Some(_))`), a
 /// pre-existing one (`Ok(None)`), or a CONCURRENT winner's
 /// ([`Conflict`](faktor_store::StoreError::Conflict), whose atomic append
-/// absorbed ITS samples) — and nothing when no record exists or the attempt
-/// failed for any other reason.
+/// absorbed ITS samples) — and nothing when the attempt failed for any
+/// other reason. The durable read is retried a bounded number of times; if
+/// it STILL fails the fallback is NON-double-counting: both producers
+/// derive the record's samples from the SAME frozen `terminal_run_facts`
+/// outbox, so the current facts' samples ARE what the winner's append
+/// absorbed and are reported as absorbed rather than re-fed per call (a
+/// persistently unreadable record can at worst postpone coverage, never
+/// count a sample twice).
 pub(super) fn resolve_absorbed_samples(
     ledger: &OutcomeLedger,
     run_id: &str,
@@ -2130,26 +2142,38 @@ pub(super) fn resolve_absorbed_samples(
     >,
     facts: &TerminalRunFacts,
 ) -> Vec<RunVerifiedSample> {
-    let durable_samples = || {
-        ledger
-            .get(run_id)
-            .ok()
-            .flatten()
-            .map(|record| record.verified_samples)
-            .unwrap_or_default()
+    let durable_samples = || -> Option<Vec<RunVerifiedSample>> {
+        for attempt in 1..=ABSORBED_SAMPLES_READ_ATTEMPTS {
+            match ledger.get(run_id) {
+                Ok(Some(record)) => return Some(record.verified_samples),
+                Ok(None) => return Some(Vec::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        run_id,
+                        attempt,
+                        attempts = ABSORBED_SAMPLES_READ_ATTEMPTS,
+                        %error,
+                        "durable outcome record read failed while reconciling absorbed samples; \
+                         retrying"
+                    );
+                }
+            }
+        }
+        None
     };
     match attempt {
         // The append (or its byte-identical replay) carried exactly the
         // facts' samples.
         Ok(Some(_)) => facts.samples.clone(),
-        // The record pre-existed: its durable samples are the truth.
-        Ok(None) => durable_samples(),
+        // The record pre-existed: its durable samples are the truth; a
+        // persistently unreadable record falls back to the frozen facts.
+        Ok(None) => durable_samples().unwrap_or_else(|| facts.samples.clone()),
         // A CONCURRENT producer won with a different row: its atomic append
         // already absorbed ITS samples, so the loser must resolve coverage
         // against the durable record rather than re-feeding per call.
         Err(crate::outcome_ledger::OutcomeLedgerError::Store(
             faktor_store::StoreError::Conflict(_),
-        )) => durable_samples(),
+        )) => durable_samples().unwrap_or_else(|| facts.samples.clone()),
         Err(_) => Vec::new(),
     }
 }

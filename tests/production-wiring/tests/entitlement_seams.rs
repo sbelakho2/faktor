@@ -124,14 +124,14 @@ fn advanced_verification_policy_is_built_through_the_gated_constructor_when_enti
         "the daemon graph's verification service carries the ADVANCED policy"
     );
     assert_eq!(
-        policy.quick_max,
+        policy.quick_max(),
         faktor_verify::exec::VerificationPolicy::ADVANCED_QUICK_MAX
     );
     assert_eq!(
-        policy.unit_max,
+        policy.unit_max(),
         faktor_verify::exec::VerificationPolicy::ADVANCED_UNIT_MAX
     );
-    assert!(!policy.full_as_background);
+    assert!(!policy.full_as_background());
 }
 
 /// A plan that does not map the entitlement refuses the DAEMON typed at the
@@ -255,7 +255,7 @@ fn numeric_advanced_combination_is_gated_by_the_entitlement() {
         "the numeric combination must resolve to the advanced profile"
     );
     assert_eq!(
-        graph.verification.policy().quick_max,
+        graph.verification.policy().quick_max(),
         faktor_verify::exec::VerificationPolicy::ADVANCED_QUICK_MAX
     );
 }

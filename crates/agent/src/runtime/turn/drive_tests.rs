@@ -1948,7 +1948,7 @@ fn losing_concurrent_append_never_refeeds_the_winners_samples() {
     assert!(absorbed.is_empty());
     // The reconciliation is PER SAMPLE: a call the record did not absorb
     // keeps the per-call feed (never all-or-nothing).
-    let mut divergent_call = call;
+    let mut divergent_call = call.clone();
     divergent_call.model = "m2".into();
     assert!(!super::drive::take_absorbed_sample(
         &mut absorbed,
@@ -1957,10 +1957,46 @@ fn losing_concurrent_append_never_refeeds_the_winners_samples() {
     ));
     // The pre-existing-record path resolves to the same durable samples.
     let preexisting = super::drive::resolve_absorbed_samples(&ledger, run_id, Ok(None), &facts);
-    assert_eq!(preexisting, vec![sample]);
+    assert_eq!(preexisting, vec![sample.clone()]);
     assert_eq!(
         view.stats(&key).unwrap().sample_count,
         1,
         "the shared sample was fed exactly once"
+    );
+    // FAULT INJECTION (Conflict + failed durable read): the read itself
+    // fails AFTER the conflict. The loser must still count the shared
+    // sample exactly once —
+    // - a TRANSIENT failure (fewer failures than the bounded attempts) is
+    //   retried and surfaces the winner's durable samples;
+    // - a PERSISTENT failure falls back to the frozen terminal-turn facts
+    //   (what the winner's append absorbed), never to the per-call feed.
+    let conflict = || {
+        Err(OutcomeLedgerError::Store(
+            faktor_store::StoreError::Conflict("injected concurrent winner".into()),
+        ))
+    };
+    for failures in [2usize, usize::MAX] {
+        let flaky = OutcomeLedger::with_failed_reads(store.clone(), failures);
+        let mut absorbed =
+            super::drive::resolve_absorbed_samples(&flaky, run_id, conflict(), &facts);
+        assert_eq!(
+            absorbed,
+            vec![sample.clone()],
+            "failures={failures}: the shared sample must stay absorbed"
+        );
+        assert!(
+            super::drive::take_absorbed_sample(
+                &mut absorbed,
+                &call,
+                &CompletionGate::VerifiedComplete
+            ),
+            "failures={failures}: the call must switch to telemetry-only, never re-feed"
+        );
+        assert!(absorbed.is_empty(), "failures={failures}");
+    }
+    assert_eq!(
+        view.stats(&key).unwrap().sample_count,
+        1,
+        "after Conflict + failed read the sample is still counted exactly once"
     );
 }

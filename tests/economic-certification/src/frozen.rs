@@ -37,6 +37,9 @@ pub const MAX_TOKEN_COUNT: u64 = 10_000_000;
 pub const MAX_SPEND_MICRO: u64 = 1_000_000_000_000;
 pub const MAX_ATTEMPT_MS: u64 = 3_600_000;
 pub const MAX_DIFF_LINES: usize = 400;
+/// Hard bound on the recorded normalization exclusions of one attempt: every
+/// excluded section of the turn's provider calls, in call order.
+pub const MAX_VOLATILE_SECTIONS: usize = 64;
 
 /// Which model-size/placeholder arm of the experiment a run belongs to.
 ///
@@ -247,6 +250,21 @@ pub struct FrozenRuntimeEvidence {
     pub files_applied: u64,
 }
 
+/// One explicitly recorded normalization exclusion of the runtime arm's
+/// wire-request hashing: the DOCUMENTED rule name, the EXACT bytes removed
+/// from the system text, and the frozen rationale. This is capture-time
+/// evidence — the extracted bytes are scheduling-dependent by design (that
+/// is why the rule exists at all) — so replay and regeneration verify the
+/// rule vocabulary and completeness, never the volatile bytes themselves;
+/// the hash identity stays the normalized text ([`FrozenAttempt::prompt_blake3`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenVolatileSection {
+    pub name: String,
+    pub extract: String,
+    pub rationale: String,
+}
+
 /// One settled model attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -271,6 +289,14 @@ pub struct FrozenAttempt {
     pub verification: FrozenVerification,
     pub prompt_blake3: String,
     pub prompt_tokens_est: u64,
+    /// Every wire section the runtime-arm hashing normalized OUT of this
+    /// attempt's provider calls, in call order: the rule name, the exact
+    /// removed bytes and the frozen rationale. Empty for the non-runtime
+    /// arms (they hash their rendered prompt without normalization). The
+    /// recorded extracts make the exclusion provable instead of hidden; a
+    /// rule not in the documented vocabulary fails artifact validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volatile: Vec<FrozenVolatileSection>,
     /// Runtime-drive evidence; `Some` exactly for the
     /// `full_daemon_runtime` arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,6 +528,34 @@ fn validate_run(run: &FrozenRun, capture: &FrozenCapture) -> Result<(), String> 
                 ))
             }
             (false, None) => {}
+        }
+        if run.prompt.arm.is_runtime() {
+            if attempt.volatile.len() > MAX_VOLATILE_SECTIONS {
+                return Err(format!(
+                    "{}: attempt records {} volatile normalization sections (bound {MAX_VOLATILE_SECTIONS})",
+                    run.task_id,
+                    attempt.volatile.len()
+                ));
+            }
+            for section in &attempt.volatile {
+                if section.extract.is_empty() || section.extract.len() > MAX_FROZEN_TEXT_BYTES {
+                    return Err(format!(
+                        "{}: volatile section '{}' extract is empty or exceeds the bound",
+                        run.task_id, section.name
+                    ));
+                }
+                if !crate::daemon_arm::documented_volatile_rule(&section.name, &section.rationale) {
+                    return Err(format!(
+                        "{}: volatile section names an UNDOCUMENTED normalization rule: {}",
+                        run.task_id, section.name
+                    ));
+                }
+            }
+        } else if !attempt.volatile.is_empty() {
+            return Err(format!(
+                "{}: non-runtime attempts never carry volatile normalization evidence",
+                run.task_id
+            ));
         }
         if let Some(raw) = &attempt.raw_response {
             if raw.len() > MAX_RAW_RESPONSE_BYTES {

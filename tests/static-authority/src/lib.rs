@@ -9038,4 +9038,158 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert_eq!(vanished.len(), 1);
         assert!(vanished[0].contains("no longer above"), "{vanished:?}");
     }
+
+    // ------------------------------------------------------------------
+    // scan 18: the ADVANCED verification policy is never constructed
+    // unchecked (fields private, constructors checked)
+    // ------------------------------------------------------------------
+
+    /// Marker of a struct-literal / definition of the paid verification
+    /// policy. Field privacy already makes a cross-crate literal a compile
+    /// error; this scan proves no PRODUCTION source in the workspace keeps
+    /// a literal construction path around the checked constructors
+    /// (`local_checked` / `advanced_checked`).
+    const POLICY_LITERAL_MARKER: &str = "VerificationPolicy {";
+
+    /// Production occurrences of the policy literal that are NOT the struct
+    /// definition, an `impl` block, or a return type: those are the
+    /// unchecked construction shapes. Three exclusions, each documented: a
+    /// word boundary before the type (so `ContractVerificationPolicy {`
+    /// never matches), and the line carrying `struct `/`impl `/`->` (the
+    /// definition, its impls and function signatures — none of them a
+    /// struct literal).
+    fn policy_unchecked_construction_offenders(f: &File<'_>) -> Vec<String> {
+        let mut hits = Vec::new();
+        for &(start, end) in &f.kept {
+            let range = &f.src[start..end];
+            let mut pos = 0usize;
+            while let Some(rel) = range[pos..].find(POLICY_LITERAL_MARKER) {
+                let at = start + pos + rel;
+                let boundary = f
+                    .src
+                    .as_bytes()
+                    .get(at.wrapping_sub(1))
+                    .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+                let line = trim_line(f.src, at);
+                let declarative =
+                    line.contains("struct ") || line.contains("impl ") || line.contains("->");
+                if boundary && !declarative {
+                    hits.push(format!(
+                        "{}:{}: {line}  [VerificationPolicy fields are private and the ADVANCED \
+                         profile is gated: construct through \
+                         VerificationPolicy::local_checked, the Default/disabled profiles, or \
+                         advanced_checked(gate)]",
+                        f.rel,
+                        line_of(f.src, at),
+                    ));
+                }
+                pos += rel + POLICY_LITERAL_MARKER.len();
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    /// Collect the production (non-test) kept ranges of one file as text,
+    /// newline-joined, for field-visibility assertions.
+    fn kept_text(f: &File<'_>) -> String {
+        f.kept
+            .iter()
+            .map(|&(s, e)| &f.src[s..e])
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every production source in every crate is scanned; the ONLY allowed
+    /// `VerificationPolicy {` occurrence is the definition (excluded) —
+    /// there is no allowlist. The definition itself is pinned: private
+    /// fields, both checked constructors and the typed accessors must stay.
+    #[test]
+    fn verification_policy_is_never_constructed_unchecked() {
+        let mut scanned = 0usize;
+        let mut offenders = Vec::new();
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else { continue };
+            if !f.kept.is_empty() {
+                scanned += 1;
+            }
+            offenders.extend(policy_unchecked_construction_offenders(&f));
+        }
+        assert_no_offenders(
+            "verification-policy scan: the ADVANCED verification policy must never be \
+             constructed through a struct literal; the fields are private and the only \
+             constructors are local_checked / advanced_checked(gate)",
+            &offenders,
+            scanned,
+            50,
+        );
+        // The one allowed literal is the definition: its production range
+        // must keep every field PRIVATE and both checked constructors plus
+        // the typed accessors present.
+        let f = load("crates/verify/src/exec.rs").expect("verify exec.rs must load");
+        let text = kept_text(&f);
+        for field in [
+            "pub quick_max:",
+            "pub unit_max:",
+            "pub full_as_background:",
+            "pub min_inline:",
+        ] {
+            assert!(
+                !text.contains(field),
+                "VerificationPolicy field `{field}` must stay private"
+            );
+        }
+        for required in [
+            "pub fn local_checked(",
+            "pub fn advanced_checked(",
+            "pub const fn quick_max(&self)",
+            "pub const fn unit_max(&self)",
+            "pub const fn full_as_background(&self)",
+            "pub const fn min_inline(&self)",
+        ] {
+            assert!(
+                text.contains(required),
+                "VerificationPolicy must keep `{required}`"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_literal_scan_fires_on_planted_unchecked_constructions() {
+        for planted in [
+            "fn f() {\n    let _p = VerificationPolicy { quick_max: X };\n}\n",
+            "fn f2() {\n    g(VerificationPolicy { unit_max: X });\n}\n",
+            "fn f3() -> bool {\n    matches!(p, VerificationPolicy { .. })\n}\n",
+        ] {
+            let f = synthetic_file("crates/agent/src/evil.rs", planted);
+            assert!(
+                !policy_unchecked_construction_offenders(&f).is_empty(),
+                "the policy-literal gate must fire on a planted literal: {planted}"
+            );
+        }
+        // The definition, its impls, return types and a same-suffix type are
+        // exempt...
+        for exempt in [
+            "pub struct VerificationPolicy {\n    quick_max: Duration,\n}\n",
+            "impl Default for VerificationPolicy {\n    fn default() -> Self { todo!() }\n}\n",
+            "pub fn policy(&self) -> crate::exec::VerificationPolicy {\n    todo!()\n}\n",
+            "pub struct ContractVerificationPolicy {\n    x: u8,\n}\n",
+        ] {
+            let f = synthetic_file("crates/verify/src/exec.rs", exempt);
+            assert!(
+                policy_unchecked_construction_offenders(&f).is_empty(),
+                "the policy-literal gate must not fire on `{exempt}`"
+            );
+        }
+        // A test-gated literal can never certify (nor fail) production.
+        let f = synthetic_file(
+            "crates/agent/src/evil.rs",
+            "#[cfg(test)]\nmod tests {\n    fn t() { let _ = VerificationPolicy { quick_max: X }; }\n}\n",
+        );
+        assert!(policy_unchecked_construction_offenders(&f).is_empty());
+    }
 }

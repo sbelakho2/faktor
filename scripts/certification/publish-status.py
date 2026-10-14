@@ -28,6 +28,7 @@ import hmac
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -76,13 +77,14 @@ def platform_signature(platform, sha, tree, run, state, context, key):
     return mac.hexdigest()
 
 
-def platform_key_from_env(platform):
+def platform_key_from_env(platform, environ=None):
+    env = os.environ if environ is None else environ
     normalized = re.sub(r"[^a-z0-9]+", "_", str(platform).lower())
     for name in (
         f"faktor_platform_status_key_{normalized}",
         f"FAKTOR_PLATFORM_STATUS_KEY_{normalized.upper()}",
     ):
-        value = os.environ.get(name, "")
+        value = env.get(name, "")
         if value:
             return value
     return ""
@@ -189,6 +191,7 @@ def selftest():
             check(f"refuses {bad!r}", True)
 
     seen = {}
+    request_bodies = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -196,9 +199,11 @@ def selftest():
 
         def do_POST(self):
             length = int(self.headers.get("content-length", "0"))
+            body = json.loads(self.rfile.read(length) or b"{}")
             seen["url"] = self.path
             seen["auth"] = self.headers.get("authorization")
-            seen["body"] = json.loads(self.rfile.read(length) or b"{}")
+            seen["body"] = body
+            request_bodies.append(body)
             self.send_response(201)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", "2")
@@ -208,9 +213,11 @@ def selftest():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    environ_before = dict(os.environ)
+    api = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         publish(
-            f"http://127.0.0.1:{server.server_address[1]}",
+            api,
             "acme/widgets",
             "a" * 40,
             "success",
@@ -219,38 +226,131 @@ def selftest():
             "",
             "selftest-token",
         )
-    finally:
-        server.shutdown()
-    check("posts to the exact-sha statuses path", seen.get("url") == f"/repos/acme/widgets/statuses/{'a' * 40}")
-    check("posts with bearer auth", seen.get("auth") == "Bearer selftest-token")
-    check(
-        "body binds state/context/description",
-        seen.get("body", {}).get("state") == "success"
-        and seen["body"]["context"] == "ci/faktor/trusted-certified-linux"
-        and seen["body"]["description"] == f"tree={'b' * 40} run=7:linux",
-    )
+        check("posts to the exact-sha statuses path", seen.get("url") == f"/repos/acme/widgets/statuses/{'a' * 40}")
+        check("posts with bearer auth", seen.get("auth") == "Bearer selftest-token")
+        check(
+            "body binds state/context/description",
+            seen.get("body", {}).get("state") == "success"
+            and seen["body"]["context"] == "ci/faktor/trusted-certified-linux"
+            and seen["body"]["description"] == f"tree={'b' * 40} run=7:linux",
+        )
 
-    # Platform signing parity: the canonical payload must hash to the SAME
-    # digest the JS/PowerShell implementations produce (vector pinned in
-    # publish-status.mjs / the windows publisher as well).
-    expected = "5fe2c03b7870f4b45a9f5ae83392cae87eb7a3effe2d76d20551a88034d08aab"
-    actual = platform_signature(
-        "darwin", "a" * 40, "b" * 40, "700:darwin", "success",
-        "ci/faktor/trusted-certified-darwin", "darwin-secret",
-    )
-    check("platform signature matches the pinned canonical vector", actual == expected)
-    saved_key = os.environ.get("FAKTOR_PLATFORM_STATUS_KEY_DARWIN")
-    os.environ["FAKTOR_PLATFORM_STATUS_KEY_DARWIN"] = "k"
-    try:
+        # Platform signing parity: the canonical payload must hash to the SAME
+        # digest the JS/PowerShell implementations produce (vector pinned in
+        # publish-status.mjs / the windows publisher as well).
+        expected = "5fe2c03b7870f4b45a9f5ae83392cae87eb7a3effe2d76d20551a88034d08aab"
+        actual = platform_signature(
+            "darwin", "a" * 40, "b" * 40, "700:darwin", "success",
+            "ci/faktor/trusted-certified-darwin", "darwin-secret",
+        )
+        check("platform signature matches the pinned canonical vector", actual == expected)
+
+        # Key lookup is HERMETIC: the unit checks pass an EXPLICIT mapping
+        # (mirroring the JS `platformKeyFromEnv(platform, env)`), so they can
+        # neither read nor mutate the ambient process environment. The `{}`
+        # mapping is the witness that an explicit mapping never falls back to
+        # os.environ, even when the real lane's key is exported.
         check(
             "platform key lookup accepts the uppercase env form",
-            platform_key_from_env("darwin") == "k",
+            platform_key_from_env("darwin", {"FAKTOR_PLATFORM_STATUS_KEY_DARWIN": "k"}) == "k",
         )
+        check(
+            "platform key lookup prefers the lowercase spelling when both exist",
+            platform_key_from_env(
+                "darwin",
+                {
+                    "faktor_platform_status_key_darwin": "lower",
+                    "FAKTOR_PLATFORM_STATUS_KEY_DARWIN": "upper",
+                },
+            )
+            == "lower",
+        )
+        check(
+            "platform key lookup never leaks ambient os.environ into an explicit mapping",
+            platform_key_from_env("darwin", {}) == "",
+        )
+
+        # Platform publish mode: both cases run the REAL CLI as a child
+        # process with an explicitly constructed environment (the JS selftest
+        # hermeticity fix mirrored here): every ambient
+        # FAKTOR_PLATFORM_STATUS_KEY_* spelling is scrubbed from the child env
+        # and only the keys for the case under test are planted, so the
+        # selftest is hermetic whether the real secrets are present or absent.
+        # process env is never mutated.
+        def hermetic_child_env(extra=None):
+            env = dict(os.environ)
+            for name in list(env):
+                if name.upper().startswith("FAKTOR_PLATFORM_STATUS_KEY_"):
+                    del env[name]
+            if extra:
+                env.update(extra)
+            return env
+
+        def run_publisher_child(env):
+            try:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        os.path.abspath(__file__),
+                        "publish",
+                        "--api", api,
+                        "--repo", "acme/widgets",
+                        "--sha", "a" * 40,
+                        "--state", "success",
+                        "--context", "ci/faktor/trusted-certified-darwin",
+                        "--platform", "darwin",
+                        "--tree", "b" * 40,
+                        "--run-prefix", "700",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess([], 124, "", "selftest child timed out")
+
+        tree = "b" * 40
+        before_platform = len(request_bodies)
+        planted = run_publisher_child(
+            hermetic_child_env(
+                {
+                    "GITHUB_STATUS_TOKEN": "selftest-token",
+                    "FAKTOR_PLATFORM_STATUS_KEY_DARWIN": "darwin-secret",
+                }
+            )
+        )
+        posted = request_bodies[-1] if len(request_bodies) == before_platform + 1 else {}
+        check(
+            "platform publish signs the constructed description",
+            planted.returncode == 0
+            and posted.get("state") == "success"
+            and posted.get("context") == "ci/faktor/trusted-certified-darwin"
+            and posted.get("description") == f"tree={tree} run=700:darwin sig={expected}",
+        )
+
+        # Refusal: the scrubbed child env carries only the OTHER platforms'
+        # keys, so this asserts "no key of its OWN", not merely "empty
+        # environment"; the typed refusal happens before any request.
+        before_refusal = len(request_bodies)
+        refused = run_publisher_child(
+            hermetic_child_env(
+                {
+                    "GITHUB_STATUS_TOKEN": "selftest-token",
+                    "faktor_platform_status_key_linux": "selftest-linux-key",
+                    "FAKTOR_PLATFORM_STATUS_KEY_WINDOWS": "selftest-windows-key",
+                }
+            )
+        )
+        check(
+            "platform publish without its own key refuses (fail closed)",
+            refused.returncode != 0
+            and "github-status-platform-key-missing" in (refused.stdout + refused.stderr),
+        )
+        check("platform key refusal makes no request", len(request_bodies) == before_refusal)
+        check("selftest never mutates os.environ", os.environ == environ_before)
     finally:
-        if saved_key is None:
-            os.environ.pop("FAKTOR_PLATFORM_STATUS_KEY_DARWIN", None)
-        else:
-            os.environ["FAKTOR_PLATFORM_STATUS_KEY_DARWIN"] = saved_key
+        server.shutdown()
 
     if failures:
         print(f"publish-status.py selftest: FAIL ({len(failures)})", file=sys.stderr)
