@@ -244,3 +244,228 @@ fn agent_home_defaults_to_scratch_and_operator_grant_parses_strictly() {
     // The whole section keeps denying unknown keys.
     assert!(serde_json::from_str::<Config>(r#"{"sandbox": {"homes": "scratch"}}"#).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Audit confirmation (tamper evidence): a decision document alone grants
+// nothing; only a document matching its append-only entry is a decision.
+// ---------------------------------------------------------------------------
+
+/// A well-formed grant document EXACTLY as `record_decision` writes it, but
+/// with no audit trail behind it.
+fn forged_grant_record() -> Vec<u8> {
+    serde_json::to_vec_pretty(&SandboxFirstRunRecord {
+        version: SANDBOX_FIRST_RUN_VERSION,
+        choice: SandboxShellChoice::NetworkCapableUserGranted,
+        decided_at_ms: 42,
+        platform: std::env::consts::OS.to_string(),
+        network_backend_available: network_backend_available(),
+        trade_off: NETWORK_CAPABLE_SHELL_TRADE_OFF.to_string(),
+    })
+    .unwrap()
+}
+
+/// Item: a hand-written decision document — even a byte-perfect grant — is
+/// NOT an operator decision; only the recorded path (audit FIRST, then the
+/// document) is. Flipping a recorded fail-closed into a grant or mutating a
+/// recorded field is refused; restoring the exact recorded document is
+/// accepted again (the check is exact, never a blanket refusal).
+#[test]
+fn a_forged_or_flipped_decision_document_grants_nothing() {
+    let dir = tmp();
+    let data_dir = dir.path();
+
+    // (1) A perfect forged grant alone: refused typed, fail-closed, and
+    // never presented as a recorded decision.
+    std::fs::write(decision_path(data_dir), forged_grant_record()).unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::FailClosed,
+        "a document with no matching audit entry must never grant"
+    );
+    assert!(
+        state.record.is_none(),
+        "an unconfirmed document is not a recorded decision"
+    );
+    assert!(state
+        .corrupt_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("audit"));
+    assert_eq!(cfg.sandbox.shell, None, "no forge path may set the mode");
+    assert_eq!(
+        cfg.sandbox.network_guarantee,
+        faktor_sandbox::SandboxGuarantee::Required
+    );
+
+    // (2) The recorded grant (audit + document) IS accepted — including
+    // when the same timestamp is used, proving the confirmation is exact.
+    let recorded =
+        record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 42).unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted
+    );
+    assert_eq!(state.record.as_ref(), Some(&recorded));
+
+    // (3) Mutating ONE recorded field (the backend fact) breaks the match.
+    let mut flipped = recorded.clone();
+    flipped.network_backend_available = !flipped.network_backend_available;
+    std::fs::write(
+        decision_path(data_dir),
+        serde_json::to_vec_pretty(&flipped).unwrap(),
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert_eq!(cfg.sandbox.shell, None);
+
+    // (4) Flipping a recorded FAIL-CLOSED into a grant cannot reuse the
+    // fail-closed audit event.
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 7).unwrap();
+    let original = std::fs::read(decision_path(data_dir)).unwrap();
+    let mut forged: SandboxFirstRunRecord = serde_json::from_slice(&original).unwrap();
+    forged.choice = SandboxShellChoice::NetworkCapableUserGranted;
+    forged.trade_off = NETWORK_CAPABLE_SHELL_TRADE_OFF.to_string();
+    std::fs::write(
+        decision_path(data_dir),
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+    let state = apply_effective_choice(&mut Config::default(), data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some());
+
+    // (5) Restoring the exact recorded document is accepted again.
+    std::fs::write(decision_path(data_dir), &original).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert!(state.record.is_some());
+}
+
+/// A legitimate record whose audit trail is replaced by a hostile
+/// multi-megabyte file is untrusted (fail closed, loud), and a decision
+/// document beyond its own byte bound is refused WITHOUT being read.
+#[test]
+fn oversized_decision_and_audit_files_fail_closed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 3).unwrap();
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(audit_path(data_dir))
+            .unwrap();
+        // 5 MiB of sparse zeros: far beyond the confirm bound and containing
+        // no matching entry.
+        file.set_len(5 * 1024 * 1024).unwrap();
+    }
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some());
+    assert_eq!(cfg.sandbox.shell, None);
+
+    // A decision document past 64 KiB is refused as oversized: never a
+    // parse of a hostile multi-gigabyte file, never a grant.
+    std::fs::write(decision_path(data_dir), vec![b'x'; 128 * 1024]).unwrap();
+    let state = apply_effective_choice(&mut Config::default(), data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state
+        .corrupt_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("bound"));
+    assert!(load_decision(data_dir).is_err());
+}
+
+/// A non-regular object planted at either artifact path is hostile input:
+/// a FIFO at the decision path must be refused (never opened — opening one
+/// would block every daemon start), and a symlinked audit trail is never
+/// followed. Both stay fail-closed and loud.
+#[cfg(unix)]
+#[test]
+fn non_regular_decision_and_audit_objects_fail_closed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+
+    let fifo = decision_path(data_dir);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be available on unix hosts");
+    assert!(status.success(), "mkfifo failed: {status:?}");
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(
+        state
+            .corrupt_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("regular file"),
+        "{:?}",
+        state.corrupt_reason
+    );
+    assert_eq!(cfg.sandbox.shell, None);
+    std::fs::remove_file(&fifo).unwrap();
+
+    // A recorded decision whose audit trail was swapped for a symlink is
+    // untrusted: the trail is never followed to another file.
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 5).unwrap();
+    let real = data_dir.join("real-audit.jsonl");
+    std::fs::rename(audit_path(data_dir), &real).unwrap();
+    std::os::unix::fs::symlink(&real, audit_path(data_dir)).unwrap();
+    let state = apply_effective_choice(&mut Config::default(), data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(
+        state
+            .corrupt_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("regular file"),
+        "{:?}",
+        state.corrupt_reason
+    );
+}
+
+/// Compaction of a hostile 64 MiB audit file reads only a bounded tail:
+/// the trail lands bounded, the new decision stays auditable, and the
+/// record is still confirmed afterwards.
+#[test]
+fn audit_compaction_of_a_hostile_oversized_file_stays_bounded() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    std::fs::create_dir_all(data_dir).unwrap();
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(audit_path(data_dir))
+            .unwrap();
+        // Sparse zeros carry no newline, so the retained tail is empty and
+        // only the new entry survives — but the READ itself must never
+        // materialize the 64 MiB file.
+        file.set_len(64 * 1024 * 1024).unwrap();
+    }
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 11).unwrap();
+    let compacted = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    assert!(compacted.contains("sandbox_choice_fail_closed_recorded"));
+    assert!(
+        compacted.len() <= 1024 * 1024,
+        "compaction must stay bounded: {} bytes",
+        compacted.len()
+    );
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert!(state.record.is_some());
+}

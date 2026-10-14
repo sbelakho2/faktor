@@ -1,0 +1,9 @@
+{
+  "id": "INV-SANDBOX-FIRST-RUN-AUDIT-CONFIRMED",
+  "file": "crates/cli/src/config/first_run.rs",
+  "find": "        Ok(Some(record)) => match audit_confirms(data_dir, &record) {\n            Ok(()) => (Some(record), None),\n            Err(reason) => (None, Some(reason)),\n        },\n",
+  "replace": "        Ok(Some(record)) => (Some(record), None), // (planted mutation) audit confirmation removed\n",
+  "gate": "cargo test -p faktor-cli first_run_tests",
+  "expect": "must never grant|no matching audit entry|not a recorded decision",
+  "note": "Removing the audit confirmation accepts a hand-forged or field-flipped sandbox decision document as an operator grant; the tamper-evidence tests must catch it."
+}
