@@ -59,6 +59,15 @@
 // skipped silently and surfaces as a typed environment-missing gate failure,
 // never as a fabricated detection.
 //
+// Shared cargo cache: CARGO_TARGET_DIR is reused across specs, and cargo
+// compares source mtimes at WHOLE-SECOND granularity — a fast mutated build
+// and the restore that follows can share a second, after which a later
+// control finds the restored source "unchanged" and reuses the MUTATED
+// artifact. The runner therefore invalidates the spec's mutated packages (and
+// the packages its gate names) before the control and again after the mutated
+// run — the only mtime-independent invalidation. A failed invalidation is an
+// environment failure, never a detection.
+//
 // Modes:
 //   node scripts/mutation-run.mjs <id>        run one spec (registry command)
 //   node scripts/mutation-run.mjs --check-specs
@@ -71,9 +80,9 @@
 // compile, missing expected signature, or the gate passed with the mutation
 // live); 2 usage or spec errors.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { provisionSupport } from './mutation-support.mjs';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,6 +173,89 @@ function materializeGateDependencies(sourceRoot, scratch) {
         `mutation-run: gate dependency ${rel} could not be materialized (${error.message}); gates that need it report environment-missing`,
       );
     }
+  }
+}
+
+/**
+ * The environment every gate — and the cargo invalidation step — runs with.
+ * CARGO_TARGET_DIR is a shared cache outside the scratch copy (compilations
+ * are reused across specs), FAKTOR_MUTATION_SOURCE_ROOT points at the ORIGINAL
+ * checkout so pinned toolchains resolve read-only from the trusted tree.
+ */
+function gateEnvironment() {
+  const env = { ...process.env };
+  if (!env.CARGO_TARGET_DIR) {
+    env.CARGO_TARGET_DIR = join(SCRIPT_ROOT, 'target', 'mutation-campaign');
+  }
+  env.FAKTOR_MUTATION_SOURCE_ROOT = SCRIPT_ROOT;
+  return env;
+}
+
+/** The name of the cargo package whose manifest governs `fileAbs`, or null. */
+function cargoPackageOf(fileAbs) {
+  let dir = dirname(resolve(fileAbs));
+  const scratch = resolve(GATE_ROOT);
+  while (dir.startsWith(scratch)) {
+    const manifest = join(dir, 'Cargo.toml');
+    if (existsSync(manifest)) {
+      const text = readFileSync(manifest, 'utf8');
+      const section = /\[package\]([\s\S]*?)(?=\n\[|$)/.exec(text);
+      const name = section === null ? null : /^\s*name\s*=\s*"([^"]+)"/m.exec(section[1]);
+      return name === null ? null : name[1];
+    }
+    if (dir === scratch) break;
+    dir = dirname(dir);
+  }
+  return null;
+}
+
+/**
+ * Deterministically invalidate the cargo artifacts a spec can poison. Cargo
+ * compares source mtimes at WHOLE-SECOND granularity, so a fast mutated build
+ * and the restore that follows can land in the same second; afterwards a
+ * control run would treat the restored source as unchanged and reuse the
+ * MUTATED binary from the shared cache (observed: a pristine control failed
+ * with the mutation's own signature). Removing the mutated packages AND the
+ * packages the gate names (a gate may test a dependent of the mutated crate)
+ * before the control and again after the mutated run is the only
+ * mtime-independent invalidation. Non-cargo gates and files outside any
+ * package need nothing; failure to clean is an environment failure, never a
+ * detection.
+ */
+function cleanGateArtifacts(spec) {
+  if (!/\bcargo\b/.test(spec.gate)) return null;
+  const names = new Set();
+  for (const edit of specEdits(spec)) {
+    const name = cargoPackageOf(resolve(GATE_ROOT, edit.file));
+    if (name !== null) names.add(name);
+  }
+  for (const match of spec.gate.matchAll(/(?:-p|--package)\s+([A-Za-z0-9_-]+)/g)) {
+    names.add(match[1]);
+  }
+  if (names.size === 0) return null;
+  const args = ['clean'];
+  for (const name of names) args.push('-p', name);
+  const result = spawnSync('cargo', args, {
+    cwd: GATE_ROOT,
+    env: gateEnvironment(),
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  if (result.error !== undefined) return `cargo clean could not be spawned: ${result.error.message}`;
+  if (result.status !== 0) {
+    const tail = (result.stderr ?? '').toString('utf8').trim().split('\n').slice(-3).join(' | ');
+    return `cargo clean -p ${[...names].join(' -p ')} exited ${result.status}: ${tail}`;
+  }
+  return null;
+}
+
+/** Append one outcome line to FAKTOR_MUTATION_LOG when the campaign sets it. */
+function recordOutcome(spec, outcome, detail) {
+  const log = process.env.FAKTOR_MUTATION_LOG;
+  if (typeof log !== 'string' || log.trim() === '') return;
+  try {
+    appendFileSync(log, `${spec.id}\t${outcome}\t${detail.replace(/\s+/g, ' ').slice(0, 400)}\n`);
+  } catch {
+    // Diagnostics must never change the verdict.
   }
 }
 
@@ -501,16 +593,12 @@ function runGate(spec) {
   return new Promise((settle) => {
     const timeoutMs =
       Number.isInteger(spec.timeout_ms) && spec.timeout_ms > 0 ? spec.timeout_ms : DEFAULT_TIMEOUT_MS;
-    const env = { ...process.env };
-    if (!env.CARGO_TARGET_DIR) {
-      // Never compile mutants into the trusted target/ tree: a dedicated
-      // cache outside the scratch copy, reused across specs.
-      env.CARGO_TARGET_DIR = join(SCRIPT_ROOT, 'target', 'mutation-campaign');
-    }
-    // The scratch copy carries no committed node_modules: point gates at the
-    // ORIGINAL checkout so a pinned toolchain (the VS Code TypeScript loader)
-    // resolves READ-ONLY from the trusted tree instead of MODULE_NOT_FOUND.
-    env.FAKTOR_MUTATION_SOURCE_ROOT = SCRIPT_ROOT;
+    // Never compile mutants into the trusted target/ tree: CARGO_TARGET_DIR is
+    // a dedicated cache outside the scratch copy, reused across specs. The
+    // scratch carries no committed node_modules: FAKTOR_MUTATION_SOURCE_ROOT
+    // points gates at the ORIGINAL checkout so a pinned toolchain (the VS Code
+    // TypeScript loader) resolves READ-ONLY from the trusted tree.
+    const env = gateEnvironment();
     const child = spawn(spec.gate, {
       shell: true,
       cwd: GATE_ROOT,
@@ -675,6 +763,18 @@ async function runOne(id) {
       });
     }
 
+    // Invalidate the artifacts this spec can poison BEFORE the control runs
+    // (a previous run may have left a same-second "clean" mutated artifact in
+    // the shared cache) — see cleanGateArtifacts.
+    const preClean = cleanGateArtifacts(spec);
+    if (preClean !== null) {
+      console.error(
+        `mutation-run: ${spec.id} FAILED — the gate environment could not be stabilized (${preClean}); an environment failure is not a detection`,
+      );
+      recordOutcome(spec, 'environment', preClean);
+      return 1;
+    }
+
     // Pristine control run: the gate must be green BEFORE the mutation, or a
     // failure with the mutation live says nothing about the oracle.
     const control = await runGate(spec);
@@ -684,12 +784,14 @@ async function runOne(id) {
       if ((control.tail ?? '').trim() !== '') {
         console.error(`mutation-run: control output tail:\n${control.tail.trimEnd()}`);
       }
+      recordOutcome(spec, 'undetected', controlReason);
       return 1;
     }
 
     let detected = false;
     let reason = '';
     let tail = '';
+    let postCleanProblem = null;
     active = planned;
     try {
       for (const entry of planned) {
@@ -723,13 +825,24 @@ async function runOne(id) {
       }
     } finally {
       restore();
+      // No mutated artifact may survive into a later spec's control: the
+      // shared cache is part of the environment this runner certifies.
+      postCleanProblem = cleanGateArtifacts(spec);
     }
 
-    if (detected) return 0;
+    if (postCleanProblem !== null) {
+      detected = false;
+      reason = `the shared gate cache could not be invalidated after the mutated run (${postCleanProblem}); a possibly poisoned cache cannot certify a detection`;
+    }
+    if (detected) {
+      recordOutcome(spec, 'detected', reason === '' ? 'gate red with the mutation live' : reason);
+      return 0;
+    }
     console.error(`mutation-run: ${spec.id} FAILED — ${reason}`);
     if (tail.trim() !== '') {
       console.error(`mutation-run: gate output tail:\n${tail.trimEnd()}`);
     }
+    recordOutcome(spec, 'undetected', reason);
     return 1;
   } finally {
     cleanupGateRoot();
