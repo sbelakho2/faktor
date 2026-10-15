@@ -32,9 +32,11 @@
 //      try);
 //   7. exits 0 ONLY when the pristine control passed AND the mutated gate
 //      failed for the planted reason. Environment failures (missing
-//      toolchain, exit 126/127, harness timeout), a mutation that does not
-//      compile, and a failure that does not match `expect` are NEVER
-//      counted as detection.
+//      toolchain, exit 126/127, missing gate dependencies such as
+//      node_modules module-resolution failures, the loader's typed
+//      `faktor-mutation-env:` refusal, harness timeout), a mutation that
+//      does not compile, and a failure that does not match `expect` are
+//      NEVER counted as detection.
 //
 // Crash safety: SIGINT/SIGTERM/SIGHUP restore the snapshot and kill the active
 // gate process group before exiting, so a mutated source is never left behind.
@@ -46,6 +48,16 @@
 // parallel lane can hash/compile it safely. CARGO_TARGET_DIR defaults to a
 // dedicated cache outside the copy so compilations are reused across specs
 // without ever writing into the trusted artifact tree.
+//
+// Gate dependencies: the isolation copy excludes node_modules (never
+// committed), so after preparing the scratch the runner materializes the
+// existing dependency trees of the ORIGINAL checkout as read-only symlinks at
+// the same relative paths (root and apps/vscode — the only app the gates use)
+// and exports FAKTOR_MUTATION_SOURCE_ROOT for loaders that must resolve a
+// pinned toolchain from the checkout (scripts/mutations/vscode-ts-loader.mjs).
+// Nothing is installed and no network is touched; an absent dependency is
+// skipped silently and surfaces as a typed environment-missing gate failure,
+// never as a fabricated detection.
 //
 // Modes:
 //   node scripts/mutation-run.mjs <id>        run one spec (registry command)
@@ -61,7 +73,7 @@
 
 import { spawn } from 'node:child_process';
 import { provisionSupport } from './mutation-support.mjs';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,6 +131,40 @@ function prepareGateRoot() {
   provisionGateSupports(SCRIPT_ROOT, scratch);
   GATE_ROOT = scratch;
   GATE_ROOT_CLEANUP = () => rmSync(scratch, { recursive: true, force: true });
+}
+
+/**
+ * Materialize the gate dependencies the isolation copy excludes (node_modules
+ * is never committed) as READ-ONLY symlinks from the developer checkout at
+ * the SAME relative paths — no network, no install. The verified support
+ * snapshot (apps/vscode/node_modules, see scripts/mutation-support.mjs) wins
+ * when present; this only fills the gaps it does not cover (a root
+ * node_modules). A source dependency that does not exist is SKIPPED
+ * SILENTLY: the gate then fails on its own with a typed environment error
+ * (`faktor-mutation-env:` / MODULE_NOT_FOUND) that the runner reports as
+ * environment-missing — never as a detection.
+ */
+function materializeGateDependencies(sourceRoot, scratch) {
+  for (const rel of [join('node_modules'), join('apps', 'vscode', 'node_modules')]) {
+    const source = join(sourceRoot, rel);
+    const dest = join(scratch, rel);
+    if (source === dest || !existsSync(source)) continue;
+    try {
+      lstatSync(dest);
+      continue; // already provisioned (verified snapshot) or already linked
+    } catch {
+      // absent: link it below
+    }
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      symlinkSync(source, dest, process.platform === 'win32' ? 'junction' : 'dir');
+      console.log(`mutation-run: gate dependency ${rel} -> source checkout (read-only symlink)`);
+    } catch (error) {
+      console.error(
+        `mutation-run: gate dependency ${rel} could not be materialized (${error.message}); gates that need it report environment-missing`,
+      );
+    }
+  }
 }
 
 function cleanupGateRoot() {
@@ -461,6 +507,10 @@ function runGate(spec) {
       // cache outside the scratch copy, reused across specs.
       env.CARGO_TARGET_DIR = join(SCRIPT_ROOT, 'target', 'mutation-campaign');
     }
+    // The scratch copy carries no committed node_modules: point gates at the
+    // ORIGINAL checkout so a pinned toolchain (the VS Code TypeScript loader)
+    // resolves READ-ONLY from the trusted tree instead of MODULE_NOT_FOUND.
+    env.FAKTOR_MUTATION_SOURCE_ROOT = SCRIPT_ROOT;
     const child = spawn(spec.gate, {
       shell: true,
       cwd: GATE_ROOT,
@@ -518,6 +568,21 @@ function looksLikeToolchainMissing(result) {
 }
 
 /**
+ * A gate dependency the scratch copy never carries (node_modules is not
+ * committed): Node's module-resolution failure spellings and the VS Code
+ * loader's typed `faktor-mutation-env:` refusal. Never a detection — an
+ * environment failure must not be fabricated into a proof.
+ */
+function looksLikeDependencyMissing(result) {
+  const tail = result.tail ?? '';
+  return (
+    /faktor-mutation-env:/.test(tail) ||
+    /(^|\n)(?:Error: )?Cannot find module\b/.test(tail) ||
+    /\bMODULE_NOT_FOUND\b/.test(tail)
+  );
+}
+
+/**
  * The mutated source did not compile, so the oracle never executed. Cargo,
  * rustc and Gradle spellings.
  */
@@ -537,6 +602,9 @@ function controlProblem(result) {
   }
   if (looksLikeToolchainMissing(result)) {
     return `the gate toolchain is unavailable on the pristine source (${howOf(result)})`;
+  }
+  if (looksLikeDependencyMissing(result)) {
+    return `the gate environment is missing a required dependency on the pristine source (${howOf(result)}); the runner never fabricates a detection from an environment failure`;
   }
   if (result.code !== 0) {
     return `the control gate failed on the pristine source (${howOf(result)}); a gate that is not green before the mutation proves nothing`;
@@ -571,6 +639,11 @@ async function runOne(id) {
   // The planted edits and both gate runs happen in the ISOLATED scratch root:
   // the trusted tree is never mutated, even transiently.
   prepareGateRoot();
+  // Fill the dependencies the isolation copy excludes (node_modules): the
+  // support provisioning may already have snapshotted apps/vscode, this adds
+  // the root tree when the checkout carries one and skips silently on hosts
+  // that have none (no network, no install, never a fabricated detection).
+  materializeGateDependencies(SCRIPT_ROOT, GATE_ROOT);
   try {
     const planned = [];
     for (const edit of specEdits(spec)) {
@@ -636,6 +709,8 @@ async function runOne(id) {
         reason = 'the gate hit the harness timeout while the mutation was live';
       } else if (looksLikeToolchainMissing(result)) {
         reason = `the gate toolchain is unavailable (${how}); an environment failure is not a detection`;
+      } else if (looksLikeDependencyMissing(result)) {
+        reason = `the gate environment is missing a required dependency (${how}); an environment failure is not a detection`;
       } else if (result.code === 0) {
         reason = `planted mutation NOT detected: gate '${spec.gate}' exited 0 with the violation live`;
       } else if (looksLikeCompileFailure(result.tail ?? '')) {
