@@ -158,10 +158,65 @@ fn pid_alive(pid: i32) -> bool {
 /// of a killed member; the wait still exits the instant the group is gone.
 const GROUP_EXTINCTION_CEILING: Duration = Duration::from_secs(60);
 
+/// Bounded forensics for a ceiling breach: which processes still hold the
+/// recorded group (or its session) when the wait gives up, and what the
+/// kernel answers for the group/leader probes. Runs only on the failure
+/// path, with the `ps` output capped, so a wedged host cannot turn
+/// diagnostics into another hang. This is what makes a breach attributable
+/// from the log instead of a bare timeout.
+fn dump_survivors(leader: i32, what: &str) {
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
+    let probe = |target: i32| unsafe {
+        if libc::kill(target, 0) == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        }
+    };
+    eprintln!(
+        "[guardian-test] {what}: forensics at the ceiling — \
+         kill(-{leader},0) errno={}, kill({leader},0) errno={}",
+        probe(-leader),
+        probe(leader)
+    );
+    let Ok(out) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,pgid=,sid=,stat=,command="])
+        .output()
+    else {
+        return;
+    };
+    let group = leader.to_string();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut shown = 0usize;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let pgid = fields.nth(2);
+        let sid = fields.next();
+        if pgid == Some(group.as_str())
+            || sid == Some(group.as_str())
+            || (!exe.is_empty() && line.contains(&exe))
+        {
+            eprintln!("[guardian-test] survivor: {line}");
+            shown += 1;
+            if shown >= 20 {
+                eprintln!("[guardian-test] survivor list capped at 20 rows");
+                break;
+            }
+        }
+    }
+}
+
 fn wait_group_settled(leader: i32, bound: Duration, what: &str) {
     let deadline = Instant::now() + bound;
     while group_alive(leader) {
-        assert!(Instant::now() < deadline, "{what} within {bound:?}");
+        if Instant::now() >= deadline {
+            dump_survivors(leader, what);
+            panic!("{what} within {bound:?}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

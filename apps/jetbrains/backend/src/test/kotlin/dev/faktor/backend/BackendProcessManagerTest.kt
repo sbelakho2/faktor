@@ -896,6 +896,24 @@ private fun assertCommandDrain() {
     assertTrue(stalled.output.isEmpty(), "a quiet stall retains no output")
     println("  command drain: quiet stall exited 0 without a timeout")
 
+    // Same-run responsiveness control: the exact fixture JVM spawn+drain on
+    // this host RIGHT NOW. A wall-clock window that includes a child spawn
+    // is also a host process-creation measurement — under memory/CPU
+    // pressure a JVM spawn has been observed taking 45s+ (a single past
+    // failure measured 49681ms of which ~45s was the spawn, with the
+    // product's own kill+reap completing in ~50ms), so the promptness
+    // ceiling below is projected from this control instead of trusting a
+    // bare pin. Its own deadline is generous (60s) because its job is to
+    // MEASURE a stalled host, not to enforce the product deadline.
+    val controlStarted = System.currentTimeMillis()
+    val control = runCommand(fixtureCommand("stall", "0"), 60_000L, cap)
+    val controlMs = System.currentTimeMillis() - controlStarted
+    assertTrue(
+        !control.timedOut && control.exitCode == 0,
+        "the responsiveness control (same fixture JVM, no hold) must complete on this host: " +
+            "timedOut=${control.timedOut} exit=${control.exitCode} launchFailure=${control.launchFailure}"
+    )
+
     val pidfile = Files.createTempFile("faktor-cmd-", ".pid")
     try {
         val started = System.currentTimeMillis()
@@ -908,11 +926,26 @@ private fun assertCommandDrain() {
             held.exitCode != null,
             "a timed-out child must be reaped (exit status observable), not left a zombie"
         )
-        assertTrue(elapsed < 15_000L, "kill+reap must return promptly, took ${elapsed}ms")
+        // Product-budget teeth: on any host whose control projects in budget
+        // the ceiling stays the original 15s pin; only a measurably stalled
+        // host (8x the same-run control, capped like the BOM certification's
+        // control-derived deadline) moves it, because such a stall is
+        // additive to every stage of the window. A runCommand that failed to
+        // kill or reap is unbounded relative to its own control and still
+        // exceeds ANY of these ceilings (or fails the reaped assertion).
+        val promptCeiling = minOf(maxOf(15_000L, 8L * controlMs), 300_000L)
+        assertTrue(
+            elapsed < promptCeiling,
+            "kill+reap must return promptly, took ${elapsed}ms " +
+                "(host control ${controlMs}ms, ceiling ${promptCeiling}ms)"
+        )
         val pid = String(Files.readAllBytes(pidfile), Charsets.UTF_8).trim().toLongOrNull()
         assertTrue(pid != null && pid > 0, "the held child must have recorded its pid")
         assertTrue(waitUntil(5_000) { !pidAlive(pid!!) }, "the killed child must be gone")
-        println("  command drain: timeout killed+reaped pid $pid in ${elapsed}ms")
+        println(
+            "  command drain: timeout killed+reaped pid $pid in ${elapsed}ms " +
+                "(host control ${controlMs}ms, ceiling ${promptCeiling}ms)"
+        )
     } finally {
         Files.deleteIfExists(pidfile)
     }

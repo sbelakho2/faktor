@@ -461,7 +461,9 @@ fn forced_fifo_control_channel_release_matrix() {
 
 /// The control-pipe seam proves FD_CLOEXEC is set on BOTH ends at the instant
 /// they exist (read from `/proc/self/fdinfo`) and that the seam fires once per
-/// creation with exactly the pair.
+/// creation with exactly the pair. A spawn creates TWO pipes (the control
+/// channel and the detach-readiness channel), so the spawn-driven seam must
+/// observe four protected descriptors, pair for pair.
 #[test]
 #[cfg(target_os = "linux")]
 fn control_pipe_seam_observes_cloexec_on_both_ends() {
@@ -500,8 +502,8 @@ fn control_pipe_seam_observes_cloexec_on_both_ends() {
     let observed = observations.lock().unwrap().clone();
     assert_eq!(
         observed.len(),
-        2,
-        "the seam must fire exactly once per creation with the fd pair: {observed:?}"
+        4,
+        "the seam must fire once per creation (control + detach-readiness) with each fd pair: {observed:?}"
     );
     for (fd, cloexec) in &observed {
         assert!(

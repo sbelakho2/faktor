@@ -22,6 +22,16 @@
 //!   gone exits the guardian on its own, so guardians do not accumulate for
 //!   finished commands (the row still owns the control pipe until reap).
 //!
+//! Detach-before-publish guarantee: the guardian also holds the WRITE end of
+//! a readiness pipe and writes one byte on it immediately after `setsid(2)`,
+//! before it blocks. [`GuardianHandle::spawn_with_identity`] does not return
+//! until that byte arrives, so a `SIGKILL` aimed at the daemon's whole
+//! process group can never take the guardian down in the fork window — the
+//! guardian is provably out of the daemon's group/session the moment its
+//! existence is published to any caller. (Without the handshake the child's
+//! first scheduling slot is unbounded, and the group kill of a crashing
+//! daemon would silently win the race.)
+//!
 //! On Linux the direct child additionally arms `PR_SET_PDEATHSIG(SIGKILL)`
 //! in its pre-exec hook ([`install_pdeathsig`]), with a `getppid` check that
 //! refuses the exec if the daemon died between fork and the hook; the
@@ -67,6 +77,15 @@ mod imp {
     const TERM_GRACE_MS: u64 = 500;
     /// Bound on the daemon-side release wait for one guardian.
     const RELEASE_BOUND_MS: u64 = 2000;
+    /// Ceiling for the detach handshake (see
+    /// [`GuardianHandle::spawn_with_identity`]). The child's work before
+    /// readiness is one `setsid(2)` and one one-byte write; the ceiling
+    /// exists only to bound a genuinely wedged child (a `SIGSTOP`ped or
+    /// never-scheduled guardian), never to shorten the wait on a loaded host
+    /// — a stretched first scheduling slot is exactly the production fork
+    /// window this handshake closes. Exceeding it kills and reaps the child
+    /// and refuses the spawn typed.
+    const GUARDIAN_READY_CEILING: Duration = Duration::from_secs(30);
 
     /// Bounded identity of one protected process group leader.
     ///
@@ -270,6 +289,84 @@ mod imp {
         unsafe { *libc::__errno_location() }
     }
 
+    /// Create one guard-channel pipe with `pipe2(O_CLOEXEC)` or refuse typed:
+    /// the daemon-death contract depends on no other process holding a copy
+    /// of the write end, and the kernel applies `FD_CLOEXEC` at creation, so
+    /// no concurrent fork/exec can ever inherit an unprotected end.
+    fn create_cloexec_pipe() -> Result<[RawFd; 2], Error> {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a live two-element array; `pipe2` writes both
+        // descriptors on success and returns non-zero on failure (checked
+        // before any read); `O_CLOEXEC` is applied atomically by the
+        // kernel, so no concurrent fork/exec can inherit either end.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(Error::internal(format!(
+                "guardian pipe2 failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        pipe_seam(&fds);
+        Ok(fds)
+    }
+
+    /// Test seam fired inside [`create_cloexec_pipe`] at the instant both
+    /// descriptors exist (and already carry `FD_CLOEXEC`): a concurrent
+    /// fork/exec has no earlier window in which to inherit an unprotected
+    /// end.
+    #[cfg(test)]
+    type PipeSeam = Box<dyn Fn(&[RawFd; 2]) + Send>;
+    #[cfg(test)]
+    static PIPE_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<PipeSeam>>> =
+        std::sync::OnceLock::new();
+
+    #[cfg(test)]
+    fn install_pipe_seam(hook: PipeSeam) {
+        let m = PIPE_SEAM.get_or_init(|| std::sync::Mutex::new(None));
+        *m.lock().expect("guardian pipe seam poisoned") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn clear_pipe_seam() {
+        if let Some(lock) = PIPE_SEAM.get() {
+            *lock.lock().expect("guardian pipe seam poisoned") = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn pipe_seam(fds: &[RawFd; 2]) {
+        if let Some(lock) = PIPE_SEAM.get() {
+            if let Some(hook) = lock.lock().expect("guardian pipe seam poisoned").as_ref() {
+                hook(fds);
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn pipe_seam(_fds: &[RawFd; 2]) {}
+
+    /// Test seam: nanoseconds the forked guardian must hold BEFORE its
+    /// `setsid(2)`, modelling the unsynchronized pre-detach window the
+    /// scheduler opens on a loaded host. Read once, in the fork child,
+    /// before the detach call — a plain atomic load and `nanosleep`, both
+    /// async-signal-safe; zero in every non-test build (the seam does not
+    /// compile there at all).
+    #[cfg(test)]
+    static PRE_DETACH_HOLD_NANOS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(test)]
+    fn install_pre_detach_hold(hold: Duration) {
+        PRE_DETACH_HOLD_NANOS.store(
+            u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    #[cfg(test)]
+    fn clear_pre_detach_hold() {
+        PRE_DETACH_HOLD_NANOS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Install `PR_SET_PDEATHSIG(SIGKILL)` on a supervisor child before
     /// `exec` (defense in depth behind the guardian). The pre-exec `getppid`
     /// check closes the fork→prctl race: a parent that died in that window
@@ -350,24 +447,30 @@ mod imp {
         }
 
         /// Fork a guardian over an explicit identity (tests exercise the
-        /// refusal verdicts through this seam).
+        /// refusal verdicts through this seam). Returns only once the forked
+        /// guardian has completed `setsid(2)` — it is provably out of the
+        /// daemon's session/process group before this call returns, so a
+        /// group `SIGKILL` aimed at the daemon can no longer take it down in
+        /// the fork window.
         pub(crate) fn spawn_with_identity(identity: ProcessIdentity) -> Result<Self, Error> {
             if !plausible(&identity) {
                 return Err(Error::internal(
                     "guardian: refusing a structurally impossible identity record",
                 ));
             }
-            let mut fds = [0 as RawFd; 2];
-            // SAFETY: `fds` is a live two-element array; `pipe2` writes both
-            // descriptors on success and returns non-zero on failure (checked
-            // before any read); `O_CLOEXEC` is applied atomically by the
-            // kernel, so no concurrent fork/exec can inherit either end.
-            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-                return Err(Error::internal(format!(
-                    "guardian control pipe2 failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            let fds = create_cloexec_pipe()?;
+            let ready = match create_cloexec_pipe() {
+                Ok(ready) => ready,
+                Err(e) => {
+                    // SAFETY: both descriptors belong to this failed spawn
+                    // (no fork happened yet), so each is closed exactly once.
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(e);
+                }
+            };
             // SAFETY: called from the daemon with no other guard required:
             // the child branch (pid == 0) touches only the raw syscalls of
             // `guardian_main` — no allocation, locks, or Rust runtime state
@@ -375,11 +478,13 @@ mod imp {
             // apply; a negative return is handled below.
             let pid = unsafe { libc::fork() };
             if pid < 0 {
-                // SAFETY: both descriptors belong to this failed spawn (the
-                // fork did not happen), so each is closed exactly once.
+                // SAFETY: the four descriptors belong to this failed spawn
+                // (the fork did not happen), so each is closed exactly once.
                 unsafe {
                     libc::close(fds[0]);
                     libc::close(fds[1]);
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
                 }
                 return Err(Error::internal(format!(
                     "guardian fork failed: {}",
@@ -387,20 +492,49 @@ mod imp {
                 )));
             }
             if pid == 0 {
-                // SAFETY: in the child, `fds[1]` (the write end) is a valid
-                // inherited descriptor owned by this process; closing it is
-                // async-signal-safe and required so the guardian cannot keep
-                // its own control pipe alive.
+                // SAFETY: in the child, `fds[1]` (the control write end) and
+                // `ready[0]` (the readiness read end) are valid inherited
+                // descriptors owned by this process; closing them is
+                // async-signal-safe and required — the control write end
+                // must not keep the daemon-death channel alive, and the
+                // readiness read end is not the child's to hold.
                 unsafe {
                     libc::close(fds[1]);
+                    libc::close(ready[0]);
                 }
-                guardian_main(fds[0], identity);
+                guardian_main(fds[0], ready[1], identity);
             }
-            // SAFETY: in the parent, `fds[0]` (the read end) is a valid
-            // descriptor owned by this process; it is closed exactly once
-            // and never used again (the child inherited its own copy).
+            // SAFETY: in the parent, `fds[0]` (the control read end) and
+            // `ready[1]` (the readiness write end) are valid descriptors
+            // owned by this process; each is closed exactly once (the child
+            // holds its own copies). Closing `ready[1]` here is what makes a
+            // child death observable as EOF on `ready[0]`.
             unsafe {
                 libc::close(fds[0]);
+                libc::close(ready[1]);
+            }
+            if let Err(e) = wait_detached(ready[0]) {
+                // The guardian never proved it left the daemon's group: it
+                // is unusable (a group signal could take it down
+                // mid-enforcement), so fail the spawn closed — kill and reap
+                // the child, close both channels, and refuse typed before
+                // any caller can publish it.
+                // SAFETY: `pid` is our forked child (fork returned it and no
+                // wait has consumed it), so SIGKILL cannot affect any other
+                // process; the blocking wait reaps it so no zombie remains.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    let mut status: libc::c_int = 0;
+                    let _ = libc::waitpid(pid, &mut status, 0);
+                    libc::close(ready[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(e);
+            }
+            // SAFETY: `ready[0]` is the readiness read end created above;
+            // its handshake is complete and it is closed exactly once here.
+            unsafe {
+                libc::close(ready[0]);
             }
             Ok(Self {
                 pid,
@@ -496,10 +630,69 @@ mod imp {
         }
     }
 
+    /// Block until the forked guardian has completed `setsid(2)` and proved
+    /// it with one byte on `ready`, or fail typed: EOF means the child died
+    /// before detaching; the ceiling means it never ran. On error the caller
+    /// still owns the forked child (kill + reap) and the control write end.
+    fn wait_detached(ready: RawFd) -> Result<(), Error> {
+        let deadline = Instant::now() + GUARDIAN_READY_CEILING;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::internal(format!(
+                    "guardian did not detach within {GUARDIAN_READY_CEILING:?}"
+                )));
+            }
+            let mut pfd = libc::pollfd {
+                fd: ready,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is a live stack `pollfd` with the readiness read
+            // fd owned by this call; the timeout bounds the call.
+            let r = unsafe {
+                libc::poll(
+                    &mut pfd,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(Error::internal(format!(
+                    "guardian readiness poll failed: {err}"
+                )));
+            }
+            if r == 0 {
+                continue; // deadline re-checked at the loop head
+            }
+            let mut byte = 0u8;
+            // SAFETY: the descriptor is the live readiness read end owned by
+            // this call and the buffer is a live one-byte stack slot.
+            let n = unsafe { libc::read(ready, (&mut byte as *mut u8).cast(), 1) };
+            if n == 1 {
+                return Ok(());
+            }
+            if n == 0 {
+                return Err(Error::internal("guardian exited before detaching"));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(Error::internal(format!(
+                "guardian readiness read failed: {err}"
+            )));
+        }
+    }
+
     /// The guardian process body. MUST NOT return: it is reached only
     /// through `fork()` from a possibly multithreaded process, so it calls
     /// raw syscalls only (no allocation, no locks, no Rust runtime).
-    fn guardian_main(read_fd: RawFd, identity: ProcessIdentity) -> ! {
+    fn guardian_main(read_fd: RawFd, ready_fd: RawFd, identity: ProcessIdentity) -> ! {
         // SAFETY: (single raw-syscall block) this body is reachable ONLY in
         // the post-fork child, which inherits no locks and performs no
         // allocation, so no syscall here can deadlock on shared Rust state.
@@ -508,10 +701,43 @@ mod imp {
         // constant, and every result is checked — failure paths `_exit`
         // instead of unwinding.
         unsafe {
+            // Test seam: hold the child in the PRE-detach window (see
+            // `install_pre_detach_hold`). Compiled out of production builds;
+            // the hold is a plain atomic read plus `nanosleep`, both safe
+            // here.
+            #[cfg(test)]
+            {
+                let hold_nanos = PRE_DETACH_HOLD_NANOS.load(std::sync::atomic::Ordering::SeqCst);
+                if hold_nanos > 0 {
+                    let req = libc::timespec {
+                        tv_sec: (hold_nanos / 1_000_000_000) as libc::time_t,
+                        tv_nsec: (hold_nanos % 1_000_000_000) as libc::c_long,
+                    };
+                    let _ = libc::nanosleep(&req, std::ptr::null_mut());
+                }
+            }
+
             // Detach from the daemon's session/process group: a group signal
             // aimed at the daemon must not take the guardian down before it
-            // can enforce the kill.
-            libc::setsid();
+            // can enforce the kill. A kernel that refuses the detach can
+            // only produce a guardian still inside the daemon's group —
+            // refuse with the internal-only exit, never publish a killable
+            // guardian.
+            if libc::setsid() < 0 {
+                libc::_exit(GUARDIAN_EXIT_INTERNAL);
+            }
+
+            // Readiness handshake (see `spawn_with_identity`): one byte,
+            // then close. The write can never block (one byte into an empty
+            // pipe) and can only fail when the daemon died between the fork
+            // and this instant — in that case the guardian MUST continue to
+            // the control `read(2)`, which is already at EOF, so SIGPIPE is
+            // ignored rather than allowed to kill it before it can enforce
+            // the group kill.
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let ready_byte: u8 = 1;
+            libc::write(ready_fd, (&ready_byte as *const u8).cast(), 1);
+            libc::close(ready_fd);
 
             // Keep the control fd above stdio and re-point stdio at
             // /dev/null so the guardian never holds a daemon pipe open.
@@ -723,6 +949,218 @@ mod imp {
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(decide_on_eof(&identity), GuardianAction::NothingToDo);
+        }
+
+        // ------------------------------------ detach-before-publish race
+
+        /// Serializes the seam-driven guardian tests: the pipe seam and the
+        /// pre-detach hold are process-global, so their install/observe
+        /// windows must never overlap.
+        static GUARDIAN_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn guardian_serial() -> std::sync::MutexGuard<'static, ()> {
+            GUARDIAN_TEST_SERIAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// The largest pid the kernel can never assign (Linux
+        /// `/proc/sys/kernel/pid_max`; pid_max itself is out of range).
+        /// Falls back to a high constant, capped to the `pid_t` range so the
+        /// record stays structurally plausible.
+        fn never_assigned_pid() -> u32 {
+            std::fs::read_to_string("/proc/sys/kernel/pid_max")
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .unwrap_or(1 << 22)
+                .min(i32::MAX as u32)
+        }
+
+        /// The detach-before-return guarantee, adversarially: the seam holds
+        /// the forked child in the pre-detach window — the window a loaded
+        /// scheduler opens for real — and `spawn_with_identity` must not
+        /// return inside it. On return the guardian is probed with
+        /// `getpgid(2)`: it must already leader its own group, so a SIGKILL
+        /// aimed at the caller's process group can no longer reach it.
+        /// Removing the readiness read makes this fail deterministically
+        /// (spawn returns instantly with the guardian still in the caller's
+        /// group); the handshake makes it pass.
+        #[test]
+        fn spawn_does_not_return_inside_the_pre_detach_window() {
+            let _serial = guardian_serial();
+            install_pre_detach_hold(Duration::from_millis(300));
+            struct ClearHold;
+            impl Drop for ClearHold {
+                fn drop(&mut self) {
+                    clear_pre_detach_hold();
+                }
+            }
+            let _clear = ClearHold;
+            // A never-live record: the release probe finds the group gone
+            // and signals nothing.
+            let dead_pid = never_assigned_pid();
+            let dead = ProcessIdentity {
+                pid: dead_pid,
+                pgid: dead_pid,
+                start_time: Some(0),
+            };
+            let started = Instant::now();
+            let mut guardian =
+                GuardianHandle::spawn_with_identity(dead).expect("spawn through the seam");
+            let elapsed = started.elapsed();
+            let gpid = guardian.pid() as libc::pid_t;
+            assert!(
+                elapsed >= Duration::from_millis(250),
+                "spawn returned after {elapsed:?}: the pre-detach window is \
+                 still published to callers (a group SIGKILL there kills the \
+                 guardian)"
+            );
+            // SAFETY: `gpid` is this module's own forked child (just
+            // returned by `spawn_with_identity`), so probing its process
+            // group is a read of an owned process; no signal is sent.
+            let pgid = unsafe { libc::getpgid(gpid) };
+            assert_eq!(
+                pgid, gpid,
+                "the guardian must be in its own group the moment spawn returns"
+            );
+            // SAFETY: `getpgrp` reads this process's own group; no argument.
+            let caller_pgid = unsafe { libc::getpgrp() };
+            assert_ne!(
+                pgid, caller_pgid,
+                "the guardian must never stay in the caller's group"
+            );
+            assert_eq!(
+                guardian.release(),
+                Some(GUARDIAN_EXIT_NOTHING_TO_DO),
+                "a never-live record releases without signalling"
+            );
+        }
+
+        /// The seam fires at the first instant each guard-channel
+        /// descriptor pair exists (before `create_cloexec_pipe` returns,
+        /// i.e. while a concurrent fork/exec is still possible) and asserts
+        /// both ends already carry `FD_CLOEXEC`: this is the exact window a
+        /// `pipe` + later `fcntl(F_SETFD)` pair would expose. One spawn
+        /// creates TWO pipes (control + detach-readiness), so the seam must
+        /// observe four protected descriptors, pair for pair.
+        #[test]
+        fn guardian_pipes_carry_cloexec_at_creation() {
+            let _serial = guardian_serial();
+            struct ClearSeam;
+            impl Drop for ClearSeam {
+                fn drop(&mut self) {
+                    clear_pipe_seam();
+                }
+            }
+            let _clear = ClearSeam;
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(RawFd, bool)>::new()));
+            let sink = seen.clone();
+            // Only this thread's creation is observed: supervised-spawn
+            // tests run concurrently in this binary and create their own
+            // guardian pipes.
+            let owner = std::thread::current().id();
+            install_pipe_seam(Box::new(move |fds| {
+                if std::thread::current().id() != owner {
+                    return;
+                }
+                for fd in fds {
+                    // SAFETY: `fd` is a live descriptor created by the
+                    // production helper that fired this seam immediately
+                    // after creation; F_GETFD only reads its flags.
+                    let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                    assert!(flags >= 0, "F_GETFD on a live guardian pipe fd");
+                    sink.lock()
+                        .expect("seam sink")
+                        .push((*fd, flags & libc::FD_CLOEXEC != 0));
+                }
+            }));
+            let dead_pid = never_assigned_pid();
+            let dead = ProcessIdentity {
+                pid: dead_pid,
+                pgid: dead_pid,
+                start_time: Some(0),
+            };
+            let mut guardian =
+                GuardianHandle::spawn_with_identity(dead).expect("spawn under the seam");
+            clear_pipe_seam();
+            let observed = seen.lock().expect("seam sink").clone();
+            assert_eq!(
+                observed.len(),
+                4,
+                "the seam must fire once per creation (control + readiness) \
+                 with each fd pair: {observed:?}"
+            );
+            for (fd, cloexec) in &observed {
+                assert!(
+                    *cloexec,
+                    "fd {fd} must carry FD_CLOEXEC at the instant it exists"
+                );
+            }
+            let _ = guardian.release();
+        }
+
+        /// A child forked+exec'd from INSIDE pipe creation — the exact
+        /// concurrent-spawn window — must not hold either end: if it did,
+        /// the daemon's death would never close the write end and the
+        /// guardian would never kill the owned process group. `/proc`
+        /// identifies an inherited end by pipe inode.
+        #[test]
+        fn child_spawned_during_creation_cannot_hold_a_guardian_pipe() {
+            let _serial = guardian_serial();
+            struct ClearSeam;
+            impl Drop for ClearSeam {
+                fn drop(&mut self) {
+                    clear_pipe_seam();
+                }
+            }
+            let _clear = ClearSeam;
+            let violations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let sink = violations.clone();
+            // Only this thread's creation is observed (see the CLOEXEC test).
+            let owner = std::thread::current().id();
+            install_pipe_seam(Box::new(move |fds| {
+                if std::thread::current().id() != owner {
+                    return;
+                }
+                let mut markers = Vec::new();
+                for fd in fds {
+                    // SAFETY: `libc::stat` is a plain C POD struct whose
+                    // all-zero bit pattern is a valid initial value, and
+                    // `fd` is a live guardian pipe descriptor; fstat only
+                    // fills the live output buffer.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    let r = unsafe { libc::fstat(*fd, &mut st) };
+                    assert_eq!(r, 0, "fstat of a live guardian pipe fd");
+                    markers.push(format!("pipe:[{}]", st.st_ino));
+                }
+                let out = std::process::Command::new("sh")
+                    .args(["-c", "ls -l /proc/self/fd 2>/dev/null"])
+                    .output()
+                    .expect("concurrent child spawn");
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                for marker in markers {
+                    if text.contains(&marker) {
+                        sink.lock().expect("seam sink").push(marker);
+                    }
+                }
+            }));
+            let dead_pid = never_assigned_pid();
+            let dead = ProcessIdentity {
+                pid: dead_pid,
+                pgid: dead_pid,
+                start_time: Some(0),
+            };
+            let mut guardian =
+                GuardianHandle::spawn_with_identity(dead).expect("spawn under the seam");
+            clear_pipe_seam();
+            let found = violations.lock().expect("seam sink");
+            assert!(
+                found.is_empty(),
+                "a child spawned during creation inherited a guardian \
+                 guard-channel end: {found:?}"
+            );
+            drop(found);
+            let _ = guardian.release();
         }
     }
 }
