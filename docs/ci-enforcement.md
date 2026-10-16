@@ -148,7 +148,7 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   | --- | --- |
   | `rust:1.98.0` | `sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959` |
   | `node:24` | `sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4` |
-  | `faktor-ci` (local build, linux/amd64) | `sha256:2c972ad0f7dc6d85ab138da184262a85e6c9f839aec90659e03e5e30bafbc333` (`docker/faktor-ci/image-digest.txt`; rebuilt 2026-10-13: pinned standalone kotlinc 2.4.20 matching the Gradle Kotlin plugin) |
+  | `faktor-ci` (local build, linux/amd64) | `sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166` (`docker/faktor-ci/image-digest.txt`; rebuilt 2026-10-16: standalone kotlinc 2.4.20 re-published (the previously pinned digest had no registry copy and was lost with the operator VM reset)) |
   | `ubuntu:24.04` | `sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3` |
   | `alpine:3.20` | `sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc` |
   | `mcr.microsoft.com/playwright:v1.55.0-noble` (VS Code Extension Host E2E; Chromium runtime libs, no apt step) | `sha256:b27e719ecbfef153e13fd24e8341736733bf2658b229677eb21ff57ff5d7fb29` |
