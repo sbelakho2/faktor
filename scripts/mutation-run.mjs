@@ -52,9 +52,10 @@
 // Gate dependencies: the isolation copy excludes node_modules (never
 // committed), so after preparing the scratch the runner materializes the
 // existing dependency trees of the ORIGINAL checkout as read-only symlinks at
-// the same relative paths (root and apps/vscode — the only app the gates use)
-// and exports FAKTOR_MUTATION_SOURCE_ROOT for loaders that must resolve a
-// pinned toolchain from the checkout (scripts/mutations/vscode-ts-loader.mjs).
+// the same relative paths — the root node_modules plus every
+// apps/<name>/node_modules the checkout carries — and exports
+// FAKTOR_MUTATION_SOURCE_ROOT for loaders that must resolve a pinned
+// toolchain from the checkout (scripts/mutations/vscode-ts-loader.mjs).
 // Nothing is installed and no network is touched; an absent dependency is
 // skipped silently and surfaces as a typed environment-missing gate failure,
 // never as a fabricated detection.
@@ -143,6 +144,23 @@ function prepareGateRoot() {
 }
 
 /**
+ * Every node_modules tree a gate can resolve a pinned toolchain from: the
+ * root plus one per app (`apps/<name>/node_modules`). Enumerated, so a new
+ * app's dependency tree is materialized too instead of silently missing.
+ */
+function gateDependencyTrees(sourceRoot) {
+  const rels = [join('node_modules')];
+  let apps = [];
+  try {
+    apps = readdirSync(join(sourceRoot, 'apps')).sort();
+  } catch {
+    // No apps directory: the root tree is all there is.
+  }
+  for (const name of apps) rels.push(join('apps', name, 'node_modules'));
+  return rels;
+}
+
+/**
  * Materialize the gate dependencies the isolation copy excludes (node_modules
  * is never committed) as READ-ONLY symlinks from the developer checkout at
  * the SAME relative paths — no network, no install. The verified support
@@ -154,7 +172,7 @@ function prepareGateRoot() {
  * environment-missing — never as a detection.
  */
 function materializeGateDependencies(sourceRoot, scratch) {
-  for (const rel of [join('node_modules'), join('apps', 'vscode', 'node_modules')]) {
+  for (const rel of gateDependencyTrees(sourceRoot)) {
     const source = join(sourceRoot, rel);
     const dest = join(scratch, rel);
     if (source === dest || !existsSync(source)) continue;

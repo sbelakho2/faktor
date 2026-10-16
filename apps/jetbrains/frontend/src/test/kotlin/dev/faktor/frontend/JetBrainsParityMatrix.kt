@@ -1949,9 +1949,13 @@ internal const val PARITY_OUTCOMES_PAGE_JSON = "{" +
     "\"localFinalRuns\":1,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":1000000," +
     "\"localFirstRuns\":1,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":1000000," +
     "\"localToHostedFallbackRuns\":0,\"localToHostedFallbackPpm\":0," +
+    "\"localClassedRuns\":3,\"localMeasurement\":\"measured\"," +
     "\"hostedOnlyRuns\":2,\"runsWithSteps\":3,\"hostedOnlyPpm\":666666," +
     "\"avoidedHostedInferenceMicro\":null,\"avoidedHostedInferenceMeasurement\":\"unavailable\"," +
-    "\"avoidedHostedMeasuredRuns\":0,\"totalWallTimeMs\":10," +
+    "\"avoidedHostedMeasuredRuns\":0," +
+    "\"attributionCompleteRuns\":3,\"attributionPartialRuns\":0," +
+    "\"attributionUnavailableRuns\":0,\"attributionIncompleteExcluded\":0," +
+    "\"totalWallTimeMs\":10," +
     "\"meanTimeToVerifiedChangeMs\":10,\"humanInterventionRuns\":0," +
     "\"humanInterventionPpm\":0,\"rollbackRuns\":0,\"regressionRollbackPpm\":0," +
     "\"checksPassed\":1,\"checksRequired\":1,\"proofCoveragePpm\":1000000," +
@@ -1963,6 +1967,8 @@ internal const val PARITY_OUTCOMES_PAGE_JSON = "{" +
     "\"taskClass\":\"Implementation\",\"riskClass\":\"low\",\"candidateSnapshot\":null," +
     "\"finalSnapshot\":\"tm1:x\",\"accepted\":true,\"integrated\":false,\"verified\":true," +
     "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0,\"modelSequence\":[]," +
+    "\"firstExecutionClass\":\"unknown\",\"finalExecutionClass\":\"unknown\"," +
+    "\"attributionState\":\"complete\"," +
     "\"moneyState\":\"complete\"," +
     "\"modelSpendMicro\":\"5\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
     "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
