@@ -151,6 +151,8 @@ fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json
         "localFirstSuccessPpm": m.local_first_success_ppm,
         "localToHostedFallbackRuns": m.local_to_hosted_fallback_runs,
         "localToHostedFallbackPpm": m.local_to_hosted_fallback_ppm,
+        "localClassedRuns": m.local_classed_runs,
+        "localMeasurement": m.local_measurement.as_str(),
         "hostedOnlyRuns": m.hosted_only_runs,
         "runsWithSteps": m.runs_with_steps,
         "hostedOnlyPpm": m.hosted_only_ppm,
@@ -159,6 +161,10 @@ fn metrics_json(report: &faktor_agent::OutcomeLedgerMetricsReport) -> serde_json
         "avoidedHostedInferenceMicro": m.avoided_hosted_inference_micro.map(|v| v.to_string()),
         "avoidedHostedInferenceMeasurement": avoided_measurement,
         "avoidedHostedMeasuredRuns": m.avoided_hosted_measured_runs,
+        "attributionCompleteRuns": m.attribution_complete_runs,
+        "attributionPartialRuns": m.attribution_partial_runs,
+        "attributionUnavailableRuns": m.attribution_unavailable_runs,
+        "attributionIncompleteExcluded": m.attribution_incomplete_excluded,
         "totalWallTimeMs": m.total_wall_time_ms,
         "meanTimeToVerifiedChangeMs": m.mean_time_to_verified_change_ms,
         "humanInterventionRuns": m.human_intervention_runs,
@@ -261,6 +267,15 @@ fn run_json(entry: &faktor_agent::OutcomeLedgerEntry) -> serde_json::Value {
         "verifiedFirstVerificationPass": record.verified_first_verification_pass,
         "repairAttempts": record.repair_attempts,
         "modelSequence": model_sequence,
+        // The exactly-preserved boundary execution classes (independent of
+        // the folded display sequence; a pre-field payload falls back to
+        // the preserved sequence boundary): the classification authority.
+        "firstExecutionClass": record.effective_first_execution_class().as_str(),
+        "finalExecutionClass": record.effective_final_execution_class().as_str(),
+        // The provider/model attribution honesty of the recorded sequence:
+        // a non-complete run never fed the ledger's routing-learning feed
+        // (its samples kept the per-call feed).
+        "attributionState": record.attribution_state.as_str(),
         "moneyState": settlement.money_state.as_str(),
         "modelSpendMicro": money(settlement.model_spend_micro),
         "verificationSpendMicro": money(settlement.verification_spend_micro),

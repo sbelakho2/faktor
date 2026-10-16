@@ -180,7 +180,7 @@ data class ProtocolSessionPromptReceipt(
     val queued: Boolean
 )
 
-/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = "unavailable"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. (unknown_fields: ignore) */
+/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = "unavailable"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. Local classification coverage mirrors that rule: `localMeasurement` reports `measured` | `partial` | `unmeasured` with the boundary-classed cohort in `localClassedRuns` (the boundary-derived local cohorts can only classify runs inside it — a folded display sequence never silently depresses them). `attributionCompleteRuns` / `attributionPartialRuns` / `attributionUnavailableRuns` count the recorded provider/model attribution honesty; `attributionIncompleteExcluded` (partial + unavailable) is the routing-learning feed exclusion count — a non-complete run never fed the ledger's atomic feed (its samples kept the per-call feed, never dropped). (unknown_fields: ignore) */
 data class ProtocolOutcomeMetrics(
     val runs: Long,
     val verifiedChanges: Long,
@@ -209,12 +209,18 @@ data class ProtocolOutcomeMetrics(
     val localFirstSuccessPpm: Long,
     val localToHostedFallbackRuns: Long,
     val localToHostedFallbackPpm: Long,
+    val localClassedRuns: Long,
+    val localMeasurement: String,
     val hostedOnlyRuns: Long,
     val runsWithSteps: Long,
     val hostedOnlyPpm: Long,
     val avoidedHostedInferenceMicro: String?,
     val avoidedHostedInferenceMeasurement: String,
     val avoidedHostedMeasuredRuns: Long,
+    val attributionCompleteRuns: Long,
+    val attributionPartialRuns: Long,
+    val attributionUnavailableRuns: Long,
+    val attributionIncompleteExcluded: Long,
     val totalWallTimeMs: Long,
     val meanTimeToVerifiedChangeMs: Long,
     val humanInterventionRuns: Long,
@@ -257,7 +263,7 @@ data class ProtocolRunOutcomeChangeScale(
     val removedLines: Long
 )
 
-/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == "complete"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = "unavailable"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). (unknown_fields: ignore) */
+/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == "complete"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = "unavailable"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). `firstExecutionClass` / `finalExecutionClass` are the run's exactly-preserved boundary execution classes (the classification authority, independent of the bounded `modelSequence` folding; a pre-field payload falls back to the preserved sequence boundary — `unknown` when the authority is absent). `attributionState` reports `complete` | `partial` | `unavailable`: a non-complete attribution records the run but never fed its samples into the ledger's routing-learning feed (they kept the per-call feed). (unknown_fields: ignore) */
 data class ProtocolRunOutcome(
     val runId: String,
     val sessionId: Long,
@@ -272,6 +278,9 @@ data class ProtocolRunOutcome(
     val verifiedFirstVerificationPass: Boolean,
     val repairAttempts: Long,
     val modelSequence: List<ProtocolRunOutcomeModelStep>,
+    val firstExecutionClass: String,
+    val finalExecutionClass: String,
+    val attributionState: String,
     val moneyState: String,
     val modelSpendMicro: String?,
     val verificationSpendMicro: String?,
@@ -616,12 +625,18 @@ fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
         localFirstSuccessPpm = v.field("localFirstSuccessPpm").long(),
         localToHostedFallbackRuns = v.field("localToHostedFallbackRuns").long(),
         localToHostedFallbackPpm = v.field("localToHostedFallbackPpm").long(),
+        localClassedRuns = v.field("localClassedRuns").long(),
+        localMeasurement = v.field("localMeasurement").string(),
         hostedOnlyRuns = v.field("hostedOnlyRuns").long(),
         runsWithSteps = v.field("runsWithSteps").long(),
         hostedOnlyPpm = v.field("hostedOnlyPpm").long(),
         avoidedHostedInferenceMicro = v.optionalField("avoidedHostedInferenceMicro")?.string(),
         avoidedHostedInferenceMeasurement = v.field("avoidedHostedInferenceMeasurement").string(),
         avoidedHostedMeasuredRuns = v.field("avoidedHostedMeasuredRuns").long(),
+        attributionCompleteRuns = v.field("attributionCompleteRuns").long(),
+        attributionPartialRuns = v.field("attributionPartialRuns").long(),
+        attributionUnavailableRuns = v.field("attributionUnavailableRuns").long(),
+        attributionIncompleteExcluded = v.field("attributionIncompleteExcluded").long(),
         totalWallTimeMs = v.field("totalWallTimeMs").long(),
         meanTimeToVerifiedChangeMs = v.field("meanTimeToVerifiedChangeMs").long(),
         humanInterventionRuns = v.field("humanInterventionRuns").long(),
@@ -683,6 +698,9 @@ fun parseProtocolRunOutcome(v: JsonView): ProtocolRunOutcome {
         verifiedFirstVerificationPass = v.field("verifiedFirstVerificationPass").bool(),
         repairAttempts = v.field("repairAttempts").long(),
         modelSequence = v.field("modelSequence").array().map { parseProtocolRunOutcomeModelStep(it) },
+        firstExecutionClass = v.field("firstExecutionClass").string(),
+        finalExecutionClass = v.field("finalExecutionClass").string(),
+        attributionState = v.field("attributionState").string(),
         moneyState = v.field("moneyState").string(),
         modelSpendMicro = v.optionalField("modelSpendMicro")?.string(),
         verificationSpendMicro = v.optionalField("verificationSpendMicro")?.string(),

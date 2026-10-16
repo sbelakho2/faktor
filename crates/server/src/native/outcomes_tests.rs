@@ -56,6 +56,9 @@ fn record(
         verified_first_verification_pass: true,
         repair_attempts: 0,
         model_sequence: vec![step(provider, model, class)],
+        first_execution_class: class,
+        final_execution_class: class,
+        attribution_state: faktor_agent::AttributionState::Complete,
         wall_time_ms: 1_000,
         human_interventions: 0,
         proof: ProofCoverage {
@@ -201,6 +204,15 @@ async fn empty_ledger_answers_zero_metrics_and_no_runs() {
         "an empty ledger has no frontier authority"
     );
     assert_eq!(metrics["frontierEscalationMeasurement"], "unmeasured");
+    // Local classification coverage mirrors the frontier rule: an empty
+    // ledger has no boundary authority — unmeasured, with a counted cohort.
+    assert_eq!(metrics["localClassedRuns"], 0);
+    assert_eq!(metrics["localMeasurement"], "unmeasured");
+    // Attribution: nothing to attest on an empty ledger.
+    assert_eq!(metrics["attributionCompleteRuns"], 0);
+    assert_eq!(metrics["attributionPartialRuns"], 0);
+    assert_eq!(metrics["attributionUnavailableRuns"], 0);
+    assert_eq!(metrics["attributionIncompleteExcluded"], 0);
     assert_eq!(metrics["truncated"], false);
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
     assert!(body["nextCursor"].is_null());
@@ -266,6 +278,14 @@ async fn ledger_metrics_and_run_page_match_the_durable_records() {
     assert_eq!(metrics["frontierEscalationRuns"], 0);
     assert_eq!(metrics["frontierEscalationPpm"], 0);
     assert_eq!(metrics["frontierEscalationMeasurement"], "measured");
+    // Local coverage is measured too (both boundary classes on every run),
+    // and the attribution is complete for every fixture run.
+    assert_eq!(metrics["localClassedRuns"], 3);
+    assert_eq!(metrics["localMeasurement"], "measured");
+    assert_eq!(metrics["attributionCompleteRuns"], 3);
+    assert_eq!(metrics["attributionPartialRuns"], 0);
+    assert_eq!(metrics["attributionUnavailableRuns"], 0);
+    assert_eq!(metrics["attributionIncompleteExcluded"], 0);
     assert_eq!(metrics["scanned"], 3);
     assert_eq!(metrics["truncated"], false);
     let runs = body["runs"].as_array().unwrap();
@@ -279,9 +299,16 @@ async fn ledger_metrics_and_run_page_match_the_durable_records() {
         runs[0]["modelSequence"][0]["executionClass"],
         "hosted_economy"
     );
+    // The exactly-preserved boundary classes and the attribution state ride
+    // the run projection (the wire's classification/learning-honesty view).
+    assert_eq!(runs[0]["firstExecutionClass"], "hosted_economy");
+    assert_eq!(runs[0]["finalExecutionClass"], "hosted_economy");
+    assert_eq!(runs[0]["attributionState"], "complete");
     assert_eq!(runs[1]["runId"], "run-b");
     assert_eq!(runs[1]["modelSequence"][0]["local"], true);
     assert_eq!(runs[1]["modelSequence"][0]["executionClass"], "local");
+    assert_eq!(runs[1]["firstExecutionClass"], "local");
+    assert_eq!(runs[1]["finalExecutionClass"], "local");
     assert_eq!(runs[1]["avoidedHostedMicro"], "250000");
     assert_eq!(runs[1]["finalBasis"], "deterministic_checks");
     let next = &body["nextCursor"];
@@ -362,6 +389,11 @@ async fn classless_legacy_local_step_is_never_promoted_on_the_wire() {
         local: true,
         execution_class: ExecutionClass::Unknown,
     }];
+    // A pre-class payload predates the boundary-class fields too: both
+    // boundaries decode `unknown` — the recorded local bit is never
+    // promoted to a class anywhere on the wire.
+    outcome.first_execution_class = ExecutionClass::Unknown;
+    outcome.final_execution_class = ExecutionClass::Unknown;
     settlement.steps = vec![SettlementStep {
         provider: "ollama".into(),
         model: "local-legacy".into(),
@@ -390,6 +422,9 @@ async fn classless_legacy_local_step_is_never_promoted_on_the_wire() {
         step["legacyLocal"], true,
         "the recorded pre-class local bit rides the legacy marker: {step}"
     );
+    // A pre-class payload carries no boundary-class authority either.
+    assert_eq!(body["runs"][0]["firstExecutionClass"], "unknown");
+    assert_eq!(body["runs"][0]["finalExecutionClass"], "unknown");
     // The metrics classify by the durable class only: the run is neither
     // local nor hosted, and it still counts toward the runs-with-steps
     // denominator (it has a step).

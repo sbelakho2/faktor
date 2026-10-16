@@ -28,11 +28,19 @@
 //!   finalize or a crash reconciliation) still carries its exact money with
 //!   the honest `UNATTRIBUTED` provenance label.
 //!
-//! Reads are bounded ([`MAX_DURABLE_SPEND_ROWS`]); a reservation flood past
-//! the bound refuses loudly rather than returning a silently partial
-//! picture.
+//! Reads are bounded ([`MAX_DURABLE_SPEND_ROWS`] /
+//! [`MAX_DURABLE_SPEND_CALL_ROWS`]); a flood past either bound refuses
+//! loudly rather than returning a silently partial picture. The
+//! provider-call read's truncation is carried EXPLICITLY by
+//! [`DurableSpendProjection::call_rows_truncated`] so a caller that must
+//! record an immutable row (the outcome ledger) can MARK the partial
+//! attribution instead of tolerating it silently, while every money/usage
+//! summation ([`SessionHandle::durable_spend_rows`]) refuses the partial
+//! read exactly like the reservation bound (the efficiency-KPI rule: a
+//! truncated bounded read is a typed refusal, never a quietly partial
+//! total).
 
-use faktor_core::id::TaskId;
+use faktor_core::id::{SessionId, TaskId};
 use faktor_core::model::{ExecutionClass, PriceAuthority};
 
 use crate::handle::SessionHandle;
@@ -113,6 +121,28 @@ impl DurableSpendRow {
     }
 }
 
+/// The durable-spend projection of one typed task: the settled rows PLUS the
+/// honesty of their provider/model attribution (the provider-call read is
+/// bounded; the money itself comes from the reservation rows and stays
+/// exact).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableSpendProjection {
+    /// One row per settled reservation in the store's read order (newest
+    /// reservation first; callers that need the run's chronological story
+    /// re-order by `occurred_at_ms`/reservation id).
+    pub rows: Vec<DurableSpendRow>,
+    /// True when the provider-call history exceeded
+    /// [`MAX_DURABLE_SPEND_CALL_ROWS`]: attribution rests on a bounded read,
+    /// so it must never be claimed complete (rows whose call fell past the
+    /// bound carry the `unattributed` provenance and zero counters).
+    pub call_rows_truncated: bool,
+    /// Settled reservations whose attributable provider-call row was NOT
+    /// found (a conservative finalize / crash reconciliation, or a call row
+    /// beyond the truncation bound): their provider/model is the explicit
+    /// [`UNATTRIBUTED_PROVENANCE`] label, never a guess.
+    pub unattributed_settled: u64,
+}
+
 /// The amount one settled reservation actually folded: the v18 canonical
 /// `settled_cost_micro`, falling back for pre-v18 rows to the legacy winner
 /// (provider-reported, else the locally calculated amount). Hostile
@@ -133,14 +163,31 @@ pub fn reservation_provider_reported_micro(row: &faktor_store::CostReservationRo
 
 impl SessionHandle {
     /// The durable-spend projection of ONE typed task (see the module docs
-    /// for the exact row sources). Read-only; bounded; a store failure is
-    /// loud.
-    pub fn durable_spend_rows(
+    /// for the exact row sources): rows plus the explicit provider/model
+    /// attribution honesty. Read-only; bounded; a store failure is loud.
+    /// The provider-call read uses the canonical
+    /// [`MAX_DURABLE_SPEND_CALL_ROWS`] bound.
+    pub fn durable_spend_projection(
         &self,
         task_id: TaskId,
         limit: i64,
-    ) -> faktor_core::Result<Vec<DurableSpendRow>> {
+    ) -> faktor_core::Result<DurableSpendProjection> {
+        self.durable_spend_projection_bounded(task_id, limit, MAX_DURABLE_SPEND_CALL_ROWS)
+    }
+
+    /// The bounded twin of [`SessionHandle::durable_spend_projection`]: the
+    /// same projection with an EXPLICIT provider-call read bound (the
+    /// canonical production bound is [`MAX_DURABLE_SPEND_CALL_ROWS`]; the
+    /// parameter exists so callers and adversarial tests can pin a tighter
+    /// bound and observe the documented truncation behavior).
+    pub fn durable_spend_projection_bounded(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+        call_limit: i64,
+    ) -> faktor_core::Result<DurableSpendProjection> {
         let limit = limit.clamp(1, MAX_DURABLE_SPEND_ROWS);
+        let call_limit = call_limit.clamp(0, MAX_DURABLE_SPEND_CALL_ROWS);
         let store = self.manager.store();
         // Ask for one row more than the bound: a full page then PROVES
         // truncation instead of guessing it.
@@ -162,12 +209,17 @@ impl SessionHandle {
             .filter(|row| row.status == "settled")
             .collect();
         if settled.is_empty() {
-            return Ok(Vec::new());
+            return Ok(DurableSpendProjection {
+                rows: Vec::new(),
+                call_rows_truncated: false,
+                unattributed_settled: 0,
+            });
         }
-        let (calls, _truncated) = store
-            .provider_call_task_rows(self.id, task_id, MAX_DURABLE_SPEND_CALL_ROWS)
+        let (calls, call_rows_truncated) = store
+            .provider_call_task_rows(self.id, task_id, call_limit)
             .map_err(SessionError::from)?;
         let mut rows = Vec::with_capacity(settled.len());
+        let mut unattributed_settled: u64 = 0;
         for reservation in settled {
             let call = calls
                 .iter()
@@ -188,10 +240,13 @@ impl SessionHandle {
                 });
             let (provider, model) = match call {
                 Some(call) => (call.provider.clone(), call.model.clone()),
-                None => (
-                    UNATTRIBUTED_PROVENANCE.to_string(),
-                    UNATTRIBUTED_PROVENANCE.to_string(),
-                ),
+                None => {
+                    unattributed_settled = unattributed_settled.saturating_add(1);
+                    (
+                        UNATTRIBUTED_PROVENANCE.to_string(),
+                        UNATTRIBUTED_PROVENANCE.to_string(),
+                    )
+                }
             };
             rows.push(DurableSpendRow {
                 session_id: self.id.raw(),
@@ -215,8 +270,50 @@ impl SessionHandle {
                 source_operation: "session.cost_reservation.settled".to_string(),
             });
         }
-        Ok(rows)
+        Ok(DurableSpendProjection {
+            rows,
+            call_rows_truncated,
+            unattributed_settled,
+        })
     }
+
+    /// The durable-spend projection of ONE typed task with the attribution
+    /// honesty ENFORCED: a truncated provider-call history is a typed
+    /// refusal (mirroring the reservation bound and the efficiency KPI's
+    /// refusal rule), never a silently partial attribution/token total. A
+    /// caller that must record an immutable row uses
+    /// [`SessionHandle::durable_spend_projection`] and marks the state
+    /// instead.
+    pub fn durable_spend_rows(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+    ) -> faktor_core::Result<Vec<DurableSpendRow>> {
+        strict_projection_rows(
+            self.durable_spend_projection(task_id, limit)?,
+            self.id,
+            task_id,
+        )
+    }
+}
+
+/// The strict fold of one projection for callers that sum money/usage: a
+/// truncated provider-call history is refused typed (mirroring the
+/// reservation bound), never a silently partial attribution or token total.
+fn strict_projection_rows(
+    projection: DurableSpendProjection,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> faktor_core::Result<Vec<DurableSpendRow>> {
+    if projection.call_rows_truncated {
+        return Err(SessionError::Conflict(format!(
+            "durable spend read of session {session_id} task {task_id} exceeds the \
+             {MAX_DURABLE_SPEND_CALL_ROWS}-provider-call bound; refusing a partial \
+             attribution"
+        ))
+        .into());
+    }
+    Ok(projection.rows)
 }
 
 #[cfg(test)]
@@ -297,6 +394,96 @@ mod tests {
         // The provenance label is honest when no call row exists.
         assert_eq!(row.provider, UNATTRIBUTED_PROVENANCE);
         assert_eq!(row.attempt_id, "2", "the physical attempt identity");
+    }
+
+    /// The provider-call truncation is CARRIED, never discarded: a bounded
+    /// projection reports it explicitly (with the unattributed provenance on
+    /// the rows whose call fell past the bound) and the strict money/usage
+    /// fold refuses it typed; a whole history stays complete.
+    #[test]
+    fn truncated_provider_call_history_is_reported_and_the_strict_fold_refuses_it() {
+        let (_dir, manager) = test_manager();
+        let s = session(&manager);
+        let task = seeded_task(&s);
+        let ledger = DurableBudgetLedger::new(s.manager.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (index, (logical, physical)) in [(1u64, 2u64), (3, 4)].into_iter().enumerate() {
+            let attempt = faktor_core::op::ModelCallAttempt::new(
+                faktor_core::id::OpId::new(logical),
+                faktor_core::id::OpId::new(physical),
+                index as u32 + 1,
+            )
+            .unwrap();
+            let reservation = runtime
+                .block_on(ledger.reserve_attempt(
+                    s.id,
+                    task,
+                    attempt,
+                    100,
+                    None,
+                    ExecutionClass::HostedEconomy,
+                ))
+                .unwrap();
+            runtime
+                .block_on(ledger.settle_usage(s.id, reservation, 5, 0, 0, 5, Some(70), None))
+                .unwrap();
+            s.record_provider_call_attempt(
+                attempt,
+                Some(reservation),
+                if index == 0 { "p-oldest" } else { "p-newest" },
+                "m",
+                "completed",
+                Some(5),
+                Some(5),
+                None,
+            )
+            .unwrap();
+        }
+        // The canonical bound sees the whole (short) history: complete.
+        let projection = s.durable_spend_projection(task, 100).unwrap();
+        assert!(!projection.call_rows_truncated);
+        assert_eq!(projection.unattributed_settled, 0);
+        assert_eq!(projection.rows.len(), 2);
+        assert!(projection
+            .rows
+            .iter()
+            .all(|row| row.provider != UNATTRIBUTED_PROVENANCE));
+        let strict = s.durable_spend_rows(task, 100).unwrap();
+        assert_eq!(strict.len(), 2, "a whole history is unchanged");
+        // A tighter explicit bound proves the truncation is observable: the
+        // newest call row fell past it, so its settled reservation carries
+        // the explicit unattributed provenance (never a guess).
+        let truncated = s.durable_spend_projection_bounded(task, 100, 1).unwrap();
+        assert!(
+            truncated.call_rows_truncated,
+            "the full bounded page PROVES truncation"
+        );
+        assert_eq!(truncated.unattributed_settled, 1);
+        assert!(truncated.rows.iter().any(|row| {
+            row.provider == UNATTRIBUTED_PROVENANCE
+                && row.model == UNATTRIBUTED_PROVENANCE
+                && row.execution_class == ExecutionClass::HostedEconomy
+        }));
+        // Money is untouched by attribution truncation: the reservation
+        // rows stay the money truth (identical folded sums).
+        let sum = |rows: &[DurableSpendRow]| -> u64 {
+            rows.iter()
+                .map(|row| row.provider_cost_micro)
+                .fold(0u64, u64::saturating_add)
+        };
+        assert_eq!(sum(&truncated.rows), sum(&projection.rows));
+        // The strict fold refuses the partial attribution typed (the
+        // efficiency-KPI refusal rule), never a silently partial picture.
+        let err = strict_projection_rows(truncated, s.id, task).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing a partial attribution"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&MAX_DURABLE_SPEND_CALL_ROWS.to_string()),
+            "{message}"
+        );
     }
 
     #[test]

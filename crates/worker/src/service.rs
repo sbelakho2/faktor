@@ -144,12 +144,31 @@ impl RecoveryReport {
 
 /// The worker plane: the ONE authority over worker registrations, job
 /// generations, leases and landed results.
+///
+/// ## Licensing boundary (deliberate, documented)
+///
+/// This library type is UNGATED by construction:
+/// [`WorkerPlane::new`] / [`WorkerPlane::new_for_embedded_host`] build a
+/// plane with no claim gate, and [`WorkerPlane::admit_claim`] returns
+/// `Ok(())` while none is installed. That is the documented embedded/
+/// community construction, kept for embedded hosts and tests.
+///
+/// The commercial boundary is a DAEMON/SERVICE SEAM, not a library API
+/// contract: the production daemon's `serve` wiring (`wire_worker_plane`)
+/// constructs its ONE plane and ALWAYS installs the `private_runners` gate
+/// through [`WorkerPlane::set_claim_entitlement_gate`] before the first
+/// request, so daemon-side claim admission is refused typed (`cloud_absent`
+/// with no billing authority, `not_in_plan`/`subscription_inactive` per the
+/// plan otherwise) — never a silent claim. Embedded hosts that require the
+/// commercial boundary must install the gate themselves; existing
+/// embedders keep the documented ungated behavior.
 pub struct WorkerPlane {
     store: Arc<dyn WorkerStore>,
     clock: Arc<dyn Clock>,
     /// The OPTIONAL claim-admission gate (`private_runners`). `None` = the
-    /// operator built this plane directly (the documented self-hosted
-    /// ungated construction used by tests and embedded hosts). The daemon
+    /// direct library construction ([`WorkerPlane::new`] /
+    /// [`WorkerPlane::new_for_embedded_host`]: the documented embedded/
+    /// community form used by embedded hosts and tests). The daemon
     /// installs the commercial gate through
     /// [`WorkerPlane::set_claim_entitlement_gate`]: claim admission then
     /// consults `private_runners` FIRST and a denial is the typed
@@ -158,7 +177,17 @@ pub struct WorkerPlane {
 }
 
 impl WorkerPlane {
-    pub fn new(store: Arc<dyn WorkerStore>, clock: Arc<dyn Clock>) -> Arc<Self> {
+    /// The documented embedded/community construction: an UNGATED plane.
+    /// Claim admission ([`Self::admit_claim`]) returns `Ok(())` until a host
+    /// installs a gate through [`Self::set_claim_entitlement_gate`].
+    ///
+    /// The production daemon does NOT treat this as its licensing boundary:
+    /// its `serve` wiring (`wire_worker_plane`) already installs the
+    /// `private_runners` gate on the one plane it builds. Gating is enforced
+    /// at that daemon/service seam — placement mint and claim admission —
+    /// not by this library API contract. Use this constructor only for
+    /// embedded hosts and tests (or install the gate yourself).
+    pub fn new_for_embedded_host(store: Arc<dyn WorkerStore>, clock: Arc<dyn Clock>) -> Arc<Self> {
         Arc::new(Self {
             store,
             clock,
@@ -166,10 +195,20 @@ impl WorkerPlane {
         })
     }
 
+    /// Compatibility alias for [`Self::new_for_embedded_host`]: the same
+    /// documented embedded/community construction and the same ungated claim
+    /// admission, kept so existing embedders never break. New embedded code
+    /// should prefer the explicitly named [`Self::new_for_embedded_host`].
+    pub fn new(store: Arc<dyn WorkerStore>, clock: Arc<dyn Clock>) -> Arc<Self> {
+        Self::new_for_embedded_host(store, clock)
+    }
+
     /// Install the claim-admission value-entitlement gate (`private_runners`).
     /// Additive: without an install the plane keeps its direct-construction
     /// behavior (ungated); with one, every `claim_next` consults the gate
-    /// first and a refusal is typed, admitting nothing.
+    /// first and a refusal is typed, admitting nothing. The daemon's serve
+    /// wiring always calls this on the plane it constructs (see the type
+    /// docs); the library-level constructors alone never gate.
     pub fn set_claim_entitlement_gate(&self, gate: faktor_core::entitlement::ValueGate) {
         *self
             .claim_gate
@@ -177,7 +216,9 @@ impl WorkerPlane {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(gate);
     }
 
-    /// The claim-admission check: `Ok(())` while no gate is installed; the
+    /// The claim-admission check: `Ok(())` while no gate is installed (the
+    /// documented embedded/community path — the daemon always installs a
+    /// gate, so this arm is never the daemon's licensing boundary); the
     /// typed refusal otherwise.
     fn admit_claim(&self) -> Result<(), WorkerError> {
         let gate = self
@@ -193,7 +234,10 @@ impl WorkerPlane {
         }
     }
 
-    /// The production construction path (system clock).
+    /// The production construction path (system clock): the same ungated
+    /// embedded/community plane as [`Self::new_for_embedded_host`] — the
+    /// daemon installs the `private_runners` claim gate right after
+    /// (`wire_worker_plane`), which is where the licensing boundary lives.
     pub fn with_system_clock(store: Arc<dyn WorkerStore>) -> Arc<Self> {
         Self::new(store, Arc::new(SystemClock))
     }
@@ -662,9 +706,10 @@ impl WorkerPlane {
         if worker.organization_id != organization.as_str() {
             return Err(WorkerError::UnknownWorker(worker_id.clone()));
         }
-        // Claim ADMISSION (the `private_runners` paid augmentation): when the
-        // daemon installed a gate, the refusal is typed and nothing is
-        // claimed. No gate = the operator's direct construction (ungated).
+        // Claim ADMISSION (the `private_runners` paid augmentation): when a
+        // gate is installed (the daemon always installs one), the refusal is
+        // typed and nothing is claimed. No gate = the documented embedded/
+        // community construction (ungated) — never the daemon path.
         self.admit_claim()?;
         let now = self.now_ms();
         let mut after: Option<i64> = None;

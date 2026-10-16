@@ -69,6 +69,16 @@ fn outcome(
     first_pass: bool,
     steps: Vec<RunModelStep>,
 ) -> TerminalEngineeringOutcome {
+    // The exactly-preserved boundary classes mirror the generated sequence;
+    // the attribution is complete (these are in-memory fold fixtures).
+    let first_execution_class = steps
+        .first()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
+    let final_execution_class = steps
+        .last()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
     TerminalEngineeringOutcome {
         schema_version: faktor_agent::OUTCOME_RECORD_SCHEMA_V,
         run_id: run.to_string(),
@@ -83,6 +93,9 @@ fn outcome(
         verified_first_verification_pass: verified && first_pass,
         repair_attempts: 0,
         model_sequence: steps,
+        first_execution_class,
+        final_execution_class,
+        attribution_state: faktor_agent::AttributionState::Complete,
         wall_time_ms: 10,
         human_interventions: 0,
         proof: ProofCoverage {

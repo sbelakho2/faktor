@@ -20,6 +20,25 @@ fn step_classed(provider: &str, model: &str, execution_class: ExecutionClass) ->
     }
 }
 
+/// Replace a record's model sequence, keeping the exactly-preserved boundary
+/// classes in sync: they — not the possibly-folded first/last display step —
+/// are the local classification authority.
+fn with_sequence(
+    mut record: TerminalEngineeringOutcome,
+    steps: Vec<RunModelStep>,
+) -> TerminalEngineeringOutcome {
+    record.first_execution_class = steps
+        .first()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
+    record.final_execution_class = steps
+        .last()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
+    record.model_sequence = steps;
+    record
+}
+
 fn sample(
     provider: &str,
     model: &str,
@@ -109,6 +128,9 @@ fn full_record() -> TerminalEngineeringOutcome {
             step("ollama", "qwen3.8", true),
             step("anthropic", "claude-opus", false),
         ],
+        first_execution_class: ExecutionClass::Local,
+        final_execution_class: ExecutionClass::HostedEconomy,
+        attribution_state: AttributionState::Complete,
         wall_time_ms: 12_345,
         human_interventions: 2,
         proof: ProofCoverage {
@@ -153,7 +175,7 @@ fn fixture() -> Vec<OutcomeLedgerEntry> {
     a.risk_class = RiskBucket::Low;
     a.candidate_snapshot = None;
     a.verified_first_verification_pass = true;
-    a.model_sequence = vec![step("hosted", "m-standard", false)];
+    a = with_sequence(a, vec![step("hosted", "m-standard", false)]);
     a.wall_time_ms = 1_000;
     a.human_interventions = 0;
     a.proof = ProofCoverage {
@@ -176,7 +198,7 @@ fn fixture() -> Vec<OutcomeLedgerEntry> {
 
     let mut b = a.clone();
     b.run_id = "r-b".into();
-    b.model_sequence = vec![step("ollama", "local-7b", true)];
+    b = with_sequence(b, vec![step("ollama", "local-7b", true)]);
     b.wall_time_ms = 2_000;
     b.proof = ProofCoverage {
         checks_passed: 4,
@@ -895,7 +917,7 @@ fn runs_with_steps_and_classed_coverage_are_folded_denominators() {
     let mut entries = Vec::new();
     let mut classed = full_record();
     classed.run_id = "classed".into();
-    classed.model_sequence = vec![step("hosted", "m", false)];
+    classed = with_sequence(classed, vec![step("hosted", "m", false)]);
     // This test pins the COHORT denominators, not the frontier counters:
     // clear the inherited recorded escalation so `frontier_*` asserts the
     // classed-coverage rule instead of the escalation itself.
@@ -907,7 +929,10 @@ fn runs_with_steps_and_classed_coverage_are_folded_denominators() {
     });
     let mut classless = full_record();
     classless.run_id = "classless".into();
-    classless.model_sequence = vec![step_classed("hosted", "m", ExecutionClass::Unknown)];
+    classless = with_sequence(
+        classless,
+        vec![step_classed("hosted", "m", ExecutionClass::Unknown)],
+    );
     classless.frontier_escalations = 0;
     classless.verified_samples.clear();
     let classless_settlement =
@@ -918,7 +943,7 @@ fn runs_with_steps_and_classed_coverage_are_folded_denominators() {
     });
     let mut stepless = full_record();
     stepless.run_id = "stepless".into();
-    stepless.model_sequence = Vec::new();
+    stepless = with_sequence(stepless, Vec::new());
     stepless.frontier_escalations = 0;
     stepless.verified_samples.clear();
     let stepless_settlement = complete_settlement(&stepless, &[], 0, MeasuredMoney::Unavailable);
@@ -950,7 +975,7 @@ fn runs_with_steps_and_classed_coverage_are_folded_denominators() {
     // it) — and with no known class anywhere the rate stays unmeasured.
     let mut escalated_stepless = full_record();
     escalated_stepless.run_id = "escalated-stepless".into();
-    escalated_stepless.model_sequence = Vec::new();
+    escalated_stepless = with_sequence(escalated_stepless, Vec::new());
     escalated_stepless.verified_samples.clear();
     let escalated_settlement =
         complete_settlement(&escalated_stepless, &[], 0, MeasuredMoney::Unavailable);
@@ -976,10 +1001,13 @@ fn metrics_fixture_includes_local_zero_cost_substitution_and_rework() {
     c.run_id = "r-c".into();
     c.verified_first_verification_pass = false;
     c.repair_attempts = 1;
-    c.model_sequence = vec![
-        step("ollama", "local-7b", true),
-        step("hosted", "m-strong", false),
-    ];
+    c = with_sequence(
+        c,
+        vec![
+            step("ollama", "local-7b", true),
+            step("hosted", "m-strong", false),
+        ],
+    );
     c.wall_time_ms = 5_000;
     c.human_interventions = 1;
     c.proof = ProofCoverage {
@@ -993,7 +1021,7 @@ fn metrics_fixture_includes_local_zero_cost_substitution_and_rework() {
     let mut d = entries[0].outcome.clone();
     d.run_id = "r-d".into();
     d.integrated = false;
-    d.model_sequence = vec![step("hosted", "m-strong", false)];
+    d = with_sequence(d, vec![step("hosted", "m-strong", false)]);
     d.wall_time_ms = 3_000;
     d.proof = ProofCoverage::default();
     d.rollback_events = 2;
@@ -1004,7 +1032,7 @@ fn metrics_fixture_includes_local_zero_cost_substitution_and_rework() {
     // E: frontier escalation, deterministic checks.
     let mut e = entries[0].outcome.clone();
     e.run_id = "r-e".into();
-    e.model_sequence = vec![step("hosted", "m-frontier", false)];
+    e = with_sequence(e, vec![step("hosted", "m-frontier", false)]);
     e.wall_time_ms = 4_000;
     e.proof = ProofCoverage {
         checks_passed: 2,
@@ -1085,7 +1113,10 @@ fn metrics_fixture_includes_local_zero_cost_substitution_and_rework() {
 #[test]
 fn unmeasured_frontier_rate_is_null_not_zero() {
     let mut entry = fixture().remove(0);
-    entry.outcome.model_sequence = vec![step_classed("hosted", "m", ExecutionClass::Unknown)];
+    entry.outcome = with_sequence(
+        entry.outcome,
+        vec![step_classed("hosted", "m", ExecutionClass::Unknown)],
+    );
     entry.outcome.verified_samples.clear();
     entry.settlement.steps = vec![SettlementStep {
         provider: "hosted".into(),
@@ -1119,10 +1150,13 @@ fn partial_frontier_rate_covers_exactly_the_classed_runs() {
     // One fully-classed run with a Frontier step.
     let mut classed = full_record();
     classed.run_id = "classed".into();
-    classed.model_sequence = vec![
-        step("hosted", "m-economy", false),
-        step_classed("hosted", "m-frontier", ExecutionClass::Frontier),
-    ];
+    classed = with_sequence(
+        classed,
+        vec![
+            step("hosted", "m-economy", false),
+            step_classed("hosted", "m-frontier", ExecutionClass::Frontier),
+        ],
+    );
     let classed_settlement =
         complete_settlement(&classed, &[100, 200], 0, MeasuredMoney::Unavailable);
     entries.push(OutcomeLedgerEntry {
@@ -1132,7 +1166,10 @@ fn partial_frontier_rate_covers_exactly_the_classed_runs() {
     // One legacy-class run: not counted in the classed cohort.
     let mut legacy = full_record();
     legacy.run_id = "legacy".into();
-    legacy.model_sequence = vec![step_classed("hosted", "m", ExecutionClass::Unknown)];
+    legacy = with_sequence(
+        legacy,
+        vec![step_classed("hosted", "m", ExecutionClass::Unknown)],
+    );
     // No recorded escalation: the escalation of interest below is the
     // durably-known Frontier STEP of the classed run.
     legacy.frontier_escalations = 0;
@@ -1212,7 +1249,7 @@ fn vcsc_counts_the_whole_attempt_cohort_not_only_the_successes() {
         failed.accepted = false;
         failed.integrated = false;
         failed.verified_first_verification_pass = false;
-        failed.model_sequence = vec![step("hosted", "m", false)];
+        failed = with_sequence(failed, vec![step("hosted", "m", false)]);
         failed.final_basis = FinalVerificationBasis::Unverified;
         failed.verified_samples.clear();
         let settlement = EconomicSettlement {
@@ -1241,7 +1278,7 @@ fn vcsc_counts_the_whole_attempt_cohort_not_only_the_successes() {
     }
     let mut success = full_record();
     success.run_id = "success".into();
-    success.model_sequence = vec![step("hosted", "m", false)];
+    success = with_sequence(success, vec![step("hosted", "m", false)]);
     success.verified_samples.clear();
     let settlement = complete_settlement(&success, &[1_000_000], 0, MeasuredMoney::Unavailable);
     entries.push(OutcomeLedgerEntry {
@@ -1270,7 +1307,7 @@ fn money_paths_remain_exact_above_f64_precision_and_round_up() {
     let big = 9_007_199_254_740_993u64;
     let mut record = full_record();
     record.run_id = "run-big".into();
-    record.model_sequence = vec![step("hosted", "m", false)];
+    record = with_sequence(record, vec![step("hosted", "m", false)]);
     record.candidate_snapshot = None;
     record.verified_samples = vec![sample("hosted", "m", RouterPhase::Implement, true, 0, 0)];
     let settlement = EconomicSettlement {
@@ -1423,6 +1460,23 @@ fn invalid_records_are_refused_before_any_write() {
         local: true,
         execution_class: ExecutionClass::HostedEconomy,
     }];
+    assert_invalid(&r, &base_settlement);
+    // A COMPLETE attribution claim carrying an explicitly unattributed step
+    // is refused (the derivation never produces one).
+    let mut r = base.clone();
+    r.model_sequence = vec![RunModelStep {
+        provider: "unattributed".into(),
+        model: "unattributed".into(),
+        local: false,
+        execution_class: ExecutionClass::Unknown,
+    }];
+    r.first_execution_class = ExecutionClass::Unknown;
+    r.final_execution_class = ExecutionClass::Unknown;
+    assert_invalid(&r, &base_settlement);
+    // A run with NO steps cannot carry durably-known boundary classes: the
+    // class authority without a step is drift.
+    let mut r = base.clone();
+    r.model_sequence = Vec::new();
     assert_invalid(&r, &base_settlement);
     let mut r = base.clone();
     r.model_sequence = (0..=MAX_RUN_MODEL_STEPS)
@@ -1645,6 +1699,165 @@ async fn adversarial_settle_between_the_two_money_reads_never_completes_missing_
     assert_eq!(settled.money_state, MoneyState::Complete);
     assert_eq!(settled.model_spend_micro, Some(123_456));
     assert_eq!(settled.seq, 1);
+}
+
+/// Seed one terminal run whose provider-call history is observable at ANY
+/// bound: two settled attempt-keyed calls (`p-oldest` recorded first) and a
+/// persisted terminal turn carrying one explicit verified sample. Returns
+/// the store, handle and run id; the caller picks the ledger's call bound
+/// and records.
+async fn attribution_env(
+    root: &str,
+) -> (
+    Arc<Store>,
+    faktor_session::SessionHandle,
+    String,
+    tempfile::TempDir,
+) {
+    use faktor_core::id::OpId;
+    use faktor_core::op::ModelCallAttempt;
+    use faktor_session::{BudgetAuthority as _, DurableBudgetLedger};
+
+    let (manager, handle, task_id, dir) = interleaving_env(root).await;
+    let store = manager.store();
+    let budget = DurableBudgetLedger::new(manager.clone());
+    for (index, (logical, physical)) in [(1u64, 2u64), (3, 4)].into_iter().enumerate() {
+        let attempt =
+            ModelCallAttempt::new(OpId::new(logical), OpId::new(physical), index as u32 + 1)
+                .unwrap();
+        let reservation = budget
+            .reserve_attempt(
+                handle.id(),
+                task_id,
+                attempt,
+                100,
+                None,
+                ExecutionClass::HostedEconomy,
+            )
+            .await
+            .unwrap();
+        budget
+            .settle_usage(handle.id(), reservation, 5, 0, 0, 5, Some(70), None)
+            .await
+            .unwrap();
+        handle
+            .record_provider_call_attempt(
+                attempt,
+                Some(reservation),
+                if index == 0 { "p-oldest" } else { "p-newest" },
+                "m",
+                "completed",
+                Some(5),
+                Some(5),
+                None,
+            )
+            .unwrap();
+    }
+    let run_id = session_terminal_run_id(handle.id());
+    TerminalRunFactsOutbox::new(store.clone())
+        .persist(
+            &run_id,
+            &TerminalRunFacts {
+                schema_version: TERMINAL_FACTS_SCHEMA_V,
+                risk_class: Some(RiskBucket::Low),
+                samples: vec![sample("p-oldest", "m", RouterPhase::Implement, true, 0, 0)],
+            },
+        )
+        .unwrap();
+    use faktor_core::state::TaskTransition;
+    let revision = handle.task_revision(task_id).unwrap();
+    handle
+        .transition_task(task_id, revision, TaskTransition::FailFromRunning, None)
+        .unwrap();
+    (store, handle, run_id, dir)
+}
+
+/// A truncated provider-call history is TOLERATED no longer: the immutable
+/// record still lands (the engineering truth must exist) but it carries
+/// `attribution_state = partial` durably, and the run's samples are EXCLUDED
+/// from the ledger's routing-learning projection — never laundered into the
+/// router registry from an attribution-incomplete run. The identical
+/// complete history stays `complete` and feeds the registry exactly once.
+#[tokio::test]
+async fn truncated_provider_call_history_marks_partial_and_excludes_the_learning_feed() {
+    use faktor_router::OutcomeView;
+
+    let (store, handle, run_id, _dir) = attribution_env("/tmp/ledger-attribution").await;
+    // Bound 1: the oldest call row is visible, the newest fell past the
+    // bound — truncation is OBSERVED, and the second settled row carries the
+    // explicit unattributed provenance.
+    let ledger = OutcomeLedger::with_spend_call_bound(store.clone(), 1);
+    assert_eq!(
+        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        Some(LedgerAppend::Recorded)
+    );
+    let record = ledger.get(&run_id).unwrap().unwrap();
+    assert_eq!(record.attribution_state, AttributionState::Partial);
+    assert_eq!(
+        record
+            .model_sequence
+            .iter()
+            .filter(|step| step.provider == "unattributed")
+            .count(),
+        1,
+        "the call beyond the bound is explicitly unattributed: {record:?}"
+    );
+    assert_eq!(record.first_execution_class, ExecutionClass::HostedEconomy);
+    assert_eq!(record.final_execution_class, ExecutionClass::HostedEconomy);
+    // The durable ROW itself carries the state (not just the in-memory
+    // record): the stored payload is the authority every later read derives
+    // from.
+    let raw = store.engineering_outcome_get(&run_id).unwrap().unwrap();
+    assert!(
+        raw.payload.contains("\"attribution_state\":\"partial\""),
+        "the durable payload must record the partial attribution: {}",
+        raw.payload
+    );
+    // The learning feed: the partial run feeds NOTHING into the durable
+    // registry (its samples keep the per-call feed via the runtime's
+    // absorbed-set reconciliation).
+    let view = StoreOutcomeStore::new(store.clone());
+    let key = faktor_router::OutcomeKey {
+        provider: "p-oldest".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        task_class: TaskClass::Medium,
+        risk_bucket: RiskBucket::Low,
+    };
+    assert!(
+        view.stats(&key).is_none(),
+        "an attribution-incomplete run must never reach the router registry"
+    );
+    let report = ledger.metrics().unwrap();
+    assert_eq!(report.metrics.attribution_partial_runs, 1);
+    assert_eq!(report.metrics.attribution_incomplete_excluded, 1);
+
+    // Control: the SAME history under a whole read bound is
+    // attribution-complete and feeds the registry exactly once.
+    let (store2, handle2, run_id2, _dir2) =
+        attribution_env("/tmp/ledger-attribution-complete").await;
+    let ledger2 = OutcomeLedger::new(store2.clone());
+    assert_eq!(
+        ledger2.record_terminal_run(&handle2, &run_id2).unwrap(),
+        Some(LedgerAppend::Recorded)
+    );
+    let record2 = ledger2.get(&run_id2).unwrap().unwrap();
+    assert_eq!(record2.attribution_state, AttributionState::Complete);
+    assert!(
+        record2
+            .model_sequence
+            .iter()
+            .all(|step| step.provider != "unattributed"),
+        "{record2:?}"
+    );
+    let view2 = StoreOutcomeStore::new(store2.clone());
+    let stats = view2
+        .stats(&key)
+        .expect("a complete-attribution run feeds the registry");
+    assert_eq!(stats.sample_count, 1, "fed exactly once, never doubled");
+    let report2 = ledger2.metrics().unwrap();
+    assert_eq!(report2.metrics.attribution_complete_runs, 1);
+    assert_eq!(report2.metrics.attribution_incomplete_excluded, 0);
 }
 
 /// Finding: finalization used to hard-fail forever when the stored
@@ -1909,7 +2122,7 @@ fn hosted_only_denominator_counts_every_run_with_steps_including_unknown_classes
     fn entry(run_id: &str, sequence: Vec<RunModelStep>, spend: u64) -> OutcomeLedgerEntry {
         let mut record = full_record();
         record.run_id = run_id.into();
-        record.model_sequence = sequence;
+        record = with_sequence(record, sequence);
         record.verified_samples.clear();
         let settlement = EconomicSettlement {
             schema_version: SETTLEMENT_SCHEMA_V,
@@ -1969,4 +2182,316 @@ fn hosted_only_denominator_counts_every_run_with_steps_including_unknown_classes
         with_empty.hosted_only_ppm, 500_000,
         "a run with no steps never enters the denominator"
     );
+}
+
+/// The boundary execution classes are preserved EXACTLY, independent of the
+/// bounded display sequence: a >cap alternating local/hosted history folds
+/// its tail into the `unknown` aggregate, yet the local-first / local-final /
+/// local-to-hosted fold reads the recorded boundaries — and the local
+/// coverage state reports the classed cohort (this is the systematic
+/// depression the fold used to cause on long histories).
+#[test]
+fn folded_sequences_keep_exact_boundary_classes_and_local_rates() {
+    let row = |id: i64, class: ExecutionClass| faktor_session::DurableSpendRow {
+        session_id: 1,
+        task_id: 1,
+        reservation_id: id,
+        attempt_id: id.to_string(),
+        // A DISTINCT identity per row: no fold-merge collapses the boundary
+        // arithmetic (identities repeating next to the last kept group would
+        // legitimately merge their spend into it).
+        provider: format!("{}-{id}", if class.is_local() { "local" } else { "hosted" }),
+        model: "m".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+        prefix_cache_tokens: 0,
+        provider_cost_micro: 10,
+        provider_reported_micro: 10,
+        price_authority: None,
+        execution_class: class,
+        state: "settled".into(),
+        occurred_at_ms: id,
+        source_operation: "test".into(),
+    };
+    // 20 alternating groups: the display keeps the first 15 and folds the
+    // rest into ONE `unknown`-class aggregate tail.
+    let alternating = |start_local: bool| -> Vec<faktor_session::DurableSpendRow> {
+        (0..20)
+            .map(|index| {
+                let local = if index % 2 == 0 {
+                    start_local
+                } else {
+                    !start_local
+                };
+                row(
+                    index + 1,
+                    if local {
+                        ExecutionClass::Local
+                    } else {
+                        ExecutionClass::HostedEconomy
+                    },
+                )
+            })
+            .collect()
+    };
+    let folding = |spend: &[faktor_session::DurableSpendRow]| {
+        let (groups, financial, model_spend, first_class, final_class) = group_spend_rows(spend);
+        assert_eq!(model_spend, 200, "all excess spend is preserved");
+        assert_eq!(groups.len(), MAX_RUN_MODEL_STEPS, "the tail folded");
+        assert_eq!(financial.len(), MAX_RUN_MODEL_STEPS, "money rides the fold");
+        assert_eq!(groups.last().unwrap().provider, "aggregate");
+        assert_eq!(
+            groups.last().unwrap().execution_class,
+            ExecutionClass::Unknown,
+            "the folded display tail carries no class guess"
+        );
+        assert_eq!(
+            financial.last().unwrap().spend_micro,
+            5 * 10,
+            "the folded tail preserves every exceeded group's spend"
+        );
+        // The settlement fixtures spend exactly the folded per-step money.
+        let spends: Vec<u64> = financial.iter().map(|step| step.spend_micro).collect();
+        (groups, spends, first_class, final_class)
+    };
+
+    // Ends HOSTED: first local, final hosted (a fallback the folded display
+    // would classify as neither).
+    let (hosted_tail_groups, hosted_tail_spends, hosted_tail_first, hosted_tail_final) =
+        folding(&alternating(true));
+    assert_eq!(hosted_tail_first, ExecutionClass::Local);
+    assert_eq!(
+        hosted_tail_final,
+        ExecutionClass::HostedEconomy,
+        "the FINAL settled row's class survives the folded tail exactly"
+    );
+    // Ends LOCAL: final local (a local-final run the folded display would
+    // silently drop from the local-final cohort).
+    let (local_tail_groups, local_tail_spends, local_tail_first, local_tail_final) =
+        folding(&alternating(false));
+    assert_eq!(local_tail_first, ExecutionClass::HostedEconomy);
+    assert_eq!(local_tail_final, ExecutionClass::Local);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path(), true).unwrap());
+    let ledger = OutcomeLedger::new(store);
+    let mut hosted_tail = full_record();
+    hosted_tail.run_id = "folded-hosted-tail".into();
+    hosted_tail.model_sequence = hosted_tail_groups;
+    hosted_tail.first_execution_class = hosted_tail_first;
+    hosted_tail.final_execution_class = hosted_tail_final;
+    hosted_tail.verified_samples.clear();
+    hosted_tail.frontier_escalations = 0;
+    let settlement = complete_settlement(
+        &hosted_tail,
+        &hosted_tail_spends,
+        0,
+        MeasuredMoney::Unavailable,
+    );
+    assert_eq!(
+        ledger.record(&hosted_tail, &settlement).unwrap(),
+        LedgerAppend::Recorded
+    );
+    let mut local_tail = full_record();
+    local_tail.run_id = "folded-local-tail".into();
+    local_tail.model_sequence = local_tail_groups;
+    local_tail.first_execution_class = local_tail_first;
+    local_tail.final_execution_class = local_tail_final;
+    local_tail.verified_samples.clear();
+    local_tail.frontier_escalations = 0;
+    let settlement = complete_settlement(
+        &local_tail,
+        &local_tail_spends,
+        0,
+        MeasuredMoney::Unavailable,
+    );
+    assert_eq!(
+        ledger.record(&local_tail, &settlement).unwrap(),
+        LedgerAppend::Recorded
+    );
+
+    let report = ledger.metrics().unwrap();
+    let m = report.metrics;
+    assert_eq!(m.runs, 2);
+    assert_eq!(
+        m.local_first_runs, 1,
+        "folded-hosted-tail's first row is durably local"
+    );
+    assert_eq!(
+        m.local_to_hosted_fallback_runs, 1,
+        "the local->hosted fallback survives the folded tail"
+    );
+    assert_eq!(
+        m.local_final_runs, 1,
+        "folded-local-tail's final row is durably local"
+    );
+    assert_eq!(
+        m.local_final_verified_changes, 1,
+        "the verified local-final run is counted again"
+    );
+    assert_eq!(m.local_final_verified_ppm, 1_000_000);
+    assert_eq!(m.local_to_hosted_fallback_ppm, 1_000_000);
+    assert_eq!(
+        (m.local_classed_runs, m.runs_with_steps),
+        (2, 2),
+        "both folded runs carry exact boundary classes"
+    );
+    assert_eq!(m.local_measurement, LocalMeasurement::Measured);
+    assert_eq!(m.attribution_complete_runs, 2);
+    // Stored bytes round-trip the exact boundaries (the durable truth).
+    let read = ledger.get("folded-local-tail").unwrap().unwrap();
+    assert_eq!(read.final_execution_class, ExecutionClass::Local);
+    assert_eq!(
+        read.model_sequence.last().unwrap().execution_class,
+        ExecutionClass::Unknown,
+        "the display tail stays honestly unknown"
+    );
+}
+
+/// The local classification-coverage state mirrors the frontier rule:
+/// `unmeasured` with no boundary authority anywhere, `partial` while some
+/// runs lack boundary classes (counted by `local_classed_runs`), `measured`
+/// only when every run with steps carries both boundaries.
+#[test]
+fn local_coverage_states_are_measured_partial_and_unmeasured() {
+    let entry =
+        |run: &str, boundary: (ExecutionClass, ExecutionClass), steps: Vec<RunModelStep>| {
+            let mut record = full_record();
+            record.run_id = run.into();
+            record.model_sequence = steps;
+            record.first_execution_class = boundary.0;
+            record.final_execution_class = boundary.1;
+            record.verified_samples.clear();
+            record.frontier_escalations = 0;
+            let spends: Vec<u64> = record.model_sequence.iter().map(|_| 1).collect();
+            OutcomeLedgerEntry {
+                settlement: complete_settlement(&record, &spends, 0, MeasuredMoney::Unavailable),
+                outcome: record,
+            }
+        };
+
+    // (1) No class authority at all: UNMEASURED — never presented as full
+    // coverage.
+    let unmeasured = entry(
+        "unknown",
+        (ExecutionClass::Unknown, ExecutionClass::Unknown),
+        vec![step_classed("hosted", "m", ExecutionClass::Unknown)],
+    );
+    let m = OutcomeLedgerMetrics::compute(std::slice::from_ref(&unmeasured));
+    assert_eq!(m.local_classed_runs, 0);
+    assert_eq!(m.local_measurement, LocalMeasurement::Unmeasured);
+    assert_eq!(m.runs_with_steps, 1);
+
+    // (2) One boundary-classed run and one unclassed run: PARTIAL, with the
+    // classed cohort counted (the local rates cover exactly it).
+    let classed = entry(
+        "classed",
+        (ExecutionClass::Local, ExecutionClass::HostedEconomy),
+        vec![step("ollama", "local-7b", true), step("hosted", "m", false)],
+    );
+    let m = OutcomeLedgerMetrics::compute(&[classed, unmeasured.clone()]);
+    assert_eq!(m.local_classed_runs, 1);
+    assert_eq!(m.runs_with_steps, 2);
+    assert_eq!(m.local_measurement, LocalMeasurement::Partial);
+    assert_eq!(
+        m.local_to_hosted_fallback_runs, 1,
+        "the classed run's fallback is counted; the unclassed run's boundary cannot"
+    );
+
+    // (3) A pre-field folded payload whose final class was genuinely lost:
+    // first known, final unknown. It is boundary authority for local-first
+    // (its rate participates) but NOT full coverage — the state says
+    // PARTIAL, never measured.
+    let mut half_lost = full_record();
+    half_lost.run_id = "half-lost".into();
+    half_lost.model_sequence = vec![
+        step("ollama", "local-7b", true),
+        step_classed("aggregate", "1 folded steps", ExecutionClass::Unknown),
+    ];
+    half_lost.first_execution_class = ExecutionClass::Local;
+    half_lost.final_execution_class = ExecutionClass::Unknown;
+    half_lost.verified_samples.clear();
+    half_lost.frontier_escalations = 0;
+    let half_lost = OutcomeLedgerEntry {
+        settlement: complete_settlement(&half_lost, &[1, 1], 0, MeasuredMoney::Unavailable),
+        outcome: half_lost,
+    };
+    let m = OutcomeLedgerMetrics::compute(std::slice::from_ref(&half_lost));
+    assert_eq!(m.local_first_runs, 1, "first-boundary authority is exact");
+    assert_eq!(
+        m.local_classed_runs, 0,
+        "the lost final boundary never enters the classed cohort"
+    );
+    assert_eq!(
+        m.local_measurement,
+        LocalMeasurement::Partial,
+        "partial boundary authority is reported, never rounded to measured"
+    );
+
+    // (4) Every run with steps fully classed: MEASURED.
+    let m = OutcomeLedgerMetrics::compute(&[entry(
+        "classed-only",
+        (ExecutionClass::Local, ExecutionClass::Local),
+        vec![step("ollama", "local-7b", true)],
+    )]);
+    assert_eq!(m.local_measurement, LocalMeasurement::Measured);
+    assert_eq!(m.local_classed_runs, 1);
+}
+
+/// Provider/model attribution honesty: recorded per row, counted by the
+/// fold, and a non-complete run feeds NOTHING into the ledger's
+/// routing-learning projection (its explicit samples stay on the per-call
+/// feed), never silently laundered into the router registry.
+#[test]
+fn attribution_states_are_counted_and_incomplete_feeds_are_excluded() {
+    let mut entries = fixture();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.outcome.router_increments().len() == 1),
+        "a complete attribution feeds its samples"
+    );
+    let mut partial = entries[0].outcome.clone();
+    partial.run_id = "r-partial".into();
+    partial.attribution_state = AttributionState::Partial;
+    assert!(
+        partial.router_increments().is_empty(),
+        "a partial attribution never feeds the router registry"
+    );
+    let partial_settlement = {
+        let mut settlement = entries[0].settlement.clone();
+        settlement.run_id = "r-partial".into();
+        settlement
+    };
+    entries.push(OutcomeLedgerEntry {
+        outcome: partial,
+        settlement: partial_settlement,
+    });
+    let mut unavailable = entries[0].outcome.clone();
+    unavailable.run_id = "r-unavailable-attr".into();
+    unavailable.attribution_state = AttributionState::Unavailable;
+    assert!(unavailable.router_increments().is_empty());
+    let unavailable_settlement = {
+        let mut settlement = entries[0].settlement.clone();
+        settlement.run_id = "r-unavailable-attr".into();
+        settlement
+    };
+    entries.push(OutcomeLedgerEntry {
+        outcome: unavailable,
+        settlement: unavailable_settlement,
+    });
+
+    let m = OutcomeLedgerMetrics::compute(&entries);
+    assert_eq!(m.runs, 4);
+    assert_eq!(m.attribution_complete_runs, 2);
+    assert_eq!(m.attribution_partial_runs, 1);
+    assert_eq!(m.attribution_unavailable_runs, 1);
+    assert_eq!(
+        m.attribution_incomplete_excluded, 2,
+        "partial + unavailable: reported, never silently dropped"
+    );
+    // The monetary/engineering folds are NOT attribution-gated: attribution
+    // is an identity fact, never a money or verification fact.
+    assert_eq!(m.money_complete_runs, 4);
+    assert_eq!(m.verified_changes, 4);
 }

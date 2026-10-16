@@ -496,6 +496,20 @@ fn build_record(
             execution_class: class_of(a.local),
         })
         .collect();
+    // The exactly-preserved boundary classes of the frozen attempt history:
+    // the classification authority (a folded display sequence never
+    // depresses the local cohorts), never a re-inference.
+    let first_execution_class = model_sequence
+        .first()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
+    let final_execution_class = model_sequence
+        .last()
+        .map(|step| step.execution_class)
+        .unwrap_or(ExecutionClass::Unknown);
+    // The replay's attribution comes from the frozen capture itself (every
+    // attempt's provider/model is recorded): complete.
+    let attribution_state = faktor_agent::AttributionState::Complete;
     let steps: Vec<SettlementStep> = run
         .attempts
         .iter()
@@ -586,6 +600,9 @@ fn build_record(
         verified_first_verification_pass: verified && total_attempts == 1,
         repair_attempts,
         model_sequence,
+        first_execution_class,
+        final_execution_class,
+        attribution_state,
         wall_time_ms: run.wall_time_ms,
         human_interventions: 0,
         proof: if verified {

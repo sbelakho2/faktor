@@ -1991,9 +1991,35 @@ pub(crate) fn doctor_outcome_ledger_line(
             } else {
                 String::new()
             };
+            // Local classification coverage (mirrors the frontier rule): the
+            // boundary-class state plus the classed cohort, never a silent
+            // full-coverage claim over a folded/classless history.
+            let local_coverage = match m.local_measurement {
+                faktor_agent::LocalMeasurement::Measured => "measured".to_string(),
+                faktor_agent::LocalMeasurement::Partial => {
+                    format!(
+                        "partial ({}/{} classed)",
+                        m.local_classed_runs, m.runs_with_steps
+                    )
+                }
+                faktor_agent::LocalMeasurement::Unmeasured => "unmeasured".to_string(),
+            };
+            // Attribution honesty: a non-complete run never fed the ledger's
+            // routing-learning feed (its samples kept the per-call feed);
+            // the exclusion is always counted when nonzero.
+            let attribution = if m.attribution_incomplete_excluded > 0 {
+                format!(
+                    ", {} attribution-incomplete excluded from learning (partial {}, unavailable {})",
+                    m.attribution_incomplete_excluded,
+                    m.attribution_partial_runs,
+                    m.attribution_unavailable_runs
+                )
+            } else {
+                String::new()
+            };
             lines.push(format!(
                 "outcomes: {} run(s), {} verified, first-verification-pass {}, successful-run cost {}, \
-                 all-in cost/verified change {}, rework ratio {}, rollback {}%{exclusion}{truncated}",
+                 all-in cost/verified change {}, rework ratio {}, rollback {}%, local-class coverage {local_coverage}{attribution}{exclusion}{truncated}",
                 m.runs,
                 m.verified_changes,
                 first_pass,

@@ -29,15 +29,53 @@
 //! decision document 64 KiB, the scanned trail 4 MiB): a hostile
 //! multi-gigabyte file is refused, never pulled into memory.
 //!
+//! **Every artifact read is anchored, opened once and handle-validated
+//! (TOCTOU-proof).** The data dir is opened as a [`faktor_fs::RootedDir`]
+//! authority; each artifact is opened through the anchored no-follow walk
+//! (every component `O_NOFOLLOW`, the final open additionally `O_NONBLOCK`
+//! on unix so a planted FIFO can never block the open), the OPENED HANDLE —
+//! never a re-resolved pathname — is `fstat`-validated as a regular file
+//! (the key is additionally required to be owner-only on unix), and the
+//! bounded read happens on that SAME handle. A directory-entry race
+//! (rename + symlink swap) can therefore only make an operation refuse; it
+//! can never make the object inspected differ from the object read. Writes
+//! stage an exclusively-created temp entry through the same authority and
+//! publish it with a single anchored same-directory rename, so a swapped
+//! entry is replaced, never followed.
+//!
 //! **Tamper evidence is keyed (HMAC-SHA256).** A daemon-local key
 //! ([`SANDBOX_FIRST_RUN_KEY_FILE`], 32 random bytes created once on first
 //! use, stored owner-only 0600 in the data dir, never logged) authenticates
 //! the decision document and the audit trail: every audit line carries a
-//! MAC over its own fields chained to the previous entry's MAC (so an edit
-//! in the middle, a deletion or a rollback to a shorter trail breaks the
-//! chain), and the decision document carries a MAC over its fields. A
-//! verification failure is a TYPED refusal and the effective state stays
-//! fail-closed — no grant is ever produced from an unauthenticated trail.
+//! MAC over its own fields chained to the previous entry's MAC (so an edit,
+//! a removal or a reorder of a retained entry breaks the chain), and the
+//! decision document carries a MAC over its fields. A verification failure
+//! is a TYPED refusal and the effective state stays fail-closed — no grant
+//! is ever produced from an unauthenticated trail.
+//!
+//! **What the chain proves — and what it explicitly does NOT prove.** The
+//! chain proves INTEGRITY BETWEEN RETAINED ENTRIES: authenticated content,
+//! no edits, removals or reorders inside the retained window, and that the
+//! decision document is consistent with that authenticated history. It does
+//! NOT prove FRESHNESS of the head. Bounded compaction legitimately drops
+//! predecessors and anchors the first retained entry as the new head, and a
+//! MAC chain cannot distinguish that legitimate re-anchor from a
+//! byte-verbatim restore of a previously-valid (decision document + trail)
+//! pair: a rollback/replay of an earlier valid state VERIFIES and is
+//! accepted. This is the honest, irreducible limit of an HMAC chain over
+//! ONE local file domain — a same-user attacker who can restore those bytes
+//! can restore (or remove) any other local file, so no check inside this
+//! domain can be a freshness authority. Detecting rollback requires a
+//! monotonic head stored in a DIFFERENT state domain (e.g. daemon secure
+//! storage, or a control-plane monotonic sequence where configured) and
+//! checked against the retained head; no such durable non-rollback domain
+//! exists in this build, so the guarantee stated here is exactly the proven
+//! one and the stronger claim (rollback detection) is NOT made. Upgrade
+//! path: where a control-plane monotonic sequence is configured, pin the
+//! head MAC there on every record and refuse a retained head older than the
+//! pinned one; until then operators must treat a restored pair as
+//! indistinguishable from the recorded state.
+//!
 //! The key is created on first use; a missing key over an existing DECISION
 //! document is itself a typed refusal (re-onboarding requires removing the
 //! decision deliberately), never a silent re-key, while an orphan audit
@@ -50,6 +88,9 @@
 
 use std::path::{Path, PathBuf};
 
+use faktor_core::error::ErrorKind;
+use faktor_fs::rooted::RootedEntryKind;
+use faktor_fs::RootedDir;
 use faktor_sandbox::{SandboxGuarantee, ShellExecutionMode};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -78,8 +119,8 @@ fn genesis_mac() -> String {
 }
 
 /// Rotation bound: the audit file holds at most this many bytes before
-/// being compacted in place (the retained complete-line tail plus the new
-/// entry), so the trail stays bounded without sidecar files.
+/// being compacted (the retained complete-line tail plus the new entry), so
+/// the trail stays bounded without sidecar files.
 const AUDIT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Hard bound on the decision document bytes: a legitimate record is a few
@@ -182,8 +223,10 @@ struct SandboxFirstRunAuditEntry {
     pid: u32,
     /// MAC of the previous VALID entry of the trail (`0` * 64 when this is
     /// the first entry of a trail, including the retained prefix after a
-    /// bounded compaction). An edited/deleted/reordered entry breaks the
-    /// linkage of every entry after it.
+    /// bounded compaction). An edited/removed/reordered retained entry
+    /// breaks the linkage of every entry after it. Linkage is integrity,
+    /// NOT freshness: a byte-verbatim restore of an earlier valid trail
+    /// re-anchors silently at its first entry (module docs).
     prev_mac: String,
     /// HMAC-SHA256 (lowercase hex) over every field above, this one included.
     mac: String,
@@ -253,47 +296,202 @@ pub fn audit_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SANDBOX_FIRST_RUN_AUDIT_FILE)
 }
 
-/// Read at most `cap` bytes, refusing (never truncating) anything larger.
-/// The file's own metadata is only a hint: the READ itself is capped, so a
-/// stat-size-zero stream file or a file growing mid-read can never exceed
-/// the bound (the bounded-read rule of audit 50e2dca).
-fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+/// The HMAC key path under `data_dir`.
+pub fn key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SANDBOX_FIRST_RUN_KEY_FILE)
+}
+
+// ---------------------------------------------------------------------------
+// The anchored artifact authority: one data-dir handle per operation, one
+// open per artifact, handle-validated reads (the TOCTOU discipline).
+// ---------------------------------------------------------------------------
+
+/// The decision document name as a rooted-relative path.
+fn decision_rel() -> &'static Path {
+    Path::new(SANDBOX_FIRST_RUN_FILE)
+}
+
+/// The audit file name as a rooted-relative path.
+fn audit_rel() -> &'static Path {
+    Path::new(SANDBOX_FIRST_RUN_AUDIT_FILE)
+}
+
+/// The integrity key name as a rooted-relative path.
+fn key_rel() -> &'static Path {
+    Path::new(SANDBOX_FIRST_RUN_KEY_FILE)
+}
+
+/// Open the data dir as the rooted authority for the first-run artifacts:
+/// the directory entry is opened ONCE and every artifact resolves relative
+/// to that handle. `Ok(None)` when the data dir does not exist yet (nothing
+/// can be there); a symlinked or non-directory data-dir entry is a typed
+/// refusal (fail closed — the containment root must be real).
+fn data_root(data_dir: &Path) -> Result<Option<RootedDir>, String> {
+    match RootedDir::open(data_dir) {
+        Ok(root) => Ok(Some(root)),
+        Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {}", data_dir.display(), e.message)),
+    }
+}
+
+/// The module's canonical refusal for a non-regular artifact object.
+fn refuse_non_regular(label: &Path, detail: &str) -> String {
+    format!(
+        "{}: not a regular file (refusing symlinks, FIFOs, sockets and devices): {detail}",
+        label.display()
+    )
+}
+
+/// Open `rel` under `root` with the anchored no-follow walk and validate
+/// the OPENED HANDLE: the entry must be a regular file, classified by
+/// `fstat` of the handle itself — never by re-resolving a pathname.
+/// `Ok(None)` when the entry does not exist. A symlink, FIFO, socket,
+/// device or directory is a typed refusal; the final open carries
+/// `O_NONBLOCK` on unix, so a planted FIFO can never block the open.
+fn open_regular(
+    root: &RootedDir,
+    rel: &Path,
+    label: &Path,
+) -> Result<Option<std::fs::File>, String> {
+    let file = match root.open_read(rel) {
+        Ok(file) => file,
+        Err(e) if e.kind == ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind == ErrorKind::Permission => {
+            return Err(refuse_non_regular(label, &e.message))
+        }
+        Err(e) => return Err(format!("{}: {}", label.display(), e.message)),
+    };
+    // The handle — not the pathname — is classified: what was validated is
+    // exactly what will be read.
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", label.display()))?;
+    if !meta.is_file() {
+        return Err(refuse_non_regular(
+            label,
+            "the opened handle is not a regular file",
+        ));
+    }
+    Ok(Some(file))
+}
+
+/// TRUE when the artifact exists as a REGULAR file through the anchored
+/// no-follow walk; `Ok(false)` when nothing is there; anything else (a
+/// symlink, FIFO, socket, device or directory) is a typed refusal. The
+/// classification never opens the entry, so a planted FIFO can never block.
+fn regular_artifact_exists(root: &RootedDir, rel: &Path, label: &Path) -> Result<bool, String> {
+    match root.entry_meta(rel) {
+        Ok(Some(meta)) if meta.kind == RootedEntryKind::File => Ok(true),
+        Ok(Some(_)) => Err(refuse_non_regular(label, "the entry is not a regular file")),
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!("{}: {}", label.display(), e.message)),
+    }
+}
+
+/// Test seam: fires with the artifact's label path AFTER the anchored open
+/// validated the HANDLE and BEFORE the bounded read, so adversarial tests
+/// can swap the entry (rename + symlink) in exactly that window and prove
+/// the read still operates on the validated handle — never on a re-resolved
+/// pathname.
+#[cfg(test)]
+type ArtifactReadSeam = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static ARTIFACT_READ_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<ArtifactReadSeam>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_artifact_read_seam(hook: ArtifactReadSeam) {
+    let slot = ARTIFACT_READ_SEAM.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().expect("artifact read seam poisoned") = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_artifact_read_seam() {
+    if let Some(slot) = ARTIFACT_READ_SEAM.get() {
+        *slot.lock().expect("artifact read seam poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn artifact_read_seam(label: &Path) {
+    if let Some(slot) = ARTIFACT_READ_SEAM.get() {
+        if let Some(hook) = slot.lock().expect("artifact read seam poisoned").as_ref() {
+            hook(label);
+        }
+    }
+}
+#[cfg(not(test))]
+fn artifact_read_seam(_label: &Path) {}
+
+/// Read at most `cap` bytes FROM THE ALREADY-OPENED, VALIDATED HANDLE,
+/// refusing (never truncating) anything larger. The file's own metadata is
+/// only a hint: the READ itself is capped, so a stat-size-zero stream file
+/// or a file growing mid-read can never exceed the bound (the bounded-read
+/// rule of audit 50e2dca). No pathname is involved between the bound and
+/// the bytes.
+fn read_bounded_handle(
+    file: &mut std::fs::File,
+    cap: u64,
+    label: &Path,
+) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut reader = file.take(cap + 1);
     let mut bytes = Vec::new();
-    reader
+    file.take(cap + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| format!("{}: {e}", label.display()))?;
     if bytes.len() as u64 > cap {
         return Err(format!(
             "{}: larger than the {cap}-byte bound; refusing to read it",
-            path.display()
+            label.display()
         ));
     }
     Ok(bytes)
 }
 
-/// TRUE when `path` exists as a REGULAR file; `Ok(false)` when nothing is
-/// there. Anything else (a symlink, FIFO, socket or device) is hostile
-/// input at these artifact paths: refusing it typed keeps a planted FIFO
-/// from blocking every daemon start and a planted symlink from redirecting
-/// a read or write.
-fn regular_file(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => Ok(true),
-        Ok(_) => Err(format!(
-            "{}: not a regular file (refusing symlinks, FIFOs, sockets and devices)",
-            path.display()
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+/// The ONE read path for the decision document and the audit trail: open
+/// through the anchored authority, validate the HANDLE as a regular file,
+/// then bounded-read from that SAME handle. `Ok(None)` when the entry does
+/// not exist.
+fn read_artifact(
+    root: &RootedDir,
+    rel: &Path,
+    label: &Path,
+    cap: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(mut file) = open_regular(root, rel, label)? else {
+        return Ok(None);
+    };
+    artifact_read_seam(label);
+    read_bounded_handle(&mut file, cap, label).map(Some)
 }
 
-/// The HMAC key path under `data_dir`.
-pub fn key_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(SANDBOX_FIRST_RUN_KEY_FILE)
+/// Validate the OPENED key handle before any byte is read: `open_regular`
+/// already proved the handle is a regular file; on unix the handle's mode
+/// must additionally deny group/other access (0600 or stricter) — a key any
+/// other identity can read or write cannot anchor the tamper evidence it
+/// vouches for, so it is refused typed. Non-unix hosts have no POSIX mode
+/// bits (documented platform limitation, parity with key creation).
+fn validate_key_handle(file: &std::fs::File, label: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", label.display()))?;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{}: the integrity key is accessible to other users (mode {mode:o}); refusing \
+                 it — a key others can read or write cannot anchor the tamper evidence",
+                label.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, label);
+    }
+    Ok(())
 }
 
 /// Lowercase hex of a byte string.
@@ -372,16 +570,28 @@ fn decision_mac(key: &[u8; KEY_BYTES], record: &SandboxFirstRunRecord) -> String
 }
 
 /// TRUE when every parseable audit entry authenticates under `key` with an
-/// intact chain (the first entry is the anchor — bounded compaction may have
-/// dropped its predecessor). Unparseable lines carry no chain and are
-/// ignored, exactly like verification. A bounded read; an oversized trail is
-/// a typed error.
-fn trail_authenticates(data_dir: &Path, key: &[u8; KEY_BYTES]) -> Result<bool, String> {
-    let path = audit_path(data_dir);
-    if !regular_file(&path)? {
+/// intact chain. The first parsed entry is the anchor: bounded compaction
+/// legitimately drops predecessors and anchors the first retained entry, so
+/// anchoring is never a freshness check (the chain proves integrity between
+/// retained entries — a verbatim restore of a previously-valid pair is
+/// accepted BY DESIGN; module docs). Unparseable lines carry no chain and
+/// are ignored, exactly like verification. The read goes through the
+/// validated handle and is byte-bounded; an oversized trail is a typed
+/// error.
+fn trail_authenticates(
+    root: &RootedDir,
+    key: &[u8; KEY_BYTES],
+    data_dir: &Path,
+) -> Result<bool, String> {
+    let Some(bytes) = read_artifact(
+        root,
+        audit_rel(),
+        &audit_path(data_dir),
+        AUDIT_CONFIRM_MAX_BYTES,
+    )?
+    else {
         return Ok(true);
-    }
-    let bytes = read_bounded(&path, AUDIT_CONFIRM_MAX_BYTES)?;
+    };
     let text = String::from_utf8_lossy(&bytes);
     let mut prev: Option<String> = None;
     for line in text.lines() {
@@ -404,18 +614,21 @@ fn trail_authenticates(data_dir: &Path, key: &[u8; KEY_BYTES]) -> Result<bool, S
     Ok(true)
 }
 
-/// Read the HMAC key. `Ok(None)` when the file is absent; a wrong-length or
-/// non-regular key object is a typed refusal (never silently re-keyed).
-fn read_key(data_dir: &Path) -> Result<Option<[u8; KEY_BYTES]>, String> {
-    let path = key_path(data_dir);
-    if !regular_file(&path)? {
+/// Read the HMAC key through the anchored authority. `Ok(None)` when the
+/// file is absent; a non-regular key object, an other-accessible key or a
+/// wrong-length key is a typed refusal (never silently re-keyed).
+fn read_key(root: &RootedDir, data_dir: &Path) -> Result<Option<[u8; KEY_BYTES]>, String> {
+    let label = key_path(data_dir);
+    let Some(mut file) = open_regular(root, key_rel(), &label)? else {
         return Ok(None);
-    }
-    let bytes = read_bounded(&path, KEY_BYTES as u64)?;
+    };
+    validate_key_handle(&file, &label)?;
+    artifact_read_seam(&label);
+    let bytes = read_bounded_handle(&mut file, KEY_BYTES as u64, &label)?;
     if bytes.len() != KEY_BYTES {
         return Err(format!(
             "{}: the integrity key must be exactly {KEY_BYTES} bytes (got {}); refusing it",
-            path.display(),
+            label.display(),
             bytes.len()
         ));
     }
@@ -435,76 +648,112 @@ fn read_key(data_dir: &Path) -> Result<Option<[u8; KEY_BYTES]>, String> {
 /// an orphan audit trail (no authenticatable decision) is likewise
 /// unauthenticated history and is reset under the new key.
 fn load_or_create_key(data_dir: &Path) -> Result<([u8; KEY_BYTES], bool), String> {
-    if let Some(key) = read_key(data_dir)? {
-        return Ok((key, false));
-    }
-    let decision = decision_path(data_dir);
-    if regular_file(&decision)? {
-        let bytes = read_bounded(&decision, DECISION_MAX_BYTES)?;
-        let claims_authentication = serde_json::from_slice::<SandboxFirstRunRecord>(&bytes)
-            .map(|record| is_hex64(&record.mac))
-            .unwrap_or(false);
-        if claims_authentication {
-            return Err(format!(
-                "{} is missing while a durable sandbox first-run decision carrying an HMAC \
-                 exists; refusing to mint a new integrity key over an existing decision \
-                 (remove the decision and audit files to re-onboard)",
-                key_path(data_dir).display()
-            ));
+    let mut root = data_root(data_dir)?;
+    if let Some(root_ref) = &root {
+        if let Some(key) = read_key(root_ref, data_dir)? {
+            return Ok((key, false));
+        }
+        let decision = decision_path(data_dir);
+        if let Some(bytes) = read_artifact(root_ref, decision_rel(), &decision, DECISION_MAX_BYTES)?
+        {
+            let claims_authentication = serde_json::from_slice::<SandboxFirstRunRecord>(&bytes)
+                .map(|record| is_hex64(&record.mac))
+                .unwrap_or(false);
+            if claims_authentication {
+                return Err(format!(
+                    "{} is missing while a durable sandbox first-run decision carrying an HMAC \
+                     exists; refusing to mint a new integrity key over an existing decision \
+                     (remove the decision and audit files to re-onboard)",
+                    key_path(data_dir).display()
+                ));
+            }
         }
     }
-    std::fs::create_dir_all(data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
+    let root = match root.take() {
+        Some(root) => root,
+        None => {
+            std::fs::create_dir_all(data_dir)
+                .map_err(|e| format!("{}: {e}", data_dir.display()))?;
+            data_root(data_dir)?.ok_or_else(|| {
+                format!("{}: data dir vanished after creation", data_dir.display())
+            })?
+        }
+    };
     use rand::Rng as _;
     let mut key = [0u8; KEY_BYTES];
     rand::rng().fill(&mut key);
-    let path = key_path(data_dir);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(&key)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            file.sync_all()
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+    let label = key_path(data_dir);
+    let mut file = match root.open_create_new(key_rel()) {
+        Ok(file) => file,
+        Err(e) => {
             // A concurrent first use won the race: adopt the existing key.
-            return read_key(data_dir)?
-                .map(|key| (key, false))
-                .ok_or_else(|| format!("{}: vanished after create", path.display()));
+            if let Some(existing) = read_key(&root, data_dir)? {
+                return Ok((existing, false));
+            }
+            return Err(format!("{}: {}", label.display(), e.message));
         }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    }
-    // Belt and braces: re-assert 0600 in case a platform umask widened the
-    // creation mode. (Non-unix hosts have no POSIX mode bits; the honest
-    // platform limitation is documented in the module docs.)
+    };
+    use std::io::Write as _;
+    file.write_all(&key)
+        .map_err(|e| format!("{}: {e}", label.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("{}: {e}", label.display()))?;
+    // Belt and braces on the HANDLE (fchmod), never a pathname chmod: a
+    // platform umask that widened the creation mode is corrected on the
+    // object that was just created. (Non-unix hosts have no POSIX mode
+    // bits; the honest platform limitation is documented in the module
+    // docs.)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("{}: {e}", label.display()))?;
     }
+    drop(file);
     Ok((key, true))
 }
 
-/// The MAC of the last VALID (parseable, well-formed-MAC) entry of the
-/// current trail, or the genesis anchor when none exists. Used by the
-/// append path to chain the next entry. The read is byte-bounded; a
-/// trail beyond the confirm bound is refused (hostile/corrupt), never
-/// pulled into memory.
-fn last_valid_entry_mac(data_dir: &Path) -> Result<String, String> {
-    let path = audit_path(data_dir);
-    if !regular_file(&path)? {
-        return Ok(genesis_mac());
-    }
-    let bytes = read_bounded(&path, AUDIT_CONFIRM_MAX_BYTES)?;
-    let text = String::from_utf8_lossy(&bytes);
+/// ONE validated-handle read of the current trail for the append path: the
+/// MAC of its last well-formed entry (the chaining target for the next
+/// line) and the retained content the next publish carries — the whole
+/// trail when within [`AUDIT_MAX_BYTES`], otherwise the bounded
+/// complete-line tail window (exactly the content compaction keeps, so a
+/// hostile oversized trail is never pulled into memory). `(genesis, "")`
+/// when the trail is absent.
+fn trail_for_append(root: &RootedDir, data_dir: &Path) -> Result<(String, String), String> {
+    let label = audit_path(data_dir);
+    let Some(mut file) = open_regular(root, audit_rel(), &label)? else {
+        return Ok((genesis_mac(), String::new()));
+    };
+    artifact_read_seam(&label);
+    let len = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", label.display()))?
+        .len();
+    let content: Vec<u8> = if len > AUDIT_MAX_BYTES {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        // Only a BOUNDED TAIL of the file is ever read: the retention window
+        // is at most half the bound plus one byte, and trimming to the first
+        // newline inside it drops the possibly partial leading line.
+        let window = (AUDIT_MAX_BYTES / 2) as usize + 1;
+        let start = len.saturating_sub(window as u64);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("{}: {e}", label.display()))?;
+        let mut content = Vec::new();
+        file.by_ref()
+            .take(window as u64)
+            .read_to_end(&mut content)
+            .map_err(|e| format!("{}: {e}", label.display()))?;
+        let cut = content
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| offset + 1)
+            .unwrap_or(content.len());
+        content.split_off(cut)
+    } else {
+        read_bounded_handle(&mut file, AUDIT_MAX_BYTES, &label)?
+    };
+    let text = String::from_utf8_lossy(&content);
     let mut last = genesis_mac();
     for line in text.lines() {
         if let Ok(entry) = serde_json::from_str::<SandboxFirstRunAuditEntry>(line) {
@@ -513,23 +762,21 @@ fn last_valid_entry_mac(data_dir: &Path) -> Result<String, String> {
             }
         }
     }
-    Ok(last)
+    Ok((last, text.into_owned()))
 }
 
-/// Read the durable decision. `Ok(None)` when none exists; a corrupt,
-/// oversized, non-regular or schema-mismatched document is a typed error
-/// (the caller keeps the fail-closed default and surfaces the refusal).
-///
-/// This is the RAW decode only: the document's HMAC and its audit-chain
-/// confirmation are enforced by [`audit_confirms`] on every granting path
-/// ([`inspect`] / [`apply_effective_choice`]) — this call alone never
-/// produces a grant.
-pub fn load_decision(data_dir: &Path) -> Result<Option<SandboxFirstRunRecord>, String> {
+/// Read the durable decision through an ALREADY-OPENED data-dir authority.
+/// `Ok(None)` when none exists; a corrupt, oversized, non-regular or
+/// schema-mismatched document is a typed error (the caller keeps the
+/// fail-closed default and surfaces the refusal).
+fn load_decision_in(
+    root: &RootedDir,
+    data_dir: &Path,
+) -> Result<Option<SandboxFirstRunRecord>, String> {
     let path = decision_path(data_dir);
-    if !regular_file(&path)? {
+    let Some(bytes) = read_artifact(root, decision_rel(), &path, DECISION_MAX_BYTES)? else {
         return Ok(None);
-    }
-    let bytes = read_bounded(&path, DECISION_MAX_BYTES)?;
+    };
     let record: SandboxFirstRunRecord =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if record.version != SANDBOX_FIRST_RUN_VERSION {
@@ -540,6 +787,24 @@ pub fn load_decision(data_dir: &Path) -> Result<Option<SandboxFirstRunRecord>, S
         ));
     }
     Ok(Some(record))
+}
+
+/// Read the durable decision. `Ok(None)` when none exists (or the data dir
+/// does not exist yet); a corrupt, oversized, non-regular or
+/// schema-mismatched document is a typed error (the caller keeps the
+/// fail-closed default and surfaces the refusal).
+///
+/// This is the RAW decode only: the document's HMAC and its audit-chain
+/// confirmation are enforced by [`audit_confirms`] on every granting path
+/// ([`inspect`] / [`apply_effective_choice`]) — this call alone never
+/// produces a grant. `inspect` uses the anchored variant to share ONE
+/// data-dir authority across the decision, key and audit reads.
+#[allow(dead_code)] // raw-decode surface pinned by tests; inspect shares one anchored authority
+pub fn load_decision(data_dir: &Path) -> Result<Option<SandboxFirstRunRecord>, String> {
+    match data_root(data_dir)? {
+        Some(root) => load_decision_in(&root, data_dir),
+        None => Ok(None),
+    }
 }
 
 /// The audit event name of one choice: shared by the writer and the
@@ -558,17 +823,26 @@ fn audit_event(choice: SandboxShellChoice) -> &'static str {
 /// 1. the document's own MAC must verify under the key;
 /// 2. every parseable audit entry must carry well-formed MACs and its MAC
 ///    must verify over its exact fields chained to the previous entry (the
-///    first entry is the chain anchor — bounded compaction retains a tail
-///    of complete lines, whose predecessor may have been dropped); an
-///    edited, deleted or reordered entry therefore breaks the chain;
+///    first parsed entry is the chain anchor — bounded compaction retains a
+///    tail of complete lines whose predecessor may have been dropped, so
+///    anchoring the first retained entry is legitimate; linkage is
+///    integrity between retained entries, NOT freshness, and a
+///    byte-verbatim restore of a previously-valid pair verifies BY DESIGN —
+///    see the module docs); an edited, removed or reordered retained entry
+///    therefore breaks the chain;
 /// 3. one chain-verified entry must match the document's exact event,
 ///    choice, timestamp, platform, backend fact and trade-off text.
 ///
 /// Any failure is a TYPED refusal: the caller keeps the fail-closed default
 /// (no grant) and reports it. Without the key a same-user attacker editing
 /// the decision and its audit entry cannot produce a verifying pair. The
-/// scan is byte-bounded ([`AUDIT_CONFIRM_MAX_BYTES`]).
-fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(), String> {
+/// scan is byte-bounded ([`AUDIT_CONFIRM_MAX_BYTES`]) and runs entirely on
+/// handles validated once by the anchored authority.
+fn audit_confirms(
+    root: &RootedDir,
+    record: &SandboxFirstRunRecord,
+    data_dir: &Path,
+) -> Result<(), String> {
     let path = audit_path(data_dir);
     let refusal = |detail: String| {
         format!(
@@ -582,12 +856,7 @@ fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(),
             "the document carries no valid HMAC (forged or truncated)".into(),
         ));
     }
-    match regular_file(&path) {
-        Ok(true) => {}
-        Ok(false) => return Err(refusal(format!("{} is absent", path.display()))),
-        Err(e) => return Err(refusal(e)),
-    }
-    let key = match read_key(data_dir) {
+    let key = match read_key(root, data_dir) {
         Ok(Some(key)) => key,
         Ok(None) => {
             return Err(refusal(format!(
@@ -597,7 +866,11 @@ fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(),
         }
         Err(e) => return Err(refusal(e)),
     };
-    let bytes = read_bounded(&path, AUDIT_CONFIRM_MAX_BYTES).map_err(refusal)?;
+    let bytes = match read_artifact(root, audit_rel(), &path, AUDIT_CONFIRM_MAX_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(refusal(format!("{} is absent", path.display()))),
+        Err(e) => return Err(refusal(e)),
+    };
     let text = String::from_utf8_lossy(&bytes);
     let expected_event = audit_event(record.choice);
     let mut prev: Option<String> = None;
@@ -615,7 +888,8 @@ fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(),
         if let Some(prev) = &prev {
             if &entry.prev_mac != prev {
                 return Err(refusal(format!(
-                    "the audit chain in {} is broken (entry rolled back, removed or reordered)",
+                    "the audit chain in {} is broken (an entry was replaced, removed or \
+                     reordered)",
                     path.display()
                 )));
             }
@@ -655,31 +929,66 @@ fn audit_confirms(data_dir: &Path, record: &SandboxFirstRunRecord) -> Result<(),
     )))
 }
 
+/// Write `bytes` at `rel` through the data-dir authority: the payload is
+/// staged in a uniquely-named internal temp created EXCLUSIVELY through the
+/// anchored walk (never by pathname), fsynced, then published as a single
+/// same-directory rename (the fs-atomic authority's rooted publish). On any
+/// failure the staged temp is removed and the destination keeps its
+/// previous state; a symlink or special entry swapped in at the destination
+/// name is replaced by the rename — never followed.
+fn write_artifact(root: &RootedDir, rel: &Path, bytes: &[u8], label: &Path) -> Result<(), String> {
+    use rand::Rng as _;
+    let name = rel.to_string_lossy();
+    let staged_rel = PathBuf::from(format!(
+        ".{name}{}{}-{}",
+        faktor_fs::atomic::FAKTOR_TEMP_MARKER,
+        std::process::id(),
+        rand::rng().random::<u64>(),
+    ));
+    let mut file = root
+        .open_create_new(&staged_rel)
+        .map_err(|e| format!("{}: {}", label.display(), e.message))?;
+    use std::io::Write as _;
+    let staged = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = staged {
+        let _ = root.remove_file(&staged_rel);
+        return Err(format!("{}: {e}", label.display()));
+    }
+    root.atomic_publish(&staged_rel, rel).map_err(|e| {
+        let _ = root.remove_file(&staged_rel);
+        format!("{}: {}", label.display(), e.message)
+    })
+}
+
 /// Record an explicit operator choice: one append-only audit line FIRST
 /// (fsynced, MAC-chained under the daemon-local key), then the durable
-/// decision document (MAC'd, atomic replace), so a readable decision is
-/// always backed by its authenticated trail. The key is created on first
-/// use. Returns the stored record.
+/// decision document (MAC'd, anchored atomic replace), so a readable
+/// decision is always backed by its authenticated trail. The key is created
+/// on first use. All writes go through the data-dir authority (a staged
+/// temp entry plus a single anchored rename), so no write can follow a
+/// swapped entry. Returns the stored record.
 pub fn record_decision(
     data_dir: &Path,
     choice: SandboxShellChoice,
     decided_at_ms: i64,
 ) -> Result<SandboxFirstRunRecord, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
+    let Some(root) = data_root(data_dir)? else {
+        return Err(format!(
+            "{}: data dir vanished after creation",
+            data_dir.display()
+        ));
+    };
     let (key, key_created) = load_or_create_key(data_dir)?;
-    // A fresh key over an ORPHAN trail (entries predating the key) starts a
-    // fresh chain: the old bytes cannot be authenticated under the new key
-    // and chaining onto them would poison every future verification.
-    // Unreadable garbage is never pulled in: the trail is replaced whole
-    // through the atomic authority.
-    let trail_exists = regular_file(&audit_path(data_dir))?;
+    let trail_exists = regular_artifact_exists(&root, audit_rel(), &audit_path(data_dir))?;
     let orphan_trail = key_created && trail_exists;
     // Recording over a trail that does NOT authenticate under the CURRENT
     // key (tampered entry, or the key was replaced) is refused typed:
     // appending there would produce a decision record that can never
     // verify. The operator re-onboards by removing the decision and audit
     // files.
-    if !key_created && trail_exists && !trail_authenticates(data_dir, &key)? {
+    if !key_created && trail_exists && !trail_authenticates(&root, &key, data_dir)? {
         return Err(format!(
             "the sandbox first-run audit trail {} fails HMAC verification under the daemon-local \
              key; refusing to record over a tampered trail or a rotated key (remove the decision \
@@ -701,6 +1010,16 @@ pub fn record_decision(
         },
         mac: String::new(),
     };
+    // One validated-handle snapshot read of the current trail supplies BOTH
+    // the chaining MAC and the retained content the publish carries; an
+    // orphan trail starts a fresh chain (its old bytes cannot be
+    // authenticated under the new key and chaining onto them would poison
+    // every future verification).
+    let (prev_mac, retained) = if orphan_trail {
+        (genesis_mac(), String::new())
+    } else {
+        trail_for_append(&root, data_dir)?
+    };
     let chained = SandboxFirstRunAuditEntry {
         event: audit_event(record.choice).to_string(),
         choice: record.choice,
@@ -709,11 +1028,7 @@ pub fn record_decision(
         network_backend_available: record.network_backend_available,
         trade_off: record.trade_off.clone(),
         pid: std::process::id(),
-        prev_mac: if orphan_trail {
-            genesis_mac()
-        } else {
-            last_valid_entry_mac(data_dir)?
-        },
+        prev_mac,
         mac: String::new(),
     };
     let entry = SandboxFirstRunAuditEntry {
@@ -728,72 +1043,19 @@ pub fn record_decision(
     // between the two writes leaves an audit entry with the PREVIOUS (or
     // no) decision document — the effective state stays exactly what it
     // was, never a half grant.
-    if orphan_trail {
-        let mut fresh = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
-        fresh.push('\n');
-        faktor_fs::atomic::atomic_replace(&audit_path(data_dir), fresh.as_bytes())
-            .map_err(|e| format!("{}: {e}", audit_path(data_dir).display()))?;
-    } else {
-        append_audit(data_dir, &entry)?;
-    }
-    faktor_fs::atomic::atomic_replace(&decision_path(data_dir), &bytes)
-        .map_err(|e| format!("{}: {e}", decision_path(data_dir).display()))?;
+    let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
+    let mut compacted = String::with_capacity(retained.len() + line.len() + 1);
+    compacted.push_str(&retained);
+    compacted.push_str(&line);
+    compacted.push('\n');
+    write_artifact(
+        &root,
+        audit_rel(),
+        compacted.as_bytes(),
+        &audit_path(data_dir),
+    )?;
+    write_artifact(&root, decision_rel(), &bytes, &decision_path(data_dir))?;
     Ok(record)
-}
-
-/// Append one MAC-chained audit line. Past the byte bound the trail is
-/// compacted through the fs-atomic authority (the retained tail of complete
-/// lines plus the new entry replace the file — never a hand-rolled rename),
-/// so the audit stays bounded on disk while recent history survives.
-fn append_audit(data_dir: &Path, entry: &SandboxFirstRunAuditEntry) -> Result<(), String> {
-    let path = audit_path(data_dir);
-    let line = serde_json::to_string(entry).map_err(|e| e.to_string())?;
-    regular_file(&path)?;
-    let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    if existing_len > AUDIT_MAX_BYTES {
-        // Compact through the fs-atomic authority (never a hand-rolled
-        // rename): keep the most recent half-bound of complete lines plus
-        // the new entry, so the trail stays bounded while recent history
-        // survives. Only a BOUNDED TAIL of the file is ever read: the
-        // retention window is at most half the bound plus one byte, and
-        // trimming to the first newline inside it drops the possibly
-        // partial leading line — a hostile oversized audit file is never
-        // pulled into memory.
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let window = (AUDIT_MAX_BYTES / 2) as usize + 1;
-        let start = existing_len.saturating_sub(window as u64);
-        let mut file =
-            std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut content = Vec::new();
-        file.take(window as u64)
-            .read_to_end(&mut content)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let cut = content
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|offset| offset + 1)
-            .unwrap_or(content.len());
-        let retained = String::from_utf8_lossy(&content[cut..]);
-        let mut compacted = String::with_capacity(retained.len() + line.len() + 1);
-        compacted.push_str(&retained);
-        compacted.push_str(&line);
-        compacted.push('\n');
-        faktor_fs::atomic::atomic_replace(&path, compacted.as_bytes())
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        return Ok(());
-    }
-    use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    writeln!(file, "{line}").map_err(|e| format!("{}: {e}", path.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(())
 }
 
 /// Inspect the first-run state WITHOUT mutating the config: reads the
@@ -801,12 +1063,17 @@ fn append_audit(data_dir: &Path, entry: &SandboxFirstRunAuditEntry) -> Result<()
 /// combines it with the config's explicit `shell` value. A corrupt,
 /// oversized or unconfirmed record yields a `Pending`/`FailClosed` state
 /// with `corrupt_reason` set — never a grant, and never a record presented
-/// as recorded.
+/// as recorded. The data dir is opened ONCE and every artifact read is
+/// handle-validated against that same authority.
 pub fn inspect(data_dir: &Path, config: &crate::config::Config) -> SandboxFirstRunState {
     let backend_available = network_backend_available();
-    let (record, corrupt_reason) = match load_decision(data_dir) {
-        Ok(Some(record)) => match audit_confirms(data_dir, &record) {
-            Ok(()) => (Some(record), None),
+    let (record, corrupt_reason) = match data_root(data_dir) {
+        Ok(Some(root)) => match load_decision_in(&root, data_dir) {
+            Ok(Some(record)) => match audit_confirms(&root, &record, data_dir) {
+                Ok(()) => (Some(record), None),
+                Err(reason) => (None, Some(reason)),
+            },
+            Ok(None) => (None, None),
             Err(reason) => (None, Some(reason)),
         },
         Ok(None) => (None, None),

@@ -2122,17 +2122,20 @@ const ABSORBED_SAMPLES_READ_ATTEMPTS: usize = 3;
 
 /// The samples a durable engineering record has ALREADY absorbed after one
 /// `record_terminal_run` attempt (the single-feed rule): the record's
-/// `verified_samples` when a record exists — ours (`Ok(Some(_))`), a
-/// pre-existing one (`Ok(None)`), or a CONCURRENT winner's
+/// `verified_samples` when a record exists AND its provider/model
+/// attribution is `complete` — ours (`Ok(Some(_))`), a pre-existing one
+/// (`Ok(None)`), or a CONCURRENT winner's
 /// ([`Conflict`](faktor_store::StoreError::Conflict), whose atomic append
 /// absorbed ITS samples) — and nothing when the attempt failed for any
-/// other reason. The durable read is retried a bounded number of times; if
-/// it STILL fails the fallback is NON-double-counting: both producers
-/// derive the record's samples from the SAME frozen `terminal_run_facts`
-/// outbox, so the current facts' samples ARE what the winner's append
-/// absorbed and are reported as absorbed rather than re-fed per call (a
-/// persistently unreadable record can at worst postpone coverage, never
-/// count a sample twice).
+/// other reason. An attribution-INCOMPLETE record (the bounded provider-call
+/// read truncated) absorbs no samples at all: its samples keep the per-call
+/// verified feed — never dropped, never doubled. The durable read is retried
+/// a bounded number of times; if it STILL fails the fallback is
+/// NON-double-counting: both producers derive the record's samples from the
+/// SAME frozen `terminal_run_facts` outbox, so the current facts' samples ARE
+/// what the winner's append absorbed and are reported as absorbed rather
+/// than re-fed per call (a persistently unreadable record can at worst
+/// postpone coverage, never count a sample twice).
 pub(super) fn resolve_absorbed_samples(
     ledger: &OutcomeLedger,
     run_id: &str,
@@ -2145,7 +2148,19 @@ pub(super) fn resolve_absorbed_samples(
     let durable_samples = || -> Option<Vec<RunVerifiedSample>> {
         for attempt in 1..=ABSORBED_SAMPLES_READ_ATTEMPTS {
             match ledger.get(run_id) {
-                Ok(Some(record)) => return Some(record.verified_samples),
+                Ok(Some(record)) => {
+                    // The attribution gate mirrors `router_increments`: a
+                    // record whose provider/model attribution is not
+                    // COMPLETE fed NOTHING atomically, so its samples must
+                    // stay on the per-call feed.
+                    return Some(
+                        if record.attribution_state == crate::AttributionState::Complete {
+                            record.verified_samples
+                        } else {
+                            Vec::new()
+                        },
+                    );
+                }
                 Ok(None) => return Some(Vec::new()),
                 Err(error) => {
                     tracing::warn!(
@@ -2163,8 +2178,10 @@ pub(super) fn resolve_absorbed_samples(
     };
     match attempt {
         // The append (or its byte-identical replay) carried exactly the
-        // facts' samples.
-        Ok(Some(_)) => facts.samples.clone(),
+        // facts' samples when the record's attribution is complete; an
+        // attribution-incomplete record absorbed none (see above), so the
+        // durable read decides.
+        Ok(Some(_)) => durable_samples().unwrap_or_else(|| facts.samples.clone()),
         // The record pre-existed: its durable samples are the truth; a
         // persistently unreadable record falls back to the frozen facts.
         Ok(None) => durable_samples().unwrap_or_else(|| facts.samples.clone()),

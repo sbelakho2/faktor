@@ -1587,6 +1587,11 @@ fn wire_worker_plane(
     // any claim is admitted (typed refusal, nothing claimed). Without
     // billing the absent gate refuses typed `cloud_absent` — the operator's
     // local execution path stays the community answer.
+    // This install is the daemon/service licensing boundary (the documented
+    // contract): the library plane is deliberately UNGATED for embedded
+    // hosts and tests (`WorkerPlane::new`/`new_for_embedded_host`), and the
+    // daemon ALWAYS installs the gate on its ONE plane here — removing this
+    // install would silently un-gate daemon claim admission.
     plane.set_claim_entitlement_gate(value_gate.clone());
     // Crash recovery before the first request: a lease whose heartbeat
     // window closed while the daemon was down expires (attempt terminal +

@@ -49,7 +49,9 @@ module (`TerminalEngineeringOutcome`, schema version 2, strict
 | `accepted`, `integrated` | The completion was accepted / landed on the owner root |
 | `verified_first_verification_pass` | The run's FIRST verification attempt passed: the certifying deterministic pass is the run's earliest verification attempt (no failed verification attempt precedes it). A verification-attempt measure — NOT an implementation-attempt claim (see below) |
 | `repair_attempts` | Verification attempts that failed before the certifying pass (0 = the first verification attempt passed; each failed verification sends the run back to repair) |
-| `model_sequence` | Ordered provider/model steps, each with its durable `execution_class` (`local` / hosted tiers / `unknown`); no money |
+| `model_sequence` | Ordered provider/model steps, each with its durable `execution_class` (`local` / hosted tiers / `unknown`); a BOUNDED display (past 15 distinct groups the tail folds into one `unknown`-class aggregate step; all excess spend is preserved). No money |
+| `first_execution_class`, `final_execution_class` | The FIRST/FINAL settled step's durable execution class, preserved EXACTLY even when the bounded display sequence folds (the local-first/local-final/local-to-hosted classification authority). `unknown` when no durable authority exists; pre-field payloads decode `unknown` and the metrics fall back to the preserved sequence boundary — a folded tail stays honestly `unknown`, never a guessed class |
+| `attribution_state` | The provider/model attribution honesty of the recorded sequence: `complete` (whole provider-call read, every settled step attributed) \| `partial` (the bounded call read truncated and/or a settled step is explicitly `unattributed`) \| `unavailable` (no attribution authority at all; the honest decode default of a pre-field payload). A non-complete state is RECORDED (the immutable row must exist) and EXCLUDED from the ledger's routing-learning feed |
 | `wall_time_ms` | Run start → terminal outcome |
 | `human_interventions` | Permission decisions, manual steers/edits |
 | `proof` | `checks_passed` / `checks_required` (invariant: passed ≤ required) |
@@ -128,6 +130,40 @@ AUTHORITY only — never from a cost number:
 - a durably-known class and the persisted `local` bit must agree — a
   disagreement is a typed corruption, and legacy payloads without the
   class key decode to `unknown` (never a guessed class).
+
+#### Boundary classes survive the bounded sequence (compaction truth)
+
+`model_sequence` is a BOUNDED DISPLAY: past the cap its distinct
+provider/model groups fold into one `unknown`-class aggregate tail (the
+spend stays exact). The run's FIRST and FINAL settled classes are therefore
+recorded SEPARATELY (`first_execution_class` / `final_execution_class`) and
+never derive from a possibly-folded display step: local-first, local-final
+and local-to-hosted classification read those exact fields (a pre-field
+payload falls back to its preserved sequence boundary; an already-folded
+legacy tail stays honestly `unknown`). The local classification-coverage
+state (`localMeasurement` = `measured` | `partial` | `unmeasured` with the
+boundary-classed cohort `localClassedRuns` via `GET /native/outcomes`,
+mirroring the Frontier Escalation Rate's measurement token) reports how
+much of the population that authority covers, so a partially-classed
+history is visible instead of silently depressing the local cohorts.
+
+#### Provider/model attribution honesty
+
+The sequence identity comes from a BOUNDED provider-call read
+(`MAX_DURABLE_SPEND_CALL_ROWS`). `attribution_state` records whether the
+identity is trustworthy: a truncated call history — or a settled step whose
+call row does not exist (conservative finalize / crash reconciliation,
+explicitly labelled `unattributed`) — types the run `partial`; settled
+steps with NO attributed identity type it `unavailable`; only a whole read
+with every settled step attributed is `complete`. The immutable record
+still lands (the engineering truth must exist), but a non-complete run's
+verified samples are EXCLUDED from the ledger's routing-learning feed (the
+`model_outcome_stats` absorption) — they keep the runtime's per-call
+verified feed, never dropped and never doubled — and the fold counts the
+exclusion (`attributionIncompleteExcluded`). The money/usage projection
+(`durable_spend_rows`, used by the commercial usage read) instead REFUSES
+a truncated provider-call read with a typed conflict, exactly like the
+reservation bound and the efficiency KPI's truncation rule.
 
 ## The economic settlement lifecycle
 
@@ -215,7 +251,10 @@ inferred as frontier) and `added_lines`/`removed_lines` (no durable
 line-count source). A run whose engineering facts are unreadable records
 NOTHING — a read failure is a typed refusal, never a partial record; an
 unreadable MONEY fact does not block the engineering record, it types the
-settlement `unavailable`.
+settlement `unavailable`; and a TRUNCATED provider-call history does not
+block it either — the record lands with `attribution_state = partial` (or
+`unavailable` when no step is attributed at all) and its samples are
+excluded from the atomic learning feed.
 
 Crash/replay semantics: the append is the store's ONE immediate
 transaction; a crash before commit leaves no row and no router sample (the
@@ -255,12 +294,16 @@ into the durable per-key projection keyed by `(provider, model, phase,
 task_class, risk_class)`, so every `RouterService` wired over
 `StoreOutcomeStore` consults the learned history exactly as before. The
 terminal turn's samples ride the run record's transaction (fed exactly
-once); samples of non-terminal gates keep the per-call feed, and a
-turn settling more samples than one record carries (`MAX_RUN_VERIFIED_SAMPLES`)
-splits at the cap — the record feeds the first samples and the remainder
-feeds per call, never dropped and never doubled. The ledger adds no second
-learning mechanism; it makes the run-level record that feeds the existing
-one.
+once) — UNLESS the record's `attribution_state` is not `complete`: an
+attribution-incomplete run feeds NOTHING atomically (its samples keep the
+per-call verified feed via the runtime's absorbed-set reconciliation, fed
+exactly once either way), and the exclusion is counted by
+`attributionIncompleteExcluded`; samples of non-terminal gates keep the
+per-call feed, and a turn settling more samples than one record carries
+(`MAX_RUN_VERIFIED_SAMPLES`) splits at the cap — the record feeds the
+first samples and the remainder feeds per call, never dropped and never
+doubled. The ledger adds no second learning mechanism; it makes the
+run-level record that feeds the existing one.
 
 ## Metrics
 
@@ -277,10 +320,12 @@ metrics fold ONLY `complete` settlements:
 | Verified First Verification Pass Rate | verified changes whose FIRST verification attempt passed ÷ verified changes (`verifiedFirstVerificationPassPpm`, with the `verifiedFirstVerificationPassChanges` count). A verification-attempt measure — never an implementation-attempt claim (see above) |
 | Rework Cost Ratio | rework spend ÷ (model + verification spend), over the money-complete cohort (`reworkCostRatioPpm`) |
 | Local-Only Verified Rate | verified runs whose every step is durably local ÷ runs whose every step is durably local (`localOnlyVerifiedPpm`, with the `localOnlyRuns`/`localOnlyVerifiedChanges` counts): how often a purely local run verifies |
-| Local-Final Verified Rate | verified runs whose FINAL model step is durably local ÷ runs whose FINAL model step is durably local (`localFinalVerifiedPpm`, with the `localFinalRuns`/`localFinalVerifiedChanges` counts) |
-| Local-First Success Rate | local-first runs (FIRST step durably local) whose FINAL step is ALSO durably local and whose FIRST verification attempt passed ÷ runs whose FIRST step is durably local (`localFirstSuccessPpm`); the same verification-attempt measure as the Verified First Verification Pass Rate |
-| Local-to-Hosted Fallback Rate | runs that started local and ENDED on a durably hosted step ÷ runs whose first step is durably local (`localToHostedFallbackPpm`); a local-then-hosted repair is a FALLBACK, never a local substitution |
+| Local-Final Verified Rate | verified runs whose FINAL boundary class is durably local (the exactly-preserved `final_execution_class`, never a folded display step) ÷ the same cohort (`localFinalVerifiedPpm`, with the `localFinalRuns`/`localFinalVerifiedChanges` counts) |
+| Local-First Success Rate | local-first runs (FIRST boundary class durably local) whose FINAL boundary class is ALSO durably local and whose FIRST verification attempt passed ÷ runs whose FIRST boundary class is durably local (`localFirstSuccessPpm`); the same verification-attempt measure as the Verified First Verification Pass Rate |
+| Local-to-Hosted Fallback Rate | runs that started local and ENDED on a durably hosted boundary ÷ runs whose FIRST boundary class is durably local (`localToHostedFallbackPpm`); a local-then-hosted repair is a FALLBACK, never a local substitution |
+| Local classification coverage | runs whose BOTH boundary classes are durably established (`localClassedRuns`) plus the state `localMeasurement` = `measured` (every run with steps classed) \| `partial` (some) \| `unmeasured` (none) — the local mirror of the Frontier Escalation Rate's measurement token |
 | Hosted-Only Rate | runs whose every step is durably HOSTED ÷ runs with steps (`hostedOnlyPpm`); an `unknown` execution class counts as neither local nor hosted |
+| Attribution honesty | runs whose provider/model attribution is `complete` / `partial` / `unavailable` (`attributionCompleteRuns`, `attributionPartialRuns`, `attributionUnavailableRuns`); `attributionIncompleteExcluded` (partial + unavailable) counts the runs whose samples were excluded from the routing-learning feed |
 | Avoided Hosted Inference | sum of MEASURED counterfactuals (`avoidedHostedInferenceMicro`); `null` with `avoidedHostedInferenceMeasurement = "unavailable"` when no run carried a measurement — never a fabricated zero |
 | Mean Time to Verified Change | wall time over verified changes ÷ verified changes, rounded up (`meanTimeToVerifiedChangeMs`) |
 | Human Intervention Rate | runs with ≥ 1 intervention ÷ all runs (`humanInterventionPpm`) |
@@ -305,14 +350,18 @@ every other money metric recompute as late settlements land.
 - `faktor doctor` prints one read-only line:
   `outcomes: N run(s), M verified, first-verification-pass P%, successful-run cost C
   microUSD, all-in cost/verified change V microUSD, rework ratio R%,
-  rollback B%` — money figures over the money-complete cohort, with
-  `K money-incomplete excluded (...)` appended when the exclusion count is
-  nonzero. Each figure is gated on its OWN served denominator, exactly like
-  the IDE panels: the two cost figures on `verifiedChangesMoneyComplete`,
-  the rework ratio on the money-complete cohort's total spend, and the
-  first-verification-pass rate on verified changes — an empty denominator
-  prints `unavailable`, never a fabricated zero (a measured zero still
-  prints as an exact `0`). A ledger read failure is a doctor ISSUE.
+  rollback B%, local-class coverage X` — money figures over the
+  money-complete cohort, with `K money-incomplete excluded (...)` appended
+  when the exclusion count is nonzero, `J attribution-incomplete excluded
+  from learning (partial P, unavailable U)` appended when a routing-feed
+  exclusion exists, and `X` = `measured` / `partial (k/n classed)` /
+  `unmeasured` (the local boundary-class coverage). Each figure is gated on
+  its OWN served denominator, exactly like the IDE panels: the two cost
+  figures on `verifiedChangesMoneyComplete`, the rework ratio on the
+  money-complete cohort's total spend, and the first-verification-pass rate
+  on verified changes — an empty denominator prints `unavailable`, never a
+  fabricated zero (a measured zero still prints as an exact `0`). A ledger
+  read failure is a doctor ISSUE.
 
 ## Bounds
 

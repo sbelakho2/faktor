@@ -31,6 +31,25 @@
 //!   ledger, proof attestation, audit history, outcome learning, worker
 //!   placement, identity federation). The hooks are typed vocabulary: the
 //!   cloud half owns the decision, the runtime half owns the feature;
+//! - **Enforcement is a daemon/service-seam contract, not a library API
+//!   guarantee.** The production daemon consults the gate at every hook
+//!   BEFORE the paid side effect: the advanced verification-policy
+//!   constructor, the organization-contract compiler consult, the federated
+//!   index query (shared/cross-repo intelligence), the outcome-ledger read,
+//!   the proof attestation entry, the extended audit-history read, the
+//!   outcome-learning feed, worker placement (before any job generation is
+//!   minted) and worker claim admission (the same `private_runners`
+//!   entitlement, consumed by `WorkerPlane::claim_next`), and the SSO /
+//!   identity-federation entry behind `enterprise_governance`. The ONE
+//!   deliberate library-level exception: the `faktor-worker` library's
+//!   `WorkerPlane::new` / `new_for_embedded_host` construction is UNGATED
+//!   for embedded hosts and tests (`admit_claim` returns `Ok(())` while no
+//!   gate is installed) — the daemon's `serve` wiring is what installs the
+//!   gate (`set_claim_entitlement_gate`) on its ONE plane, and an embedded
+//!   host that needs the commercial boundary must install the gate itself.
+//!   Licensing therefore holds at the daemon/service seams (placement mint,
+//!   claim admission and the other boundaries above); the library API
+//!   itself promises no entitlement enforcement;
 //! - **Governance is capability flags, not an implementation.** Enterprise
 //!   governance exposes the `sso`/`scim` capability flags
 //!   ([`GovernanceCapabilities`]) behind the ONE

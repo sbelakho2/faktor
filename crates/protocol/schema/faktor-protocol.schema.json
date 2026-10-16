@@ -963,7 +963,7 @@
     },
     {
       "name": "OutcomeMetrics",
-      "doc": "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = \"unavailable\"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`.",
+      "doc": "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = \"unavailable\"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. Local classification coverage mirrors that rule: `localMeasurement` reports `measured` | `partial` | `unmeasured` with the boundary-classed cohort in `localClassedRuns` (the boundary-derived local cohorts can only classify runs inside it — a folded display sequence never silently depresses them). `attributionCompleteRuns` / `attributionPartialRuns` / `attributionUnavailableRuns` count the recorded provider/model attribution honesty; `attributionIncompleteExcluded` (partial + unavailable) is the routing-learning feed exclusion count — a non-complete run never fed the ledger's atomic feed (its samples kept the per-call feed, never dropped).",
       "unknown_fields": "ignore",
       "shape": {
         "kind": "struct",
@@ -1185,6 +1185,22 @@
             "optional": false
           },
           {
+            "name": "localClassedRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localMeasurement",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
             "name": "hostedOnlyRuns",
             "type": {
               "kind": "i64"
@@ -1226,6 +1242,38 @@
           },
           {
             "name": "avoidedHostedMeasuredRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "attributionCompleteRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "attributionPartialRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "attributionUnavailableRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "attributionIncompleteExcluded",
             "type": {
               "kind": "i64"
             },
@@ -1491,7 +1539,7 @@
     },
     {
       "name": "RunOutcome",
-      "doc": "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == \"complete\"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = \"unavailable\"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim).",
+      "doc": "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == \"complete\"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = \"unavailable\"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). `firstExecutionClass` / `finalExecutionClass` are the run's exactly-preserved boundary execution classes (the classification authority, independent of the bounded `modelSequence` folding; a pre-field payload falls back to the preserved sequence boundary — `unknown` when the authority is absent). `attributionState` reports `complete` | `partial` | `unavailable`: a non-complete attribution records the run but never fed its samples into the ledger's routing-learning feed (they kept the per-call feed).",
       "unknown_fields": "ignore",
       "shape": {
         "kind": "struct",
@@ -1600,6 +1648,30 @@
                 "kind": "named",
                 "name": "RunOutcomeModelStep"
               }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "firstExecutionClass",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "finalExecutionClass",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "attributionState",
+            "type": {
+              "kind": "string"
             },
             "nullable": false,
             "optional": false

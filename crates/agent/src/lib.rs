@@ -49,13 +49,13 @@ pub use faktor_session::VerificationRecord;
 pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
 pub use outcome_ledger::{
-    session_terminal_run_id, ChangedCodeScale, EconomicSettlement, FinalVerificationBasis,
-    LedgerAppend, MeasuredMoney, MoneyState, OutcomeCursor, OutcomeLedger, OutcomeLedgerEntry,
-    OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport, OutcomeLedgerPage,
-    ProofCoverage, RunModelStep, RunVerifiedSample, SettlementFinalize, SettlementStep,
-    TerminalEngineeringOutcome, TerminalRunFacts, TerminalRunFactsOutbox, MAX_LEDGER_PAGE,
-    MAX_METRICS_RECORDS, MAX_RUN_VERIFIED_SAMPLES, OUTCOME_RECORD_SCHEMA_V, SETTLEMENT_SCHEMA_V,
-    TERMINAL_FACTS_SCHEMA_V,
+    session_terminal_run_id, AttributionState, ChangedCodeScale, EconomicSettlement,
+    FinalVerificationBasis, LedgerAppend, LocalMeasurement, MeasuredMoney, MoneyState,
+    OutcomeCursor, OutcomeLedger, OutcomeLedgerEntry, OutcomeLedgerError, OutcomeLedgerMetrics,
+    OutcomeLedgerMetricsReport, OutcomeLedgerPage, ProofCoverage, RunModelStep, RunVerifiedSample,
+    SettlementFinalize, SettlementStep, TerminalEngineeringOutcome, TerminalRunFacts,
+    TerminalRunFactsOutbox, MAX_LEDGER_PAGE, MAX_METRICS_RECORDS, MAX_RUN_VERIFIED_SAMPLES,
+    OUTCOME_RECORD_SCHEMA_V, SETTLEMENT_SCHEMA_V, TERMINAL_FACTS_SCHEMA_V,
 };
 pub use runtime::{
     review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,

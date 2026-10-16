@@ -1818,6 +1818,9 @@ fn losing_concurrent_append_never_refeeds_the_winners_samples() {
             local: false,
             execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
         }],
+        first_execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+        final_execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+        attribution_state: crate::AttributionState::Complete,
         wall_time_ms,
         human_interventions: 0,
         proof: ProofCoverage {
@@ -1999,4 +2002,118 @@ fn losing_concurrent_append_never_refeeds_the_winners_samples() {
         1,
         "after Conflict + failed read the sample is still counted exactly once"
     );
+}
+
+/// Attribution gate on the single-feed reconciliation: a record whose
+/// provider/model attribution is NOT complete absorbed NO samples at all, so
+/// the terminal turn's calls keep the per-call verified feed — the samples
+/// are excluded from the ledger's atomic learning feed and never dropped.
+#[test]
+fn attribution_incomplete_records_absorb_no_samples() {
+    use faktor_router::OutcomeView;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(faktor_store::Store::open(dir.path(), true).unwrap());
+    let ledger = OutcomeLedger::new(store.clone());
+    let run_id = "tx-session-attr-partial";
+    let sample = RunVerifiedSample {
+        provider: "p".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        verified_success: true,
+        rework_cost_micro: 0,
+        rework_turns: 0,
+    };
+    let record = TerminalEngineeringOutcome {
+        schema_version: OUTCOME_RECORD_SCHEMA_V,
+        run_id: run_id.into(),
+        session_id: 998,
+        task_id: 8,
+        task_class: TaskClass::Medium,
+        risk_class: RiskBucket::Low,
+        candidate_snapshot: None,
+        final_snapshot: "tm1:final".into(),
+        accepted: true,
+        integrated: true,
+        verified_first_verification_pass: false,
+        repair_attempts: 0,
+        model_sequence: vec![RunModelStep {
+            provider: "unattributed".into(),
+            model: "unattributed".into(),
+            local: false,
+            execution_class: faktor_core::model::ExecutionClass::Unknown,
+        }],
+        first_execution_class: faktor_core::model::ExecutionClass::Unknown,
+        final_execution_class: faktor_core::model::ExecutionClass::Unknown,
+        attribution_state: crate::AttributionState::Partial,
+        wall_time_ms: 1_000,
+        human_interventions: 0,
+        proof: ProofCoverage {
+            checks_passed: 1,
+            checks_required: 1,
+        },
+        change_scale: ChangedCodeScale::default(),
+        rollback_events: 0,
+        recovery_events: 0,
+        final_basis: FinalVerificationBasis::DeterministicChecks,
+        frontier_escalations: 0,
+        completed_at_ms: 1_760_000_000_000,
+        verified_samples: vec![sample.clone()],
+    };
+    let settlement = EconomicSettlement {
+        schema_version: SETTLEMENT_SCHEMA_V,
+        run_id: run_id.into(),
+        seq: 0,
+        money_state: MoneyState::Complete,
+        reason: "test".into(),
+        model_spend_micro: Some(500_000),
+        verification_spend_micro: Some(0),
+        rework_spend_micro: Some(0),
+        avoided_hosted: MeasuredMoney::Unavailable,
+        steps: vec![SettlementStep {
+            provider: "unattributed".into(),
+            model: "unattributed".into(),
+            local: false,
+            execution_class: faktor_core::model::ExecutionClass::Unknown,
+            spend_micro: 500_000,
+        }],
+        settled_at_ms: 1_760_000_000_000,
+    };
+    assert_eq!(
+        ledger.record(&record, &settlement).unwrap(),
+        LedgerAppend::Recorded
+    );
+    // The partial record fed NOTHING into the router registry...
+    let view = crate::StoreOutcomeStore::new(store.clone());
+    let key = faktor_router::OutcomeKey {
+        provider: "p".into(),
+        model: "m".into(),
+        phase: RouterPhase::Implement,
+        task_class: TaskClass::Medium,
+        risk_bucket: RiskBucket::Low,
+    };
+    assert!(
+        view.stats(&key).is_none(),
+        "an attribution-incomplete record never reaches the registry"
+    );
+    // ...so the reconciliation reports NO absorbed samples for every append
+    // outcome: the terminal turn's calls keep the per-call verified feed.
+    let facts = TerminalRunFacts {
+        schema_version: TERMINAL_FACTS_SCHEMA_V,
+        risk_class: Some(RiskBucket::Low),
+        samples: vec![sample.clone()],
+    };
+    for attempt in [
+        Ok(Some(LedgerAppend::Recorded)),
+        Ok(None),
+        Err(OutcomeLedgerError::Store(
+            faktor_store::StoreError::Conflict("injected concurrent winner".into()),
+        )),
+    ] {
+        let absorbed = super::drive::resolve_absorbed_samples(&ledger, run_id, attempt, &facts);
+        assert!(
+            absorbed.is_empty(),
+            "a partial-attribution record absorbs nothing; the samples stay per-call"
+        );
+    }
 }
