@@ -307,7 +307,18 @@ The create-session contract validates BOTH the provider and the model against th
   split `localOnlyVerifiedPpm` / `localFinalVerifiedPpm` /
   `localFirstSuccessPpm` / `localToHostedFallbackPpm` / `hostedOnlyPpm`
   with their counts (every local/hosted split is decided by each step's
-  durable `executionClass`: `unknown` counts as neither local nor hosted),
+  durable `executionClass`: `unknown` counts as neither local nor hosted;
+  the first/final/fallback splits classify from the run's exactly-preserved
+  boundary classes, `firstExecutionClass` / `finalExecutionClass`, so a
+  folded display sequence never depresses them, and
+  `localClassedRuns` / `localMeasurement` = `measured` | `partial` |
+  `unmeasured` report the boundary-class coverage — mirroring the frontier
+  rule),
+  `attributionCompleteRuns` / `attributionPartialRuns` /
+  `attributionUnavailableRuns` and the routing-learning exclusion count
+  `attributionIncompleteExcluded` (a non-complete provider/model
+  attribution is recorded but never fed the ledger's atomic learning feed;
+  its samples kept the per-call feed),
   `avoidedHostedInferenceMicro` (null with
   `avoidedHostedInferenceMeasurement = "unavailable"` unless a run carried
   a MEASURED counterfactual; zero is only a measured zero),
@@ -328,6 +339,12 @@ The create-session contract validates BOTH the provider and the model against th
   CLASS-DERIVED, so a pre-class row that recorded a local execution keeps
   `local: false` and exposes its recorded bit as `legacyLocal: true`
   instead of promoting it to a class claim);
+  `firstExecutionClass` / `finalExecutionClass` are the run's
+  exactly-preserved boundary classes (the classification authority,
+  independent of the bounded sequence folding; a pre-field payload falls
+  back to the preserved sequence boundary) and `attributionState`
+  (`complete` | `partial` | `unavailable`) is the provider/model
+  attribution honesty of the recorded sequence;
   `avoidedHostedMicro` is null with
   `avoidedHostedMeasurement = "unavailable"` when no counterfactual
   authority exists); `nextCursor` is the composite
@@ -389,7 +406,13 @@ The create-session contract validates BOTH the provider and the model against th
   organizational learning feed; `worker_placement` = private-runner
   placement (checked before any job generation is minted; the 403
   `value_entitlement_refused` refusal is typed through the executor) and
-  worker claim admission (the same 403 on the worker claim route);
+  worker claim admission (the same 403 on the worker claim route) —
+  gating is enforced at these daemon/service seams, not by the library
+  API contract: the `faktor-worker` library's `WorkerPlane::new`/
+  `new_for_embedded_host` construction is deliberately ungated for
+  embedded hosts and tests, and the daemon's serve wiring always installs
+  the `private_runners` claim gate on its ONE plane
+  (`WorkerPlane::set_claim_entitlement_gate`);
   `identity_federation` = the SSO entry
   (`POST /native/sso/start` and `/callback`) behind the
   `enterprise_governance` entitlement AND the capability flag (the flag

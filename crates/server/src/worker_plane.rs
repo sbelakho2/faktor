@@ -46,6 +46,19 @@
 //!   the operator half of the worker plane) is unreachable there (404). The
 //!   operator routes stay on the loopback native listener.
 //!
+//! ## Licensing boundary (what this listener does NOT do)
+//!
+//! This module is the listener/transport-EXPOSURE boundary only. The
+//! commercial `private_runners` boundary — remote placement mint and claim
+//! admission — is a daemon/service seam: the daemon installs the value
+//! entitlement gate on the ONE worker plane it serves
+//! (`faktor_worker::WorkerPlane::set_claim_entitlement_gate`), and a claim
+//! request crossing this socket is refused typed by that gate. The listener
+//! itself adds no licensing enforcement, and the library-level plane
+//! construction (`WorkerPlane::new` / `WorkerPlane::new_for_embedded_host`)
+//! is deliberately ungated for embedded hosts and tests (see the
+//! `faktor_worker::service` contract).
+//!
 //! The validated decision is a [`WorkerPlaneExposure`] witness; its
 //! [`WorkerPlaneExposure::audit_line`] is logged at startup (so the gateway
 //! acknowledgement is recorded in the daemon's audit log) and reported by

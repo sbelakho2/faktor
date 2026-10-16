@@ -2134,6 +2134,23 @@ mod scans {
             ],
         ),
         ("TaskExecutor::new_owner_direct_for_test_harness(", &[]),
+        // The daemon's worker plane (the remote/VPC plane): the ONE
+        // production construction lives in the serve wiring
+        // (`wire_worker_plane`), which ALWAYS installs the `private_runners`
+        // claim gate on it right after — that install IS the licensing
+        // boundary (daemon/service seam, owner decision for the public
+        // Apache-2.0 repo). The library constructors are the documented
+        // embedded/community forms and must never appear in production
+        // code: an ungated daemon plane would silently admit paid remote
+        // claims. The dedicated pin test
+        // (`daemon_worker_plane_installs_the_claim_gate_on_its_one_plane`)
+        // asserts the construction/install order and the doc contract.
+        (
+            "WorkerPlane::with_system_clock(",
+            &[("crates/cli/src/daemon/serve.rs", 1)],
+        ),
+        ("WorkerPlane::new(", &[]),
+        ("WorkerPlane::new_for_embedded_host(", &[]),
     ];
 
     /// Every production file that constructs `marker`, with the exact
@@ -9191,5 +9208,169 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "#[cfg(test)]\nmod tests {\n    fn t() { let _ = VerificationPolicy { quick_max: X }; }\n}\n",
         );
         assert!(policy_unchecked_construction_offenders(&f).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // scan: the daemon worker-plane licensing seam (doc-pinned)
+    // ------------------------------------------------------------------
+
+    /// The daemon licensing pin: the production serve wiring must construct
+    /// its ONE worker plane and install the `private_runners` claim gate on
+    /// it, in that order. A source where the install is missing or precedes
+    /// the construction is an offender: removing the install would leave
+    /// daemon claim admission ungated (the library plane is deliberately
+    /// ungated for embedded hosts) while the docs still claim enforcement.
+    fn daemon_claim_gate_pin_offenders(src: &str) -> Vec<String> {
+        const CONSTRUCT: &str = "let plane = faktor_worker::WorkerPlane::with_system_clock(store);";
+        const INSTALL: &str = "plane.set_claim_entitlement_gate(value_gate.clone());";
+        let construct = src.lines().position(|l| l.trim() == CONSTRUCT);
+        let install = src.lines().position(|l| l.trim() == INSTALL);
+        match (construct, install) {
+            (Some(construct), Some(install)) if construct < install => Vec::new(),
+            (Some(_), Some(_)) => vec![
+                "the daemon's private_runners claim-gate install must FOLLOW the worker-plane \
+                 construction"
+                    .to_string(),
+            ],
+            (Some(_), None) => vec![
+                "the daemon constructs its worker plane but never installs the private_runners \
+                 claim gate (silent licensing regression)"
+                    .to_string(),
+            ],
+            _ => vec![
+                "the daemon worker-plane construction + claim-gate install seam is missing from \
+                 wire_worker_plane"
+                    .to_string(),
+            ],
+        }
+    }
+
+    /// The worker-plane licensing boundary is a DAEMON seam (owner decision,
+    /// auditor-endorsed option 1 for a public Apache-2.0 repo): the library
+    /// `WorkerPlane::new`/`new_for_embedded_host` is intentionally ungated
+    /// for embedded hosts and tests, and the production daemon's serve
+    /// wiring ALWAYS installs the `private_runners` claim gate on the ONE
+    /// plane its `wire_worker_plane` builds. This doc-pinned check ties the
+    /// documented contract (crates/worker/src/service.rs,
+    /// docs/native-protocol.md, docs/architecture.md) to the code so the
+    /// boundary cannot regress silently: the exact construction/install
+    /// lines must exist once each, in order, inside `wire_worker_plane`; no
+    /// other production site may construct a plane; and the docs must keep
+    /// stating the deliberate library-level exception.
+    #[test]
+    fn daemon_worker_plane_installs_the_claim_gate_on_its_one_plane() {
+        const CONSTRUCT: &str = "let plane = faktor_worker::WorkerPlane::with_system_clock(store);";
+        const INSTALL: &str = "plane.set_claim_entitlement_gate(value_gate.clone());";
+        let root = repo_root();
+        let serve = std::fs::read_to_string(root.join("crates/cli/src/daemon/serve.rs"))
+            .expect("the daemon serve wiring must load");
+        assert!(
+            daemon_claim_gate_pin_offenders(&serve).is_empty(),
+            "the daemon licensing seam regressed"
+        );
+        let lines: Vec<&str> = serve.lines().collect();
+        let occurrences = |needle: &str| lines.iter().filter(|l| l.trim() == needle).count();
+        assert_eq!(occurrences(CONSTRUCT), 1, "exactly ONE daemon plane");
+        assert_eq!(occurrences(INSTALL), 1, "exactly ONE gate install");
+        let fn_start = lines
+            .iter()
+            .position(|l| l.trim() == "fn wire_worker_plane(")
+            .expect("wire_worker_plane must exist");
+        let construct = lines.iter().position(|l| l.trim() == CONSTRUCT).unwrap();
+        let install = lines.iter().position(|l| l.trim() == INSTALL).unwrap();
+        assert!(fn_start < construct && construct < install);
+        assert!(
+            !lines[fn_start + 1..=install]
+                .iter()
+                .any(|l| l.trim_start().starts_with("fn ")),
+            "the construction and the gate install must live in the SAME \
+             `wire_worker_plane` function body"
+        );
+
+        // No other production crate (and no other production file of the
+        // CLI) may construct a plane: the daemon's ONE plane is the only
+        // production construction, and the library constructors are
+        // deliberately ungated.
+        let mut stray = Vec::new();
+        for rel in walk_crate_sources() {
+            if rel == "crates/cli/src/daemon/serve.rs" {
+                continue;
+            }
+            let Some(f) = load(&rel) else { continue };
+            for marker in [
+                "WorkerPlane::with_system_clock(",
+                "WorkerPlane::new(",
+                "WorkerPlane::new_for_embedded_host(",
+            ] {
+                for (line, text) in find_markers(&f, &[marker]) {
+                    stray.push(format!("{rel}:{line}: {text}"));
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "a production site outside the daemon seam constructs a worker plane:\n  {}\n",
+            stray.join("\n  ")
+        );
+
+        // Doc pins: the library and the protocol/architecture docs must keep
+        // stating the deliberate exception (the daemon/service-seam
+        // boundary), so the docs cannot drift away from the code silently.
+        let worker = std::fs::read_to_string(root.join("crates/worker/src/service.rs"))
+            .expect("the worker service must load");
+        for phrase in [
+            "new_for_embedded_host",
+            "embedded/community",
+            "not by this library API contract",
+            "wire_worker_plane",
+        ] {
+            assert!(
+                worker.contains(phrase),
+                "crates/worker/src/service.rs lost the licensing-boundary phrase {phrase:?}"
+            );
+        }
+        let protocol = std::fs::read_to_string(root.join("docs/native-protocol.md"))
+            .expect("native-protocol.md must load");
+        for phrase in ["daemon/service seams", "new_for_embedded_host"] {
+            assert!(
+                protocol.contains(phrase),
+                "docs/native-protocol.md lost the licensing-boundary phrase {phrase:?}"
+            );
+        }
+        let architecture = std::fs::read_to_string(root.join("docs/architecture.md"))
+            .expect("architecture.md must load");
+        for phrase in [
+            "deliberately ungated for embedded hosts and tests",
+            "always installs the `private_runners` claim gate",
+        ] {
+            assert!(
+                architecture.contains(phrase),
+                "docs/architecture.md lost the licensing-boundary phrase {phrase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_claim_gate_pin_fires_on_planted_regressions() {
+        // Missing install: the daemon would run its plane ungated.
+        assert!(!daemon_claim_gate_pin_offenders(
+            "fn wire_worker_plane() {\n    \
+             let plane = faktor_worker::WorkerPlane::with_system_clock(store);\n}\n",
+        )
+        .is_empty());
+        // Install before construction: cannot gate the plane.
+        assert!(!daemon_claim_gate_pin_offenders(
+            "fn wire_worker_plane() {\n    \
+             plane.set_claim_entitlement_gate(value_gate.clone());\n    \
+             let plane = faktor_worker::WorkerPlane::with_system_clock(store);\n}\n",
+        )
+        .is_empty());
+        // The sanctioned shape is clean.
+        assert!(daemon_claim_gate_pin_offenders(
+            "fn wire_worker_plane() {\n    \
+             let plane = faktor_worker::WorkerPlane::with_system_clock(store);\n    \
+             plane.set_claim_entitlement_gate(value_gate.clone());\n}\n",
+        )
+        .is_empty());
     }
 }

@@ -523,7 +523,7 @@ fn type_defs_outcomes() -> Vec<TypeDef> {
     vec![
     TypeDef {
         name: "OutcomeMetrics",
-        doc: "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = \"unavailable\"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`.",
+        doc: "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`) — or null when the fact is not settled: `avoidedHostedInferenceMicro` is null with `avoidedHostedInferenceMeasurement = \"unavailable\"` unless at least one run carried a MEASURED counterfactual (zero is only a measured zero). Monetary metrics fold only `moneyCompleteRuns`; `moneyPendingRuns` / `moneyUnavailableRuns` are excluded and counted by `moneyIncompleteExcluded`, and `verifiedChangesMoneyComplete` is the shared Successful-Run-Cost/VCSC denominator (a client must gate BOTH cost values on it, never render its empty-denominator zero). Every rate carries its served denominator so an empty denominator renders as not-measured, never a measured 0: `localOnlyRuns`, `localFinalRuns`, `localFirstRuns`, `runsWithSteps` (the Hosted-Only Rate denominator: runs with at least one model step, `hostedOnlyRuns` / `runsWithSteps`), `runs`, `checksRequired`, and `totalSpendMicro` (Rework Cost Ratio); the Frontier Escalation Rate is null unless durable execution-class authority exists and its `measured` state folds over `runs` while `partial` folds over `frontierClassedRuns` (`frontierEscalationClassedRuns` / `frontierClassedRuns`). `verifiedFirstVerificationPassChanges` / `verifiedFirstVerificationPassPpm` are the Verified First Verification Pass Rate: verified changes whose FIRST VERIFICATION attempt passed — a verification-attempt measure, never an implementation-attempt claim. `localToHostedFallback*` is the Local-to-Hosted Fallback Rate and `hostedOnly*` the Hosted-Only Rate; both classify steps by the durable `executionClass` only. `frontierEscalationMeasurement` reports `measured` | `partial` | `unmeasured`. Local classification coverage mirrors that rule: `localMeasurement` reports `measured` | `partial` | `unmeasured` with the boundary-classed cohort in `localClassedRuns` (the boundary-derived local cohorts can only classify runs inside it — a folded display sequence never silently depresses them). `attributionCompleteRuns` / `attributionPartialRuns` / `attributionUnavailableRuns` count the recorded provider/model attribution honesty; `attributionIncompleteExcluded` (partial + unavailable) is the routing-learning feed exclusion count — a non-complete run never fed the ledger's atomic feed (its samples kept the per-call feed, never dropped).",
         unknown_fields: "ignore",
         shape: Shape::Struct {
             fields: vec![
@@ -554,12 +554,18 @@ fn type_defs_outcomes() -> Vec<TypeDef> {
                 req("localFirstSuccessPpm", Ty::I64),
                 req("localToHostedFallbackRuns", Ty::I64),
                 req("localToHostedFallbackPpm", Ty::I64),
+                req("localClassedRuns", Ty::I64),
+                text_field("localMeasurement"),
                 req("hostedOnlyRuns", Ty::I64),
                 req("runsWithSteps", Ty::I64),
                 req("hostedOnlyPpm", Ty::I64),
                 nullable("avoidedHostedInferenceMicro", Ty::String),
                 text_field("avoidedHostedInferenceMeasurement"),
                 req("avoidedHostedMeasuredRuns", Ty::I64),
+                req("attributionCompleteRuns", Ty::I64),
+                req("attributionPartialRuns", Ty::I64),
+                req("attributionUnavailableRuns", Ty::I64),
+                req("attributionIncompleteExcluded", Ty::I64),
                 req("totalWallTimeMs", Ty::I64),
                 req("meanTimeToVerifiedChangeMs", Ty::I64),
                 req("humanInterventionRuns", Ty::I64),
@@ -620,7 +626,7 @@ fn type_defs_outcomes() -> Vec<TypeDef> {
     },
     TypeDef {
         name: "RunOutcome",
-        doc: "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == \"complete\"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = \"unavailable\"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim).",
+        doc: "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, the LATEST settled money projection (`moneyState`), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. Engineering facts are immutable from record time; money fields are decimal strings only when `moneyState == \"complete\"` and null otherwise (a pending/unavailable money fact is never a fabricated zero). `avoidedHostedMicro` is null with `avoidedHostedMeasurement = \"unavailable\"` when no counterfactual authority exists. `verifiedFirstVerificationPass` is the run's FIRST VERIFICATION attempt having passed (a verification-attempt measure, never a first-implementation-attempt claim). `firstExecutionClass` / `finalExecutionClass` are the run's exactly-preserved boundary execution classes (the classification authority, independent of the bounded `modelSequence` folding; a pre-field payload falls back to the preserved sequence boundary — `unknown` when the authority is absent). `attributionState` reports `complete` | `partial` | `unavailable`: a non-complete attribution records the run but never fed its samples into the ledger's routing-learning feed (they kept the per-call feed).",
         unknown_fields: "ignore",
         shape: Shape::Struct {
             fields: vec![
@@ -644,6 +650,9 @@ fn type_defs_outcomes() -> Vec<TypeDef> {
                         }),
                     },
                 ),
+                text_field("firstExecutionClass"),
+                text_field("finalExecutionClass"),
+                text_field("attributionState"),
                 text_field("moneyState"),
                 nullable("modelSpendMicro", Ty::String),
                 nullable("verificationSpendMicro", Ty::String),

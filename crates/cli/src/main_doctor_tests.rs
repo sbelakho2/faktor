@@ -1588,6 +1588,9 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
             local: true,
             execution_class: faktor_core::model::ExecutionClass::Local,
         }],
+        first_execution_class: faktor_core::model::ExecutionClass::Local,
+        final_execution_class: faktor_core::model::ExecutionClass::Local,
+        attribution_state: faktor_agent::AttributionState::Complete,
         wall_time_ms: 900,
         human_interventions: 0,
         proof: ProofCoverage {
@@ -1653,6 +1656,14 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
         !line.contains("money-incomplete excluded"),
         "a fully settled cohort excludes nothing: {line}"
     );
+    assert!(
+        line.contains("local-class coverage measured"),
+        "a fully boundary-classed ledger reports measured coverage: {line}"
+    );
+    assert!(
+        !line.contains("attribution-incomplete"),
+        "a complete-attribution ledger excludes nothing from learning: {line}"
+    );
 
     // A second run whose money is still pending: excluded and counted, and
     // when NO run's money is settled the doctor says `unavailable`, never a
@@ -1660,6 +1671,8 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
     let mut pending_record = record.clone();
     pending_record.run_id = "doctor-run-2".into();
     pending_record.model_sequence = vec![];
+    pending_record.first_execution_class = faktor_core::model::ExecutionClass::Unknown;
+    pending_record.final_execution_class = faktor_core::model::ExecutionClass::Unknown;
     let pending_settlement = EconomicSettlement {
         schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
         run_id: "doctor-run-2".into(),
@@ -1695,6 +1708,58 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
     assert!(
         line.contains("successful-run cost 40000 microUSD"),
         "the complete cohort's money is unchanged by the excluded row: {line}"
+    );
+
+    // A third run with a classless boundary step and PARTIAL attribution:
+    // the doctor reports the partial local coverage and the learning-feed
+    // exclusion — a folded/classless history is never rounded to full
+    // coverage and an attribution-incomplete run is never silent.
+    let mut partial_record = record.clone();
+    partial_record.run_id = "doctor-run-3".into();
+    partial_record.model_sequence = vec![RunModelStep {
+        provider: "hosted".into(),
+        model: "m-unknown".into(),
+        local: false,
+        execution_class: faktor_core::model::ExecutionClass::Unknown,
+    }];
+    partial_record.first_execution_class = faktor_core::model::ExecutionClass::Unknown;
+    partial_record.final_execution_class = faktor_core::model::ExecutionClass::Unknown;
+    partial_record.attribution_state = faktor_agent::AttributionState::Partial;
+    partial_record.verified_samples = vec![];
+    let partial_settlement = EconomicSettlement {
+        schema_version: faktor_agent::SETTLEMENT_SCHEMA_V,
+        run_id: "doctor-run-3".into(),
+        seq: 0,
+        money_state: MoneyState::Pending,
+        reason: "doctor test partial attribution".into(),
+        model_spend_micro: None,
+        verification_spend_micro: None,
+        rework_spend_micro: None,
+        avoided_hosted: MeasuredMoney::Unavailable,
+        steps: vec![],
+        settled_at_ms: 0,
+    };
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        OutcomeLedger::new(session.store())
+            .record(&partial_record, &partial_settlement)
+            .expect("the partial-attribution fixture records exactly once");
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("outcomes: "))
+        .expect("ledger line");
+    assert!(
+        line.contains("local-class coverage partial (1/2 classed)"),
+        "one of two runs with steps carries boundary authority: {line}"
+    );
+    assert!(
+        line.contains("1 attribution-incomplete excluded from learning (partial 1, unavailable 0)"),
+        "the partial attribution is counted loudly: {line}"
     );
 }
 
@@ -1739,6 +1804,9 @@ fn doctor_cost_lines_guard_their_real_denominators_never_a_fabricated_zero() {
                 local: false,
                 execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
             }],
+            first_execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+            final_execution_class: faktor_core::model::ExecutionClass::HostedEconomy,
+            attribution_state: faktor_agent::AttributionState::Complete,
             wall_time_ms: 900,
             human_interventions: 0,
             proof: ProofCoverage {

@@ -83,8 +83,8 @@ pub mod wedge;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use billing_read::{
-    reservation_folded_micro, reservation_provider_reported_micro, DurableSpendRow,
-    MAX_DURABLE_SPEND_CALL_ROWS, MAX_DURABLE_SPEND_ROWS, UNATTRIBUTED_PROVENANCE,
+    reservation_folded_micro, reservation_provider_reported_micro, DurableSpendProjection,
+    DurableSpendRow, MAX_DURABLE_SPEND_CALL_ROWS, MAX_DURABLE_SPEND_ROWS, UNATTRIBUTED_PROVENANCE,
 };
 pub use board::{
     BoardAction, BoardDeliveryView, BoardId, BoardPage, BoardPost, BoardPostId, BoardRead,

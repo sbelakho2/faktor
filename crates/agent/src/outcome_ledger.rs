@@ -48,6 +48,29 @@
 //! excluded rows (`money_incomplete_excluded`). Rates are floor-divided ppm
 //! ("at least"); cost/time averages round UP (never understate). Zero
 //! denominators yield zero, never a fabricated number.
+//!
+//! Attribution honesty and boundary-class truth
+//! --------------------------------------------
+//! The model sequence is a BOUNDED display: past the cap its distinct
+//! provider/model groups fold into an `unknown`-class aggregate tail, and
+//! the provider-call history the identity comes from is itself a bounded
+//! read. Two truths are therefore recorded EXPLICITLY, independent of that
+//! display:
+//!
+//! - [`AttributionState`] (`complete` | `partial` | `unavailable`): whether
+//!   the run's provider/model attribution came from a whole provider-call
+//!   read and covered every settled step. A non-complete attribution is
+//!   RECORDED (the immutable row must exist) but excluded from the ledger's
+//!   routing-learning feed — its samples keep the per-call feed, never
+//!   dropped, never doubled — and counted by the metrics fold, never
+//!   silently tolerated;
+//! - `first_execution_class` / `final_execution_class`: the run's boundary
+//!   execution classes, preserved exactly even when the display sequence
+//!   folds, so local-first / local-final / local-to-hosted classification
+//!   reads durable class authority instead of a possibly-folded boundary
+//!   step. [`LocalMeasurement`] reports how much of that boundary authority
+//!   exists (`measured` | `partial` | `unmeasured`) with the classed-run
+//!   count, mirroring the frontier measurement.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -249,6 +272,45 @@ impl MoneyState {
             "pending" => Some(MoneyState::Pending),
             "unavailable" => Some(MoneyState::Unavailable),
             _ => None,
+        }
+    }
+}
+
+/// The provider/model attribution honesty of one recorded model sequence.
+/// The sequence identity comes from a BOUNDED provider-call read and the
+/// display sequence folds past its cap, so attribution completeness is a
+/// first-class recorded fact, never an assumption:
+///
+/// - `complete`: the provider-call history was read whole and every settled
+///   step found its attributable call row;
+/// - `partial`: the provider-call history exceeded its read bound and/or
+///   some settled steps carry the explicit unattributed provenance — the
+///   money stays exact, the identity does not;
+/// - `unavailable`: attribution cannot be established at all: settled steps
+///   exist but none carries a provider/model identity, or a payload that
+///   predates this field (the honest decode default). Never a guessed
+///   identity, never a claimed completeness.
+///
+/// A non-complete attribution is recorded (the immutable row must exist)
+/// and its verified samples are excluded from the ledger's routing-learning
+/// feed (they keep the per-call feed — never dropped, never doubled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionState {
+    Complete,
+    Partial,
+    /// The honest legacy decode of a payload written before the attribution
+    /// state was recorded: no authority, never a claimed completeness.
+    #[default]
+    Unavailable,
+}
+
+impl AttributionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttributionState::Complete => "complete",
+            AttributionState::Partial => "partial",
+            AttributionState::Unavailable => "unavailable",
         }
     }
 }
@@ -501,7 +563,33 @@ pub struct TerminalEngineeringOutcome {
     pub repair_attempts: u64,
     /// The provider/model sequence actually used, in order (engineering
     /// identity only; per-step money lives in the settlement projection).
+    /// A BOUNDED display: past [`MAX_RUN_MODEL_STEPS`] distinct groups fold
+    /// into an `unknown`-class aggregate tail, so the boundary classes
+    /// below — not the sequence's first/last step — are the classification
+    /// authority.
     pub model_sequence: Vec<RunModelStep>,
+    /// The run's FIRST settled step's durable execution class, preserved
+    /// exactly even when the bounded display sequence folds (survives
+    /// compaction). `unknown` when no step carried a durable authority (or
+    /// no step exists). `#[serde(default)]` decodes a pre-field payload as
+    /// `unknown` and the local metrics then fall back to the preserved
+    /// sequence boundary.
+    #[serde(default)]
+    pub first_execution_class: ExecutionClass,
+    /// The run's FINAL settled step's durable execution class, preserved
+    /// exactly even when the bounded display sequence folds it into the
+    /// aggregate tail (survives compaction). Same decode contract as
+    /// [`Self::first_execution_class`]; for a pre-field payload whose tail
+    /// was folded the class is genuinely lost and stays `unknown` — never a
+    /// guess from the aggregate step.
+    #[serde(default)]
+    pub final_execution_class: ExecutionClass,
+    /// The provider/model attribution honesty of the recorded sequence (see
+    /// [`AttributionState`]); `#[serde(default)]` decodes a pre-field
+    /// payload as `unavailable` (the state was never recorded — never a
+    /// claimed completeness).
+    #[serde(default)]
+    pub attribution_state: AttributionState,
     /// Wall time from run start to terminal outcome.
     pub wall_time_ms: u64,
     /// Human interventions (permission decisions, manual steers/edits).
@@ -594,9 +682,45 @@ impl TerminalEngineeringOutcome {
         self.accepted && self.integrated && self.final_basis.is_deterministic_verified()
     }
 
-    /// Whether any step ran on a local model.
+    /// The run's FIRST-step execution class with its documented legacy
+    /// fallback: the exactly-preserved [`Self::first_execution_class`] when
+    /// a durable authority recorded it, else the display sequence's first
+    /// step class (a pre-field payload; the first step is never folded).
+    /// `unknown` when neither exists — never a guessed class.
+    pub fn effective_first_execution_class(&self) -> ExecutionClass {
+        if self.first_execution_class.is_known() {
+            return self.first_execution_class;
+        }
+        self.model_sequence
+            .first()
+            .map(|step| step.execution_class)
+            .unwrap_or(ExecutionClass::Unknown)
+    }
+
+    /// The run's FINAL-step execution class with its documented legacy
+    /// fallback: the exactly-preserved [`Self::final_execution_class`] when
+    /// a durable authority recorded it, else the display sequence's last
+    /// step class (a pre-field payload; an already-folded tail reads
+    /// `unknown` — the class is genuinely lost there, never inferred from
+    /// the aggregate step).
+    pub fn effective_final_execution_class(&self) -> ExecutionClass {
+        if self.final_execution_class.is_known() {
+            return self.final_execution_class;
+        }
+        self.model_sequence
+            .last()
+            .map(|step| step.execution_class)
+            .unwrap_or(ExecutionClass::Unknown)
+    }
+
+    /// Whether any step ran on a local model. The bounded display sequence
+    /// is folded past its cap, so the exactly-preserved boundary classes
+    /// participate too: a run whose only local step is its final (folded)
+    /// step still counts as local-used.
     pub fn local_used(&self) -> bool {
         self.model_sequence.iter().any(|s| s.local)
+            || self.effective_first_execution_class().is_local()
+            || self.effective_final_execution_class().is_local()
     }
 
     /// Bounded structural validation, on the caller's thread BEFORE any
@@ -665,6 +789,34 @@ impl TerminalEngineeringOutcome {
                 "checks_passed {} exceeds checks_required {}",
                 self.proof.checks_passed, self.proof.checks_required
             )));
+        }
+        // A run with no recorded step proves no boundary class: a
+        // durably-known first/final class without any step is drift, never
+        // a class authority.
+        if self.model_sequence.is_empty()
+            && (self.first_execution_class.is_known() || self.final_execution_class.is_known())
+        {
+            return Err(OutcomeLedgerError::Invalid(
+                "a run with no model steps cannot carry durably-known boundary execution \
+                 classes"
+                    .into(),
+            ));
+        }
+        // A COMPLETE attribution claim must not carry an explicitly
+        // unattributed step (the derivation never produces one; a hostile
+        // or drifted payload is a typed corruption).
+        if self.attribution_state == AttributionState::Complete {
+            for step in &self.model_sequence {
+                if step.provider == faktor_session::UNATTRIBUTED_PROVENANCE
+                    || step.model == faktor_session::UNATTRIBUTED_PROVENANCE
+                {
+                    return Err(OutcomeLedgerError::Invalid(format!(
+                        "a complete attribution claim cannot carry the unattributed step \
+                         {:?}/{:?}",
+                        step.provider, step.model
+                    )));
+                }
+            }
         }
         if self.verified_first_verification_pass && !self.verified() {
             return Err(OutcomeLedgerError::Invalid(
@@ -749,7 +901,20 @@ impl TerminalEngineeringOutcome {
     /// The durable per-call verified samples this record feeds into the
     /// router's `model_outcome_stats` registry (verified attribution only —
     /// the samples themselves carry the explicit signal).
+    ///
+    /// ATTRIBUTION GATE: a record whose provider/model attribution is not
+    /// [`AttributionState::Complete`] feeds NOTHING here. Its attribution is
+    /// record-local truth (the bounded provider-call read can truncate), and
+    /// the immutable row must still be written — so the run's samples are
+    /// excluded from the atomic learning feed instead of laundering an
+    /// attribution-incomplete run into the router registry. The samples are
+    /// NOT dropped: the runtime's terminal-turn reconciliation sees the
+    /// exclusion and keeps them on the per-call verified feed (fed exactly
+    /// once either way).
     pub fn router_increments(&self) -> Vec<ModelOutcomeIncrement> {
+        if self.attribution_state != AttributionState::Complete {
+            return Vec::new();
+        }
         self.verified_samples
             .iter()
             .map(|s| ModelOutcomeIncrement {
@@ -867,6 +1032,14 @@ pub struct OutcomeLedger {
     /// non-double-counting fallback. Compiled out of every non-test build.
     #[cfg(test)]
     failed_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Test-only provider-call read bound override (see
+    /// [`OutcomeLedger::with_spend_call_bound`]): the derivations read the
+    /// settled spend through this bound so an adversarial test can force the
+    /// documented truncation at test scale. `None` = the canonical
+    /// [`faktor_session::MAX_DURABLE_SPEND_CALL_ROWS`]. Compiled out of
+    /// every non-test build.
+    #[cfg(test)]
+    spend_call_bound_override: Option<i64>,
 }
 
 impl std::fmt::Debug for OutcomeLedger {
@@ -885,6 +1058,8 @@ impl OutcomeLedger {
             after_reservation_read: None,
             #[cfg(test)]
             failed_reads: None,
+            #[cfg(test)]
+            spend_call_bound_override: None,
         }
     }
 
@@ -901,6 +1076,7 @@ impl OutcomeLedger {
             store,
             after_reservation_read: Some(probe),
             failed_reads: None,
+            spend_call_bound_override: None,
         }
     }
 
@@ -913,7 +1089,33 @@ impl OutcomeLedger {
             store,
             after_reservation_read: None,
             failed_reads: Some(Arc::new(std::sync::atomic::AtomicUsize::new(failures))),
+            spend_call_bound_override: None,
         }
+    }
+
+    /// Test-only: pin an explicit provider-call read bound on the
+    /// derivations (see [`Self::spend_call_bound`]). The only way to observe
+    /// the documented truncation at test scale without seeding the
+    /// production-scale history.
+    #[cfg(test)]
+    pub(crate) fn with_spend_call_bound(store: Arc<Store>, bound: i64) -> Self {
+        Self {
+            store,
+            after_reservation_read: None,
+            failed_reads: None,
+            spend_call_bound_override: Some(bound),
+        }
+    }
+
+    /// The provider-call read bound of both derivations: the canonical
+    /// session bound in production, the test-only override (if any) under
+    /// `cfg(test)`.
+    fn spend_call_bound(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(bound) = self.spend_call_bound_override {
+            return bound;
+        }
+        faktor_session::MAX_DURABLE_SPEND_CALL_ROWS
     }
 
     /// Fire the test-only read-order probe, if any.
@@ -1273,6 +1475,13 @@ fn decode_legacy_row(
                 execution_class: ExecutionClass::Unknown,
             })
             .collect(),
+        // Legacy v1 payloads predate the boundary-class and attribution
+        // fields: no boundary class authority exists (the sequence keeps the
+        // honest legacy local bits) and no attribution completeness was ever
+        // recorded — never a claimed class or completeness.
+        first_execution_class: ExecutionClass::Unknown,
+        final_execution_class: ExecutionClass::Unknown,
+        attribution_state: AttributionState::Unavailable,
         wall_time_ms: legacy.wall_time_ms,
         human_interventions: legacy.human_interventions,
         proof: legacy.proof,
@@ -1483,6 +1692,20 @@ pub struct OutcomeLedgerMetrics {
     /// Pending + unavailable runs: excluded from every monetary metric
     /// (reported, never silently dropped).
     pub money_incomplete_excluded: u64,
+    /// Runs whose provider/model attribution is `complete` (the whole
+    /// provider-call read, every settled step attributed).
+    pub attribution_complete_runs: u64,
+    /// Runs whose attribution is `partial` (the provider-call history
+    /// truncated and/or a settled step is explicitly unattributed).
+    pub attribution_partial_runs: u64,
+    /// Runs whose attribution is `unavailable` (settled steps exist but
+    /// none carries a provider/model identity — including pre-field legacy
+    /// payloads, whose state was never recorded).
+    pub attribution_unavailable_runs: u64,
+    /// Partial + unavailable runs: their verified samples are EXCLUDED from
+    /// the ledger's routing-learning feed (they keep the per-call feed) —
+    /// reported, never silently dropped.
+    pub attribution_incomplete_excluded: u64,
     /// Verified changes among the money-complete runs: the VCSC
     /// denominator.
     pub verified_changes_money_complete: u64,
@@ -1528,6 +1751,17 @@ pub struct OutcomeLedgerMetrics {
     pub local_to_hosted_fallback_runs: u64,
     /// Local-to-Hosted Fallback Rate (ppm) over local-first runs.
     pub local_to_hosted_fallback_ppm: u32,
+    /// Runs with a model sequence whose boundary execution classes (first
+    /// AND final) are BOTH durably established — the local-coverage cohort
+    /// and the local mirror of `frontier_classed_runs`. The boundary-derived
+    /// local cohorts (`local_first_runs`, `local_final_runs`, the fallback
+    /// denominator) can only classify runs inside it.
+    pub local_classed_runs: u64,
+    /// How much durable boundary-class authority the local classification
+    /// rests on (see [`LocalMeasurement`]): `measured` when every run with
+    /// steps carries both boundary classes, `partial` when only some do,
+    /// `unmeasured` when none does (never a fabricated full coverage).
+    pub local_measurement: LocalMeasurement,
     /// Runs whose every step is a durably-known HOSTED tier (no local step,
     /// no unknown-class step). A run with any unknown-class step is counted
     /// as neither local nor hosted.
@@ -1611,6 +1845,39 @@ impl FrontierMeasurement {
     }
 }
 
+/// How much durable boundary-class authority the LOCAL classification
+/// (local-first / local-final / local-to-hosted) rests on — the local mirror
+/// of [`FrontierMeasurement`]. The boundary classes are preserved exactly on
+/// the record (`first_execution_class` / `final_execution_class`), so a
+/// folded display sequence no longer depresses the local cohorts; this state
+/// reports how many runs the boundary authority actually covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMeasurement {
+    /// Every run with a model sequence carries both boundary classes: the
+    /// local cohorts cover the whole population.
+    Measured,
+    /// Some runs carry boundary classes, others do not (e.g. an unpriced
+    /// boundary step, or a pre-field payload whose folded tail genuinely
+    /// lost the final class): the local cohorts cover exactly the classed
+    /// runs, reported by `local_classed_runs`.
+    Partial,
+    /// No run carries any boundary-class authority: the local cohorts have
+    /// no measured evidence — never presented as full coverage.
+    #[default]
+    Unmeasured,
+}
+
+impl LocalMeasurement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocalMeasurement::Measured => "measured",
+            LocalMeasurement::Partial => "partial",
+            LocalMeasurement::Unmeasured => "unmeasured",
+        }
+    }
+}
+
 impl OutcomeLedgerMetrics {
     /// Pure, integer-exact fold over a ledger entry set (saturating u128
     /// intermediates; never floating point). Engineering metrics fold every
@@ -1641,6 +1908,8 @@ impl OutcomeLedgerMetrics {
         let mut runs_with_steps: u128 = 0;
         let mut classed_runs: u128 = 0;
         let mut any_known_class = false;
+        let mut local_classed_runs: u128 = 0;
+        let mut any_boundary_class = false;
         let mut verified_first_pass: u128 = 0;
         let mut verified_money_complete: u128 = 0;
         for entry in entries {
@@ -1675,13 +1944,32 @@ impl OutcomeLedgerMetrics {
                 avoided = avoided.saturating_add(u128::from(value));
                 avoided_measured_runs = avoided_measured_runs.saturating_add(1);
             }
+            // Attribution honesty: recorded per row, counted here, never
+            // silently folded into a completeness claim.
+            match record.attribution_state {
+                AttributionState::Complete => {
+                    m.attribution_complete_runs = m.attribution_complete_runs.saturating_add(1)
+                }
+                AttributionState::Partial => {
+                    m.attribution_partial_runs = m.attribution_partial_runs.saturating_add(1)
+                }
+                AttributionState::Unavailable => {
+                    m.attribution_unavailable_runs =
+                        m.attribution_unavailable_runs.saturating_add(1)
+                }
+            }
             let steps = &record.model_sequence;
             // P1 classification: every local/hosted measure is decided by the
             // durable execution class, never by a cost number. Unknown is
-            // counted as NEITHER local nor hosted.
-            let first_local = steps.first().is_some_and(|s| s.execution_class.is_local());
-            let last_local = steps.last().is_some_and(|s| s.execution_class.is_local());
-            let last_hosted = steps.last().is_some_and(|s| s.execution_class.is_hosted());
+            // counted as NEITHER local nor hosted. The FIRST/FINAL measures
+            // read the exactly-preserved boundary classes (with their
+            // documented legacy fallback), so a folded display sequence
+            // never depresses the local cohorts.
+            let first_class = record.effective_first_execution_class();
+            let final_class = record.effective_final_execution_class();
+            let first_local = first_class.is_local();
+            let last_local = final_class.is_local();
+            let last_hosted = final_class.is_hosted();
             let all_local = !steps.is_empty() && steps.iter().all(|s| s.execution_class.is_local());
             let all_hosted =
                 !steps.is_empty() && steps.iter().all(|s| s.execution_class.is_hosted());
@@ -1693,6 +1981,16 @@ impl OutcomeLedgerMetrics {
                     classed_runs = classed_runs.saturating_add(1);
                 }
                 any_known_class |= steps.iter().any(|s| s.execution_class.is_known());
+                // The LOCAL coverage cohort: runs with BOTH boundary classes
+                // durably established. A run with only one boundary class is
+                // boundary authority for the rates of that boundary but not
+                // full coverage, so it reports `partial` (never measured).
+                if first_class.is_known() && final_class.is_known() {
+                    local_classed_runs = local_classed_runs.saturating_add(1);
+                }
+                if first_class.is_known() || final_class.is_known() {
+                    any_boundary_class = true;
+                }
             }
             if any_local {
                 local_runs = local_runs.saturating_add(1);
@@ -1766,6 +2064,9 @@ impl OutcomeLedgerMetrics {
         m.money_incomplete_excluded = m
             .money_pending_runs
             .saturating_add(m.money_unavailable_runs);
+        m.attribution_incomplete_excluded = m
+            .attribution_partial_runs
+            .saturating_add(m.attribution_unavailable_runs);
         m.verified_changes_money_complete = sat_u64(verified_money_complete);
         m.verified_first_verification_pass_changes = sat_u64(verified_first_pass);
         m.local_runs = sat_u64(local_runs);
@@ -1778,6 +2079,7 @@ impl OutcomeLedgerMetrics {
         m.local_to_hosted_fallback_runs = sat_u64(local_to_hosted);
         m.hosted_only_runs = sat_u64(hosted_only);
         m.runs_with_steps = sat_u64(runs_with_steps);
+        m.local_classed_runs = sat_u64(local_classed_runs);
         m.human_intervention_runs = sat_u64(intervention_runs);
         m.rollback_runs = sat_u64(rollback_runs);
         m.frontier_escalation_runs = sat_u64(frontier_runs);
@@ -1824,6 +2126,18 @@ impl OutcomeLedgerMetrics {
             FrontierMeasurement::Partial => {
                 (classed_runs > 0).then(|| meaning_ppm(frontier_runs_classed, classed_runs))
             }
+        };
+        // Local coverage (mirrors the frontier rule): without any boundary
+        // class authority the state is `unmeasured` (never a fabricated full
+        // coverage); with all runs with steps classed it is `measured`; in
+        // between the local cohorts cover exactly the classed runs and the
+        // state reports the partiality.
+        m.local_measurement = if !any_boundary_class {
+            LocalMeasurement::Unmeasured
+        } else if local_classed_runs == runs_with_steps {
+            LocalMeasurement::Measured
+        } else {
+            LocalMeasurement::Partial
         };
         // Money/time averages: ceil ("never understate"); the VCSC
         // denominator is the money-complete verified cohort ONLY.
@@ -2015,8 +2329,10 @@ impl EconomicProjection {
 /// Group the settled spend rows into the run's provider/model step
 /// projection (occurrence order, first-seen groups, one explicit aggregate
 /// tail past the cap; the spend sum stays exact). Returns the engineering
-/// steps (identity + durable execution class) and the financial steps (with
-/// spend).
+/// steps (identity + durable execution class), the financial steps (with
+/// spend) and the EXACT boundary execution classes (first and final settled
+/// row) — preserved independent of the bounded display sequence, so the
+/// local-first/local-final/local-to-hosted classification survives folding.
 ///
 /// P1 classification: the class comes from the reservation's DURABLE
 /// route-time authority ([`faktor_session::DurableSpendRow::effective_execution_class`]);
@@ -2024,7 +2340,13 @@ impl EconomicProjection {
 /// `Unknown` and is counted as neither local nor hosted.
 fn group_spend_rows(
     spend: &[faktor_session::DurableSpendRow],
-) -> (Vec<RunModelStep>, Vec<SettlementStep>, u128) {
+) -> (
+    Vec<RunModelStep>,
+    Vec<SettlementStep>,
+    u128,
+    ExecutionClass,
+    ExecutionClass,
+) {
     let mut groups: Vec<RunModelStep> = Vec::new();
     let mut financial: Vec<SettlementStep> = Vec::new();
     let mut folded_groups: u64 = 0;
@@ -2035,6 +2357,16 @@ fn group_spend_rows(
     // so first/last-step classification is deterministic.
     let mut ordered: Vec<&faktor_session::DurableSpendRow> = spend.iter().collect();
     ordered.sort_by_key(|row| (row.occurred_at_ms, row.reservation_id));
+    // The EXACT boundary classes: taken from the ordered settled rows, not
+    // from the possibly-folded display sequence below.
+    let first_class = ordered
+        .first()
+        .map(|row| row.effective_execution_class())
+        .unwrap_or(ExecutionClass::Unknown);
+    let final_class = ordered
+        .last()
+        .map(|row| row.effective_execution_class())
+        .unwrap_or(ExecutionClass::Unknown);
     for row in ordered {
         model_spend = model_spend.saturating_add(u128::from(row.provider_cost_micro));
         let execution_class = row.effective_execution_class();
@@ -2086,7 +2418,37 @@ fn group_spend_rows(
             spend_micro: sat_u64(folded_spend),
         });
     }
-    (groups, financial, model_spend)
+    (groups, financial, model_spend, first_class, final_class)
+}
+
+/// The recorded attribution honesty of one run's model sequence from the
+/// bounded provider-call projection ONLY (the settled rows, the truncation
+/// flag and the unattributed count — never the folded display sequence):
+///
+/// - no settled step: `complete` (nothing to attribute);
+/// - settled steps exist but none is attributed: `unavailable` (no
+///   provider/model identity authority at all);
+/// - the call read truncated AND/OR some settled step is unattributed:
+///   `partial`;
+/// - a whole call read with every settled step attributed: `complete`.
+fn derive_attribution_state(
+    projection: &faktor_session::DurableSpendProjection,
+) -> AttributionState {
+    if projection.rows.is_empty() {
+        return AttributionState::Complete;
+    }
+    let attributed = projection
+        .rows
+        .iter()
+        .filter(|row| row.provider != faktor_session::UNATTRIBUTED_PROVENANCE)
+        .count();
+    if attributed == 0 {
+        return AttributionState::Unavailable;
+    }
+    if projection.call_rows_truncated || attributed < projection.rows.len() {
+        return AttributionState::Partial;
+    }
+    AttributionState::Complete
 }
 
 /// The settled rework spend: settled rows STRICTLY AFTER the first failed
@@ -2132,6 +2494,11 @@ impl OutcomeLedger {
     ///   the verification records, the settled spend rows, the durable
     ///   integration record, the integration transaction, the permission
     ///   decisions and the recovery events;
+    /// - the bounded provider-call history never silently truncates: a
+    ///   truncated read (or an explicitly unattributed settled step) types
+    ///   the record's `attribution_state` `partial`/`unavailable`, and the
+    ///   record's samples are then excluded from the routing-learning feed
+    ///   (they keep the per-call feed);
     /// - the money projection is derived from the reservation ledger: an
     ///   open/dispatched/uncertain reservation types the initial settlement
     ///   `pending` (amounts NULL), an unreadable ledger or an unmetered
@@ -2258,11 +2625,21 @@ impl OutcomeLedger {
         let records = handle.list_verification_records(task_id).map_err(|e| {
             OutcomeLedgerError::Facts(format!("verification records read failed: {e}"))
         })?;
-        let mut spend = handle
-            .durable_spend_rows(task_id, faktor_session::MAX_DURABLE_SPEND_ROWS)
+        // The settled-spend PROJECTION (never the strict rows fold): the
+        // immutable record must exist even when the bounded provider-call
+        // history truncated, so the truncation is carried EXPLICITLY into
+        // the record's attribution state instead of being discarded.
+        let spend_projection = handle
+            .durable_spend_projection_bounded(
+                task_id,
+                faktor_session::MAX_DURABLE_SPEND_ROWS,
+                self.spend_call_bound(),
+            )
             .map_err(|e| {
                 OutcomeLedgerError::Facts(format!("settled spend rows read failed: {e}"))
             })?;
+        let attribution_state = derive_attribution_state(&spend_projection);
+        let mut spend = spend_projection.rows;
         // The durable read returns newest-first; the model SEQUENCE is the
         // chronological story (the first implementation attempt first) and
         // the rework window is order-sensitive, so order once by the durable
@@ -2346,7 +2723,8 @@ impl OutcomeLedger {
             FinalVerificationBasis::Unverified
         };
         let verified = accepted && final_basis.is_deterministic_verified();
-        let (groups, settlement_steps, model_spend) = group_spend_rows(&spend);
+        let (groups, settlement_steps, model_spend, first_execution_class, final_execution_class) =
+            group_spend_rows(&spend);
         let rework_spend_micro = derive_rework_spend(&spend, &records, model_spend);
         let candidate_snapshot = integration
             .as_ref()
@@ -2418,6 +2796,13 @@ impl OutcomeLedger {
             verified_first_verification_pass: first_verification_passed && verified,
             repair_attempts,
             model_sequence: groups,
+            // The EXACT boundary classes of the settled rows (independent of
+            // the bounded display sequence above): local-first/local-final/
+            // local-to-hosted classification reads these, never a possibly
+            // folded boundary step.
+            first_execution_class,
+            final_execution_class,
+            attribution_state,
             wall_time_ms,
             human_interventions,
             proof: ProofCoverage {
@@ -2465,18 +2850,25 @@ impl OutcomeLedger {
     ) -> Result<EconomicProjection, OutcomeLedgerError> {
         let reservations = self.read_reservation_state(handle, task_id);
         self.note_reservation_read();
+        // The money-only path uses the same bounded PROJECTION as the record
+        // derivation: a truncated provider-call history affects attribution
+        // only, never the money (which comes from the reservation rows), so
+        // it must not wedge the settlement lifecycle.
         let mut spend = handle
-            .durable_spend_rows(task_id, faktor_session::MAX_DURABLE_SPEND_ROWS)
-            .map_err(|e| {
-                OutcomeLedgerError::Facts(format!("settled spend rows read failed: {e}"))
-            })?;
+            .durable_spend_projection_bounded(
+                task_id,
+                faktor_session::MAX_DURABLE_SPEND_ROWS,
+                self.spend_call_bound(),
+            )
+            .map_err(|e| OutcomeLedgerError::Facts(format!("settled spend rows read failed: {e}")))?
+            .rows;
         // Same chronological ordering as the record derivation: the settled
         // per-step projection tells the run's story oldest-first.
         spend.sort_by_key(|row| row.reservation_id);
         let records = handle.list_verification_records(task_id).map_err(|e| {
             OutcomeLedgerError::Facts(format!("verification records read failed: {e}"))
         })?;
-        let (_, settlement_steps, model_spend) = group_spend_rows(&spend);
+        let (_, settlement_steps, model_spend, _, _) = group_spend_rows(&spend);
         let rework_spend_micro = derive_rework_spend(&spend, &records, model_spend);
         self.classify_economic_projection(
             task_id,

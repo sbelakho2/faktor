@@ -762,6 +762,18 @@ fn recording_over_an_unauthenticated_or_rotated_key_trail_is_refused() {
     let mut rotated = [0u8; 32];
     rotated[0] = 7;
     std::fs::write(key_path(fresh.path()), rotated).unwrap();
+    // The replacement stays owner-only: the read path refuses an
+    // other-accessible key before it even looks at the bytes (that refusal
+    // has its own test), so this stays the rotated-KEY path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            key_path(fresh.path()),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     let state = inspect(fresh.path(), &Config::default());
     assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
     assert!(state.corrupt_reason.is_some());
@@ -785,4 +797,433 @@ fn recording_over_an_unauthenticated_or_rotated_key_trail_is_refused() {
         SandboxFirstRunDecision::NetworkCapableUserGranted
     );
     assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+}
+
+// ---------------------------------------------------------------------------
+// Open-once no-follow handle validation (TOCTOU). Every artifact is opened
+// ONCE through the anchored data-dir authority, the OPENED HANDLE is
+// fstat-validated as a regular file and every byte is read from that SAME
+// handle. The seam fires in the exact inspect->read window, so the swap is
+// deterministic: the read must operate on the original handle or refuse —
+// never on the swapped-in entry.
+// ---------------------------------------------------------------------------
+
+/// Serializes the tests that install the process-global artifact read seam.
+static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn seam_guard() -> std::sync::MutexGuard<'static, ()> {
+    SEAM_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The key read (record path): swap the key entry for a symlink to a decoy
+/// key AFTER the handle was opened and validated. The read must use the
+/// VALIDATED HANDLE, so the record is signed under the original key — a
+/// re-open by pathname would have read the decoy and the trail check would
+/// have refused under it.
+#[cfg(unix)]
+#[test]
+fn key_read_never_follows_a_swap_planted_after_handle_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let _guard = seam_guard();
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let original_key = std::fs::read(key_path(data_dir)).unwrap();
+    let decoy = dir.path().join("decoy-key");
+    std::fs::write(&decoy, [0x41u8; 32]).unwrap();
+    let held = dir.path().join("held-key");
+
+    let target = key_path(data_dir);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let flag = swapped.clone();
+    let (hook_target, hook_decoy, hook_held) = (target.clone(), decoy.clone(), held.clone());
+    install_artifact_read_seam(Box::new(move |label| {
+        if label == hook_target && !flag.swap(true, Ordering::SeqCst) {
+            std::fs::rename(&hook_target, &hook_held).unwrap();
+            std::os::unix::fs::symlink(&hook_decoy, &hook_target).unwrap();
+        }
+    }));
+    record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 2).unwrap();
+    clear_artifact_read_seam();
+    assert!(swapped.load(Ordering::SeqCst), "the seam must have fired");
+
+    // Restore the original key entry: the recorded pair verifies under the
+    // ORIGINAL key — only possible if the read used the original handle.
+    std::fs::remove_file(key_path(data_dir)).unwrap();
+    std::fs::rename(&held, key_path(data_dir)).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted
+    );
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(std::fs::read(key_path(data_dir)).unwrap(), original_key);
+}
+
+/// The audit read (confirmation path): swap the audit entry for a symlink
+/// to a forged decoy trail AFTER the handle was opened and validated. The
+/// confirmation must read the ORIGINAL handle and still confirm the grant —
+/// a re-open by pathname would have read the decoy, matched nothing and
+/// refused.
+#[cfg(unix)]
+#[test]
+fn audit_read_never_follows_a_swap_planted_after_handle_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let _guard = seam_guard();
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 7).unwrap();
+    let trail_before = std::fs::read(audit_path(data_dir)).unwrap();
+    let decoy = dir.path().join("decoy-audit.jsonl");
+    std::fs::write(&decoy, b"{\"event\":\"forged-entry\"}\n").unwrap();
+    let held = dir.path().join("held-audit.jsonl");
+
+    let target = audit_path(data_dir);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let flag = swapped.clone();
+    let (hook_target, hook_decoy, hook_held) = (target.clone(), decoy.clone(), held.clone());
+    install_artifact_read_seam(Box::new(move |label| {
+        if label == hook_target && !flag.swap(true, Ordering::SeqCst) {
+            std::fs::rename(&hook_target, &hook_held).unwrap();
+            std::os::unix::fs::symlink(&hook_decoy, &hook_target).unwrap();
+        }
+    }));
+    let state = inspect(data_dir, &Config::default());
+    clear_artifact_read_seam();
+    assert!(swapped.load(Ordering::SeqCst), "the seam must have fired");
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted
+    );
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+
+    // The byte-verbatim trail survived the read untouched; restore it.
+    std::fs::remove_file(audit_path(data_dir)).unwrap();
+    std::fs::rename(&held, audit_path(data_dir)).unwrap();
+    assert_eq!(std::fs::read(audit_path(data_dir)).unwrap(), trail_before);
+    let state = inspect(data_dir, &Config::default());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+}
+
+/// The decision read (inspect path): swap the decision entry for a symlink
+/// to a different (fail-closed, valid-hex-MAC) document AFTER the handle
+/// was opened and validated. Inspect must resolve the ORIGINAL handle — a
+/// re-open by pathname would have loaded the decoy and refused it against
+/// the grant trail.
+#[cfg(unix)]
+#[test]
+fn decision_read_never_follows_a_swap_planted_after_handle_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let _guard = seam_guard();
+    let dir = tmp();
+    let data_dir = dir.path();
+    let recorded =
+        record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 7).unwrap();
+    let document_before = std::fs::read(decision_path(data_dir)).unwrap();
+    let decoy = dir.path().join("decoy-decision.json");
+    std::fs::write(
+        &decoy,
+        serde_json::to_vec_pretty(&SandboxFirstRunRecord {
+            version: SANDBOX_FIRST_RUN_VERSION,
+            choice: SandboxShellChoice::FailClosed,
+            decided_at_ms: 99,
+            platform: std::env::consts::OS.to_string(),
+            network_backend_available: false,
+            trade_off: String::new(),
+            mac: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let held = dir.path().join("held-decision.json");
+
+    let target = decision_path(data_dir);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let flag = swapped.clone();
+    let (hook_target, hook_decoy, hook_held) = (target.clone(), decoy.clone(), held.clone());
+    install_artifact_read_seam(Box::new(move |label| {
+        if label == hook_target && !flag.swap(true, Ordering::SeqCst) {
+            std::fs::rename(&hook_target, &hook_held).unwrap();
+            std::os::unix::fs::symlink(&hook_decoy, &hook_target).unwrap();
+        }
+    }));
+    let state = inspect(data_dir, &Config::default());
+    clear_artifact_read_seam();
+    assert!(swapped.load(Ordering::SeqCst), "the seam must have fired");
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted
+    );
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(state.record.as_ref(), Some(&recorded));
+
+    std::fs::remove_file(decision_path(data_dir)).unwrap();
+    std::fs::rename(&held, decision_path(data_dir)).unwrap();
+    assert_eq!(
+        std::fs::read(decision_path(data_dir)).unwrap(),
+        document_before
+    );
+}
+
+/// The append snapshot read (record path): swap the audit entry for a
+/// symlink to a decoy AFTER the append snapshot's handle was opened and
+/// validated (the verification walk already read the original entry). The
+/// snapshot must come from the ORIGINAL handle — the published trail
+/// retains the original content — and the anchored rename replaces the link
+/// ENTRY, so the decoy target is never read or written.
+#[cfg(unix)]
+#[test]
+fn append_snapshot_never_reads_a_swap_and_the_publish_replaces_the_link() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let _guard = seam_guard();
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let trail_before = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    let decoy = dir.path().join("decoy.jsonl");
+    std::fs::write(&decoy, "decoy must never be read or written\n").unwrap();
+    let held = dir.path().join("held-audit.jsonl");
+
+    let target = audit_path(data_dir);
+    // The 1st audit read of this record is the verification walk; the 2nd
+    // is the append snapshot. Swap in the snapshot's seam.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    let (hook_target, hook_decoy, hook_held) = (target.clone(), decoy.clone(), held.clone());
+    install_artifact_read_seam(Box::new(move |label| {
+        if label == hook_target && counter.fetch_add(1, Ordering::SeqCst) == 1 {
+            std::fs::rename(&hook_target, &hook_held).unwrap();
+            std::os::unix::fs::symlink(&hook_decoy, &hook_target).unwrap();
+        }
+    }));
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 2).unwrap();
+    clear_artifact_read_seam();
+    assert!(reads.load(Ordering::SeqCst) >= 2, "both reads must fire");
+
+    // The snapshot came from the validated handle: the ORIGINAL trail is
+    // retained and the new chained line lands on top of it.
+    let trail = std::fs::read_to_string(audit_path(data_dir)).unwrap();
+    assert!(
+        trail.starts_with(&trail_before),
+        "the original trail must be retained: {trail}"
+    );
+    assert_eq!(trail.lines().count(), 2);
+    // The rename replaced the link ENTRY; the decoy target is untouched.
+    assert_eq!(
+        std::fs::read_to_string(&decoy).unwrap(),
+        "decoy must never be read or written\n"
+    );
+    let state = inspect(data_dir, &Config::default());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    // No staged temp survives the publish.
+    let names: Vec<String> = std::fs::read_dir(data_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains(".faktor-tmp-")),
+        "staged temp leaked: {names:?}"
+    );
+}
+
+/// FIFO, symlink (even to a device) and socket objects planted at every
+/// artifact path are refused typed — a FIFO must never block a read, a
+/// symlink must never be followed, and a symlinked audit trail must refuse
+/// recording without touching the link's target.
+#[cfg(unix)]
+#[test]
+fn non_regular_objects_at_every_artifact_path_are_refused_typed() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    std::fs::create_dir_all(data_dir).unwrap();
+
+    // (1) FIFO at the KEY path: refused WITHOUT blocking (non-blocking
+    // open + handle fstat). A blocking open would hang this test.
+    let status = std::process::Command::new("mkfifo")
+        .arg(key_path(data_dir))
+        .status()
+        .expect("mkfifo must be available on unix hosts");
+    assert!(status.success());
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap_err();
+    assert!(err.contains("regular file"), "{err}");
+    std::fs::remove_file(key_path(data_dir)).unwrap();
+
+    // (2) Symlink at the KEY path (to a device): refused, never followed.
+    std::os::unix::fs::symlink("/dev/zero", key_path(data_dir)).unwrap();
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 2).unwrap_err();
+    assert!(err.contains("regular file"), "{err}");
+    std::fs::remove_file(key_path(data_dir)).unwrap();
+
+    // (3) FIFO at the DECISION path: inspect refuses typed, no block.
+    let fifo = decision_path(data_dir);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be available on unix hosts");
+    assert!(status.success());
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(
+        state
+            .corrupt_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("regular file"),
+        "{:?}",
+        state.corrupt_reason
+    );
+    assert_eq!(cfg.sandbox.shell, None);
+    std::fs::remove_file(&fifo).unwrap();
+
+    // (4) Unix socket at the DECISION path: refused typed (special file).
+    let socket_path = decision_path(data_dir);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some(), "{:?}", state.corrupt_reason);
+    drop(listener);
+    std::fs::remove_file(&socket_path).unwrap();
+
+    // (5) A symlinked audit trail refuses RECORDING through the anchored
+    // write path, and the link's target stays byte-identical.
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 3).unwrap();
+    let real = data_dir.join("real-audit.jsonl");
+    std::fs::rename(audit_path(data_dir), &real).unwrap();
+    let decoy_target = dir.path().join("decoy-target.jsonl");
+    std::fs::write(&decoy_target, "must survive\n").unwrap();
+    std::os::unix::fs::symlink(&decoy_target, audit_path(data_dir)).unwrap();
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 4).unwrap_err();
+    assert!(err.contains("regular file"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&decoy_target).unwrap(),
+        "must survive\n"
+    );
+    // The refused record never advanced the decision document.
+    let live = std::fs::read(decision_path(data_dir)).unwrap();
+    let live: SandboxFirstRunRecord = serde_json::from_slice(&live).unwrap();
+    assert_eq!(live.decided_at_ms, 3);
+}
+
+/// An owner-other-accessible integrity key (`0644`) is refused typed: a key
+/// any other identity can read or write cannot anchor the tamper evidence.
+#[cfg(unix)]
+#[test]
+fn an_other_accessible_integrity_key_is_refused_typed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tmp();
+    let data_dir = dir.path();
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    std::fs::set_permissions(key_path(data_dir), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.record.is_none());
+    assert!(
+        state
+            .corrupt_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("accessible to other users"),
+        "{:?}",
+        state.corrupt_reason
+    );
+    assert_eq!(cfg.sandbox.shell, None);
+    let err = record_decision(data_dir, SandboxShellChoice::FailClosed, 2).unwrap_err();
+    assert!(err.contains("accessible to other users"), "{err}");
+}
+
+/// Absent artifacts (and an absent data dir) read as absent, never as
+/// errors: `Ok(None)` from the raw decode and a corruption-free state.
+#[test]
+fn absent_artifacts_and_an_absent_data_dir_read_as_absent_never_errors() {
+    let dir = tmp();
+    let data_dir = dir.path().join("never-created");
+    assert!(load_decision(&data_dir).unwrap().is_none());
+    let state = inspect(&data_dir, &Config::default());
+    assert!(state.record.is_none());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+
+    std::fs::create_dir_all(&data_dir).unwrap();
+    assert!(load_decision(&data_dir).unwrap().is_none());
+    let state = inspect(&data_dir, &Config::default());
+    assert!(state.record.is_none());
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+}
+
+/// Pins the documented freshness semantics EXACTLY. The keyed MAC chain
+/// proves integrity BETWEEN RETAINED ENTRIES, never freshness of the head:
+/// bounded compaction legitimately anchors a new first entry, so a
+/// byte-verbatim restore of a previously-valid (decision document + trail)
+/// pair — a rollback/replay of an earlier valid state — VERIFIES and is
+/// ACCEPTED. No local file-domain check can do better (a same-user attacker
+/// who can restore those bytes controls every local file); anti-rollback
+/// needs a monotonic head in a different state domain (the documented
+/// upgrade path). What IS still refused: restoring an earlier trail WITHOUT
+/// its matching document (the live document matches no chain-verified
+/// entry).
+#[test]
+fn rollback_of_a_previously_valid_pair_is_accepted_and_unmatched_restores_are_refused() {
+    let dir = tmp();
+    let data_dir = dir.path();
+    // State A: explicit fail-closed. State B: the grant. Live state: fail
+    // closed again (3).
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 1).unwrap();
+    let pair_a = (
+        std::fs::read(decision_path(data_dir)).unwrap(),
+        std::fs::read(audit_path(data_dir)).unwrap(),
+    );
+    let granted =
+        record_decision(data_dir, SandboxShellChoice::NetworkCapableUserGranted, 2).unwrap();
+    let pair_b = (
+        std::fs::read(decision_path(data_dir)).unwrap(),
+        std::fs::read(audit_path(data_dir)).unwrap(),
+    );
+    record_decision(data_dir, SandboxShellChoice::FailClosed, 3).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+
+    // (1) Verbatim rollback of the GRANT pair: ACCEPTED — the documented
+    // guarantee does not (and cannot) detect a previously-valid state
+    // restored wholesale. This is the exact semantics the module documents.
+    std::fs::write(decision_path(data_dir), &pair_b.0).unwrap();
+    std::fs::write(audit_path(data_dir), &pair_b.1).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(
+        state.decision,
+        SandboxFirstRunDecision::NetworkCapableUserGranted,
+        "a byte-verbatim restore of a previously-valid pair is accepted (freshness is NOT proven)"
+    );
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(state.record.as_ref().map(|r| r.decided_at_ms), Some(2));
+    assert_eq!(state.record.as_ref().map(|r| &r.mac), Some(&granted.mac));
+
+    // (2) The earlier TRAIL alone (a rollback to a shorter trail) with the
+    // grant document still live: REFUSED — the live document matches no
+    // chain-verified entry. The chain proves consistency between the pair,
+    // not freshness of the head.
+    std::fs::write(audit_path(data_dir), &pair_a.1).unwrap();
+    let mut cfg = Config::default();
+    let state = apply_effective_choice(&mut cfg, data_dir);
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_some());
+    assert_eq!(cfg.sandbox.shell, None, "no unmatched restore may grant");
+
+    // (3) The earlier fail-closed PAIR restored verbatim is accepted again
+    // (the check is exact; a rollback to a valid fail-closed state is a
+    // no-op for the effective policy).
+    std::fs::write(decision_path(data_dir), &pair_a.0).unwrap();
+    let state = inspect(data_dir, &Config::default());
+    assert_eq!(state.decision, SandboxFirstRunDecision::FailClosed);
+    assert!(state.corrupt_reason.is_none(), "{:?}", state.corrupt_reason);
+    assert_eq!(state.record.as_ref().map(|r| r.decided_at_ms), Some(1));
 }
