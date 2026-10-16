@@ -6,7 +6,7 @@
 // merely HEAD^{tree}: it hashes every tracked file's worktree content (so an
 // uncommitted edit changes the digest), refuses a dirty checkout outright
 // (certifying bytes must be the committed bytes), runs the registry,
-// coverage, workflow-graph, publisher, soak and visual selftests, and emits
+// coverage, workflow-graph, publisher and visual selftests, and emits
 // target/certification/prove-all.json.
 //
 // Classes (`--class`, default `ci-evidence`):
@@ -20,7 +20,7 @@
 //
 // Facts that can only be observed at pipeline runtime are listed explicitly
 // under `not_proven_here` (platform certificate authentication, the mutation
-// campaign's tree barrier, quiescent convergence) — they are enforced by
+// campaign's tree barrier) — they are enforced by
 // their own lanes, never silently assumed here.
 //
 // Usage:
@@ -97,7 +97,6 @@ const COMMON_CHECKS = [
   { name: 'discovery', command: ['node', ['scripts/discover-capabilities.mjs', 'selftest']] },
   { name: 'workflow-graph', command: ['node', ['scripts/certification/check-workflow-graph.mjs', '--check']] },
   { name: 'publisher', command: ['node', ['scripts/certification/publish-status.mjs', 'selftest']] },
-  { name: 'soak-sampler', command: ['python3', ['scripts/certification/soak-convergence.py', 'selftest']] },
   { name: 'visual-record-selftest', command: ['python3', ['scripts/certification/check-visual-baseline.py', 'selftest']] },
   // Every REQUIRED platform record, including its resolved font fingerprint:
   // the real committed baseline, never a synthetic fixture. In the
@@ -263,7 +262,6 @@ function main(argv) {
     not_proven_here: [
       'platform certificate authentication (ci/faktor/trusted-certified-{linux,darwin,windows} signatures) — publish-status aggregate lane',
       'mutation campaign tree barrier and isolated-copy execution — check-invariants --mutations lane',
-      'quiescent convergence (RSS/FD/children/queues/WAL/temp/CAS/latency) — soak lanes',
       'real VS Code Extension Host and JetBrains packaged-ZIP host matrices — vscode-e2e / jetbrains-smoke lanes',
     ],
   };

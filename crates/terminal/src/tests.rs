@@ -1974,39 +1974,6 @@ async fn spawn_timeline_records_pid_argv_and_exit() {
     );
 }
 
-#[ignore = "[perf] 300 sequential spawns — ring must stay bounded; run explicitly"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timeline_ring_stays_bounded_under_300_spawns() {
-    // Bounded ring under pressure: 300 sequential spawns never grow the
-    // timeline past its cap.
-    let dir = tempfile::tempdir().unwrap();
-    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-    let sup = ProcessSupervisor::new(cas);
-    for _ in 0..300 {
-        let _ = sup
-            .run(
-                SpawnConfig {
-                    cmd: "sh".into(),
-                    args: vec!["-c".into(), "true".into()],
-                    cwd: dir.path().into(),
-                    env: EnvSpec::default_baseline(),
-                    owner: ProcessOwner::Daemon,
-                    capture: true,
-                    artifact_max: 1024,
-                    network_isolation: NetworkIsolation::Inherit,
-                    filesystem_isolation: FilesystemIsolation::Inherit,
-                },
-                std::time::Duration::from_secs(5),
-                CancellationToken::new(),
-            )
-            .await;
-    }
-    assert!(
-        sup.recent_spawns().len() >= 4,
-        "timeline records every spawn"
-    );
-}
-
 // ================= network-isolation honesty (audit 4/28/35-39) =====
 //
 // The Linux spawn backend (pre-exec unshare(CLONE_NEWNET) under

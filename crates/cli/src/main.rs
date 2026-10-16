@@ -2646,7 +2646,7 @@ pub(crate) fn doctor_worker_plane_line(
 /// opt-in canary environment variable is present, else `absent`. This is
 /// always information, never an ISSUE: absence is the default, and no
 /// vendor request happens without an operator explicitly providing the
-/// credentials (`crates/commerce-connectors/tests/live_canary.rs`; legal
+/// credentials (live-canary registry in `faktor-commerce-connectors`; legal
 /// posture in `docs/legal/marketplace-acquisition.md`).
 pub(crate) fn doctor_live_canary_line(lines: &mut Vec<String>) {
     for (source, status) in faktor_commerce_connectors::canary::canary_statuses_from_env() {

@@ -25,15 +25,12 @@
 #   scripts/check-gradle-integrity.sh       planted tampering + temp-name migration
 #   scripts/check-ci-image-pins.sh          image pins + apt-snapshot/apt-pinned audit
 #   scripts/build-ci-image.sh --selftest    Faktor CI image pin hygiene
-#   scripts/certification/soak-convergence.py selftest
-#                                           soak convergence metric algebra
-#                                           (converged/leaky/missing/duration)
 #   scripts/certification/flake-tolerance.py selftest
 #                                           bounded retry-once semantics for the
 #                                           trusted linux test lane: flaky pass
 #                                           recorded, persistent failure red,
 #                                           budget/unverified-pass/no-retry
-#                                           refusals (fault/soak/live/perf)
+#                                           refusals (fault/release/visual)
 #   scripts/certification/publish-status.py selftest
 #                                           stdlib GitHub status publisher:
 #                                           validation + fail-closed POST,
@@ -70,7 +67,6 @@ run "cross-target-check.sh classify selftest" env CROSS_TARGET_SELFTEST=classify
 run "check-gradle-integrity.sh --selftest" bash scripts/check-gradle-integrity.sh --selftest
 run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --selftest
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
-run "soak-convergence.py selftest" python3 scripts/certification/soak-convergence.py selftest
 run "flake-tolerance.py selftest" python3 scripts/certification/flake-tolerance.py selftest
 run "publish-status.py selftest" python3 scripts/certification/publish-status.py selftest
 

@@ -106,7 +106,7 @@ export function computeMarkerAuth(record, token) {
 }
 
 // Secret env naming: the lane id is lowercased and every run of non-alnum
-// characters becomes `_`, e.g. `soak-smoke` -> `faktor_lane_token_soak_smoke`.
+// characters becomes `_`, e.g. `jetbrains-smoke` -> `faktor_lane_token_jetbrains_smoke`.
 // The uppercase form is accepted as a convenience for host/step environments
 // that canonicalize names.
 export function normalizeLane(lane) {

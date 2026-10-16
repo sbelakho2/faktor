@@ -1,2 +1,2 @@
-#[ignore = "[soak] planted bounded demo soak"]
-fn demo_soak_bounded() {}
+#[ignore = "[fault] planted bounded demo fault"]
+fn demo_fault_bounded() {}

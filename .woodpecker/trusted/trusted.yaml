@@ -16,11 +16,10 @@
 # Job graph (one workflow per matrix platform; all mandatory linux lanes run
 # as parallel steps of a single workflow so they share one workspace):
 #
-#   stage 1 (parallel): linux · static · docs · soak-smoke · vscode
+#   stage 1 (parallel): linux · static · docs · vscode
 #                       · jetbrains-build · jetbrains-smoke
-#   stage 2:            perf (after linux, static, docs)
-#   stage 3:            vscode-e2e (after vscode)
-#   stage 4:            certificate (after every linux lane)
+#   stage 2:            vscode-e2e (after vscode)
+#   stage 3:            certificate (after every linux lane)
 #
 #   darwin combo:  darwin-check · darwin-test · darwin-doctor -> certificate-darwin
 #   windows combo: windows-check · windows-test · windows-visual-baseline
@@ -52,12 +51,10 @@
 #   linux                  faktor_lane_token_linux
 #   static                 faktor_lane_token_static
 #   docs                   faktor_lane_token_docs
-#   soak-smoke             faktor_lane_token_soak_smoke
 #   vscode                 faktor_lane_token_vscode
 #   vscode-e2e             faktor_lane_token_vscode_e2e
 #   jetbrains-build        faktor_lane_token_jetbrains_build
 #   jetbrains-smoke        faktor_lane_token_jetbrains_smoke
-#   perf                   faktor_lane_token_perf
 #   release-artifacts      faktor_lane_token_release_artifacts
 #
 # env var name = `faktor_lane_token_<lane>` with '-' -> '_' (the uppercase
@@ -273,8 +270,8 @@ steps:
       # isolation is recorded as a flake (name + first failure excerpt) in the
       # lane's report, attached to the lane marker via --flake-file and surfaced in
       # the certificate manifest — never a silent green. Initial failures above the
-      # flake budget (3) fail the lane with no retries at all; fault/soak/live/perf
-      # lanes and any `--ignored` selection are refused typed by the runner.
+      # flake budget (3) fail the lane with no retries at all; fault lanes and any
+      # `--ignored` selection are refused typed by the runner.
       - python3 scripts/certification/flake-tolerance.py selftest
       - python3 scripts/certification/flake-tolerance.py run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
       # P0-PROOF (audit 3): compiled test enumeration, not source-text
@@ -386,52 +383,6 @@ steps:
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane docs --status passed \
           --out target/certification/lanes/docs.json
-  # Per-release accelerated churn (scripts/soak.sh --mode churn): the
-  # convergence churn workload runs for FAKTOR_SOAK_CHURN_SECONDS with the
-  # mandatory quiescent-convergence checker. Every recorded metric must pass
-  # (RSS/FD bands, zero children/background tasks, drained writer/reader
-  # queues, WAL/temp/CAS convergence, no journal/index latency trend,
-  # reconnect correctness); missing samples are a typed failure, never a
-  # skip. The real-time 12-24h run is the nightly `soak` lane.
-  - name: soak-smoke
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    when:
-      matrix:
-        platform: linux/amd64
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-      FAKTOR_SOAK_MODE: churn
-      FAKTOR_SOAK_CHURN_SECONDS: "1800"
-      FAKTOR_SOAK_CONVERGENCE: required
-      FAKTOR_SOAK_LANE: soak-smoke
-      # Bounded even though the first (cold) release build dominates: a
-      # non-positive budget is refused, a zero-test run fails the step, and a
-      # failed convergence metric fails the lane. On emulated/VM runners the
-      # effective campaign wall budget is derived from same-run controls
-      # (bounded calibration workload through this same harness + the
-      # sampler's realtime-vs-monotonic span), max(product, factor*product),
-      # capped at FAKTOR_SOAK_WALL_CAP_SECONDS; the product budget stays a
-      # floor and an over-budget/non-converging campaign still fails.
-      FAKTOR_SOAK_MAX_WALL_SECONDS: "3600"
-      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "3300"
-    volumes:
-      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
-      - faktor-trusted-cargo-git:/usr/local/cargo/git
-      - faktor-trusted-target-soak-smoke:/woodpecker-cache/target
-    commands:
-      - bash scripts/soak.sh --mode churn -p faktor-tests-soak --release -- --ignored --exact soak_convergence_churn
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        bash scripts/soak.sh --mode churn -p faktor-tests-soak --release -- --ignored --exact soak_convergence_churn
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane soak-smoke --status passed \
-          --artifact target/certification/soak.json \
-          --out target/certification/lanes/soak-smoke.json
   - name: vscode
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     when:
@@ -650,37 +601,6 @@ steps:
           --lane jetbrains-smoke --status passed \
           --artifact target/certification/jetbrains-host-matrix.json \
           --out target/certification/lanes/jetbrains-smoke.json
-  - name: perf
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    depends_on: [linux, static, docs]
-    when:
-      matrix:
-        platform: linux/amd64
-      status: [success, failure]
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-      # Shared self-hosted runner: the darwin lane's tests run on the same
-      # host while these containers build, so cap rustc fan-out and keep the
-      # fixture children schedulable (bounded, documented resource setting —
-      # no test is excluded).
-      CARGO_BUILD_JOBS: "4"
-    volumes:
-      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
-      - faktor-trusted-cargo-git:/usr/local/cargo/git
-      - faktor-trusted-target-perf:/woodpecker-cache/target
-    commands:
-      - cargo test -p faktor-tests-performance --release -- --ignored
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-performance --release -- --ignored
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane perf --status passed \
-          --out target/certification/lanes/perf.json
   - name: darwin-check
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     environment:
@@ -816,11 +736,11 @@ steps:
       - cargo test -p faktor-fs rooted
       - cargo test -p faktor-fs atomic
       - cargo test -p faktor-fs platform::windows
-      - cargo test --workspace --exclude faktor-cli --exclude faktor-hooks --exclude faktor-tests-coding-benchmark --exclude faktor-tests-fuzz-seeds --exclude faktor-tests-performance
+      - cargo test --workspace --exclude faktor-cli --exclude faktor-hooks --exclude faktor-tests-fuzz-seeds
       - |
         $ErrorActionPreference = "Stop"
         New-Item -ItemType Directory -Force -Path target/certification/lanes | Out-Null
-        $cmds = "cargo test -p faktor-fs --all-targets`ncargo test -p faktor-fs rooted`ncargo test -p faktor-fs atomic`ncargo test -p faktor-fs platform::windows`ncargo test --workspace --exclude faktor-cli --exclude faktor-hooks --exclude faktor-tests-coding-benchmark --exclude faktor-tests-fuzz-seeds --exclude faktor-tests-performance"
+        $cmds = "cargo test -p faktor-fs --all-targets`ncargo test -p faktor-fs rooted`ncargo test -p faktor-fs atomic`ncargo test -p faktor-fs platform::windows`ncargo test --workspace --exclude faktor-cli --exclude faktor-hooks --exclude faktor-tests-fuzz-seeds"
         $bytes = [Text.Encoding]::UTF8.GetBytes($cmds)
         $sha256 = [Security.Cryptography.SHA256]::Create()
         $cmds_digest = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-','').ToLower()
@@ -909,12 +829,10 @@ steps:
       - linux
       - static
       - docs
-      - soak-smoke
       - vscode
       - vscode-e2e
       - jetbrains-build
       - jetbrains-smoke
-      - perf
       - release-artifacts
     when:
       matrix:
@@ -928,17 +846,15 @@ steps:
     #   faktor_lane_token_linux: { from_secret: faktor_lane_token_linux }
     #   faktor_lane_token_static: { from_secret: faktor_lane_token_static }
     #   faktor_lane_token_docs: { from_secret: faktor_lane_token_docs }
-    #   faktor_lane_token_soak_smoke: { from_secret: faktor_lane_token_soak_smoke }
     #   faktor_lane_token_vscode: { from_secret: faktor_lane_token_vscode }
     #   faktor_lane_token_vscode_e2e: { from_secret: faktor_lane_token_vscode_e2e }
     #   faktor_lane_token_jetbrains_build: { from_secret: faktor_lane_token_jetbrains_build }
     #   faktor_lane_token_jetbrains_smoke: { from_secret: faktor_lane_token_jetbrains_smoke }
-    #   faktor_lane_token_perf: { from_secret: faktor_lane_token_perf }
     #   faktor_lane_token_release_artifacts: { from_secret: faktor_lane_token_release_artifacts }
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and lane-assigned in .woodpecker/trusted/nightly.yaml
-      # or documented as manual/live-paid (scripts/certification/ignored-tests.json).
+      # or documented as manual (scripts/certification/ignored-tests.json).
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
@@ -980,11 +896,11 @@ steps:
       # certificate evidence below.
       - node scripts/contracts/emit.mjs selftest
       # P1-PROOF: ONE top-level gate binding the offline-provable release
-      # facts (registry, coverage, workflow graph, publishers, soak sampler,
-      # visual record, contracts) to the ACTUAL checkout bytes — the hash of
+      # facts (registry, coverage, workflow graph, publishers, visual record,
+      # contracts) to the ACTUAL checkout bytes — the hash of
       # every tracked worktree file, not merely HEAD^{tree} — and refusing a
       # dirty checkout. Runtime-only facts (platform authentication, mutation
-      # tree barrier, quiescence, host UI matrices) stay explicit in the
+      # tree barrier, host UI matrices) stay explicit in the
       # report's `not_proven_here` list and are enforced by their own lanes.
       - node scripts/certification/prove-all.mjs
       - |

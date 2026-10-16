@@ -14,7 +14,6 @@ it needs credentials or a server this checkout does not have.
 | Committed-artifact hygiene scan (bytecode / build artifacts / opaque extensionless binaries ≥ 64 KiB) with justified load-bearing allowlist and planted-fixture proof | Applied | `tests/static-authority/src/lib.rs` (scan 13), `.gitignore`, `docs/repo-hygiene.md` |
 | Container images pinned by multi-arch index digest (non-Rust) | Applied | `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml`, `.woodpecker/trusted/nightly.yaml`, `scripts/woodpecker/docker-compose.yml` |
 | VS Code E2E toolchain pinned by release version + commit + sha256 in the lane script (verified before extraction; `code --version` must print both) | Applied | `scripts/vscode-e2e.sh`, `.woodpecker/trusted/trusted.yaml` |
-| Bounded release-soak driver (configurable `FAKTOR_SOAK_SCALE`, wall/test budgets, zero/zero-test refusal) | Applied | `scripts/soak.sh`, `.woodpecker/trusted/trusted.yaml` (`soak-smoke`), `.woodpecker/trusted/nightly.yaml` (`soak` long mode) |
 | Lane-bound marker auth: per-lane HMAC `auth` over the canonical unsigned marker, one shared generator, `unattested` (not silent pass) without a token | Applied | `scripts/certification/lane-marker.{sh,mjs,py}`, `scripts/certification/evidence.mjs`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/trusted/nightly.yaml` |
 | Invariant criticality + planted-mutation proof: every entry is release-critical by default (its `authority` names the production gate) and must ship a planted `mutation_command`; non-empty `mutation_debt` fails both checker modes, downgrades require `criticality_reason` | Applied | `tests/invariants.toml`, `scripts/check-invariants.mjs`, `scripts/mutation-run.mjs`, `scripts/mutations/*.json`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
@@ -185,17 +184,6 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   `faktor-trusted-vscode-e2e-cache` volume. Re-pin deliberately with
   `curl https://update.code.visualstudio.com/api/update/linux-x64/stable/<version>`
   and update the constants (see §2.15 of `docs/certification.md`).
-- Release soak driver: `scripts/soak.sh` is the only soak campaign entry
-  point. `FAKTOR_SOAK_CHURN_SECONDS`/`FAKTOR_SOAK_REALTIME_SECONDS` are the
-  real wall-clock targets of the `churn`/`realtime` modes (the legacy
-  `FAKTOR_SOAK_SCALE` remains for `smoke`/`long`); `FAKTOR_SOAK_MAX_WALL_SECONDS`
-  and `FAKTOR_SOAK_TEST_TIMEOUT_SECONDS` bound the run; a zero/negative/
-  unparseable scale and a run that executes zero tests are both refusals.
-  `target/certification/soak.json` records lane/mode/target/status and the
-  embedded all-metrics convergence report, and ANY failed (or missing)
-  convergence metric fails the lane. The trusted `soak-smoke` step runs the
-  30–60 min accelerated churn and the nightly `soak` lane runs the real
-  12–24 h real-time mode (see §2.15 of `docs/certification.md`).
 - Invariant criticality and planted-mutation proof: every `[[invariant]]` in
   `tests/invariants.toml` is release-critical by default because its
   `authority` names the production gate, and it must ship an executable

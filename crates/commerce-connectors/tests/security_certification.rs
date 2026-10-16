@@ -3,9 +3,9 @@
 //! acquired text is DATA with a data origin (never an instruction).
 //!
 //! Every case here is offline: the injected fixture transport replays the
-//! exact hostile bytes and no test in this file touches the network. The
-//! opt-in live canaries (network, operator credentials only) live in
-//! `tests/live_canary.rs` and are `#[ignore]`-gated; see
+//! exact hostile bytes and no test in this file touches the network. Live
+//! vendor canaries are never automated — the `canary` registry exposes the
+//! doctor's per-source configured/absent status; see
 //! `docs/legal/marketplace-acquisition.md`.
 
 use std::sync::Arc;

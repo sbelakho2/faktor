@@ -1,9 +1,0 @@
-{
-  "id": "range-sum",
-  "task_class": "medium",
-  "phase": "debug",
-  "input_tokens": 20000,
-  "output_tokens": 1600,
-  "fix_at_attempt": 2,
-  "order": 8
-}

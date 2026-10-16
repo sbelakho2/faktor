@@ -46,7 +46,7 @@ impl ProcessSupervisor {
 - Deadline exceeded or cancelled: kill the process group, return Error::timeout/cancelled, record Reaped with the kill.
 - No orphans: when the supervisor drops a session's processes are NOT auto-killed (daemon owns them) — but `kill_all_for(Session)` must kill the group. Zombie reaping is explicit (`reap()`).
 - 300MB log adversarial test: stream a synthetic 300MB of output; RAM stays bounded (assert excerpt small, artifact present, ring ≤ 200 lines).
-- For tests use real `sleep`/`sh -c` processes (fast). Long tests: `#[ignore]` `[soak]`.
+- For tests use real `sleep`/`sh -c` processes (fast).
 
 ## Adversarial tests (name every one)
 1. ring_buffer_caps_at_200_lines (write 10k lines)

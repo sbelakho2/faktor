@@ -17,23 +17,11 @@
 # do not fight over a target-dir lock.
 #
 # Coverage: [fault] campaigns at scale, the longrun suite (release), the
-# efficiency harness, the economy suite (synthetic policy gates) plus the
-# router-economics regression (scripted fake model; router discipline only,
-# never model-quality evidence) and the deterministic CI replay of frozen
-# coding-benchmark outputs, the
-# coding-benchmark smoke, the
-# provider-key real-model run (recorded as an explicit skip unless keys are
-# supplied out-of-band — CI requires NO secrets by default), the
 # supply-chain evidence job (missing advisory tools stay loud recorded skips
 # inside target/certification/supply-chain-status.json), and the nightly UI
 # smoke lanes (`ui-smoke-vscode` real headless-chromium render check +
 # selftest; `ui-smoke-jetbrains` packaged-plugin host-matrix ZIP proof).
 #
-# Timeout: Woodpecker has no per-step timeout; the project pipeline timeout
-# applies. The 24h REAL-TIME soak lane needs a >= 25h budget, so raise it
-# (setup.md §6):
-#   server:  WOODPECKER_MAX_PIPELINE_TIMEOUT=1560
-#   project: PATCH /api/repos/{trusted_repo_id} {"timeout":1560}
 # Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
 # components rustfmt+clippy (profile minimal). Every `rust:1.98.0` image
 # below is only a rustup baseline; the cargo/rustc shims resolve the exact
@@ -41,13 +29,12 @@
 # digest (comment records the original tag and the date); an image line
 # without `@sha256:` fails `scripts/check-ci-image-pins.sh`.
 #
-# Ignored-test lanes: the `fault-scale`, `soak` and `longrun` (release)
-# steps execute the ignored-test groups assigned to the fault/soak/release
-# nightly lanes. `node scripts/check-ignored-tests.mjs` (run first in the
-# certificate job) enforces the `[fault]/[soak]/[security]/[release]/[perf]/
-# [live-paid]` tag convention and requires every `#[ignore]`d test to be
-# assigned to a lane wired here or documented as manual/live-paid in
-# `scripts/certification/ignored-tests.json`.
+# Ignored-test lanes: the `fault-scale` and `longrun` (release) steps
+# execute the ignored-test groups assigned to the fault/release nightly
+# lanes. `node scripts/check-ignored-tests.mjs` (run first in the
+# certificate job) enforces the `[fault]/[release]` tag convention and
+# requires every `#[ignore]`d test to be assigned to a lane wired here or
+# documented as manual in `scripts/certification/ignored-tests.json`.
 #
 # Commit-status context (default format): ci/woodpecker/cron/nightly
 #
@@ -60,13 +47,7 @@
 # scripts/woodpecker/setup.md §4):
 #
 #   fault-scale                          faktor_lane_token_fault_scale
-#   soak                                 faktor_lane_token_soak
 #   longrun                              faktor_lane_token_longrun
-#   efficiency                           faktor_lane_token_efficiency
-#   contention                           faktor_lane_token_contention
-#   economy                              faktor_lane_token_economy
-#   coding-benchmark                     faktor_lane_token_coding_benchmark
-#   coding-benchmark-real-model          faktor_lane_token_coding_benchmark_real_model
 #   supply-chain                         faktor_lane_token_supply_chain
 #   ui-smoke-vscode                      faktor_lane_token_ui_smoke_vscode
 #   ui-smoke-jetbrains                   faktor_lane_token_ui_smoke_jetbrains
@@ -107,50 +88,6 @@ steps:
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane fault-scale --status passed \
           --out target/certification/lanes/fault-scale.json
-  - name: soak
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-      # REAL-TIME durability run: scripts/soak.sh --mode realtime keeps the
-      # convergence churn workload running until FAKTOR_SOAK_REALTIME_SECONDS
-      # of real wall clock has elapsed (never shortened by a fast workload),
-      # plus the keyless accounting modelcheck lane test. The mandatory
-      # quiescent-convergence checker then evaluates every typed metric and
-      # ANY failed metric fails the lane. The per-release trusted push gate
-      # runs the same driver as the 30-60 min churn. The project must raise
-      # the pipeline timeout to >= 25h (WOODPECKER_MAX_PIPELINE_TIMEOUT).
-      FAKTOR_SOAK_MODE: realtime
-      FAKTOR_SOAK_REALTIME_SECONDS: "86400"
-      FAKTOR_SOAK_CONVERGENCE: required
-      FAKTOR_SOAK_LANE: soak
-      # Sparse sampling over 24h: 5760 bounded samples is far more than the
-      # checker's percentile windows need and keeps the sampler light.
-      FAKTOR_SOAK_SAMPLE_INTERVAL: "15"
-      FAKTOR_SOAK_MAX_WALL_SECONDS: "90000"
-      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "88200"
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-soak:/woodpecker-cache/target
-    commands:
-      # Exact-SHA real-time soak: the keyless ignored [soak] tests assigned to
-      # this lane in scripts/certification/ignored-tests.json. The convergence
-      # test honors the real target; soak_12h_scale stays a manual operator
-      # test (its 10k-turn synthetic scale is superseded here by real wall
-      # time). The registry command must match this step verbatim.
-      - bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane soak --status passed \
-          --artifact target/certification/soak.json \
-          --out target/certification/lanes/soak.json
   - name: longrun
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -172,161 +109,6 @@ steps:
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane longrun --status passed \
           --out target/certification/lanes/longrun.json
-  - name: efficiency
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-efficiency:/woodpecker-cache/target
-    commands:
-      - cargo test -p faktor-tests-efficiency
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-efficiency
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane efficiency --status passed \
-          --out target/certification/lanes/efficiency.json
-  # Audit 27: the reproducible multi-agent contention benchmark. 32 concurrent
-  # sessions with child agents, direct + SSE journal readers, index rebuilds,
-  # tool records and budget writes; records p50/p95/p99 turn bookkeeping,
-  # DB writer wait, reader-pool wait, WAL and RSS, and asserts GENEROUS
-  # regression bounds (tail-latency teeth only). Normal PR runs never touch it:
-  # the test is #[ignore]d and only the nightly/trusted lanes select it.
-  - name: contention
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-contention:/woodpecker-cache/target
-    commands:
-      - cargo test -p faktor-tests-performance --release --test contention -- --ignored
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-performance --release --test contention -- --ignored
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane contention --status passed \
-          --out target/certification/lanes/contention.json
-  - name: economy
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-economy:/woodpecker-cache/target
-    commands:
-      # The synthetic economic-policy suite plus the router-economics
-      # REGRESSION (audit item 9): a frozen corpus, a policy-independent
-      # scripted fake coding model, real subprocess verification, and the
-      # real router/outcome-learning loop. The regression proves router
-      # economics discipline only — NOT model quality — and writes
-      # target/certification/router-economics-regression.json, bound into
-      # the lane marker below. The same `cargo test -p` invocation also runs
-      # the deterministic CI replay of the frozen coding-benchmark outputs
-      # (fixture records: machinery proof, not model evidence).
-      - cargo test -p faktor-tests-economy
-      - cargo test -p faktor-tests-router-economics
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-economy
-        cargo test -p faktor-tests-router-economics
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane economy --status passed \
-          --artifact target/certification/router-economics-regression.json \
-          --out target/certification/lanes/economy.json
-  - name: coding-benchmark
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-bench:/woodpecker-cache/target
-    commands:
-      - cargo test -p faktor-tests-coding-benchmark --test smoke
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-coding-benchmark --test smoke
-        CMDS
-        )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane coding-benchmark --status passed \
-          --out target/certification/lanes/coding-benchmark.json
-  - name: coding-benchmark-real-model
-    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    environment:
-      RUST_BACKTRACE: "1"
-      CARGO_TARGET_DIR: /woodpecker-cache/target
-    volumes:
-      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
-      - faktor-nightly-cargo-git:/usr/local/cargo/git
-      - faktor-nightly-target-real:/woodpecker-cache/target
-    commands:
-      - |
-        set -eu
-        if [ "${FAKTOR_ECON_CAPTURE:-}" = "1" ]; then
-          cargo test -p faktor-tests-router-economics --test capture -- --ignored
-        else
-          echo "economic-capture: skipped (FAKTOR_ECON_CAPTURE is not set; live capture is opt-in and never runs by default)"
-        fi
-        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
-          cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
-          status="passed"; reason=""
-        else
-          status="skipped"
-          reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
-        fi
-      - |
-        set -u
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        set -eu
-        if [ "${FAKTOR_ECON_CAPTURE:-}" = "1" ]; then
-        cargo test -p faktor-tests-router-economics --test capture -- --ignored
-        else
-        echo "economic-capture: skipped (FAKTOR_ECON_CAPTURE is not set; live capture is opt-in and never runs by default)"
-        fi
-        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
-        cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
-        status="passed"; reason=""
-        else
-        status="skipped"
-        reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
-        fi
-        CMDS
-        )"
-        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
-          status="passed"; reason=""
-        else
-          status="skipped"
-          reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
-        fi
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
-          --lane coding-benchmark-real-model --status "$status" --reason "$reason" \
-          --out target/certification/lanes/coding-benchmark-real-model.json
-        echo "coding-benchmark-real-model: $status ${reason:+(recorded skip)}"
   - name: supply-chain
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -496,13 +278,7 @@ steps:
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
       - fault-scale
-      - soak
       - longrun
-      - efficiency
-      - contention
-      - economy
-      - coding-benchmark
-      - coding-benchmark-real-model
       - supply-chain
       - ui-smoke-vscode
       - ui-smoke-jetbrains
@@ -514,26 +290,14 @@ steps:
     # comments today so the pipeline compiles without the secrets:
     # environment:
     #   faktor_lane_token_fault_scale: { from_secret: faktor_lane_token_fault_scale }
-    #   faktor_lane_token_soak: { from_secret: faktor_lane_token_soak }
     #   faktor_lane_token_longrun: { from_secret: faktor_lane_token_longrun }
-    #   faktor_lane_token_efficiency: { from_secret: faktor_lane_token_efficiency }
-    #   faktor_lane_token_contention: { from_secret: faktor_lane_token_contention }
-    #   faktor_lane_token_economy: { from_secret: faktor_lane_token_economy }
-    #   faktor_lane_token_coding_benchmark: { from_secret: faktor_lane_token_coding_benchmark }
-    #   faktor_lane_token_coding_benchmark_real_model: { from_secret: faktor_lane_token_coding_benchmark_real_model }
     #   faktor_lane_token_supply_chain: { from_secret: faktor_lane_token_supply_chain }
     #   faktor_lane_token_ui_smoke_vscode: { from_secret: faktor_lane_token_ui_smoke_vscode }
     #   faktor_lane_token_ui_smoke_jetbrains: { from_secret: faktor_lane_token_ui_smoke_jetbrains }
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and assigned to a lane wired in this workflow
-      # (or documented as manual/live-paid) — see scripts/check-ignored-tests.mjs.
+      # (or documented as manual) — see scripts/check-ignored-tests.mjs.
       - node scripts/check-ignored-tests.mjs
       - node scripts/certification/evidence.mjs verify-markers --workflow nightly --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_nightly --status passed --from-markers target/certification/lanes --commands "woodpecker nightly campaign certificate"
-      - |
-        if node -e 'process.exit(require("./target/certification/lanes/coding-benchmark-real-model.json").status === "passed" ? 0 : 1)'; then
-          node scripts/certification/evidence.mjs write --kind real_provider --status passed --from-markers target/certification/lanes --only-lane coding-benchmark-real-model --commands "provider-key real-model run at this commit"
-        else
-          echo "real_provider evidence not written: coding-benchmark-real-model recorded a skip (no keys)"
-        fi

@@ -1,9 +1,0 @@
-{
-  "id": "max-of-three",
-  "task_class": "easy",
-  "phase": "implement",
-  "input_tokens": 13000,
-  "output_tokens": 1000,
-  "fix_at_attempt": 1,
-  "order": 3
-}

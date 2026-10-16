@@ -863,8 +863,8 @@ mod tests {
     /// only so `--ignored --exact` can start this process by name; the
     /// normal test run must never execute it (there is nothing here to
     /// exercise in-process, and it blocks for two minutes). The
-    /// `[soak]`/`[perf]`/`[visual]`/`[fault]` long-test prefixes do not
-    /// apply: those mark long-running TESTS, and this is not a test.
+    /// `[visual]`/`[fault]` long-test prefixes do not apply: those mark
+    /// long-running TESTS, and this is not a test.
     #[cfg(windows)]
     #[test]
     #[ignore = "re-exec helper process (not a test); driven by the windows multiprocess lease tests"]

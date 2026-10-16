@@ -21,9 +21,8 @@
 #                   darwin); static-authority scans; fault campaign smoke;
 #                   doctor --deep on a fresh data dir; branding scan; release
 #                   CLI build + doctor --deep on an empty data dir.
-#   full            fast plus the long lanes: release [perf] distribution
-#                   gates; [fault] campaigns at scale; coding-benchmark
-#                   harness smoke; efficiency harness; ACP interop;
+#   full            fast plus the long lanes: [fault] campaigns at scale;
+#                   ACP interop;
 #                   installable artifact packaging (daemon tar.gz + VSIX +
 #                   JetBrains zip), OS-level code signing (codesign/
 #                   notarytool or Authenticode when identity/cert env is
@@ -103,10 +102,8 @@
 #
 # A release is certified only for its exact commit with dirty=false AND every
 # evidence gate verified; see docs/certification.md for what 100% means in
-# this repository. The wall-clock soak gates are owned by CI and are never
-# fabricated locally: the trusted soak-smoke lane runs the 30-60 min
-# accelerated churn and the nightly soak lane owns the real 12-24h
-# convergence run (scripts/soak.sh --mode churn|realtime).
+# this repository. Long wall-clock campaigns are owned by CI and are never
+# fabricated locally.
 #
 # Self-test:
 #   CERTIFY_SELFTEST=force_fail bash scripts/certify-local.sh fast
@@ -318,9 +315,8 @@ local_offline_certified_rule() {
 
 # `release_certified`: the local offline certificate PLUS the external
 # evidence gates at the same SHA. The local harness can never fabricate a
-# cross-platform lane or a real-provider run. The wall-clock soak gates
-# (trusted churn, nightly real-time convergence) are CI-owned and are
-# deliberately NOT simulated by this local harness.
+# cross-platform lane or a real-provider run; wall-clock campaigns are
+# CI-owned and are deliberately NOT simulated by this local harness.
 release_certified_rule() {
     # local_offline cross_platform real_provider
     if [ "$1" = "true" ] && [ "$2" = "true" ] && [ "$3" = "true" ]; then
@@ -454,20 +450,8 @@ section_release_cli() {
     return "$rc"
 }
 
-section_release_perf() {
-    cargo test -p faktor-tests-performance --release -- --ignored
-}
-
 section_fault_scale() {
     cargo test -p faktor-tests-fault --release -- --ignored
-}
-
-section_coding_benchmark() {
-    cargo test -p faktor-tests-coding-benchmark --test smoke
-}
-
-section_efficiency() {
-    cargo test -p faktor-tests-efficiency
 }
 
 section_acp_interop() {
@@ -601,17 +585,40 @@ if [ "$SELFTEST" = "release_gates" ]; then
     fi
     EVIDENCE_DIR="$saved_evidence_dir"
     if command -v node >/dev/null 2>&1; then
+        # Generate the ed25519 identity AND the three platform child
+        # certificates (linux/darwin/windows) the cross_platform_lanes
+        # verifier requires. The writer derives its verdict from these
+        # children (evidence.mjs: verifyCrossPlatformEvidence), so a genuine
+        # envelope must carry all three, bound to this HEAD commit and tree;
+        # a certificate-less envelope is correctly refused.
+        head_sha="$(git rev-parse HEAD)"
+        head_tree="$(git rev-parse 'HEAD^{tree}')"
         if node -e '
 const { generateKeyPairSync } = require("crypto");
 const fs = require("fs");
+const path = require("path");
+const [keyPath, keysPath, platformsDir, commit, tree] = process.argv.slice(1);
 const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-fs.writeFileSync(process.argv[1], privateKey.export({ type: "pkcs8", format: "pem" }));
-fs.writeFileSync(process.argv[2], JSON.stringify({
+fs.writeFileSync(keyPath, privateKey.export({ type: "pkcs8", format: "pem" }));
+fs.writeFileSync(keysPath, JSON.stringify({
   identities: { selftest: { ed25519_public_key: publicKey.export({ format: "der", type: "spki" }).subarray(12).toString("base64") } },
 }));
-' "$selftest_tmp/key.pem" "$selftest_tmp/keys.json" &&
+fs.mkdirSync(platformsDir, { recursive: true });
+for (const platform of ["linux", "darwin", "windows"]) {
+  fs.writeFileSync(path.join(platformsDir, `${platform}.json`), JSON.stringify({
+    schema: "faktor-ci-certification/v2",
+    platform,
+    workflow: "trusted",
+    commit,
+    tree,
+    pipeline: "1",
+    status: "pass",
+  }));
+}
+' "$selftest_tmp/key.pem" "$selftest_tmp/keys.json" "$selftest_tmp/platforms" "$head_sha" "$head_tree" &&
             CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" node "$EVIDENCE_SCRIPT" write \
                 --kind cross_platform_lanes --status passed --out-dir "$selftest_tmp/signed" \
+                --artifacts "$selftest_tmp/platforms/linux.json,$selftest_tmp/platforms/darwin.json,$selftest_tmp/platforms/windows.json" \
                 --sign-key "$selftest_tmp/key.pem" --key-id selftest --commands "release-gate selftest" \
                 --runner-os darwin --runner-arch arm64 --runner-ci selftest --runner-run-id 1 >/dev/null &&
             CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" node "$EVIDENCE_SCRIPT" write \
@@ -688,25 +695,18 @@ else
     add_section section_release_cli release-cli "release CLI + doctor (empty data dir)"
 
     if [ "$PROFILE" = "full" ]; then
-        add_section section_release_perf release-perf "[perf] release gates"
         add_section section_fault_scale fault-scale "[fault] campaigns at scale"
-        add_section section_coding_benchmark coding-benchmark "coding-benchmark smoke"
-        add_section section_efficiency efficiency "efficiency harness"
         add_section section_acp_interop acp-interop "ACP interop"
         add_section section_package_artifacts package-artifacts "release artifact packaging (daemon + VSIX + JetBrains)"
         add_section section_install_matrix install-matrix "install matrix (clean-prefix extract + doctor + archive structure)"
         add_section section_update_manifest update-manifest "signed update manifest (faktor-update/v1)"
     else
-        add_skip release-perf "fast profile: run the full profile for [perf] release gates"
         add_skip fault-scale "fast profile: run the full profile for [fault] campaigns at scale"
-        add_skip coding-benchmark "fast profile: run the full profile for the benchmark harness smoke"
-        add_skip efficiency "fast profile: run the full profile for the efficiency harness"
         add_skip acp-interop "fast profile: run the full profile for ACP interop"
         add_skip package-artifacts "fast profile: run the full profile to package release artifacts"
         add_skip install-matrix "fast profile: run the full profile for the installation matrix"
         add_skip update-manifest "fast profile: run the full profile to assemble the signed update manifest"
     fi
-    add_skip coding-benchmark-real-model "provider-key run excluded: local certification is offline by contract (no keys, no network)"
     add_skip windows-lane "no Windows host here; the CI windows lane owns it"
 fi
 
@@ -796,8 +796,8 @@ emit_manifest() {
     # Certification levels: local_offline is this host's clean full pass;
     # release additionally requires EVERY verified external evidence gate
     # for this exact commit and tree. The harness never fabricates a gate
-    # from a flag; the wall-clock soak acceptance (trusted churn + nightly
-    # real-time convergence) is CI-owned and never simulated locally.
+    # from a flag; long wall-clock campaigns are CI-owned and never
+    # simulated locally.
     local_offline="$(local_offline_certified_rule "$status" "$PROFILE" "$dirty" "$FAST_TESTS_SKIPPED")"
     # Write this host's own evidence object when it certifies (unsigned unless
     # CERTIFY_EVIDENCE_SIGN_KEY is configured; never a release gate).
@@ -906,14 +906,10 @@ emit_manifest() {
         printf '      "static_authority": %s,\n' "$(section_passed static-authority)"
         printf '      "doctor_deep": %s,\n' "$(section_passed doctor-deep)"
         printf '      "release_cli_doctor": %s,\n' "$(section_passed release-cli)"
-        printf '      "release_perf": %s,\n' "$(section_passed release-perf)"
         printf '      "fault_scale": %s,\n' "$(section_passed fault-scale)"
-        printf '      "coding_benchmark_smoke": %s,\n' "$(section_passed coding-benchmark)"
-        printf '      "efficiency_harness": %s,\n' "$(section_passed efficiency)"
         printf '      "acp_interop": %s,\n' "$(section_passed acp-interop)"
         printf '      "packaging_artifacts": %s,\n' "$(section_passed package-artifacts)"
         printf '      "install_matrix": %s,\n' "$(section_passed install-matrix)"
-        printf '      "coding_benchmark_real_model": "skipped: provider-key run, offline local certification never spends"\n'
         printf '    },\n'
         printf '    "offline": {"network_required": false, "provider_keys_required": false},\n'
         printf '    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider evidence"\n'

@@ -26,7 +26,7 @@ Contract (documented in docs/certification.md):
     account for against the `test result:` counters -> lane FAILS with no
     retries (a mass failure is a regression, never flake weather);
   * refusals (typed, exit 2): non-`cargo test` suite commands, any
-    `--ignored`/`[fault]`/`[soak]`/`[perf]` marker, and fault/soak/live/perf
+    `--ignored`/`[fault]`/`[release]`/`[visual]` marker, and fault proof
     lanes — those lanes are never retried;
   * the report `faktor-flake-tolerance/v1` is ALWAYS written (even on a
     clean run) to target/certification/flakes/<lane>.json and is attached to
@@ -61,9 +61,9 @@ DEFAULT_MAX_FLAKES = 3
 DEFAULT_SUITE_TIMEOUT_S = 4 * 3600
 DEFAULT_ISOLATION_TIMEOUT_S = 900
 EXCERPT_BYTES = 2048
-# Lanes whose failures are never re-run: fault/soak/live/perf proof lanes.
-REFUSED_LANE_MARKERS = ("fault", "soak", "live", "perf", "nightly")
-REFUSED_ARG_MARKERS = ("--ignored", "[fault]", "[soak]", "[perf]", "[live]")
+# Lanes whose failures are never re-run: fault and nightly proof lanes.
+REFUSED_LANE_MARKERS = ("fault", "nightly")
+REFUSED_ARG_MARKERS = ("--ignored", "[fault]", "[release]", "[visual]")
 
 TEST_FAILED_RE = re.compile(r"^test (.+?) \.\.\. FAILED\b")
 TEST_OK_RE = re.compile(r"^test (.+?) \.\.\. ok\b")
@@ -258,8 +258,8 @@ def _validate_invocation(args):
         for marker in REFUSED_ARG_MARKERS:
             if marker in joined:
                 problems.append(
-                    "suite command carries '{}': fault/soak/perf/ignored tests "
-                    "are never retried".format(marker)
+                    "suite command carries '{}': fault/release/visual/ignored "
+                    "tests are never retried".format(marker)
                 )
     if args.max_flakes < 1:
         problems.append("--max-flakes must be >= 1")
@@ -731,8 +731,8 @@ def selftest():
             "ignored: no report written for a refusal",
         )
 
-        # 8. refusal: fault/soak/live/perf lanes are never retried.
-        for lane in ("soak-smoke", "nightly", "perf", "fault-campaign", "live-paid"):
+        # 8. refusal: fault and nightly lanes are never retried.
+        for lane in ("fault-campaign", "fault-scale", "nightly"):
             scenario, bin_dir = _selftest_scenario(tmp, "lane-" + lane, suite, 1)
             env = dict(os.environ)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
