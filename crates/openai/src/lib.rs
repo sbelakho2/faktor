@@ -97,6 +97,11 @@ pub struct OpenAiConfig {
     pub family: OpenAiFamily,
     /// Explicit capability overrides per model; defaults are conservative.
     pub models: HashMap<String, ModelCapabilities>,
+    /// The ids declared through [`OpenAiConfig::with_models`] — the
+    /// ENDPOINT's generic declaration for a custom/listed id (as opposed to
+    /// a model-specific [`OpenAiConfig::with_model`] declaration). These
+    /// resolve as [`CapabilityAuthority::DeclaredGeneric`], never `Known`.
+    pub declared_generic: std::collections::HashSet<String>,
 }
 
 impl fmt::Debug for OpenAiConfig {
@@ -108,6 +113,7 @@ impl fmt::Debug for OpenAiConfig {
             .field("api_key", &self.api_key)
             .field("family", &self.family)
             .field("models", &self.models)
+            .field("declared_generic", &self.declared_generic)
             .finish()
     }
 }
@@ -119,6 +125,7 @@ impl OpenAiConfig {
             api_key,
             family: OpenAiFamily::Chat,
             models: HashMap::new(),
+            declared_generic: std::collections::HashSet::new(),
         }
     }
 
@@ -128,6 +135,7 @@ impl OpenAiConfig {
     /// declared ids instead of silently substituting them.
     pub fn with_models<I: IntoIterator<Item = String>>(mut self, models: I) -> Self {
         for model in models {
+            self.declared_generic.insert(model.clone());
             self.models
                 .entry(model)
                 .or_insert_with(Self::generic_capabilities);
@@ -159,15 +167,21 @@ impl OpenAiConfig {
             api_key,
             family: OpenAiFamily::Responses,
             models: HashMap::new(),
+            declared_generic: std::collections::HashSet::new(),
         }
     }
 
     pub fn with_model(mut self, model: &str, caps: ModelCapabilities) -> Self {
+        // An exact per-model declaration OUTRANKS a generic listing of the
+        // same id (the operator stated the model-specific truth).
+        self.declared_generic.remove(model);
         self.models.insert(model.to_string(), caps);
         self
     }
 
     pub fn with_default_caps(mut self, caps: ModelCapabilities) -> Self {
+        // The `*` wildcard is the endpoint's EXPLICIT generic declaration —
+        // usable, and resolved as DeclaredGeneric, never as Known.
         self.models.insert("*".to_string(), caps);
         self
     }
@@ -1299,6 +1313,33 @@ impl Provider for OpenAiProvider {
         }
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        use faktor_core::model::{CapabilityAuthority, CapabilityResolution};
+        // Authority ladder for a generic OpenAI-compatible endpoint:
+        //   1. an exact per-model declaration (`with_model`) is Known;
+        //   2. a generic id listing (`with_models`) or the endpoint
+        //      wildcard (`with_default_caps`) is an explicit endpoint
+        //      DECLARATION — DeclaredGeneric, usable but visibly declared;
+        //   3. nothing matched: the hardcoded fallback is an UNVERIFIED
+        //      default — Unknown. It must never masquerade as Known
+        //      capabilities (the "unknown custom model" defect).
+        if let Some(caps) = self.config.models.get(model) {
+            let authority = if self.config.declared_generic.contains(model) {
+                CapabilityAuthority::DeclaredGeneric
+            } else {
+                CapabilityAuthority::Known
+            };
+            return CapabilityResolution {
+                caps: caps.clone(),
+                authority,
+            };
+        }
+        if let Some(caps) = self.config.models.get("*") {
+            return CapabilityResolution::declared_generic(caps.clone());
+        }
+        CapabilityResolution::unknown(self.capabilities(model))
+    }
+
     fn max_image_bytes(&self) -> usize {
         OPENAI_MAX_IMAGE_BYTES
     }
@@ -1327,8 +1368,10 @@ impl Provider for OpenAiProvider {
         };
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound. A refusal
-        // is a typed terminal error frame (nothing was sent).
-        let caps = self.capabilities(&req.model);
+        // is a typed terminal error frame (nothing was sent). The gate acts
+        // on the AUTHORITY-gated profile: an Unknown lookup (no declaration,
+        // no probe) can never lower an image part on an assumed vision flag.
+        let caps = self.capability_resolution(&req.model).effective();
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {

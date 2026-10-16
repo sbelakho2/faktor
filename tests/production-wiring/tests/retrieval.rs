@@ -99,6 +99,11 @@ fn ollama_config(dir: &Path, base: &str, with_embeddings: bool) -> Config {
 /// One loopback OpenAI-compatible chat endpoint (`api: "chat"` — the
 /// compatible-server default) with the same explicit quality declaration as
 /// the Ollama family, so the pinned turn clears the Implement-phase floor.
+/// The served id is DECLARED through the endpoint's `models` list: under the
+/// capability-authority semantics an undeclared id resolves `Unknown` (its
+/// feature flags are forced off — tools included — and the daemon would
+/// refuse the turn pre-wire), so the declaration is the documented way to
+/// make a custom endpoint usable.
 fn openai_chat_config(dir: &Path, base: &str) -> Config {
     config_file(
         dir,
@@ -113,6 +118,7 @@ fn openai_chat_config(dir: &Path, base: &str) -> Config {
                 "base_url": base,
                 "api_key_env": null,
                 "api": "chat",
+                "models": ["default"],
                 "allow_loopback": true,
                 "quality": {"coding_reliability": 80, "context_reliability": 80},
             }],

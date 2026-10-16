@@ -22,6 +22,16 @@
 //! `temperature` is not a `GenericAgentRequest` field (nothing to lower).
 //! The Ollama document row is a deliberate typed refusal: a hostile request
 //! carrying document bytes must not reach that wire at all.
+//!
+//! Capability authority: a request carrying images is deliverable only to a
+//! model whose capability lookup RESOLVES (the adapter gates on the
+//! authority-gated profile, so an undeclared id — `Unknown` — forces every
+//! feature flag off and refuses the image pre-wire). Each row therefore
+//! DECLARES its audited model through the adapter's own declaration API
+//! (`with_model` / `model_overrides`), exactly as an operator declaring a
+//! custom endpoint would; the declaration is the documented way to make the
+//! vision row auditable. `undeclared_model_refuses_images_pre_wire` pins the
+//! refusal half of the SAME semantics.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +54,18 @@ const RESULT: &str = "RESULT-SENTINEL";
 const MAX_OUT: usize = 777;
 const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
 const PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF";
+
+/// The audited profile DECLARED for every row's model (exact per-model
+/// declaration => `Known` authority): a full tools + vision model, so the
+/// audited request's image/document/tool fields are all deliverable and the
+/// audit stays about LOWERING, not about capability gating.
+fn audited_caps() -> ModelCapabilities {
+    ModelCapabilities {
+        vision: true,
+        tools: true,
+        ..ModelCapabilities::default()
+    }
+}
 
 fn transport() -> Arc<dyn HttpTransport> {
     Arc::new(PolicyCheckedHttpTransport::permissive())
@@ -159,7 +181,7 @@ fn rows() -> Vec<Row> {
             })]),
             build: |base| {
                 faktor_openai::OpenAiProvider::build(
-                    faktor_openai::OpenAiConfig::chat(base, None),
+                    faktor_openai::OpenAiConfig::chat(base, None).with_model("m1", audited_caps()),
                     transport(),
                 )
             },
@@ -176,7 +198,8 @@ fn rows() -> Vec<Row> {
             ]),
             build: |base| {
                 faktor_openai::OpenAiProvider::build(
-                    faktor_openai::OpenAiConfig::responses(base, None),
+                    faktor_openai::OpenAiConfig::responses(base, None)
+                        .with_model("m1", audited_caps()),
                     transport(),
                 )
             },
@@ -190,7 +213,9 @@ fn rows() -> Vec<Row> {
             response: "data: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n".into(),
             build: |base| {
                 faktor_anthropic::AnthropicProvider::build(
-                    faktor_anthropic::AnthropicConfig::new(None).with_base(base),
+                    faktor_anthropic::AnthropicConfig::new(None)
+                        .with_base(base)
+                        .with_model("claude-x", audited_caps()),
                     transport(),
                 )
             },
@@ -204,7 +229,9 @@ fn rows() -> Vec<Row> {
             response: "data: {}\n\n".into(),
             build: |base| {
                 faktor_google::GoogleProvider::build(
-                    faktor_google::GoogleConfig::new(None).with_base(base),
+                    faktor_google::GoogleConfig::new(None)
+                        .with_base(base)
+                        .with_model("gemini-x", audited_caps()),
                     transport(),
                 )
             },
@@ -299,6 +326,46 @@ async fn ollama_refuses_documents_pre_wire() {
         "the refusal must name the document gate: {err:?}"
     );
     assert_eq!(server.request_count(), 0, "refusal happens pre-wire");
+}
+
+/// The authority half of the SAME semantics: an id with NO declaration (and
+/// no probe) resolves `Unknown`; its effective profile forces the feature
+/// flags off, so an image-bearing request is refused typedly BEFORE any wire
+/// byte — never silently downgraded to a text-only request and never sent
+/// with the image.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undeclared_model_refuses_images_pre_wire() {
+    let server = MockServer::new();
+    server.route(
+        "POST",
+        "/chat/completions",
+        MockAction::Respond {
+            status: 200,
+            body: sse_body(&[serde_json::json!({
+                "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]
+            })]),
+        },
+    );
+    let base = server.base_url().await;
+    let provider = faktor_openai::OpenAiProvider::build(
+        faktor_openai::OpenAiConfig::chat(base, None),
+        transport(),
+    );
+    let err = provider
+        .stream(full_request("m1", false))
+        .next()
+        .await
+        .expect("one refusal frame")
+        .expect_err("an undeclared model must refuse the image");
+    assert!(
+        err.message.contains("does not support vision"),
+        "the refusal must name the vision gate: {err:?}"
+    );
+    assert_eq!(
+        server.request_count(),
+        0,
+        "an Unknown model's refusal happens pre-wire"
+    );
 }
 
 fn check_openai_chat(body: &serde_json::Value, path: &str) {

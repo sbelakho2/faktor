@@ -558,6 +558,44 @@ the agent reads capabilities; adapters set them; provider quirks stay
 inside adapters. Capabilities come from discovery/probing, never
 hard-coded lists.
 
+#### 9.2.1 Capability authority (an unknown model is never silently "known")
+
+Every capability lookup carries an explicit **authority state**
+(`faktor_core::model::CapabilityAuthority`) — `Provider::capability_resolution(model)`
+returns the profile **plus** how it was established:
+
+- `known` — model-SPECIFIC truth: probed live for this exact id (e.g. the
+  Ollama `GET /api/show` probe) or declared for it (`with_model` /
+  `model_caps` rows).
+- `declared_generic` — the endpoint/operator explicitly declared a generic
+  profile for this id or for any id on the endpoint: config `models = [...]`
+  (`with_models`), a `*` wildcard (`with_default_caps`), or an adapter's
+  documented family default (Anthropic/Google/DeepSeek families, the
+  pre-probe `small_local` Ollama profile). Usable as declared — the
+  declaration IS the authority — and visibly `declared_generic` everywhere
+  the lookup is consumed.
+- `unknown` — nothing matched: the adapter fell back to an unverified
+  default (the generic OpenAI-compatible 128K/tools/vision profile is the
+  canonical case). **Unknown never silently equals Known.**
+
+Consumers decide from `CapabilityResolution::effective()`: for `unknown`
+the model features the endpoint never declared (tools, parallel tools,
+thinking, vision, JSON schema, reasoning, embeddings) are forced OFF and
+the context/output budget is clamped to the conservative default — an
+unlisted model runs like a fail-safe local default until the endpoint
+declares it (`models = [...]` for an OpenAI-compatible endpoint) or a live
+probe establishes it. The gate is one function (`resolve_turn_caps` in the
+agent turn): the turn's plan, tool bundle, context budget, media admission
+and the ADAPTER wire gates all read the same effective caps, so routing
+(`catalog_entry` advertises the effective profile) can never select a
+candidate for features the runtime would strip. A gated lookup emits a
+bounded `tracing::warn`, and the state is surfaced in the native
+`/models`, `/capabilities`, `/providers` payloads (`capabilityAuthority`,
+`capabilitiesGated`) and in the doctor's `capability authority:` section —
+never hidden. Streaming is deliberately never gated (the wire is streamed
+for every family; refusing it would refuse every turn, not gate a model
+feature).
+
 ### 9.3 Adapter families
 
 | Family | Wire | Notes |

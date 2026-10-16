@@ -128,6 +128,12 @@ impl Provider for CapturingProvider {
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Authority travels with the wrapped provider: a test
+        // decorator must not silently turn a known provider into an
+        // Unknown lookup (or vice versa).
+        self.inner.capability_resolution(model)
+    }
 
     fn supports_embeddings(&self, model: &str) -> bool {
         self.inner.supports_embeddings(model)
@@ -160,6 +166,11 @@ impl Provider for AlwaysOk {
             tools: true,
             ..Default::default()
         }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {

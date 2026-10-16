@@ -689,6 +689,13 @@ impl Provider for PricingOverrideProvider {
         self.inner.capabilities(model)
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Delegate: the wrapper must not mask the wrapped adapter's
+        // authority state (pricing/quality/billing-origin decoration is
+        // orthogonal to capability authority).
+        self.inner.capability_resolution(model)
+    }
+
     fn known_models(&self) -> Vec<String> {
         self.inner.known_models()
     }
@@ -840,6 +847,13 @@ impl Provider for QualityOverrideProvider {
         self.inner.capabilities(model)
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Delegate: the wrapper must not mask the wrapped adapter's
+        // authority state (pricing/quality/billing-origin decoration is
+        // orthogonal to capability authority).
+        self.inner.capability_resolution(model)
+    }
+
     fn known_models(&self) -> Vec<String> {
         self.inner.known_models()
     }
@@ -966,6 +980,13 @@ impl Provider for BillingOriginProvider {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
+    }
+
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Delegate: the wrapper must not mask the wrapped adapter's
+        // authority state (pricing/quality/billing-origin decoration is
+        // orthogonal to capability authority).
+        self.inner.capability_resolution(model)
     }
 
     fn known_models(&self) -> Vec<String> {
@@ -1573,7 +1594,17 @@ mod tests {
             assert_eq!(e.provenance, Provenance::BuiltIn);
             assert_eq!(e.pricing_epoch(), CATALOG_FIRST_EPOCH);
             assert_eq!(e.quality_prior, QualityPrior::conservative_generic());
-            assert_eq!(e.capabilities, p.capabilities(&model));
+            // Capability authority: the DEFAULT trait impl reports no
+            // model-specific authority — the catalog row advertises the
+            // EFFECTIVE (gated) profile the runtime would act on, never the
+            // unverified declared one.
+            let resolution = p.capability_resolution(&model);
+            assert_eq!(
+                resolution.authority,
+                faktor_core::model::CapabilityAuthority::Unknown,
+                "a provider that overrides nothing never reads as Known"
+            );
+            assert_eq!(e.capabilities, resolution.effective());
         }
         let e = p.catalog_entry("probed-a");
         assert!(!e.pricing.is_local_zero());

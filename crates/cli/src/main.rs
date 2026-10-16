@@ -1584,6 +1584,7 @@ pub(crate) fn doctor_run_with_config(
     doctor_sandbox_agent_home_line(data_dir, config_path, &mut lines, &mut issues);
     doctor_network_isolation_line(&mut lines);
     doctor_tokenizer_certification_line(config_path, &mut lines, &mut issues);
+    doctor_capability_authority_line(config_path, &mut lines, &mut issues);
     doctor_contract_compiler_line(&mut lines, &mut issues);
     doctor_live_canary_line(&mut lines);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
@@ -2862,6 +2863,89 @@ pub(crate) fn doctor_tokenizer_certification_line(
             *issues += 1;
         }
     }
+}
+
+/// The additive CAPABILITY-AUTHORITY section (capability authority law):
+/// per configured provider instance and known model, the authority of the
+/// capability lookup — `known` (model-specific: probed or declared for the
+/// exact id), `declared_generic` (endpoint-declared generic profile:
+/// usable, visibly declared) or `unknown` (no probe, no declaration: the
+/// runtime GATES tools/vision/context conservatively and warns). Surfaced
+/// line-by-line, never repaired here; an `unknown` row names the exact
+/// remedy (declare the id in the provider's `models` list or pin a
+/// model-specific profile). The section runs only when a config is named,
+/// like the tokenizer matrix.
+pub(crate) fn doctor_capability_authority_line(
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(path) = config_path else {
+        return;
+    };
+    let cfg = match config::Config::load_strict(path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            lines.push(format!(
+                "capability authority: unavailable (the daemon refuses this config) {e}"
+            ));
+            return;
+        }
+    };
+    let sandbox = match cfg.sandbox_policy() {
+        Ok(policy) => policy,
+        Err(e) => {
+            lines.push(format!("capability authority: FAILED sandbox policy: {e}"));
+            *issues += 1;
+            return;
+        }
+    };
+    let destinations = sandbox
+        .network
+        .installed()
+        .cloned()
+        .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
+    let transport: Arc<dyn faktor_provider::egress::HttpTransport> =
+        match faktor_provider::egress::PolicyCheckedHttpTransport::try_with_policy(destinations) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                lines.push(format!(
+                    "capability authority: FAILED egress transport: {e}"
+                ));
+                *issues += 1;
+                return;
+            }
+        };
+    let mut configured = ProviderRegistry::new();
+    for p in &cfg.providers {
+        if let Ok(built) = p.build(transport.clone()) {
+            let _ = configured.try_register(built);
+        }
+    }
+    let (mut known, mut declared, mut unknown) = (0usize, 0usize, 0usize);
+    for id in configured.ids() {
+        let Some(p) = configured.get(&id) else {
+            continue;
+        };
+        for model in p.known_models() {
+            let resolution = p.capability_resolution(&model);
+            match resolution.authority {
+                faktor_core::model::CapabilityAuthority::Known => known += 1,
+                faktor_core::model::CapabilityAuthority::DeclaredGeneric => declared += 1,
+                faktor_core::model::CapabilityAuthority::Unknown => unknown += 1,
+            }
+            lines.push(format!(
+                "capability authority: {id} {model} authority={} gated={}",
+                resolution.authority.as_str(),
+                resolution.is_gated()
+            ));
+        }
+    }
+    lines.push(format!(
+        "capability authority: {known} known, {declared} declared_generic, {unknown} unknown \
+         (an unknown row runs with tools/vision/context gated off until the id is declared \
+         in the provider's `models` list or a probe establishes it)"
+    ));
 }
 
 /// The additive engineering-contract compiler self-check (audit item 5): a

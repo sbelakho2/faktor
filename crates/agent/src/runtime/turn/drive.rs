@@ -17,18 +17,48 @@ impl AgentRuntime {
 
     /// Run the parent's next logical turn from a BOUNDED typed child handoff
     /// (audit: typed child handoff consumption). The child's transcript
-    /// never enters the request: only [`ChildHandoff::render_bounded`] does,
-    /// and it is guaranteed to fit `budget_tokens` before the prompt is
-    /// submitted. Everything omitted stays retrievable through the
-    /// handoff's scoped refs.
+    /// never enters the request and the handoff is NEVER submitted as user
+    /// text: it travels as a typed internal-context item rendered only
+    /// under the Faktor-controlled `[faktor:internal-context]` section
+    /// (untrusted DATA, never instructions). The render is bounded to
+    /// `budget_tokens` before anything is submitted; an envelope that
+    /// cannot fit is the typed Oversized error and nothing is submitted.
+    /// Everything omitted stays retrievable through the handoff's scoped
+    /// refs.
     pub async fn run_turn_from_handoff(
         self: &Arc<Self>,
         session: SessionId,
         handoff: &ChildHandoff,
         budget_tokens: usize,
     ) -> faktor_core::Result<TurnOutcome> {
-        let prompt = handoff.render_bounded(budget_tokens);
-        self.run_turn(session, &prompt, &[]).await
+        let input = ParentTurnInput::internal_only(InternalContextItem::ChildHandoff {
+            provenance: "orchestrator:child-handoff".to_string(),
+            handoff: handoff.clone(),
+        });
+        self.run_turn_input(session, input, budget_tokens).await
+    }
+
+    /// Run one parent logical turn from a STRUCTURED [`ParentTurnInput`]:
+    /// the optional user message is the only text with user authority and
+    /// is submitted byte-identically through the normal prompt path; typed
+    /// internal context items are rendered ONLY by the Faktor-controlled
+    /// internal-context section renderer and ride the turn's system slot as
+    /// untrusted DATA. They never enter the user-role conversation. A
+    /// render that cannot fit `budget_tokens` (irreducible envelope) fails
+    /// typed BEFORE anything is submitted.
+    pub async fn run_turn_input(
+        self: &Arc<Self>,
+        session: SessionId,
+        input: ParentTurnInput,
+        budget_tokens: usize,
+    ) -> faktor_core::Result<TurnOutcome> {
+        let internal = input
+            .render_internal_bounded(budget_tokens)
+            .map_err(|error| Error::oversized(error.to_string()))?;
+        let ParentTurnInput { user_message, .. } = input;
+        let prompt = user_message.unwrap_or_default();
+        self.run_turn_structured(session, &prompt, &[], None, internal)
+            .await
     }
 
     /// Like [`AgentRuntime::run_turn`] with a per-message model override.
@@ -46,11 +76,31 @@ impl AgentRuntime {
         files: &[String],
         model: Option<String>,
     ) -> faktor_core::Result<TurnOutcome> {
+        self.run_turn_structured(session, prompt, files, model, None)
+            .await
+    }
+
+    /// The ONE submission tail shared by every turn entry: submit the user
+    /// prompt (user authority), attach the ALREADY-RENDERED Faktor internal
+    /// context to the submitted operation when one exists, and drive it.
+    async fn run_turn_structured(
+        self: &Arc<Self>,
+        session: SessionId,
+        prompt: &str,
+        files: &[String],
+        model: Option<String>,
+        internal: Option<String>,
+    ) -> faktor_core::Result<TurnOutcome> {
         let receipt = self.submit(session, prompt, files)?;
+        if let Some(rendered) = internal {
+            self.store_internal_context(receipt.op_id, rendered);
+        }
         if receipt.queued {
             // A single per-session turn runner delivers queued prompts after
             // the active logical turn completes (audit round 6). Never start
-            // a second concurrent turn.
+            // a second concurrent turn. The internal-context block stays
+            // keyed by the queued operation id and is consumed by the drive
+            // that admits it.
             return Ok(TurnOutcome {
                 op_id: receipt.op_id,
                 final_state: AgentState::Idle,

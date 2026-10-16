@@ -96,6 +96,134 @@ impl ModelCapabilities {
     }
 }
 
+/// The authority state of ONE capability lookup: how the returned
+/// [`ModelCapabilities`] profile was established. A profile is only ever
+/// `Known` when it is model-SPECIFIC (probed live for that exact model id,
+/// or declared per exact id); a generic endpoint/family declaration is
+/// [`CapabilityAuthority::DeclaredGeneric`] — usable, but visibly declared,
+/// never silently equal to a validated profile; everything else is
+/// [`CapabilityAuthority::Unknown`] and must never behave like `Known`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAuthority {
+    /// Model-specific profile: probed for this exact model id or declared
+    /// for it (config `with_model`, adapter model table, live probe).
+    Known,
+    /// Endpoint-declared generic assumptions: the profile was explicitly
+    /// declared to apply to this id or to any id on the endpoint
+    /// (`with_models`, a `*` wildcard, an adapter family-default table).
+    /// Usable as declared — the declaration is the authority, and it is
+    /// surfaced everywhere the profile is consumed.
+    DeclaredGeneric,
+    /// No declaration and no probe matched this id: the profile is an
+    /// unverified default. It may not silently enable model features or
+    /// the optimistic context (see [`CapabilityResolution::effective`]).
+    Unknown,
+}
+
+impl CapabilityAuthority {
+    /// The stable wire/config spelling (`known` / `declared_generic` /
+    /// `unknown`) used by telemetry, doctor and native JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CapabilityAuthority::Known => "known",
+            CapabilityAuthority::DeclaredGeneric => "declared_generic",
+            CapabilityAuthority::Unknown => "unknown",
+        }
+    }
+
+    /// True only for a model-specific profile.
+    pub fn is_known(&self) -> bool {
+        matches!(self, CapabilityAuthority::Known)
+    }
+
+    /// True for a declared (model-specific or generic) profile — the states
+    /// where declared feature flags may be acted on.
+    pub fn is_declared(&self) -> bool {
+        !matches!(self, CapabilityAuthority::Unknown)
+    }
+}
+
+/// A capability profile plus the authority state of its lookup — the value
+/// every capability consumer should take instead of a bare
+/// [`ModelCapabilities`]. [`CapabilityResolution::caps`] is the profile as
+/// declared/probed; [`CapabilityResolution::effective`] is the profile a
+/// decision may act on (gated for `Unknown`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityResolution {
+    pub caps: ModelCapabilities,
+    pub authority: CapabilityAuthority,
+}
+
+impl CapabilityResolution {
+    /// Model-specific profile (probed or declared for the exact id).
+    pub fn known(caps: ModelCapabilities) -> Self {
+        Self {
+            caps,
+            authority: CapabilityAuthority::Known,
+        }
+    }
+
+    /// Endpoint-declared generic profile (usable as declared).
+    pub fn declared_generic(caps: ModelCapabilities) -> Self {
+        Self {
+            caps,
+            authority: CapabilityAuthority::DeclaredGeneric,
+        }
+    }
+
+    /// Unverified default profile: no declaration, no probe.
+    pub fn unknown(caps: ModelCapabilities) -> Self {
+        Self {
+            caps,
+            authority: CapabilityAuthority::Unknown,
+        }
+    }
+    /// `Known` when the caller established the profile is model-specific,
+    /// `DeclaredGeneric` otherwise (an endpoint/family declaration matched).
+    pub fn from_declaration(caps: ModelCapabilities, model_specific: bool) -> Self {
+        if model_specific {
+            Self::known(caps)
+        } else {
+            Self::declared_generic(caps)
+        }
+    }
+
+    /// The profile a DECISION may act on. `Known` and `DeclaredGeneric`
+    /// keep the declared values. `Unknown` may not silently enable model
+    /// features: tools/parallel tools/thinking/vision/JSON schema/reasoning/
+    /// embeddings are forced off and the context/output budget is clamped to
+    /// the conservative default profile, so an unlisted model behaves like a
+    /// fail-safe local default until the endpoint declares it (or a probe
+    /// establishes it). `streaming` stays as reported: the wire is streamed
+    /// for every family and refusing it would refuse every turn rather than
+    /// gate a model feature.
+    pub fn effective(&self) -> ModelCapabilities {
+        if self.authority.is_declared() {
+            return self.caps.clone();
+        }
+        let safe = ModelCapabilities::default();
+        ModelCapabilities {
+            context: self.caps.context.min(safe.context),
+            max_output: self.caps.max_output.min(safe.max_output),
+            tools: false,
+            parallel_tools: false,
+            thinking: false,
+            vision: false,
+            json_schema: false,
+            streaming: self.caps.streaming,
+            embeddings: false,
+            reasoning: false,
+        }
+    }
+
+    /// True when `effective()` gated something the declared profile claimed
+    /// — the condition telemetry/doctor must surface, never hide.
+    pub fn is_gated(&self) -> bool {
+        self.effective() != self.caps
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +235,66 @@ mod tests {
         assert!(!c.thinking);
         assert!(c.context > 0);
         assert!(!c.supports_parallel_tools());
+    }
+
+    #[test]
+    fn capability_authority_states_are_distinct_and_serialize_stably() {
+        assert_eq!(CapabilityAuthority::Known.as_str(), "known");
+        assert_eq!(
+            CapabilityAuthority::DeclaredGeneric.as_str(),
+            "declared_generic"
+        );
+        assert_eq!(CapabilityAuthority::Unknown.as_str(), "unknown");
+        assert!(CapabilityAuthority::Known.is_known());
+        assert!(CapabilityAuthority::DeclaredGeneric.is_declared());
+        assert!(!CapabilityAuthority::Unknown.is_declared());
+        // The wire spelling is pinned (telemetry/doctor/IDE contract).
+        let json = serde_json::to_value(CapabilityAuthority::DeclaredGeneric).unwrap();
+        assert_eq!(json, serde_json::json!("declared_generic"));
+        let back: CapabilityAuthority = serde_json::from_value(json).unwrap();
+        assert_eq!(back, CapabilityAuthority::DeclaredGeneric);
+    }
+
+    #[test]
+    fn unknown_authority_never_silently_equals_known() {
+        let claimed = ModelCapabilities {
+            context: 128_000,
+            max_output: 16_384,
+            tools: true,
+            parallel_tools: true,
+            thinking: true,
+            vision: true,
+            json_schema: true,
+            streaming: true,
+            embeddings: true,
+            reasoning: true,
+        };
+        // Unknown: the declared-looking profile is NOT actionable as-is.
+        let unknown = CapabilityResolution::unknown(claimed.clone());
+        let gated = unknown.effective();
+        assert!(!gated.tools && !gated.parallel_tools && !gated.vision);
+        assert!(!gated.json_schema && !gated.reasoning && !gated.thinking);
+        assert!(!gated.embeddings);
+        assert!(gated.streaming, "the wire is streamed for every family");
+        assert!(
+            gated.context <= ModelCapabilities::default().context
+                && gated.max_output <= ModelCapabilities::default().max_output,
+            "an Unknown context must not silently keep the optimistic window"
+        );
+        assert!(unknown.is_gated(), "the gate is visible");
+        // DeclaredGeneric: the endpoint declaration IS the authority — the
+        // declared values stay usable, and the state stays visible.
+        let declared = CapabilityResolution::declared_generic(claimed.clone());
+        assert_eq!(declared.effective(), claimed);
+        assert!(!declared.is_gated());
+        // Known: model-specific, untouched.
+        let known = CapabilityResolution::known(claimed.clone());
+        assert_eq!(known.effective(), claimed);
+        assert!(known.authority.is_known());
+        // A profile that claims nothing is not "gated" spuriously.
+        let bare = CapabilityResolution::unknown(ModelCapabilities::default());
+        assert_eq!(bare.effective(), ModelCapabilities::default());
+        assert!(!bare.is_gated());
     }
 
     #[test]

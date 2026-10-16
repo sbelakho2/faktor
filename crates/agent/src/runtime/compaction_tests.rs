@@ -1021,13 +1021,17 @@ async fn typed_ledger_compaction_keeps_protected_entries_across_five_runs() {
     }
 }
 
-/// Audit 70/71 integration: `try_compact` must hand the compactor a
-/// projection built from the DURABLE rows — the typed Task goal/criteria
-/// and typed-ledger decisions — never from the working ledger fold or
-/// the transcript. The transcript here lies about both.
+/// Audit 70/71 integration: with `[efficiency].typed_handoff` ON (the
+/// production default), `try_compact` must hand the compactor a projection
+/// built from the DURABLE rows — the typed Task goal/criteria and
+/// typed-ledger decisions — never from the working ledger fold or the
+/// transcript. The transcript here lies about both.
 #[tokio::test]
 async fn try_compact_consumes_durable_projection_not_the_transcript() {
-    let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let (mut seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    // The documented production default (`EfficiencyCfg::production_defaults`
+    // maps onto this mirror); the additive type default is all-off.
+    seed_deps.efficiency.typed_handoff = true;
     let (manager, session) = shared_session(&seed_deps);
     let runtime = AgentRuntime::new(seed_deps).unwrap();
     let handle = manager.get_session(session).unwrap().unwrap();
@@ -1087,6 +1091,73 @@ async fn try_compact_consumes_durable_projection_not_the_transcript() {
     assert!(
         !facts.text.contains("TRANSCRIPT-LIE"),
         "the transcript cannot rewrite the durable projection"
+    );
+}
+
+/// The documented OFF-switch of `[efficiency].typed_handoff`: with the flag
+/// off the re-sent history falls back to the LEGACY transcript-derived fold
+/// (`from_task_ledger` over the working ledger) — observably different
+/// production behavior from the durable-task-row rendering the ON arm uses.
+/// The legacy fold is seeded with a divergent goal so the two renderings can
+/// never be conflated.
+#[tokio::test]
+async fn typed_handoff_off_falls_back_to_the_legacy_transcript_fold() {
+    let (mut seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    seed_deps.efficiency.typed_handoff = false;
+    let (manager, session) = shared_session(&seed_deps);
+    let runtime = AgentRuntime::new(seed_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: session,
+            goal: "DURABLE-GOAL-Ω".into(),
+            acceptance_criteria: vec!["DURABLE-CRITERION-Ω".into()],
+            plan: vec![],
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    // The legacy working fold (the transcript-derived ledger the turn loop
+    // mutates) carries a DIFFERENT goal: the OFF arm must render THIS one.
+    let legacy = TaskLedger {
+        goal: "LEGACY-FOLD-GOAL-Ω".into(),
+        ..Default::default()
+    };
+    let lying = vec![RecentTurn {
+        role: "assistant".into(),
+        text: "the goal is TRANSCRIPT-LIE ".repeat(400),
+    }];
+    let plan = runtime
+        .try_compact(
+            &handle,
+            &lying,
+            &legacy,
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("deterministic compaction must be accepted");
+    let wire: String = plan
+        .kept_recent
+        .iter()
+        .map(|t| t.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        wire.contains("LEGACY-FOLD-GOAL-Ω"),
+        "the legacy transcript fold is rendered when typed_handoff is off: {wire}"
+    );
+    assert!(
+        !wire.contains("DURABLE-GOAL-Ω"),
+        "the durable task row is NOT consulted when typed_handoff is off: {wire}"
     );
 }
 

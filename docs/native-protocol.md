@@ -142,13 +142,24 @@ generated into both IDE clients (`ProtocolAttachmentId`,
 - `GET /models` — the flat daemon model catalog:
   `[{provider, model, context, maxOutput, tools, parallelTools,
   reasoning, thinking, vision, structuredOutput, embeddings, streaming,
-  source, documentCapable, attachmentLimits}]`, walking every registered
-  provider instance × its `known_models()` × `capabilities(model)`.
+  source, capabilityAuthority, capabilitiesGated, documentCapable,
+  attachmentLimits}]`, walking every registered provider instance × its
+  `known_models()` × `capabilities(model)`.
   `source` is the provenance string: `"liveProbe"` when the provider
   reports a live runtime context limit for the model (e.g. an Ollama
   `/api/ps` allocation), `"providerCatalog"` when the entry carries a
   non-default capability profile (configured or probed), else
   `"conservativeDefault"` (the fail-safe default profile).
+  `capabilityAuthority` is the AUTHORITY of the capability lookup —
+  `"known"` (model-specific: probed for this exact id or declared per
+  exact id), `"declared_generic"` (an endpoint-declared generic profile:
+  config `models = [...]`, a `*` wildcard, or a documented adapter family
+  default — usable as declared) or `"unknown"` (no probe, no declaration:
+  the unverified fallback). `capabilitiesGated` is true exactly when the
+  runtime would gate that Unknown profile (tools/vision/JSON
+  schema/reasoning forced off, context clamped to the conservative
+  default, see `docs/architecture.md` §9.2.1) — clients must render this,
+  never hide it: an unknown model is never silently "known".
   `documentCapable` is the model's document-delivery gate (the
   vision-like gate for `application/pdf` / `text/plain` attachments) and
   `attachmentLimits` is the daemon-advertised attachment admission
@@ -161,10 +172,10 @@ generated into both IDE clients (`ProtocolAttachmentId`,
   keep only a conservative emergency ceiling for the window before the
   catalog is read.
 - `GET /capabilities` — introspection map for capability-driven UI:
-  `{ "<provider>": { models: [{id, capabilities, documentCapable,
-  attachmentLimits}], runtimeContextLimitSupported: bool } }` (same
-  registry walk; the boolean is true when any known model of the provider
-  reports a live runtime limit).
+  `{ "<provider>": { models: [{id, capabilities, capabilityAuthority,
+  documentCapable, attachmentLimits}], runtimeContextLimitSupported: bool
+  } }` (same registry walk; the boolean is true when any known model of
+  the provider reports a live runtime limit).
 - `GET /native/health` / `GET /native/ready` — see "Liveness and
   readiness" above.
 - `POST /native/session` — create one durable session:

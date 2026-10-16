@@ -14,6 +14,39 @@
 
 use super::*;
 
+/// The ONE capability view of a (provider, model) pair: the raw declared
+/// profile, its AUTHORITY state, and the budget-ceiling caps. The effective
+/// caps are authority-gated ([`faktor_core::model::CapabilityResolution::effective`])
+/// — an `Unknown` lookup never silently enables model features or the
+/// optimistic context — and then clamped by the provider's live runtime
+/// window (the Ollama `/api/ps` allocation). Used at plan time AND at every
+/// post-routing refresh, so the gate can never be bypassed through a
+/// re-plan. A gated lookup is surfaced as a bounded warn (telemetry), never
+/// silently.
+pub(crate) fn resolve_turn_caps(
+    provider: &std::sync::Arc<dyn faktor_provider::Provider>,
+    model: &str,
+) -> (
+    faktor_core::model::ModelCapabilities,
+    faktor_core::model::CapabilityAuthority,
+    faktor_core::model::ModelCapabilities,
+) {
+    let resolution = provider.capability_resolution(model);
+    let mut effective = resolution.effective();
+    if let Some(limit) = provider.runtime_context_limit(model) {
+        effective.context = effective.context.min(limit);
+    }
+    if resolution.is_gated() {
+        tracing::warn!(
+            provider = %provider.id(),
+            model = %model,
+            authority = resolution.authority.as_str(),
+            "capability lookup carries no model-specific authority: model features are gated off until the endpoint declares this model (context/tools/vision conservative)"
+        );
+    }
+    (resolution.caps, resolution.authority, effective)
+}
+
 /// Loop-carried state of ONE logical turn (the locals `drive_turn_inner`
 /// kept across its iterations, lifted into one owner).
 pub(crate) struct TurnDriveState<'a> {
@@ -34,12 +67,22 @@ pub(crate) struct TurnDriveState<'a> {
     pub(crate) model: String,
     pub(crate) envelope_fixed: bool,
     pub(crate) caps: faktor_core::model::ModelCapabilities,
+    /// The authority state of `caps` (`known` / `declared_generic` /
+    /// `unknown`): surfaced to telemetry and tests; `effective_caps` is the
+    /// gated decision profile derived from it.
+    pub(crate) cap_authority: faktor_core::model::CapabilityAuthority,
     pub(crate) effective_caps: faktor_core::model::ModelCapabilities,
     pub(crate) budget: ContextBudget,
     pub(crate) admitted_evidence_hash: Option<u64>,
     pub(crate) semantic_turn: Option<SemanticTurnState>,
     pub(crate) evidence_poll_status: Option<crate::EvidencePollStatus>,
     pub(crate) system_extra: String,
+    /// The Faktor-rendered internal-context block of THIS turn
+    /// ([`ParentTurnInput`] channel): DATA authority only — folded into the
+    /// volatile system slot at every boundary, never into the conversation.
+    /// Consumed exactly once from the runtime's op-keyed map by
+    /// [`TurnDriveState::new`].
+    pub(crate) internal_context: String,
     pub(crate) recent: Vec<RecentTurn>,
     pub(crate) evidence: Vec<Evidence>,
     pub(crate) project_rules: String,
@@ -161,19 +204,14 @@ impl<'a> TurnDriveState<'a> {
         // recovery resumes from the RECORD, never from whatever the session
         // defaults are afterwards (P1: overrides survive crashes).
         let envelope_fixed = false;
-        let caps = provider.capabilities(&model);
-        // P0 (runtime context override): a provider's LIVE runtime window
-        // (e.g. the Ollama /api/ps allocation, which can sit far below the
-        // advertised 256K model maximum) is the real budget ceiling. When
-        // the provider reports one, budget from min(model max, runtime
-        // limit); None means no live data and the model maximum stands
-        // (today's behavior — safe direction). Built ONCE per logical turn,
-        // so the compaction trigger, try_compact's target, and every
-        // post-compaction re-plan all share the SAME effective budget.
-        let mut effective_caps = caps.clone();
-        if let Some(limit) = provider.runtime_context_limit(&model) {
-            effective_caps.context = effective_caps.context.min(limit);
-        }
+        // The capability view is AUTHORITY-aware: `effective_caps` (the
+        // budget/tool/vision decision input, see `resolve_turn_caps`) is the
+        // declared profile gated for an Unknown lookup and clamped by the
+        // provider's LIVE runtime window (e.g. the Ollama /api/ps allocation,
+        // which can sit far below the advertised maximum). Built ONCE per
+        // logical turn, so the compaction trigger, try_compact's target, and
+        // every post-compaction re-plan all share the SAME effective budget.
+        let (caps, cap_authority, effective_caps) = resolve_turn_caps(&provider, &model);
         let budget = ContextBudget::for_capabilities(&effective_caps);
         // P0-79 site d: the hash of the evidence set the last retrieval
         // admitted into this drive's context (drive-local; the tracker's
@@ -189,6 +227,22 @@ impl<'a> TurnDriveState<'a> {
         // same turn with the same status dedupes durably (same revision +
         // same bytes).
         let evidence_poll_status: Option<crate::EvidencePollStatus> = None;
+        // The structured internal-context channel (`ParentTurnInput`): the
+        // already-rendered Faktor section of THIS op, consumed exactly once
+        // here, PLUS the DURABLE pending sections the orchestrator's
+        // child-terminal settlement recorded for this session (the parent
+        // continuation), consumed exactly once here as well. The blocks are
+        // DATA rendered under the Faktor-controlled internal-context header
+        // — folded into the volatile system slot at every boundary and
+        // NEVER conversation messages.
+        let mut internal_context = rt.take_internal_context(op_id);
+        let pending = take_pending_internal_context(handle);
+        if !pending.is_empty() {
+            if !internal_context.is_empty() {
+                internal_context.push('\n');
+            }
+            internal_context.push_str(&pending);
+        }
         Ok(Self {
             handle,
             op_id,
@@ -207,12 +261,14 @@ impl<'a> TurnDriveState<'a> {
             model,
             envelope_fixed,
             caps,
+            cap_authority,
             effective_caps,
             budget,
             admitted_evidence_hash,
             semantic_turn,
             evidence_poll_status,
             system_extra: String::new(),
+            internal_context,
             recent: Vec::new(),
             evidence: Vec::new(),
             project_rules: String::new(),
@@ -291,12 +347,26 @@ impl AgentRuntime {
             Some(notice) => format!("{steer_note}\n{notice}"),
             None => steer_note,
         };
+        // The Faktor-rendered internal-context block of this turn
+        // (`ParentTurnInput` channel) rides the volatile system tail AFTER
+        // the steering/coordination slot: it is untrusted DATA from child
+        // agents under its own Faktor-controlled `[faktor:internal-context]`
+        // header (never instructions, never user authority), and it can
+        // never open a prompt section because every child-controlled string
+        // was flattened before it entered this string. A turn without an
+        // internal block is byte-identical to the pre-channel path.
+        if !st.internal_context.is_empty() {
+            st.system_extra = if st.system_extra.is_empty() {
+                st.internal_context.clone()
+            } else {
+                format!("{}\n{}", st.system_extra, st.internal_context)
+            };
+        }
         if model_changed {
-            st.caps = st.provider.capabilities(&st.model);
-            st.effective_caps = st.caps.clone();
-            if let Some(limit) = st.provider.runtime_context_limit(&st.model) {
-                st.effective_caps.context = st.effective_caps.context.min(limit);
-            }
+            let (caps, cap_authority, effective_caps) = resolve_turn_caps(&st.provider, &st.model);
+            st.caps = caps;
+            st.cap_authority = cap_authority;
+            st.effective_caps = effective_caps;
             st.budget = ContextBudget::for_capabilities(&st.effective_caps);
         }
         let state = st.handle.state()?;
@@ -989,11 +1059,10 @@ impl AgentRuntime {
             // model: refresh caps and the context budget for the NEXT
             // iteration's plan (this iteration's plan already fits the
             // routed window — the router's fit axis qualified it).
-            st.caps = st.provider.capabilities(&st.model);
-            st.effective_caps = st.caps.clone();
-            if let Some(limit) = st.provider.runtime_context_limit(&st.model) {
-                st.effective_caps.context = st.effective_caps.context.min(limit);
-            }
+            let (caps, cap_authority, effective_caps) = resolve_turn_caps(&st.provider, &st.model);
+            st.caps = caps;
+            st.cap_authority = cap_authority;
+            st.effective_caps = effective_caps;
             st.budget = ContextBudget::for_capabilities(&st.effective_caps);
             // v7 durable per-turn envelope: written once, at the bind —
             // the moment the logical turn actually drives with its

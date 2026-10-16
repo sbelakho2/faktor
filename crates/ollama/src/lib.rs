@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use faktor_core::error::{Error, ErrorKind};
-use faktor_core::model::{ModelCapabilities, ReasoningMode};
+use faktor_core::model::{CapabilityResolution, ModelCapabilities, ReasoningMode};
 use faktor_provider::catalog::{
     ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
 };
@@ -739,6 +739,11 @@ impl Provider for OllamaProvider {
         // Default profile: small local models are the norm (spec §9/§10);
         // a live probe replaces this once the daemon warms the provider.
         ModelCapabilities::small_local()
+    }
+    fn capability_resolution(&self, model: &str) -> CapabilityResolution {
+        let modeled = self.config.model_overrides.contains_key(model)
+            || self.probed.read().unwrap().contains_key(model);
+        CapabilityResolution::from_declaration(self.capabilities(model), modeled)
     }
 
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {

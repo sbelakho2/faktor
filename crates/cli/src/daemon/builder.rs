@@ -1187,17 +1187,29 @@ pub(crate) fn build_daemon_core(
     // (audit items 13/14/L): verified samples the runtime records at the
     // deterministic gate sites land here and every later route consult
     // reads them back — routing and the recorded outcome history share
-    // one store-backed registry, exactly like the pricing authority.
+    // one store-backed registry, exactly like the pricing authority. The
+    // installation itself is gated by `[efficiency].rework_routing` (see
+    // below): OFF selects the no-op registry, the documented off-switch of
+    // the rework-aware routing component.
     let routing_mode = config
         .routing_mode
         .clone()
         .unwrap_or(faktor_core::model::RoutingMode::Economy);
-    let routing = graph::economic_routing_policy_with_outcomes(
-        &providers,
-        routing_mode,
-        Arc::new(faktor_agent::StoreOutcomeStore::new(store.clone())),
-    )
-    .map_err(|e| format!("routing config error: {e}"))?;
+    // The `[efficiency].rework_routing` production gate (audit: efficiency
+    // switches must have real consumers): ON (the production default)
+    // installs the store-backed verified-outcome registry — every verified
+    // sample the runtime records at its deterministic gate sites lands in
+    // this store and every later route consult reads it back. OFF installs
+    // the documented no-op registry, so neither recording nor consultation
+    // reaches durable state and routing scores exactly like a
+    // registry-less service.
+    let outcomes: Arc<dyn faktor_router::OutcomeStore> = if config.efficiency.rework_routing {
+        Arc::new(faktor_agent::StoreOutcomeStore::new(store.clone()))
+    } else {
+        Arc::new(faktor_router::EmptyOutcomeStore)
+    };
+    let routing = graph::economic_routing_policy_with_outcomes(&providers, routing_mode, outcomes)
+        .map_err(|e| format!("routing config error: {e}"))?;
     // Step 8 — the durable cost ledger over THIS daemon's store (P0-6/12):
     // one reservation per paid model call, settled exactly once. Crash
     // recovery abandons every OPEN reservation of a previous process BEFORE
@@ -1313,33 +1325,7 @@ pub(crate) fn build_daemon_core(
     // the daemon configuration immediately (never a silent estimate), and
     // conservative-accounting rows stay routable with their UpperBound
     // uncertainty recorded on the certification row.
-    let tokenizer_rows = graph::certify_provider_tokenizers(&providers, &tokenizers)?;
-    for row in &tokenizer_rows {
-        if row.is_exact() {
-            tracing::debug!(
-                provider = %row.provider,
-                model = %row.model,
-                tokenizer = %row.tokenizer,
-                compatibility = row.compatibility.as_str(),
-                estimate_kind = row.estimate_kind,
-                "tokenizer certification"
-            );
-        } else {
-            // Conservative-accounting row: routable, but every count it
-            // produces is an UpperBound — the uncertainty is attached to
-            // the daemon's budget/routing telemetry explicitly (never
-            // silently treated as exact).
-            tracing::info!(
-                provider = %row.provider,
-                model = %row.model,
-                tokenizer = %row.tokenizer,
-                compatibility = row.compatibility.as_str(),
-                estimate_kind = row.estimate_kind,
-                uncertainty = row.uncertainty,
-                "token accounting uncertainty: conservative UpperBound estimates"
-            );
-        }
-    }
+    certify_and_log_tokenizers(&providers, &tokenizers)?;
     // Step 17 — Faktor Acquire (docs/acquire.md §13/§14): the ONE commerce
     // source service, constructed AFTER memory/tokenizers and BEFORE the
     // agent, because the `source_market` tool needs its Arc before the final
@@ -1592,6 +1578,47 @@ pub(crate) fn build_daemon_core(
         shadows,
         tasks,
     })
+}
+
+/// Tokenizer compatibility certification + reporting (audit item 22; the
+/// cohesive phase split out of [`build_daemon_core`]): classify every
+/// built-in and configured catalog row of `providers` against the ONE
+/// tokenizer `registry`, refusing the daemon configuration on any
+/// exact-accounting row without an exact tokenizer, and logging each
+/// conservative row with its explicit UpperBound uncertainty (routable,
+/// never silently treated as exact).
+pub(crate) fn certify_and_log_tokenizers(
+    providers: &ProviderRegistry,
+    registry: &faktor_context::TokenizerRegistry,
+) -> Result<(), String> {
+    let tokenizer_rows = graph::certify_provider_tokenizers(providers, registry)?;
+    for row in &tokenizer_rows {
+        if row.is_exact() {
+            tracing::debug!(
+                provider = %row.provider,
+                model = %row.model,
+                tokenizer = %row.tokenizer,
+                compatibility = row.compatibility.as_str(),
+                estimate_kind = row.estimate_kind,
+                "tokenizer certification"
+            );
+        } else {
+            // Conservative-accounting row: routable, but every count it
+            // produces is an UpperBound — the uncertainty is attached to
+            // the daemon's budget/routing telemetry explicitly (never
+            // silently treated as exact).
+            tracing::info!(
+                provider = %row.provider,
+                model = %row.model,
+                tokenizer = %row.tokenizer,
+                compatibility = row.compatibility.as_str(),
+                estimate_kind = row.estimate_kind,
+                uncertainty = row.uncertainty,
+                "token accounting uncertainty: conservative UpperBound estimates"
+            );
+        }
+    }
+    Ok(())
 }
 
 use faktor_learning::LearningStore as _;

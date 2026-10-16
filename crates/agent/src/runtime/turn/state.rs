@@ -4,6 +4,11 @@
 
 use super::*;
 
+// THE one ledger sanitizer (faktor-context crate root): child handoff text
+// is flattened through the same function as the ledger fold and the wire
+// renderer, so there is no second sanitizer that could drift.
+use faktor_context::sanitize_ledger_text;
+
 /// Default stall-silence budget (see [`StallTracker`]): total silence
 /// (no output, no progress, no op completion) past this marks the session
 /// stalled. Tunable per runtime via
@@ -37,20 +42,99 @@ pub const MAX_CHILD_HANDOFF_ITEMS: usize = 16;
 /// budget.
 pub(crate) const CHILD_HANDOFF_ITEM_CHARS: usize = 240;
 
+/// Availability envelope of ONE acquired handoff component (the
+/// unavailable-≠-absent law). A component the runtime READ is `Available` —
+/// including an empty one, which honestly means "the child recorded
+/// nothing" — while a read/decode that FAILED is `Unavailable` with the
+/// typed reason: the value is UNKNOWN, and the parent's next action differs
+/// (re-read through the scoped refs / surface the failure). The two states
+/// never collapse: the renderer always prints an unavailable component and
+/// the truncation loop never drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffData<T> {
+    /// The component was read; `T` is its value (an empty collection is a
+    /// genuine absence, never a failure).
+    Available(T),
+    /// The component could not be read or decoded: its value is unknown.
+    Unavailable { reason: String },
+}
+
+impl<T> HandoffData<T> {
+    pub fn available(value: T) -> Self {
+        Self::Available(value)
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    /// The read value, or `None` when the component is unavailable. An
+    /// available-but-empty component yields `Some` — the caller distinguishes
+    /// absence from unavailability, never the reverse.
+    pub fn as_available(&self) -> Option<&T> {
+        match self {
+            Self::Available(value) => Some(value),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// A component that was never acquired is `Unavailable`, never an
+/// apparently-empty `Available`: constructing a handoff must not read as a
+/// complete report when a component was not read.
+impl<T> Default for HandoffData<T> {
+    fn default() -> Self {
+        Self::Unavailable {
+            reason: "not acquired".into(),
+        }
+    }
+}
+
+/// Typed refusal of [`ChildHandoff::render_bounded`]: the IRREDUCIBLE
+/// envelope (the Faktor-owned `[child-handoff]` header, the mandatory
+/// identity lines, every unavailable-component line and the kept session
+/// ref) alone exceeds `budget_tokens`. The renderer never returns an
+/// over-budget string and never manufactures an empty "handoff".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildHandoffOversized {
+    pub budget_tokens: usize,
+    pub envelope_tokens: usize,
+}
+
+impl std::fmt::Display for ChildHandoffOversized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "child handoff envelope needs {} tokens but the budget is {}",
+            self.envelope_tokens, self.budget_tokens
+        )
+    }
+}
+
+impl std::error::Error for ChildHandoffOversized {}
+
 /// The bounded typed handoff of ONE child agent (audit: the parent consumes
 /// THIS, never the child transcript). `refs` are scoped pointers to the
 /// backing rows; everything not rendered here remains retrievable through
-/// them.
+/// them. `facts`/`findings`/`decisions`/`changed_files` each carry their
+/// acquisition state ([`HandoffData`]), so a failed child-side read can
+/// never masquerade as "the child recorded nothing".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChildHandoff {
     pub child_id: String,
     pub child_session: Option<SessionId>,
     pub goal: String,
     pub outcome: String,
-    pub facts: Vec<String>,
-    pub findings: Vec<String>,
-    pub decisions: Vec<String>,
-    pub changed_files: Vec<String>,
+    pub facts: HandoffData<Vec<String>>,
+    pub findings: HandoffData<Vec<String>>,
+    pub decisions: HandoffData<Vec<String>>,
+    pub changed_files: HandoffData<Vec<String>>,
     pub refs: Vec<String>,
 }
 
@@ -62,15 +146,57 @@ impl ChildHandoff {
         }
     }
 
+    /// Sanitized provenance item block: every item is flattened through the
+    /// ONE ledger sanitizer ([`faktor_context::sanitize_ledger_text`]), so
+    /// control characters (embedded newlines included) become spaces and a
+    /// hostile child string can never open a prompt section — not even in
+    /// the unbounded telemetry render.
     pub(crate) fn item_line(label: &str, items: &[String]) -> String {
         if items.is_empty() {
             return String::new();
         }
         let mut out = format!("{label}:\n");
         for item in items.iter().take(MAX_CHILD_HANDOFF_ITEMS) {
-            out.push_str(&format!("- {}\n", truncate(item, CHILD_HANDOFF_ITEM_CHARS)));
+            out.push_str(&format!(
+                "- {}\n",
+                truncate(&sanitize_ledger_text(item), CHILD_HANDOFF_ITEM_CHARS)
+            ));
         }
         out
+    }
+
+    /// One acquisition-envelope component as a provenance block: an
+    /// available component renders its items (an available-but-empty
+    /// component renders nothing — genuine absence), an unavailable one
+    /// renders its sanitized reason EXPLICITLY (never dropped, never
+    /// confused with absence).
+    pub(crate) fn data_block(label: &str, data: &HandoffData<Vec<String>>) -> String {
+        match data {
+            HandoffData::Available(items) => Self::item_line(label, items),
+            HandoffData::Unavailable { reason } => format!(
+                "{label}: unavailable ({})\n",
+                truncate(&sanitize_ledger_text(reason), CHILD_HANDOFF_ITEM_CHARS)
+            ),
+        }
+    }
+
+    fn changed_files_block(data: &HandoffData<Vec<String>>) -> String {
+        match data {
+            HandoffData::Available(items) if items.is_empty() => String::new(),
+            HandoffData::Available(items) => {
+                let joined = items
+                    .iter()
+                    .take(MAX_CHILD_HANDOFF_ITEMS)
+                    .map(|s| sanitize_ledger_text(s))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("changed files: {}\n", truncate(&joined, 300))
+            }
+            HandoffData::Unavailable { reason } => format!(
+                "changed files: unavailable ({})\n",
+                truncate(&sanitize_ledger_text(reason), CHILD_HANDOFF_ITEM_CHARS)
+            ),
+        }
     }
 
     pub(crate) fn render_unbounded(&self) -> String {
@@ -78,35 +204,38 @@ impl ChildHandoff {
         if !self.child_id.is_empty() {
             out.push_str(&format!(
                 "child: {}\n",
-                truncate(&self.child_id, CHILD_HANDOFF_ITEM_CHARS)
+                truncate(
+                    &sanitize_ledger_text(&self.child_id),
+                    CHILD_HANDOFF_ITEM_CHARS
+                )
             ));
         }
         if !self.goal.is_empty() {
             out.push_str(&format!(
                 "goal: {}\n",
-                truncate(&self.goal, CHILD_HANDOFF_ITEM_CHARS)
+                truncate(&sanitize_ledger_text(&self.goal), CHILD_HANDOFF_ITEM_CHARS)
             ));
         }
         if !self.outcome.is_empty() {
             out.push_str(&format!(
                 "outcome: {}\n",
-                truncate(&self.outcome, CHILD_HANDOFF_ITEM_CHARS)
+                truncate(
+                    &sanitize_ledger_text(&self.outcome),
+                    CHILD_HANDOFF_ITEM_CHARS
+                )
             ));
         }
-        out.push_str(&Self::item_line("facts", &self.facts));
-        out.push_str(&Self::item_line("findings", &self.findings));
-        out.push_str(&Self::item_line("decisions", &self.decisions));
-        if !self.changed_files.is_empty() {
-            out.push_str("changed files: ");
-            out.push_str(&truncate(&self.changed_files.join(", "), 300));
-            out.push('\n');
-        }
+        out.push_str(&Self::data_block("facts", &self.facts));
+        out.push_str(&Self::data_block("findings", &self.findings));
+        out.push_str(&Self::data_block("decisions", &self.decisions));
+        out.push_str(&Self::changed_files_block(&self.changed_files));
         out.push_str(&Self::item_line("refs", &self.refs));
         out
     }
 
     /// The deterministic, unbounded render (telemetry/tests only; the
     /// production parent path always calls [`ChildHandoff::render_bounded`]).
+    /// Every child-controlled string is sanitized (see [`Self::item_line`]).
     pub fn render(&self) -> String {
         self.render_unbounded()
     }
@@ -119,17 +248,26 @@ impl ChildHandoff {
     /// `budget_tokens`. Drop order is fixed (decisions, findings, facts,
     /// changed files, then refs — always keeping the session ref), so two
     /// runs of the same handoff produce byte-identical renders. Returns the
-    /// number of dropped items.
+    /// number of dropped items. The irreducible envelope (fixed header,
+    /// identity lines, unavailable components, kept ref) is never dropped —
+    /// [`Self::render_bounded`] refuses typed when it alone exceeds the
+    /// budget.
     pub fn truncate_to_tokens(&mut self, budget_tokens: usize) -> usize {
+        fn pop_one(data: &mut HandoffData<Vec<String>>) -> bool {
+            match data {
+                HandoffData::Available(items) => items.pop().is_some(),
+                HandoffData::Unavailable { .. } => false,
+            }
+        }
         let mut dropped = 0usize;
         loop {
             if self.approx_tokens() <= budget_tokens {
                 return dropped;
             }
-            if self.decisions.pop().is_some()
-                || self.findings.pop().is_some()
-                || self.facts.pop().is_some()
-                || self.changed_files.pop().is_some()
+            if pop_one(&mut self.decisions)
+                || pop_one(&mut self.findings)
+                || pop_one(&mut self.facts)
+                || pop_one(&mut self.changed_files)
             {
                 dropped += 1;
                 continue;
@@ -154,15 +292,37 @@ impl ChildHandoff {
         }
     }
 
+    /// The irreducible envelope render: every droppable item is dropped and
+    /// the fixed lines (Faktor header, identity lines, unavailable
+    /// components, kept session ref) remain. This is the exact minimal text
+    /// [`Self::render_bounded`] can ever produce for a budget ≥ 1, and the
+    /// token count the typed [`ChildHandoffOversized`] names.
+    pub fn minimal_render(&self) -> String {
+        let mut copy = self.clone();
+        copy.truncate_to_tokens(0);
+        copy.render_unbounded()
+    }
+
     /// The bounded production render: the parent-visible handoff text never
-    /// exceeds `budget_tokens` (a `0` budget renders nothing at all).
-    pub fn render_bounded(&self, budget_tokens: usize) -> String {
+    /// exceeds `budget_tokens` (a `0` budget renders nothing at all; a
+    /// budget that cannot fit even the irreducible envelope is the typed
+    /// [`ChildHandoffOversized`] — never an over-budget prompt, never a
+    /// fabricated complete-looking handoff).
+    pub fn render_bounded(&self, budget_tokens: usize) -> Result<String, ChildHandoffOversized> {
         if budget_tokens == 0 {
-            return String::new();
+            return Ok(String::new());
         }
         let mut copy = self.clone();
         copy.truncate_to_tokens(budget_tokens);
-        copy.render_unbounded()
+        let rendered = copy.render_unbounded();
+        let tokens = faktor_context::Estimator.estimate_tokens(&rendered);
+        if tokens > budget_tokens {
+            return Err(ChildHandoffOversized {
+                budget_tokens,
+                envelope_tokens: tokens,
+            });
+        }
+        Ok(rendered)
     }
 }
 
@@ -612,7 +772,22 @@ pub struct AgentRuntime {
     /// gate through [`AgentRuntime::set_value_gate`] when `[billing]` is
     /// enabled.
     pub(crate) value_gate: std::sync::Mutex<faktor_core::entitlement::ValueGate>,
+    /// Rendered internal-context sections of submitted-but-not-yet-driven
+    /// parent turns, keyed by the turn's operation id (the
+    /// [`ParentTurnInput`] channel). The block is DATA rendered by the
+    /// Faktor-controlled internal-context renderer; the drive that owns the
+    /// op consumes it exactly once at its start and folds it into the
+    /// volatile system slot — it never enters the user-role conversation.
+    /// Bounded: at most [`MAX_INTERNAL_CONTEXT_ENTRIES`] blocks are kept
+    /// (oldest operation evicted), so a queue that never runs cannot grow
+    /// memory without bound.
+    pub(crate) internal_context: std::sync::Mutex<std::collections::HashMap<OpId, String>>,
 }
+
+/// Hard bound of in-flight internal-context blocks (bounded everything): a
+/// submitted block is consumed when its turn drives; older operations that
+/// never drove are evicted oldest-first.
+pub(crate) const MAX_INTERNAL_CONTEXT_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
@@ -1932,6 +2107,7 @@ impl AgentRuntime {
             verification_providers: std::sync::Mutex::new(None),
             system_intelligence: std::sync::Mutex::new(None),
             value_gate: std::sync::Mutex::new(faktor_core::entitlement::ValueGate::absent()),
+            internal_context: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -2002,6 +2178,34 @@ impl AgentRuntime {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// Store the rendered internal-context block of a submitted turn, keyed
+    /// by its operation id (see [`AgentRuntime::run_turn_input`]). Bounded:
+    /// beyond [`MAX_INTERNAL_CONTEXT_ENTRIES`] the oldest operation is
+    /// evicted.
+    pub(crate) fn store_internal_context(&self, op_id: OpId, rendered: String) {
+        let mut map = self
+            .internal_context
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if map.len() >= MAX_INTERNAL_CONTEXT_ENTRIES {
+            if let Some(oldest) = map.keys().min().copied() {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(op_id, rendered);
+    }
+
+    /// Consume the internal-context block of `op_id` (empty when the turn
+    /// carries none). Exactly-once: the drive's state constructor takes the
+    /// block, so no later turn can inherit it.
+    pub(crate) fn take_internal_context(&self, op_id: OpId) -> String {
+        self.internal_context
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&op_id)
+            .unwrap_or_default()
     }
 
     /// THE durable evidence authority of this runtime (schema v21).
@@ -2404,6 +2608,7 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::runtime::tests::{deps, new_session};
     use faktor_core::model::ModelCapabilities;
     use faktor_provider::FakeProvider;

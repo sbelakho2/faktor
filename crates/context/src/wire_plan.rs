@@ -57,6 +57,7 @@ use crate::assembler::Evidence;
 use crate::budget::ContextBudget;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
+use crate::sanitize_ledger_text;
 use crate::tokenizer::{GenericTokenCounter, ModelTokenCounter, TokenCounter};
 use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
 
@@ -1130,23 +1131,6 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
-}
-
-/// Recorded ledger text (decisions, failures) is PROVENANCE DATA, never
-/// instructions: control characters are flattened so an embedded newline can
-/// never open a new prompt section, and the outer whitespace is trimmed.
-fn sanitize_ledger_text(text: &str) -> String {
-    let flattened: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    flattened.trim().to_string()
 }
 
 #[cfg(test)]

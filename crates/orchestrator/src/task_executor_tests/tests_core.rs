@@ -1910,6 +1910,11 @@ impl Provider for RecordingProvider {
         let _ = model;
         self.caps.clone()
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         use futures::StreamExt;
         self.request_count.fetch_add(1, Ordering::SeqCst);

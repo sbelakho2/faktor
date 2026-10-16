@@ -418,6 +418,7 @@ async fn native_models_and_capabilities_serve_registered_models() {
             api_key: None,
             family: faktor_openai::OpenAiFamily::Chat,
             models: caps,
+            declared_generic: std::collections::HashSet::new(),
         },
         permissive_transport(),
     );

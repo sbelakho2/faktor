@@ -3,19 +3,23 @@
 use super::*;
 
 impl AgentRuntime {
-    /// Admission-time provider facts for media validation: the capabilities
-    /// of `provider`/`model` plus the provider's per-image byte bound.
-    /// `None` when the provider is not registered — admission callers fail
-    /// closed (a typed refusal, never an assume-vision default).
+    /// Admission-time provider facts for media validation: the
+    /// AUTHORITY-gated capabilities of `provider`/`model` (an `Unknown`
+    /// lookup can never admit images on an assumed vision flag) plus the
+    /// provider's per-image byte bound. `None` when the provider is not
+    /// registered — admission callers fail closed (a typed refusal, never an
+    /// assume-vision default).
     pub fn provider_media_caps(
         &self,
         provider: &str,
         model: &str,
     ) -> Option<(faktor_core::model::ModelCapabilities, usize)> {
-        self.deps
-            .providers
-            .get(provider)
-            .map(|p| (p.capabilities(model), p.max_image_bytes()))
+        self.deps.providers.get(provider).map(|p| {
+            (
+                p.capability_resolution(model).effective(),
+                p.max_image_bytes(),
+            )
+        })
     }
 
     /// Resolve the durable task's IMAGE and non-image DOCUMENT attachments
