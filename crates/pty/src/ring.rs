@@ -154,4 +154,67 @@ mod tests {
         assert!(!ring.is_poisoned());
         assert_eq!(lock_ring(&ring).total(), 2);
     }
+
+    /// Independent audit probe: the bulk `push` rewrite must equal a naive
+    /// `VecDeque` oracle byte-for-byte under randomized push/drain
+    /// sequences, including unicode payloads, empty offers, exact-capacity
+    /// offers and oversized offers.
+    #[test]
+    fn bulk_push_matches_a_naive_vecdeque_oracle_under_random_sequences() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        let mut state = 0xBEEF_u64;
+        let mut ring = Ring::new();
+        let mut oracle: VecDeque<u8> = VecDeque::new();
+        let mut total: u64 = 0;
+        // Corpus with unicode bytes and pattern bytes.
+        let corpus: Vec<Vec<u8>> = vec![
+            "颜色 π-😀 mixed ascii".as_bytes().to_vec(),
+            (0..=255u8).collect(),
+            Vec::new(),
+            b"x".to_vec(),
+        ];
+        for round in 0..600 {
+            let choice = lcg(&mut state) % 8;
+            match choice {
+                0..=4 => {
+                    let base = &corpus[(lcg(&mut state) as usize) % corpus.len()];
+                    let len = match lcg(&mut state) % 5 {
+                        0 => RING_MAX_BYTES,      // exact capacity
+                        1 => RING_MAX_BYTES + 17, // oversized
+                        2 => 0,
+                        _ => ((lcg(&mut state) as usize) % 4096).min(base.len().max(1)),
+                    };
+                    let payload: Vec<u8> = if base.is_empty() {
+                        Vec::new()
+                    } else {
+                        base.iter().copied().cycle().take(len).collect()
+                    };
+                    ring.push(&payload);
+                    total = total.saturating_add(payload.len() as u64);
+                    oracle.extend(payload);
+                    while oracle.len() > RING_MAX_BYTES {
+                        oracle.pop_front();
+                    }
+                }
+                5 => {
+                    assert_eq!(ring.snapshot(), oracle.iter().copied().collect::<Vec<u8>>());
+                }
+                6 => {
+                    assert_eq!(ring.drain(), oracle.drain(..).collect::<Vec<u8>>());
+                }
+                _ => {
+                    ring.rebuild();
+                    oracle.clear();
+                    total = 0;
+                }
+            }
+            assert_eq!(ring.total(), total, "round {round}");
+            assert_eq!(ring.snapshot().len(), oracle.len(), "round {round}");
+        }
+    }
 }

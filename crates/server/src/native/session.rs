@@ -1146,52 +1146,33 @@ pub(crate) async fn native_list_sessions(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let sessions = match state.deps.session.list_sessions(None) {
-        Ok(s) => s,
-        Err(e) => return api_err(&e),
+    // ONE statement read of the durable listing per page: the historical
+    // shape ran the manager's listing (a whole-table read plus a journal
+    // verification per session) and then this batch join — the session
+    // table was read twice per page. The single listing now feeds the
+    // served page directly, in the same newest-first order the historical
+    // handle listing used (the manager listing and this read execute the
+    // same store listing), so the served DTO is byte-identical; an
+    // unreadable listing is a typed error, never a partial page.
+    let rows: Vec<faktor_store::SessionRow> = match state.deps.session.store().list_sessions(None) {
+        Ok(rows) => rows,
+        Err(e) => return api_err(&store_err_to_core(e)),
     };
-    // ONE batch read of the durable rows for the served page: the historical
-    // per-handle `row()` store round trip (one get_session query per listed
-    // session, 1000 on a full page) is replaced by a single listing joined
-    // by id. Values are byte-identical (the same table row the per-handle
-    // read would return); when the batch read itself fails — or a row
-    // vanished between the two reads — the handler falls back to the exact
-    // legacy per-handle read, so the fallback entry rules are unchanged.
-    let batch_rows: Option<std::collections::HashMap<faktor_core::id::SessionId, _>> = state
-        .deps
-        .session
-        .store()
-        .list_sessions(None)
-        .ok()
-        .map(|rows| rows.into_iter().map(|row| (row.id, row)).collect());
-    let rows: Vec<serde_json::Value> = sessions
-        .iter()
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
         .take(MAX_NATIVE_SESSION_LISTING)
-        .map(|h| {
-            let row = match batch_rows.as_ref().and_then(|by_id| by_id.get(&h.id())) {
-                Some(row) => Ok(row.clone()),
-                None => h.row(),
-            };
-            match row {
-                Ok(row) => serde_json::json!({
-                    "id": row.id.to_string(),
-                    "title": row.title,
-                    "provider": row.provider,
-                    "model": row.model,
-                    "state": agent_state_tag(row.state),
-                    // Durable creation time for History surfaces (additive;
-                    // the clients parse it tolerantly and never fabricate a
-                    // time).
-                    "created_ms": row.created_ms,
-                }),
-                Err(_) => serde_json::json!({
-                    "id": h.id().to_string(),
-                    "title": "",
-                    "provider": "",
-                    "model": "",
-                    "state": "unknown",
-                }),
-            }
+        .map(|row| {
+            serde_json::json!({
+                "id": row.id.to_string(),
+                "title": row.title,
+                "provider": row.provider,
+                "model": row.model,
+                "state": agent_state_tag(row.state),
+                // Durable creation time for History surfaces (additive;
+                // the clients parse it tolerantly and never fabricate a
+                // time).
+                "created_ms": row.created_ms,
+            })
         })
         .collect();
     Json(serde_json::json!({ "sessions": rows })).into_response()
@@ -1556,11 +1537,15 @@ mod tests {
         );
     }
 
-    /// The History surfaces need a durable time: the listing serves the
-    /// session row's `created_ms` (additive DTO field; clients parse it
-    /// tolerantly and never fabricate one).
+    /// Perf-wave follow-up (residual): the listing route reads the session
+    /// table exactly ONCE per page. The historical shape ran the manager's
+    /// listing (whole-table read plus a journal verification per session)
+    /// and then a batch join — two full reads per page. The single listing
+    /// now feeds the served page directly; the DTO stays byte-identical to
+    /// the historical per-handle projection, and the handler performs
+    /// exactly one store read (one listing statement) at 5k sessions.
     #[tokio::test]
-    async fn session_listing_batches_durable_row_reads() {
+    async fn session_listing_reads_the_table_once_per_page() {
         let dir = tempfile::tempdir().unwrap();
         let (state, _seed) = test_state(dir.path(), "seed");
         let session = state.deps.session.clone();
@@ -1573,15 +1558,14 @@ mod tests {
                 .unwrap();
         }
         let seed_elapsed = started.elapsed();
-        let started = std::time::Instant::now();
-        let sessions = session.list_sessions(None).unwrap();
-        let list_elapsed = started.elapsed();
-        assert!(sessions.len() > EXTRA_SESSIONS);
 
-        // The historical projection, replayed verbatim: take(cap) then one
-        // get_session store read per listed handle.
+        // The historical projection, replayed verbatim from the manager
+        // listing order: take(cap) then one get_session read per listed
+        // handle. This is the golden the single-read DTO must reproduce
+        // byte for byte.
         let started = std::time::Instant::now();
-        let historical: Vec<serde_json::Value> = sessions
+        let handles = session.list_sessions(None).unwrap();
+        let historical: Vec<serde_json::Value> = handles
             .iter()
             .take(MAX_NATIVE_SESSION_LISTING)
             .map(|h| match h.row() {
@@ -1603,46 +1587,37 @@ mod tests {
             })
             .collect();
         let historical_elapsed = started.elapsed();
+        assert!(handles.len() > EXTRA_SESSIONS);
 
-        // The batched projection this fix installs: ONE store listing joined
-        // by id, then the identical DTO rows.
+        // ONE store listing is all the served page needs (the same query
+        // the manager listing runs, so the rows and their order are
+        // identical).
         let started = std::time::Instant::now();
-        let batch_rows: std::collections::HashMap<faktor_core::id::SessionId, _> = session
-            .store()
-            .list_sessions(None)
-            .unwrap()
+        let listing = session.store().list_sessions(None).unwrap();
+        let single: Vec<serde_json::Value> = listing
             .into_iter()
-            .map(|row| (row.id, row))
-            .collect();
-        let batched: Vec<serde_json::Value> = sessions
-            .iter()
             .take(MAX_NATIVE_SESSION_LISTING)
-            .map(|h| match batch_rows.get(&h.id()) {
-                Some(row) => serde_json::json!({
+            .map(|row| {
+                serde_json::json!({
                     "id": row.id.to_string(),
                     "title": row.title,
                     "provider": row.provider,
                     "model": row.model,
                     "state": agent_state_tag(row.state),
                     "created_ms": row.created_ms,
-                }),
-                None => serde_json::json!({
-                    "id": h.id().to_string(),
-                    "title": "",
-                    "provider": "",
-                    "model": "",
-                    "state": "unknown",
-                }),
+                })
             })
             .collect();
-        let batched_projection = started.elapsed();
+        let single_projection = started.elapsed();
         assert_eq!(
-            batched, historical,
-            "the batched projection answers byte-identically to the per-handle read"
+            single, historical,
+            "the single-read projection answers byte-identically to the per-handle read"
         );
 
         let headers = authed_headers(&state);
+        let reads_before = session.store().reader_telemetry().reads;
         let response = super::native_list_sessions(State(state.clone()), headers).await;
+        let reads_after = session.store().reader_telemetry().reads;
         let (status, body) = json_body(response).await;
         assert_eq!(status, StatusCode::OK);
         let rows = body["sessions"].as_array().expect("sessions array");
@@ -1650,9 +1625,14 @@ mod tests {
             rows, &historical,
             "the served handler answers byte-identically to the per-handle read"
         );
+        assert_eq!(
+            reads_after - reads_before,
+            1,
+            "the page must read the session table exactly once (one listing statement)"
+        );
         eprintln!(
-            "session listing: {} sessions (seed {seed_elapsed:?}, list+verify {list_elapsed:?}): per-handle projection {historical_elapsed:?} vs batched projection {batched_projection:?}",
-            sessions.len()
+            "session listing: {} sessions (seed {seed_elapsed:?}, manager list+verify {historical_elapsed:?}): single-read projection {single_projection:?}; handler reads delta 1",
+            handles.len()
         );
     }
 

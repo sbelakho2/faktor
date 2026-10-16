@@ -420,6 +420,10 @@ pub(crate) fn parse_lifecycle(
 #[path = "session_command_txn_tests.rs"]
 mod session_command_txn_tests;
 
+#[cfg(test)]
+#[path = "session_listing_tests.rs"]
+mod session_listing_tests;
+
 impl Store {
     pub fn create_session(
         &self,
@@ -517,6 +521,13 @@ impl Store {
         }
     }
 
+    /// The durable session listing, newest-updated first. This is the page
+    /// routes' single read (perf-wave follow-up): `/native/sessions` serves
+    /// its DTO directly from ONE call's result — the historical handler ran
+    /// the manager listing AND a second listing join, reading the whole
+    /// table twice per page — so the contract is exactly one statement per
+    /// call. `workspace_id = Some` filters to one workspace; `None` lists
+    /// every session.
     pub fn list_sessions(&self, workspace_id: Option<WorkspaceId>) -> StoreResult<Vec<SessionRow>> {
         let conn = self.read()?;
         let mut stmt = match workspace_id {

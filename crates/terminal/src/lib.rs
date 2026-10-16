@@ -3856,6 +3856,79 @@ mod ring_tests {
             assert_eq!(a.len(), b.len(), "input {input:?}");
         }
     }
+
+    /// Independent audit probe: randomized interleavings of `push` and
+    /// `push_text_lines` (mixed payloads: unicode, `\r\n`, lone `\r`,
+    /// embedded empty lines, no trailing newline) must equal a naive
+    /// per-line `VecDeque` oracle for capacities 0, 1, 3 and the production
+    /// window — and `push_text_lines` may only materialize the surviving
+    /// window.
+    #[test]
+    fn bulk_text_lines_match_the_naive_per_line_oracle_under_random_sequences() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        let payloads = [
+            "颜色 π-😀 line\r\nnext\nno-newline-tail",
+            "",
+            "\r",
+            "\n\n\n",
+            "a\r\nb\rc\nd\r",
+            "one line only",
+        ];
+        let mut state = 0xFEED_u64;
+        for capacity in [0usize, 1, 3, RING_LINES] {
+            let mut ring = RingBuffer::new(capacity);
+            let mut oracle: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            for round in 0..400 {
+                match lcg(&mut state) % 3 {
+                    0 => {
+                        let line = format!("pushed-{round}");
+                        ring.push(line.clone());
+                        if capacity > 0 {
+                            if oracle.len() == capacity {
+                                oracle.pop_front();
+                            }
+                            oracle.push_back(line);
+                        }
+                    }
+                    _ => {
+                        let input = payloads[(lcg(&mut state) as usize) % payloads.len()];
+                        let segments = input.split('\n').count();
+                        let materialized = ring.push_text_lines(input);
+                        assert_eq!(
+                            materialized,
+                            segments.min(capacity),
+                            "capacity {capacity}: only the surviving window may materialize"
+                        );
+                        for line in input.split('\n') {
+                            let line = line.trim_end_matches('\r').to_string();
+                            if capacity > 0 {
+                                if oracle.len() == capacity {
+                                    oracle.pop_front();
+                                }
+                                oracle.push_back(line);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    ring.len(),
+                    oracle.len(),
+                    "capacity {capacity} round {round}"
+                );
+                let expected: String = oracle.iter().map(|l| format!("{l}\n")).collect();
+                assert_eq!(
+                    ring.excerpt(),
+                    expected,
+                    "capacity {capacity} round {round}"
+                );
+            }
+        }
+    }
 }
 
 // Every test below drives the process-group/signal machinery (setsid

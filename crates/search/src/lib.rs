@@ -1900,4 +1900,85 @@ mod tests {
         assert_eq!(requests.len(), 131, "query + 130 singleton batches");
         assert!(requests.iter().all(|&n| n == 1), "{requests:?}");
     }
+
+    /// Independent audit probe: with many EXACT score ties, `fuse` and the
+    /// full `fused` path must produce one byte-identical ordering on every
+    /// run — fresh hash maps (fresh index instances) and plain replays of
+    /// the same ranked input included.
+    #[test]
+    fn fuse_ties_are_deterministic_across_fresh_maps_and_replays() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        // Every file matches the token exactly once: all fused scores tie.
+        let query = "tie";
+        let build = || {
+            let mut idx = WI::new();
+            let ws = WorkspaceId::new(77);
+            let names: Vec<String> = (0..32).map(|i| format!("src/file_{i:02}.rs")).collect();
+            let mut order: Vec<usize> = (0..names.len()).collect();
+            let mut state = 0x1234_u64;
+            for i in (1..order.len()).rev() {
+                let j = (lcg(&mut state) as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            for i in order {
+                idx.index_file(ws, std::path::Path::new(&names[i]), b"tie tie\n", 1)
+                    .unwrap();
+            }
+            (Arc::new(Mutex::new(idx)), ws)
+        };
+        let mut baseline: Option<Vec<Hit>> = None;
+        for round in 0..25 {
+            let (idx, ws) = build();
+            let svc = SearchService::new(idx, None);
+            let hits = svc.fused(ws, query, 16).unwrap();
+            assert_eq!(hits.len(), 16);
+            // Within a score group the order is strictly path-ascending.
+            for pair in hits.windows(2) {
+                assert!(
+                    pair[0].score > pair[1].score
+                        || (pair[0].score == pair[1].score && pair[0].path < pair[1].path),
+                    "round {round}: tie order must be path-ascending: {:?}",
+                    hits.iter()
+                        .map(|h| (h.path.as_str(), h.score))
+                        .collect::<Vec<_>>()
+                );
+            }
+            match &baseline {
+                Some(expected) => assert_eq!(&hits, expected, "round {round}: fused drifted"),
+                None => baseline = Some(hits),
+            }
+        }
+        // The same ranked input (with ties and duplicate paths across
+        // legs) must replay byte-identically: the accumulation order is
+        // path-sorted, so a fresh `HashMap` seed cannot reorder the fold.
+        let hit = |path: &str| Hit {
+            path: path.to_string(),
+            score: 0.0,
+            snippet: path.to_string(),
+            symbol: None,
+        };
+        let base: Vec<(f64, Vec<Hit>)> = vec![
+            (
+                2.0,
+                vec![hit("a.rs"), hit("b.rs"), hit("c.rs"), hit("d.rs")],
+            ),
+            (
+                1.5,
+                vec![hit("d.rs"), hit("b.rs"), hit("a.rs"), hit("c.rs")],
+            ),
+            (
+                1.0,
+                vec![hit("c.rs"), hit("a.rs"), hit("d.rs"), hit("b.rs")],
+            ),
+        ];
+        let expected = fuse(&base, 10);
+        for round in 0..50 {
+            assert_eq!(fuse(&base, 10), expected, "round {round}: replay drifted");
+        }
+    }
 }
