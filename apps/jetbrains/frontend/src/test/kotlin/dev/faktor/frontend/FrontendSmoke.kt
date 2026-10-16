@@ -5028,9 +5028,13 @@ object FrontendSmoke {
         "\"localFinalRuns\":2,\"localFinalVerifiedChanges\":1,\"localFinalVerifiedPpm\":500000," +
         "\"localFirstRuns\":5,\"localFirstSuccessChanges\":1,\"localFirstSuccessPpm\":200000," +
         "\"localToHostedFallbackRuns\":2,\"localToHostedFallbackPpm\":400000," +
+        "\"localClassedRuns\":10,\"localMeasurement\":\"measured\"," +
         "\"hostedOnlyRuns\":6,\"runsWithSteps\":10,\"hostedOnlyPpm\":600000," +
         "\"avoidedHostedInferenceMicro\":null,\"avoidedHostedInferenceMeasurement\":\"unavailable\"," +
-        "\"avoidedHostedMeasuredRuns\":0,\"totalWallTimeMs\":100," +
+        "\"avoidedHostedMeasuredRuns\":0," +
+        "\"attributionCompleteRuns\":10,\"attributionPartialRuns\":0," +
+        "\"attributionUnavailableRuns\":0,\"attributionIncompleteExcluded\":0," +
+        "\"totalWallTimeMs\":100," +
         "\"meanTimeToVerifiedChangeMs\":50," +
         "\"humanInterventionRuns\":1,\"humanInterventionPpm\":100000," +
         "\"rollbackRuns\":1,\"regressionRollbackPpm\":100000," +
@@ -5047,6 +5051,8 @@ object FrontendSmoke {
         "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0," +
         "\"modelSequence\":[{\"provider\":\"local\",\"model\":\"m\",\"local\":true," +
         "\"legacyLocal\":false,\"executionClass\":\"local\",\"spendMicro\":\"1\"}]," +
+        "\"firstExecutionClass\":\"local\",\"finalExecutionClass\":\"local\"," +
+        "\"attributionState\":\"complete\"," +
         "\"moneyState\":\"complete\"," +
         "\"modelSpendMicro\":\"1\",\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
         "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
@@ -5256,7 +5262,9 @@ object FrontendSmoke {
                         "\"candidateSnapshot\":null,\"finalSnapshot\":\"tm1:x\"," +
                         "\"accepted\":true,\"integrated\":true,\"verified\":true," +
                         "\"verifiedFirstVerificationPass\":true,\"repairAttempts\":0," +
-                        "\"modelSequence\":[],\"moneyState\":\"complete\"," +
+                        "\"modelSequence\":[]," +
+                        "\"firstExecutionClass\":\"unknown\",\"finalExecutionClass\":\"unknown\"," +
+                        "\"attributionState\":\"complete\",\"moneyState\":\"complete\"," +
                         "\"modelSpendMicro\":\"1\"," +
                         "\"verificationSpendMicro\":\"0\",\"reworkSpendMicro\":\"0\"," +
                         "\"avoidedHostedMicro\":null,\"avoidedHostedMeasurement\":\"unavailable\"," +
