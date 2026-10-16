@@ -28,7 +28,10 @@ fn config_file(dir: &Path, body: serde_json::Value) -> Config {
 /// One loopback OpenAI-compatible chat endpoint with an explicit quality
 /// declaration AND an explicit operator price: the model is a REAL hosted
 /// candidate (Exact pricing authority), and the config leaves `routing_mode`
-/// at the production default (Economy).
+/// at the production default (Economy). The served id is DECLARED through
+/// the endpoint's `models` list — under the capability-authority semantics
+/// an undeclared id resolves `Unknown` (feature flags forced off) and the
+/// daemon would refuse the turn pre-wire before any reservation exists.
 fn economy_hosted_config(dir: &Path, base: &str) -> Config {
     config_file(
         dir,
@@ -42,6 +45,7 @@ fn economy_hosted_config(dir: &Path, base: &str) -> Config {
                 "base_url": base,
                 "api_key_env": null,
                 "api": "chat",
+                "models": ["default"],
                 "allow_loopback": true,
                 "quality": {"coding_reliability": 80, "context_reliability": 80},
                 "pricing": {

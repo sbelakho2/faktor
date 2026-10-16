@@ -352,6 +352,19 @@ impl Provider for GoogleProvider {
         }
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Configured/probed `model_caps` rows are model-specific (Known);
+        // the hardcoded 1M-context Gemini family profile is the adapter's
+        // DECLARED generic default — usable and visibly DeclaredGeneric,
+        // never silently Known.
+        match self.config.model_caps.get(model) {
+            Some(caps) => faktor_core::model::CapabilityResolution::known(caps.clone()),
+            None => {
+                faktor_core::model::CapabilityResolution::declared_generic(self.capabilities(model))
+            }
+        }
+    }
+
     fn max_image_bytes(&self) -> usize {
         GOOGLE_MAX_IMAGE_BYTES
     }
@@ -364,7 +377,7 @@ impl Provider for GoogleProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound.
-        let caps = self.capabilities(&req.model);
+        let caps = self.capability_resolution(&req.model).effective();
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {

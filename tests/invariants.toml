@@ -1922,12 +1922,24 @@ platforms = ["linux"]
 
 [[invariant]]
 id = "INV-AUTHORITY-COLLAPSE-FREE"
-statement = "In the authority-bearing modules, an unreadable authority read never collapses to absence/default: .ok()/unwrap_or_default() on authority receivers and bare Err(_) arms are mechanically rejected unless explicitly reviewed, and stale allowlist entries fail too."
+statement = "DISCOVERY IS TOTAL: every production Rust file under crates/*/src is scanned mechanically (no file list, no annotation; inline #[cfg(test)] items and test-gated-only out-of-line modules are excluded by declaration analysis). Error→absence transformations are rejected everywhere: .ok()/.ok().flatten()/.unwrap_or*/map_or on authority receivers, let/if-let Ok(..) bindings on authority reads, and bare Err(_) arms fabricating None/vec![]/false/0/{}. Each surviving hit is a reviewed ALLOWLIST entry with a reason and an owner; stale entries fail; durable-authority reads are not exempted (they must be typed at the boundary)."
 owner = "scripts/check-authority-collapse.mjs authority law"
-authority = "scripts/check-authority-collapse.mjs + planted mutation scripts/mutations/INV-AUTHORITY-COLLAPSE-FREE.json"
+authority = "scripts/check-authority-collapse.mjs + planted mutations scripts/mutations/INV-AUTHORITY-COLLAPSE-FREE.json, scripts/mutations/INV-CHILD-HANDOFF-AUTHORITY.json"
 script_check = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
 mutation_witness = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
 mutation_command = "node scripts/mutation-run.mjs INV-AUTHORITY-COLLAPSE-FREE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CHILD-HANDOFF-AUTHORITY"
+statement = "The child-handoff envelope never collapses an unreadable legacy task-ledger read to absence: the typed acquisition (Ok(row) => HandoffData::available(row), Err(error) => HandoffData::unavailable(reason)) is discovered by the file-list-independent authority-collapse scanner WITHOUT any annotation, and reverting it to `.ok().flatten()` is flagged UNREVIEWED."
+owner = "crates/orchestrator child-handoff authority"
+authority = "planted mutation scripts/mutations/INV-CHILD-HANDOFF-AUTHORITY.json"
+script_check = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
+mutation_witness = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
+mutation_command = "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-AUTHORITY"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]

@@ -221,8 +221,15 @@ impl StreamingSummarizer {
         // silent (std CancellationToken has no async wait primitive; a
         // bounded tick mirrors the guarded transports' cancellation checks).
         const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
-        // Capabilities decide: a non-streaming compaction model is skipped.
-        if !self.provider.capabilities(&self.model).streaming {
+        // Capabilities decide: a non-streaming compaction model is skipped
+        // (authority-gated like every other capability decision — `streaming`
+        // itself is never gated off, the wire is streamed for every family).
+        if !self
+            .provider
+            .capability_resolution(&self.model)
+            .effective()
+            .streaming
+        {
             return None;
         }
         let request = GenericAgentRequest {

@@ -1200,6 +1200,58 @@ mod tests {
     }
 
     #[test]
+    fn declared_openai_models_stay_routable_while_undeclared_ids_are_authority_gated() {
+        // Capability authority law: an OpenAI-compatible endpoint whose
+        // config DECLARES its served ids (`models = [...]`) keeps them
+        // routable on the declared generic profile; an UNDECLARED id
+        // resolves Unknown and its catalog row is gated, so no route can
+        // select it for tools/vision.
+        let cfg = crate::config::ProviderCfg::OpenAi {
+            id: "corp-proxy".into(),
+            base_url: "https://corp.example.com/v1".into(),
+            api_key_env: None,
+            api: None,
+            models: vec!["corp-custom".into()],
+            pricing: Some(crate::config::ProviderPricingCfg {
+                pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
+                ..Default::default()
+            }),
+            quality: None,
+            allow_loopback: true,
+        };
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(cfg.build(open_transport()).unwrap())
+            .unwrap();
+        let p = registry.get("corp-proxy").unwrap();
+        let declared = p.capability_resolution("corp-custom");
+        assert_eq!(declared.authority.as_str(), "declared_generic");
+        assert!(
+            declared.effective().tools && declared.effective().vision,
+            "the declared generic profile is usable as declared"
+        );
+        let undeclared = p.capability_resolution("some-unlisted-id");
+        assert_eq!(undeclared.authority.as_str(), "unknown");
+        assert!(!undeclared.effective().tools && !undeclared.effective().vision);
+        assert!(
+            !p.catalog_entry("some-unlisted-id").capabilities.tools,
+            "routing must never see features the runtime gates off"
+        );
+        // MaximumQuality admits the Unknown-priced declared candidate; the
+        // declared tools flag survives candidate building (it still routes).
+        let svc = empty_store_service(&registry, &RoutingMode::MaximumQuality).unwrap();
+        let candidate = svc
+            .priced
+            .iter()
+            .find(|c| c.descriptor.model == "corp-custom")
+            .expect("the declared model is a routed candidate");
+        assert!(
+            candidate.descriptor.tools,
+            "a declared capability profile still routes with its declared tools"
+        );
+    }
+
+    #[test]
     fn local_zero_and_known_rows_are_always_included_and_keep_their_state() {
         let mut registry = ProviderRegistry::new();
         registry

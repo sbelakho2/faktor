@@ -24,7 +24,7 @@ use std::pin::Pin;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{OpId, SessionId};
-use faktor_core::model::{ModelCapabilities, PricingSnapshot, ReasoningMode};
+use faktor_core::model::{CapabilityResolution, ModelCapabilities, PricingSnapshot, ReasoningMode};
 use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
@@ -1207,6 +1207,19 @@ pub trait Provider: Send + Sync {
     /// lists in the agent.
     fn capabilities(&self, model: &str) -> ModelCapabilities;
 
+    /// The capability lookup WITH its authority state: `Known` only for a
+    /// model-specific profile (probed for this exact id or declared per
+    /// exact id), `DeclaredGeneric` for an endpoint-declared generic
+    /// assumption, `Unknown` when neither matched. The default is
+    /// [`CapabilityAuthority::Unknown`] — an adapter that truly knows its
+    /// models MUST override; a generic fallback can never silently present
+    /// itself as validated capabilities. Consumers decide from
+    /// [`CapabilityResolution::effective`], so `Unknown` gates model
+    /// features off instead of assuming them.
+    fn capability_resolution(&self, model: &str) -> CapabilityResolution {
+        CapabilityResolution::unknown(self.capabilities(model))
+    }
+
     /// A live runtime context bound for `model` in tokens, when the provider
     /// can report one (e.g. an Ollama `/api/ps` allocation clamped by the
     /// probed model maximum — the window actually loaded for the model can
@@ -1296,12 +1309,17 @@ pub trait Provider: Send + Sync {
     /// unchanged and their undocumented models read as Unknown until
     /// priced by config ([`catalog::PricingOverrides`]).
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        // The row advertises what the runtime will ACTUALLY enable for this
+        // id: `capability_resolution(...).effective()` gates an Unknown
+        // lookup exactly like the runtime does, so routing can never select
+        // a candidate for features the runtime would strip.
+        let caps = self.capability_resolution(model).effective();
         let row = catalog::builtin::lookup(self.id(), model);
         match row {
             Some(row) => ModelCatalogEntry {
                 provider: self.identity().instance_id,
                 model: model.to_string(),
-                capabilities: self.capabilities(model),
+                capabilities: caps.clone(),
                 pricing: PricingState::Known(PricingSnapshot::exact(
                     catalog::builtin::quote_of(&row),
                     catalog::CATALOG_FIRST_EPOCH,
@@ -1314,7 +1332,7 @@ pub trait Provider: Send + Sync {
             None => ModelCatalogEntry {
                 provider: self.identity().instance_id,
                 model: model.to_string(),
-                capabilities: self.capabilities(model),
+                capabilities: caps,
                 pricing: PricingState::Unknown,
                 quality_prior: QualityPrior::default(),
                 source_epoch: catalog::CATALOG_FIRST_EPOCH,
@@ -1361,6 +1379,12 @@ impl Provider for InstanceProvider {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
+    }
+
+    fn capability_resolution(&self, model: &str) -> CapabilityResolution {
+        // Delegate: an instance-wrapped adapter's authority state is its
+        // own (the wrapper must not collapse a known family to Unknown).
+        self.inner.capability_resolution(model)
     }
 
     fn known_models(&self) -> Vec<String> {
@@ -2181,6 +2205,17 @@ impl Provider for CatalogProvider {
             .unwrap_or_else(|| self.default_caps.clone())
     }
 
+    fn capability_resolution(&self, model: &str) -> CapabilityResolution {
+        // The catalog's named models are model-specific rows (`Known`); the
+        // constructor-provided `default_caps` answers unnamed ids as an
+        // EXPLICIT declared generic profile, never as validated caps.
+        self.models
+            .iter()
+            .find(|(m, _)| m == model)
+            .map(|(_, caps)| CapabilityResolution::known(caps.clone()))
+            .unwrap_or_else(|| CapabilityResolution::declared_generic(self.default_caps.clone()))
+    }
+
     fn known_models(&self) -> Vec<String> {
         self.models.iter().map(|(m, _)| m.clone()).collect()
     }
@@ -2368,6 +2403,12 @@ impl Provider for FakeProvider {
 
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         self.caps.clone()
+    }
+
+    fn capability_resolution(&self, _model: &str) -> CapabilityResolution {
+        // A scripted fake is constructed with its exact profile by the
+        // test: model-specific by construction.
+        CapabilityResolution::known(self.caps.clone())
     }
 
     fn document_capable(&self, _model: &str) -> bool {

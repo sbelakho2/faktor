@@ -1,0 +1,9 @@
+{
+  "id": "INV-CHILD-HANDOFF-AUTHORITY",
+  "file": "crates/orchestrator/src/merge.rs",
+  "find": "        let legacy = match handle.get_task_ledger() {\n            Ok(row) => HandoffData::available(row),\n            Err(error) => HandoffData::unavailable(format!(\n                \"legacy task ledger read failed: {}\",\n                error.message\n            )),\n        };",
+  "replace": "        let legacy = HandoffData::available(handle.get_task_ledger().ok().flatten());",
+  "gate": "node scripts/check-authority-collapse.mjs --coverage",
+  "expect": "UNREVIEWED",
+  "note": "The revert of the child-handoff authority fix: collapsing an unreadable legacy task-ledger read back to `.ok().flatten()` (an error→absence transformation in the child-handoff envelope) must be discovered by the file-list-independent scanner with NO annotation — the merge.rs class the previous annotation-gated checker missed."
+}

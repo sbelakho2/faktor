@@ -68,6 +68,27 @@ pub use wire_plan::{
     PROMPT_SEGMENT_COUNT,
 };
 
+/// THE one provenance-text sanitizer (audit 44; shared by the ledger fold,
+/// the wire renderer and the agent's internal-context renderer): recorded
+/// ledger/child-handoff text is PROVENANCE DATA, never instructions. Every
+/// control character is flattened to a space, so an embedded newline can
+/// never open a new prompt section, and the outer whitespace is trimmed.
+/// The agent crate reuses this exact function — there is no second
+/// sanitizer that could drift.
+pub fn sanitize_ledger_text(text: &str) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    flattened.trim().to_string()
+}
+
 // ======================================================================
 // Token-count identity + cache (P0-81, audits 72/73)
 //

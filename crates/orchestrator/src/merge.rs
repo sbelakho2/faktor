@@ -1806,15 +1806,29 @@ impl OrchestratorRuntime {
     /// The parent consumes [`faktor_agent::ChildHandoff::render_bounded`];
     /// everything omitted stays retrievable through the `session:<id>` refs
     /// (the durable message/ledger/memory rows are untouched by this read).
+    ///
+    /// Availability law (unavailable ≠ absent): every
+    /// facts/findings/changed_files/decisions component is acquired into an
+    /// explicit [`HandoffData`] envelope. A read or decode failure becomes
+    /// `unavailable(reason)` — NEVER an apparently empty "the child
+    /// recorded nothing" — because the parent's next action differs (re-read
+    /// through the refs, surface the failure). Authoritative components that
+    /// cannot be read at all (session handle, child identity/goal, the
+    /// typed ledger head that carries outcome + decisions) fail the WHOLE
+    /// handoff with a typed error; the retrievable-by-ref components above
+    /// stay per-component available/unavailable.
+    ///
     /// `budget_tokens` is enforced here (whole-item drops, deterministic
-    /// order) so the handoff that leaves this boundary is already bounded.
+    /// order); a budget the irreducible envelope cannot fit is a typed
+    /// [`ExecError::Oversized`] — this boundary never returns an
+    /// over-budget or apparently complete handoff.
     pub fn child_handoff(
         &self,
         child_id: &str,
         child_session: SessionId,
         budget_tokens: usize,
     ) -> Result<faktor_agent::runtime::ChildHandoff, ExecError> {
-        use faktor_agent::runtime::ChildHandoff;
+        use faktor_agent::runtime::{ChildHandoff, HandoffData};
         if child_id.is_empty() || child_id.len() > 256 {
             return Err(ExecError::Oversized(
                 "child handoff id must be 1..=256 bytes".into(),
@@ -1837,54 +1851,101 @@ impl OrchestratorRuntime {
             .filter_map(|c| c.outcome.clone())
             .next_back()
             .unwrap_or_default();
-        handoff.decisions = head
-            .decisions
-            .iter()
-            .rev()
-            .take(8)
-            .map(|d| format!("{}: {}", d.step, d.choice))
-            .collect();
+        // Decisions ride the SAME authoritative head read: a head that
+        // cannot be read fails the whole handoff typed above, so this
+        // component is Available by construction (never silently empty).
+        handoff.decisions = HandoffData::available(
+            head.decisions
+                .iter()
+                .rev()
+                .take(8)
+                .map(|d| format!("{}: {}", d.step, d.choice))
+                .collect::<Vec<_>>(),
+        );
         // The legacy durable fold carries the changed files + known failures
-        // the child recorded across its turns (a corrupt row is skipped, the
-        // handoff stays honest). Read as JSON: the orchestrator has no
-        // context-crate dependency and must not learn one for a summary.
-        let legacy: Option<serde_json::Value> = handle
-            .get_task_ledger()
-            .ok()
-            .flatten()
-            .filter(|value| value.is_object());
-        let strings_of = |key: &str| -> Vec<String> {
-            legacy
-                .as_ref()
-                .and_then(|value| value.get(key))
-                .and_then(|value| value.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default()
+        // the child recorded across its turns. The acquisition envelope is
+        // explicit: a failed read or a malformed row is `unavailable(...)`,
+        // never the "no failures / no files" of the absent case. Read as
+        // JSON: the orchestrator has no context-crate dependency and must
+        // not learn one for a summary.
+        let legacy = match handle.get_task_ledger() {
+            Ok(row) => HandoffData::available(row),
+            Err(error) => HandoffData::unavailable(format!(
+                "legacy task ledger read failed: {}",
+                error.message
+            )),
+        };
+        let strings_of = |key: &str| -> HandoffData<Vec<String>> {
+            match &legacy {
+                HandoffData::Available(Some(value)) => {
+                    if !value.is_object() {
+                        return HandoffData::unavailable(
+                            "legacy task ledger row is not an object".to_string(),
+                        );
+                    }
+                    match value.get(key) {
+                        None => HandoffData::available(Vec::new()),
+                        Some(field) => {
+                            let Some(items) = field.as_array() else {
+                                return HandoffData::unavailable(format!(
+                                    "legacy task ledger field {key:?} is not an array"
+                                ));
+                            };
+                            let mut out = Vec::with_capacity(items.len());
+                            for item in items {
+                                match item.as_str() {
+                                    Some(text) => out.push(text.to_string()),
+                                    None => {
+                                        return HandoffData::unavailable(format!(
+                                        "legacy task ledger field {key:?} holds a non-string entry"
+                                    ))
+                                    }
+                                }
+                            }
+                            HandoffData::available(out)
+                        }
+                    }
+                }
+                HandoffData::Available(None) => HandoffData::available(Vec::new()),
+                HandoffData::Unavailable { reason } => HandoffData::unavailable(reason.clone()),
+            }
         };
         let known_failures = strings_of("known_failures");
         let changed_files = strings_of("changed_files");
-        handoff.findings = known_failures.iter().rev().take(8).cloned().collect();
-        handoff.changed_files = changed_files.iter().take(16).cloned().collect();
+        handoff.findings = match known_failures {
+            HandoffData::Available(items) => {
+                HandoffData::available(items.iter().rev().take(8).cloned().collect())
+            }
+            other => other,
+        };
+        handoff.changed_files = match changed_files {
+            HandoffData::Available(items) => {
+                HandoffData::available(items.iter().take(16).cloned().collect())
+            }
+            other => other,
+        };
         // Bounded durable facts page (the child's own typed/legacy rows):
-        // heads only, never the transcript.
-        if let Ok(page) = handle.memory_facts_page(None, 16) {
-            handoff.facts = page
-                .facts
-                .into_iter()
-                .take(8)
-                .map(|(kind, key, value)| {
-                    format!(
-                        "{kind}:{key} = {}",
-                        truncate(&value, MAX_HANDOFF_FACT_CHARS)
-                    )
-                })
-                .collect();
-        }
+        // heads only, never the transcript. A page read that fails is
+        // UNAVAILABLE — "the read failed" and "the child recorded nothing"
+        // must never render the same.
+        handoff.facts = match handle.memory_facts_page(None, 16) {
+            Ok(page) => HandoffData::available(
+                page.facts
+                    .into_iter()
+                    .take(8)
+                    .map(|(kind, key, value)| {
+                        format!(
+                            "{kind}:{key} = {}",
+                            truncate(&value, MAX_HANDOFF_FACT_CHARS)
+                        )
+                    })
+                    .collect(),
+            ),
+            Err(error) => HandoffData::unavailable(format!(
+                "memory facts page read failed: {}",
+                error.message
+            )),
+        };
         // Scoped refs: the backing (child session transcript + rows) stays
         // retrievable by identity; the parent never inlines it.
         handoff.refs = vec![
@@ -1893,6 +1954,12 @@ impl OrchestratorRuntime {
             format!("child:{child_id}"),
         ];
         handoff.truncate_to_tokens(budget_tokens);
+        let tokens = handoff.approx_tokens();
+        if tokens > budget_tokens {
+            return Err(ExecError::Oversized(format!(
+                "child handoff {child_id} envelope needs {tokens} tokens but the budget is {budget_tokens}"
+            )));
+        }
         Ok(handoff)
     }
 

@@ -131,6 +131,19 @@ impl Provider for HeaderGateway {
         }
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Delegate to the wrapped provider; the gateway's own configured
+        // `default_caps` only answers when the inner provider reports no
+        // profile at all (context 0) — that is an explicit gateway
+        // declaration, DeclaredGeneric, never Known.
+        let inner = self.inner.capability_resolution(model);
+        if inner.caps.context == 0 {
+            faktor_core::model::CapabilityResolution::declared_generic(self.default_caps.clone())
+        } else {
+            inner
+        }
+    }
+
     fn stream(&self, req: faktor_provider::GenericAgentRequest) -> faktor_provider::ProviderStream {
         // Route-by-prefix: rewrite the model id for the upstream gateway.
         let mut model = req.model.clone();

@@ -322,6 +322,7 @@ async fn native_providers_registry_and_health_snapshot() {
             api_key: Some("sk-super-secret".into()),
             family: faktor_openai::OpenAiFamily::Chat,
             models: caps,
+            declared_generic: std::collections::HashSet::new(),
         },
         permissive_transport(),
     );

@@ -388,6 +388,19 @@ impl Provider for AnthropicProvider {
             .unwrap_or_else(|| self.config.default_caps.clone())
     }
 
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // An exact `model_caps` row (configured or probed) is model-specific
+        // truth — Known. The family default is the adapter's DECLARED
+        // generic Claude profile: usable, and visibly `DeclaredGeneric`
+        // everywhere the lookup is consumed — never silently Known.
+        match self.config.model_caps.get(model) {
+            Some(caps) => faktor_core::model::CapabilityResolution::known(caps.clone()),
+            None => faktor_core::model::CapabilityResolution::declared_generic(
+                self.config.default_caps.clone(),
+            ),
+        }
+    }
+
     fn max_image_bytes(&self) -> usize {
         ANTHROPIC_MAX_IMAGE_BYTES
     }
@@ -401,7 +414,7 @@ impl Provider for AnthropicProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound.
-        let caps = self.capabilities(&req.model);
+        let caps = self.capability_resolution(&req.model).effective();
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {

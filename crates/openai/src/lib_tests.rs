@@ -77,7 +77,13 @@ mod openai_contract_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
+        // The endpoint DECLARES the id it serves: the declared generic
+        // profile is what authorizes the generic vision flag here (an
+        // unlisted id is Unknown and refuses the image pre-wire — covered
+        // by `wire_vision_gate_reacts_to_capability_authority`).
+        let provider = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat(base, None).with_models(vec!["m1".to_string()]),
+        );
         assert_eq!(provider.max_image_bytes(), OPENAI_MAX_IMAGE_BYTES);
         let mut r = req("m1");
         r.messages.push(RequestMessage {
@@ -123,7 +129,9 @@ mod openai_contract_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::responses(base, None).with_models(vec!["m1".to_string()]),
+        );
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -271,8 +279,11 @@ mod openai_contract_tests {
         assert!(err.message.contains("vision"), "{err}");
         assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
 
-        // Over the provider's own per-image bound: typed, pre-wire.
-        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
+        // Over the provider's own per-image bound: typed, pre-wire (the id
+        // is declared so the vision gate itself is not the refusal).
+        let provider = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat(base, None).with_models(vec!["m1".to_string()]),
+        );
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -530,6 +541,107 @@ mod openai_contract_tests {
             ));
         assert!(!p.capabilities("small").tools);
         assert_eq!(p.capabilities("small").context, 8192);
+    }
+
+    #[test]
+    fn capability_authority_ladder_unlisted_is_unknown_declared_is_generic_exact_is_known() {
+        use faktor_core::model::CapabilityAuthority;
+        // (1) Unlisted id on a generic endpoint: the hardcoded fallback must
+        // NEVER read as Known capabilities — it is Unknown, and its
+        // effective view gates the unproven features off.
+        let p = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://x", None));
+        let unlisted = p.capability_resolution("custom-model-42");
+        assert_eq!(unlisted.authority, CapabilityAuthority::Unknown);
+        assert!(!unlisted.authority.is_known());
+        assert!(
+            unlisted.is_gated(),
+            "an Unknown lookup must gate the generic fallback profile"
+        );
+        let effective = unlisted.effective();
+        assert!(!effective.tools && !effective.vision && !effective.json_schema);
+        assert!(effective.context <= ModelCapabilities::default().context);
+        // ...and the catalog row routing consumes is gated identically: the
+        // router can never select this id for features the runtime strips.
+        let row = p.catalog_entry("custom-model-42");
+        assert!(!row.capabilities.tools && !row.capabilities.vision);
+
+        // (2) An endpoint-declared generic id (`models = [...]` in config /
+        // `with_models`): DeclaredGeneric — usable as declared, visibly
+        // declared, and still routable with its declared tools.
+        let declared = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat("http://x", None).with_models(vec!["custom-model-42".to_string()]),
+        );
+        let resolution = declared.capability_resolution("custom-model-42");
+        assert_eq!(resolution.authority, CapabilityAuthority::DeclaredGeneric);
+        assert!(resolution.authority.is_declared());
+        assert!(!resolution.is_gated());
+        assert!(resolution.effective().tools && resolution.effective().vision);
+        assert!(
+            declared.catalog_entry("custom-model-42").capabilities.tools,
+            "a declared capability profile still routes (candidate advertises tools)"
+        );
+
+        // (3) An exact per-model declaration is Known.
+        let exact =
+            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://x", None).with_model(
+                "custom-model-42",
+                ModelCapabilities {
+                    context: 8192,
+                    tools: true,
+                    ..Default::default()
+                },
+            ));
+        assert_eq!(
+            exact.capability_resolution("custom-model-42").authority,
+            CapabilityAuthority::Known
+        );
+
+        // (4) The endpoint wildcard (`with_default_caps`) is an explicit
+        // generic declaration — DeclaredGeneric, never Known.
+        let wildcard = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat("http://x", None)
+                .with_default_caps(ModelCapabilities::small_local()),
+        );
+        assert_eq!(
+            wildcard.capability_resolution("anything").authority,
+            CapabilityAuthority::DeclaredGeneric
+        );
+        assert!(wildcard.capability_resolution("anything").effective().tools);
+    }
+
+    #[tokio::test]
+    async fn wire_vision_gate_reacts_to_capability_authority() {
+        // Unknown authority + an image part: the delivery gate refuses
+        // typedly BEFORE any wire byte (no assumed vision).
+        let p = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://x", None));
+        let mut unknown_req = req("custom-model-42");
+        unknown_req.messages[0]
+            .content
+            .push(ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap());
+        let first = p.stream(unknown_req).next().await.unwrap();
+        assert_eq!(
+            first.unwrap_err().kind,
+            ProviderErrorKind::BadRequest,
+            "an Unknown lookup must not lower an image on an assumed vision flag"
+        );
+
+        // The SAME request against a declared generic profile passes the
+        // capability gate (the stream then fails on the unreachable host,
+        // never with the vision refusal).
+        let declared = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat("http://x", None).with_models(vec!["custom-model-42".to_string()]),
+        );
+        let mut declared_req = req("custom-model-42");
+        declared_req.messages[0]
+            .content
+            .push(ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap());
+        let first = declared.stream(declared_req).next().await.unwrap();
+        let err = first.unwrap_err();
+        assert_ne!(
+            err.kind,
+            ProviderErrorKind::BadRequest,
+            "the declared generic profile explicitly opts into the wire's generic vision: {err:?}"
+        );
     }
 
     #[tokio::test]

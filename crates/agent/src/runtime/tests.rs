@@ -232,6 +232,12 @@ impl faktor_provider::Provider for InspectingProvider {
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Authority travels with the wrapped provider: a test
+        // decorator must not silently turn a known provider into an
+        // Unknown lookup (or vice versa).
+        self.inner.capability_resolution(model)
+    }
 
     fn document_capable(&self, model: &str) -> bool {
         self.inner.document_capable(model)
@@ -289,6 +295,12 @@ impl faktor_provider::Provider for RuntimeLimitedProvider {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Authority travels with the wrapped provider: a test
+        // decorator must not silently turn a known provider into an
+        // Unknown lookup (or vice versa).
+        self.inner.capability_resolution(model)
     }
 
     fn runtime_context_limit(&self, _model: &str) -> Option<usize> {
@@ -464,6 +476,11 @@ impl faktor_provider::Provider for CacheHeavyProvider {
 
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         ModelCapabilities::default()
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
@@ -1115,6 +1132,11 @@ impl faktor_provider::Provider for PendingProvider {
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         ModelCapabilities::default()
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
         Box::pin(futures::stream::pending::<
@@ -1179,6 +1201,11 @@ impl faktor_provider::Provider for InfiniteToolProvider {
             tools: true,
             ..Default::default()
         }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
@@ -1403,6 +1430,11 @@ impl faktor_provider::Provider for GatedStreamProvider {
 
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         self.caps.clone()
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
@@ -1866,6 +1898,12 @@ impl faktor_provider::Provider for CountingPanicProvider {
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Authority travels with the wrapped provider: a test
+        // decorator must not silently turn a known provider into an
+        // Unknown lookup (or vice versa).
+        self.inner.capability_resolution(model)
+    }
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!(
@@ -1914,6 +1952,11 @@ impl faktor_provider::Provider for CostReportingProvider {
             streaming: true,
             ..Default::default()
         }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
@@ -2126,6 +2169,11 @@ impl faktor_provider::Provider for CacheSplitProvider {
             streaming: true,
             ..Default::default()
         }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {

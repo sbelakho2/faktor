@@ -61,6 +61,7 @@ pub(crate) async fn native_models(State(state): State<AppState>, headers: Header
         let instance = p.identity().instance_id.clone();
         for model in p.known_models() {
             let caps = p.capabilities(&model);
+            let resolution = p.capability_resolution(&model);
             let source = catalog_source(p.as_ref(), &model, &caps);
             out.push(serde_json::json!({
                 "provider": instance,
@@ -76,6 +77,13 @@ pub(crate) async fn native_models(State(state): State<AppState>, headers: Header
                 "embeddings": caps.embeddings,
                 "streaming": caps.streaming,
                 "source": source,
+                // The AUTHORITY of this capability lookup (capability
+                // authority law): `known` (model-specific), `declared_generic`
+                // (endpoint-declared assumptions — usable) or `unknown`
+                // (unverified: the runtime gates the unproven features off).
+                // Never omitted, so a generic fallback is visible to clients.
+                "capabilityAuthority": resolution.authority.as_str(),
+                "capabilitiesGated": resolution.is_gated(),
                 "documentCapable": p.document_capable(&model),
                 "attachmentLimits": attachment_limits_for(p.as_ref(), &model),
             }));
@@ -110,6 +118,7 @@ pub(crate) async fn native_capabilities(
             models.push(serde_json::json!({
                 "id": m,
                 "capabilities": p.capabilities(&m),
+                "capabilityAuthority": p.capability_resolution(&m).authority.as_str(),
                 "documentCapable": p.document_capable(&m),
                 "attachmentLimits": attachment_limits_for(p.as_ref(), &m),
             }));
@@ -188,6 +197,7 @@ pub(crate) async fn native_providers(
                 "embeddings": caps.embeddings,
                 "streaming": caps.streaming,
                 "source": catalog_source(p.as_ref(), &model, &caps),
+                "capabilityAuthority": p.capability_resolution(&model).authority.as_str(),
             }));
         }
         models.sort_by(|a, b| a["model"].as_str().cmp(&b["model"].as_str()));

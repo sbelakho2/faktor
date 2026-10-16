@@ -568,7 +568,17 @@ impl AgentRuntime {
         // checks from the VerificationRecord rows. The transcript can lie;
         // these rows cannot. (The projection is not written back: compaction
         // has no ledger write authority.)
-        let projection = Self::compaction_projection(handle, ledger)?;
+        //
+        // `[efficiency].typed_handoff` is the production switch of exactly
+        // this rendering path: ON (the production default) renders the
+        // re-sent history from the durable task rows below; OFF falls back
+        // to the legacy transcript-derived fold (`from_task_ledger`), which
+        // is the byte-identical pre-flag rendering.
+        let projection = if self.deps.efficiency.typed_handoff {
+            Self::compaction_projection(handle, ledger)?
+        } else {
+            faktor_context::ledger::TaskContextProjection::from_task_ledger(ledger)
+        };
         let mut plan = compactor
             .compact_projected(
                 recent,

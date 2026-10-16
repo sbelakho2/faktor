@@ -276,11 +276,18 @@ pub(crate) fn validate_wire_attachments(
             retryable: false,
         })?;
     if !images.is_empty() {
-        let caps = entry.capabilities(&model);
+        // Authority-gated admission: an Unknown capability lookup (no
+        // model-specific probe, no endpoint declaration) can never admit
+        // images on the generic fallback's assumed vision flag.
+        let resolution = entry.capability_resolution(&model);
+        let caps = resolution.effective();
         if !caps.vision {
             return Err(media_model_unsupported(
                 &model,
-                "the model does not advertise vision capability",
+                &format!(
+                    "the model does not advertise vision capability (capability authority: {})",
+                    resolution.authority.as_str()
+                ),
             ));
         }
         let per_image = entry

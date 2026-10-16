@@ -499,6 +499,11 @@ async fn serve_shutdown_reaps_live_orchestrated_drives_and_keeps_them_resumable(
         fn capabilities(&self, _model: &str) -> ModelCapabilities {
             self.caps.clone()
         }
+        fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+            // A test double constructed with its exact profile is
+            // model-specific by construction.
+            faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+        }
 
         fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             self.entered.fetch_add(1, Ordering::SeqCst);

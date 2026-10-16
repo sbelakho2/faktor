@@ -113,6 +113,11 @@ impl Provider for AlwaysOk {
             ..Default::default()
         }
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
         Box::pin(futures::stream::iter(vec![

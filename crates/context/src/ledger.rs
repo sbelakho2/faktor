@@ -6,6 +6,13 @@
 
 use faktor_core::error::{Error, ErrorKind};
 
+// Recorded ledger text (decisions, failures) is PROVENANCE DATA, never
+// instructions: the crate-root [`crate::sanitize_ledger_text`] flattens
+// control characters so an embedded newline can never open a new prompt
+// section. ONE implementation is shared by the ledger fold, the wire
+// renderer and the agent's internal-context renderer.
+use crate::sanitize_ledger_text;
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct TaskLedger {
@@ -148,23 +155,6 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
-}
-
-/// Recorded ledger text (decisions, failures) is PROVENANCE DATA, never
-/// instructions: control characters are flattened so an embedded newline can
-/// never open a new prompt section, and outer whitespace is trimmed.
-fn sanitize_ledger_text(text: &str) -> String {
-    let flattened: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    flattened.trim().to_string()
 }
 
 // ===========================================================================

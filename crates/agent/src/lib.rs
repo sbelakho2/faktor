@@ -78,9 +78,22 @@ pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 ///
 /// - [`EfficiencyFlags::failure_learning`]: apply the installed failure-aware
 ///   context prior ([`AgentDeps::context_prior`]) to non-Required candidate
-///   selection through `plan_context_with_information_and_prior`;
-/// - `ccr`, `typed_handoff`, `semantic_context`, `rework_routing`: parsed and
-///   carried by [`AgentDeps`] for the corresponding efficiency components.
+///   selection through `plan_context_with_information_and_prior`, and feed
+///   the durable learning corpus in retrieval (`learning_corpus_evidence`);
+/// - [`EfficiencyFlags::ccr`]: route large tool outputs through the durable
+///   evidence authority ([`AgentRuntime::archive_tool_output`]);
+/// - [`EfficiencyFlags::typed_handoff`]: render the re-sent history from the
+///   durable typed task rows (`TaskContextProjection::from_durable_rows`)
+///   when compaction replaces the transcript; OFF falls back to the legacy
+///   transcript-derived fold (`from_task_ledger`);
+/// - [`EfficiencyFlags::semantic_context`]: install the information-gain
+///   `ContextCompiler` ([`AgentRuntime::context_compiler`]);
+/// - [`EfficiencyFlags::rework_routing`]: the daemon consumes this switch at
+///   graph build (`daemon::builder` step 7) to install (ON) or omit (OFF)
+///   the store-backed verified-outcome registry its router records into and
+///   consults; on a host that wires its own policy, the policy's outcome
+///   registry decides recording/consultation — the runtime records through
+///   whatever registry the installed policy carries.
 ///
 /// With every flag off (and/or no prior handle installed) the runtime's
 /// plans are byte-identical to the pre-flag path.

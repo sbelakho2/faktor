@@ -68,6 +68,11 @@ impl faktor_provider::Provider for FedProvider {
             ..Default::default()
         }
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProviderChunk>();
@@ -493,6 +498,11 @@ impl faktor_provider::Provider for CacheReportingProvider {
             ..Default::default()
         }
     }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
 
     fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
         let read = self.reads.lock().unwrap().pop_front().unwrap_or(0);
@@ -801,6 +811,12 @@ impl faktor_provider::Provider for RecordingProvider {
     }
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.inner.capabilities(model)
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // Authority travels with the wrapped provider: a test
+        // decorator must not silently turn a known provider into an
+        // Unknown lookup (or vice versa).
+        self.inner.capability_resolution(model)
     }
     fn stream(&self, req: faktor_provider::GenericAgentRequest) -> faktor_provider::ProviderStream {
         self.log.lock().unwrap().push(req.clone());
@@ -1124,6 +1140,11 @@ impl faktor_provider::Provider for RetryOnceThenCacheSplitProvider {
             streaming: true,
             ..Default::default()
         }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        // A test double constructed with its exact profile is
+        // model-specific by construction.
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
     fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {

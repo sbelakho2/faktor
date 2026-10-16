@@ -2117,3 +2117,85 @@ fn attribution_incomplete_records_absorb_no_samples() {
         );
     }
 }
+
+/// Capability-authority probe: a provider whose declared profile is fixed
+/// and whose AUTHORITY state the test chooses (the runtime consumers branch
+/// on `resolve_turn_caps`, so the authority must drive the outcome).
+struct AuthorityProbeProvider {
+    caps: ModelCapabilities,
+    authority: faktor_core::model::CapabilityAuthority,
+}
+
+impl faktor_provider::Provider for AuthorityProbeProvider {
+    fn id(&self) -> &str {
+        "authority-probe"
+    }
+
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        self.caps.clone()
+    }
+
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        faktor_core::model::CapabilityResolution {
+            caps: self.capabilities(model),
+            authority: self.authority,
+        }
+    }
+
+    fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+#[test]
+fn turn_capability_resolution_gates_unknown_and_keeps_declared_usable() {
+    use faktor_core::model::CapabilityAuthority;
+    let claimed = ModelCapabilities {
+        context: 128_000,
+        max_output: 16_384,
+        tools: true,
+        parallel_tools: true,
+        vision: true,
+        json_schema: true,
+        reasoning: true,
+        streaming: true,
+        ..ModelCapabilities::default()
+    };
+    // Unknown authority: the turn's DECISION caps gate the unproven
+    // features off (tool bundle/budget/vision all read `effective_caps`),
+    // while the raw declared profile stays visible for telemetry.
+    let unknown: Arc<dyn faktor_provider::Provider> = Arc::new(AuthorityProbeProvider {
+        caps: claimed.clone(),
+        authority: CapabilityAuthority::Unknown,
+    });
+    let (raw, authority, effective) = resolve_turn_caps(&unknown, "custom-model");
+    assert_eq!(authority, CapabilityAuthority::Unknown);
+    assert!(
+        raw.tools && raw.vision,
+        "the declared-looking profile stays visible"
+    );
+    assert!(
+        !effective.tools && !effective.vision && !effective.parallel_tools,
+        "an Unknown lookup may not enable tools/vision in the turn's decision caps"
+    );
+    assert!(effective.context <= ModelCapabilities::default().context);
+    // DeclaredGeneric: explicitly declared assumptions stay usable.
+    let declared: Arc<dyn faktor_provider::Provider> = Arc::new(AuthorityProbeProvider {
+        caps: claimed.clone(),
+        authority: CapabilityAuthority::DeclaredGeneric,
+    });
+    let (_, authority, effective) = resolve_turn_caps(&declared, "custom-model");
+    assert_eq!(authority, CapabilityAuthority::DeclaredGeneric);
+    assert_eq!(
+        effective, claimed,
+        "the declared profile is acted on as declared"
+    );
+    // Known: model-specific, untouched.
+    let known: Arc<dyn faktor_provider::Provider> = Arc::new(AuthorityProbeProvider {
+        caps: claimed.clone(),
+        authority: CapabilityAuthority::Known,
+    });
+    let (_, authority, effective) = resolve_turn_caps(&known, "model");
+    assert_eq!(authority, CapabilityAuthority::Known);
+    assert_eq!(effective, claimed);
+}

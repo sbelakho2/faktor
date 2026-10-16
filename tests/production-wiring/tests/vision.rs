@@ -55,8 +55,12 @@ fn config_file(dir: &Path, body: serde_json::Value) -> Config {
 /// A loopback OpenAI-compatible provider whose quality is EXPLICITLY
 /// authorized (`providers.*.quality`, quality-authority declaration): the
 /// user's declaration is what lets the conservative unknown-quality row
-/// clear the Implement phase's hard 60 floor. Routing is pinned so the
-/// session's turn must select exactly this endpoint.
+/// clear the Implement phase's hard 60 floor. The served id is DECLARED
+/// through the endpoint's `models` list — under the capability-authority
+/// semantics an undeclared id resolves `Unknown`, its effective profile
+/// forces every feature flag (vision included) off, and the image-bearing
+/// turn would be refused pre-wire. Routing is pinned so the session's turn
+/// must select exactly this endpoint.
 fn vision_config(dir: &Path, base: &str) -> Config {
     config_file(
         dir,
@@ -70,6 +74,8 @@ fn vision_config(dir: &Path, base: &str) -> Config {
                 "id": "fake-openai",
                 "base_url": base,
                 "api_key_env": null,
+                "api": "chat",
+                "models": ["default"],
                 "allow_loopback": true,
                 "quality": {
                     "coding_reliability": 80,

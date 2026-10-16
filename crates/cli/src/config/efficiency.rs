@@ -5,20 +5,31 @@
 /// PRODUCTION every flag defaults ON — the efficiency system is active —
 /// and an explicit `false` is the documented OFF-SWITCH for that one
 /// component (an absent section keeps the production defaults; a partial
-/// section flips only the keys it names):
+/// section flips only the keys it names). Every switch has a real
+/// production consumer; none is inert:
 ///
 /// - `failure_learning`: feed the learning crate's failure prior into
 ///   context selection through `faktor_context`'s `FailurePrior` planner
-///   seam (audit 68). OFF installs no prior (neutral omission risk);
-/// - `ccr`: compressed-context representation for tool/evidence payloads.
-///   OFF keeps raw tool output byte-identical (bounded excerpts only);
-/// - `typed_handoff`: re-sent history rendered from durable task rows.
-///   OFF falls back to the legacy transcript rendering;
+///   seam (audit 68) and the durable learning corpus into retrieval.
+///   OFF installs no prior (neutral omission risk; the agent's
+///   `EfficiencyFlags::failure_learning` gates the consult);
+/// - `ccr`: compressed-context representation for tool/evidence payloads —
+///   the agent archives large tool output through the durable evidence
+///   authority only with this flag on (`archive_tool_output`). OFF keeps
+///   raw tool output byte-identical (bounded excerpts only);
+/// - `typed_handoff`: re-sent history rendered from durable task rows —
+///   compaction renders its projection from the typed Task/session-ledger/
+///   VerificationRecord rows only with this flag on. OFF falls back to the
+///   legacy transcript-derived fold (`from_task_ledger`);
 /// - `semantic_context`: information-gain selection of evidence through the
-///   ContextCompiler. OFF keeps the producer evidence list byte-identical
-///   (neutral sparse fallback; unit contexts stay parity);
+///   ContextCompiler (the audit's `information_gain` flag); OFF installs no
+///   compiler and keeps the producer evidence list byte-identical (neutral
+///   sparse fallback; unit contexts stay parity);
 /// - `rework_routing`: rework-aware routing over durable verified-outcome
-///   stats.
+///   stats — the daemon graph installs the store-backed outcome registry
+///   (the one the runtime records verified samples into and every route
+///   consult reads) only with this flag on; OFF installs the no-op
+///   registry, so neither recording nor consultation reaches durable state.
 ///
 /// The section is strictly additive: unknown keys, non-boolean values,
 /// duplicate keys and non-object shapes (a JSON array must never enable
