@@ -804,4 +804,154 @@ mod complexity_tests {
         assert_eq!(wanted.len(), 3);
         assert!(wanted.contains(&NormalizedAttribute::of_parts("颜色", "黑色")));
     }
+
+    /// Independent audit probe: the hoisted [`QueryView`] signals must equal
+    /// the PRE-FIX per-offer computations (reimplemented here verbatim) over
+    /// deterministic random queries/offers with unicode, case and spacing
+    /// twins. Covers title tokens, spec overlap and package matching.
+    #[test]
+    fn query_view_signals_match_the_per_offer_computation_exactly() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        // PRE-FIX title tokens, verbatim.
+        fn old_title_tokens(query: &PartQuery) -> Vec<String> {
+            let mut wanted = tokenize(query.part_number.as_str());
+            if let Some(manufacturer) = &query.manufacturer {
+                for token in tokenize(manufacturer.as_str()) {
+                    if !wanted.contains(&token) {
+                        wanted.push(token);
+                    }
+                }
+            }
+            if let Some(package) = &query.package {
+                for token in tokenize(package.as_str()) {
+                    if !wanted.contains(&token) {
+                        wanted.push(token);
+                    }
+                }
+            }
+            wanted
+        }
+        let names = ["颜色", " 颜色 ", "LENGTH", "length", "公差", "V"];
+        let values = ["1M", " 1m ", "± 1%", "±1%", "黑", "black"];
+        let parts = ["PART7", "part7", "PART-7", "X7", "PART_7"];
+        let manufacturers = [Some("ACME"), Some(" acme "), None, Some("Acme 电子")];
+        let packages = [Some("0603"), Some("0603 "), None, Some("CASE 0603")];
+        let mut state = 0xC0FFEE_u64;
+        for round in 0..300 {
+            let query = PartQuery {
+                manufacturer: manufacturers[(lcg(&mut state) as usize) % manufacturers.len()]
+                    .map(|m| Text::new(m).unwrap()),
+                part_number: Text::new(parts[(lcg(&mut state) as usize) % parts.len()]).unwrap(),
+                package: packages[(lcg(&mut state) as usize) % packages.len()]
+                    .map(|p| Text::new(p).unwrap()),
+                packaging: None,
+                quantity: None,
+                attributes: {
+                    let count = (lcg(&mut state) as usize) % 4;
+                    (0..count)
+                        .map(|_| {
+                            attr(
+                                names[(lcg(&mut state) as usize) % names.len()],
+                                values[(lcg(&mut state) as usize) % values.len()],
+                            )
+                        })
+                        .collect()
+                },
+            };
+            let offer_count = 1 + (lcg(&mut state) as usize) % 3;
+            let offers: Vec<CommercialOffer> = (0..offer_count)
+                .map(|_| {
+                    let variant_count = (lcg(&mut state) as usize) % 3;
+                    let mut candidate = offer(0, 0, 0);
+                    candidate.title = Text::new("ACME PART7 电阻 0603").unwrap();
+                    candidate.variants = (0..variant_count)
+                        .map(|_| {
+                            let attr_count = (lcg(&mut state) as usize) % 4;
+                            let mut v = variant(0, 0);
+                            v.attributes = (0..attr_count)
+                                .map(|_| {
+                                    attr(
+                                        names[(lcg(&mut state) as usize) % names.len()],
+                                        values[(lcg(&mut state) as usize) % values.len()],
+                                    )
+                                })
+                                .collect();
+                            v
+                        })
+                        .collect();
+                    candidate
+                })
+                .collect();
+            let view = QueryView::new(&query);
+            // Title tokens: the precomputed vector must equal the old one.
+            let mut expected_tokens = old_title_tokens(&query);
+            let mut precomputed = view.title_tokens.clone();
+            expected_tokens.sort();
+            precomputed.sort();
+            assert_eq!(expected_tokens, precomputed, "round {round}");
+            assert_eq!(
+                view.manufacturer,
+                query
+                    .manufacturer
+                    .as_ref()
+                    .map(|v| normalized_text(v.as_str()))
+                    .filter(|v| !v.is_empty()),
+                "round {round}"
+            );
+            for candidate in &offers {
+                // Old spec overlap, verbatim pairwise predicate.
+                let old_spec = if query.attributes.is_empty() {
+                    None
+                } else {
+                    let best = candidate
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            let hits = query
+                                .attributes
+                                .iter()
+                                .filter(|wanted| {
+                                    variant
+                                        .attributes
+                                        .iter()
+                                        .any(|attribute| attribute.matches(wanted))
+                                })
+                                .count() as u64;
+                            (hits * 10_000) / query.attributes.len() as u64
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    Some(best.min(10_000) as u16)
+                };
+                assert_eq!(
+                    spec_overlap_bp(&view, candidate),
+                    old_spec,
+                    "round {round} spec overlap"
+                );
+                // Old title overlap, verbatim.
+                let old_title = {
+                    if expected_tokens.is_empty() {
+                        0
+                    } else {
+                        let present = tokenize(candidate.title.as_str());
+                        let hits = expected_tokens
+                            .iter()
+                            .filter(|token| present.contains(token))
+                            .count() as u64;
+                        ((hits * 10_000) / expected_tokens.len() as u64).min(10_000) as u16
+                    }
+                };
+                assert_eq!(
+                    title_token_overlap_bp(&view, candidate.title.as_str()),
+                    old_title,
+                    "round {round} title overlap"
+                );
+            }
+        }
+    }
 }

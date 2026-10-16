@@ -9633,6 +9633,94 @@ async function navigationWebviewTests() {
     assertEqual(list.children.length, 3, 'the recovered conversations are back');
   });
 
+  await test('content guards cannot over-suppress: selection, session framing and review deltas all render', () => {
+    // Independent audit probe for the content-key guards: every input the
+    // guarded renderers actually read must be part of the key (a real
+    // content change re-renders), while a genuinely identical delta settles
+    // without churn.
+    const snapshot = webviewSnapshot([]);
+    snapshot.changes = {
+      available: true,
+      reason: null,
+      rows: [
+        { path: 'src/a.ts', changeKind: 'modified', refs: [] },
+        { path: 'src/b.ts', changeKind: 'added', refs: [] },
+      ],
+      candidateDisplay: 'Candidate change',
+      basis: null,
+      advanced: [],
+    };
+    snapshot.sessions = [
+      { ...clone(sessionSummaryJson), id: '7', title: 'selftest' },
+      { id: '8', title: 'older conversation', provider: 'fake', model: 'm', state: 'idle' },
+    ];
+    const harness = runChatWebview(snapshot);
+    const changesList = harness.dom.document.getElementById('changes-list');
+    assertEqual(harness.renderCounts.changes, 1, 'the first snapshot builds once');
+    assertEqual(harness.renderCounts.history, 1, 'the history listing builds once');
+
+    // 1. Selection move then an identical delta: the key covers the
+    // selection, so the DOM settles and the selection survives byte-for-byte.
+    const rowB = findFake(
+      changesList,
+      (node) => node.tagName === 'button' && node.textContent === 'src/b.ts',
+    );
+    assert(rowB, 'row b is selectable');
+    rowB.click();
+    assertEqual(harness.renderCounts.changes, 2, 'the selection move renders');
+    const settled = canonicalDomDigest(harness.dom.nodesById);
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(snapshot)) });
+    assertEqual(harness.renderCounts.changes, 2, 'identical delta after a selection skips');
+    assertEqual(
+      canonicalDomDigest(harness.dom.nodesById),
+      settled,
+      'the selected row survives the skipped rebuild',
+    );
+    const stillSelected = findFake(changesList, (node) =>
+      String(node.className).includes('changes-row-selected'),
+    );
+    assertEqual(
+      stillSelected && stillSelected.getAttribute('data-change-path'),
+      'src/b.ts',
+      'selection is retained, never reset by the guard',
+    );
+
+    // 2. Session framing is a real content change: identical session rows
+    // but a different current session must rebuild the listing and move the
+    // `current` chip.
+    const beforeFraming = canonicalDomDigest(harness.dom.nodesById);
+    const reframed = JSON.parse(JSON.stringify(snapshot));
+    reframed.session.id = '8';
+    harness.deliver({ type: 'snapshot', snapshot: reframed });
+    assertEqual(harness.renderCounts.history, 2, 'a current-session move rebuilds the listing');
+    assert(
+      canonicalDomDigest(harness.dom.nodesById) !== beforeFraming,
+      'the current chip actually moved in the DOM',
+    );
+    assertEqual(harness.renderCounts.changes, 2, 'unchanged changes stay skipped');
+
+    // 3. The review message path renders the review node without touching
+    // the list, and the next identical snapshot still settles (the key
+    // covers the review state).
+    harness.deliver({ type: 'changeReview', path: 'src/b.ts', state: 'opened', evidenceId: 41 });
+    const review = harness.dom.document.getElementById('change-review-state');
+    const reviewLine =
+      review && findFake(review, (node) => String(node.textContent).includes('evidence #41'));
+    assert(
+      review && review.hidden !== true && reviewLine,
+      `the review state renders from the message: ${review ? fakeText(review) : 'missing'}`,
+    );
+    assertEqual(harness.renderCounts.changes, 2, 'the review message never rebuilds the list');
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(reframed)) });
+    const afterConverge = harness.renderCounts.changes;
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(reframed)) });
+    assertEqual(
+      harness.renderCounts.changes,
+      afterConverge,
+      'after the review state converges, identical deltas settle',
+    );
+  });
+
   await test('the served session listing parses the additive created_ms tolerantly', () => {
     const withDate = nc.validateSessionList({
       sessions: [{ ...clone(sessionSummaryJson), created_ms: 1700000000000 }],

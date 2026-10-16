@@ -180,3 +180,128 @@ fn dependency_index_matches_the_plan_scan_on_adversarial_plans() {
         assert!(probes == plan.work_items.len());
     }
 }
+
+/// Independent audit probe: the per-settle `DependencyIndex` propagation
+/// must drive the SAME state machine as the PRE-FIX plan scans across
+/// MANY settles in one drive — failed dependencies block, retried
+/// dependencies (Done again) unblock, duplicates/diamonds/self-edges are
+/// all exercised. The index is rebuilt per settle (as in `settle`), so a
+/// stale index is impossible by construction; this probe additionally
+/// shows the rebuilt index reproduces the naive outcome step by step.
+#[test]
+fn dependency_propagation_across_settles_matches_the_plan_scan() {
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+    let items = vec![
+        wi("a", WorkKind::Analysis, &[]),
+        wi("b", WorkKind::Analysis, &["a"]),
+        wi("c", WorkKind::Analysis, &["a", "a"]),
+        wi("d", WorkKind::Analysis, &["b", "c"]),
+        wi("e", WorkKind::Analysis, &["d", "b", "d"]),
+        wi("f", WorkKind::Analysis, &["missing", "e"]),
+        wi("g", WorkKind::Analysis, &["g"]),
+    ];
+    let plan = raw_plan(items);
+    // Children in a fixed order with a terminal flag per child.
+    let children: Vec<(String, String, bool)> = vec![
+        ("ch-b".into(), "b".into(), false),
+        ("ch-c".into(), "c".into(), false),
+        ("ch-b2".into(), "b".into(), false),
+        ("ch-f".into(), "f".into(), false),
+        ("ch-a".into(), "a".into(), true),
+    ];
+    let naive_fail = |states: &mut HashMap<String, WorkState>, item: &str| {
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        for w in &plan.work_items {
+            if w.depends_on.contains(&item.to_string())
+                && states.get(&w.id) == Some(&WorkState::Pending)
+            {
+                states.insert(w.id.clone(), WorkState::Blocked);
+                for (child_id, child_item, terminal) in &children {
+                    if child_item == &w.id && !*terminal {
+                        blocks.push((child_id.clone(), format!("waiting on work item {item:?}")));
+                    }
+                }
+            }
+        }
+        blocks
+    };
+    let index_fail = |states: &mut HashMap<String, WorkState>,
+                      item: &str,
+                      index: &DependencyIndex| {
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        for w_id in index.dependents_of(item) {
+            if states.get(w_id) == Some(&WorkState::Pending) {
+                states.insert(w_id.clone(), WorkState::Blocked);
+                for (child_id, child_item, terminal) in &children {
+                    if child_item == w_id && !*terminal {
+                        blocks.push((child_id.clone(), format!("waiting on work item {item:?}")));
+                    }
+                }
+            }
+        }
+        blocks
+    };
+    let naive_done = |states: &mut HashMap<String, WorkState>, item: &str| {
+        for w in &plan.work_items {
+            if w.depends_on.contains(&item.to_string())
+                && states.get(&w.id) == Some(&WorkState::Blocked)
+                && w.depends_on
+                    .iter()
+                    .all(|d| states.get(d) == Some(&WorkState::Done))
+            {
+                states.insert(w.id.clone(), WorkState::Pending);
+            }
+        }
+    };
+    let index_done =
+        |states: &mut HashMap<String, WorkState>, item: &str, index: &DependencyIndex| {
+            for w_id in index.dependents_of(item) {
+                if states.get(w_id) == Some(&WorkState::Blocked)
+                    && index
+                        .deps_of(w_id)
+                        .iter()
+                        .all(|d| states.get(d) == Some(&WorkState::Done))
+                {
+                    states.insert(w_id.clone(), WorkState::Pending);
+                }
+            }
+        };
+    let mut state = 0xABCD_u64;
+    for round in 0..400 {
+        // One "drive": several settle waves; the index is REBUILT each
+        // wave exactly like `settle` does.
+        let mut naive: HashMap<String, WorkState> = plan
+            .work_items
+            .iter()
+            .map(|w| (w.id.clone(), WorkState::Pending))
+            .collect();
+        let mut indexed = naive.clone();
+        for _wave in 0..6 {
+            let index = DependencyIndex::build(&plan);
+            let target = plan.work_items[(lcg(&mut state) as usize) % plan.work_items.len()]
+                .id
+                .clone();
+            if lcg(&mut state).is_multiple_of(2) {
+                // Dependency failed (or was cancelled): block dependents.
+                let a = naive_fail(&mut naive, &target);
+                let b = index_fail(&mut indexed, &target, &index);
+                assert_eq!(a, b, "round {round}: fail blocks drifted for {target}");
+            } else {
+                // Retried dependency reached Done again: unblock.
+                naive.insert(target.clone(), WorkState::Done);
+                indexed.insert(target.clone(), WorkState::Done);
+                naive_done(&mut naive, &target);
+                index_done(&mut indexed, &target, &index);
+            }
+            assert_eq!(
+                naive, indexed,
+                "round {round}: states drifted after {target}"
+            );
+        }
+    }
+}

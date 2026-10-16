@@ -371,6 +371,36 @@ pub struct TaskUsageBatch {
 /// whose rows failed read-time validation (the caller falls back per task).
 type ReservationChunkScan = (Vec<CostReservationRow>, Vec<(SessionId, TaskId)>);
 
+/// Result of one usage-facts batch chunk: the kind-`usage` rows plus the
+/// sessions whose rows failed read-time validation (the caller falls back
+/// per session).
+type UsageFactsChunkScan = (Vec<(SessionId, String, String)>, Vec<SessionId>);
+
+/// First-occurrence-deduplicated session ids: the batch reads take SETS, so
+/// an id that straddles two 500-id chunks is queried (and served) exactly
+/// once.
+fn unique_session_ids(session_ids: &[SessionId]) -> Vec<SessionId> {
+    let mut seen: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(session_ids.len());
+    session_ids
+        .iter()
+        .copied()
+        .filter(|s| seen.insert(s.raw()))
+        .collect()
+}
+
+/// First-occurrence-deduplicated `(session, task)` pairs (see
+/// [`unique_session_ids`]).
+fn unique_pairs(pairs: &[(SessionId, TaskId)]) -> Vec<(SessionId, TaskId)> {
+    let mut seen: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::with_capacity(pairs.len());
+    pairs
+        .iter()
+        .copied()
+        .filter(|(s, t)| seen.insert((s.raw(), t.raw())))
+        .collect()
+}
+
 /// Result of [`Store::cost_reservations_for_tasks`].
 #[derive(Debug, Clone, Default)]
 pub struct TaskReservationBatch {
@@ -390,10 +420,13 @@ pub struct TaskReservationBatch {
 #[derive(Debug, Clone, Default)]
 pub struct UsageFactsBatch {
     /// `(session, key, value)` rows of kind `usage`, per session ordered by
-    /// `updated_ms DESC, kind DESC, key DESC`.
+    /// `updated_ms DESC, kind DESC, key DESC`. A session in `unreadable` is
+    /// never served here.
     pub rows: Vec<(SessionId, String, String)>,
-    /// Sessions whose chunk failed at the SQL layer: the caller re-reads
-    /// them through [`Store::memory_facts`].
+    /// Sessions the batch cannot serve EXACTLY: a row of ANY kind whose
+    /// storage the per-session read would refuse (the legacy read decodes
+    /// every kind), or a chunk-level SQL failure. The caller re-reads them
+    /// through [`Store::memory_facts`].
     pub unreadable: Vec<SessionId>,
 }
 
@@ -2415,7 +2448,10 @@ impl Store {
     ) -> StoreResult<TaskReservationBatch> {
         const PAIR_CHUNK: usize = 500;
         let mut batch = TaskReservationBatch::default();
-        for chunk in pairs.chunks(PAIR_CHUNK) {
+        // SET semantics (the doc contract): a repeated pair is served ONCE,
+        // never once per chunk it appears in.
+        let unique = unique_pairs(pairs);
+        for chunk in unique.chunks(PAIR_CHUNK) {
             match self.cost_reservations_for_task_chunk(chunk, limit) {
                 Ok((rows, failed)) => {
                     batch.rows.extend(rows);
@@ -2527,7 +2563,10 @@ impl Store {
     ) -> StoreResult<SessionUsageBatch> {
         const SESSION_CHUNK: usize = 500;
         let mut batch = SessionUsageBatch::default();
-        for chunk in session_ids.chunks(SESSION_CHUNK) {
+        // SET semantics (the doc contract): a repeated id is served ONCE,
+        // never once per chunk it appears in.
+        let unique = unique_session_ids(session_ids);
+        for chunk in unique.chunks(SESSION_CHUNK) {
             let ids: std::collections::BTreeSet<i64> =
                 chunk.iter().map(|s| s.raw() as i64).collect();
             let ph = std::iter::repeat_n("?", ids.len())
@@ -2542,7 +2581,8 @@ impl Store {
                         COUNT(CASE WHEN prompt_prefix_hash IS NOT NULL
                                     AND prefix_stability IS NOT NULL THEN 1 END),
                         COALESCE(SUM(CASE WHEN prompt_prefix_hash IS NOT NULL AND (
-                                        length(prompt_prefix_hash) != 32
+                                        typeof(prompt_prefix_hash) != 'blob'
+                                        OR length(prompt_prefix_hash) != 32
                                         OR prompt_tokens IS NULL
                                         OR prompt_tokens < 0
                                         OR prompt_tokens > 4294967295
@@ -2609,7 +2649,10 @@ impl Store {
     ) -> StoreResult<TaskUsageBatch> {
         const SESSION_CHUNK: usize = 500;
         let mut batch = TaskUsageBatch::default();
-        for chunk in session_ids.chunks(SESSION_CHUNK) {
+        // SET semantics (the doc contract): a repeated id is served ONCE,
+        // never once per chunk it appears in.
+        let unique = unique_session_ids(session_ids);
+        for chunk in unique.chunks(SESSION_CHUNK) {
             let ids: std::collections::BTreeSet<i64> =
                 chunk.iter().map(|s| s.raw() as i64).collect();
             let ph = std::iter::repeat_n("?", ids.len())
@@ -2698,24 +2741,41 @@ impl Store {
     /// over a SET of sessions: one statement per bounded chunk, in the SAME
     /// per-session order (`updated_ms DESC, kind DESC, key DESC`), so the
     /// caller's last-wins fold over `budget`/`spent` keys is byte-identical.
+    /// A session with an unreadable row of ANY kind (the legacy read decodes
+    /// every kind and fails the session) lands in `unreadable` instead of
+    /// being silently filtered out by the `kind` predicate.
     pub fn usage_facts_by_session(
         &self,
         session_ids: &[SessionId],
     ) -> StoreResult<UsageFactsBatch> {
         const SESSION_CHUNK: usize = 500;
         let mut batch = UsageFactsBatch::default();
-        for chunk in session_ids.chunks(SESSION_CHUNK) {
+        // SET semantics (the doc contract): a repeated id is served ONCE,
+        // never once per chunk it appears in.
+        let unique = unique_session_ids(session_ids);
+        for chunk in unique.chunks(SESSION_CHUNK) {
             let ids: std::collections::BTreeSet<i64> =
                 chunk.iter().map(|s| s.raw() as i64).collect();
             let ph = std::iter::repeat_n("?", ids.len())
                 .collect::<Vec<_>>()
                 .join(",");
+            // The legacy read decodes every kind, so an unreadable row of
+            // ANY kind fails the whole session; `kind = 'usage'` alone would
+            // silently skip those rows. The anomaly probes keep the fetched
+            // set small while making every row the legacy read would refuse
+            // visible here: a non-TEXT kind/key/value fails the row decode
+            // and marks the session for the per-session fallback.
             let sql = format!(
                 "SELECT session_id, kind, key, value FROM memory_fact
-                 WHERE session_id IN ({ph}) AND kind = 'usage'
+                 WHERE session_id IN ({ph}) AND (
+                     kind = 'usage'
+                     OR typeof(kind) != 'text'
+                     OR typeof(key) != 'text'
+                     OR typeof(value) != 'text'
+                 )
                  ORDER BY session_id ASC, updated_ms DESC, kind DESC, key DESC"
             );
-            let scan = || -> StoreResult<Vec<(SessionId, String, String)>> {
+            let scan = || -> StoreResult<UsageFactsChunkScan> {
                 let conn = self.read()?;
                 let mut stmt = conn.prepare(&sql)?;
                 let params_vec: Vec<rusqlite::types::Value> = ids
@@ -2724,6 +2784,7 @@ impl Store {
                     .collect();
                 let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
                 let mut out = Vec::new();
+                let mut unreadable: Vec<SessionId> = Vec::new();
                 while let Some(r) = rows.next()? {
                     let raw_sid: i64 = r.get(0)?;
                     let Ok(session_id) = id_field::<SessionId>(
@@ -2732,14 +2793,39 @@ impl Store {
                     ) else {
                         continue; // not a decodable id: cannot be in the set
                     };
-                    let key: String = r.get(2)?;
-                    let value: String = r.get(3)?;
-                    out.push((session_id, key, value));
+                    // Anomaly probes can only decode as TEXT when they are
+                    // ordinary usage rows; anything else is the legacy
+                    // read's loud failure, reported per session.
+                    let row = (|| -> rusqlite::Result<(String, String, String)> {
+                        let kind: String = r.get(1)?;
+                        let key: String = r.get(2)?;
+                        let value: String = r.get(3)?;
+                        Ok((kind, key, value))
+                    })();
+                    match row {
+                        Ok((kind, key, value)) => {
+                            if kind == "usage" {
+                                out.push((session_id, key, value));
+                            }
+                        }
+                        Err(_) => {
+                            if !unreadable.contains(&session_id) {
+                                unreadable.push(session_id);
+                            }
+                        }
+                    }
                 }
-                Ok(out)
+                // A session that failed anywhere in the scan is never served
+                // from the batch: the caller re-reads it per session (the
+                // row order must not decide which rows leak through).
+                out.retain(|(session_id, _, _)| !unreadable.contains(session_id));
+                Ok((out, unreadable))
             };
             match scan() {
-                Ok(rows) => batch.rows.extend(rows),
+                Ok((rows, unreadable)) => {
+                    batch.rows.extend(rows);
+                    batch.unreadable.extend(unreadable);
+                }
                 Err(_) => batch.unreadable.extend(chunk.iter().copied()),
             }
         }

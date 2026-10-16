@@ -2156,4 +2156,199 @@ mod tests {
             assert_eq!(pairwise_hits, hoisted_hits);
         }
     }
+
+    // ---------------------------------------- independent audit probes
+    //
+    // The committed one-pass rewrites are compared against the OLD pairwise
+    // algorithms, reimplemented here verbatim as oracles, over deterministic
+    // pseudo-random permutations: every error (kind AND first offending
+    // element) must be identical, including the precedence between a
+    // per-variant validation failure and a duplicate id.
+
+    /// Deterministic LCG: adversarial permutations without a proptest dep.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// PRE-FIX `VariantOffer::validate` attribute axis, verbatim pairwise
+    /// scan (price breaks are always valid in this corpus).
+    fn oracle_attribute_error(attributes: &[VariantAttribute]) -> Option<(String, String)> {
+        if attributes.len() > MAX_ATTRIBUTES_PER_VARIANT {
+            return Some(("too_many_attributes".into(), String::new()));
+        }
+        for (index, attribute) in attributes.iter().enumerate() {
+            for other in attributes.iter().skip(index + 1) {
+                if normalize_attribute(attribute.name.as_str())
+                    == normalize_attribute(other.name.as_str())
+                {
+                    return Some((
+                        "duplicate_attribute".into(),
+                        attribute.name.as_str().to_string(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// PRE-FIX `CommercialOffer::validate` variant axis, verbatim: validate
+    /// each variant, then first later equal id; packaging options the same.
+    fn oracle_offer_error(offer: &CommercialOffer) -> Option<(String, String)> {
+        if offer.variants.len() > MAX_VARIANTS_PER_OFFER {
+            return Some(("too_many_variants".into(), String::new()));
+        }
+        if offer.packaging.len() > MAX_PACKAGING_OPTIONS {
+            return Some(("too_many_packaging".into(), String::new()));
+        }
+        for (index, variant) in offer.variants.iter().enumerate() {
+            // Precedence: the per-variant validation runs BEFORE the
+            // duplicate-id check at the same index, and both bubble up
+            // through `CommercialOffer::validate` with the same key.
+            if let Some(error) = oracle_attribute_error(&variant.attributes) {
+                return Some(error);
+            }
+            for other in offer.variants.iter().skip(index + 1) {
+                if variant.variant_id == other.variant_id {
+                    return Some((
+                        "duplicate_variant_id".into(),
+                        variant.variant_id.as_str().to_string(),
+                    ));
+                }
+            }
+        }
+        for (index, option) in offer.packaging.iter().enumerate() {
+            for other in offer.packaging.iter().skip(index + 1) {
+                if option.packaging == other.packaging && option.label == other.label {
+                    return Some((
+                        "duplicate_packaging".into(),
+                        format!("{:?}", option.packaging),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn probe_error_key(result: &Result<(), OfferError>) -> Option<(String, String)> {
+        match result {
+            Ok(()) => None,
+            Err(OfferError::TooManyAttributes { .. }) => {
+                Some(("too_many_attributes".into(), String::new()))
+            }
+            Err(OfferError::DuplicateAttribute { name }) => {
+                Some(("duplicate_attribute".into(), name.clone()))
+            }
+            Err(OfferError::TooManyVariants { .. }) => {
+                Some(("too_many_variants".into(), String::new()))
+            }
+            Err(OfferError::TooManyPackagingOptions { .. }) => {
+                Some(("too_many_packaging".into(), String::new()))
+            }
+            Err(OfferError::DuplicateVariantId { id }) => {
+                Some(("duplicate_variant_id".into(), id.clone()))
+            }
+            Err(OfferError::DuplicatePackagingOption { packaging }) => {
+                Some(("duplicate_packaging".into(), format!("{packaging:?}")))
+            }
+            Err(other) => Some((format!("other:{other:?}"), String::new())),
+        }
+    }
+
+    #[test]
+    fn one_pass_duplicate_detection_matches_pairwise_for_every_permutation() {
+        // Name alphabet with case/space/unicode twins and duplicates.
+        let names = ["A", " a ", "颜色", " 颜色", "COLOR", "color", "长度", "B"];
+        let values = ["1", "x", "值"];
+        let ids = ["v0", "v1", "V1", "v2", "v0", "v2"];
+        let mut state = 0x5eed_u64;
+        for round in 0..400 {
+            // Random attribute list (0..=7 entries): duplicates, unicode and
+            // case twins all legal inputs.
+            let attr_count = (lcg(&mut state) % 8) as usize;
+            let attributes: Vec<VariantAttribute> = (0..attr_count)
+                .map(|_| {
+                    attribute(
+                        names[(lcg(&mut state) as usize) % names.len()],
+                        values[(lcg(&mut state) as usize) % values.len()],
+                    )
+                })
+                .collect();
+            // Variant axis: sometimes deliberately over the attribute cap.
+            let mut attributes = attributes;
+            if lcg(&mut state).is_multiple_of(17) {
+                attributes = vec![attribute("A", "1"); MAX_ATTRIBUTES_PER_VARIANT + 1];
+            }
+            let one = variant(
+                ids[(lcg(&mut state) as usize) % ids.len()],
+                attributes.clone(),
+            );
+            let oracle = oracle_attribute_error(&attributes);
+            let probe = probe_error_key(&one.validate(Currency::CNY));
+            assert_eq!(oracle, probe, "round {round}: attributes {attributes:?}");
+
+            // Offer axis: 1..=5 variants, packaging options.
+            let variant_count = 1 + (lcg(&mut state) as usize) % 5;
+            let variants: Vec<VariantOffer> = (0..variant_count)
+                .map(|_| {
+                    let count = (lcg(&mut state) as usize) % 4;
+                    let attrs: Vec<VariantAttribute> = (0..count)
+                        .map(|_| {
+                            attribute(
+                                names[(lcg(&mut state) as usize) % names.len()],
+                                values[(lcg(&mut state) as usize) % values.len()],
+                            )
+                        })
+                        .collect();
+                    variant(ids[(lcg(&mut state) as usize) % ids.len()], attrs)
+                })
+                .collect();
+            let packaging_count = (lcg(&mut state) as usize) % 4;
+            let packaging: Vec<PackagingOption> = (0..packaging_count)
+                .map(|_| {
+                    let kinds = [
+                        PackagingType::TapeAndReel,
+                        PackagingType::Tray,
+                        PackagingType::Tube,
+                    ];
+                    PackagingOption {
+                        packaging: kinds[(lcg(&mut state) as usize) % kinds.len()],
+                        label: if lcg(&mut state).is_multiple_of(3) {
+                            None
+                        } else {
+                            Some(Text::new("reel").expect("label"))
+                        },
+                        moq: None,
+                        order_multiple: None,
+                        standard_pack: None,
+                        stock: StockState::Unknown,
+                        price_breaks: Vec::new(),
+                        lead_time: None,
+                    }
+                })
+                .collect();
+            let mut probe_offer = offer();
+            probe_offer.variants = variants;
+            probe_offer.packaging = packaging;
+            let oracle = oracle_offer_error(&probe_offer);
+            let probe = probe_error_key(&probe_offer.validate());
+            assert_eq!(
+                oracle,
+                probe,
+                "round {round}: variants {:?} packaging {:?}",
+                probe_offer
+                    .variants
+                    .iter()
+                    .map(|v| v.variant_id.as_str())
+                    .collect::<Vec<_>>(),
+                probe_offer
+                    .packaging
+                    .iter()
+                    .map(|p| (p.packaging, p.label.is_some()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

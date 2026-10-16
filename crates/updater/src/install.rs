@@ -185,25 +185,172 @@ pub const DIGEST_MEMO_MIN_BYTES: u64 = 1024 * 1024;
 /// Bounded memo count per install layout.
 const DIGEST_MEMO_CAPACITY: usize = 256;
 
+/// The object-identity half of a memo key. `size`/`mtime` are settable by
+/// any writer (`utimes`/`SetFileTime`), so the memo also pins the change
+/// metadata a plain rewrite cannot preserve: on Unix the device, inode and
+/// ctime (an unprivileged writer cannot set ctime); on Windows the volume
+/// serial, file index and creation time read through the same enumerated
+/// authority the launch seam uses (a replacement changes the file index).
+/// The Windows creation time, unlike the unix ctime, IS settable by the
+/// file's owner (`SetFileTime`), so the Windows arm is consulted only for
+/// files that pass [`windows_memo_authorized`] — owner SID equal to the
+/// daemon process's user and no group/other write grant in the DACL;
+/// everything else streams the full bytes on every verification. A platform
+/// where no such identity is available never memoizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Unix {
+        dev: u64,
+        ino: u64,
+        ctime: i64,
+        ctime_nsec: i64,
+    },
+    #[cfg(windows)]
+    Windows {
+        volume_serial: u32,
+        file_index: u64,
+        creation_time: u64,
+    },
+    #[cfg(not(any(unix, windows)))]
+    Coarse,
+}
+
+/// One ALLOW grant the Windows authority copied out of a file's DACL: the
+/// raw `ACCESS_MASK` plus the trustee classification the authority computed
+/// with `EqualSid` against the file owner and the daemon process's user. The
+/// mask vocabulary stays here (not in the authority) so the write-grant
+/// policy is probeable on every host, not only Windows.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaclGrant {
+    pub mask: u32,
+    pub trustee_is_owner: bool,
+    pub trustee_is_process_user: bool,
+}
+
+/// The Windows digest-memo authorization facts, read by the `win_exec`
+/// authority through one handle: whether the file's owner SID equals the
+/// daemon process's user SID, whether the file's DACL was read in full, and
+/// every ALLOW grant it contains (bounded; an unreadable or truncated DACL
+/// reads as `dacl_read = false`). A NULL DACL — no DACL at all, granting
+/// every trustee full access — cannot be read and therefore also refuses.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MemoFacts {
+    pub owner_is_process_user: bool,
+    pub dacl_read: bool,
+    pub grants: Vec<DaclGrant>,
+}
+
+/// The `winnt.h` access bits that let an ALLOW grant's trustee rewrite the
+/// file's content or forge its timestamps: `FILE_WRITE_DATA |
+/// FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | WRITE_DAC |
+/// WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL` (literal values, so the policy
+/// compiles and is probeable on every host). `WRITE_DAC`/`WRITE_OWNER` are
+/// included because their holder can grant itself the write bits (or take
+/// ownership) at any time, so a trustee holding them is treated exactly like
+/// one already holding write access. `DELETE` is deliberately absent: a
+/// deleted-and-replaced file changes the file index, which the memo key
+/// already pins, while an in-place forger of `mtime` AND creation time needs
+/// `FILE_WRITE_ATTRIBUTES` or one of the other bits.
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_WRITE_ACCESS_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA
+    | 0x0000_0004 // FILE_APPEND_DATA
+    | 0x0000_0010 // FILE_WRITE_EA
+    | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+    | 0x0004_0000 // WRITE_DAC (the holder can grant itself the write bits)
+    | 0x0008_0000 // WRITE_OWNER (take ownership, then rewrite the ACL)
+    | 0x4000_0000 // GENERIC_WRITE
+    | 0x1000_0000; // GENERIC_ALL
+
+/// Whether the Windows memo fast path may serve `facts`: the file must be
+/// owned by the daemon's own user AND its DACL must be readable and contain
+/// no write-capable ALLOW grant for any other trustee. Anything else falls
+/// back to full hashing, so an owner forging `mtime` AND creation time with
+/// `SetFileTime` cannot mask a same-size rewrite: forging needs a write
+/// grant this predicate excludes, or the writer is the daemon's own user —
+/// the documented same-owner boundary (that writer is the daemon itself).
+/// This is a per-verification gate, like every memo observation: a third
+/// party granted write access BETWEEN two verifications and revoked before
+/// the next one is the same class of unobservable transient the unix ctime
+/// key also cannot see from the outside (the ACL is not part of the key).
+#[cfg(any(windows, test))]
+pub(crate) fn windows_memo_authorized(facts: &MemoFacts) -> bool {
+    facts.owner_is_process_user
+        && facts.dacl_read
+        && !facts.grants.iter().any(|grant| {
+            grant.mask & WINDOWS_WRITE_ACCESS_MASK != 0
+                && !grant.trustee_is_owner
+                && !grant.trustee_is_process_user
+        })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata, _path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(FileIdentity::Unix {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(_metadata: &fs::Metadata, path: &Path) -> Option<FileIdentity> {
+    // The memo fast path is valid ONLY on a file the daemon's own user owns
+    // and no group/other trustee can write (`windows_memo_authorized`); any
+    // refusal — a mismatched owner, a NULL/unreadable DACL, a write grant
+    // for any other trustee — and any unreadable Win32 fact all return
+    // `None`, so the caller streams the full bytes every time. An owner
+    // forging mtime AND creation time with `SetFileTime` cannot mask a
+    // same-size rewrite through this path; the same-user writer IS the
+    // daemon (the boundary the memo documents), and cross-user forgery is
+    // excluded by the owner + DACL check.
+    let facts = crate::win_exec::path_memo_facts(path)?;
+    if !windows_memo_authorized(&facts.authorization) {
+        return None;
+    }
+    let (volume_serial, file_index, creation_time) = facts.identity.memo_key();
+    Some(FileIdentity::Windows {
+        volume_serial,
+        file_index,
+        creation_time,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata, _path: &Path) -> Option<FileIdentity> {
+    Some(FileIdentity::Coarse)
+}
+
 /// One memoized digest observation of one install-tree path.
 #[derive(Debug)]
 struct DigestMemo {
     size: u64,
     mtime: Option<std::time::SystemTime>,
+    identity: FileIdentity,
     expected: String,
     digest: String,
 }
 
 /// The digest memo table of one install layout. A memo is consulted ONLY
-/// when the path's byte length, modification time AND the caller's expected
-/// digest all match exactly, and every writer of this layout explicitly
-/// invalidates the paths it publishes — first-time verification and any
-/// observable change always stream the full bytes, so the digest stays the
-/// authority and the memo only removes repeated work (recovery retries,
-/// idempotent stage/apply replays). Documented boundary: a same-owner
-/// rewrite that preserves byte length AND the filesystem's full mtime
-/// resolution is outside what the memo can observe (the same-owner in-place
-/// writer residual the release machinery already documents).
+/// when the path's byte length, modification time, object identity AND the
+/// caller's expected digest all match exactly, and every writer of this
+/// layout explicitly invalidates the paths it publishes — first-time
+/// verification and any observable change always stream the full bytes, so
+/// the digest stays the authority and the memo only removes repeated work
+/// (recovery retries, idempotent stage/apply replays). Documented boundary:
+/// a same-owner rewrite that preserves byte length AND the filesystem's full
+/// mtime resolution is outside what the memo can observe (the same-owner
+/// in-place writer residual the release machinery already documents). On
+/// Windows that boundary is narrowed further: the identity half of the key
+/// is only produced for files owned by the daemon's own user with no
+/// group/other write grant ([`windows_memo_authorized`]), so an owner who
+/// forges `mtime` AND creation time with `SetFileTime` is either the daemon
+/// itself (same owner) or cannot reach the memo at all (owner mismatch or an
+/// other-writable DACL forces the full hash on every verification).
 #[derive(Debug, Default)]
 struct DigestMemoTable {
     entries: std::sync::Mutex<std::collections::HashMap<PathBuf, DigestMemo>>,
@@ -275,6 +422,12 @@ impl InstallLayout {
         };
         let size = metadata.len();
         let mtime = metadata.modified().ok();
+        // No stable object identity on this filesystem — or the Windows
+        // owner/DACL gate refused — never memoize.
+        let Some(identity) = file_identity(&metadata, path) else {
+            self.note_digest_computation();
+            return file_digest(path);
+        };
         {
             let entries = self
                 .digest_memos
@@ -282,7 +435,11 @@ impl InstallLayout {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(memo) = entries.get(path) {
-                if memo.size == size && memo.mtime == mtime && memo.expected == expected {
+                if memo.size == size
+                    && memo.mtime == mtime
+                    && memo.identity == identity
+                    && memo.expected == expected
+                {
                     return Ok(memo.digest.clone());
                 }
             }
@@ -302,6 +459,7 @@ impl InstallLayout {
             DigestMemo {
                 size,
                 mtime,
+                identity,
                 expected: expected.to_string(),
                 digest: digest.clone(),
             },
@@ -792,6 +950,314 @@ mod tests {
         eprintln!(
             "updater-verify: 5x{}KiB: streamed {streamed:?} vs memoized {memoized:?}",
             bytes.len() / 1024
+        );
+    }
+
+    /// Independent perf-wave audit probe: a same-size, same-mtime rewrite
+    /// (user-level utimes) must still re-hash — the memo key carries the
+    /// object's change metadata, not just (size, mtime), so a stale memo can
+    /// never mask a tamper it did not observe.
+    #[cfg(unix)]
+    #[test]
+    fn memo_never_masks_a_same_size_mtime_preserving_rewrite() {
+        let (_dir, layout) = layout();
+        let bytes = vec![0x11u8; (DIGEST_MEMO_MIN_BYTES as usize) + 4096];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-mtime", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-mtime")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        layout.verify_installed(&pointer).unwrap();
+        assert_eq!(layout.digest_computations(), 1);
+        let original_mtime = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        // Same-size in-place rewrite, then restore the EXACT mtime.
+        std::fs::write(&dest, vec![0x22u8; bytes.len()]).unwrap();
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+            file.set_modified(original_mtime).unwrap();
+        }
+        let after = std::fs::metadata(&dest).unwrap();
+        assert_eq!(after.len(), bytes.len() as u64, "size collision is real");
+        assert_eq!(
+            after.modified().unwrap(),
+            original_mtime,
+            "mtime collision is real"
+        );
+        let err = layout.verify_installed(&pointer).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "staged_artifact_unusable",
+            "a same-size same-mtime rewrite must be re-hashed and refused"
+        );
+        assert_eq!(
+            layout.digest_computations(),
+            2,
+            "the changed object must be streamed, never served from the memo"
+        );
+    }
+
+    /// Launch-path probe (independent perf-wave audit): the bootstrap
+    /// launcher opens a FRESH readonly layout, so its first verification
+    /// streams the bytes even when a warm in-process layout already
+    /// memoized the same path — and a tampered file is refused with the
+    /// same typed error.
+    #[test]
+    fn a_fresh_readonly_layout_streams_and_never_trusts_a_warm_memo() {
+        let (_dir, layout) = layout();
+        let bytes = vec![0x33u8; (DIGEST_MEMO_MIN_BYTES as usize) + 1024];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-fresh", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-fresh")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        layout.verify_installed(&pointer).unwrap();
+        assert_eq!(layout.digest_computations(), 1, "warm layout memoized");
+        std::fs::write(&dest, vec![0x44u8; bytes.len()]).unwrap();
+        let readonly = InstallLayout::open_readonly(layout.root().to_path_buf());
+        let err = readonly.verify_installed(&pointer).unwrap_err();
+        assert_eq!(err.code(), "staged_artifact_unusable");
+        assert_eq!(
+            readonly.digest_computations(),
+            1,
+            "the fresh launch-path layout must stream its first verification"
+        );
+    }
+
+    /// Independent perf-wave audit follow-up (residual 1): the Windows memo
+    /// policy is probed on EVERY host with the exact fact shape the Win32
+    /// authority copies out of a real ACL. A file owned by a DIFFERENT user
+    /// must never produce a memo key: its owner can forge `mtime` AND
+    /// creation time with `SetFileTime`, so a same-size rewrite by that
+    /// owner would otherwise be masked.
+    #[test]
+    fn windows_memo_refuses_a_mismatched_owner() {
+        let facts = MemoFacts {
+            owner_is_process_user: false,
+            dacl_read: true,
+            grants: vec![DaclGrant {
+                mask: 0x0000_0001, // FILE_READ_DATA only
+                trustee_is_owner: false,
+                trustee_is_process_user: false,
+            }],
+        };
+        assert!(
+            !windows_memo_authorized(&facts),
+            "an owner that is not the daemon's user can forge both timestamps; \
+             the memo fast path must refuse"
+        );
+    }
+
+    /// Residual 1: any write-capable ALLOW grant for a trustee that is
+    /// neither the owner nor the daemon's user refuses the fast path — the
+    /// exact access a cross-user forger would need for a same-size rewrite
+    /// with forged mtime AND creation time.
+    #[test]
+    fn windows_memo_refuses_group_or_other_write_grants() {
+        let write_bits = [
+            0x0000_0002u32, // FILE_WRITE_DATA
+            0x0000_0004,    // FILE_APPEND_DATA
+            0x0000_0010,    // FILE_WRITE_EA
+            0x0000_0100,    // FILE_WRITE_ATTRIBUTES (the SetFileTime bit)
+            0x0004_0000,    // WRITE_DAC
+            0x0008_0000,    // WRITE_OWNER
+            0x4000_0000,    // GENERIC_WRITE
+            0x1000_0000,    // GENERIC_ALL
+        ];
+        for mask in write_bits {
+            let third_party = MemoFacts {
+                owner_is_process_user: true,
+                dacl_read: true,
+                grants: vec![DaclGrant {
+                    mask,
+                    trustee_is_owner: false,
+                    trustee_is_process_user: false,
+                }],
+            };
+            assert!(
+                !windows_memo_authorized(&third_party),
+                "mask {mask:#010x} for another trustee must refuse memoization"
+            );
+        }
+        // Grants that belong to the owner or the process user keep the fast
+        // path, and read-only grants to other trustees never block it.
+        let owned = MemoFacts {
+            owner_is_process_user: true,
+            dacl_read: true,
+            grants: vec![
+                DaclGrant {
+                    mask: 0x001F_01FF,
+                    trustee_is_owner: true,
+                    trustee_is_process_user: true,
+                },
+                DaclGrant {
+                    mask: 0x0012_0089, // read/execute for a third party
+                    trustee_is_owner: false,
+                    trustee_is_process_user: false,
+                },
+            ],
+        };
+        assert!(windows_memo_authorized(&owned));
+        // DELETE alone is deliberately not a refusal: a deleted-and-replaced
+        // file changes the file index, which the identity key already pins.
+        let deletable = MemoFacts {
+            owner_is_process_user: true,
+            dacl_read: true,
+            grants: vec![DaclGrant {
+                mask: 0x0001_0000, // DELETE
+                trustee_is_owner: false,
+                trustee_is_process_user: false,
+            }],
+        };
+        assert!(windows_memo_authorized(&deletable));
+    }
+
+    /// Residual 1: a DACL that cannot be read in full (NULL DACL, a failed
+    /// ACE walk, a truncated grant list) refuses the fast path — an
+    /// unreadable ACL can never prove "no group/other write grant".
+    #[test]
+    fn windows_memo_refuses_an_unreadable_dacl() {
+        let unreadable = MemoFacts {
+            owner_is_process_user: true,
+            dacl_read: false,
+            grants: Vec::new(),
+        };
+        assert!(!windows_memo_authorized(&unreadable));
+    }
+
+    /// Residual 1 (Unix unaffected): the unix identity key (device + inode +
+    /// ctime) protects the memo regardless of the file's mode, so the
+    /// Windows owner/ACL gate must not leak into the unix path: a
+    /// group/other-writable artifact still memoizes.
+    #[cfg(unix)]
+    #[test]
+    fn unix_memo_is_unaffected_by_the_windows_owner_gate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, layout) = layout();
+        let bytes = vec![0x66u8; (DIGEST_MEMO_MIN_BYTES as usize) + 32];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-unix-mode", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-unix-mode")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        for _ in 0..3 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        assert_eq!(
+            layout.digest_computations(),
+            1,
+            "the unix memo key ignores group/other writability"
+        );
+    }
+
+    /// Independent perf-wave audit follow-up (residual 1), Windows lane: the
+    /// end-to-end memo behavior follows the REAL owner/DACL facts read by
+    /// the Win32 authority. When the policy authorizes, repeated
+    /// verification memoizes; the moment ANY other trustee can write the
+    /// file (granted here through `icacls` with the well-known Everyone
+    /// SID), every verification streams the full bytes, so no forged
+    /// timestamp can ever serve a stale observation.
+    #[cfg(windows)]
+    #[test]
+    fn windows_memo_end_to_end_follows_the_owner_acl_facts() {
+        let (_dir, layout) = layout();
+        let bytes = vec![0x7Bu8; (DIGEST_MEMO_MIN_BYTES as usize) + 64];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-win-acl", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-win-acl")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        layout.verify_installed(&pointer).unwrap();
+        assert_eq!(layout.digest_computations(), 1);
+        // The host's real ACL decides the branch; the memo behavior must
+        // FOLLOW the policy exactly on any Windows host (elevated agents
+        // create files owned by Administrators, which the owner check
+        // refuses — hence the branch, not an assumption).
+        let authorized = windows_memo_authorized(
+            &crate::win_exec::path_memo_facts(&dest)
+                .expect("facts for an openable file")
+                .authorization,
+        );
+        for _ in 0..2 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        assert_eq!(
+            layout.digest_computations(),
+            if authorized { 1 } else { 3 },
+            "repeated verification must follow the owner/DACL verdict"
+        );
+        // Make the file writable by every trustee: the policy must refuse
+        // and every later verification must stream the full bytes.
+        let output = std::process::Command::new("icacls")
+            .arg(&dest)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .expect("icacls ships with every supported Windows host");
+        assert!(output.status.success(), "icacls /grant: {output:?}");
+        let after = crate::win_exec::path_memo_facts(&dest).expect("facts after the grant");
+        assert!(
+            !windows_memo_authorized(&after.authorization),
+            "an Everyone-writable file must never memoize"
+        );
+        let before = layout.digest_computations();
+        for _ in 0..2 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        assert_eq!(
+            layout.digest_computations(),
+            before + 2,
+            "an unauthorized file streams on every verification"
+        );
+    }
+
+    /// Residual 1 forgery probe, Windows lane: once the ACL refuses (or
+    /// always refused), a same-size rewrite with a restored mtime — the
+    /// shape of the `SetFileTime` forgery, which can additionally forge the
+    /// creation time — is re-hashed and refused even though a memo
+    /// observation may exist from before the file became other-writable.
+    #[cfg(windows)]
+    #[test]
+    fn windows_memo_never_masks_a_rewrite_when_the_acl_refuses() {
+        let (_dir, layout) = layout();
+        let bytes = vec![0x3Cu8; (DIGEST_MEMO_MIN_BYTES as usize) + 96];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-win-forge", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-win-forge")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        layout.verify_installed(&pointer).unwrap();
+        let original_mtime = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(&dest)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .output()
+            .expect("icacls ships with every supported Windows host");
+        assert!(output.status.success(), "icacls /grant: {output:?}");
+        // Same-size in-place rewrite with the exact original mtime restored
+        // (a Windows owner can forge the creation time too, which nothing in
+        // user space can restore — the ACL check is what refuses the memo).
+        std::fs::write(&dest, vec![0xC3u8; bytes.len()]).unwrap();
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+            file.set_modified(original_mtime).unwrap();
+        }
+        let after = std::fs::metadata(&dest).unwrap();
+        assert_eq!(after.len(), bytes.len() as u64, "size collision is real");
+        assert_eq!(
+            after.modified().unwrap(),
+            original_mtime,
+            "mtime collision is real"
+        );
+        let err = layout.verify_installed(&pointer).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "staged_artifact_unusable",
+            "the rewrite must be re-hashed and refused, never served from a memo"
         );
     }
 

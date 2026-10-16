@@ -40,22 +40,34 @@
 //! The readiness handshake remains the child's own health proof, not an
 //! independent hash of the running image.
 //!
-//! The one `unsafe` block reads the identity from the live handle via
-//! `GetFileInformationByHandle` (the stable std accessors for the volume
-//! serial/file index are still feature-gated); it carries its `// SAFETY:`
-//! justification and is enumerated in the static-authority unsafe policy.
+//! ONE `#[allow(unsafe_code)]` scope (`handle_facts`) is the single
+//! enumerated unsafe location of this crate: every raw Win32 call — the
+//! identity read via `GetFileInformationByHandle` (the stable std accessors
+//! for the volume serial/file index are still feature-gated) and the
+//! digest-memo owner/ACL facts via `GetSecurityInfo` + the process token
+//! user — sits inside its `unsafe` blocks, each carrying its own `// SAFETY:`
+//! justification, and the location is enumerated in the static-authority
+//! unsafe policy.
 
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::{
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation, TokenUser, ACL,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::error::UpdateError;
-use crate::install::file_digest_of;
+use crate::install::{file_digest_of, DaclGrant, MemoFacts, WINDOWS_WRITE_ACCESS_MASK};
 
 /// `FILE_SHARE_READ` (`winnt.h`): later opens of the file object may request
 /// read access only. A write open is refused because `FILE_SHARE_WRITE` is
@@ -65,10 +77,42 @@ pub(crate) const FILE_SHARE_READ: u32 = 0x0000_0001;
 
 /// The stable Windows identity of one file object, read from an open handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ObjectIdentity {
+pub(crate) struct ObjectIdentity {
     volume_serial: u32,
     file_index: u64,
     creation_time: u64,
+}
+
+impl ObjectIdentity {
+    /// The `(volume serial, file index, creation time)` triple, for callers
+    /// that pin the same identity vocabulary outside the launch seam (the
+    /// digest memo's Windows key half in `install`).
+    pub(crate) fn memo_key(&self) -> (u32, u64, u64) {
+        (self.volume_serial, self.file_index, self.creation_time)
+    }
+}
+
+/// The identity plus the digest-memo authorization facts of one file, read
+/// through ONE read-only handle for the install layout's memo fast path:
+/// the object identity (`GetFileInformationByHandle`) and the owner/DACL
+/// facts (`GetSecurityInfo`: owner SID, the DACL's allow grants, and the
+/// process token's user SID). `None` — the path cannot be opened or any
+/// fact cannot be read — refuses memoization: the caller streams the full
+/// bytes instead of trusting a weakened key.
+pub(crate) fn path_memo_facts(path: &Path) -> Option<MemoPathFacts> {
+    let file = File::open(path).ok()?;
+    let (identity, authorization) = memo_facts_from_handle(&file, path).ok()?;
+    Some(MemoPathFacts {
+        identity,
+        authorization,
+    })
+}
+
+/// One file's stable identity plus its digest-memo authorization facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemoPathFacts {
+    pub identity: ObjectIdentity,
+    pub authorization: MemoFacts,
 }
 
 /// One verified release binary pinned by its open no-replace handle.
@@ -169,12 +213,50 @@ impl VerifiedRelease {
 /// the source of truth handed to `CreateProcessW`'s pathname, never a re-stat
 /// of the path.
 fn identity_from_handle(file: &File, path: &Path) -> Result<ObjectIdentity, UpdateError> {
+    handle_facts(file, path, false).map(|(identity, _)| identity)
+}
+
+/// The identity plus the digest-memo authorization facts of one open handle.
+fn memo_facts_from_handle(
+    file: &File,
+    path: &Path,
+) -> Result<(ObjectIdentity, MemoFacts), UpdateError> {
+    handle_facts(file, path, true)
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE` (`winnt.h`): a plain allow ACE (header, mask,
+/// then the trustee SID at offset 8).
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// `ACCESS_ALLOWED_OBJECT_ACE_TYPE` (`winnt.h`): an allow ACE scoped to
+/// object GUIDs; the trustee SID sits behind optional GUIDs, so a
+/// write-capable one is conservatively recorded without a trustee.
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+/// Bound on the allow grants copied out of one DACL; a longer ACL refuses
+/// memoization (fail closed) instead of truncating the grant list.
+const MAX_DACL_GRANTS: usize = 64;
+/// Stack buffer for the `TokenUser` query: `sizeof(TOKEN_USER)` plus the
+/// largest possible SID (`SECURITY_MAX_SID_SIZE`, 68 bytes) fits far below
+/// this.
+const TOKEN_USER_BUF_BYTES: usize = 512;
+
+/// The ONE `#[allow(unsafe_code)]` scope of this crate (the static-authority
+/// unsafe policy enumerates this file as the sole unsafe location): every
+/// raw Win32 call — the identity read, the process token user lookup, the
+/// owner/DACL read and the ACE walk — is lexically inside an `unsafe` block
+/// below, each carrying its own `// SAFETY:` justification. `security =
+/// false` skips the owner/ACL reads for callers that only need the identity
+/// (the launch seam), so those paths make no security call at all.
+#[allow(unsafe_code)]
+fn handle_facts(
+    file: &File,
+    path: &Path,
+    security: bool,
+) -> Result<(ObjectIdentity, MemoFacts), UpdateError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: `file` owns a live handle for the duration of the call and
     // `info` is a valid writable out-parameter; GetFileInformationByHandle
     // writes only into `info` and reports failure through its return value,
     // checked immediately below.
-    #[allow(unsafe_code)]
     let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
     if ok == 0 {
         return Err(UpdateError::LaunchRefused {
@@ -185,12 +267,133 @@ fn identity_from_handle(file: &File, path: &Path) -> Result<ObjectIdentity, Upda
             ),
         });
     }
-    Ok(ObjectIdentity {
+    let identity = ObjectIdentity {
         volume_serial: info.dwVolumeSerialNumber,
         file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         creation_time: (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
             | u64::from(info.ftCreationTime.dwLowDateTime),
-    })
+    };
+    if !security {
+        return Ok((identity, MemoFacts::default()));
+    }
+    let mut facts = MemoFacts::default();
+    // SAFETY: every raw call below runs against objects owned by this
+    // process: `file` keeps its handle live for the whole call, the token is
+    // opened and closed here, the security descriptor is allocated by
+    // GetSecurityInfo and released with LocalFree before returning, every
+    // out-parameter is an initialized local, and every pointer obtained is
+    // null-checked before use. Any failure leaves `facts` non-authorizing
+    // (fail closed), never a weaker check.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        let mut user_sid: PSID = std::ptr::null_mut();
+        let mut token_open = false;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0 {
+            token_open = true;
+            let mut user_buf = [0u8; TOKEN_USER_BUF_BYTES];
+            let mut needed: u32 = 0;
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                user_buf.as_mut_ptr().cast(),
+                user_buf.len() as u32,
+                &mut needed,
+            ) != 0
+                && needed as usize <= user_buf.len()
+            {
+                user_sid = (*user_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            }
+        }
+        let mut owner_sid: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let security_read = GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        ) == 0;
+        if security_read && !user_sid.is_null() && !owner_sid.is_null() {
+            // The trustee comparisons run through `EqualSid`, so the
+            // self-relative SIDs inside the descriptor are compared
+            // correctly regardless of their stored form.
+            facts.owner_is_process_user = EqualSid(owner_sid, user_sid) != 0;
+            if !dacl.is_null() {
+                let mut size = ACL_SIZE_INFORMATION::default();
+                if GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ) != 0
+                {
+                    let mut read = true;
+                    let mut grants: Vec<DaclGrant> = Vec::new();
+                    let mut index = 0u32;
+                    while index < size.AceCount {
+                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                        if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+                            read = false;
+                            break;
+                        }
+                        index += 1;
+                        let bytes = ace as *const u8;
+                        let ace_type = *bytes;
+                        if ace_type == ACCESS_ALLOWED_OBJECT_ACE_TYPE {
+                            let mask = (bytes.add(4) as *const u32).read_unaligned();
+                            if mask & WINDOWS_WRITE_ACCESS_MASK != 0 {
+                                if grants.len() == MAX_DACL_GRANTS {
+                                    read = false;
+                                    break;
+                                }
+                                grants.push(DaclGrant {
+                                    mask,
+                                    trustee_is_owner: false,
+                                    trustee_is_process_user: false,
+                                });
+                            }
+                            continue;
+                        }
+                        if ace_type != ACCESS_ALLOWED_ACE_TYPE {
+                            continue;
+                        }
+                        let flags = u32::from(*bytes.add(1));
+                        if flags & INHERIT_ONLY_ACE != 0 {
+                            // Inherit-only ACEs grant nothing on the file
+                            // itself.
+                            continue;
+                        }
+                        if grants.len() == MAX_DACL_GRANTS {
+                            read = false;
+                            break;
+                        }
+                        let mask = (bytes.add(4) as *const u32).read_unaligned();
+                        let sid = bytes.add(8) as PSID;
+                        grants.push(DaclGrant {
+                            mask,
+                            trustee_is_owner: EqualSid(sid, owner_sid) != 0,
+                            trustee_is_process_user: EqualSid(sid, user_sid) != 0,
+                        });
+                    }
+                    if read {
+                        facts.grants = grants;
+                        facts.dacl_read = true;
+                    }
+                }
+            }
+        }
+        if !descriptor.is_null() {
+            LocalFree(descriptor);
+        }
+        if token_open {
+            CloseHandle(token);
+        }
+    }
+    Ok((identity, facts))
 }
 
 fn require_same(
@@ -341,5 +544,33 @@ mod tests {
         assert!(err.to_string().contains("share mode"), "{err}");
         drop(writer);
         assert!(VerifiedRelease::open(&path, &sha256_hex(b"bytes")).is_ok());
+    }
+
+    /// The digest-memo facts read through the single unsafe authority: a
+    /// test-created file's DACL is readable in full and the identity from
+    /// the facts equals the plain identity read (both OBSERVED, never
+    /// assumed — on elevated hosts the owner is the Administrators group,
+    /// which the memo's owner check refuses by design).
+    #[test]
+    fn memo_facts_read_the_owner_dacl_and_process_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "artifact", b"bytes");
+        let facts = path_memo_facts(&path).expect("facts for an openable file");
+        assert!(
+            facts.authorization.dacl_read,
+            "the temp file's DACL must be read in full"
+        );
+        let file = File::open(&path).unwrap();
+        assert_eq!(facts.identity, identity_from_handle(&file, &path).unwrap());
+    }
+
+    /// A path that cannot be opened refuses memoization (`None`), so the
+    /// install layout streams the full bytes instead of trusting a weakened
+    /// key.
+    #[test]
+    fn memo_facts_refuse_an_unopenable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-there");
+        assert!(path_memo_facts(&missing).is_none());
     }
 }

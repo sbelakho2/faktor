@@ -1189,4 +1189,252 @@ mod deadline_tests {
         }
         assert!(items >= 1);
     }
+
+    // ------------------------------------------ independent audit probes
+    //
+    // The cursor/compaction rewrite is probed against the PRE-FIX algorithm
+    // reimplemented here, over every two-chunk byte split of adversarial
+    // documents, plus work-counter linearity on hostile fragment bursts.
+
+    /// Drive the stream over explicit chunks (the probe module has no
+    /// access to the sibling test module's private helper).
+    fn probe_collect(
+        chunks: Vec<Result<Vec<u8>, String>>,
+        max_line: usize,
+    ) -> Vec<Result<String, ProviderError>> {
+        let stream = futures::stream::iter(chunks);
+        let mut lines = Box::pin(utf8_line_stream(stream, max_line));
+        let mut out = Vec::new();
+        while let Some(item) = futures::executor::block_on(lines.next()) {
+            out.push(item);
+        }
+        out
+    }
+
+    /// PRE-FIX line splitter, verbatim (pending-buffer rescan + drain).
+    fn probe_old_lines(chunks: &[Vec<u8>], max_line: usize) -> Vec<Result<String, ProviderError>> {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = Vec::new();
+        let mut dead = false;
+        for chunk in chunks {
+            if dead {
+                break;
+            }
+            pending.extend_from_slice(chunk);
+            loop {
+                if let Some(break_at) = pending.iter().position(|b| *b == b'\n') {
+                    if break_at > max_line {
+                        out.push(Err(ProviderError::new(
+                            ProviderErrorKind::Malformed,
+                            format!("SSE/NDJSON line exceeds {max_line} bytes"),
+                        )));
+                        dead = true;
+                        break;
+                    }
+                    let mut line: Vec<u8> = pending.drain(..=break_at).collect();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    match String::from_utf8(line) {
+                        Ok(line) => out.push(Ok(line)),
+                        Err(_) => {
+                            out.push(Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                "invalid utf-8 in SSE/NDJSON line",
+                            )));
+                            dead = true;
+                            break;
+                        }
+                    }
+                } else {
+                    if pending.len() > max_line {
+                        out.push(Err(ProviderError::new(
+                            ProviderErrorKind::Malformed,
+                            format!("SSE/NDJSON line exceeds {max_line} bytes"),
+                        )));
+                        dead = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if !dead && !pending.is_empty() {
+            match String::from_utf8(pending) {
+                Ok(line) => out.push(Ok(line)),
+                Err(_) => out.push(Err(ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    "invalid utf-8 in SSE/NDJSON line",
+                ))),
+            }
+        }
+        out
+    }
+
+    fn probe_result_key(result: Vec<Result<String, ProviderError>>) -> Vec<Result<String, String>> {
+        result
+            .into_iter()
+            .map(|r| r.map_err(|e| format!("{:?}:{}", e.kind, e.message)))
+            .collect()
+    }
+
+    #[test]
+    fn every_two_chunk_byte_split_matches_the_old_splitter() {
+        let docs: Vec<&[u8]> = vec![
+            b"data: one\ndata: two\n",
+            b"data: one\r\ndata: two\r\n",
+            b"a\rb\r\nc\nd",
+            b"",
+            b"no trailing newline",
+            "data: \u{03c0}-\u{1f600} unicode\n\u{989c}\u{8272}\n".as_bytes(),
+            b"\n\n\n",
+            b"\r\n\r",
+            b"line exactly at cap\nnext\n",
+            b"0123456789\r\nnext\n",
+            "data: {\"json\": \"\u{00e9}\u{00e8}\u{00ea}\"}\n\n".as_bytes(),
+        ];
+        for doc in docs {
+            for max_line in [1usize, 4, 5, 10, 32] {
+                // Whole document in one chunk.
+                let all = probe_collect(vec![Ok(doc.to_vec())], max_line);
+                assert_eq!(
+                    probe_result_key(all.clone()),
+                    probe_result_key(probe_old_lines(&[doc.to_vec()], max_line)),
+                    "whole-chunk drift for {doc:?} cap {max_line}"
+                );
+                // Every byte boundary.
+                for split in 0..=doc.len() {
+                    let raw = vec![doc[..split].to_vec(), doc[split..].to_vec()];
+                    let chunks: Vec<Result<Vec<u8>, String>> =
+                        raw.iter().map(|c| Ok(c.clone())).collect();
+                    let got = probe_collect(chunks, max_line);
+                    assert_eq!(
+                        probe_result_key(got),
+                        probe_result_key(probe_old_lines(&raw, max_line)),
+                        "split {split} drift for {doc:?} cap {max_line}"
+                    );
+                }
+                // Byte-at-a-time with zero-byte chunks interleaved.
+                let mut chunks: Vec<Result<Vec<u8>, String>> = Vec::new();
+                for (i, byte) in doc.iter().enumerate() {
+                    if i % 7 == 0 {
+                        chunks.push(Ok(Vec::new()));
+                    }
+                    chunks.push(Ok(vec![*byte]));
+                }
+                chunks.push(Ok(Vec::new()));
+                let got = probe_collect(chunks.clone(), max_line);
+                assert_eq!(
+                    probe_result_key(got),
+                    probe_result_key(probe_old_lines(
+                        &chunks
+                            .iter()
+                            .map(|c| c.as_ref().unwrap().clone())
+                            .collect::<Vec<_>>(),
+                        max_line
+                    )),
+                    "byte-at-a-time drift for {doc:?} cap {max_line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_fragment_bursts_are_linear_work() {
+        // 100k one-byte fragments of short lines: scan and compaction work
+        // must stay LINEAR in the received bytes (no rescan from zero, no
+        // per-line tail shift).
+        let line = b"event-0123456789\n";
+        let count = 100_000usize;
+        let payload: Vec<u8> = line
+            .iter()
+            .copied()
+            .cycle()
+            .take(line.len() * count)
+            .collect();
+        let total = payload.len() as u64;
+        line_stream_work::reset();
+        let chunks: Vec<Result<Vec<u8>, String>> = payload.iter().map(|b| Ok(vec![*b])).collect();
+        let got = probe_collect(chunks, 64);
+        assert_eq!(got.len(), count);
+        assert!(got
+            .iter()
+            .all(|r| r.as_ref().unwrap() == "event-0123456789"));
+        let (scan, compact) = line_stream_work::snapshot();
+        assert!(
+            scan <= total + count as u64 * 2,
+            "scan work must be linear: scanned {scan} bytes for {total} received \
+             ({count} fragments)"
+        );
+        assert!(
+            compact <= total * 2,
+            "compaction must be amortized: {compact} bytes for {total} received"
+        );
+
+        // One burst chunk carrying the same 100k lines: emitted lines must
+        // not shift the tail per line (compaction stays bounded).
+        line_stream_work::reset();
+        let got = probe_collect(vec![Ok(payload.clone())], 64);
+        assert_eq!(got.len(), count);
+        let (scan, compact) = line_stream_work::snapshot();
+        assert!(scan <= total + 1024, "burst scan must be linear: {scan}");
+        assert!(
+            compact <= total + 1024,
+            "burst compaction must be amortized: {compact}"
+        );
+
+        // A dribbled line just under the cap, then a newline: linear too.
+        line_stream_work::reset();
+        let mut chunks: Vec<Result<Vec<u8>, String>> = Vec::new();
+        for _ in 0..4096 {
+            chunks.push(Ok(vec![b'x']));
+        }
+        chunks.push(Ok(vec![b'\n']));
+        chunks.push(Ok(vec![b'\n']));
+        let got = probe_collect(chunks, 4096);
+        assert_eq!(got.len(), 2);
+        let (scan, _) = line_stream_work::snapshot();
+        assert!(scan <= 4098 * 2, "dribble scan must be linear: {scan}");
+    }
+
+    #[test]
+    fn cap_checks_count_the_cr_and_match_the_old_boundary() {
+        // A line whose body (before "\r\n") is exactly cap bytes: the "\r"
+        // is part of the pre-cap measurement in BOTH implementations.
+        for cap in [1usize, 3, 8, 32] {
+            let body = "x".repeat(cap);
+            let over = format!("{body}\r\n");
+            let at = format!("{}\r\n", "x".repeat(cap.saturating_sub(1)));
+            for chunks in [
+                vec![Ok(over.clone().into_bytes())],
+                vec![
+                    Ok(over.clone().into_bytes()[..1].to_vec()),
+                    Ok(over.clone().into_bytes()[1..].to_vec()),
+                ],
+            ] {
+                let got_over = probe_collect(chunks.clone(), cap);
+                assert_eq!(
+                    probe_result_key(got_over.clone()),
+                    probe_result_key(probe_old_lines(
+                        &chunks
+                            .iter()
+                            .map(|c| c.as_ref().unwrap().clone())
+                            .collect::<Vec<_>>(),
+                        cap
+                    )),
+                    "cap {cap}: CR-inclusive boundary must match the old splitter"
+                );
+                assert!(
+                    got_over[0].is_err(),
+                    "cap {cap}: a cap-byte line plus CRLF must exceed (the CR counts)"
+                );
+            }
+            let got_at = probe_collect(vec![Ok(at.into_bytes())], cap);
+            assert_eq!(got_at.len(), 1);
+            assert_eq!(
+                got_at[0].as_ref().unwrap(),
+                &"x".repeat(cap.saturating_sub(1))
+            );
+        }
+    }
 }

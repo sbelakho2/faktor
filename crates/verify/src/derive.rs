@@ -1908,6 +1908,269 @@ mod tests {
             .collect()
     }
 
+    // ------------------------------------------- independent audit probes
+    //
+    // The perf wave replaced per-file full component scans with ancestor
+    // walks and a one-pass spec-id map. These probes re-implement the PRE-fix
+    // algorithms verbatim in-test and require identical outputs on
+    // adversarial roots/paths and component permutations.
+
+    fn probe_component(
+        root: &str,
+        languages: Vec<LanguageFamily>,
+        cmake: bool,
+    ) -> ProjectComponent {
+        ProjectComponent {
+            root: PathBuf::from(root),
+            languages,
+            build_systems: if cmake {
+                vec![BuildSystem::CMake]
+            } else {
+                vec![BuildSystem::Cargo]
+            },
+            toolchains: if cmake {
+                vec![Toolchain::CMake]
+            } else {
+                vec![Toolchain::Rust]
+            },
+            targets: Vec::new(),
+            test_frameworks: Vec::new(),
+        }
+    }
+
+    /// PRE-FIX `owner_index`: the full per-file component scan, verbatim.
+    fn oracle_owner_index(profile: &ProjectProfile, file: &str) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, component) in profile.components.iter().enumerate() {
+            let root = component.root.to_string_lossy();
+            if !is_under(&root, file) {
+                continue;
+            }
+            let depth = root.matches('/').count() + usize::from(!root.is_empty());
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, index));
+            }
+        }
+        best.map(|(_, index)| index)
+    }
+
+    /// PRE-FIX `nearest_key`: the full per-dir key scan, verbatim.
+    fn probe_old_nearest_key(
+        components: &BTreeMap<String, ProjectComponent>,
+        dir: &str,
+    ) -> Option<String> {
+        components
+            .keys()
+            .filter(|root| is_under(root, dir))
+            .max_by_key(|root| root.matches('/').count() + usize::from(!root.is_empty()))
+            .cloned()
+    }
+
+    #[test]
+    fn owner_indices_match_the_full_scan_on_adversarial_paths() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        let roots = [
+            "",
+            "pkg",
+            "pkg/sub",
+            "a:b",
+            "a_b",
+            "颜色",
+            "pkg/",
+            "pkg//sub",
+            "..",
+            ".",
+            "PKG",
+            "pkg/sub/deep",
+            "pkg/SUB",
+        ];
+        let files = [
+            "pkg/x.c",
+            "pkg",
+            "pkg/",
+            "pkg//x.c",
+            "pkg/./x.c",
+            "pkg/../x.c",
+            "pkg/sub/y.c",
+            "pkg/sub/deep/z.c",
+            "pkg/SUB/y.c",
+            "a:b/z.c",
+            "a_b/w.c",
+            "颜色/文件.c",
+            "颜色/文件",
+            "",
+            "..",
+            "./x",
+            "pkg/Ünïcode.c",
+            "PKG/X.C",
+            "pkg/sub",
+            "pkg/sub/",
+        ];
+        let mut state = 0xA11CE_u64;
+        for round in 0..300 {
+            let count = 1 + (lcg(&mut state) as usize) % 6;
+            let components: Vec<ProjectComponent> = (0..count)
+                .map(|_| {
+                    let root = roots[(lcg(&mut state) as usize) % roots.len()];
+                    probe_component(
+                        root,
+                        vec![LanguageFamily::Rust],
+                        lcg(&mut state).is_multiple_of(2),
+                    )
+                })
+                .collect();
+            let profile = ProjectProfile {
+                components,
+                manifest_refusals: Vec::new(),
+            };
+            let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(*f)).collect();
+            let walked = profile.owner_indices(paths.iter().map(|p| p.as_path()));
+            for (file, got) in files.iter().zip(walked) {
+                assert_eq!(
+                    got,
+                    oracle_owner_index(&profile, file),
+                    "round {round}: owner of {file:?} drifted (roots {:?})",
+                    profile
+                        .components
+                        .iter()
+                        .map(|c| c.root.display().to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
+            // `nearest_key` over the same roots: the ancestor walk must equal
+            // the old max-depth scan key-by-key.
+            let mut map: BTreeMap<String, ProjectComponent> = BTreeMap::new();
+            for component in &profile.components {
+                let key = component.root.to_string_lossy().into_owned();
+                map.entry(key).or_insert_with(|| component.clone());
+            }
+            for dir in [
+                "", "pkg", "pkg/", "pkg/sub", "pkg/sub/", "a:b", "x/y", "..", ".",
+            ] {
+                assert_eq!(
+                    nearest_key(&map, dir),
+                    probe_old_nearest_key(&map, dir),
+                    "round {round}: nearest_key({dir:?}) drifted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derived_checks_match_a_naive_ownership_dedupe_pipeline() {
+        // Components with roots that collide after id sanitization
+        // (`a:b` vs `a_b`), nested ownership, and duplicates.
+        let components = [
+            probe_component("pkg", vec![LanguageFamily::C], true),
+            probe_component("pkg/sub", vec![LanguageFamily::C], true),
+            probe_component("a:b", vec![LanguageFamily::C], true),
+            probe_component("a_b", vec![LanguageFamily::C], true),
+            probe_component("pkg", vec![LanguageFamily::C], true),
+            probe_component("颜色", vec![LanguageFamily::Rust], false),
+        ];
+        let changed: Vec<PathBuf> = [
+            "pkg/x.c",
+            "pkg/sub/y.c",
+            "a:b/z.c",
+            "a_b/w.c",
+            "颜色/lib.rs",
+            "pkg/Ünïcode.c",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let mut state = 0xD00D_u64;
+        for round in 0..120 {
+            // Deterministic permutations of the component list.
+            let mut order: Vec<usize> = (0..components.len()).collect();
+            for i in (1..order.len()).rev() {
+                let j = (state as usize) % (i + 1);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                order.swap(i, j);
+            }
+            let permuted: Vec<ProjectComponent> =
+                order.iter().map(|i| components[*i].clone()).collect();
+            let profile = ProjectProfile {
+                components: permuted.clone(),
+                manifest_refusals: Vec::new(),
+            };
+            // Oracle: ownership by the PRE-FIX full scan, per-component
+            // derivation through the public single-component API, then the
+            // PRE-FIX pairwise dedupe and the same required-first sort.
+            let normalized: Vec<String> = changed
+                .iter()
+                .filter_map(|p| normalize_rel(&p.to_string_lossy()))
+                .collect();
+            let mut per_component: Vec<Vec<String>> = vec![Vec::new(); profile.components.len()];
+            for file in &normalized {
+                if let Some(owner) = oracle_owner_index(&profile, file) {
+                    per_component[owner].push(file.clone());
+                }
+            }
+            let mut specs: Vec<CheckSpec> = Vec::new();
+            for (component, local) in profile.components.iter().zip(per_component.iter()) {
+                if local.is_empty() {
+                    continue;
+                }
+                let single = ProjectProfile {
+                    components: vec![component.clone()],
+                    manifest_refusals: Vec::new(),
+                };
+                let local_paths: Vec<PathBuf> = local.iter().map(PathBuf::from).collect();
+                specs.extend(derive_checks(&single, &local_paths).unwrap());
+            }
+            let mut deduped: Vec<CheckSpec> = Vec::new();
+            let mut oracle_error: Option<String> = None;
+            for spec in specs {
+                match deduped.iter().find(|existing| existing.id == spec.id) {
+                    Some(existing) if *existing == spec => continue,
+                    Some(_) => {
+                        oracle_error = Some(spec.id);
+                        break;
+                    }
+                    None => deduped.push(spec),
+                }
+            }
+            match oracle_error {
+                Some(expected_id) => match derive_checks(&profile, &changed) {
+                    Err(VerificationDerivationError::ConflictingCheckId { id }) => {
+                        assert_eq!(id, expected_id, "round {round}: conflict id drifted");
+                    }
+                    other => {
+                        panic!("round {round}: oracle says conflict {expected_id}, got {other:?}")
+                    }
+                },
+                None => {
+                    deduped.sort_by_key(|spec| !spec.required);
+                    let derived = derive_checks(&profile, &changed).unwrap();
+                    assert_eq!(
+                        derived, deduped,
+                        "round {round}: derived checks drifted under permutation {order:?}"
+                    );
+                }
+            }
+            // The direct owner_indices output must equal the naive scan on
+            // this exact corpus, too.
+            let paths: Vec<PathBuf> = changed.clone();
+            let owners = profile.owner_indices(paths.iter().map(|p| p.as_path()));
+            for (path, owner) in changed.iter().zip(owners) {
+                let file = path.to_string_lossy();
+                assert_eq!(
+                    owner,
+                    oracle_owner_index(&profile, &file),
+                    "round {round}: ownership of {file} drifted"
+                );
+            }
+        }
+    }
+
     fn mirror(spec: &CheckSpec) -> Check {
         let kind = match spec.kind {
             CheckKind::Compile => LegacyKind::Compile,
