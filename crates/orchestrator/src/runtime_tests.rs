@@ -5208,6 +5208,11 @@ fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
         Err(ExecError::Oversized(_))
     ));
 }
+/// Perf-wave evidence tests for the orchestrator one-pass indexes (kept in
+/// their own file: `runtime_tests.rs` is under a recorded source ceiling).
+#[path = "runtime_tests_perf.rs"]
+mod runtime_tests_perf;
+
 /// The run-mirror lock is a projection of the durable rows: a poisoned guard
 /// (a panicking writer) must be recovered by the next read path instead of
 /// wedging child execution, and the poison flag must be cleared.

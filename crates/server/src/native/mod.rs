@@ -158,12 +158,21 @@ pub(crate) fn parse_session_id(id: &str) -> Result<SessionId, ApiError> {
     Ok(SessionId::new(raw))
 }
 
+/// Strip the JSON string quotes from one serde-serialized enum name IN
+/// PLACE (one allocation instead of the historical
+/// `to_string().trim_matches('"').to_string()`). The fallbacks (`"unknown"`,
+/// `""`) carry no quotes, so they pass through unchanged.
+pub(crate) fn serde_name_in_place(mut raw: String) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw.remove(0);
+        raw.pop();
+    }
+    raw
+}
+
 /// The snake_case agent-state tag for machine-readable summaries.
 pub(crate) fn agent_state_tag(s: AgentState) -> String {
-    serde_json::to_string(&s)
-        .unwrap_or_else(|_| "unknown".into())
-        .trim_matches('"')
-        .to_string()
+    serde_name_in_place(serde_json::to_string(&s).unwrap_or_else(|_| "unknown".into()))
 }
 
 // ------------------------------------------------------------ disposal & auth

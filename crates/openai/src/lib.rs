@@ -54,6 +54,36 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     }
     deadlines
 }
+
+/// Test-only work counter (complexity-audit evidence): bytes appended to
+/// tool-call argument accumulators. Appending must copy each fragment
+/// exactly ONCE (the pre-fix `format!("{cur}{arguments}")` copied the whole
+/// accumulated prefix per fragment — O(total^2) bytes). Thread-local so the
+/// counter tests run in parallel with every other test.
+#[cfg(test)]
+pub(crate) mod argument_accumulation {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Total argument bytes copied into accumulators.
+        pub(crate) static APPENDED_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset the counter.
+    pub(crate) fn reset() {
+        APPENDED_BYTES.with(|c| c.set(0));
+    }
+
+    /// Record one append.
+    pub(crate) fn add_appended(bytes: u64) {
+        APPENDED_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// The counter value.
+    pub(crate) fn snapshot() -> u64 {
+        APPENDED_BYTES.with(Cell::get)
+    }
+}
 use faktor_provider::{
     CanonicalUsage, ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk,
     ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
@@ -1681,8 +1711,22 @@ fn parse_chat_chunk(
                     accs[slot]["name"] = serde_json::json!(name);
                 }
                 if !arguments.is_empty() {
-                    let cur = accs[slot]["arguments"].as_str().unwrap_or("").to_string();
-                    accs[slot]["arguments"] = serde_json::json!(format!("{cur}{arguments}"));
+                    // In-place append (complexity audit): the pre-fix code
+                    // rebuilt `cur + arguments` into a fresh String via
+                    // `format!` for EVERY fragment, copying the whole
+                    // accumulated buffer each time — O(total^2) bytes over a
+                    // long tool-call argument stream. `push_str` on the
+                    // slot's existing String is linear in the fragment.
+                    match accs[slot].get_mut("arguments") {
+                        Some(serde_json::Value::String(existing)) => {
+                            existing.push_str(arguments);
+                        }
+                        _ => {
+                            accs[slot]["arguments"] = serde_json::json!(arguments);
+                        }
+                    }
+                    #[cfg(test)]
+                    argument_accumulation::add_appended(arguments.len() as u64);
                 }
             }
         }

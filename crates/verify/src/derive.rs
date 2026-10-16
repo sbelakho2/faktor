@@ -15,6 +15,20 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// Test-only per-thread probe counter for the profile lookups (evidence for
+// the complexity tests): one unit per candidate probe the ancestor walks
+// make. Production builds carry no counter and no branches into one.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROFILE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn count_probe() {
+    #[cfg(test)]
+    PROFILE_PROBES.with(|counter| counter.set(counter.get() + 1));
+}
+
 use crate::exec::{CheckCategory, CheckKind, CheckSpec, BUILD_DIR};
 use crate::inventory::{
     probe_manifest_text, CandidateGeneration, ManifestProbe, ManifestProbeRefusal,
@@ -153,6 +167,45 @@ impl ProjectProfile {
             }
         }
         best.map(|(_, component)| component)
+    }
+
+    /// Owner indices for MANY files with exactly the semantics of
+    /// [`ProjectProfile::owning_component`] (longest root prefix; the first
+    /// component wins a tie), computed with ONE lookup-table build and a
+    /// per-file string-ancestor walk — O(components + files · depth)
+    /// instead of a full component scan per file. The walk enumerates the
+    /// same candidate roots the scan's `is_under` accepts (`file` itself,
+    /// then each `/`-boundary prefix down to `""`), byte-identical for any
+    /// input the scan accepts.
+    pub fn owner_indices<'f>(
+        &self,
+        files: impl IntoIterator<Item = &'f Path>,
+    ) -> Vec<Option<usize>> {
+        let mut by_root: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(self.components.len());
+        for (index, component) in self.components.iter().enumerate() {
+            by_root
+                .entry(component.root.to_string_lossy().into_owned())
+                .or_insert(index);
+        }
+        files
+            .into_iter()
+            .map(|file| {
+                let file = file.to_string_lossy();
+                let mut candidate: &str = &file;
+                loop {
+                    count_probe();
+                    if let Some(&index) = by_root.get(candidate) {
+                        return Some(index);
+                    }
+                    match candidate.rsplit_once('/') {
+                        Some((head, _)) => candidate = head,
+                        None if !candidate.is_empty() => candidate = "",
+                        None => return None,
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -357,24 +410,44 @@ fn component_at<'a>(
     components: &'a mut BTreeMap<String, ProjectComponent>,
     dir: &str,
 ) -> &'a mut ProjectComponent {
+    // The lookup-first form never allocates the key on a hit (the entry API
+    // would reconstruct `dir.to_string()` on every call, hit or miss).
+    if components.get(dir).is_none() {
+        components.insert(
+            dir.to_string(),
+            ProjectComponent {
+                root: PathBuf::from(dir),
+                languages: Vec::new(),
+                build_systems: Vec::new(),
+                toolchains: Vec::new(),
+                targets: Vec::new(),
+                test_frameworks: Vec::new(),
+            },
+        );
+    }
     components
-        .entry(dir.to_string())
-        .or_insert_with(|| ProjectComponent {
-            root: PathBuf::from(dir),
-            languages: Vec::new(),
-            build_systems: Vec::new(),
-            toolchains: Vec::new(),
-            targets: Vec::new(),
-            test_frameworks: Vec::new(),
-        })
+        .get_mut(dir)
+        .expect("the component was just inserted when absent")
 }
 
 fn nearest_key(components: &BTreeMap<String, ProjectComponent>, dir: &str) -> Option<String> {
-    components
-        .keys()
-        .filter(|root| is_under(root, dir))
-        .max_by_key(|root| root.matches('/').count() + usize::from(!root.is_empty()))
-        .cloned()
+    // Ancestor walk (deepest first): every component root that `is_under`
+    // accepts for `dir` is an ancestor prefix of `dir`, and ancestors are
+    // totally ordered by depth, so the first hit is exactly the deepest
+    // (max-depth) one the old full scan selected. O(depth · log m) probes
+    // instead of O(m).
+    let mut candidate = dir;
+    loop {
+        count_probe();
+        if components.contains_key(candidate) {
+            return Some(candidate.to_string());
+        }
+        match candidate.rsplit_once('/') {
+            Some((parent, _)) => candidate = parent,
+            None if !candidate.is_empty() => candidate = "",
+            None => return None,
+        }
+    }
 }
 
 fn add_language(component: &mut ProjectComponent, language: LanguageFamily) {
@@ -775,30 +848,34 @@ fn detect_ctest(components: &mut BTreeMap<String, ProjectComponent>, files: &[St
     let mut additions: Vec<String> = Vec::new();
     for rel in files {
         let dir = dir_of(rel);
-        let mut best: Option<(usize, String)> = None;
-        for (key, component) in components.iter() {
-            if !component.build_systems.contains(&BuildSystem::CMake) || !is_under(key, dir) {
-                continue;
+        // Ancestor walk (deepest first): the old nested scan selected the
+        // DEEPEST component root that is an ancestor of the file's dir and
+        // satisfies (CMake build system, discoverable relative path). All
+        // such roots are ancestor prefixes, totally ordered by depth, so
+        // the first satisfying hit is exactly that component — O(depth ·
+        // log m) probes instead of O(m) per file.
+        let mut candidate = dir;
+        loop {
+            count_probe();
+            let is_cmake = components
+                .get(candidate)
+                .is_some_and(|component| component.build_systems.contains(&BuildSystem::CMake));
+            if is_cmake {
+                let discoverable = relative_to(candidate, rel).is_some_and(|relative| {
+                    relative.starts_with("tests/")
+                        || relative.starts_with("test/")
+                        || relative.ends_with("CTestTestfile.cmake")
+                });
+                if discoverable {
+                    additions.push(candidate.to_string());
+                    break;
+                }
             }
-            let Some(relative) = relative_to(key, rel) else {
-                continue;
-            };
-            let discoverable = relative.starts_with("tests/")
-                || relative.starts_with("test/")
-                || relative.ends_with("CTestTestfile.cmake");
-            if !discoverable {
-                continue;
+            match candidate.rsplit_once('/') {
+                Some((parent, _)) => candidate = parent,
+                None if !candidate.is_empty() => candidate = "",
+                None => break,
             }
-            let depth = key.matches('/').count() + usize::from(!key.is_empty());
-            if best
-                .as_ref()
-                .is_none_or(|(best_depth, _)| depth > *best_depth)
-            {
-                best = Some((depth, key.clone()));
-            }
-        }
-        if let Some((_, key)) = best {
-            additions.push(key);
         }
     }
     additions.sort();
@@ -1662,21 +1739,6 @@ fn derive_component_checks(component: &ProjectComponent, local: &[String]) -> Ve
     out
 }
 
-fn owner_index(profile: &ProjectProfile, file: &str) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (index, component) in profile.components.iter().enumerate() {
-        let root = component.root.to_string_lossy();
-        if !is_under(&root, file) {
-            continue;
-        }
-        let depth = root.matches('/').count() + usize::from(!root.is_empty());
-        if best.is_none_or(|(best_depth, _)| depth > best_depth) {
-            best = Some((depth, index));
-        }
-    }
-    best.map(|(_, index)| index)
-}
-
 /// Derive the checks a change requires from a multi-component profile.
 /// Every changed file maps to its owning component (longest root prefix) and
 /// every owning component contributes ALL of its applicable check families.
@@ -1712,8 +1774,11 @@ pub fn derive_checks_with_limits(
     changed_norm.sort();
     changed_norm.dedup();
     let mut per_component: Vec<Vec<String>> = vec![Vec::new(); profile.components.len()];
-    for file in &changed_norm {
-        if let Some(index) = owner_index(profile, file) {
+    for (file, owner) in changed_norm
+        .iter()
+        .zip(profile.owner_indices(changed_norm.iter().map(|f| Path::new(f.as_str()))))
+    {
+        if let Some(index) = owner {
             per_component[index].push(file.clone());
         }
     }
@@ -1724,13 +1789,23 @@ pub fn derive_checks_with_limits(
         }
         specs.extend(derive_component_checks(component, local));
     }
+    // Dedupe by id with ONE map lookup per spec (spec counts are attacker
+    // influenced before the MAX_CHECKS cap check, so the old O(k^2)
+    // first-match scan is not admissible): first-seen order is preserved
+    // exactly (specs push in iteration order), an identical spec is skipped,
+    // and the same id with different bytes is the same typed conflict.
     let mut deduped: Vec<CheckSpec> = Vec::new();
+    let mut index_by_id: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for spec in specs {
-        match deduped.iter().find(|existing| existing.id == spec.id) {
-            Some(existing) if *existing == spec => continue,
-            Some(_) => return Err(VerificationDerivationError::ConflictingCheckId { id: spec.id }),
-            None => deduped.push(spec),
+        if let Some(&index) = index_by_id.get(spec.id.as_str()) {
+            if deduped[index] == spec {
+                continue;
+            }
+            return Err(VerificationDerivationError::ConflictingCheckId { id: spec.id });
         }
+        index_by_id.insert(spec.id.clone(), deduped.len());
+        deduped.push(spec);
     }
     // Required checks first; within a group the derivation order (component
     // order, then family order) is preserved — deterministic, and stable
@@ -2393,6 +2468,266 @@ mod tests {
                 .unwrap()
                 .root,
             PathBuf::from("")
+        );
+    }
+
+    // ---------------------------------------------------------------- walk
+    // Adversarial + complexity evidence for the ancestor-walk rewrites.
+
+    fn walk_component(root: &str, build_systems: Vec<BuildSystem>) -> ProjectComponent {
+        ProjectComponent {
+            root: PathBuf::from(root),
+            languages: Vec::new(),
+            build_systems,
+            toolchains: Vec::new(),
+            targets: Vec::new(),
+            test_frameworks: Vec::new(),
+        }
+    }
+
+    /// The pre-rewrite full-scan `nearest_key`, kept verbatim as the
+    /// correctness oracle for the ancestor walk.
+    fn reference_nearest_key(
+        components: &BTreeMap<String, ProjectComponent>,
+        dir: &str,
+    ) -> Option<String> {
+        components
+            .keys()
+            .filter(|root| is_under(root, dir))
+            .max_by_key(|root| root.matches('/').count() + usize::from(!root.is_empty()))
+            .cloned()
+    }
+
+    /// The pre-rewrite nested-scan `detect_ctest`, kept verbatim (applied to
+    /// its own map clone) as the correctness oracle for the ancestor walk.
+    fn reference_detect_ctest(
+        components: &mut BTreeMap<String, ProjectComponent>,
+        files: &[String],
+    ) {
+        let mut additions: Vec<String> = Vec::new();
+        for rel in files {
+            let dir = dir_of(rel);
+            let mut best: Option<(usize, String)> = None;
+            for (key, component) in components.iter() {
+                if !component.build_systems.contains(&BuildSystem::CMake) || !is_under(key, dir) {
+                    continue;
+                }
+                let Some(relative) = relative_to(key, rel) else {
+                    continue;
+                };
+                let discoverable = relative.starts_with("tests/")
+                    || relative.starts_with("test/")
+                    || relative.ends_with("CTestTestfile.cmake");
+                if !discoverable {
+                    continue;
+                }
+                let depth = key.matches('/').count() + usize::from(!key.is_empty());
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_depth, _)| depth > *best_depth)
+                {
+                    best = Some((depth, key.clone()));
+                }
+            }
+            if let Some((_, key)) = best {
+                additions.push(key);
+            }
+        }
+        additions.sort();
+        additions.dedup();
+        for key in additions {
+            add_test_framework(component_at(components, &key), TestFramework::CTest);
+        }
+    }
+
+    #[test]
+    fn ancestor_walk_matches_the_reference_scans_on_adversarial_profiles() {
+        let map = || {
+            let mut components: BTreeMap<String, ProjectComponent> = BTreeMap::new();
+            components.insert(String::new(), walk_component("", vec![BuildSystem::Cargo]));
+            components.insert("a".into(), walk_component("a", vec![BuildSystem::CMake]));
+            components.insert(
+                "a/b".into(),
+                walk_component("a/b", vec![BuildSystem::CMake]),
+            );
+            components.insert(
+                "a/b/c".into(),
+                walk_component("a/b/c", vec![BuildSystem::Npm]),
+            );
+            components.insert("z".into(), walk_component("z", vec![BuildSystem::CMake]));
+            components.insert("x/y".into(), walk_component("x/y", Vec::new()));
+            components
+        };
+        let dirs = [
+            "", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/d", "a/bx", "a/x", "z", "z/w", "q", "x",
+            "x/y", "x/y/z",
+        ];
+        let components = map();
+        for dir in dirs {
+            assert_eq!(
+                nearest_key(&components, dir),
+                reference_nearest_key(&components, dir),
+                "nearest_key diverged for {dir:?}"
+            );
+        }
+        let files: Vec<String> = [
+            "a/b/tests/t.c",
+            "a/b/c/tests/t.c",
+            "a/b/c/CTestTestfile.cmake",
+            "a/tests/deep/t.c",
+            "a/test/x.c",
+            "z/build.c",
+            "z/tests/CTestTestfile.cmake",
+            "x/y/tests/t.c",
+            "a/b/src/wm.cmake",
+            "a/bx/tests/t.c",
+            "t.c",
+        ]
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+        let mut walked = map();
+        detect_ctest(&mut walked, &files);
+        let mut reference = map();
+        reference_detect_ctest(&mut reference, &files);
+        assert_eq!(walked, reference, "detect_ctest diverged from the scan");
+        // The discoverable deepest CMake ancestor is the one that gains CTest:
+        // "a/b" (not "a") for its own tree, "z", and "a" (via test/ files).
+        assert!(walked["a/b"]
+            .test_frameworks
+            .contains(&TestFramework::CTest));
+        assert!(walked["z"].test_frameworks.contains(&TestFramework::CTest));
+        assert!(walked["a"].test_frameworks.contains(&TestFramework::CTest));
+        assert!(
+            !walked["a/b/c"]
+                .test_frameworks
+                .contains(&TestFramework::CTest),
+            "a non-CMake component never gains CTest"
+        );
+    }
+
+    #[test]
+    fn profile_probe_work_scales_with_depth_not_component_count() {
+        // 10k files across `component_count` CMake components (the realistic
+        // monorepo shape): the ancestor walk probes a constant number of
+        // dirs per file (its own dir, then the component root); the old scan
+        // probed every component per file. The instrumented counter proves
+        // the bound in work units, with no timing.
+        let run = |component_count: usize| -> (u64, Vec<String>) {
+            let mut components: BTreeMap<String, ProjectComponent> = BTreeMap::new();
+            for i in 0..component_count {
+                let root = format!("pkg{i:04}");
+                components.insert(
+                    root.clone(),
+                    walk_component(&root, vec![BuildSystem::CMake]),
+                );
+            }
+            let files: Vec<String> = (0..10_000)
+                .map(|f| format!("pkg{:04}/tests/t{f:05}.c", f % component_count))
+                .collect();
+            PROFILE_PROBES.with(|counter| counter.set(0));
+            detect_ctest(&mut components, &files);
+            let probes = PROFILE_PROBES.with(std::cell::Cell::get);
+            assert_eq!(
+                components
+                    .values()
+                    .filter(|c| c.test_frameworks.contains(&TestFramework::CTest))
+                    .count(),
+                component_count,
+                "every component must still be detected"
+            );
+            (probes, files)
+        };
+        let (small_probes, files) = run(40);
+        let (large_probes, _) = run(400);
+        assert_eq!(
+            small_probes, large_probes,
+            "walk probes must be independent of the component count"
+        );
+        assert!(
+            large_probes <= 2 * files.len() as u64 + 4,
+            "bounded by files x (depth + 1): {large_probes} probes"
+        );
+        let old_work_units = files.len() as u64 * 400;
+        assert!(
+            old_work_units >= 50 * large_probes,
+            "old scan {old_work_units} work units vs walk {large_probes}: \
+             the rewrite must remove at least 50x of the probe work"
+        );
+    }
+
+    #[test]
+    fn owner_indices_match_owning_component_for_every_adversarial_path() {
+        // Unsorted depths, a duplicated root (first wins), the root
+        // component, and a non-ancestor sibling: the batch index must agree
+        // with the public per-file scan for ALL of them.
+        let mut first = walk_component("a/b", vec![BuildSystem::CMake]);
+        first.languages = vec![LanguageFamily::C];
+        let mut duplicate = walk_component("a/b", vec![BuildSystem::CMake]);
+        duplicate.languages = vec![LanguageFamily::Cpp];
+        let profile = ProjectProfile {
+            components: vec![
+                walk_component("", vec![BuildSystem::Cargo]),
+                walk_component("a", vec![BuildSystem::Cargo]),
+                first,
+                duplicate,
+                walk_component("a/b/c", vec![BuildSystem::Npm]),
+                walk_component("z", Vec::new()),
+            ],
+            manifest_refusals: Vec::new(),
+        };
+        let files = [
+            "",
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/d.rs",
+            "a/b/d.rs",
+            "a/bx/d.rs",
+            "a/x.rs",
+            "z",
+            "z/y",
+            "q",
+            "a//b/c.rs",
+            "a/b/./c.rs",
+            "a/./b/c.rs",
+            "trailing/",
+            "a/b/",
+        ];
+        let batch = profile.owner_indices(files.iter().map(Path::new));
+        for (file, got) in files.iter().zip(batch) {
+            let expected = profile
+                .owning_component(Path::new(file))
+                .map(|c| c.root.clone());
+            let got = got.map(|index| profile.components[index].root.clone());
+            assert_eq!(got, expected, "owner diverged for {file:?}");
+        }
+        // The duplicated root resolves to its FIRST component on both paths.
+        let a_b = profile.owner_indices([Path::new("a/b/x.rs")])[0].unwrap();
+        assert_eq!(a_b, 2, "first component at a depth tie wins");
+    }
+
+    #[test]
+    fn hoisted_owner_batches_keep_conflict_and_dedupe_semantics() {
+        // Same-id specs still conflict typed; identical specs still collapse
+        // (via the existing duplicate-component fixture), now through the
+        // id map instead of the O(k^2) first-match scan.
+        let component = ProjectComponent {
+            root: PathBuf::from("x"),
+            languages: vec![LanguageFamily::C, LanguageFamily::Cpp],
+            build_systems: vec![BuildSystem::CMake],
+            toolchains: vec![Toolchain::CMake],
+            targets: vec![],
+            test_frameworks: vec![],
+        };
+        let profile = ProjectProfile {
+            components: vec![component.clone(), component],
+            manifest_refusals: Vec::new(),
+        };
+        let checks = derive_checks(&profile, &[PathBuf::from("x/main.c")]).unwrap();
+        assert_eq!(
+            required_ids(&checks),
+            vec!["x:cmake_configure", "x:cmake_build"]
         );
     }
 }

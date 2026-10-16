@@ -1653,6 +1653,13 @@ pub(crate) fn rebuild_attempt_verification(
     let mut results: Vec<(String, bool)> = Vec::new();
     let mut unavailable: Vec<(String, String)> = Vec::new();
     let mut executed: Vec<ExecutedCheck> = Vec::new();
+    // One map build for the whole attempt: the old per-check
+    // `rows.iter().find(...)` was O(checks × rows).
+    let mut rows_by_check: std::collections::HashMap<&str, &faktor_session::VerificationJob> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        rows_by_check.entry(row.check_id.as_str()).or_insert(row);
+    }
     for entry in &attempt.checks {
         let mirror = faktor_verify::Check {
             id: entry.check_id.clone(),
@@ -1673,7 +1680,7 @@ pub(crate) fn rebuild_attempt_verification(
                 unavailable.push((entry.check_id.clone(), entry.command.clone()));
             }
             None => {
-                let job = rows.iter().find(|j| j.check_id == entry.check_id);
+                let job = rows_by_check.get(entry.check_id.as_str()).copied();
                 let settled = match job {
                     Some(j)
                         if matches!(

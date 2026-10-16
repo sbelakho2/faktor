@@ -689,8 +689,61 @@ impl VariantSelection {
     }
 }
 
+/// Build the wanted attributes for one variant spec, with the documented
+/// oversize fallback text (`attribute`/`value`). Called ONCE per
+/// [`select_variant`] call (complexity audit): the pre-fix closure rebuilt
+/// this vector — and re-validated every `Text` — once per
+/// (spec × matrix entry) pair.
+fn wanted_attributes(spec: &[(String, String)]) -> Vec<VariantAttribute> {
+    #[cfg(test)]
+    wanted_builds::add(1);
+    spec.iter()
+        .map(|(name, value)| VariantAttribute {
+            name: Text::<64>::new(name)
+                .unwrap_or_else(|_| Text::<64>::new("attribute").expect("literal")),
+            value: Text::<256>::new(value)
+                .unwrap_or_else(|_| Text::<256>::new("value").expect("literal")),
+        })
+        .collect()
+}
+
+/// Test-only work counter (complexity-audit evidence): how many times the
+/// wanted-attribute vector is built. Thread-local so counter tests run in
+/// parallel with the rest of the suite.
+#[cfg(test)]
+pub(crate) mod wanted_builds {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Wanted-vector constructions.
+        pub(crate) static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset the counter.
+    pub(crate) fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+
+    /// Record one construction.
+    pub(crate) fn add(count: u64) {
+        COUNT.with(|c| c.set(c.get() + count));
+    }
+
+    /// The counter value.
+    pub(crate) fn snapshot() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// Select a variant by exact id first, then by attribute-spec match. An
 /// ambiguous or missing mapping is never resolved to the cheapest variant.
+///
+/// Complexity (audit fix): the wanted attributes are built and validated
+/// ONCE per call — the pre-fix closure rebuilt them per (spec × matrix)
+/// pair. The oversize fallback text (`attribute`/`value`) is preserved
+/// byte-for-byte, and the match predicate is still the pairwise
+/// [`VariantAttribute::matches`] (its fail-fast shape is optimal for the
+/// common non-matching entry).
 pub fn select_variant(matrix: &[VariantEntry], requested_id: &str) -> VariantSelection {
     if let Some(exact) = matrix
         .iter()
@@ -702,20 +755,15 @@ pub fn select_variant(matrix: &[VariantEntry], requested_id: &str) -> VariantSel
     if spec.is_empty() {
         return VariantSelection::Missing;
     }
+    let wanted = wanted_attributes(&spec);
     let matching: Vec<VariantEntry> = matrix
         .iter()
         .filter(|entry| {
-            spec.iter().all(|(name, value)| {
-                let wanted = VariantAttribute {
-                    name: Text::<64>::new(name)
-                        .unwrap_or_else(|_| Text::<64>::new("attribute").expect("literal")),
-                    value: Text::<256>::new(value)
-                        .unwrap_or_else(|_| Text::<256>::new("value").expect("literal")),
-                };
+            wanted.iter().all(|wanted| {
                 entry
                     .attributes
                     .iter()
-                    .any(|attribute| attribute.matches(&wanted))
+                    .any(|attribute| attribute.matches(wanted))
             })
         })
         .cloned()
@@ -971,5 +1019,169 @@ mod tests {
         let id = canonical_variant_id(&attributes).expect("id");
         assert_eq!(id.as_str(), "a=1;b=2");
         assert!(canonical_variant_id(&[]).is_err());
+    }
+
+    // ------------------------------------------------ complexity-audit fixes
+
+    fn attr(name: &str, value: &str) -> VariantAttribute {
+        VariantAttribute {
+            name: Text::<64>::new(name).expect("name"),
+            value: Text::<256>::new(value).expect("value"),
+        }
+    }
+
+    fn entry(id: &str, attributes: Vec<VariantAttribute>) -> VariantEntry {
+        VariantEntry {
+            variant_id: VariantId::new(id).expect("variant id"),
+            attributes,
+            unit_price: None,
+            moq: None,
+            stock: StockState::Unknown,
+        }
+    }
+
+    /// The PRE-FIX `select_variant` closure, verbatim: the oracle the
+    /// hoisted version must match (selection included, fallback included).
+    fn reference_select_variant(matrix: &[VariantEntry], requested_id: &str) -> VariantSelection {
+        if let Some(exact) = matrix
+            .iter()
+            .find(|entry| entry.variant_id.as_str() == requested_id)
+        {
+            return VariantSelection::Exact(exact.clone());
+        }
+        let spec = parse_variant_spec(requested_id);
+        if spec.is_empty() {
+            return VariantSelection::Missing;
+        }
+        let matching: Vec<VariantEntry> = matrix
+            .iter()
+            .filter(|entry| {
+                spec.iter().all(|(name, value)| {
+                    let wanted = VariantAttribute {
+                        name: Text::<64>::new(name)
+                            .unwrap_or_else(|_| Text::<64>::new("attribute").expect("literal")),
+                        value: Text::<256>::new(value)
+                            .unwrap_or_else(|_| Text::<256>::new("value").expect("literal")),
+                    };
+                    entry
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.matches(&wanted))
+                })
+            })
+            .cloned()
+            .collect();
+        match matching.len() {
+            0 => VariantSelection::Missing,
+            1 => VariantSelection::Exact(matching[0].clone()),
+            _ => VariantSelection::Ambiguous(matching),
+        }
+    }
+
+    #[test]
+    fn hoisted_variant_selection_matches_the_pairwise_reference() {
+        let oversized_name = "n".repeat(70);
+        let oversized_value = "v".repeat(300);
+        let matrix = vec![
+            entry(
+                "长度=1m;颜色=黑色",
+                vec![attr("颜色", "黑色"), attr("长度", "1m")],
+            ),
+            entry("颜色=白色", vec![attr("颜色", "白色")]),
+            entry("attribute=value", vec![attr("attribute", "value")]),
+            entry("case=1", vec![attr("Case", "1")]),
+        ];
+        let specs = [
+            "颜色=黑色;长度=1m",
+            " 颜色 = 黑色 ",
+            "颜色:黑色",
+            "颜色=蓝色",
+            "颜色=黑",
+            "",
+            "case=1",
+            "CASE=1",
+            // Fallback equivalence: oversized name/value normalize to the
+            // literal `attribute`/`value` pair in BOTH implementations.
+            &format!("{oversized_name}=value")[..],
+            &format!("attribute={oversized_value}")[..],
+            &format!("{oversized_name}={oversized_value}")[..],
+            "长度=1m;颜色=黑色",
+        ];
+        for spec in specs {
+            assert_eq!(
+                select_variant(&matrix, spec),
+                reference_select_variant(&matrix, spec),
+                "spec {spec:?}"
+            );
+        }
+        // Exact id short-circuit is untouched.
+        assert_eq!(
+            select_variant(&matrix, "颜色=白色"),
+            reference_select_variant(&matrix, "颜色=白色")
+        );
+    }
+
+    #[test]
+    fn wanted_attributes_are_built_once_per_selection_not_per_entry() {
+        // Complexity-audit evidence: 256 matrix entries × 16 spec pairs.
+        // The pre-fix closure rebuilt and re-validated the wanted vector per
+        // (spec × matrix entry) pair — 4096 constructions; the hoisted form
+        // builds it exactly ONCE per call. The counter is deterministic
+        // (thread-local), and the reference below mirrors the pre-fix
+        // structure exactly (wanted rebuilt inside the per-entry filter).
+        let matrix: Vec<VariantEntry> = (0..MAX_VARIANTS)
+            .map(|v| {
+                entry(
+                    &format!("sku{v}"),
+                    (0..MAX_VARIANT_ATTRIBUTES)
+                        .map(|a| attr(&format!("a{a}"), &format!("v{v}-{a}")))
+                        .collect(),
+                )
+            })
+            .collect();
+        let spec: String = (0..MAX_VARIANT_ATTRIBUTES)
+            .map(|a| format!("a{a}=v5-{a}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let spec = spec.as_str();
+
+        // The reference (pre-fix shape) rebuilds the wanted vector per
+        // entry, exactly as the old closure did.
+        wanted_builds::reset();
+        let reference: Vec<VariantEntry> = matrix
+            .iter()
+            .filter(|entry| {
+                let pairs = parse_variant_spec(spec);
+                wanted_attributes(&pairs).iter().all(|wanted| {
+                    entry
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.matches(wanted))
+                })
+            })
+            .cloned()
+            .collect();
+        let reference_builds = wanted_builds::snapshot();
+        assert_eq!(
+            reference_builds, MAX_VARIANTS as u64,
+            "the pre-fix shape rebuilds wanted per entry"
+        );
+
+        // The hoisted selection builds it once and selects identically.
+        wanted_builds::reset();
+        let selection = select_variant(&matrix, spec);
+        let hoisted_builds = wanted_builds::snapshot();
+        assert_eq!(hoisted_builds, 1, "one construction per call");
+        assert_eq!(
+            selection,
+            VariantSelection::Exact(matrix[5].clone()),
+            "identical selection"
+        );
+        assert_eq!(
+            reference.len(),
+            1,
+            "the reference agrees on the single match"
+        );
+        assert!(hoisted_builds < reference_builds);
     }
 }

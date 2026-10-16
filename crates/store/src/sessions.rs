@@ -1015,6 +1015,18 @@ impl Store {
                     // Drop without commit: the durable world is untouched.
                     return Ok(ExpiredPermissionResolution::default());
                 }
+                // ONE indexed aggregate pass builds both arrays; the former
+                // per-row `json_set('$[#]', ...)` chain re-parsed and
+                // re-serialized the growing array once per row (O(n^2)).
+                let (ids_json, ops_json): (String, String) = txn.tx.query_row(
+                    "SELECT COALESCE(json_group_array(pid), '[]'),
+                            COALESCE(json_group_array(opid), '[]')
+                     FROM (SELECT id AS pid, op_id AS opid FROM permission
+                           WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
+                           ORDER BY id ASC)",
+                    params![session_id.raw() as i64, now_ms],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
                 let changed = txn.tx.execute(
                     "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
@@ -1029,22 +1041,6 @@ impl Store {
                 // object gets both arrays replaced; a missing payload becomes the
                 // object; a non-object payload is left unchanged, exactly like the
                 // former in-closure patch).
-                let mut ids_json = String::from("[]");
-                for (pid, _) in &expired {
-                    ids_json = txn.conn().query_row(
-                        "SELECT json_set(?1, '$[#]', ?2)",
-                        params![ids_json, *pid],
-                        |r| r.get::<_, String>(0),
-                    )?;
-                }
-                let mut ops_json = String::from("[]");
-                for (_, pop) in &expired {
-                    ops_json = txn.conn().query_row(
-                        "SELECT json_set(?1, '$[#]', ?2)",
-                        params![ops_json, pop.raw() as i64],
-                        |r| r.get::<_, String>(0),
-                    )?;
-                }
                 let payload_json = match payload_base {
                     Some(base) => {
                         let is_object = txn.conn().query_row(
@@ -3926,4 +3922,52 @@ mod typed_ledger_tests {
     // (schema v18): refund-after-dispatch is SQL-impossible, reservations and
     // provider-call rows key by attempt_op_id, delivery/cost-basis columns
     // ride the row, crash recovery splits reserved-vs-dispatched.
+
+    /// Chunk-boundary correctness for the IN-list cancel: 1,201 ops cross
+    /// two 500-op chunks plus a partial one; only non-terminal rows cancel
+    /// (whatever their status), the count is exact, and a replay is a no-op.
+    #[test]
+    fn cancel_queued_ops_chunks_large_lists_exactly() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        const N: i64 = 1_201;
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            let statuses = ["pending", "claimed", "running", "done", "cancelled"];
+            for i in 0..N {
+                tx.execute(
+                    "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, status, requested_at)
+                     VALUES (?1, ?2, ?3, 'p', ?4, 1)",
+                    params![
+                        s.id.raw() as i64,
+                        i + 1,
+                        5_000 + i,
+                        statuses[(i % statuses.len() as i64) as usize]
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let ops: Vec<OpId> = (0..N).map(|i| OpId::new(5_000 + i as u64)).collect();
+        let expected_cancelled = (0..N).filter(|i| matches!(i % 5, 0..=2)).count() as i64;
+        assert_eq!(
+            store.cancel_queued_ops(s.id, &ops).unwrap(),
+            expected_cancelled
+        );
+        assert_eq!(store.cancel_queued_ops(s.id, &ops).unwrap(), 0, "replay");
+        let conn = store.raw_conn();
+        let cancelled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1 AND status = 'cancelled'",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, expected_cancelled + N / 5);
+        assert_eq!(store.queue_op_ids(s.id).unwrap().len(), 0);
+        assert!(store.sessions_with_pending_queues().unwrap().is_empty());
+    }
 }

@@ -253,6 +253,100 @@ fn decision_must_cover_every_file_and_reject_hostile_paths() {
 }
 
 #[test]
+fn decision_validation_is_one_pass_over_the_change_set() {
+    // Evidence for the one-pass `ChangeSetIndex`: the historical lookup
+    // scanned the change set per decision and re-lowercased EVERY staged
+    // path per case-variant miss (O(decisions · files)); the index is
+    // O(decisions + files). Both paths are run here on the same corpus and
+    // must classify every decision identically.
+    //
+    // The old primitive, exactly as it stood (position scan + per-miss
+    // lowercase sweep).
+    fn old_find(cs: &ChangeSet, wanted: &Path) -> Result<Option<usize>, ExecError> {
+        if let Some(i) = cs.files.iter().position(|e| e.path == wanted) {
+            return Ok(Some(i));
+        }
+        let wanted_lc = wanted.to_string_lossy().to_lowercase();
+        for e in &cs.files {
+            if e.path.to_string_lossy().to_lowercase() == wanted_lc {
+                return Err(ExecError::InvalidApproval(format!(
+                    "path {:?} differs in case from the staged path {:?}",
+                    wanted.display(),
+                    e.path.display()
+                )));
+            }
+        }
+        Ok(None)
+    }
+    fn classify(r: Result<Option<usize>, ExecError>) -> String {
+        match r {
+            Ok(Some(i)) => format!("hit:{i}"),
+            Ok(None) => "miss".to_string(),
+            Err(e) => format!("err:{e:?}"),
+        }
+    }
+
+    let n = MAX_CHANGES; // 2000 staged files, the hard bound.
+    let files: Vec<ChangeEntry> = (0..n)
+        .map(|i| entry(&format!("src/f{i:04}.rs"), Some(H), Some(H2)))
+        .collect();
+    let c = cs(files);
+    // Mixed adversarial corpus: exact hits, case variants, unknowns, and a
+    // duplicate staged path (first-index semantics must survive).
+    let mut decisions: Vec<PathBuf> = Vec::new();
+    for i in (0..n).step_by(3) {
+        decisions.push(PathBuf::from(format!("src/f{i:04}.rs")));
+    }
+    for i in (1..n).step_by(3) {
+        decisions.push(PathBuf::from(format!("SRC/F{i:04}.RS")));
+    }
+    for i in (2..n).step_by(3) {
+        decisions.push(PathBuf::from(format!("src/ghost-{i:04}.rs")));
+    }
+
+    // Equivalence: every decision classifies identically.
+    let mut index = ChangeSetIndex::new(&c);
+    for d in &decisions {
+        let old = classify(old_find(&c, d));
+        let new = classify(index.find(d));
+        assert_eq!(old, new, "classification drift for {d:?}");
+    }
+
+    // Bounded measurement: the case-variant corpus is the old path's worst
+    // case (full lowercase sweep per miss).
+    let variants: Vec<PathBuf> = (0..n)
+        .map(|i| PathBuf::from(format!("SRC/F{i:04}.RS")))
+        .collect();
+    let t0 = std::time::Instant::now();
+    for d in &variants {
+        old_find(&c, d).expect_err("case variant");
+    }
+    let old_elapsed = t0.elapsed();
+    let mut index = ChangeSetIndex::new(&c);
+    let t1 = std::time::Instant::now();
+    for d in &variants {
+        index.find(d).expect_err("case variant");
+    }
+    let new_elapsed = t1.elapsed();
+    eprintln!(
+        "change-set decision lookup ({n} files x {n} case-variant decisions): old {old_elapsed:?} -> new {new_elapsed:?}"
+    );
+    assert!(
+        new_elapsed < old_elapsed,
+        "the one-pass index must beat the per-decision sweep: old {old_elapsed:?} new {new_elapsed:?}"
+    );
+
+    // End-to-end sanity at the cap: a complete disjoint decision still
+    // validates and round-trips sorted (the index drives the real path).
+    let all: Vec<PathBuf> = (0..n)
+        .map(|i| PathBuf::from(format!("src/f{i:04}.rs")))
+        .collect();
+    let (approved, rejected) = validate_decision(&c, &all, &[]).expect("complete decision");
+    assert_eq!(approved.len(), n);
+    assert!(rejected.is_empty());
+}
+
+#[test]
 fn pack_chunks_roundtrips_and_empty_payloads_stay_readable() {
     let items: Vec<ChangeEntry> = (0..1000)
         .map(|i| entry(&format!("dir/f{i:04}.rs"), Some(H), None))

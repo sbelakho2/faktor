@@ -74,98 +74,174 @@ pub(crate) async fn native_usage(
         Err(e) => return api_err(&e),
     };
     sessions.truncate(MAX_SESSIONS);
-    // ---- durable layer (authoritative; P0-63)
-    let mut durable_tokens: u64 = 0;
+    let store = state.deps.session.store();
+    let session_ids: Vec<SessionId> = sessions.iter().map(|h| h.id()).collect();
+    // ---- durable layer (authoritative; P0-63), BATCH reads (perf wave):
+    // one statement per bounded session/task chunk replaces the per-session
+    // and per-task round-trips. Byte-identical DTO: every number comes from
+    // the same SQL expression as the single-session read, and anything the
+    // batch cannot serve EXACTLY (a shape the per-row validated read would
+    // reject, task rows beyond the scan scope, or a chunk-level SQL
+    // failure) falls back to the original per-session/per-task reads below.
+    let usage_batch = store
+        .session_usage_aggregates(&session_ids)
+        .unwrap_or_else(|_| faktor_store::SessionUsageBatch {
+            unreadable: session_ids.clone(),
+            ..Default::default()
+        });
+    let usage_by_session: std::collections::HashMap<u64, &faktor_store::SessionUsageAggregate> =
+        usage_batch
+            .rows
+            .iter()
+            .map(|a| (a.session_id.raw(), a))
+            .collect();
+    let usage_unreadable: std::collections::HashSet<u64> =
+        usage_batch.unreadable.iter().map(|s| s.raw()).collect();
+    let tasks_batch = store
+        .task_usage_scope(&session_ids, MAX_NATIVE_LIST as u32)
+        .unwrap_or_else(|_| faktor_store::TaskUsageBatch {
+            unreadable: session_ids.clone(),
+            ..Default::default()
+        });
+    let mut tasks_by_session: std::collections::HashMap<u64, Vec<faktor_store::TaskUsageRow>> =
+        std::collections::HashMap::new();
+    for row in tasks_batch.rows {
+        tasks_by_session
+            .entry(row.session_id.raw())
+            .or_default()
+            .push(row);
+    }
+    let tasks_unreadable: std::collections::HashSet<u64> =
+        tasks_batch.unreadable.iter().map(|s| s.raw()).collect();
+    // The reservation batch covers exactly the `(session, task)` pairs the
+    // route reads — the servable scope rows of the servable sessions.
+    let pairs: Vec<(SessionId, faktor_core::id::TaskId)> = tasks_by_session
+        .iter()
+        .filter(|(sid, _)| !tasks_unreadable.contains(sid))
+        .flat_map(|(_, rows)| rows.iter().map(|r| (r.session_id, r.task_id)))
+        .collect();
+    let reservations_batch = store
+        .cost_reservations_for_tasks(&pairs, MAX_NATIVE_RESERVATIONS_SCAN)
+        .unwrap_or_else(|_| faktor_store::TaskReservationBatch {
+            unreadable: pairs.clone(),
+            ..Default::default()
+        });
+    let mut reservations_by_pair: std::collections::HashMap<
+        (u64, u64),
+        Vec<faktor_store::CostReservationRow>,
+    > = std::collections::HashMap::new();
+    for row in reservations_batch.rows {
+        reservations_by_pair
+            .entry((row.session_id.raw(), row.task_id.raw()))
+            .or_default()
+            .push(row);
+    }
+    let reservations_unreadable: std::collections::HashSet<(u64, u64)> = reservations_batch
+        .unreadable
+        .iter()
+        .map(|(s, t)| (s.raw(), t.raw()))
+        .collect();
     let mut sessions_with_calls: u64 = 0;
     let mut prefix_rows: u64 = 0;
     let mut prefix_tokens: u64 = 0;
     let mut prefix_stability_observations: u64 = 0;
-    let mut res_open_count: u64 = 0;
-    let mut res_open_predicted: u64 = 0;
-    let mut res_settled_count: u64 = 0;
-    let mut res_settled_predicted: u64 = 0;
-    let mut res_settled_spent: u64 = 0;
-    let mut res_settled_reported: u64 = 0;
-    let mut res_refunded_count: u64 = 0;
-    let mut res_refunded_predicted: u64 = 0;
-    let mut res_uncertain_count: u64 = 0;
-    let mut res_uncertain_predicted: u64 = 0;
+    let mut durable_tokens: u64 = 0;
+    let mut res = ReservationFold::default();
     let mut task_budget_spent_micro: u64 = 0;
-    let mut scan_truncated = false;
     for handle in &sessions {
-        let store = state.deps.session.store();
         let sid = handle.id();
-        let session_tokens = match store.session_usage_tokens(sid) {
-            Ok(t) => t,
-            Err(_) => continue, // vanished/corrupt session row mid-scan
+        let servable = usage_by_session
+            .get(&sid.raw())
+            .filter(|_| !usage_unreadable.contains(&sid.raw()));
+        let session_tokens = match servable {
+            Some(agg) => agg.tokens,
+            None => match store.session_usage_tokens(sid) {
+                Ok(t) => t,
+                Err(_) => continue, // vanished/corrupt session row mid-scan
+            },
         };
         if session_tokens > 0 {
             sessions_with_calls += 1;
         }
         durable_tokens = durable_tokens.saturating_add(session_tokens);
-        match store.provider_call_prefix_rows(sid) {
-            Ok(rows) => {
-                prefix_rows = prefix_rows.saturating_add(rows.len() as u64);
-                for r in rows {
-                    prefix_tokens = prefix_tokens.saturating_add(r.prompt_tokens as u64);
-                    if r.prefix_stability.is_some() {
-                        prefix_stability_observations += 1;
+        match servable.filter(|a| a.prefix_servable) {
+            Some(agg) => {
+                prefix_rows = prefix_rows.saturating_add(agg.prefix_rows);
+                prefix_tokens = prefix_tokens.saturating_add(agg.prefix_tokens);
+                prefix_stability_observations += agg.prefix_stability_observations;
+            }
+            None => match store.provider_call_prefix_rows(sid) {
+                Ok(rows) => {
+                    prefix_rows = prefix_rows.saturating_add(rows.len() as u64);
+                    for r in rows {
+                        prefix_tokens = prefix_tokens.saturating_add(r.prompt_tokens as u64);
+                        if r.prefix_stability.is_some() {
+                            prefix_stability_observations += 1;
+                        }
                     }
                 }
-            }
-            Err(_) => continue, // a hostile prefix row fails this session's read loudly
+                Err(_) => continue, // a hostile prefix row fails this session's read loudly
+            },
         }
-        let tasks = match handle.list_tasks() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        for task in tasks.iter().take(MAX_NATIVE_LIST) {
-            if let Ok(Some(cost)) = store.cost_task_row(sid, task.task_id) {
-                task_budget_spent_micro =
-                    task_budget_spent_micro.saturating_add(cost.spent_cost_micro);
+        if let Some(scope) = tasks_by_session
+            .get(&sid.raw())
+            .filter(|_| !tasks_unreadable.contains(&sid.raw()))
+        {
+            for task in scope {
+                task_budget_spent_micro = task_budget_spent_micro
+                    .saturating_add(u64::try_from(task.spent_cost_micro).unwrap_or(u64::MAX));
+                // Batch rows for the pair; a pair the batch could not serve
+                // falls back to the single-task read (which reproduces the
+                // legacy skip), an absent pair has no rows.
+                let fallback_rows;
+                let rows: &[faktor_store::CostReservationRow] = if let Some(rows) =
+                    reservations_by_pair.get(&(task.session_id.raw(), task.task_id.raw()))
+                {
+                    rows
+                } else if reservations_unreadable
+                    .contains(&(task.session_id.raw(), task.task_id.raw()))
+                {
+                    match store.cost_reservations_of(
+                        task.session_id,
+                        task.task_id,
+                        MAX_NATIVE_RESERVATIONS_SCAN,
+                    ) {
+                        Ok(rows) => {
+                            fallback_rows = rows;
+                            &fallback_rows
+                        }
+                        Err(_) => continue,
+                    }
+                } else {
+                    &[]
+                };
+                if rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN {
+                    res.truncated = true;
+                }
+                res.fold(rows);
             }
-            let rows =
-                match store.cost_reservations_of(sid, task.task_id, MAX_NATIVE_RESERVATIONS_SCAN) {
+        } else {
+            let tasks = match handle.list_tasks() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            for task in tasks.iter().take(MAX_NATIVE_LIST) {
+                if let Ok(Some(cost)) = store.cost_task_row(sid, task.task_id) {
+                    task_budget_spent_micro =
+                        task_budget_spent_micro.saturating_add(cost.spent_cost_micro);
+                }
+                let rows = match store.cost_reservations_of(
+                    sid,
+                    task.task_id,
+                    MAX_NATIVE_RESERVATIONS_SCAN,
+                ) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-            if rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN {
-                scan_truncated = true;
-            }
-            for row in rows {
-                // Group vocabulary is the schema v17+ state set: in-flight
-                // `reserved`/`dispatched`, terminal `settled`/`refunded`
-                // and crash-recovery `uncertain` — the v15 `open`/
-                // `abandoned` names were renamed at v16/v17 and never
-                // occur in a migrated store.
-                match row.status.as_str() {
-                    "reserved" | "dispatched" => {
-                        res_open_count += 1;
-                        res_open_predicted = res_open_predicted.saturating_add(row.predicted_micro);
-                    }
-                    "settled" => {
-                        res_settled_count += 1;
-                        res_settled_predicted =
-                            res_settled_predicted.saturating_add(row.predicted_micro);
-                        res_settled_spent =
-                            res_settled_spent.saturating_add(reservation_settled_spent_micro(&row));
-                        res_settled_reported = res_settled_reported
-                            .saturating_add(reservation_provider_reported_micro(&row));
-                    }
-                    "refunded" => {
-                        res_refunded_count += 1;
-                        res_refunded_predicted =
-                            res_refunded_predicted.saturating_add(row.predicted_micro);
-                    }
-                    "uncertain" => {
-                        res_uncertain_count += 1;
-                        res_uncertain_predicted =
-                            res_uncertain_predicted.saturating_add(row.predicted_micro);
-                    }
-                    // Unknown status strings (hostile rows) contribute
-                    // nothing: the aggregate never guesses.
-                    _ => {}
+                if rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN {
+                    res.truncated = true;
                 }
+                res.fold(&rows);
             }
         }
     }
@@ -179,41 +255,71 @@ pub(crate) async fn native_usage(
         },
         "taskSpend": { "settledCostMicro": money::json(task_budget_spent_micro) },
         "reservations": {
-            "open": { "count": res_open_count, "predictedMicro": money::json(res_open_predicted) },
+            "open": { "count": res.open_count, "predictedMicro": money::json(res.open_predicted) },
             "settled": {
-                "count": res_settled_count,
-                "predictedMicro": money::json(res_settled_predicted),
-                "spentMicro": money::json(res_settled_spent),
-                "providerReportedMicro": money::json(res_settled_reported),
+                "count": res.settled_count,
+                "predictedMicro": money::json(res.settled_predicted),
+                "spentMicro": money::json(res.settled_spent),
+                "providerReportedMicro": money::json(res.settled_reported),
             },
-            "refunded": { "count": res_refunded_count, "predictedMicro": money::json(res_refunded_predicted) },
+            "refunded": { "count": res.refunded_count, "predictedMicro": money::json(res.refunded_predicted) },
             "uncertain": {
-                "count": res_uncertain_count,
-                "predictedMicro": money::json(res_uncertain_predicted),
+                "count": res.uncertain_count,
+                "predictedMicro": money::json(res.uncertain_predicted),
             },
         },
     });
-    if scan_truncated {
+    if res.truncated {
         durable["truncated"] = serde_json::json!(true);
     }
-    for handle in &sessions {
-        let facts = match handle.memory_facts() {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut budget: Option<i64> = None;
-        let mut spent: Option<i64> = None;
-        for (kind, key, value) in facts {
-            if kind != "usage" {
-                continue;
-            }
-            let parsed = value.parse::<i64>().ok();
-            match key.as_str() {
-                "budget" => budget = parsed,
-                "spent" => spent = parsed,
-                _ => {}
-            }
+    // ---- legacy per-session facts (kind `usage`): batch read with the same
+    // per-session last-wins fold; chunks the SQL layer could not serve fall
+    // back to the per-session fact read.
+    let facts_batch = store
+        .usage_facts_by_session(&session_ids)
+        .unwrap_or_else(|_| faktor_store::UsageFactsBatch {
+            unreadable: session_ids.clone(),
+            ..Default::default()
+        });
+    let mut facts_by_session: std::collections::HashMap<u64, (Option<i64>, Option<i64>)> =
+        std::collections::HashMap::new();
+    for (sid, key, value) in &facts_batch.rows {
+        let entry = facts_by_session.entry(sid.raw()).or_default();
+        match key.as_str() {
+            "budget" => entry.0 = value.parse::<i64>().ok(),
+            "spent" => entry.1 = value.parse::<i64>().ok(),
+            _ => {}
         }
+    }
+    let facts_unreadable: std::collections::HashSet<u64> =
+        facts_batch.unreadable.iter().map(|s| s.raw()).collect();
+    for handle in &sessions {
+        let sid = handle.id();
+        let (budget, spent) = if facts_unreadable.contains(&sid.raw()) {
+            let facts = match handle.memory_facts() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut budget: Option<i64> = None;
+            let mut spent: Option<i64> = None;
+            for (kind, key, value) in facts {
+                if kind != "usage" {
+                    continue;
+                }
+                let parsed = value.parse::<i64>().ok();
+                match key.as_str() {
+                    "budget" => budget = parsed,
+                    "spent" => spent = parsed,
+                    _ => {}
+                }
+            }
+            (budget, spent)
+        } else {
+            facts_by_session
+                .get(&sid.raw())
+                .copied()
+                .unwrap_or((None, None))
+        };
         if budget.is_none() && spent.is_none() {
             continue;
         }
@@ -231,6 +337,66 @@ pub(crate) async fn native_usage(
         "perSession": per_session,
         "durable": durable,
     }))
+}
+
+/// The durable reservation counters of the cross-session aggregate, folded
+/// from the SAME status vocabulary and saturating arithmetic as before (the
+/// batch and single-task reads share this exact fold).
+#[derive(Default)]
+struct ReservationFold {
+    open_count: u64,
+    open_predicted: u64,
+    settled_count: u64,
+    settled_predicted: u64,
+    settled_spent: u64,
+    settled_reported: u64,
+    refunded_count: u64,
+    refunded_predicted: u64,
+    uncertain_count: u64,
+    uncertain_predicted: u64,
+    truncated: bool,
+}
+
+impl ReservationFold {
+    fn fold(&mut self, rows: &[faktor_store::CostReservationRow]) {
+        for row in rows {
+            // Group vocabulary is the schema v17+ state set: in-flight
+            // `reserved`/`dispatched`, terminal `settled`/`refunded`
+            // and crash-recovery `uncertain` — the v15 `open`/
+            // `abandoned` names were renamed at v16/v17 and never
+            // occur in a migrated store.
+            match row.status.as_str() {
+                "reserved" | "dispatched" => {
+                    self.open_count += 1;
+                    self.open_predicted = self.open_predicted.saturating_add(row.predicted_micro);
+                }
+                "settled" => {
+                    self.settled_count += 1;
+                    self.settled_predicted =
+                        self.settled_predicted.saturating_add(row.predicted_micro);
+                    self.settled_spent = self
+                        .settled_spent
+                        .saturating_add(reservation_settled_spent_micro(row));
+                    self.settled_reported = self
+                        .settled_reported
+                        .saturating_add(reservation_provider_reported_micro(row));
+                }
+                "refunded" => {
+                    self.refunded_count += 1;
+                    self.refunded_predicted =
+                        self.refunded_predicted.saturating_add(row.predicted_micro);
+                }
+                "uncertain" => {
+                    self.uncertain_count += 1;
+                    self.uncertain_predicted =
+                        self.uncertain_predicted.saturating_add(row.predicted_micro);
+                }
+                // Unknown status strings (hostile rows) contribute
+                // nothing: the aggregate never guesses.
+                _ => {}
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------ native v1: audits 62-64

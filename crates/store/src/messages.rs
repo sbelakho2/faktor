@@ -22,13 +22,21 @@ pub struct PartRow {
 }
 
 pub(crate) fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
+    message_map_data(r, &r.get::<_, String>(4)?)
+}
+
+/// [`message_map`] over an already-read `data` column: the bounded backward
+/// page reads the raw payload to measure it and used to fetch the very same
+/// column a second time via [`message_map`] (two String allocations per row
+/// on a hot path).
+pub(crate) fn message_map_data(r: &rusqlite::Row<'_>, data_raw: &str) -> StoreResult<MessageRow> {
     let id = r.get::<_, i64>(0)?;
     Ok(MessageRow {
         id,
         session_id: id_field(&format!("message {id} session_id"), r.get::<_, i64>(1)?)?,
         seq: r.get(2)?,
         role: r.get(3)?,
-        data: parse_json(&format!("message {id} data"), &r.get::<_, String>(4)?)?,
+        data: parse_json(&format!("message {id} data"), data_raw)?,
         created_ms: r.get(5)?,
     })
 }
@@ -156,7 +164,7 @@ impl Store {
             if !out.is_empty() && total_bytes.saturating_add(row_bytes) > max_bytes {
                 break;
             }
-            out.push(message_map(row)?);
+            out.push(message_map_data(row, &raw)?);
             total_bytes = total_bytes.saturating_add(row_bytes);
         }
         Ok(out)
@@ -726,5 +734,106 @@ mod tests {
         let page = store.messages_before(sid, None, 10).unwrap();
         let seqs: Vec<i64> = page.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![3, 1]);
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::tests::tmp_store;
+    use super::*;
+
+    /// Bounded deterministic measurement on 10,000 durable message rows: the
+    /// bounded backward page reads only the requested window, decodes every
+    /// row correctly (including a hostile oversized newest payload and a
+    /// unicode payload under the byte bound), and completes in bounded time.
+    #[test]
+    fn bounded_backwards_page_is_correct_and_bounded_on_10k_rows() {
+        const N: i64 = 10_000;
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 1..=N {
+                tx.execute(
+                    "INSERT INTO message(session_id, seq, role, data, created_ms)
+                     VALUES (?1, ?2, 'user', ?3, ?4)",
+                    params![
+                        sid.raw() as i64,
+                        i,
+                        format!(r#"{{"text":"payload-{i:05}"}}"#),
+                        i
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let started = std::time::Instant::now();
+        let page = store
+            .messages_backwards_bounded(sid, None, 500, u64::MAX)
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(page.len(), 500);
+        assert_eq!(page[0].seq, N);
+        assert_eq!(page[499].seq, N - 499);
+        for m in &page {
+            let expected = format!("payload-{:05}", m.seq);
+            assert_eq!(m.data["text"], expected, "row {} decodes exactly", m.seq);
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "500-row page out of 10k took {elapsed:?}"
+        );
+
+        // Strict cursor cut: nothing at or above `before_seq` is returned.
+        let cut = store
+            .messages_backwards_bounded(sid, Some(100), 500, u64::MAX)
+            .unwrap();
+        assert!(cut.iter().all(|m| m.seq < 100));
+        assert_eq!(cut.first().unwrap().seq, 99);
+
+        // Adversarial payloads: an oversized newest row is still exact and
+        // the byte bound holds between rows; a unicode row decodes.
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO message(session_id, seq, role, data, created_ms)
+                 VALUES (?1, ?2, 'user', ?3, ?4)",
+                params![
+                    sid.raw() as i64,
+                    N + 1,
+                    serde_json::json!({ "text": "x".repeat(64 * 1024) }).to_string(),
+                    N + 1
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO message(session_id, seq, role, data, created_ms)
+                 VALUES (?1, ?2, 'user', ?3, ?4)",
+                params![
+                    sid.raw() as i64,
+                    N + 2,
+                    serde_json::json!({ "text": "π-😀 unicode" }).to_string(),
+                    N + 2
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let tiny = store
+            .messages_backwards_bounded(sid, None, 500, 64)
+            .unwrap();
+        assert_eq!(tiny.len(), 1, "the byte bound stops between rows");
+        assert_eq!(tiny[0].seq, N + 2);
+        assert_eq!(tiny[0].data["text"], "π-😀 unicode");
+        let next = store
+            .messages_backwards_bounded(sid, Some((N + 2) as u64), 1, 64)
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].seq, N + 1);
+        assert_eq!(next[0].data["text"].as_str().unwrap().len(), 64 * 1024);
     }
 }

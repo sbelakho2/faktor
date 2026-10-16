@@ -32,6 +32,47 @@ use futures::{Stream, StreamExt};
 
 use crate::{ProviderError, ProviderErrorKind};
 
+/// Test-only work counters (complexity-audit evidence): total bytes examined
+/// while searching for a line terminator, and total bytes shifted by buffer
+/// compaction. Both must stay LINEAR in the stream size (the pre-fix
+/// implementation rescanned the pending buffer from byte 0 per chunk —
+/// O(n^2) on a dribbled line — and drained the whole buffer per emitted
+/// line — O(k * n) on a burst chunk). THREAD-LOCAL so the counter tests can
+/// run in parallel with every other test without cross-talk (the stream is
+/// polled on the calling thread).
+#[cfg(test)]
+pub(crate) mod line_stream_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Bytes compared while locating `\n`.
+        pub(crate) static SCAN_BYTES: Cell<u64> = const { Cell::new(0) };
+        /// Bytes moved by compaction (memmove of the unconsumed tail).
+        pub(crate) static COMPACT_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset both counters.
+    pub(crate) fn reset() {
+        SCAN_BYTES.with(|c| c.set(0));
+        COMPACT_BYTES.with(|c| c.set(0));
+    }
+
+    /// Add to the scan counter.
+    pub(crate) fn add_scan(bytes: u64) {
+        SCAN_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// Add to the compaction counter.
+    pub(crate) fn add_compact(bytes: u64) {
+        COMPACT_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// (scan_bytes, compact_bytes).
+    pub(crate) fn snapshot() -> (u64, u64) {
+        (SCAN_BYTES.with(Cell::get), COMPACT_BYTES.with(Cell::get))
+    }
+}
+
 /// Hard cap on one SSE/NDJSON text line (a tool-call JSON line is the
 /// largest legitimate frame; prompts are bounded at 512 KiB by session
 /// bounds, so a megabyte is a generous wire ceiling).
@@ -67,8 +108,25 @@ where
     B: AsRef<[u8]> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    /// Cursor state (complexity audit): `buf[start..]` is the unconsumed
+    /// tail and `buf[..scanned]` is known to contain no `\n`, so each
+    /// network byte is scanned for a terminator at most ONCE (the pre-fix
+    /// code re-ran `position` over the whole pending buffer per chunk —
+    /// quadratic on a hostile dribble of a long line). Emitted lines are
+    /// consumed by ADVANCING `start`; the consumed prefix is compacted
+    /// (memmove) only when it is at least half the buffer, so per-line
+    /// draining can never shift the tail repeatedly (the pre-fix
+    /// `drain(..=break_at)` moved the whole remainder per emitted line —
+    /// quadratic on a burst chunk carrying many lines).
+    struct Active<S> {
+        bytes: Pin<Box<S>>,
+        buf: Vec<u8>,
+        start: usize,
+        scanned: usize,
+    }
+
     enum Buf<S> {
-        Active(Pin<Box<S>>, Vec<u8>),
+        Active(Box<Active<S>>),
         Dead,
     }
 
@@ -76,22 +134,56 @@ where
         ProviderError::new(ProviderErrorKind::Malformed, msg)
     }
 
+    fn decode(buf: &[u8]) -> Result<String, ProviderError> {
+        // Strict decode (audit round 16b): protocol lines never go through
+        // from_utf8_lossy — replacement characters would corrupt
+        // SSE/NDJSON silently.
+        std::str::from_utf8(buf)
+            .map(str::to_string)
+            .map_err(|_| malformed("invalid utf-8 in SSE/NDJSON line"))
+    }
+
     // Pin<Box<S>> is Unpin even when S is not, so StreamExt::next works.
     futures::stream::unfold(
-        Buf::Active(Box::pin(bytes), Vec::<u8>::new()),
+        Buf::Active(Box::new(Active {
+            bytes: Box::pin(bytes),
+            buf: Vec::new(),
+            start: 0,
+            scanned: 0,
+        })),
         move |state| async move {
-            let Buf::Active(mut bytes, mut pending) = state else {
+            let Buf::Active(mut active) = state else {
                 return None;
             };
             loop {
                 // 1. Emit complete lines first — a single chunk may carry
-                //    many. The cap is enforced HERE, before the drain
-                //    (audit round 16): a complete line longer than the cap
-                //    is a loud Malformed error, never an emitted giant
-                //    line. `break_at` is the `\n` index, hence the line
-                //    length without the terminator.
-                if let Some(break_at) = pending.iter().position(|b| *b == b'\n') {
-                    if break_at > max_line_bytes {
+                //    many. The scan resumes at `scanned` (never from the
+                //    consumed prefix), so total scan work is linear in the
+                //    bytes received. The cap is enforced HERE, before the
+                //    emit (audit round 16): a complete line longer than the
+                //    cap is a loud Malformed error, never an emitted giant
+                //    line. `break_at` is the `\n` index; the line length is
+                //    measured WITHOUT the terminator (an adjacent `\r` is
+                //    stripped after the check, exactly as before).
+                let search_from = active.scanned;
+                let found = active.buf[search_from..].iter().position(|b| *b == b'\n');
+                #[cfg(test)]
+                match found {
+                    Some(offset) => line_stream_work::add_scan((offset + 1) as u64),
+                    None => {
+                        line_stream_work::add_scan((active.buf.len() - search_from) as u64);
+                    }
+                }
+                let shifted = match found {
+                    Some(offset) => search_from + offset,
+                    None => {
+                        active.scanned = active.buf.len();
+                        usize::MAX
+                    }
+                };
+                if shifted != usize::MAX {
+                    let line_len = shifted - active.start;
+                    if line_len > max_line_bytes {
                         return Some((
                             Err(malformed(format!(
                                 "SSE/NDJSON line exceeds {max_line_bytes} bytes"
@@ -99,30 +191,37 @@ where
                             Buf::Dead,
                         ));
                     }
-                    let mut line: Vec<u8> = pending.drain(..=break_at).collect();
-                    line.pop(); // '\n'
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
+                    let mut end = shifted;
+                    if end > active.start && active.buf[end - 1] == b'\r' {
+                        end -= 1;
                     }
-                    // Strict decode (audit round 16b): protocol lines never
-                    // go through from_utf8_lossy — replacement characters
-                    // would corrupt SSE/NDJSON silently.
-                    let line = match String::from_utf8(line) {
+                    let line = match decode(&active.buf[active.start..end]) {
                         Ok(line) => line,
-                        Err(_) => {
-                            return Some((
-                                Err(malformed("invalid utf-8 in SSE/NDJSON line")),
-                                Buf::Dead,
-                            ));
-                        }
+                        Err(error) => return Some((Err(error), Buf::Dead)),
                     };
-                    return Some((Ok(line), Buf::Active(bytes, pending)));
+                    active.start = shifted + 1;
+                    active.scanned = active.start;
+                    // Consume the prefix: reset when fully drained, compact
+                    // (amortized O(1) per byte) when the consumed prefix
+                    // dominates the buffer.
+                    if active.start == active.buf.len() {
+                        active.buf.clear();
+                        active.start = 0;
+                        active.scanned = 0;
+                    } else if active.start >= 4096 && active.start * 2 >= active.buf.len() {
+                        #[cfg(test)]
+                        line_stream_work::add_compact((active.buf.len() - active.start) as u64);
+                        active.buf.drain(..active.start);
+                        active.scanned -= active.start;
+                        active.start = 0;
+                    }
+                    return Some((Ok(line), Buf::Active(active)));
                 }
                 // 2. Only the INCOMPLETE tail sits in the buffer here: enforce
                 //    the cap before reading more (bounded memory by
                 //    construction — a hostile giant line is a loud error and
                 //    the stream terminates).
-                if pending.len() > max_line_bytes {
+                if active.buf.len() - active.start > max_line_bytes {
                     return Some((
                         Err(malformed(format!(
                             "SSE/NDJSON line exceeds {max_line_bytes} bytes"
@@ -130,10 +229,19 @@ where
                         Buf::Dead,
                     ));
                 }
-                // 3. Read the next network chunk.
-                match bytes.next().await {
+                // 3. Read the next network chunk (compacting the consumed
+                //    prefix first, so the buffer holds the live tail plus at
+                //    most one chunk).
+                if active.start > 0 && active.start * 2 >= active.buf.len() {
+                    #[cfg(test)]
+                    line_stream_work::add_compact((active.buf.len() - active.start) as u64);
+                    active.buf.drain(..active.start);
+                    active.scanned -= active.start;
+                    active.start = 0;
+                }
+                match active.bytes.next().await {
                     Some(Ok(chunk)) => {
-                        pending.extend_from_slice(chunk.as_ref());
+                        active.buf.extend_from_slice(chunk.as_ref());
                         // Loop back to the split branch.
                     }
                     Some(Err(e)) => {
@@ -146,17 +254,12 @@ where
                         ));
                     }
                     None => {
-                        if !pending.is_empty() {
-                            let line = std::mem::take(&mut pending);
-                            let line = match String::from_utf8(line) {
+                        if active.start < active.buf.len() {
+                            let line = match decode(&active.buf[active.start..]) {
                                 Ok(line) => line,
-                                Err(_) => {
-                                    return Some((
-                                        Err(malformed("invalid utf-8 in SSE/NDJSON line")),
-                                        Buf::Dead,
-                                    ));
-                                }
+                                Err(error) => return Some((Err(error), Buf::Dead)),
                             };
+                            active.buf.clear();
                             return Some((Ok(line), Buf::Dead));
                         }
                         return None;
@@ -337,6 +440,250 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(lines, vec!["data: hello"]);
+    }
+
+    // ------------------------------------------------ complexity-audit fixes
+
+    /// Reference implementation of the PRE-FIX algorithm (rescan the whole
+    /// pending buffer per chunk, drain the whole remainder per line): the
+    /// equivalence oracle every optimized chunking must match byte-for-byte
+    /// (same lines, same typed errors, same order).
+    fn reference_lines(chunks: &[Vec<u8>], max_line: usize) -> Vec<Result<String, ProviderError>> {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = Vec::new();
+        let mut dead = false;
+        for chunk in chunks {
+            if dead {
+                break;
+            }
+            pending.extend_from_slice(chunk);
+            loop {
+                if let Some(break_at) = pending.iter().position(|b| *b == b'\n') {
+                    if break_at > max_line {
+                        out.push(Err(ProviderError::new(
+                            ProviderErrorKind::Malformed,
+                            format!("SSE/NDJSON line exceeds {max_line} bytes"),
+                        )));
+                        dead = true;
+                        break;
+                    }
+                    let mut line: Vec<u8> = pending.drain(..=break_at).collect();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    match String::from_utf8(line) {
+                        Ok(line) => out.push(Ok(line)),
+                        Err(_) => {
+                            out.push(Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                "invalid utf-8 in SSE/NDJSON line",
+                            )));
+                            dead = true;
+                            break;
+                        }
+                    }
+                } else {
+                    if pending.len() > max_line {
+                        out.push(Err(ProviderError::new(
+                            ProviderErrorKind::Malformed,
+                            format!("SSE/NDJSON line exceeds {max_line} bytes"),
+                        )));
+                        dead = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if !dead && !pending.is_empty() {
+            match String::from_utf8(pending) {
+                Ok(line) => out.push(Ok(line)),
+                Err(_) => out.push(Err(ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    "invalid utf-8 in SSE/NDJSON line",
+                ))),
+            }
+        }
+        out
+    }
+
+    fn render(results: &[Result<String, ProviderError>]) -> Vec<Result<String, String>> {
+        results
+            .iter()
+            .map(|r| match r {
+                Ok(line) => Ok(line.clone()),
+                Err(e) => Err(e.message.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_at_every_byte_boundary_matches_the_reference() {
+        // Adversarial bodies: CRLF frames, empty lines, a lone CR, a
+        // multibyte rune (é/漢/😀), a final unterminated line, and trailing
+        // pure-CR text. EVERY two-way split must produce identical lines to
+        // the reference algorithm (which itself matches the single-chunk
+        // view used by the pre-fix code).
+        let bodies: Vec<Vec<u8>> = vec![
+            "data: one\r\n\r\ndata: two\n\ndata: héllo 漢字 😀\nlast"
+                .to_string()
+                .into_bytes(),
+            "a\rb\nc\r\n\r\nd".to_string().into_bytes(),
+            "\n\n\n".to_string().into_bytes(),
+            "é".to_string().into_bytes(),
+        ];
+        for body in &bodies {
+            let single = render(&reference_lines(std::slice::from_ref(body), MAX_LINE_BYTES));
+            for split in 0..=body.len() {
+                let (left, right) = body.split_at(split);
+                let chunks = vec![left.to_vec(), right.to_vec()];
+                let got = render(&collect(
+                    chunks
+                        .into_iter()
+                        .map(Ok)
+                        .collect::<Vec<Result<Vec<u8>, String>>>(),
+                    MAX_LINE_BYTES,
+                ));
+                assert_eq!(
+                    got,
+                    single,
+                    "split {split} of {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            // Also with a hostile byte-step chunking (2,3,5,... pattern).
+            for step in [2usize, 3, 5, 7] {
+                let chunks: Vec<Result<Vec<u8>, String>> =
+                    body.chunks(step).map(|c| Ok(c.to_vec())).collect();
+                let got = render(&collect(chunks, MAX_LINE_BYTES));
+                assert_eq!(
+                    got,
+                    single,
+                    "step {step} of {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_and_over_cap_stay_loud_and_terminate_under_any_chunking() {
+        let mut body = b"ok\n".to_vec();
+        body.extend_from_slice(b"bad \xff\n");
+        body.extend_from_slice(b"never\n");
+        let expected = render(&reference_lines(std::slice::from_ref(&body), 4096));
+        for step in 1..=body.len() {
+            let chunks: Vec<Result<Vec<u8>, String>> =
+                body.chunks(step).map(|c| Ok(c.to_vec())).collect();
+            assert_eq!(
+                render(&collect(chunks, 4096)),
+                expected,
+                "step {step}: invalid utf-8 must stay exactly one loud error"
+            );
+        }
+        // Over-cap complete line and over-cap dribble, at every split.
+        let big = {
+            let mut v = vec![b'x'; 5000];
+            v.push(b'\n');
+            v.extend_from_slice(b"after\n");
+            v
+        };
+        let expected = render(&reference_lines(std::slice::from_ref(&big), 1024));
+        for split in [0, 1, 1023, 1024, 1025, 4096, 5000, 5001, big.len()] {
+            let (l, r) = big.split_at(split);
+            assert_eq!(
+                render(&collect(vec![Ok(l.to_vec()), Ok(r.to_vec())], 1024)),
+                expected,
+                "over-cap split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn dribbled_long_line_scans_each_byte_at_most_twice() {
+        // 60k bytes, one byte per chunk, NO newline at all: the pre-fix
+        // algorithm re-ran `position` from byte 0 per chunk — ~n^2/2 = 1.8e9
+        // byte comparisons. The cursor must stay linear. (Counting is done
+        // post-decode, so the `\r`-strip of a complete line is not in play
+        // here.)
+        const N: usize = 60_000;
+        line_stream_work::reset();
+        let chunks: Vec<Result<Vec<u8>, String>> = (0..N).map(|_| Ok(vec![b'x'])).collect();
+        let results = collect(chunks, 1 << 20);
+        assert_eq!(results.len(), 1, "one unterminated tail line");
+        assert_eq!(results[0].as_ref().unwrap().len(), N);
+        let (scan, compact) = line_stream_work::snapshot();
+        let old_work = (N as u64) * (N as u64 + 1) / 2;
+        assert!(
+            scan <= 2 * N as u64,
+            "cursor scan must be linear: scanned {scan} bytes for {N} input (pre-fix ~{old_work})"
+        );
+        assert!(
+            compact <= 2 * N as u64,
+            "compaction must be linear: {compact}"
+        );
+    }
+
+    #[test]
+    fn hundred_thousand_lines_in_one_chunk_compacts_linearly() {
+        // One burst chunk carrying 100k lines: the pre-fix `drain` per line
+        // shifted the whole remainder each time — O(k * n) memmove (tens of
+        // GB for this body). The cursor consumes by index and compacts
+        // amortized.
+        const LINES: usize = 100_000;
+        line_stream_work::reset();
+        let mut body = Vec::with_capacity(LINES * 12);
+        for i in 0..LINES {
+            body.extend_from_slice(format!("data: {i}\n").as_bytes());
+        }
+        let body_len = body.len() as u64;
+        let results = collect(vec![Ok(body)], 1 << 20);
+        assert_eq!(results.len(), LINES);
+        assert_eq!(results[LINES - 1].as_ref().unwrap(), "data: 99999");
+        let (scan, compact) = line_stream_work::snapshot();
+        assert!(
+            scan <= body_len + LINES as u64,
+            "scan {scan} must be linear in {body_len} bytes"
+        );
+        // Amortized compaction: the tail is moved only when the consumed
+        // prefix dominates, so total moved bytes stay a small multiple of
+        // the body (pre-fix: sum of remainders ~ lines * body / 2).
+        assert!(
+            compact <= 2 * body_len + 16 * 1024,
+            "compaction {compact} must be amortized-linear in {body_len} bytes"
+        );
+    }
+
+    #[test]
+    fn hundred_thousand_sse_chunks_one_line_each_stay_bounded() {
+        // The task-scale liveness bound: 100k network chunks, one SSE line
+        // each (800 KB total). Must complete with linear work and bounded
+        // wall time.
+        const CHUNKS: usize = 100_000;
+        line_stream_work::reset();
+        let body: Vec<Vec<u8>> = (0..CHUNKS)
+            .map(|i| format!("data: {i}\n").into_bytes())
+            .collect();
+        let body_len: u64 = body.iter().map(|c| c.len() as u64).sum();
+        let chunks: Vec<Result<Vec<u8>, String>> = body.into_iter().map(Ok).collect();
+        let started = std::time::Instant::now();
+        let results = collect(chunks, 1 << 20);
+        let elapsed = started.elapsed();
+        assert_eq!(results.len(), CHUNKS);
+        assert_eq!(results[CHUNKS - 1].as_ref().unwrap(), "data: 99999");
+        let (scan, compact) = line_stream_work::snapshot();
+        assert!(
+            scan <= 2 * body_len,
+            "scan {scan} must stay within 2x the {body_len} body bytes"
+        );
+        assert!(
+            compact <= 2 * body_len,
+            "compact {compact} within 2x body bytes"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "100k SSE chunks must stay far below the bound: {elapsed:?}"
+        );
     }
 }
 

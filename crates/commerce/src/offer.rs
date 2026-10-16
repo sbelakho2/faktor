@@ -22,6 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::{HashMap, HashSet};
+
 use crate::identity::ProductIdentity;
 use crate::money::{BasisPoints, Currency, Money};
 use crate::packaging::PackagingType;
@@ -388,9 +390,108 @@ impl VariantAttribute {
         normalize_attribute(self.name.as_str()) == normalize_attribute(other.name.as_str())
             && normalize_attribute(self.value.as_str()) == normalize_attribute(other.value.as_str())
     }
+
+    /// This attribute's [`NormalizedAttribute`] form.
+    pub fn normalized(&self) -> NormalizedAttribute {
+        NormalizedAttribute::of_parts(self.name.as_str(), self.value.as_str())
+    }
+}
+
+/// The normalized form of one [`VariantAttribute`] (whitespace stripped,
+/// Unicode-lowercased name/value). Normalization is a pure function of the
+/// attribute text, so hot paths normalize ONCE and compare the precomputed
+/// forms — the pre-fix `matches()` re-normalized BOTH sides (four `String`
+/// allocations) per comparison, and callers multiplied that by every
+/// candidate attribute per requested attribute (complexity audit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedAttribute {
+    name: String,
+    value: String,
+}
+
+impl NormalizedAttribute {
+    /// Normalize raw name/value text.
+    pub fn of_parts(name: &str, value: &str) -> Self {
+        Self {
+            name: normalize_attribute(name),
+            value: normalize_attribute(value),
+        }
+    }
+
+    /// Normalize one attribute.
+    pub fn of(attribute: &VariantAttribute) -> Self {
+        attribute.normalized()
+    }
+
+    /// The normalized name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The normalized value.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Normalize one attribute list once (see [`NormalizedAttribute`]).
+pub fn normalized_attributes(attributes: &[VariantAttribute]) -> Vec<NormalizedAttribute> {
+    attributes
+        .iter()
+        .map(VariantAttribute::normalized)
+        .collect()
+}
+
+/// TRUE when every `wanted` normalized attribute is present in `have`
+/// (ignoring order). The comparison twin of
+/// [`VariantOffer::matches_attributes`] over precomputed forms.
+pub fn attributes_match_normalized(
+    have: &[NormalizedAttribute],
+    wanted: &[NormalizedAttribute],
+) -> bool {
+    wanted.iter().all(|w| have.contains(w))
+}
+
+/// How many `wanted` normalized attributes are present in `have`.
+pub fn matching_attribute_count(
+    have: &[NormalizedAttribute],
+    wanted: &[NormalizedAttribute],
+) -> usize {
+    wanted.iter().filter(|w| have.contains(w)).count()
+}
+
+/// Bump per-call normalization work (complexity-audit evidence): counts how
+/// many times text is normalized. Must stay LINEAR in the number of
+/// attributes/reference pairs. Thread-local so counter tests run in
+/// parallel with the rest of the suite.
+#[cfg(test)]
+pub(crate) mod normalization_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Total `normalize_attribute` invocations.
+        pub(crate) static NORMALIZATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset the counter.
+    pub(crate) fn reset() {
+        NORMALIZATIONS.with(|c| c.set(0));
+    }
+
+    /// Record one normalization.
+    pub(crate) fn add(count: u64) {
+        NORMALIZATIONS.with(|c| c.set(c.get() + count));
+    }
+
+    /// The counter value.
+    pub(crate) fn snapshot() -> u64 {
+        NORMALIZATIONS.with(Cell::get)
+    }
 }
 
 fn normalize_attribute(value: &str) -> String {
+    #[cfg(test)]
+    normalization_work::add(1);
     value
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -689,27 +790,44 @@ impl VariantOffer {
                 actual: self.attributes.len(),
             });
         }
+        // Duplicate attribute names, detected in ONE normalization pass
+        // (complexity audit): the pairwise form normalized both names per
+        // pair — O(a^2) `String` allocations. The FIRST duplicate reported
+        // is byte-identical to the pairwise scan: the earliest attribute
+        // whose normalized name occurs again later.
+        let mut occurrences: HashMap<String, (u64, usize)> =
+            HashMap::with_capacity(self.attributes.len());
         for (index, attribute) in self.attributes.iter().enumerate() {
-            for other in self.attributes.iter().skip(index + 1) {
-                if normalize_attribute(attribute.name.as_str())
-                    == normalize_attribute(other.name.as_str())
-                {
-                    return Err(OfferError::DuplicateAttribute {
-                        name: attribute.name.as_str().to_string(),
-                    });
-                }
-            }
+            let entry = occurrences
+                .entry(normalize_attribute(attribute.name.as_str()))
+                .or_insert((0, index));
+            entry.0 += 1;
+        }
+        if let Some(first) = occurrences
+            .values()
+            .filter(|(count, _)| *count > 1)
+            .map(|(_, first)| *first)
+            .min()
+        {
+            return Err(OfferError::DuplicateAttribute {
+                name: self.attributes[first].name.as_str().to_string(),
+            });
         }
         validate_price_breaks(&self.price_breaks, currency)
     }
 
     /// True when the variant matches every requested attribute.
+    ///
+    /// Normalization runs ONCE per side (complexity audit) instead of four
+    /// allocations per (requested, attribute) pair; comparison semantics are
+    /// unchanged (`matches()` is the pairwise form of the same predicate).
     pub fn matches_attributes(&self, requested: &[VariantAttribute]) -> bool {
-        requested.iter().all(|wanted| {
-            self.attributes
-                .iter()
-                .any(|attribute| attribute.matches(wanted))
-        })
+        if requested.is_empty() {
+            return true;
+        }
+        let wanted = normalized_attributes(requested);
+        let have = normalized_attributes(&self.attributes);
+        attributes_match_normalized(&have, &wanted)
     }
 }
 
@@ -1054,24 +1172,48 @@ impl CommercialOffer {
             }
         }
         validate_price_breaks(&self.price_breaks, self.currency)?;
+        // Duplicate detection is precomputed in ONE reverse pass (complexity
+        // audit: the pairwise form was O(v^2) string comparisons), but the
+        // ERROR PRECEDENCE is byte-identical to the pairwise scan: at each
+        // index, the variant is validated first, then reported as a
+        // duplicate exactly when an equal id appears later. The reported id
+        // is the earlier occurrence's (the pairwise loop's `variant`).
+        let mut duplicate_later = vec![false; self.variants.len()];
+        {
+            let mut seen_from_right: HashSet<&str> = HashSet::with_capacity(self.variants.len());
+            for index in (0..self.variants.len()).rev() {
+                if !seen_from_right.insert(self.variants[index].variant_id.as_str()) {
+                    duplicate_later[index] = true;
+                }
+            }
+        }
         for (index, variant) in self.variants.iter().enumerate() {
             variant.validate(self.currency)?;
-            for other in self.variants.iter().skip(index + 1) {
-                if variant.variant_id == other.variant_id {
-                    return Err(OfferError::DuplicateVariantId {
-                        id: variant.variant_id.as_str().to_string(),
-                    });
+            if duplicate_later[index] {
+                return Err(OfferError::DuplicateVariantId {
+                    id: variant.variant_id.as_str().to_string(),
+                });
+            }
+        }
+        // The same rule for packaging options.
+        let mut packaging_duplicate_later = vec![false; self.packaging.len()];
+        {
+            let mut seen_from_right: HashSet<(PackagingType, Option<&str>)> =
+                HashSet::with_capacity(self.packaging.len());
+            for index in (0..self.packaging.len()).rev() {
+                let option = &self.packaging[index];
+                let key = (option.packaging, option.label.as_ref().map(Text::as_str));
+                if !seen_from_right.insert(key) {
+                    packaging_duplicate_later[index] = true;
                 }
             }
         }
         for (index, option) in self.packaging.iter().enumerate() {
             option.validate(self.currency)?;
-            for other in self.packaging.iter().skip(index + 1) {
-                if option.packaging == other.packaging && option.label == other.label {
-                    return Err(OfferError::DuplicatePackagingOption {
-                        packaging: option.packaging,
-                    });
-                }
+            if packaging_duplicate_later[index] {
+                return Err(OfferError::DuplicatePackagingOption {
+                    packaging: option.packaging,
+                });
             }
         }
         Ok(())
@@ -1086,9 +1228,14 @@ impl CommercialOffer {
 
     /// All variants matching every requested attribute.
     pub fn variants_matching(&self, requested: &[VariantAttribute]) -> Vec<&VariantOffer> {
+        // Requested-side normalization once for the whole scan (complexity
+        // audit); each variant normalizes its own attributes once.
+        let wanted = normalized_attributes(requested);
         self.variants
             .iter()
-            .filter(|variant| variant.matches_attributes(requested))
+            .filter(|variant| {
+                attributes_match_normalized(&normalized_attributes(&variant.attributes), &wanted)
+            })
             .collect()
     }
 
@@ -1856,5 +2003,157 @@ mod tests {
             variant.validate(Currency::CNY),
             Err(OfferError::TooManyAttributes { .. })
         ));
+    }
+
+    // ------------------------------------------------ complexity-audit fixes
+
+    fn attribute(name: &str, value: &str) -> VariantAttribute {
+        VariantAttribute {
+            name: Text::new(name).expect("name"),
+            value: Text::new(value).expect("value"),
+        }
+    }
+
+    fn variant(id: &str, attributes: Vec<VariantAttribute>) -> VariantOffer {
+        VariantOffer {
+            variant_id: VariantId::new(id).expect("id"),
+            attributes,
+            packaging: None,
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            price_breaks: Vec::new(),
+            lead_time: None,
+        }
+    }
+
+    /// The PRE-FIX attribute-duplicate scan, verbatim: the oracle the
+    /// one-pass detection must match (error identity included).
+    fn naive_duplicate_attribute_name(attributes: &[VariantAttribute]) -> Option<String> {
+        for (index, attribute) in attributes.iter().enumerate() {
+            for other in attributes.iter().skip(index + 1) {
+                if normalize_attribute(attribute.name.as_str())
+                    == normalize_attribute(other.name.as_str())
+                {
+                    return Some(attribute.name.as_str().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn duplicate_attribute_detection_matches_the_pairwise_scan() {
+        // Adversarial orderings where the earliest duplicated NAME is not
+        // the first name to repeat: [A,B,B,A] etc. The reported name (the
+        // earliest duplicated occurrence) must be identical to the pairwise
+        // scan, including unicode/case/space normalization.
+        let cases: Vec<Vec<(&str, &str)>> = vec![
+            vec![("A", "1"), ("B", "2"), ("B", "3"), ("A", "4")],
+            vec![
+                ("颜色", "黑"),
+                ("长度", "1m"),
+                (" 颜色 ", "白"),
+                ("长度", "2m"),
+            ],
+            vec![("Resistance", "10k"), ("resistance", "20k")],
+            vec![("V", "1"), ("W", "2"), ("V", "3"), ("W", "4"), ("V", "5")],
+            vec![("A", "1"), ("B", "2")],
+            vec![],
+        ];
+        for case in cases {
+            let attributes: Vec<VariantAttribute> =
+                case.iter().map(|(n, v)| attribute(n, v)).collect();
+            let naive = naive_duplicate_attribute_name(&attributes);
+            let validated = variant("v", attributes.clone()).validate(Currency::CNY);
+            match (naive, validated) {
+                (Some(expected), Err(OfferError::DuplicateAttribute { name })) => {
+                    assert_eq!(name, expected, "case {case:?}");
+                }
+                (None, Ok(())) => {}
+                (naive, other) => panic!("case {case:?}: pairwise {naive:?} vs {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_normalizes_attributes_once_each() {
+        // Evidence: 256 variants × 16 attributes. The pairwise scan
+        // normalized both names per PAIR (~256 × 120 × 2 = 61k
+        // normalizations for the attribute axis alone, plus the variant
+        // O(v^2) id comparisons); one-pass detection normalizes each name
+        // exactly once, and the id duplicate scan does zero string compares
+        // per pair (hash lookups instead).
+        let mut variants = Vec::new();
+        for v in 0..MAX_VARIANTS_PER_OFFER {
+            let attributes: Vec<VariantAttribute> = (0..16)
+                .map(|a| attribute(&format!("attr{a}"), &format!("v{v}{a}")))
+                .collect();
+            variants.push(variant(&format!("id{v}"), attributes));
+        }
+        let mut offer = offer();
+        offer.variants = variants;
+        normalization_work::reset();
+        offer.validate().expect("valid offer");
+        let normalizations = normalization_work::snapshot();
+        let attributes_total = (MAX_VARIANTS_PER_OFFER * 16) as u64;
+        assert!(
+            normalizations <= attributes_total,
+            "each attribute name must be normalized exactly once: \
+             {normalizations} for {attributes_total} attributes"
+        );
+        // Duplicate ids are still caught, with the pairwise error identity.
+        let mut dup = offer.clone();
+        dup.variants[5].variant_id = dup.variants[200].variant_id.clone();
+        match dup.validate() {
+            Err(OfferError::DuplicateVariantId { id }) => {
+                assert_eq!(id, dup.variants[5].variant_id.as_str());
+            }
+            other => panic!("expected the duplicate id error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalized_attribute_reuse_is_equivalent_to_pairwise_matches() {
+        // `matches()` (pairwise, re-normalizing) vs the hoisted normalized
+        // comparison: same predicate on unicode/case/whitespace variants.
+        let requested = vec![
+            attribute("颜色", "黑色"),
+            attribute(" length ", "1M"),
+            attribute("Tolerance", "± 1%"),
+        ];
+        let candidates: Vec<Vec<VariantAttribute>> = vec![
+            vec![
+                attribute("颜色", "黑色"),
+                attribute("长度", "1m"),
+                attribute("tolerance", "±1%"),
+            ],
+            vec![attribute("颜色", "白色")],
+            vec![attribute("LENGTH", "1M")],
+            vec![],
+            vec![
+                attribute("颜色", "黑色"),
+                attribute("长度", "1m"),
+                attribute("tolerance", "±1%"),
+                attribute("extra", "x"),
+            ],
+        ];
+        let wanted = normalized_attributes(&requested);
+        for attributes in &candidates {
+            let pairwise_all = requested
+                .iter()
+                .all(|w| attributes.iter().any(|attribute| attribute.matches(w)));
+            let hoisted_all =
+                attributes_match_normalized(&normalized_attributes(attributes), &wanted);
+            assert_eq!(pairwise_all, hoisted_all, "attributes {attributes:?}");
+            let pairwise_hits = requested
+                .iter()
+                .filter(|w| attributes.iter().any(|attribute| attribute.matches(w)))
+                .count();
+            let hoisted_hits =
+                matching_attribute_count(&normalized_attributes(attributes), &wanted);
+            assert_eq!(pairwise_hits, hoisted_hits);
+        }
     }
 }

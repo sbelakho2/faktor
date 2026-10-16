@@ -904,24 +904,56 @@ fn rel_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn find_entry(cs: &ChangeSet, wanted: &Path) -> Result<Option<usize>, ExecError> {
-    if let Some(i) = cs.files.iter().position(|e| e.path == wanted) {
-        return Ok(Some(i));
+/// One-pass membership index of a change set: the FIRST index of every
+/// staged path (the historical first-match scan, made one pass) plus a lazily
+/// built lowercase variant map used only to render the friendly
+/// case-mismatch error. Built once per decision validation so validating
+/// `D` decisions over `F` staged files is O(D+F) instead of O(D·F) (each
+/// miss used to re-lowercase every staged path).
+struct ChangeSetIndex<'a> {
+    exact: HashMap<&'a Path, usize>,
+    files: &'a [ChangeEntry],
+    lowercased: Option<HashMap<String, &'a Path>>,
+}
+
+impl<'a> ChangeSetIndex<'a> {
+    fn new(cs: &'a ChangeSet) -> Self {
+        let mut exact: HashMap<&'a Path, usize> = HashMap::with_capacity(cs.files.len());
+        for (i, e) in cs.files.iter().enumerate() {
+            exact.entry(e.path.as_path()).or_insert(i);
+        }
+        Self {
+            exact,
+            files: &cs.files,
+            lowercased: None,
+        }
     }
-    // Exact membership failed: distinguish a CASE variant of a staged path
-    // (a friendly typed error) from a path that is simply not part of the
-    // change set.
-    let wanted_lc = rel_str(wanted).to_lowercase();
-    for e in &cs.files {
-        if rel_str(&e.path).to_lowercase() == wanted_lc {
+
+    /// Exact membership first; on a miss, the FIRST staged case variant (by
+    /// staged order, exactly like the scan this replaces) is a typed error,
+    /// otherwise `Ok(None)`.
+    fn find(&mut self, wanted: &Path) -> Result<Option<usize>, ExecError> {
+        if let Some(i) = self.exact.get(wanted) {
+            return Ok(Some(*i));
+        }
+        let wanted_lc = rel_str(wanted).to_lowercase();
+        let lower = self.lowercased.get_or_insert_with(|| {
+            let mut map: HashMap<String, &'a Path> = HashMap::with_capacity(self.files.len());
+            for e in self.files {
+                map.entry(rel_str(&e.path).to_lowercase())
+                    .or_insert(e.path.as_path());
+            }
+            map
+        });
+        if let Some(staged) = lower.get(&wanted_lc) {
             return Err(ExecError::InvalidApproval(format!(
                 "path {:?} differs in case from the staged path {:?}",
                 wanted.display(),
-                e.path.display()
+                staged.display()
             )));
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
 /// Validate an approval/rejection decision against the change set. Every
@@ -937,6 +969,7 @@ pub fn validate_decision(
     let mut rejected_set: Vec<PathBuf> = Vec::new();
     let mut seen_approved: HashSet<PathBuf> = HashSet::new();
     let mut seen_rejected: HashSet<PathBuf> = HashSet::new();
+    let mut index = ChangeSetIndex::new(cs);
     for p in approved {
         let p = validate_rel_path_str(&rel_str(p))?;
         if seen_rejected.contains(&p) {
@@ -951,7 +984,7 @@ pub fn validate_decision(
                 p.display()
             )));
         }
-        match find_entry(cs, &p)? {
+        match index.find(&p)? {
             Some(_) => approved_set.push(p),
             None => {
                 return Err(ExecError::InvalidApproval(format!(
@@ -975,7 +1008,7 @@ pub fn validate_decision(
                 p.display()
             )));
         }
-        match find_entry(cs, &p)? {
+        match index.find(&p)? {
             Some(_) => rejected_set.push(p),
             None => {
                 return Err(ExecError::InvalidApproval(format!(
@@ -988,13 +1021,17 @@ pub fn validate_decision(
     approved_set.sort();
     rejected_set.sort();
     // The parent must decide EVERY changed file — no silent default.
+    // Membership over the (sorted, deduplicated) decision sets is a set
+    // lookup: a per-file `Vec::contains` made this O(files · decisions).
+    let approved_lookup: HashSet<&Path> = approved_set.iter().map(|p| p.as_path()).collect();
+    let rejected_lookup: HashSet<&Path> = rejected_set.iter().map(|p| p.as_path()).collect();
     let mut undecided: Vec<String> = cs
         .files
         .iter()
         .map(|e| rel_str(&e.path))
         .filter(|s| {
             let p = PathBuf::from(s);
-            !approved_set.contains(&p) && !rejected_set.contains(&p)
+            !approved_lookup.contains(p.as_path()) && !rejected_lookup.contains(p.as_path())
         })
         .collect();
     undecided.sort();
@@ -2337,10 +2374,11 @@ impl OrchestratorRuntime {
         // ---- apply phase (deterministic order = staged path order).
         let mut merged: Vec<PathBuf> = Vec::new();
         let mut conflicts: Vec<(PathBuf, String)> = Vec::new();
+        let rejected_lookup: HashSet<&Path> = rejected_v.iter().map(|p| p.as_path()).collect();
         #[cfg(any(test, feature = "fault-injection"))]
         let mut processed = 0usize;
         for entry in &cs.files {
-            if rejected_v.contains(&entry.path) {
+            if rejected_lookup.contains(entry.path.as_path()) {
                 #[cfg(any(test, feature = "fault-injection"))]
                 {
                     processed += 1;

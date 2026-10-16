@@ -24,7 +24,6 @@
 //! uses the same supervisor and the same completeness discipline: ANY
 //! non-Complete inventory refuses a `Passed` verdict.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -397,17 +396,26 @@ fn select_specs(
 /// no natively derivable lint check here (a configured linter is not
 /// guessed); the caller sees an honest `Unavailable` for those targets.
 fn lint_specs(profile: &ProjectProfile, selection: &[PathBuf]) -> Vec<CheckSpec> {
-    let mut owners: BTreeSet<PathBuf> = BTreeSet::new();
-    for file in selection {
-        if let Some(component) = profile.owning_component(file) {
-            if component.build_systems.contains(&BuildSystem::Cargo) {
-                owners.insert(component.root.clone());
-            }
+    // One owner-index build + per-path ancestor walk; the old per-path
+    // `owning_component` scan was O(selection × components) — the Workspace
+    // target selects the WHOLE inventory. Owner ROOTS are collected (not
+    // component indices) so components sharing a root keep the exact old
+    // behavior (every component at an owned root contributes its spec).
+    let mut cargo_roots: std::collections::HashSet<&std::path::Path> =
+        std::collections::HashSet::new();
+    for index in profile
+        .owner_indices(selection.iter().map(|p| p.as_path()))
+        .into_iter()
+        .flatten()
+    {
+        let component = &profile.components[index];
+        if component.build_systems.contains(&BuildSystem::Cargo) {
+            cargo_roots.insert(component.root.as_path());
         }
     }
     let mut specs = Vec::new();
     for component in &profile.components {
-        if !owners.contains(&component.root) {
+        if !cargo_roots.contains(component.root.as_path()) {
             continue;
         }
         specs.push(CheckSpec {

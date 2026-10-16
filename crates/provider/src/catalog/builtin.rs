@@ -513,6 +513,68 @@ pub fn table() -> &'static [BuiltinPrice] {
     &CATALOG.rows
 }
 
+/// Pre-lowered (origin → lowercase model → row index) over [`table`], built
+/// exactly once (complexity audit): the per-call row scan with a per-row
+/// `to_ascii_lowercase()` allocation is gone; lookups never allocate for an
+/// already-lowercase id. The loaded catalog rejects duplicate
+/// (origin, model) pairs, so the index is 1:1.
+static PRICE_ROW_INDEX: LazyLock<
+    std::collections::HashMap<BillingOrigin, std::collections::HashMap<String, usize>>,
+> = LazyLock::new(|| {
+    let mut index: std::collections::HashMap<
+        BillingOrigin,
+        std::collections::HashMap<String, usize>,
+    > = std::collections::HashMap::new();
+    for (row_index, row) in table().iter().enumerate() {
+        index
+            .entry(row.origin)
+            .or_default()
+            .insert(row.model.to_ascii_lowercase(), row_index);
+    }
+    index
+});
+
+/// Pre-lowered (origin → lowercase model → row index) over
+/// [`PERFORMANCE_TABLE`], built exactly once.
+static PERFORMANCE_ROW_INDEX: LazyLock<
+    std::collections::HashMap<BillingOrigin, std::collections::HashMap<String, usize>>,
+> = LazyLock::new(|| {
+    let mut index: std::collections::HashMap<
+        BillingOrigin,
+        std::collections::HashMap<String, usize>,
+    > = std::collections::HashMap::new();
+    for (row_index, row) in PERFORMANCE_TABLE.iter().enumerate() {
+        index
+            .entry(row.origin)
+            .or_default()
+            .insert(row.model.to_ascii_lowercase(), row_index);
+    }
+    index
+});
+
+/// O(1) index entry for (origin, model): trims, and allocates a lowercase
+/// copy ONLY when the input really carries ASCII uppercase (the old code
+/// allocated one lowercase `String` per TABLE ROW per call, plus the input
+/// copy).
+fn row_index(
+    index: &std::collections::HashMap<BillingOrigin, std::collections::HashMap<String, usize>>,
+    origin: BillingOrigin,
+    model: &str,
+) -> Option<usize> {
+    let models = index.get(&origin)?;
+    let model = model.trim();
+    if model.bytes().any(|b| b.is_ascii_uppercase()) {
+        models.get(&model.to_ascii_lowercase()).copied()
+    } else {
+        models.get(model).copied()
+    }
+}
+
+/// [`row_index`] over the price table.
+fn price_row_index(origin: BillingOrigin, model: &str) -> Option<usize> {
+    row_index(&PRICE_ROW_INDEX, origin, model)
+}
+
 /// The file-level provenance and date window of the loaded table.
 pub fn meta() -> &'static BuiltinCatalogMeta {
     &CATALOG.meta
@@ -782,6 +844,11 @@ impl PriceSchedule for BuiltinRowSchedule {
 /// path): case-insensitive on the model, exact on the origin, and RETIRED
 /// rows excluded. `None` for anything not in the documented table — callers
 /// then stay [`PricingState::Unknown`].
+///
+/// Complexity (audit fix): backed by a once-built pre-lowered index, so a
+/// lookup is O(1) and allocates NOTHING for an already-lowercase model id
+/// (the pre-fix implementation scanned every row and materialized a
+/// lowercase `String` per row, per call — paid per catalog resolution).
 pub fn lookup_by_origin(origin: BillingOrigin, model: &str) -> Option<BuiltinPrice> {
     lookup_documented_by_origin(origin, model).filter(|row| !row.is_retired())
 }
@@ -789,11 +856,8 @@ pub fn lookup_by_origin(origin: BillingOrigin, model: &str) -> Option<BuiltinPri
 /// Documented-row lookup INCLUDING retired rows (metadata/tests only; the
 /// routing paths use [`lookup_by_origin`]).
 pub fn lookup_documented_by_origin(origin: BillingOrigin, model: &str) -> Option<BuiltinPrice> {
-    let model = model.trim().to_ascii_lowercase();
-    table()
-        .iter()
-        .copied()
-        .find(|row| row.origin == origin && row.model.to_ascii_lowercase() == model)
+    let index = price_row_index(origin, model)?;
+    table().get(index).copied()
 }
 
 /// LEGACY family-keyed lookup kept for the raw `Provider::catalog_entry`
@@ -866,23 +930,21 @@ pub fn quote_of(row: &BuiltinPrice) -> PriceQuote {
 
 /// The documented Faktor routing prior of one (origin, model), when the
 /// table documents it: a [`ModelPerformanceProfile`] carrying the explicit
-/// built-in-prior authority and the frozen benchmark version.
+/// built-in-prior authority and the frozen benchmark version. O(1) via the
+/// once-built index (see [`PRICE_ROW_INDEX`] for the pre-fix cost).
 pub fn performance_prior(origin: BillingOrigin, model: &str) -> Option<ModelPerformanceProfile> {
-    let model = model.trim().to_ascii_lowercase();
-    PERFORMANCE_TABLE
-        .iter()
-        .copied()
-        .find(|row| row.origin == origin && row.model.to_ascii_lowercase() == model)
-        .map(|row| ModelPerformanceProfile {
-            prior: ModelPerformance {
-                context_reliability: row.context_reliability,
-                coding_reliability: row.coding_reliability,
-                estimated_latency_ms: row.estimated_latency_ms,
-                rate_limit_state: faktor_core::model::RateLimitState::Healthy,
-            },
-            authority: QualityAuthority::BuiltInPrior,
-            benchmark_version: PERFORMANCE_PRIOR_VERSION.to_string(),
-        })
+    let index = row_index(&PERFORMANCE_ROW_INDEX, origin, model)?;
+    let row = PERFORMANCE_TABLE.get(index)?;
+    Some(ModelPerformanceProfile {
+        prior: ModelPerformance {
+            context_reliability: row.context_reliability,
+            coding_reliability: row.coding_reliability,
+            estimated_latency_ms: row.estimated_latency_ms,
+            rate_limit_state: faktor_core::model::RateLimitState::Healthy,
+        },
+        authority: QualityAuthority::BuiltInPrior,
+        benchmark_version: PERFORMANCE_PRIOR_VERSION.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1506,5 +1568,118 @@ mod tests {
         assert_eq!(legacy.effective_at_ms, None);
         assert_eq!(legacy.observed_at_ms, None);
         assert_eq!(legacy.valid_until_ms, None);
+    }
+
+    // ------------------------------------------------ complexity-audit fixes
+
+    /// The PRE-FIX lookup algorithm, verbatim: trim + lowercase the input,
+    /// then scan every row comparing `to_ascii_lowercase()` — the control
+    /// the indexed lookup must match exactly.
+    fn naive_lookup(origin: BillingOrigin, model: &str) -> Option<BuiltinPrice> {
+        let model = model.trim().to_ascii_lowercase();
+        table()
+            .iter()
+            .copied()
+            .find(|row| row.origin == origin && row.model.to_ascii_lowercase() == model)
+    }
+
+    #[test]
+    fn indexed_lookup_is_equivalent_to_the_pre_fix_scan() {
+        // Every row, every case spelling, padded input, and a spread of
+        // misses: the index must return exactly the naive result.
+        for row in table() {
+            for spelling in [
+                row.model.to_string(),
+                row.model.to_ascii_uppercase(),
+                format!("  {}  ", row.model),
+                row.model.to_ascii_uppercase() + " ",
+            ] {
+                assert_eq!(
+                    lookup_documented_by_origin(row.origin, &spelling),
+                    naive_lookup(row.origin, &spelling),
+                    "row {}/{} spelling {spelling:?}",
+                    origin_label(row.origin),
+                    row.model
+                );
+            }
+        }
+        for (origin, model) in [
+            (BillingOrigin::OfficialOpenAi, "gpt-4o"),
+            (BillingOrigin::OfficialOpenAi, "GPT-4O"),
+            (BillingOrigin::OfficialOpenAi, " gpt-4o-mini "),
+            (BillingOrigin::OfficialOpenAi, "gpt-4o-not-real"),
+            (BillingOrigin::OfficialAnthropic, "gpt-4o"),
+            (BillingOrigin::CustomEndpoint, "gpt-4o"),
+            (BillingOrigin::Gateway, "deepseek-chat"),
+            (BillingOrigin::Local, "gpt-4o"),
+            (BillingOrigin::OfficialGoogle, "gpt-4o"),
+            (BillingOrigin::OfficialOpenAi, ""),
+        ] {
+            assert_eq!(
+                lookup_documented_by_origin(origin, model),
+                naive_lookup(origin, model),
+                "{origin:?}/{model:?}"
+            );
+        }
+        // The prior index obeys the same rule: every documented prior is
+        // found under any case spelling, and never cross-origin.
+        for row in PERFORMANCE_TABLE {
+            assert!(
+                performance_prior(row.origin, &row.model.to_ascii_uppercase()).is_some(),
+                "{} prior is case-insensitive",
+                row.model
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_beats_the_pre_fix_scan_by_a_bounded_factor() {
+        // Same-run control (min of 3 rounds, 30k lookups each): the naive
+        // path pays a lowercase `String` per row per call (16 rows here);
+        // the index pays zero for a lowercase id. The ratio bound is
+        // deliberately loose (2x) so a loaded host cannot flake it.
+        const LOOKUPS: usize = 30_000;
+        let models: Vec<&str> = table().iter().map(|row| row.model).collect();
+        let naive = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let mut hits = 0usize;
+                for i in 0..LOOKUPS {
+                    if naive_lookup(BillingOrigin::OfficialOpenAi, models[i % models.len()])
+                        .is_some()
+                    {
+                        hits += 1;
+                    }
+                }
+                assert!(hits > 0);
+                started.elapsed()
+            })
+            .min()
+            .expect("3 rounds");
+        let indexed = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let mut hits = 0usize;
+                for i in 0..LOOKUPS {
+                    if lookup_documented_by_origin(
+                        BillingOrigin::OfficialOpenAi,
+                        models[i % models.len()],
+                    )
+                    .is_some()
+                    {
+                        hits += 1;
+                    }
+                }
+                assert!(hits > 0);
+                started.elapsed()
+            })
+            .min()
+            .expect("3 rounds");
+        assert!(
+            indexed.saturating_mul(2) <= naive,
+            "indexed lookup must be >=2x faster than the per-row scan: \
+             indexed {indexed:?} vs naive {naive:?} for {LOOKUPS} lookups"
+        );
+        eprintln!("catalog lookup {LOOKUPS}x: naive {naive:?} vs indexed {indexed:?}");
     }
 }

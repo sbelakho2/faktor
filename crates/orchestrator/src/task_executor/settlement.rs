@@ -792,6 +792,16 @@ impl TaskExecutor {
             .filter(|s| s.spawn)
             .map(|s| s.item_id)
             .collect();
+        // Membership/index sets built ONCE: the settlement used to scan the
+        // spawn-item vec per durable row and the rows per spawn item
+        // (O(items · rows)). Same predicate, one pass.
+        let spawn_item_set: std::collections::HashSet<&str> =
+            spawn_items.iter().map(|s| s.as_str()).collect();
+        let done_item_set: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter(|r| r.state == ChildState::Done)
+            .map(|r| r.item_id.as_str())
+            .collect();
         let merge_proposals: Vec<String> = rows
             .iter()
             .filter(|r| {
@@ -844,17 +854,16 @@ impl TaskExecutor {
                         r.ownership,
                         faktor_session::child::ChildOwnership::IsolatedWorktree
                             | faktor_session::child::ChildOwnership::ExclusivePaths
-                    ) && spawn_items.iter().any(|i| i == &r.item_id)
+                    ) && spawn_item_set.contains(r.item_id.as_str())
                 })
                 .collect()
         };
         let all_done = if tournament_decided {
             !eligible.is_empty() && eligible.iter().all(|r| r.state == ChildState::Done)
         } else {
-            spawn_items.iter().all(|item| {
-                rows.iter()
-                    .any(|r| &r.item_id == item && r.state == ChildState::Done)
-            })
+            spawn_items
+                .iter()
+                .all(|item| done_item_set.contains(item.as_str()))
         };
         let mut outcome = SettlementOutcome {
             run_id: run_id.clone(),

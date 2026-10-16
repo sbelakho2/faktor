@@ -747,9 +747,7 @@ pub(crate) async fn native_events(
 pub(crate) fn native_event_row(e: &faktor_core::event::Event) -> serde_json::Value {
     serde_json::json!({
         "seq": e.seq.raw(),
-        "kind": serde_json::to_string(&e.kind)
-            .unwrap_or_default()
-            .trim_matches('"'),
+        "kind": super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default()),
         "state": agent_state_tag(e.state),
         "opId": e.op_id.map(|o| o.to_string()),
         "tsMs": e.ts_ms,
@@ -855,10 +853,8 @@ fn native_journal_stream(
             let mut advanced = false;
             for e in events {
                 let seq = e.seq.raw();
-                let kind = serde_json::to_string(&e.kind)
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_string();
+                let kind =
+                    super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default());
                 let data =
                     serde_json::to_string(&native_event_row(&e)).unwrap_or_else(|_| "{}".into());
                 batch.push_back(
@@ -1154,27 +1150,48 @@ pub(crate) async fn native_list_sessions(
         Ok(s) => s,
         Err(e) => return api_err(&e),
     };
+    // ONE batch read of the durable rows for the served page: the historical
+    // per-handle `row()` store round trip (one get_session query per listed
+    // session, 1000 on a full page) is replaced by a single listing joined
+    // by id. Values are byte-identical (the same table row the per-handle
+    // read would return); when the batch read itself fails — or a row
+    // vanished between the two reads — the handler falls back to the exact
+    // legacy per-handle read, so the fallback entry rules are unchanged.
+    let batch_rows: Option<std::collections::HashMap<faktor_core::id::SessionId, _>> = state
+        .deps
+        .session
+        .store()
+        .list_sessions(None)
+        .ok()
+        .map(|rows| rows.into_iter().map(|row| (row.id, row)).collect());
     let rows: Vec<serde_json::Value> = sessions
         .iter()
         .take(MAX_NATIVE_SESSION_LISTING)
-        .map(|h| match h.row() {
-            Ok(row) => serde_json::json!({
-                "id": row.id.to_string(),
-                "title": row.title,
-                "provider": row.provider,
-                "model": row.model,
-                "state": agent_state_tag(row.state),
-                // Durable creation time for History surfaces (additive; the
-                // clients parse it tolerantly and never fabricate a time).
-                "created_ms": row.created_ms,
-            }),
-            Err(_) => serde_json::json!({
-                "id": h.id().to_string(),
-                "title": "",
-                "provider": "",
-                "model": "",
-                "state": "unknown",
-            }),
+        .map(|h| {
+            let row = match batch_rows.as_ref().and_then(|by_id| by_id.get(&h.id())) {
+                Some(row) => Ok(row.clone()),
+                None => h.row(),
+            };
+            match row {
+                Ok(row) => serde_json::json!({
+                    "id": row.id.to_string(),
+                    "title": row.title,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "state": agent_state_tag(row.state),
+                    // Durable creation time for History surfaces (additive;
+                    // the clients parse it tolerantly and never fabricate a
+                    // time).
+                    "created_ms": row.created_ms,
+                }),
+                Err(_) => serde_json::json!({
+                    "id": h.id().to_string(),
+                    "title": "",
+                    "provider": "",
+                    "model": "",
+                    "state": "unknown",
+                }),
+            }
         })
         .collect();
     Json(serde_json::json!({ "sessions": rows })).into_response()
@@ -1536,6 +1553,106 @@ mod tests {
             state.deps.session.list_sessions(None).unwrap().len(),
             before,
             "an unregistered provider must leave no session behind"
+        );
+    }
+
+    /// The History surfaces need a durable time: the listing serves the
+    /// session row's `created_ms` (additive DTO field; clients parse it
+    /// tolerantly and never fabricate one).
+    #[tokio::test]
+    async fn session_listing_batches_durable_row_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _seed) = test_state(dir.path(), "seed");
+        let session = state.deps.session.clone();
+        let ws = session.create_workspace("/tmp").unwrap();
+        const EXTRA_SESSIONS: usize = 5000;
+        let started = std::time::Instant::now();
+        for i in 0..EXTRA_SESSIONS {
+            session
+                .create_session(ws, &format!("batch {i}"), "fake", "m")
+                .unwrap();
+        }
+        let seed_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let sessions = session.list_sessions(None).unwrap();
+        let list_elapsed = started.elapsed();
+        assert!(sessions.len() > EXTRA_SESSIONS);
+
+        // The historical projection, replayed verbatim: take(cap) then one
+        // get_session store read per listed handle.
+        let started = std::time::Instant::now();
+        let historical: Vec<serde_json::Value> = sessions
+            .iter()
+            .take(MAX_NATIVE_SESSION_LISTING)
+            .map(|h| match h.row() {
+                Ok(row) => serde_json::json!({
+                    "id": row.id.to_string(),
+                    "title": row.title,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "state": agent_state_tag(row.state),
+                    "created_ms": row.created_ms,
+                }),
+                Err(_) => serde_json::json!({
+                    "id": h.id().to_string(),
+                    "title": "",
+                    "provider": "",
+                    "model": "",
+                    "state": "unknown",
+                }),
+            })
+            .collect();
+        let historical_elapsed = started.elapsed();
+
+        // The batched projection this fix installs: ONE store listing joined
+        // by id, then the identical DTO rows.
+        let started = std::time::Instant::now();
+        let batch_rows: std::collections::HashMap<faktor_core::id::SessionId, _> = session
+            .store()
+            .list_sessions(None)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row))
+            .collect();
+        let batched: Vec<serde_json::Value> = sessions
+            .iter()
+            .take(MAX_NATIVE_SESSION_LISTING)
+            .map(|h| match batch_rows.get(&h.id()) {
+                Some(row) => serde_json::json!({
+                    "id": row.id.to_string(),
+                    "title": row.title,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "state": agent_state_tag(row.state),
+                    "created_ms": row.created_ms,
+                }),
+                None => serde_json::json!({
+                    "id": h.id().to_string(),
+                    "title": "",
+                    "provider": "",
+                    "model": "",
+                    "state": "unknown",
+                }),
+            })
+            .collect();
+        let batched_projection = started.elapsed();
+        assert_eq!(
+            batched, historical,
+            "the batched projection answers byte-identically to the per-handle read"
+        );
+
+        let headers = authed_headers(&state);
+        let response = super::native_list_sessions(State(state.clone()), headers).await;
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["sessions"].as_array().expect("sessions array");
+        assert_eq!(
+            rows, &historical,
+            "the served handler answers byte-identically to the per-handle read"
+        );
+        eprintln!(
+            "session listing: {} sessions (seed {seed_elapsed:?}, list+verify {list_elapsed:?}): per-handle projection {historical_elapsed:?} vs batched projection {batched_projection:?}",
+            sessions.len()
         );
     }
 
