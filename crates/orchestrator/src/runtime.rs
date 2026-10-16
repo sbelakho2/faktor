@@ -1122,12 +1122,25 @@ impl OrchestratorRuntime {
                 HashMap::new()
             }
         };
-        let spawn_items: Vec<&str> = plan
+        let spawn_items: HashSet<&str> = plan
             .work_items
             .iter()
             .filter(|w| specs.get(&w.id).map(|s| s.spawn).unwrap_or(true))
             .map(|w| w.id.as_str())
             .collect();
+        // One-pass indexes: item id -> (plan position, item) with first-wins
+        // semantics (the loops below used a scan + a second scan for the
+        // position per durable row: O(rows · items)).
+        let mut item_index: HashMap<&str, (usize, &crate::WorkItem)> =
+            HashMap::with_capacity(plan.work_items.len());
+        for (i, w) in plan.work_items.iter().enumerate() {
+            item_index.entry(w.id.as_str()).or_insert((i, w));
+        }
+        let mut rows_by_item: HashMap<&str, &WorkItemAssignment> =
+            HashMap::with_capacity(rows.len());
+        for r in rows {
+            rows_by_item.entry(r.item_id.as_str()).or_insert(r);
+        }
         let mut by_item: HashMap<&str, usize> = HashMap::new();
         let mut by_child: HashMap<&str, &str> = HashMap::new();
         for row in rows {
@@ -1146,14 +1159,14 @@ impl OrchestratorRuntime {
                 ));
                 continue;
             }
-            let Some(item) = plan.work_items.iter().find(|w| w.id == row.item_id) else {
+            let Some((index, item)) = item_index.get(row.item_id.as_str()).copied() else {
                 violations.push(format!(
                     "assignment names unknown work item {:?}",
                     row.item_id
                 ));
                 continue;
             };
-            if !spawn_items.contains(&item.id.as_str()) {
+            if !spawn_items.contains(item.id.as_str()) {
                 violations.push(format!(
                     "assignment for auto item {:?}, which never spawns a child",
                     item.id
@@ -1180,11 +1193,6 @@ impl OrchestratorRuntime {
                     item.id
                 ));
             }
-            let index = plan
-                .work_items
-                .iter()
-                .position(|w| w.id == item.id)
-                .expect("item came from the plan");
             if row.plan_step_index != index {
                 violations.push(format!(
                     "assignment of item {} records plan step {} but the item sits at step {index}",
@@ -1207,10 +1215,10 @@ impl OrchestratorRuntime {
             }
         }
         for row in child_rows {
-            if !spawn_items.contains(&row.item_id.as_str()) {
+            if !spawn_items.contains(row.item_id.as_str()) {
                 continue;
             }
-            match rows.iter().find(|a| a.item_id == row.item_id) {
+            match rows_by_item.get(row.item_id.as_str()).copied() {
                 Some(assignment) if assignment.child_id == row.child_id => {}
                 Some(assignment) => violations.push(format!(
                     "durable child {} of item {} disagrees with its assignment (assigned {})",
@@ -2221,6 +2229,18 @@ impl OrchestratorRuntime {
             .map(|w| (w.id.clone(), WorkState::Pending))
             .collect();
         let rows_snapshot = rows.clone();
+        // One-pass dependency indexes over the durable snapshot (first row
+        // per item, exactly like the scans they replace).
+        let mut items_by_id: HashMap<&str, &crate::WorkItem> =
+            HashMap::with_capacity(state.plan.work_items.len());
+        for w in &state.plan.work_items {
+            items_by_id.entry(w.id.as_str()).or_insert(w);
+        }
+        let mut rows_by_item: HashMap<&str, &ChildRuntime> =
+            HashMap::with_capacity(rows_snapshot.len());
+        for r in &rows_snapshot {
+            rows_by_item.entry(r.item_id.as_str()).or_insert(r);
+        }
         for mut row in rows {
             let (reconciled, blocker) = self.reconcile_child_state(&row)?;
             row.state = reconciled;
@@ -2229,7 +2249,7 @@ impl OrchestratorRuntime {
             // never silently re-driven as if it were runnable.
             let blocker = if reconciled.is_terminal() {
                 None
-            } else if let Some(dep_block) = unmet_dependency(&state.plan, &rows_snapshot, &row) {
+            } else if let Some(dep_block) = unmet_dependency(&items_by_id, &rows_by_item, &row) {
                 if reconciled == ChildState::Running || blocker.is_none() {
                     row.state = ChildState::Blocked;
                     Some(dep_block)
@@ -2480,10 +2500,14 @@ impl OrchestratorRuntime {
             }
         }
         drop(outcomes);
+        // The per-settle dependency index: one build per wave, then O(1)
+        // propagation lookups per finished drive (was a plan scan per
+        // transition).
+        let dependency_index = DependencyIndex::build(&exec.plan);
         let parent_session = exec.parent_session;
         drop(guard);
         for (child_id, row) in done {
-            self.advance_item(run_id, &child_id, &row)?;
+            self.advance_item(run_id, &child_id, &row, &dependency_index)?;
             // The parent continuation boundary (audit: typed child handoff
             // consumption): a child that just reached its terminal state
             // hands its BOUNDED typed handoff to the parent session as
@@ -2623,6 +2647,7 @@ impl OrchestratorRuntime {
         run_id: &str,
         _child_id: &str,
         row: &ChildRuntime,
+        index: &DependencyIndex,
     ) -> Result<(), ExecError> {
         let mut guard = recover_lock(&self.exec);
         let exec = guard
@@ -2655,18 +2680,20 @@ impl OrchestratorRuntime {
         } else {
             return Ok(());
         }
+        // Dependency propagation uses the ONE per-settle index (dep ->
+        // dependents, item -> deps), never a plan scan per transition: the
+        // historical scans made K finished drives cost O(K · items · deps).
         match target {
             WorkState::Failed | WorkState::Cancelled => {
                 let mut dependency_blocks: Vec<(String, ChildBlocker)> = Vec::new();
-                for w in &exec.plan.work_items {
-                    if w.depends_on.contains(&item)
-                        && exec.item_states.get(&w.id) == Some(&WorkState::Pending)
-                    {
-                        exec.item_states.insert(w.id.clone(), WorkState::Blocked);
+                let dependents: &[String] = index.dependents_of(&item);
+                for w_id in dependents {
+                    if exec.item_states.get(w_id) == Some(&WorkState::Pending) {
+                        exec.item_states.insert(w_id.clone(), WorkState::Blocked);
                         // Any LIVE child of the dependent item is blocked
                         // too, naming the failed dependency.
                         for c in exec.children.values() {
-                            if c.item_id == w.id && !c.is_terminal() {
+                            if c.item_id == *w_id && !c.is_terminal() {
                                 dependency_blocks.push((
                                     c.child_id.clone(),
                                     ChildBlocker::dependency(
@@ -2695,14 +2722,14 @@ impl OrchestratorRuntime {
             WorkState::Done => {
                 // A retried item unblocks its dependents when every
                 // dependency is Done again.
-                for w in &exec.plan.work_items {
-                    if w.depends_on.contains(&item)
-                        && exec.item_states.get(&w.id) == Some(&WorkState::Blocked)
-                        && w.depends_on
+                for w_id in index.dependents_of(&item) {
+                    if exec.item_states.get(w_id) == Some(&WorkState::Blocked)
+                        && index
+                            .deps_of(w_id)
                             .iter()
                             .all(|d| exec.item_states.get(d) == Some(&WorkState::Done))
                     {
-                        exec.item_states.insert(w.id.clone(), WorkState::Pending);
+                        exec.item_states.insert(w_id.clone(), WorkState::Pending);
                     }
                 }
             }
@@ -2801,6 +2828,11 @@ impl OrchestratorRuntime {
             let exec = guard
                 .get_mut(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
+            let mut items_by_id: HashMap<&str, &crate::WorkItem> =
+                HashMap::with_capacity(exec.plan.work_items.len());
+            for w in &exec.plan.work_items {
+                items_by_id.entry(w.id.as_str()).or_insert(w);
+            }
             for child in exec.children.values() {
                 if exec.drive_ops.contains_key(&child.child_id) {
                     continue;
@@ -2853,7 +2885,7 @@ impl OrchestratorRuntime {
                         let dependency_recovered = child
                             .blocker()
                             .is_some_and(|b| b.kind == BlockerKind::Dependency)
-                            && dependencies_done(&exec.plan, &exec.item_states, &child.item_id);
+                            && dependencies_done(&items_by_id, &exec.item_states, &child.item_id);
                         let resume_requested = pending
                             .iter()
                             .any(|r| matches!(r.control, ChildControl::Resume));
@@ -3471,20 +3503,23 @@ impl OrchestratorRuntime {
         let mut failed = Vec::new();
         let mut cancelled = Vec::new();
         let mut waiting = Vec::new();
+        let mut waiting_seen: HashSet<String> = HashSet::new();
         for w in &exec.plan.work_items {
             let st = *exec.item_states.get(&w.id).unwrap_or(&WorkState::Pending);
             item_states.push((w.id.clone(), st));
             match st {
                 WorkState::Failed => failed.push(w.id.clone()),
                 WorkState::Cancelled => cancelled.push(w.id.clone()),
-                WorkState::Running => waiting.push(w.id.clone()),
+                WorkState::Running if waiting_seen.insert(w.id.clone()) => {
+                    waiting.push(w.id.clone());
+                }
                 _ => {}
             }
         }
         // Non-terminal mirror children whose drives ended (parked waiting)
         // surface as waiting.
         for c in &children {
-            if c.state == ChildState::Waiting && !waiting.contains(&c.item_id) {
+            if c.state == ChildState::Waiting && waiting_seen.insert(c.item_id.clone()) {
                 waiting.push(c.item_id.clone());
             }
         }
@@ -3936,24 +3971,20 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<Chi
 
 /// The work item's dependency that is not Done yet (or `None` when every
 /// dependency is satisfied). A dependency with no child row counts as its
-/// plan `completion` (a pre-satisfied item never spawns).
+/// plan `completion` (a pre-satisfied item never spawns). The id→item and
+/// item→first-row indexes are built ONCE by the caller: the historical
+/// per-dependency scans made re-attach O(children · deps · rows).
 fn unmet_dependency(
-    plan: &crate::TaskPlan,
-    rows: &[ChildRuntime],
+    items_by_id: &HashMap<&str, &crate::WorkItem>,
+    rows_by_item: &HashMap<&str, &ChildRuntime>,
     row: &ChildRuntime,
 ) -> Option<ChildBlocker> {
-    let item = plan.work_items.iter().find(|w| w.id == row.item_id)?;
+    let item = *items_by_id.get(row.item_id.as_str())?;
     for dep in &item.depends_on {
-        let state = rows
-            .iter()
-            .find(|r| r.item_id == *dep)
-            .map(project_child_state)
-            .or_else(|| {
-                plan.work_items
-                    .iter()
-                    .find(|w| w.id == *dep)
-                    .map(|w| w.completion)
-            })
+        let state = rows_by_item
+            .get(dep.as_str())
+            .map(|r| project_child_state(r))
+            .or_else(|| items_by_id.get(dep.as_str()).map(|w| w.completion))
             .unwrap_or(WorkState::Pending);
         if state != WorkState::Done {
             return Some(ChildBlocker::dependency(
@@ -3966,20 +3997,63 @@ fn unmet_dependency(
     None
 }
 
-/// Whether every dependency of `item_id` is Done in the live mirror.
+/// Per-settle dependency index of one run's plan: `dep -> dependent item
+/// ids` (plan order, each dependent listed once) and `item -> deps`. Built
+/// ONCE per settlement wave so `advance_item` never scans the plan per
+/// child transition (the historical O(K · items · deps)).
+struct DependencyIndex {
+    dependents: HashMap<String, Vec<String>>,
+    deps: HashMap<String, Vec<String>>,
+}
+
+impl DependencyIndex {
+    fn build(plan: &crate::TaskPlan) -> Self {
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut deps: HashMap<String, Vec<String>> = HashMap::with_capacity(plan.work_items.len());
+        for w in &plan.work_items {
+            let mut w_deps: Vec<String> = Vec::with_capacity(w.depends_on.len());
+            for d in &w.depends_on {
+                if w_deps.contains(d) {
+                    continue;
+                }
+                w_deps.push(d.clone());
+                let list = dependents.entry(d.clone()).or_default();
+                // Each w is visited once, so the last entry is the only
+                // possible duplicate of w in this list.
+                if list.last() != Some(&w.id) {
+                    list.push(w.id.clone());
+                }
+            }
+            deps.insert(w.id.clone(), w_deps);
+        }
+        Self { dependents, deps }
+    }
+
+    fn dependents_of(&self, item: &str) -> &[String] {
+        self.dependents
+            .get(item)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn deps_of(&self, item: &str) -> &[String] {
+        self.deps.get(item).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// Whether every dependency of `item_id` is Done in the live mirror. The
+/// caller passes the plan's id→item index so the check is one map probe
+/// instead of a plan scan per child.
 fn dependencies_done(
-    plan: &crate::TaskPlan,
+    items_by_id: &HashMap<&str, &crate::WorkItem>,
     states: &HashMap<String, WorkState>,
     item_id: &str,
 ) -> bool {
-    plan.work_items
-        .iter()
-        .find(|w| w.id == item_id)
-        .is_some_and(|w| {
-            w.depends_on
-                .iter()
-                .all(|d| states.get(d) == Some(&WorkState::Done))
-        })
+    items_by_id.get(item_id).is_some_and(|w| {
+        w.depends_on
+            .iter()
+            .all(|d| states.get(d) == Some(&WorkState::Done))
+    })
 }
 
 impl OrchestratorRuntime {

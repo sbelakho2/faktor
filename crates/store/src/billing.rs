@@ -209,6 +209,194 @@ pub struct CostReservationRow {
     pub execution_class: ExecutionClass,
 }
 
+/// One `cost_reservation` row from the canonical 23-column projection, with
+/// the read-time validation shared by [`Store::cost_reservations_of`] and
+/// [`Store::cost_reservations_for_tasks`]: v34 execution-class tags are
+/// validated loudly and a corrupt `pricing_snapshot_json` is `Corrupt` —
+/// never a silent misread.
+fn cost_reservation_row_map(r: &rusqlite::Row<'_>) -> StoreResult<CostReservationRow> {
+    let reservation_id: i64 = r.get(0)?;
+    let row_session: i64 = r.get(1)?;
+    let row_task: i64 = r.get(2)?;
+    let op_id: i64 = r.get(3)?;
+    let predicted: i64 = r.get(4)?;
+    let status: String = r.get(5)?;
+    let created_ms: i64 = r.get(6)?;
+    let settled_ms: Option<i64> = r.get(7)?;
+    let dispatched_ms: Option<i64> = r.get(8)?;
+    let snapshot_json: Option<String> = r.get(9)?;
+    let provider_cost: Option<i64> = r.get(10)?;
+    let provider_reported: Option<i64> = r.get(11)?;
+    let route_json: Option<String> = r.get(12)?;
+    let attempt_op_id: Option<i64> = r.get(13)?;
+    let parent_op_id: Option<i64> = r.get(14)?;
+    let request_id: Option<String> = r.get(15)?;
+    let delivery_state: Option<String> = r.get(16)?;
+    let failure_reason_code: Option<String> = r.get(17)?;
+    let cost_basis: Option<String> = r.get(18)?;
+    let provider_reported_cost_micro: Option<i64> = r.get(19)?;
+    let estimated_cost_micro: Option<i64> = r.get(20)?;
+    let settled_cost_micro: Option<i64> = r.get(21)?;
+    let execution_class_tag: Option<String> = r.get(22)?;
+    // v34 execution class: NULL (legacy/unpriced) = Unknown; an
+    // unrecognized tag is a loud corruption, never a guessed class.
+    let execution_class = match execution_class_tag {
+        None => ExecutionClass::Unknown,
+        Some(tag) => ExecutionClass::from_tag(&tag).ok_or_else(|| {
+            StoreError::Corrupt(vec![format!(
+                "cost_reservation {reservation_id} execution_class tag {tag:?} is not a \
+                 known execution class"
+            )])
+        })?,
+    };
+    let pricing_snapshot = match snapshot_json {
+        Some(json) => Some(parse_json(
+            &format!("reservation {reservation_id} pricing_snapshot_json"),
+            &json,
+        )?),
+        None => None,
+    };
+    Ok(CostReservationRow {
+        reservation_id,
+        session_id: id_field(
+            &format!("cost_reservation {reservation_id} session_id"),
+            row_session,
+        )?,
+        task_id: id_field(
+            &format!("cost_reservation {reservation_id} task_id"),
+            row_task,
+        )?,
+        op_id: id_field(&format!("cost_reservation {reservation_id} op_id"), op_id)?,
+        attempt_op_id: id_field_opt(
+            &format!("cost_reservation {reservation_id} attempt_op_id"),
+            attempt_op_id,
+        )?,
+        parent_op_id: id_field_opt(
+            &format!("cost_reservation {reservation_id} parent_op_id"),
+            parent_op_id,
+        )?,
+        predicted_micro: predicted.max(0) as u64,
+        status,
+        created_ms,
+        settled_ms,
+        dispatched_ms,
+        pricing_snapshot,
+        provider_cost_micro: provider_cost.map(|m| m.max(0) as u64),
+        provider_reported_micro: provider_reported.map(|m| m.max(0) as u64),
+        route_decision_json: route_json,
+        request_id,
+        delivery_state,
+        failure_reason_code,
+        cost_basis,
+        provider_reported_cost_micro: provider_reported_cost_micro.map(|m| m.max(0) as u64),
+        estimated_cost_micro: estimated_cost_micro.map(|m| m.max(0) as u64),
+        settled_cost_micro: settled_cost_micro.map(|m| m.max(0) as u64),
+        execution_class,
+    })
+}
+
+// ------------------------------------ cross-session usage batch reads (perf)
+//
+// The cross-session `/native/usage` aggregate used to run per-session and
+// per-task store round-trips (sessions × 3 + tasks × 2 statements). These
+// batch reads serve the same rows in ONE statement per bounded session/task
+// chunk. Byte-identical semantics: every field is computed with the same
+// expression as the single-session read, and any row the batch cannot serve
+// EXACTLY (a shape the per-row validated read would reject, a session with
+// task rows beyond the caller's scope, or a chunk-level SQL failure) is
+// reported in `unreadable` for the caller's typed per-session fallback.
+
+/// One session's provider-call usage aggregate from
+/// [`Store::session_usage_aggregates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUsageAggregate {
+    pub session_id: SessionId,
+    /// `COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0)`,
+    /// clamped like [`Store::session_usage_tokens`].
+    pub tokens: u64,
+    /// Prefix rows (`prompt_prefix_hash IS NOT NULL`).
+    pub prefix_rows: u64,
+    pub prefix_tokens: u64,
+    pub prefix_stability_observations: u64,
+    /// False when a prefix row's stored shape can only be validated (or
+    /// rejected) by the per-row read: a non-NULL `prefix_segments_json` or a
+    /// cheap shape anomaly (wrong hash length, NULL/out-of-range tokens,
+    /// out-of-range stability). The aggregate's prefix fields are then NOT
+    /// authoritative for this session — the caller re-reads them through
+    /// [`Store::provider_call_prefix_rows`].
+    pub prefix_servable: bool,
+}
+
+/// Result of [`Store::session_usage_aggregates`].
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsageBatch {
+    /// One row per session with at least one `provider_call` row; sessions
+    /// without rows are absent (zero aggregates, exactly like the
+    /// single-session reads).
+    pub rows: Vec<SessionUsageAggregate>,
+    /// Sessions whose chunk failed at the SQL layer: the caller re-reads
+    /// them through the per-session APIs (typed fallback).
+    pub unreadable: Vec<SessionId>,
+}
+
+/// One task's usage-relevant scope row from [`Store::task_usage_scope`]:
+/// the legacy `list_tasks` order and the raw cost columns of
+/// [`Store::cost_task_row`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskUsageRow {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    /// Raw stored `max_cost_micro` (the caller clamps exactly like
+    /// `cost_task_row`: `.map(|m| m.max(0) as u64)`).
+    pub max_cost_micro: Option<i64>,
+    /// Raw stored `spent_cost_micro` (the caller converts exactly like
+    /// `cost_task_row`: `u64::try_from(raw).unwrap_or(u64::MAX)`).
+    pub spent_cost_micro: i64,
+}
+
+/// Result of [`Store::task_usage_scope`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskUsageBatch {
+    /// The first `per_session` task rows of every servable session, in the
+    /// legacy `list_tasks` order (created_ms ASC, task_id ASC).
+    pub rows: Vec<TaskUsageRow>,
+    /// Sessions whose task scope the batch cannot serve: a row failed the
+    /// legacy `task_row_map` decode, rows exist beyond `per_session` (the
+    /// legacy read decodes them), or the chunk failed at the SQL layer.
+    /// The caller falls back to `list_tasks` + per-task reads.
+    pub unreadable: Vec<SessionId>,
+}
+
+/// Result of one reservation batch chunk: the servable rows plus the pairs
+/// whose rows failed read-time validation (the caller falls back per task).
+type ReservationChunkScan = (Vec<CostReservationRow>, Vec<(SessionId, TaskId)>);
+
+/// Result of [`Store::cost_reservations_for_tasks`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskReservationBatch {
+    /// Rows of every servable pair, ordered (session, task,
+    /// reservation_id DESC) — the exact per-task order
+    /// [`Store::cost_reservations_of`] serves.
+    pub rows: Vec<CostReservationRow>,
+    /// Pairs whose rows failed the read-time validation or whose chunk
+    /// failed at the SQL layer: the caller falls back to the single-task
+    /// read (which reproduces the skip semantics).
+    pub unreadable: Vec<(SessionId, TaskId)>,
+}
+
+/// Result of [`Store::usage_facts_by_session`]: the `kind = "usage"` memory
+/// facts of a session set, in the exact per-session order
+/// [`Store::memory_facts`] serves.
+#[derive(Debug, Clone, Default)]
+pub struct UsageFactsBatch {
+    /// `(session, key, value)` rows of kind `usage`, per session ordered by
+    /// `updated_ms DESC, kind DESC, key DESC`.
+    pub rows: Vec<(SessionId, String, String)>,
+    /// Sessions whose chunk failed at the SQL layer: the caller re-reads
+    /// them through [`Store::memory_facts`].
+    pub unreadable: Vec<SessionId>,
+}
+
 /// Every `TaskState` variant with its canonical row text, prepared on the
 /// caller's thread. Writer jobs that must decide a state-dependent rule from
 /// the RAW `task.state` column (audit finding 5) compare against these texts
@@ -2200,120 +2388,362 @@ impl Store {
              WHERE session_id = ?1 AND task_id = ?2
              ORDER BY reservation_id DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![session_id.raw() as i64, task_id.raw() as i64, limit.max(0)],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, Option<i64>>(7)?,
-                    r.get::<_, Option<i64>>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                    r.get::<_, Option<i64>>(10)?,
-                    r.get::<_, Option<i64>>(11)?,
-                    r.get::<_, Option<String>>(12)?,
-                    r.get::<_, Option<i64>>(13)?,
-                    r.get::<_, Option<i64>>(14)?,
-                    r.get::<_, Option<String>>(15)?,
-                    r.get::<_, Option<String>>(16)?,
-                    r.get::<_, Option<String>>(17)?,
-                    r.get::<_, Option<String>>(18)?,
-                    r.get::<_, Option<i64>>(19)?,
-                    r.get::<_, Option<i64>>(20)?,
-                    r.get::<_, Option<i64>>(21)?,
-                    r.get::<_, Option<String>>(22)?,
-                ))
-            },
-        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            limit.max(0)
+        ])?;
         let mut out = Vec::new();
-        for row in rows {
-            let (
-                reservation_id,
-                row_session,
-                row_task,
-                op_id,
-                predicted,
-                status,
-                created_ms,
-                settled_ms,
-                dispatched_ms,
-                snapshot_json,
-                provider_cost,
-                provider_reported,
-                route_json,
-                attempt_op_id,
-                parent_op_id,
-                request_id,
-                delivery_state,
-                failure_reason_code,
-                cost_basis,
-                provider_reported_cost_micro,
-                estimated_cost_micro,
-                settled_cost_micro,
-                execution_class_tag,
-            ) = row?;
-            // v34 execution class: NULL (legacy/unpriced) = Unknown; an
-            // unrecognized tag is a loud corruption, never a guessed class.
-            let execution_class = match execution_class_tag {
-                None => ExecutionClass::Unknown,
-                Some(tag) => ExecutionClass::from_tag(&tag).ok_or_else(|| {
-                    StoreError::Corrupt(vec![format!(
-                        "cost_reservation {reservation_id} execution_class tag {tag:?} is not a \
-                         known execution class"
-                    )])
-                })?,
-            };
-            let pricing_snapshot = match snapshot_json {
-                Some(json) => Some(parse_json(
-                    &format!("reservation {reservation_id} pricing_snapshot_json"),
-                    &json,
-                )?),
-                None => None,
-            };
-            out.push(CostReservationRow {
-                reservation_id,
-                session_id: id_field(
-                    &format!("cost_reservation {reservation_id} session_id"),
-                    row_session,
-                )?,
-                task_id: id_field(
-                    &format!("cost_reservation {reservation_id} task_id"),
-                    row_task,
-                )?,
-                op_id: id_field(&format!("cost_reservation {reservation_id} op_id"), op_id)?,
-                attempt_op_id: id_field_opt(
-                    &format!("cost_reservation {reservation_id} attempt_op_id"),
-                    attempt_op_id,
-                )?,
-                parent_op_id: id_field_opt(
-                    &format!("cost_reservation {reservation_id} parent_op_id"),
-                    parent_op_id,
-                )?,
-                predicted_micro: predicted.max(0) as u64,
-                status,
-                created_ms,
-                settled_ms,
-                dispatched_ms,
-                pricing_snapshot,
-                provider_cost_micro: provider_cost.map(|m| m.max(0) as u64),
-                provider_reported_micro: provider_reported.map(|m| m.max(0) as u64),
-                route_decision_json: route_json,
-                request_id,
-                delivery_state,
-                failure_reason_code,
-                cost_basis,
-                provider_reported_cost_micro: provider_reported_cost_micro.map(|m| m.max(0) as u64),
-                estimated_cost_micro: estimated_cost_micro.map(|m| m.max(0) as u64),
-                settled_cost_micro: settled_cost_micro.map(|m| m.max(0) as u64),
-                execution_class,
-            });
+        while let Some(row) = rows.next()? {
+            out.push(cost_reservation_row_map(row)?);
         }
         Ok(out)
+    }
+
+    /// Batch form of [`Store::cost_reservations_of`] over a SET of
+    /// `(session, task)` pairs: the newest `limit` rows of every pair in ONE
+    /// statement per chunk (window-ranked, same per-row validation and
+    /// ordering as the single-task read). A pair whose rows fail the
+    /// read-time validation — or whose chunk fails at the SQL layer — is
+    /// reported in `unreadable`; the caller re-reads it through
+    /// [`Store::cost_reservations_of`] (typed fallback), which reproduces
+    /// the single-task skip semantics exactly.
+    pub fn cost_reservations_for_tasks(
+        &self,
+        pairs: &[(SessionId, TaskId)],
+        limit: i64,
+    ) -> StoreResult<TaskReservationBatch> {
+        const PAIR_CHUNK: usize = 500;
+        let mut batch = TaskReservationBatch::default();
+        for chunk in pairs.chunks(PAIR_CHUNK) {
+            match self.cost_reservations_for_task_chunk(chunk, limit) {
+                Ok((rows, failed)) => {
+                    batch.rows.extend(rows);
+                    batch.unreadable.extend(failed);
+                }
+                // A chunk-level SQL failure degrades exactly: every pair in
+                // the chunk goes to the caller's per-task fallback.
+                Err(_) => batch.unreadable.extend(chunk.iter().copied()),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// One chunk of [`Store::cost_reservations_for_tasks`]: the servable
+    /// rows plus the pairs the caller must re-read through the single-task
+    /// API.
+    fn cost_reservations_for_task_chunk(
+        &self,
+        chunk: &[(SessionId, TaskId)],
+        limit: i64,
+    ) -> StoreResult<ReservationChunkScan> {
+        let sid_list: std::collections::BTreeSet<i64> =
+            chunk.iter().map(|(s, _)| s.raw() as i64).collect();
+        let task_list: std::collections::BTreeSet<i64> =
+            chunk.iter().map(|(_, t)| t.raw() as i64).collect();
+        let sid_ph = std::iter::repeat_n("?", sid_list.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let task_ph = std::iter::repeat_n("?", task_list.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT reservation_id, session_id, task_id, op_id, predicted_micro,
+                    status, created_ms, settled_ms, dispatched_ms,
+                    pricing_snapshot_json, provider_cost_micro,
+                    provider_reported_micro, route_decision_json,
+                    attempt_op_id, parent_op_id, request_id, delivery_state,
+                    failure_reason_code, cost_basis,
+                    provider_reported_cost_micro, estimated_cost_micro,
+                    settled_cost_micro, execution_class
+             FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                     PARTITION BY session_id, task_id
+                     ORDER BY reservation_id DESC
+                 ) AS rn
+                 FROM cost_reservation
+                 WHERE session_id IN ({sid_ph}) AND task_id IN ({task_ph})
+             )
+             WHERE rn <= ?{}
+             ORDER BY session_id ASC, task_id ASC, reservation_id DESC",
+            sid_list.len() + task_list.len() + 1
+        );
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<rusqlite::types::Value> =
+            Vec::with_capacity(sid_list.len() + task_list.len() + 1);
+        for sid in &sid_list {
+            params_vec.push(rusqlite::types::Value::Integer(*sid));
+        }
+        for tid in &task_list {
+            params_vec.push(rusqlite::types::Value::Integer(*tid));
+        }
+        params_vec.push(rusqlite::types::Value::Integer(limit.max(0)));
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+        // Rows are ordered by (session, task): a pair that fails validation
+        // is marked once and its remaining rows are dropped (the caller's
+        // fallback reproduces the skip).
+        let mut out = Vec::new();
+        let mut failed_pairs: Vec<(SessionId, TaskId)> = Vec::new();
+        let mut dead: Option<(i64, i64)> = None;
+        while let Some(r) = rows.next()? {
+            let raw_sid: i64 = r.get(1)?;
+            let raw_task: i64 = r.get(2)?;
+            if dead == Some((raw_sid, raw_task)) {
+                continue;
+            }
+            match cost_reservation_row_map(r) {
+                Ok(row) => out.push(row),
+                Err(_) => {
+                    dead = Some((raw_sid, raw_task));
+                    let sid = id_field::<SessionId>(
+                        &format!("cost_reservation batch session_id {raw_sid}"),
+                        raw_sid,
+                    )
+                    .ok();
+                    let task_id = id_field::<TaskId>(
+                        &format!("cost_reservation batch task_id {raw_task}"),
+                        raw_task,
+                    )
+                    .ok();
+                    if let (Some(sid), Some(task_id)) = (sid, task_id) {
+                        failed_pairs.push((sid, task_id));
+                    }
+                }
+            }
+        }
+        Ok((out, failed_pairs))
+    }
+
+    /// Batch form of [`Store::session_usage_tokens`] +
+    /// [`Store::provider_call_prefix_rows`] over a SET of sessions in one
+    /// statement per bounded chunk (the cross-session `/native/usage`
+    /// aggregate). The token sum replicates the single-session expression
+    /// exactly; prefix aggregates are exact unless `prefix_servable` is
+    /// false (see [`SessionUsageAggregate`]).
+    pub fn session_usage_aggregates(
+        &self,
+        session_ids: &[SessionId],
+    ) -> StoreResult<SessionUsageBatch> {
+        const SESSION_CHUNK: usize = 500;
+        let mut batch = SessionUsageBatch::default();
+        for chunk in session_ids.chunks(SESSION_CHUNK) {
+            let ids: std::collections::BTreeSet<i64> =
+                chunk.iter().map(|s| s.raw() as i64).collect();
+            let ph = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT session_id,
+                        COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0),
+                        COUNT(CASE WHEN prompt_prefix_hash IS NOT NULL THEN 1 END),
+                        COALESCE(SUM(CASE WHEN prompt_prefix_hash IS NOT NULL
+                                          THEN COALESCE(prompt_tokens, 0) ELSE 0 END), 0),
+                        COUNT(CASE WHEN prompt_prefix_hash IS NOT NULL
+                                    AND prefix_stability IS NOT NULL THEN 1 END),
+                        COALESCE(SUM(CASE WHEN prompt_prefix_hash IS NOT NULL AND (
+                                        length(prompt_prefix_hash) != 32
+                                        OR prompt_tokens IS NULL
+                                        OR prompt_tokens < 0
+                                        OR prompt_tokens > 4294967295
+                                        OR (prefix_stability IS NOT NULL
+                                            AND (prefix_stability < 0.0 OR prefix_stability > 1.0))
+                                        OR prefix_segments_json IS NOT NULL
+                                    ) THEN 1 ELSE 0 END), 0)
+                 FROM provider_call
+                 WHERE session_id IN ({ph})
+                 GROUP BY session_id
+                 ORDER BY session_id"
+            );
+            let scan = || -> StoreResult<Vec<SessionUsageAggregate>> {
+                let conn = self.read()?;
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<rusqlite::types::Value> = ids
+                    .iter()
+                    .map(|sid| rusqlite::types::Value::Integer(*sid))
+                    .collect();
+                let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+                let mut out = Vec::new();
+                while let Some(r) = rows.next()? {
+                    let raw_sid: i64 = r.get(0)?;
+                    let Ok(session_id) = id_field::<SessionId>(
+                        &format!("usage batch session_id {raw_sid}"),
+                        raw_sid,
+                    ) else {
+                        continue; // not a decodable id: cannot be in the set
+                    };
+                    let tokens: i64 = r.get(1)?;
+                    let prefix_rows: i64 = r.get(2)?;
+                    let prefix_tokens: i64 = r.get(3)?;
+                    let prefix_stability_observations: i64 = r.get(4)?;
+                    let prefix_anomalies: i64 = r.get(5)?;
+                    out.push(SessionUsageAggregate {
+                        session_id,
+                        tokens: tokens.max(0) as u64,
+                        prefix_rows: prefix_rows.max(0) as u64,
+                        prefix_tokens: prefix_tokens.max(0) as u64,
+                        prefix_stability_observations: prefix_stability_observations.max(0) as u64,
+                        prefix_servable: prefix_anomalies == 0,
+                    });
+                }
+                Ok(out)
+            };
+            match scan() {
+                Ok(rows) => batch.rows.extend(rows),
+                Err(_) => batch.unreadable.extend(chunk.iter().copied()),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Batch form of [`Store::list_tasks`] + [`Store::cost_task_row`] over a
+    /// SET of sessions: the first `per_session` task rows of every session in
+    /// the legacy order, with the raw cost columns, validated by the SAME
+    /// `task_row_map` decode as `list_tasks`. A session with rows beyond
+    /// `per_session` (the legacy read decodes them) or a row failing the
+    /// decode is reported in `unreadable` for the caller's typed fallback.
+    pub fn task_usage_scope(
+        &self,
+        session_ids: &[SessionId],
+        per_session: u32,
+    ) -> StoreResult<TaskUsageBatch> {
+        const SESSION_CHUNK: usize = 500;
+        let mut batch = TaskUsageBatch::default();
+        for chunk in session_ids.chunks(SESSION_CHUNK) {
+            let ids: std::collections::BTreeSet<i64> =
+                chunk.iter().map(|s| s.raw() as i64).collect();
+            let ph = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT task_id, session_id, goal, acceptance_criteria, plan,
+                        max_tokens, max_turns, spent_tokens, spent_turns,
+                        state, created_ms, updated_ms, revision, attachments,
+                        contract, max_cost_micro, spent_cost_micro, rn
+                 FROM (
+                     SELECT task_id, session_id, goal, acceptance_criteria, plan,
+                            max_tokens, max_turns, spent_tokens, spent_turns,
+                            state, created_ms, updated_ms, revision, attachments,
+                            contract, max_cost_micro, spent_cost_micro,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY session_id
+                                ORDER BY created_ms ASC, task_id ASC
+                            ) AS rn
+                     FROM task WHERE session_id IN ({ph})
+                 )
+                 WHERE rn <= {}
+                 ORDER BY session_id ASC, rn ASC",
+                i64::from(per_session) + 1
+            );
+            let scan = || -> StoreResult<(Vec<TaskUsageRow>, Vec<SessionId>)> {
+                let conn = self.read()?;
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<rusqlite::types::Value> = ids
+                    .iter()
+                    .map(|sid| rusqlite::types::Value::Integer(*sid))
+                    .collect();
+                let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+                let mut out = Vec::new();
+                let mut unreadable: Vec<SessionId> = Vec::new();
+                while let Some(r) = rows.next()? {
+                    // Column order matches `task_row_map` (task_id first).
+                    let raw_sid: i64 = r.get(1)?;
+                    let Ok(session_id) = id_field::<SessionId>(
+                        &format!("usage batch session_id {raw_sid}"),
+                        raw_sid,
+                    ) else {
+                        continue; // not a decodable id: cannot be in the set
+                    };
+                    let rn: i64 = r.get(17)?;
+                    if rn > i64::from(per_session) {
+                        // Rows exist beyond the caller's scope: the legacy
+                        // read would decode them, so this session falls back.
+                        if !unreadable.contains(&session_id) {
+                            unreadable.push(session_id);
+                        }
+                        continue;
+                    }
+                    match task_row_map(r, session_id) {
+                        Ok(row) => {
+                            let max_cost_micro: Option<i64> = r.get(15)?;
+                            let spent_cost_micro: i64 = r.get(16)?;
+                            out.push(TaskUsageRow {
+                                session_id,
+                                task_id: row.task_id,
+                                max_cost_micro,
+                                spent_cost_micro,
+                            });
+                        }
+                        Err(_) => {
+                            if !unreadable.contains(&session_id) {
+                                unreadable.push(session_id);
+                            }
+                        }
+                    }
+                }
+                Ok((out, unreadable))
+            };
+            match scan() {
+                Ok((rows, unreadable)) => {
+                    batch.rows.extend(rows);
+                    batch.unreadable.extend(unreadable);
+                }
+                Err(_) => batch.unreadable.extend(chunk.iter().copied()),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Batch form of [`Store::memory_facts`] filtered to `kind = "usage"`
+    /// over a SET of sessions: one statement per bounded chunk, in the SAME
+    /// per-session order (`updated_ms DESC, kind DESC, key DESC`), so the
+    /// caller's last-wins fold over `budget`/`spent` keys is byte-identical.
+    pub fn usage_facts_by_session(
+        &self,
+        session_ids: &[SessionId],
+    ) -> StoreResult<UsageFactsBatch> {
+        const SESSION_CHUNK: usize = 500;
+        let mut batch = UsageFactsBatch::default();
+        for chunk in session_ids.chunks(SESSION_CHUNK) {
+            let ids: std::collections::BTreeSet<i64> =
+                chunk.iter().map(|s| s.raw() as i64).collect();
+            let ph = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT session_id, kind, key, value FROM memory_fact
+                 WHERE session_id IN ({ph}) AND kind = 'usage'
+                 ORDER BY session_id ASC, updated_ms DESC, kind DESC, key DESC"
+            );
+            let scan = || -> StoreResult<Vec<(SessionId, String, String)>> {
+                let conn = self.read()?;
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<rusqlite::types::Value> = ids
+                    .iter()
+                    .map(|sid| rusqlite::types::Value::Integer(*sid))
+                    .collect();
+                let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+                let mut out = Vec::new();
+                while let Some(r) = rows.next()? {
+                    let raw_sid: i64 = r.get(0)?;
+                    let Ok(session_id) = id_field::<SessionId>(
+                        &format!("usage batch session_id {raw_sid}"),
+                        raw_sid,
+                    ) else {
+                        continue; // not a decodable id: cannot be in the set
+                    };
+                    let key: String = r.get(2)?;
+                    let value: String = r.get(3)?;
+                    out.push((session_id, key, value));
+                }
+                Ok(out)
+            };
+            match scan() {
+                Ok(rows) => batch.rows.extend(rows),
+                Err(_) => batch.unreadable.extend(chunk.iter().copied()),
+            }
+        }
+        Ok(batch)
     }
 
     /// Mark one DISPATCHED reservation UNCERTAIN (post-dispatch failure

@@ -177,10 +177,45 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+/// Files at or above this size are measured against the digest memo; smaller
+/// files are always streamed (their re-hash costs microseconds and never
+/// memoizing them keeps the tamper answer exact on every filesystem).
+pub const DIGEST_MEMO_MIN_BYTES: u64 = 1024 * 1024;
+
+/// Bounded memo count per install layout.
+const DIGEST_MEMO_CAPACITY: usize = 256;
+
+/// One memoized digest observation of one install-tree path.
+#[derive(Debug)]
+struct DigestMemo {
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    expected: String,
+    digest: String,
+}
+
+/// The digest memo table of one install layout. A memo is consulted ONLY
+/// when the path's byte length, modification time AND the caller's expected
+/// digest all match exactly, and every writer of this layout explicitly
+/// invalidates the paths it publishes — first-time verification and any
+/// observable change always stream the full bytes, so the digest stays the
+/// authority and the memo only removes repeated work (recovery retries,
+/// idempotent stage/apply replays). Documented boundary: a same-owner
+/// rewrite that preserves byte length AND the filesystem's full mtime
+/// resolution is outside what the memo can observe (the same-owner in-place
+/// writer residual the release machinery already documents).
+#[derive(Debug, Default)]
+struct DigestMemoTable {
+    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, DigestMemo>>,
+    #[cfg(test)]
+    computations: std::sync::atomic::AtomicUsize,
+}
+
 /// The install root and its derived paths.
 #[derive(Debug, Clone)]
 pub struct InstallLayout {
     root: PathBuf,
+    digest_memos: std::sync::Arc<DigestMemoTable>,
 }
 
 impl InstallLayout {
@@ -193,7 +228,10 @@ impl InstallLayout {
         if root.as_os_str().is_empty() {
             return Err(UpdateError::Config("install root must not be empty".into()));
         }
-        let layout = InstallLayout { root };
+        let layout = InstallLayout {
+            root,
+            digest_memos: std::sync::Arc::new(DigestMemoTable::default()),
+        };
         create_private_dir_all(&layout.artifacts_dir()).map_err(|e| {
             UpdateError::Install(format!(
                 "create artifacts dir {}: {e}",
@@ -213,7 +251,92 @@ impl InstallLayout {
     /// no side effect is possible. The bootstrap launcher uses this so a
     /// launched process never mutates the layout it is authenticating.
     pub fn open_readonly(root: impl Into<PathBuf>) -> Self {
-        InstallLayout { root: root.into() }
+        InstallLayout {
+            root: root.into(),
+            digest_memos: std::sync::Arc::new(DigestMemoTable::default()),
+        }
+    }
+
+    /// The digest of `path` against `expected`, memoized across repeated
+    /// verification of the same immutable file (see [`DigestMemoTable`]).
+    pub(crate) fn digest_memoized(
+        &self,
+        path: &Path,
+        expected: &str,
+    ) -> Result<String, UpdateError> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) if metadata.len() >= DIGEST_MEMO_MIN_BYTES => metadata,
+            // Small or unreadable: stream (an unreadable path produces its
+            // identical typed error there).
+            _ => {
+                self.note_digest_computation();
+                return file_digest(path);
+            }
+        };
+        let size = metadata.len();
+        let mtime = metadata.modified().ok();
+        {
+            let entries = self
+                .digest_memos
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(memo) = entries.get(path) {
+                if memo.size == size && memo.mtime == mtime && memo.expected == expected {
+                    return Ok(memo.digest.clone());
+                }
+            }
+        }
+        self.note_digest_computation();
+        let digest = file_digest(path)?;
+        let mut entries = self
+            .digest_memos
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.len() >= DIGEST_MEMO_CAPACITY {
+            entries.clear();
+        }
+        entries.insert(
+            path.to_path_buf(),
+            DigestMemo {
+                size,
+                mtime,
+                expected: expected.to_string(),
+                digest: digest.clone(),
+            },
+        );
+        Ok(digest)
+    }
+
+    /// Explicit invalidation for every path this layout publishes: the exact
+    /// path and everything under it (a release directory) are dropped, so a
+    /// later verification always streams the freshly adopted bytes.
+    pub(crate) fn invalidate_digest_memos(&self, path: &Path) {
+        let mut entries = self
+            .digest_memos
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|known, _| known != path && !known.starts_with(path));
+    }
+
+    fn note_digest_computation(&self) {
+        #[cfg(test)]
+        {
+            self.digest_memos
+                .computations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The number of full-file digest computations this layout has performed
+    /// (test evidence seam for the memo).
+    #[cfg(test)]
+    fn digest_computations(&self) -> usize {
+        self.digest_memos
+            .computations
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn root(&self) -> &Path {
@@ -317,17 +440,23 @@ impl InstallLayout {
             UpdateError::Install(format!("create artifact dir {}: {e}", parent.display()))
         })?;
         faktor_fs::atomic::atomic_adopt(staged, &dest)?;
+        // The adopted bytes are fresh: a memoized observation of this path
+        // is stale by construction.
+        self.invalidate_digest_memos(&dest);
         Ok(dest)
     }
 
-    /// The sha256 hex of one artifact's full content, streamed (bounded
-    /// memory) — the post-swap probe and the pre-apply re-check both use it.
+    /// The sha256 hex of one artifact's full content (memoized across
+    /// repeated verification of the same immutable content-addressed path;
+    /// see [`DigestMemoTable`]) — the post-swap probe and the pre-apply
+    /// re-check both use it.
     pub fn artifact_digest(&self, name: &str, digest: &str) -> Result<String, UpdateError> {
         let path = self.artifact_path(name, digest);
-        file_digest(&path).map_err(|e| UpdateError::StagedArtifactUnusable {
-            artifact: name.to_string(),
-            detail: e.to_string(),
-        })
+        self.digest_memoized(&path, digest)
+            .map_err(|e| UpdateError::StagedArtifactUnusable {
+                artifact: name.to_string(),
+                detail: e.to_string(),
+            })
     }
 
     /// Verify the bytes the pointer names are still present AND intact.
@@ -337,10 +466,12 @@ impl InstallLayout {
     pub fn verify_installed(&self, pointer: &InstallPointer) -> Result<(), UpdateError> {
         if let Some(release_id) = &pointer.release_id {
             let binary = self.release_binary(release_id);
-            let actual = file_digest(&binary).map_err(|e| UpdateError::StagedArtifactUnusable {
-                artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
-                detail: e.to_string(),
-            })?;
+            let actual = self
+                .digest_memoized(&binary, &pointer.digest)
+                .map_err(|e| UpdateError::StagedArtifactUnusable {
+                    artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
+                    detail: e.to_string(),
+                })?;
             if actual != pointer.digest {
                 return Err(UpdateError::StagedArtifactUnusable {
                     artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
@@ -609,6 +740,78 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn repeated_verification_memoizes_large_bytes_and_never_masks_a_change() {
+        let (_dir, layout) = layout();
+        let bytes = vec![0x5Au8; (DIGEST_MEMO_MIN_BYTES as usize) + 1];
+        let digest = crate::manifest::sha256_hex(&bytes);
+        let staged = layout.staging_file("op-memo", "big.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-memo")).unwrap();
+        std::fs::write(&staged, &bytes).unwrap();
+        let dest = layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("big.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        for _ in 0..5 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        assert_eq!(
+            layout.digest_computations(),
+            1,
+            "the first verification streams the bytes; the repeats memoize"
+        );
+
+        // A changed file is always re-read: its byte length no longer matches
+        // the memo key, so the stale observation can never mask the tamper.
+        std::fs::write(&dest, vec![0xA5u8; bytes.len() + 1]).unwrap();
+        let err = layout.verify_installed(&pointer).unwrap_err();
+        assert_eq!(err.code(), "staged_artifact_unusable");
+        assert_eq!(layout.digest_computations(), 2);
+
+        // publish_staged explicitly invalidates the destination: restoring
+        // the original bytes and re-publishing must verify fresh, not serve
+        // the memoized observation of the tampered read.
+        std::fs::write(&staged, &bytes).unwrap();
+        layout.publish_staged(&staged, "big.bin", &digest).unwrap();
+        layout.verify_installed(&pointer).unwrap();
+        assert_eq!(layout.digest_computations(), 3);
+
+        // Audit evidence: the same 5-verify workload with and without the
+        // memo over the artifact bytes just restored (both paths answered
+        // from the identical bytes; direct streams are uncounted above).
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            file_digest(&dest).unwrap();
+        }
+        let streamed = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        let memoized = started.elapsed();
+        eprintln!(
+            "updater-verify: 5x{}KiB: streamed {streamed:?} vs memoized {memoized:?}",
+            bytes.len() / 1024
+        );
+    }
+
+    #[test]
+    fn small_files_are_always_streamed_never_memoized() {
+        let (_dir, layout) = layout();
+        let digest = crate::manifest::sha256_hex(b"tiny");
+        let staged = layout.staging_file("op-small", "tiny.bin");
+        std::fs::create_dir_all(layout.staging_dir_for("op-small")).unwrap();
+        std::fs::write(&staged, b"tiny").unwrap();
+        layout.publish_staged(&staged, "tiny.bin", &digest).unwrap();
+        let pointer = InstallPointer::new("tiny.bin", &digest, "1.0.0", "stable", 1).unwrap();
+        for _ in 0..3 {
+            layout.verify_installed(&pointer).unwrap();
+        }
+        assert_eq!(
+            layout.digest_computations(),
+            3,
+            "a small file is re-hashed every time (mtime granularity can never mask a tamper)"
+        );
     }
 
     #[test]

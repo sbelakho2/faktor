@@ -162,7 +162,7 @@ fn insert_prepared_refs(
 ) -> StoreResult<Vec<AttachmentRef>> {
     let mut out = Vec::with_capacity(prepared.len());
     for (index, attachment) in prepared.iter().enumerate() {
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -173,6 +173,26 @@ fn insert_prepared_refs(
                 attachment.size_i64,
             ],
         )?;
+        if inserted == 1 {
+            // Fresh row: the surrogate id is the row just inserted and the
+            // identity columns are the caller-prepared values that were
+            // bound verbatim, so the resolve SELECT is skipped.
+            let id = tx.last_insert_rowid();
+            if id <= 0 {
+                return Err(StoreError::Corrupt(vec![std::mem::take(
+                    &mut not_found[index],
+                )]));
+            }
+            let identity = attachment.to_attachment_id()?;
+            out.push(AttachmentRef {
+                id: id as u64,
+                digest: identity.digest,
+                mime: identity.mime,
+                filename: identity.filename,
+                size: identity.size,
+            });
+            continue;
+        }
         let reference = tx
             .query_row(
                 "SELECT id, digest, mime, filename, size FROM attachment
@@ -2004,5 +2024,38 @@ mod tests {
             "a failed create must not leave the task row"
         );
         assert!(listed_sorted(&store, s.id).is_empty());
+    }
+
+    /// The fresh-insert path (row id from `last_insert_rowid`) and the
+    /// conflict path (resolve SELECT) must agree EXACTLY: a repeated or
+    /// in-batch-duplicated reference returns the SAME surrogate id with the
+    /// same identity, and references differing in any identity column stay
+    /// distinct rows.
+    #[test]
+    fn inherit_attachment_refs_dedupe_returns_identical_rows() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "att", "p", "m").unwrap();
+        let digest = faktor_core::hash::FileHash::from([31; 32]);
+        let a = AttachmentId::new(digest, "image/png", Some("a.png"), 7).unwrap();
+        let a_no_name = AttachmentId::new(digest, "image/png", None, 7).unwrap();
+        let a_other_mime = AttachmentId::new(digest, "image/jpeg", Some("a.png"), 7).unwrap();
+        let first = store
+            .inherit_attachment_refs(s.id, &[a.clone(), a.clone(), a_no_name.clone()])
+            .unwrap();
+        assert_eq!(first[0].id, first[1].id, "in-batch duplicate dedupes");
+        assert_ne!(first[2].id, first[0].id, "NULL filename is a distinct row");
+        assert_eq!(first[0].attachment(), a);
+        assert_eq!(first[1].attachment(), a);
+        assert_eq!(first[2].attachment(), a_no_name);
+        let again = store
+            .inherit_attachment_refs(s.id, &[a.clone(), a_other_mime.clone()])
+            .unwrap();
+        assert_eq!(again[0].id, first[0].id, "replay resolves the SAME row");
+        assert_eq!(again[0].attachment(), a);
+        assert_ne!(again[1].id, first[0].id, "mime is part of the identity");
+        assert_eq!(again[1].attachment(), a_other_mime);
+        let all = store.list_attachments(s.id, 32).unwrap();
+        assert_eq!(all.len(), 3, "no duplicate rows materialized: {all:?}");
     }
 }

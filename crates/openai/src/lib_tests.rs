@@ -388,6 +388,64 @@ mod openai_contract_tests {
             .is_none());
     }
 
+    #[test]
+    fn tool_argument_accumulation_copies_each_fragment_once() {
+        // Complexity-audit evidence: 100k argument fragments. The pre-fix
+        // code rebuilt `cur + arguments` per fragment (copying the whole
+        // prefix: sum over i of i*frag_len ~ 4e10 bytes for this input);
+        // `push_str` copies each fragment exactly once. The work counter
+        // proves the linear bound, and a reference accumulator proves the
+        // assembled string is byte-identical.
+        const FRAGMENTS: usize = 100_000;
+        const FRAG: &str = "\"abcdefg\"";
+        let mut accs = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        let mut reference = String::new();
+        argument_accumulation::reset();
+        for i in 0..FRAGMENTS {
+            let frame = if i == 0 {
+                serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                        "function": {"name": "f", "arguments": FRAG}}]}}]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [{"index": 0,
+                        "function": {"arguments": FRAG}}]}}]
+                })
+            };
+            reference.push_str(FRAG);
+            assert!(parse_chat_chunk(&frame, &mut accs, &mut pending)
+                .expect("fragment frame")
+                .is_none());
+        }
+        let assembled = accs[0]["arguments"].as_str().expect("arguments slot");
+        assert_eq!(assembled.len(), reference.len());
+        assert_eq!(assembled, reference, "fragment assembly is byte-identical");
+        let copied = argument_accumulation::snapshot();
+        let total = (FRAGMENTS * FRAG.len()) as u64;
+        let pre_fix = total * (FRAGMENTS as u64 + 1) / 2;
+        assert!(
+            copied <= total + FRAGMENTS as u64,
+            "each fragment must be copied once: copied {copied} for {total} bytes"
+        );
+        assert!(
+            copied * 1_000 < pre_fix,
+            "linear append must be orders below the pre-fix quadratic rebuild \
+             ({copied} vs ~{pre_fix} bytes copied)"
+        );
+        // The finishing marker still flushes the call with the exact JSON
+        // (the accumulated text parses into the tool input).
+        let finish = serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
+        let chunk = parse_chat_chunk(&finish, &mut accs, &mut pending)
+            .expect("flush frame")
+            .expect("a completed tool call");
+        match chunk {
+            ProviderChunk::ToolCall { complete, .. } => assert!(complete),
+            other => panic!("expected a tool-call chunk, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn tool_call_accumulates_and_completes() {
         let server = MockServer::new();

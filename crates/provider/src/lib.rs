@@ -2171,6 +2171,10 @@ pub struct CatalogProvider {
     id: String,
     default_caps: ModelCapabilities,
     models: Vec<(String, ModelCapabilities)>,
+    /// Model-name → row index (complexity audit): `capabilities`/
+    /// `capability_resolution` are called per candidate during routing-graph
+    /// construction, and the pre-fix form scanned the whole Vec per call.
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl CatalogProvider {
@@ -2181,13 +2185,21 @@ impl CatalogProvider {
             id: id.into(),
             default_caps,
             models: Vec::new(),
+            index: std::collections::HashMap::new(),
         }
     }
 
     /// Add one known model with its own capabilities. Appends after the
-    /// models added before it: `known_models()` reports insertion order.
+    /// models added before it: `known_models()` reports insertion order. A
+    /// repeated model id keeps the FIRST row's capabilities (the pre-fix
+    /// linear scan was first-match-wins); the duplicate still appears in
+    /// `known_models()` exactly as before.
     pub fn add_model(&mut self, model: impl Into<String>, caps: ModelCapabilities) -> &mut Self {
-        self.models.push((model.into(), caps));
+        let model = model.into();
+        if !self.index.contains_key(&model) {
+            self.index.insert(model.clone(), self.models.len());
+        }
+        self.models.push((model, caps));
         self
     }
 }
@@ -2198,10 +2210,7 @@ impl Provider for CatalogProvider {
     }
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
-        self.models
-            .iter()
-            .find(|(m, _)| m == model)
-            .map(|(_, caps)| caps.clone())
+        self.caps_for(model)
             .unwrap_or_else(|| self.default_caps.clone())
     }
 
@@ -2209,10 +2218,8 @@ impl Provider for CatalogProvider {
         // The catalog's named models are model-specific rows (`Known`); the
         // constructor-provided `default_caps` answers unnamed ids as an
         // EXPLICIT declared generic profile, never as validated caps.
-        self.models
-            .iter()
-            .find(|(m, _)| m == model)
-            .map(|(_, caps)| CapabilityResolution::known(caps.clone()))
+        self.caps_for(model)
+            .map(CapabilityResolution::known)
             .unwrap_or_else(|| CapabilityResolution::declared_generic(self.default_caps.clone()))
     }
 
@@ -2222,6 +2229,17 @@ impl Provider for CatalogProvider {
 
     fn stream(&self, _req: GenericAgentRequest) -> ProviderStream {
         Box::pin(futures::stream::empty())
+    }
+}
+
+impl CatalogProvider {
+    /// The row for `model`, first-insertion-wins (the pre-fix linear scan
+    /// returned the first equal id; the index pins the same row).
+    fn caps_for(&self, model: &str) -> Option<ModelCapabilities> {
+        self.index
+            .get(model)
+            .and_then(|index| self.models.get(*index))
+            .map(|(_, caps)| caps.clone())
     }
 }
 
@@ -3625,5 +3643,48 @@ mod tests {
             MAX_MEDIA_BYTES_HARD as u64
         );
         assert!(!capped.document.capable);
+    }
+
+    #[test]
+    fn catalog_provider_index_keeps_first_match_and_fallback_semantics() {
+        // Complexity-audit regression: the indexed lookup must be
+        // indistinguishable from the pre-fix linear `find` — first
+        // insertion wins for a repeated id, an unnamed id answers the
+        // declared-generic default, and `known_models` keeps insertion
+        // order (duplicates included).
+        let named = ModelCapabilities {
+            tools: true,
+            ..ModelCapabilities::default()
+        };
+        let replaced = ModelCapabilities {
+            vision: true,
+            ..ModelCapabilities::default()
+        };
+        let mut provider = CatalogProvider::new("catalog", ModelCapabilities::default());
+        provider
+            .add_model("m1", named.clone())
+            .add_model("m2", ModelCapabilities::default())
+            .add_model("m1", replaced);
+        assert_eq!(provider.capabilities("m1"), named, "first row wins");
+        assert_eq!(provider.capabilities("m2"), ModelCapabilities::default());
+        assert_eq!(
+            provider.capabilities("missing"),
+            ModelCapabilities::default(),
+            "unnamed models answer the declared default"
+        );
+        assert!(matches!(
+            provider.capability_resolution("m1"),
+            CapabilityResolution { .. }
+        ));
+        assert_eq!(
+            provider.known_models(),
+            vec!["m1".to_string(), "m2".to_string(), "m1".to_string()],
+            "insertion order, duplicates included"
+        );
+        // The declared-generic fallback is never `Known`.
+        assert_ne!(
+            provider.capability_resolution("missing").authority,
+            provider.capability_resolution("m1").authority
+        );
     }
 }

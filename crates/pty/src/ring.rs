@@ -23,13 +23,21 @@ impl Ring {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.buf.push_back(*b);
-        }
-        while self.buf.len() > RING_MAX_BYTES {
-            self.buf.pop_front();
-        }
         self.total = self.total.saturating_add(bytes.len() as u64);
+        if bytes.len() >= RING_MAX_BYTES {
+            // One offer at or beyond the whole ring: only its own tail can
+            // survive. Replace the buffer with that tail in ONE bulk move
+            // instead of per-byte push/pop churn.
+            self.buf.clear();
+            self.buf
+                .extend(bytes[bytes.len() - RING_MAX_BYTES..].iter().copied());
+            return;
+        }
+        self.buf.extend(bytes.iter().copied());
+        let excess = self.buf.len().saturating_sub(RING_MAX_BYTES);
+        if excess > 0 {
+            self.buf.drain(..excess);
+        }
     }
 
     /// Drain the currently available bytes.
@@ -72,6 +80,53 @@ pub(crate) fn lock_ring(ring: &Mutex<Ring>) -> MutexGuard<'_, Ring> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bounded deterministic workload: 4 MiB offered in 64 KiB chunks — the
+    /// exact shape a PTY reader thread sees during a large build's output.
+    /// Content is asserted exactly (retained tail, oversized single offer,
+    /// empty offer) and the elapsed time is printed for the audit report.
+    #[test]
+    fn bulk_push_retains_the_exact_tail() {
+        let mut ring = Ring::new();
+        let chunk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let started = std::time::Instant::now();
+        for _ in 0..64 {
+            ring.push(&chunk);
+        }
+        let elapsed = started.elapsed();
+        eprintln!("pty-ring: 4 MiB in 64 KiB pushes = {elapsed:?}");
+        assert_eq!(ring.total(), 64 * 64 * 1024);
+        let mut expected = Vec::new();
+        for _ in 0..(RING_MAX_BYTES / chunk.len()) {
+            expected.extend_from_slice(&chunk);
+        }
+        assert_eq!(ring.snapshot(), expected);
+        assert_eq!(ring.drain(), expected);
+        assert_eq!(ring.snapshot(), Vec::<u8>::new());
+
+        // One offer LARGER than the ring keeps exactly its own tail.
+        let big: Vec<u8> = (0..(RING_MAX_BYTES + 4096))
+            .map(|i| (i % 241) as u8)
+            .collect();
+        ring.push(&big);
+        assert_eq!(ring.snapshot(), big[4096..].to_vec());
+        assert_eq!(ring.total(), (64 * 64 * 1024 + big.len()) as u64);
+
+        // An empty offer changes nothing; the total still counts what was
+        // offered.
+        ring.push(&[]);
+        assert_eq!(ring.snapshot(), big[4096..].to_vec());
+        assert_eq!(ring.total(), (64 * 64 * 1024 + big.len()) as u64);
+
+        // Boundary: exact capacity, then one more byte.
+        let mut boundary = Ring::new();
+        boundary.push(&big[..RING_MAX_BYTES]);
+        assert_eq!(boundary.snapshot().len(), RING_MAX_BYTES);
+        boundary.push(b"z");
+        let mut expected_boundary = big[1..RING_MAX_BYTES].to_vec();
+        expected_boundary.push(b'z');
+        assert_eq!(boundary.snapshot(), expected_boundary);
+    }
 
     #[test]
     fn poisoned_ring_is_rebuilt_not_propagated() {

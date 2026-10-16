@@ -38,6 +38,19 @@ pub(crate) fn in_session_run_state_tag(
     })
 }
 
+/// The ORCHESTRATED run ids named by the session's durable facts rows. The
+/// classification is a membership question, so the run-id set is built ONCE
+/// (a scan of the facts) instead of re-scanning every facts row per run —
+/// the historical `facts.iter().any(...)` inside the run loop was O(runs x
+/// facts) on the hot task-run projection.
+fn orchestrated_run_ids(facts: &[(String, String, String)]) -> std::collections::HashSet<&str> {
+    facts
+        .iter()
+        .filter(|(kind, _, _)| kind == TASK_RUN_ROW_KIND)
+        .map(|(_, key, _)| key.as_str())
+        .collect()
+}
+
 /// The task-run projection of a session (wave-24): every TaskExecutor run
 /// — in-session (linkage rows) and orchestrated (plan rows + children) —
 /// with its durable run identity, per-run state and goal. Built from
@@ -50,6 +63,7 @@ pub(crate) fn native_task_run_entries(
     handle: &faktor_session::SessionHandle,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let facts = orchestrator_graph_facts(handle).map_err(internal_graph_err)?;
+    let orchestrated = orchestrated_run_ids(&facts);
     let session_row = handle
         .row()
         .map_err(|e| faktor_protocol::error::from_core(&e))?;
@@ -62,10 +76,7 @@ pub(crate) fn native_task_run_entries(
         let Some(run_id) = e.get("run_id").and_then(|r| r.as_str()) else {
             continue;
         };
-        let mode = if facts
-            .iter()
-            .any(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == run_id)
-        {
+        let mode = if orchestrated.contains(run_id) {
             "in_session"
         } else {
             "orchestrated"
@@ -1070,6 +1081,76 @@ pub(crate) async fn native_tournaments_list(
     match faktor_orchestrator::tournament::Tournament::summaries(&handle) {
         Ok(list) => Json(list).into_response(),
         Err(e) => tournament_error_response(&e),
+    }
+}
+
+#[cfg(test)]
+mod run_mode_classification_tests {
+    //! The task-run mode classification is a membership question scanned
+    //! ONCE per projection: this pins the exact classification vocabulary
+    //! and the bounded-work property at the 1k-run scan size.
+    use super::{orchestrated_run_ids, TASK_RUN_ROW_KIND};
+
+    fn fact(kind: &str, key: &str) -> (String, String, String) {
+        (kind.to_string(), key.to_string(), "{}".to_string())
+    }
+
+    #[test]
+    fn modes_classify_by_membership_in_one_facts_scan() {
+        let mut facts: Vec<(String, String, String)> = Vec::new();
+        for run in 0..256 {
+            facts.push(fact(TASK_RUN_ROW_KIND, &format!("run-{run}")));
+        }
+        facts.push(fact("other-kind", "run-0"));
+        facts.push(fact("orchestrator", "run-9"));
+        let orchestrated = orchestrated_run_ids(&facts);
+        assert_eq!(orchestrated.len(), 256, "only the run row kind counts");
+        assert!(orchestrated.contains("run-0"));
+        assert!(orchestrated.contains("run-255"));
+        // A foreign row kind that names a run id never reclassifies it.
+        assert!(!orchestrated.contains("run-256"));
+
+        // Bounded deterministic workload: 1k runs against 10k facts. The
+        // classification result is asserted exactly; the elapsed time is
+        // printed for the audit report (the historical nested scan and this
+        // single-pass set build answer identically).
+        let runs: Vec<String> = (0..1000).map(|i| format!("scan-run-{i}")).collect();
+        let mut big_facts: Vec<(String, String, String)> = Vec::new();
+        for chunk in 0..8 {
+            for run in 0..1000usize {
+                big_facts.push(fact("other-kind", &format!("noise-{chunk}-{run}")));
+            }
+        }
+        for run in (0..1000).step_by(2) {
+            big_facts.push(fact(TASK_RUN_ROW_KIND, &format!("scan-run-{run}")));
+        }
+        // The historical per-run nested scan, replayed verbatim on the same
+        // workload so both answers and both costs are visible in one run.
+        let started = std::time::Instant::now();
+        let mut historical = Vec::with_capacity(runs.len());
+        for run in &runs {
+            historical.push(
+                big_facts
+                    .iter()
+                    .any(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == run),
+            );
+        }
+        let historical_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let set = orchestrated_run_ids(&big_facts);
+        let mut classified = Vec::with_capacity(runs.len());
+        for run in &runs {
+            classified.push(set.contains(run.as_str()));
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "task-run modes: 1k runs x 10k facts: nested {historical_elapsed:?} vs set {elapsed:?}"
+        );
+        assert_eq!(historical, classified);
+        for (index, run) in runs.iter().enumerate() {
+            assert_eq!(classified[index], index % 2 == 0, "{run}");
+        }
     }
 }
 

@@ -832,13 +832,14 @@ impl Orchestrator {
     /// Pending and whose every dependency is Done. Deterministic by
     /// construction order of the plan's `work_items`.
     pub fn ready_items(&self) -> Vec<String> {
-        let state_of = |id: &str| {
-            self.plan
-                .work_items
-                .iter()
-                .find(|w| w.id == id)
-                .map(|w| w.completion)
-        };
+        // One pass over the plan instead of a linear `state_of` scan per
+        // dependency (O(items · deps)).
+        let state_of: HashMap<&str, WorkState> = self
+            .plan
+            .work_items
+            .iter()
+            .map(|w| (w.id.as_str(), w.completion))
+            .collect();
         self.plan
             .work_items
             .iter()
@@ -846,7 +847,7 @@ impl Orchestrator {
                 w.completion == WorkState::Pending
                     && w.depends_on
                         .iter()
-                        .all(|d| state_of(d) == Some(WorkState::Done))
+                        .all(|d| state_of.get(d.as_str()) == Some(&WorkState::Done))
             })
             .map(|w| w.id.clone())
             .collect()
@@ -2272,8 +2273,26 @@ impl OrchestratorExecutor {
     pub fn execute_next(&mut self, ex: &mut dyn StepExecutor) -> Result<Vec<String>, String> {
         let ready = self.next_ready();
         let mut executed: Vec<String> = Vec::new();
+        // One-pass indexes for this wave: item id -> item and dep ->
+        // dependent ids (the historical per-ready-item find and per-failure
+        // plan scan made this O(ready · items) + O(items · deps)).
+        let by_id: HashMap<&str, &WorkItem> = self
+            .plan
+            .work_items
+            .iter()
+            .map(|w| (w.id.as_str(), w))
+            .collect();
+        let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+        for w in &self.plan.work_items {
+            for d in &w.depends_on {
+                let list = dependents.entry(d.as_str()).or_default();
+                if list.last() != Some(&w.id.as_str()) {
+                    list.push(w.id.as_str());
+                }
+            }
+        }
         for id in ready {
-            let Some(item) = self.plan.work_items.iter().find(|w| w.id == id) else {
+            let Some(item) = by_id.get(id.as_str()).copied() else {
                 continue;
             };
             let est = estimate_cost(item);
@@ -2288,11 +2307,11 @@ impl OrchestratorExecutor {
                 }
                 StepOutcome::Failed { .. } | StepOutcome::VerificationFailed { .. } => {
                     self.state.insert(id.clone(), WorkState::Failed);
-                    for dependent in &self.plan.work_items {
-                        if dependent.depends_on.contains(&id)
-                            && self.state.get(&dependent.id) == Some(&WorkState::Pending)
-                        {
-                            self.state.insert(dependent.id.clone(), WorkState::Blocked);
+                    if let Some(dents) = dependents.get(id.as_str()) {
+                        for dependent in dents {
+                            if self.state.get(*dependent) == Some(&WorkState::Pending) {
+                                self.state.insert(dependent.to_string(), WorkState::Blocked);
+                            }
                         }
                     }
                 }

@@ -7858,6 +7858,10 @@ function runChatWebview(snapshot) {
   const dom = makeFakeDom();
   let messageHandler = null;
   let keydownHandler = null;
+  // The instrumented render seam chat.js consults (`renderProbe`): every
+  // Changes/History list REBUILD is counted here so tests can assert that an
+  // unchanged delta performs zero DOM rebuilds (see the delta-guard rows).
+  const renderCounts = {};
   const sandbox = {
     document: dom.document,
     window: {
@@ -7868,6 +7872,11 @@ function runChatWebview(snapshot) {
         if (type === 'keydown') {
           keydownHandler = callback;
         }
+      },
+      __faktorRenderProbe: {
+        count(kind) {
+          renderCounts[kind] = (renderCounts[kind] || 0) + 1;
+        },
       },
     },
     acquireVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
@@ -7886,6 +7895,7 @@ function runChatWebview(snapshot) {
   return {
     posted,
     dom,
+    renderCounts,
     deliver: (message) => messageHandler({ data: message.data ? message.data : message }),
     keydown: (event) => {
       if (keydownHandler) {
@@ -9502,6 +9512,125 @@ async function navigationWebviewTests() {
       restored && restored.focused === true,
       'focus follows the same logical row/button across an async refresh',
     );
+  });
+
+  await test('an unchanged snapshot delta never rebuilds the changes list (bounded render count)', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.changes = {
+      available: true,
+      reason: null,
+      rows: [
+        {
+          path: 'src/a.ts',
+          changeKind: 'modified',
+          refs: [{ label: 'criterion: build', criterionKey: 'build' }],
+        },
+        { path: 'src/b.ts', changeKind: 'added', refs: [] },
+      ],
+      candidateDisplay: 'Candidate change',
+      basis: { lines: ['candidate basis'] },
+      advanced: [{ label: 'scope', value: 'candidate' }],
+    };
+    const harness = runChatWebview(snapshot);
+    const changesList = harness.dom.document.getElementById('changes-list');
+    assertEqual(harness.renderCounts.changes, 1, 'the first snapshot builds the list once');
+    assertEqual(changesList.children.length, 2, 'both served rows render');
+    const baseline = canonicalDomDigest(harness.dom.nodesById);
+
+    // The host re-posts the WHOLE snapshot per stream delta and the webview
+    // parses a FRESH object graph, so identity can never be the guard; the
+    // content key is. An identical delta must touch NOTHING.
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(snapshot)) });
+    assertEqual(
+      harness.renderCounts.changes,
+      1,
+      'an identical delta must not rebuild the changes list',
+    );
+    assertEqual(
+      canonicalDomDigest(harness.dom.nodesById),
+      baseline,
+      'the DOM is byte-identical after a skipped rebuild',
+    );
+
+    // A REAL row delta rebuilds exactly once and reflects the new row.
+    const changed = JSON.parse(JSON.stringify(snapshot));
+    changed.changes.rows.push({ path: 'src/c.ts', changeKind: 'deleted', refs: [] });
+    harness.deliver({ type: 'snapshot', snapshot: changed });
+    assertEqual(harness.renderCounts.changes, 2, 'a changed row set rebuilds once');
+    assertEqual(changesList.children.length, 3, 'the new row is rendered');
+
+    // Local selection stays a live interaction: clicking another row moves
+    // the selection (the key covers the selection, so it re-renders).
+    const rowButton = findFake(
+      changesList,
+      (node) => node.tagName === 'button' && node.textContent === 'src/b.ts',
+    );
+    assert(rowButton, 'the served rows are selectable');
+    rowButton.click();
+    assertEqual(harness.renderCounts.changes, 3, 'a selection move re-renders');
+    const selected = findFake(changesList, (node) =>
+      String(node.className).includes('changes-row-selected'),
+    );
+    assertEqual(
+      selected && selected.getAttribute('data-change-path'),
+      'src/b.ts',
+      'the clicked row carries the selection',
+    );
+
+    // Unavailable resets the guard: the recovery snapshot always rebuilds.
+    const unavailable = JSON.parse(JSON.stringify(changed));
+    unavailable.changes.available = false;
+    unavailable.changes.reason = 'projection read refused';
+    harness.deliver({ type: 'snapshot', snapshot: unavailable });
+    assertEqual(
+      harness.renderCounts.changes,
+      4,
+      'the unavailable state drops the rows (and counts as a rebuild)',
+    );
+    assertEqual(changesList.children.length, 0, 'no stale served paths survive the failure');
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(changed)) });
+    assertEqual(harness.renderCounts.changes, 5, 'a recovery always rebuilds, never trusts a stale key');
+    assertEqual(changesList.children.length, 3, 'the recovered rows are back');
+  });
+
+  await test('an unchanged snapshot delta never rebuilds the history list (bounded render count)', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.sessions = [
+      { ...clone(sessionSummaryJson), id: '7', title: 'selftest' },
+      { id: '8', title: 'older conversation', provider: 'fake', model: 'm', state: 'idle' },
+    ];
+    const harness = runChatWebview(snapshot);
+    const list = harness.dom.document.getElementById('history-list');
+    assertEqual(harness.renderCounts.history, 1, 'the first snapshot builds the list once');
+    assertEqual(list.children.length, 2, 'both served conversations render');
+
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(snapshot)) });
+    assertEqual(
+      harness.renderCounts.history,
+      1,
+      'an identical delta must not rebuild the history list',
+    );
+
+    const changed = JSON.parse(JSON.stringify(snapshot));
+    changed.sessions.push({ id: '9', title: 'third', provider: 'fake', model: 'm', state: 'idle' });
+    harness.deliver({ type: 'snapshot', snapshot: changed });
+    assertEqual(harness.renderCounts.history, 2, 'a changed listing rebuilds once');
+    assertEqual(list.children.length, 3, 'the new conversation is listed');
+
+    // A read failure renders the unavailable state and clears the rows; the
+    // recovery rebuilds even when the listing bytes are identical.
+    const down = JSON.parse(JSON.stringify(changed));
+    down.sessionsUnavailable = 'listing read failed';
+    harness.deliver({ type: 'snapshot', snapshot: down });
+    assertEqual(list.children.length, 0, 'a failed listing drops the stale rows');
+    assertEqual(
+      harness.renderCounts.history,
+      2,
+      'the unavailable branch builds no rows (not a rebuild)',
+    );
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(changed)) });
+    assertEqual(harness.renderCounts.history, 3, 'the recovery always rebuilds');
+    assertEqual(list.children.length, 3, 'the recovered conversations are back');
   });
 
   await test('the served session listing parses the additive created_ms tolerantly', () => {

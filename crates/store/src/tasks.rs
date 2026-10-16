@@ -2984,9 +2984,25 @@ impl Store {
             }
         }
         scan.total_records = records.len() as u64;
+        // Reference sets built in ONE pass: the former per-record/per-task
+        // `iter().any()` scans were O(tasks x records) on a whole-table read.
+        let task_ids: std::collections::HashSet<i64> = tasks.iter().map(|t| t.task_id).collect();
+        let mut passed_certificates: std::collections::HashSet<(i64, i64)> =
+            std::collections::HashSet::new();
+        let mut passed_by_task: std::collections::HashMap<i64, Vec<(i64, i64)>> =
+            std::collections::HashMap::new();
+        for r in &records {
+            if r.status == VerificationStatus::Passed {
+                passed_certificates.insert((r.task_id, r.revision));
+                passed_by_task
+                    .entry(r.task_id)
+                    .or_default()
+                    .push((r.revision, r.id));
+            }
+        }
         // (1) Records whose task row is gone entirely.
         for r in &records {
-            if !tasks.iter().any(|t| t.task_id == r.task_id) {
+            if !task_ids.contains(&r.task_id) {
                 scan.issues.push(VerificationInvariantIssue {
                     kind: "record_without_task",
                     detail: format!(
@@ -3002,16 +3018,17 @@ impl Store {
             if t.state == TaskState::VerifiedComplete {
                 continue;
             }
-            for r in &records {
-                if r.task_id == t.task_id
-                    && r.status == VerificationStatus::Passed
-                    && r.revision == t.revision
-                {
+            for (revision, record_id) in passed_by_task
+                .get(&t.task_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if *revision == t.revision {
                     scan.issues.push(VerificationInvariantIssue {
                         kind: "passed_on_uncompleted",
                         detail: format!(
                             "Passed verification record {} certifies the current revision {} of task {}/{} whose state is {:?}, not VerifiedComplete",
-                            r.id, t.revision, t.session_id, t.task_id, t.state
+                            record_id, t.revision, t.session_id, t.task_id, t.state
                         ),
                     });
                 }
@@ -3023,15 +3040,8 @@ impl Store {
             if t.state != TaskState::VerifiedComplete {
                 continue;
             }
-            let certified = if t.revision >= 2 {
-                records.iter().any(|r| {
-                    r.task_id == t.task_id
-                        && r.status == VerificationStatus::Passed
-                        && r.revision == t.revision - 1
-                })
-            } else {
-                false
-            };
+            let certified =
+                t.revision >= 2 && passed_certificates.contains(&(t.task_id, t.revision - 1));
             if !certified {
                 scan.issues.push(VerificationInvariantIssue {
                     kind: "verified_without_record",
@@ -3054,47 +3064,33 @@ impl Store {
     pub fn active_turn_ownership_invariants(&self) -> StoreResult<TurnOwnershipScan> {
         let conn = self.read()?;
         let mut scan = TurnOwnershipScan::default();
+        // ONE statement per active turn row: the four anchors are EXISTS
+        // probes evaluated in SQL. The former loop issued up to four
+        // `COUNT(*)` point queries per row (N+1).
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id
-             FROM turn_record WHERE status = 'active' ORDER BY id ASC",
+            "SELECT t.id, t.session_id, t.turn_op_id,
+                    (t.prompt_message_id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM message m
+                         WHERE m.session_id = t.session_id AND m.seq = t.prompt_message_id)),
+                    (t.queue_seq IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM prompt_queue q
+                         WHERE q.session_id = t.session_id AND q.seq = t.queue_seq)),
+                    EXISTS (SELECT 1 FROM event e
+                             WHERE e.session_id = t.session_id AND e.op_id = t.turn_op_id),
+                    EXISTS (SELECT 1 FROM tool_run tr
+                             WHERE tr.session_id = t.session_id AND tr.op_id = t.turn_op_id)
+             FROM turn_record t WHERE t.status = 'active' ORDER BY t.id ASC",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let record_id: i64 = row.get(0)?;
             let session_id: i64 = row.get(1)?;
             let turn_op_id: i64 = row.get(2)?;
-            let queue_seq: Option<i64> = row.get(3)?;
-            let prompt_message_id: Option<i64> = row.get(4)?;
             scan.active_turns += 1;
-            let anchored = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> StoreResult<bool> {
-                let n: i64 = conn.query_row(sql, params, |r| r.get(0))?;
-                Ok(n > 0)
-            };
-            let message_anchor = match prompt_message_id {
-                Some(mid) => anchored(
-                    // `prompt_message_id` records the prompt's message SEQ
-                    // (== the PromptReceived journal event seq); the row id
-                    // is a separate autoincrement.
-                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND seq = ?2",
-                    &[&session_id, &mid],
-                )?,
-                None => false,
-            };
-            let queue_anchor = match queue_seq {
-                Some(seq) => anchored(
-                    "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1 AND seq = ?2",
-                    &[&session_id, &seq],
-                )?,
-                None => false,
-            };
-            let event_anchor = anchored(
-                "SELECT COUNT(*) FROM event WHERE session_id = ?1 AND op_id = ?2",
-                &[&session_id, &turn_op_id],
-            )?;
-            let tool_anchor = anchored(
-                "SELECT COUNT(*) FROM tool_run WHERE session_id = ?1 AND op_id = ?2",
-                &[&session_id, &turn_op_id],
-            )?;
+            let message_anchor = row.get::<_, i64>(3)? != 0;
+            let queue_anchor = row.get::<_, i64>(4)? != 0;
+            let event_anchor = row.get::<_, i64>(5)? != 0;
+            let tool_anchor = row.get::<_, i64>(6)? != 0;
             if message_anchor || queue_anchor || event_anchor || tool_anchor {
                 scan.recoverable += 1;
             } else {

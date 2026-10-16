@@ -738,6 +738,12 @@ fn run_backup(src: Connection, dest: &Path, cancel: &AtomicBool) -> StoreResult<
                 "online backup cancelled by store shutdown".into(),
             ));
         }
+        // Test-only per-step seam (compiled out of production): lets a test
+        // hold the backup INSIDE its page loop as an observable condition
+        // instead of racing a wall clock. The hook sees the destination
+        // path so unrelated concurrent backups are never affected.
+        #[cfg(test)]
+        backup_step_hook::invoke(dest, cancel);
         match backup.step(BACKUP_PAGES_PER_STEP)? {
             rusqlite::backup::StepResult::Done => {
                 drop(backup);
@@ -745,6 +751,36 @@ fn run_backup(src: Connection, dest: &Path, cancel: &AtomicBool) -> StoreResult<
                 return Ok(());
             }
             _ => std::thread::sleep(BACKUP_STEP_PAUSE),
+        }
+    }
+}
+
+/// Test-only hook invoked once per backup page-loop iteration, with the
+/// store's cancellation flag. Production builds contain no such seam (the
+/// module does not exist outside `cfg(test)`).
+#[cfg(test)]
+pub(crate) mod backup_step_hook {
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = Box<dyn Fn(&Path, &AtomicBool) + Send + Sync + 'static>;
+
+    fn slot() -> &'static Mutex<Option<Hook>> {
+        static SLOT: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Install (or clear with `None`) the per-step hook. One hook at a time;
+    /// tests that install one must clear it before finishing.
+    pub(crate) fn set(hook: Option<Hook>) {
+        *slot().lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    pub(crate) fn invoke(dest: &Path, cancel: &AtomicBool) {
+        let guard = slot().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(hook) = guard.as_ref() {
+            hook(dest, cancel);
         }
     }
 }
@@ -884,7 +920,7 @@ pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(ctx: &str, raw: &str) -
 mod writer_service_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1586,6 +1622,12 @@ mod writer_service_tests {
     /// Audit item 6/7 seam: a large backup running on the maintenance thread
     /// is cancelled by `shutdown` within the bound; its caller receives the
     /// typed maintenance cancellation and the writer still stops typed.
+    ///
+    /// Determinism: the per-step test hook holds the backup INSIDE its page
+    /// loop and only returns once shutdown's cancellation flag is set (an
+    /// observable condition, not a wall-clock race between registration and
+    /// the shutdown call). Every wait has a generous ceiling; the typed
+    /// assertions keep their teeth.
     #[test]
     fn shutdown_cancels_a_running_backup_within_the_bound() {
         let dir = tempfile::tempdir().unwrap();
@@ -1597,14 +1639,49 @@ mod writer_service_tests {
             .unwrap();
         super::tests::seed_padded_parts(&store, mid, 200_000);
 
+        // Observable mid-backup condition: the hook signals entry into the
+        // page loop, then blocks until shutdown cancels it. It only reacts
+        // to this test's destination, so concurrent backups stay untouched.
         let backup_path = dir.path().join("cancelled.db");
+        let watched = backup_path.clone();
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_hook = Arc::clone(&entered);
+        backup_step_hook::set(Some(Box::new(move |dest, cancel| {
+            if dest != watched {
+                return;
+            }
+            {
+                let (flag, cv) = &*entered_hook;
+                *flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !cancel.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown never cancelled the held backup"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        })));
+
         let backup_store = Arc::clone(&store);
         let backup_path_for_thread = backup_path.clone();
         let backup = thread::spawn(move || backup_store.backup_to(&backup_path_for_thread));
-        wait_until(
-            || store.maintenance_active_count() == 1,
-            "backup maintenance task",
-        );
+        {
+            let (flag, cv) = &*entered;
+            let mut entered_flag = flag.lock().unwrap_or_else(|p| p.into_inner());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !*entered_flag {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "backup never entered its page loop");
+                let (guard, _) = cv
+                    .wait_timeout(entered_flag, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                entered_flag = guard;
+            }
+        }
+        assert_eq!(store.maintenance_active_count(), 1);
 
         let bounded = Duration::from_millis(500);
         let at = Instant::now();
@@ -1627,6 +1704,7 @@ mod writer_service_tests {
         // can never be mistaken for a complete backup.
         assert!(!backup_path.exists(), "partial backup file must be removed");
         assert_eq!(store.maintenance_active_count(), 0);
+        backup_step_hook::set(None);
     }
 
     /// Finding 3: a maintenance task that ignores cancellation keeps a

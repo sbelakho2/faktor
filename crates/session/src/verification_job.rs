@@ -635,13 +635,25 @@ impl SessionHandle {
             bounds_check_job_input(job)?;
         }
         // Every background job must be declared exactly once in the ordered
-        // checks, and every ordered background check must carry a job.
+        // checks, and every ordered background check must carry a job. Both
+        // counts are built once (O(checks + jobs)); the old per-job
+        // `checks.iter().filter(...).count()` and per-check
+        // `jobs.iter().find(...)` were O(checks × jobs).
+        let mut declared_background: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for c in checks {
+            if c.inline.is_none() {
+                *declared_background.entry(c.check_id.as_str()).or_insert(0) += 1;
+            }
+        }
         let mut seen_jobs = std::collections::HashSet::new();
+        let mut jobs_by_id: std::collections::HashMap<&str, &VerificationJobInput> =
+            std::collections::HashMap::with_capacity(jobs.len());
         for job in jobs {
-            let declared = checks
-                .iter()
-                .filter(|c| c.inline.is_none() && c.check_id == job.check_id)
-                .count();
+            let declared = declared_background
+                .get(job.check_id.as_str())
+                .copied()
+                .unwrap_or(0);
             if declared != 1 {
                 return Err(SessionError::Malformed(format!(
                     "job '{}' is declared {} times as a background check (must be exactly once)",
@@ -654,6 +666,7 @@ impl SessionHandle {
                     job.check_id
                 )));
             }
+            jobs_by_id.entry(job.check_id.as_str()).or_insert(job);
         }
         for c in checks {
             if c.inline.is_none() && !seen_jobs.contains(c.check_id.as_str()) {
@@ -674,7 +687,7 @@ impl SessionHandle {
         let mut check_rows: Vec<VerificationJobRow> = Vec::with_capacity(checks.len());
         for (ordinal, run) in checks.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
-            let job = jobs.iter().find(|j| j.check_id == run.check_id);
+            let job = jobs_by_id.get(run.check_id.as_str()).copied();
             let (kind, spec_json, program, args_json, budget_ms, inline, state) = match run.inline {
                 Some(inline) => (
                     String::new(),
@@ -1321,6 +1334,102 @@ mod tests {
             s.current_verification_attempt(TASK).unwrap().unwrap().op_id,
             41
         );
+    }
+
+    #[test]
+    fn job_declaration_validation_names_each_exact_refusal() {
+        // The declaration counts are built once (map) instead of a filter per
+        // job; every refusal must stay byte-exact on its own input class.
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        // duplicate check declared twice, one job.
+        let err = s
+            .begin_verification_attempt(
+                TASK,
+                REV,
+                42,
+                ROOT,
+                &[],
+                &[job_check("dup"), job_check("dup")],
+                &[job_input("dup")],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("declared 2 times"),
+            "duplicate declaration must name its count: {err}"
+        );
+        // duplicate JOB rows for one declared check.
+        let err = s
+            .begin_verification_attempt(
+                TASK,
+                REV,
+                42,
+                ROOT,
+                &[],
+                &[job_check("d")],
+                &[job_input("d"), job_input("d")],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enqueued twice"),
+            "duplicate job must name the enqueue conflict: {err}"
+        );
+        // a job whose check is nowhere declared (count 0, not absent-panic).
+        let err = s
+            .begin_verification_attempt(
+                TASK,
+                REV,
+                42,
+                ROOT,
+                &[],
+                &[inline_pass("inline"), job_check("real")],
+                &[job_input("real"), job_input("ghost")],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("declared 0 times"),
+            "an undeclared job must name count 0: {err}"
+        );
+        // a background check with no job row (another check keeps the job
+        // list non-empty so the later per-check refusal is the one probed).
+        let err = s
+            .begin_verification_attempt(
+                TASK,
+                REV,
+                42,
+                ROOT,
+                &[],
+                &[
+                    inline_pass("lint"),
+                    job_check("backed"),
+                    job_check("unbacked"),
+                ],
+                &[job_input("backed")],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no job row definition"),
+            "a background check without a job must refuse: {err}"
+        );
+        // Nothing above wrote a row; the mixed valid attempt then succeeds
+        // with the exact derived order (inline first, background second).
+        assert!(s.open_verification_jobs(TASK).unwrap().is_empty());
+        assert!(s.current_verification_attempt(TASK).unwrap().is_none());
+        s.begin_verification_attempt(
+            TASK,
+            REV,
+            43,
+            ROOT,
+            &["src/a.c".into()],
+            &[inline_pass("lint"), job_check("unit")],
+            &[job_input("unit")],
+        )
+        .unwrap();
+        let attempt = s.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(attempt.checks.len(), 2);
+        assert_eq!(attempt.checks[0].check_id, "lint");
+        assert_eq!(attempt.checks[1].check_id, "unit");
+        assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
     }
 
     #[test]

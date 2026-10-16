@@ -1027,3 +1027,74 @@ fn every_agent_state_vocabulary_arm_round_trips_through_the_row_serializer() {
         );
     }
 }
+
+/// Bounded deterministic sweep measurement: 4,000 expired pending
+/// permissions terminalize in ONE transaction, the event's id/op arrays are
+/// byte-identical to the ascending-id arrays the former per-row
+/// `json_set('$[#]')` chain produced, and no pending row survives. The
+/// chained build re-parsed and re-serialized a growing JSON array once per
+/// row (O(n^2)); the aggregate path is one indexed pass.
+#[test]
+fn expire_sweep_terminalizes_many_rows_in_one_pass() {
+    const N: i64 = 4_000;
+    let (_dir, store, sid) = setup();
+    {
+        let conn = store.raw_conn();
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..N {
+            tx.execute(
+                "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
+                 VALUES (?1, ?2, 'cap', 'pending', ?3)",
+                params![sid.raw() as i64, 10_000 + i, 5_000],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let started = std::time::Instant::now();
+    let outcome = store
+        .expire_pending_permissions_for_session(
+            sid,
+            10_000,
+            AgentState::Idle,
+            ev(
+                EventKind::PermissionExpired,
+                AgentState::Idle,
+                serde_json::json!({}),
+            ),
+        )
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.expired.len(), N as usize);
+    assert!(outcome.event_seq.is_some());
+    let ids: Vec<i64> = outcome.expired.iter().map(|(id, _)| *id).collect();
+    let ops: Vec<i64> = outcome
+        .expired
+        .iter()
+        .map(|(_, op)| op.raw() as i64)
+        .collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids ascending");
+    let conn = store.raw_conn();
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM event WHERE session_id = ?1 AND kind = 'permission_expired'",
+            params![sid.raw() as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["permission_ids"], serde_json::json!(ids));
+    assert_eq!(payload["op_ids"], serde_json::json!(ops));
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM permission WHERE session_id = ?1 AND decision = 'pending'",
+            params![sid.raw() as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "every expired row terminalized");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "4k-row sweep took {elapsed:?}; the per-row JSON chain is back"
+    );
+}

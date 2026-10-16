@@ -50,6 +50,7 @@
 #[cfg(test)]
 use std::sync::Mutex;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -643,7 +644,7 @@ impl ShadowRoots {
         let Ok(sessions) = self.manager.list_sessions(None) else {
             return Err(ExecError::Internal("session list failed".into()));
         };
-        let mut rowed_dirs: Vec<PathBuf> = Vec::new();
+        let mut rowed_dirs: HashSet<PathBuf> = HashSet::new();
         for handle in sessions {
             let session = handle.id();
             let row = self
@@ -658,7 +659,7 @@ impl ShadowRoots {
                 continue;
             };
             let dir = PathBuf::from(&row.root);
-            rowed_dirs.push(dir.clone());
+            rowed_dirs.insert(dir.clone());
             if row.state.is_live() && !dir.is_dir() {
                 // Shadow directory gone: integration is impossible.
                 self.mark_state(session, ShadowRowState::Discarded)?;

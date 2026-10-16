@@ -158,25 +158,27 @@ impl SearchService {
         let needle_l = needle.to_lowercase();
         let index = recover_lock(&self.index);
         let mut out = Vec::new();
-        // Path substring matches.
-        if let Some(files) = index_files(&index, ws) {
-            for path in files.keys() {
-                if path.to_lowercase().contains(&needle_l) {
-                    out.push(Hit {
-                        path: path.clone(),
-                        score: 3.0,
-                        snippet: format!("path match: {path}"),
-                        symbol: None,
-                    });
-                }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Path substring matches. The path listing is enough: symbol data is
+        // never read here (per-call symbol materialization was pure clone
+        // work proportional to the whole workspace).
+        for path in index.file_paths(ws) {
+            if path_contains_lowercase(&path, &needle_l) {
+                seen.insert(path.clone());
+                out.push(Hit {
+                    score: 3.0,
+                    snippet: format!("path match: {path}"),
+                    path,
+                    symbol: None,
+                });
             }
         }
         // Token matches.
         for token in faktor_index::tokenize(needle) {
             for hit in index.files_for_token(ws, &token, limit) {
-                if !out.iter().any(|h| h.path == hit.path) {
+                if seen.insert(hit.path.clone()) {
                     out.push(Hit {
-                        path: hit.path.clone(),
+                        path: hit.path,
                         score: hit.freq as f64,
                         snippet: format!("token `{token}` × {}", hit.freq),
                         symbol: None,
@@ -437,23 +439,11 @@ impl SearchService {
     }
 }
 
-fn index_files(
-    index: &WorkspaceIndex,
-    ws: WorkspaceId,
-) -> Option<std::collections::HashMap<String, Vec<Symbol>>> {
-    let paths = index.file_paths(ws);
-    if paths.is_empty() {
-        return None;
+fn path_contains_lowercase(path: &str, needle_lower: &str) -> bool {
+    if path.is_ascii() && !path.bytes().any(|b| b.is_ascii_uppercase()) {
+        return path.contains(needle_lower);
     }
-    Some(
-        paths
-            .into_iter()
-            .map(|p| {
-                let syms = index.symbols_for(ws, &p);
-                (p, syms)
-            })
-            .collect(),
-    )
+    path.to_lowercase().contains(needle_lower)
 }
 
 /// One snapshot candidate of the fallback semantic path: the text embedded
@@ -684,6 +674,7 @@ pub fn fuse(rankings: &[(f64, Vec<Hit>)], limit: usize) -> Vec<Hit> {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.path.cmp(&b.path))
     });
     out.truncate(limit);
     out
@@ -721,6 +712,118 @@ mod tests {
     use super::*;
     use faktor_index::WorkspaceIndex as WI;
     use faktor_index::{content_hash, EmbeddingModel};
+
+    fn best_of<F: FnMut() -> u64>(runs: usize, mut f: F) -> u64 {
+        (0..runs).map(|_| f()).min().unwrap_or(u64::MAX)
+    }
+
+    /// Bounded deterministic measurement: `exact()` must not pay per-call
+    /// work proportional to the number of indexed SYMBOLS. Two corpora with
+    /// the same 1,000 Rust files and 0 vs 200 symbols per file are queried;
+    /// the symbol-free corpus is the baseline. The pre-fix path materialized
+    /// every symbol of every file on EVERY call (200k clones here; the
+    /// audit's 600k-symbol corpus measured ~12.8ms vs ~0.45ms baseline), so
+    /// its latency grew with the symbol count; the fixed path scans only
+    /// paths, so the two stay within a small factor.
+    #[test]
+    fn exact_cost_does_not_scale_with_indexed_symbols() {
+        let ws = WorkspaceId::new(21);
+        let mut no_symbols = WI::new();
+        let mut with_symbols = WI::new();
+        let mut symbol_body = String::from("parse token\n");
+        for s in 0..200 {
+            symbol_body.push_str(&format!("fn symbol_{s}() {{}}\n"));
+        }
+        for f in 0..1_000 {
+            let rel = format!("src/mod_{f:04}.rs");
+            no_symbols
+                .index_file(ws, std::path::Path::new(&rel), b"parse token\n", 0)
+                .unwrap();
+            with_symbols
+                .index_file(ws, std::path::Path::new(&rel), symbol_body.as_bytes(), 0)
+                .unwrap();
+        }
+        let bare = SearchService::new(Arc::new(Mutex::new(no_symbols)), None);
+        let rich = SearchService::new(Arc::new(Mutex::new(with_symbols)), None);
+        let base_ns = best_of(3, || {
+            let started = std::time::Instant::now();
+            let hits = bare.exact(ws, "parse", 200).unwrap();
+            assert!(!hits.is_empty());
+            started.elapsed().as_nanos() as u64
+        });
+        let rich_ns = best_of(3, || {
+            let started = std::time::Instant::now();
+            let hits = rich.exact(ws, "parse", 200).unwrap();
+            assert_eq!(hits.len(), 200);
+            started.elapsed().as_nanos() as u64
+        });
+        assert!(
+            rich_ns <= base_ns.saturating_mul(6) + 500_000,
+            "exact() over 200k indexed symbols took {rich_ns}ns vs {base_ns}ns without symbols; \
+             per-call symbol materialization scaled the query"
+        );
+    }
+
+    #[test]
+    fn exact_dedupes_overlapping_matches_and_handles_unicode_paths() {
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(22);
+        idx.index_file(
+            ws,
+            std::path::Path::new("SRC/Lib.RS"),
+            b"parse parse parse\n",
+            0,
+        )
+        .unwrap();
+        idx.index_file(ws, std::path::Path::new("src/lib.rs"), b"parse\n", 0)
+            .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/Ünicode_File.rs"),
+            b"parse\n",
+            0,
+        )
+        .unwrap();
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
+        let hits = svc.exact(ws, "lib.rs", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["SRC/Lib.RS", "src/lib.rs"]);
+        assert!(hits.iter().all(|h| h.score == 3.0));
+        assert_eq!(hits.iter().filter(|h| h.path == "src/lib.rs").count(), 1);
+        let unicode = svc.exact(ws, "ünicode", 10).unwrap();
+        assert_eq!(unicode.len(), 1);
+        assert_eq!(unicode[0].path, "src/Ünicode_File.rs");
+        // A token shared by every file is deduped per path, no duplicates.
+        let shared = svc.exact(ws, "parse", 10).unwrap();
+        assert_eq!(shared.len(), 3);
+        let mut sorted: Vec<&str> = shared.iter().map(|h| h.path.as_str()).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3);
+    }
+
+    /// Equal fused scores must order by path (the previous score-only sort
+    /// left the tie order to the score map's iteration order).
+    #[test]
+    fn fuse_ties_are_path_ordered_and_replay_identical() {
+        let hit = |path: &str| Hit {
+            path: path.to_string(),
+            score: 0.0,
+            snippet: path.to_string(),
+            symbol: None,
+        };
+        let rankings = vec![
+            (1.0, vec![hit("a.rs"), hit("b.rs"), hit("c.rs")]),
+            (1.0, vec![hit("b.rs"), hit("c.rs"), hit("a.rs")]),
+            (1.0, vec![hit("c.rs"), hit("a.rs"), hit("b.rs")]),
+        ];
+        let fused = fuse(&rankings, 10);
+        let paths: Vec<&str> = fused.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(fused[0].score, fused[1].score);
+        assert_eq!(fused[1].score, fused[2].score);
+        assert_eq!(fuse(&rankings, 10), fused);
+    }
 
     fn corpus() -> (Arc<Mutex<WI>>, WorkspaceId) {
         let mut idx = WI::new();

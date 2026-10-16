@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{
     NormalizedPartNumber, PartNumberError, PartNumberNormalizer, MAX_PART_NUMBER_BYTES,
 };
-use crate::offer::{CommercialOffer, VariantAttribute, MAX_ATTRIBUTES_PER_VARIANT};
+use crate::offer::{
+    matching_attribute_count, normalized_attributes, CommercialOffer, NormalizedAttribute,
+    VariantAttribute, MAX_ATTRIBUTES_PER_VARIANT,
+};
 use crate::packaging::PackagingType;
 use crate::quantity::Quantity;
 use crate::quote::{resolve_quote, PricingContext, QuoteStatus, VariantRequest};
@@ -224,61 +227,100 @@ fn tokenize(value: &str) -> Vec<String> {
     tokens
 }
 
-fn title_token_overlap_bp(query: &PartQuery, title: &str) -> u16 {
-    let mut wanted = tokenize(query.part_number.as_str());
-    if let Some(manufacturer) = &query.manufacturer {
-        for token in tokenize(manufacturer.as_str()) {
-            if !wanted.contains(&token) {
-                wanted.push(token);
+/// Query-side precomputation (complexity audit): the per-offer path used to
+/// re-tokenize and re-normalize the SAME query for every candidate — the
+/// part number + manufacturer + package tokens were rebuilt per offer, the
+/// manufacturer was re-normalized per offer, and the requested attributes
+/// were re-normalized per (variant × attribute) pair. One [`QueryView`] is
+/// built per call ([`match_offers`] shares it across the whole batch) and
+/// every candidate consumes the precomputed forms.
+struct QueryView<'a> {
+    query: &'a PartQuery,
+    /// Normalized manufacturer, non-empty (the signal's `query` half).
+    manufacturer: Option<String>,
+    /// Title-overlap wanted tokens: part number + manufacturer + package.
+    title_tokens: Vec<String>,
+    /// Normalized requested attributes (spec-overlap wanted side).
+    spec: Vec<NormalizedAttribute>,
+    /// Normalized package text (the package-match wanted side).
+    package_normalized: Option<String>,
+    /// The canonical query part number (normalized once, not per offer).
+    part: Result<NormalizedPartNumber, PartNumberError>,
+}
+
+impl<'a> QueryView<'a> {
+    fn new(query: &'a PartQuery) -> Self {
+        let manufacturer = query
+            .manufacturer
+            .as_ref()
+            .map(|value| normalized_text(value.as_str()))
+            .filter(|value| !value.is_empty());
+        let mut title_tokens = tokenize(query.part_number.as_str());
+        if let Some(value) = &query.manufacturer {
+            for token in tokenize(value.as_str()) {
+                if !title_tokens.contains(&token) {
+                    title_tokens.push(token);
+                }
             }
         }
-    }
-    if let Some(package) = &query.package {
-        for token in tokenize(package.as_str()) {
-            if !wanted.contains(&token) {
-                wanted.push(token);
+        if let Some(value) = &query.package {
+            for token in tokenize(value.as_str()) {
+                if !title_tokens.contains(&token) {
+                    title_tokens.push(token);
+                }
             }
         }
+        let package_normalized = query
+            .package
+            .as_ref()
+            .map(|value| normalized_text(value.as_str()));
+        Self {
+            query,
+            manufacturer,
+            title_tokens,
+            spec: normalized_attributes(&query.attributes),
+            package_normalized,
+            part: PartNumberNormalizer::new().normalize(query.part_number.as_str()),
+        }
     }
-    if wanted.is_empty() {
+}
+
+fn title_token_overlap_bp(view: &QueryView<'_>, title: &str) -> u16 {
+    if view.title_tokens.is_empty() {
         return 0;
     }
     let present = tokenize(title);
-    let hits = wanted
+    let hits = view
+        .title_tokens
         .iter()
         .filter(|token| present.contains(token))
         .count() as u64;
-    ((hits * 10_000) / wanted.len() as u64).min(10_000) as u16
+    ((hits * 10_000) / view.title_tokens.len() as u64).min(10_000) as u16
 }
 
-fn spec_overlap_bp(query: &PartQuery, offer: &CommercialOffer) -> Option<u16> {
-    if query.attributes.is_empty() {
+fn spec_overlap_bp(view: &QueryView<'_>, offer: &CommercialOffer) -> Option<u16> {
+    if view.spec.is_empty() {
         return None;
     }
+    let wanted = view.spec.len() as u64;
     let best = offer
         .variants
         .iter()
         .map(|variant| {
-            let hits = query
-                .attributes
-                .iter()
-                .filter(|wanted| {
-                    variant
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.matches(wanted))
-                })
-                .count() as u64;
-            (hits * 10_000) / query.attributes.len() as u64
+            // Each variant's attributes are normalized once; every wanted
+            // attribute is then a plain normalized comparison (the pairwise
+            // `matches()` re-normalized four strings per comparison).
+            let have = normalized_attributes(&variant.attributes);
+            let hits = matching_attribute_count(&have, &view.spec) as u64;
+            (hits * 10_000) / wanted
         })
         .max()
         .unwrap_or(0);
     Some(best.min(10_000) as u16)
 }
 
-fn package_match(query: &PartQuery, offer: &CommercialOffer) -> Option<bool> {
-    let wanted = query.package.as_ref()?;
-    let wanted_normalized = normalized_text(wanted.as_str());
+fn package_match(view: &QueryView<'_>, offer: &CommercialOffer) -> Option<bool> {
+    let wanted_normalized = view.package_normalized.as_ref()?;
     if wanted_normalized.is_empty() {
         return None;
     }
@@ -292,9 +334,9 @@ fn package_match(query: &PartQuery, offer: &CommercialOffer) -> Option<bool> {
         }
     }
     if !stated.is_empty() {
-        return Some(stated.iter().any(|value| value == &wanted_normalized));
+        return Some(stated.iter().any(|value| value == wanted_normalized));
     }
-    if normalized_text(offer.title.as_str()).contains(&wanted_normalized) {
+    if normalized_text(offer.title.as_str()).contains(wanted_normalized) {
         return Some(true);
     }
     None
@@ -365,12 +407,8 @@ struct ManufacturerSignal {
     conflict: bool,
 }
 
-fn manufacturer_signal(query: &PartQuery, offer: &CommercialOffer) -> ManufacturerSignal {
-    let query_manufacturer = query
-        .manufacturer
-        .as_ref()
-        .map(|value| normalized_text(value.as_str()))
-        .filter(|value| !value.is_empty());
+fn manufacturer_signal(view: &QueryView<'_>, offer: &CommercialOffer) -> ManufacturerSignal {
+    let query_manufacturer = view.manufacturer.clone();
     let offer_manufacturer = offer
         .identity
         .manufacturer
@@ -410,8 +448,18 @@ fn empty_signals() -> MatchSignals {
 
 /// Match one offer against a query, with full signals.
 pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usize) -> OfferMatch {
+    match_offer_with(&QueryView::new(query), offer, offer_index)
+}
+
+/// The shared implementation over a precomputed [`QueryView`].
+fn match_offer_with(
+    view: &QueryView<'_>,
+    offer: &CommercialOffer,
+    offer_index: usize,
+) -> OfferMatch {
+    let query = view.query;
     let mut signals = empty_signals();
-    let manufacturer = manufacturer_signal(query, offer);
+    let manufacturer = manufacturer_signal(view, offer);
     let (manufacturer_exact, manufacturer_known, manufacturer_conflict) = (
         manufacturer.exact,
         manufacturer.known,
@@ -420,14 +468,14 @@ pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usiz
     signals.manufacturer_exact = manufacturer_exact;
     signals.manufacturer_known = manufacturer_known;
     signals.manufacturer_conflict = manufacturer_conflict;
-    signals.package_match = package_match(query, offer);
+    signals.package_match = package_match(view, offer);
     signals.packaging_match = packaging_match(query, offer);
     signals.quantity_compatible = quantity_compatible(query, offer);
-    signals.title_token_overlap_bp = Some(title_token_overlap_bp(query, offer.title.as_str()));
-    signals.spec_overlap_bp = spec_overlap_bp(query, offer);
+    signals.title_token_overlap_bp = Some(title_token_overlap_bp(view, offer.title.as_str()));
+    signals.spec_overlap_bp = spec_overlap_bp(view, offer);
     signals.supplier_evidence = offer.supplier.is_some() || offer.manufacturer.is_some();
 
-    let query_part = PartNumberNormalizer::new().normalize(query.part_number.as_str());
+    let query_part = view.part.clone();
     let offer_mpn: Result<Option<NormalizedPartNumber>, PartNumberError> =
         offer.identity.normalized_mpn();
     let offer_source_part = offer.identity.normalized_source_part_number();
@@ -516,12 +564,14 @@ pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usiz
     }
 }
 
-/// Match many offers, applying the set-level ambiguity rule.
+/// Match many offers, applying the set-level ambiguity rule. The query-side
+/// precomputation is built ONCE for the whole batch (complexity audit).
 pub fn match_offers(query: &PartQuery, offers: &[CommercialOffer]) -> MatchOutcome {
+    let view = QueryView::new(query);
     let mut matches = Vec::new();
     let mut mismatches = 0usize;
     for (index, offer) in offers.iter().enumerate() {
-        let offer_match = match_offer(query, offer, index);
+        let offer_match = match_offer_with(&view, offer, index);
         if offer_match.certainty == MatchCertainty::Mismatch {
             mismatches += 1;
         } else {
@@ -552,5 +602,206 @@ pub fn match_offers(query: &PartQuery, offers: &[CommercialOffer]) -> MatchOutco
         certainty,
         matches,
         mismatches,
+    }
+}
+
+#[cfg(test)]
+mod complexity_tests {
+    use super::*;
+    use crate::money::Currency;
+    use crate::offer::{
+        CommercialOffer, LifecycleStatus, NormalizedAttribute, OfferProvenance, PriceVisibility,
+        StockState, VariantOffer,
+    };
+    use crate::text::SourceId;
+
+    fn source() -> SourceId {
+        SourceId::new("test").unwrap()
+    }
+
+    fn attr(name: &str, value: &str) -> VariantAttribute {
+        VariantAttribute {
+            name: Text::new(name).unwrap(),
+            value: Text::new(value).unwrap(),
+        }
+    }
+
+    fn variant(index: usize, attrs: usize) -> VariantOffer {
+        VariantOffer {
+            variant_id: crate::text::VariantId::new(&format!("sku-{index}")).unwrap(),
+            attributes: (0..attrs)
+                .map(|a| attr(&format!("attr{a}"), &format!("val{index}-{a}")))
+                .collect(),
+            packaging: None,
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            price_breaks: Vec::new(),
+            lead_time: None,
+        }
+    }
+
+    fn offer(index: usize, variants: usize, attrs: usize) -> CommercialOffer {
+        CommercialOffer {
+            source: source(),
+            identity: crate::identity::ProductIdentity {
+                manufacturer: Some(Text::new("ACME").unwrap()),
+                manufacturer_part_number: Some(Text::new(&format!("PART{index}")).unwrap()),
+                source_part_number: None,
+                offer_id: None,
+                canonical_url: None,
+                category: None,
+            },
+            title: Text::new(&format!("ACME PART{index} res 10K case 0603")).unwrap(),
+            description: None,
+            currency: Currency::CNY,
+            price_breaks: Vec::new(),
+            variants: (0..variants).map(|v| variant(v, attrs)).collect(),
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            lead_time: None,
+            packaging: Vec::new(),
+            supplier: None,
+            manufacturer: None,
+            provenance: OfferProvenance {
+                origin: crate::offer::ObservationOrigin::OfficialApi,
+                source: source(),
+                extractor_version: None,
+                connector_version: None,
+                normalization_version: None,
+                content_digest: None,
+                account_scope: None,
+                locale: None,
+                market: None,
+                source_confidence_bp: None,
+            },
+            observed_at_ms: 1,
+            price_visibility: PriceVisibility::Public,
+            lifecycle: LifecycleStatus::Unknown,
+        }
+    }
+
+    fn query() -> PartQuery {
+        PartQuery {
+            manufacturer: Some(Text::new("ACME").unwrap()),
+            part_number: Text::new("PART7").unwrap(),
+            package: Some(Text::new("0603").unwrap()),
+            packaging: None,
+            quantity: None,
+            attributes: vec![
+                attr("attr1", "val3-1"),
+                attr("attr4", "val5-4"),
+                attr(" attr7 ", "VAL2-7"),
+                attr("attr10", "val1-10"),
+            ],
+        }
+    }
+
+    #[test]
+    fn batch_matching_normalizes_the_query_and_candidates_linearly() {
+        // Complexity-audit evidence: 120 offers × 64 variants × 12 attributes.
+        // The pre-fix path rebuilt the query tokens/normalization per offer
+        // and re-normalized four strings per (wanted × attribute) pair in
+        // spec overlap; the batch view normalizes each candidate attribute
+        // exactly once and the wanted side once per batch.
+        const OFFERS: usize = 120;
+        const VARIANTS: usize = 64;
+        const ATTRS: usize = 12;
+        let offers: Vec<CommercialOffer> = (0..OFFERS).map(|i| offer(i, VARIANTS, ATTRS)).collect();
+        let query = query();
+        crate::offer::normalization_work::reset();
+        let outcome = match_offers(&query, &offers);
+        // Exactly the offer carrying PART7 matches; every other part number
+        // is a mismatch (the title shares vendor tokens but the identifier
+        // contradicts).
+        assert_eq!(outcome.mismatches, OFFERS - 1);
+        let best = outcome.matches.first().expect("one match");
+        assert_eq!(best.offer_index, 7);
+        assert!(best.certainty.rank() >= MatchCertainty::Strong.rank());
+        let normalizations = crate::offer::normalization_work::snapshot();
+        // Wanted: 4 attributes × 2 (name+value) once; candidates: each
+        // attribute name+value once per offer.
+        let candidate_axis = (OFFERS * VARIANTS * ATTRS * 2) as u64;
+        assert!(
+            normalizations <= candidate_axis + 64,
+            "normalizations must be linear in candidate attributes: \
+             {normalizations} for {candidate_axis} attribute halves + wanted side"
+        );
+        // Single-offer and batch paths agree on the full signal set.
+        for index in [0usize, 7, 42] {
+            let single = match_offer(&query, &offers[index], index);
+            if single.certainty == MatchCertainty::Mismatch {
+                assert!(
+                    outcome.matches.iter().all(|m| m.offer_index != index),
+                    "single mismatch must stay a batch mismatch at {index}"
+                );
+            } else {
+                assert_eq!(
+                    outcome.matches.iter().find(|m| m.offer_index == index),
+                    Some(&single),
+                    "batch and single signals must agree at {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spec_overlap_reuses_normalized_attributes_exactly() {
+        // The hoisted comparison must reproduce the pairwise `matches()`
+        // predicate byte-for-byte on unicode, case and spacing variants.
+        let query = PartQuery {
+            manufacturer: None,
+            part_number: Text::new("X1").unwrap(),
+            package: None,
+            packaging: None,
+            quantity: None,
+            attributes: vec![
+                attr("颜色", "黑色"),
+                attr(" 长度 ", "1M"),
+                attr("Tolerance", "± 1%"),
+            ],
+        };
+        let mut candidate = offer(0, 0, 0);
+        candidate.variants = vec![VariantOffer {
+            variant_id: crate::text::VariantId::new("v").unwrap(),
+            attributes: vec![
+                attr("颜色", "黑色"),
+                attr("长度", "1m"),
+                attr("tolerance", "±1%"),
+            ],
+            packaging: None,
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            price_breaks: Vec::new(),
+            lead_time: None,
+        }];
+        let view = QueryView::new(&query);
+        let hoisted = spec_overlap_bp(&view, &candidate);
+        assert_eq!(hoisted, Some(10_000), "all three attributes must match");
+        // Drop one wanted attribute's match: 2/3 hits -> 6666 bp.
+        candidate.variants[0].attributes.pop();
+        let hoisted = spec_overlap_bp(&view, &candidate);
+        assert_eq!(hoisted, Some(6_666));
+        // Equivalent to the pairwise predicate recomputed here.
+        let pairwise_hits = query
+            .attributes
+            .iter()
+            .filter(|wanted| {
+                candidate.variants[0]
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.matches(wanted))
+            })
+            .count();
+        assert_eq!(pairwise_hits, 2);
+        // The wanted side really is precomputed and comparable.
+        let wanted = normalized_attributes(&query.attributes);
+        assert_eq!(wanted.len(), 3);
+        assert!(wanted.contains(&NormalizedAttribute::of_parts("颜色", "黑色")));
     }
 }

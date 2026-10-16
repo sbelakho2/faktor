@@ -329,9 +329,11 @@ impl InstallLayout {
                 binary.display()
             )));
         }
-        let actual = file_digest(&binary).map_err(|e| UpdateError::StagedArtifactUnusable {
-            artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
-            detail: e.to_string(),
+        let actual = self.digest_memoized(&binary, digest).map_err(|e| {
+            UpdateError::StagedArtifactUnusable {
+                artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
+                detail: e.to_string(),
+            }
         })?;
         if actual != digest {
             return Err(UpdateError::StagedArtifactUnusable {
@@ -387,9 +389,11 @@ impl InstallLayout {
             ));
         }
         let artifact = self.artifact_path(artifact_name, digest);
-        let actual = file_digest(&artifact).map_err(|e| UpdateError::StagedArtifactUnusable {
-            artifact: artifact_name.to_string(),
-            detail: e.to_string(),
+        let actual = self.digest_memoized(&artifact, digest).map_err(|e| {
+            UpdateError::StagedArtifactUnusable {
+                artifact: artifact_name.to_string(),
+                detail: e.to_string(),
+            }
         })?;
         if actual != digest {
             return Err(UpdateError::StagedArtifactUnusable {
@@ -409,9 +413,11 @@ impl InstallLayout {
                 .map(|meta| meta.file_type().is_file())
                 .unwrap_or(false);
             let binary_current = binary_regular
-                && file_digest(&binary).map_err(|e| UpdateError::StagedArtifactUnusable {
-                    artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
-                    detail: e.to_string(),
+                && self.digest_memoized(&binary, digest).map_err(|e| {
+                    UpdateError::StagedArtifactUnusable {
+                        artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
+                        detail: e.to_string(),
+                    }
                 })? == digest;
             let manifest_current = fs::symlink_metadata(&manifest_path)
                 .map(|meta| meta.file_type().is_file())
@@ -486,6 +492,9 @@ impl InstallLayout {
                 Some(note) => UpdateError::Install(format!("{e}{note}")),
             });
         }
+        // The adopted release directory carries fresh bytes: any memoized
+        // observation of its paths is stale by construction.
+        self.invalidate_digest_memos(&dir);
         self.clear_stale_release_temps(release_id);
         Ok(dir)
     }

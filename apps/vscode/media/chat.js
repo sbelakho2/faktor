@@ -226,6 +226,18 @@
   var changeReviewState = null;
   var activeHistoryTab = 'conversations';
   var renderedOutcomes = null;
+  /**
+   * Content keys of the last rendered Changes / History lists. The host
+   * re-posts the WHOLE snapshot for every stream delta (the store object is
+   * structured-cloned across the webview boundary, so per-field identity
+   * never survives); these keys let an unchanged section skip the DOM
+   * rebuild entirely — an identical delta keeps focus, expansion state and
+   * reading position instead of tearing 1000 rows down and re-creating them.
+   * A section that renders its unavailable state resets its key so the
+   * recovery snapshot always rebuilds.
+   */
+  var renderedChangesKey = null;
+  var renderedHistoryKey = null;
   /** TRUE while an explicit outcomes read awaits its snapshot. */
   var outcomesReading = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
@@ -240,6 +252,23 @@
 
   function byId(id) {
     return document.getElementById(id);
+  }
+
+  /**
+   * Instrumented render seam: the selftest installs
+   * `window.__faktorRenderProbe` to count list REBUILDS (evidence that an
+   * unchanged delta skipped the DOM work). With no probe installed this is
+   * a no-op: the guard is the production behavior, the counter is evidence.
+   */
+  function renderProbe(kind) {
+    try {
+      var probe = typeof window !== 'undefined' ? window.__faktorRenderProbe : null;
+      if (probe && typeof probe.count === 'function') {
+        probe.count(kind);
+      }
+    } catch (error) {
+      // A probe must never affect rendering.
+    }
   }
 
   /**
@@ -1200,11 +1229,31 @@
         advanced: [],
       };
     }
+    // Content guard: everything this renderer puts on screen is a pure
+    // function of (changes, normalized selection, review state). An
+    // identical delta re-renders NOTHING — the previous DOM is already what
+    // a rebuild would produce.
+    var guardRows = Array.isArray(changes.rows) ? changes.rows : [];
+    var guardIndex = selectedIndexFor(guardRows);
+    var guardKey =
+      hash128(JSON.stringify(changes)) +
+      '#' +
+      guardIndex +
+      '#' +
+      (guardIndex >= 0 ? String(guardRows[guardIndex].path) : '') +
+      '#' +
+      hash128(JSON.stringify(changeReviewState));
+    if (renderedChangesKey !== null && renderedChangesKey === guardKey) {
+      return;
+    }
+    renderedChangesKey = guardKey;
+    renderProbe('changes');
     var focus = captureFocus(list);
     clear(list);
     if (changes.available === false) {
       // Explicit unavailable state with the exact reason; no rows and no
       // stale previously served paths (the read failure drops them).
+      renderedChangesKey = null;
       setText('changes-unavailable-label', CHANGES_UNAVAILABLE_LABEL);
       setText(
         'changes-unavailable-copy',
@@ -1450,6 +1499,7 @@
       note.hidden = true;
       list.hidden = true;
       historyOpenInFlight = null;
+      renderedHistoryKey = null;
       clear(list);
       return;
     }
@@ -1465,12 +1515,28 @@
     ) {
       historyOpenInFlight = null;
     }
+    // Content guard: the rows derive from (sessions, query) through the
+    // history policy and the framing flags are part of the key, so an
+    // identical delta never rebuilds up to a full 1000-row listing.
+    var historyKey =
+      hash128(JSON.stringify(Array.isArray(snapshot.sessions) ? snapshot.sessions : [])) +
+      '#' +
+      hash128(historyQuery) +
+      '#' +
+      (snapshot.session ? String(snapshot.session.id) : '') +
+      '#' +
+      String(historyOpenInFlight);
+    if (renderedHistoryKey !== null && renderedHistoryKey === historyKey) {
+      return;
+    }
+    renderedHistoryKey = historyKey;
     var result = historyPolicy.historyRows(
       Array.isArray(snapshot.sessions) ? snapshot.sessions : [],
       historyQuery,
     );
     status.textContent = historyPolicy.historyStatusText(result, historyQuery);
     var focus = captureHistoryFocus();
+    renderProbe('history');
     clear(list);
     for (var i = 0; i < result.rows.length; i++) {
       list.appendChild(historyRowNode(snapshot, result.rows[i]));

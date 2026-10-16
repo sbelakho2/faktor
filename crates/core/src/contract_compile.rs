@@ -1052,6 +1052,22 @@ struct NativeCompile<'a> {
     touched_files: Vec<String>,
     touched_symbols: Vec<String>,
     total_lines: u64,
+    /// Cargo component roots (`Cargo.toml` parent dirs) of the snapshot,
+    /// built ONCE per compile: the touched-file loops used to rebuild this
+    /// set inside every `cargo_component_root` call (O(touched × files)).
+    cargo_roots: BTreeSet<&'a str>,
+    /// Path -> index into `files`, built once (first occurrence wins):
+    /// `compile_constraints` used a linear `files.iter().find` per touched
+    /// path (O(touched × files)).
+    file_index: std::collections::HashMap<&'a str, usize>,
+}
+
+// Test-only per-thread count of Cargo-root set builds per compile (evidence
+// for the hoisting test): production builds carry no counter.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CARGO_ROOT_SET_BUILDS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 impl<'a> NativeCompile<'a> {
@@ -1062,6 +1078,21 @@ impl<'a> NativeCompile<'a> {
         build_systems: &'a [String],
         selectors: &'a [DiscoveredTest],
     ) -> CompiledContract {
+        let cargo_roots: BTreeSet<&str> = files
+            .iter()
+            .filter_map(|file| {
+                file.path
+                    .strip_suffix("Cargo.toml")
+                    .map(|dir| dir.trim_end_matches('/'))
+            })
+            .collect();
+        #[cfg(test)]
+        CARGO_ROOT_SET_BUILDS.with(|counter| counter.set(counter.get() + 1));
+        let mut file_index: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            file_index.entry(file.path.as_str()).or_insert(index);
+        }
         let mut state = Self {
             request,
             intent,
@@ -1074,6 +1105,8 @@ impl<'a> NativeCompile<'a> {
             touched_files: Vec::new(),
             touched_symbols: Vec::new(),
             total_lines: 0,
+            cargo_roots,
+            file_index,
         };
         state.collect_touched_surface();
         state.compile_test_obligations();
@@ -1215,7 +1248,7 @@ impl<'a> NativeCompile<'a> {
             if !path.ends_with(".rs") {
                 continue;
             }
-            roots.insert(cargo_component_root(path, &self.files));
+            roots.insert(cargo_component_root(path, &self.cargo_roots));
         }
         for root in roots.into_iter().take(MAX_COMPILE_OBLIGATIONS) {
             let label = component_label(&root);
@@ -1255,17 +1288,17 @@ impl<'a> NativeCompile<'a> {
         let mut by_component: std::collections::BTreeMap<String, (usize, usize, Vec<String>)> =
             std::collections::BTreeMap::new();
         for path in &self.touched_files {
-            let Some(file) = self.files.iter().find(|f| f.path == *path) else {
+            let Some(&file_index) = self.file_index.get(path.as_str()) else {
                 continue;
             };
-            let Some(content) = &file.content else {
+            let Some(content) = self.files[file_index].content.as_ref() else {
                 continue;
             };
             let public_items = public_item_count(content);
             if public_items == 0 {
                 continue;
             }
-            let root = cargo_component_root(path, &self.files);
+            let root = cargo_component_root(path, &self.cargo_roots);
             let entry = by_component.entry(root).or_insert((0, 0, Vec::new()));
             entry.0 += public_items;
             entry.1 += 1;
@@ -2292,28 +2325,22 @@ fn public_item_count(content: &str) -> usize {
 }
 
 /// The nearest ancestor directory of `path` that contains a `Cargo.toml`
-/// among the snapshot paths (`""` = the repository root).
-fn cargo_component_root(path: &str, files: &[&RepositoryFile]) -> String {
-    let manifests: BTreeSet<&str> = files
-        .iter()
-        .filter_map(|file| {
-            file.path
-                .strip_suffix("Cargo.toml")
-                .map(|dir| dir.trim_end_matches('/'))
-        })
-        .collect();
+/// among the snapshot paths (`""` = the repository root). `cargo_roots` is
+/// the prebuilt set of manifest parent dirs (see
+/// [`NativeCompile::cargo_roots`]).
+fn cargo_component_root(path: &str, cargo_roots: &BTreeSet<&str>) -> String {
     let mut dir = match path.rfind('/') {
         Some(index) => &path[..index],
         None => "",
     };
     loop {
-        if manifests.contains(dir) {
+        if cargo_roots.contains(dir) {
             return dir.to_string();
         }
         match dir.rfind('/') {
             Some(index) => dir = &dir[..index],
             None => {
-                if dir.is_empty() || manifests.contains("") {
+                if dir.is_empty() || cargo_roots.contains("") {
                     return String::new();
                 }
                 dir = "";
@@ -3418,5 +3445,133 @@ fn replayed_refresh_token_fails() {}
         assert!(a.starts_with("r1:"));
         assert_eq!(a.len(), 3 + 16);
         assert!(a[3..].chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cargo_root_lookup_is_hoisted_once_per_compile() {
+        // A full-size snapshot (the MAX_COMPILE_FILES cap) with 64 touched
+        // Rust files across 64 Cargo components: the old code rebuilt the
+        // Cargo-root set inside EVERY cargo_component_root call — once per
+        // touched file in the obligation pass and again in the constraints
+        // pass — i.e. >= 64 full 20k-file scans per compile. The
+        // instrumented counter proves the hoisted build runs exactly once,
+        // so old/new work-unit ratio is >= the touched-file count.
+        let mut files: Vec<RepositoryFile> = Vec::with_capacity(MAX_COMPILE_FILES);
+        files.push(RepositoryFile::with_content(
+            "Cargo.toml",
+            "[package]\nname = \"root\"\n",
+        ));
+        for i in 0..64 {
+            files.push(RepositoryFile::with_content(
+                format!("pkg{i:03}/Cargo.toml"),
+                format!("[package]\nname = \"pkg{i:03}\"\n"),
+            ));
+            files.push(RepositoryFile::with_content(
+                format!("pkg{i:03}/src/refresh.rs"),
+                "pub fn refresh() {}\n",
+            ));
+        }
+        while files.len() < MAX_COMPILE_FILES {
+            files.push(RepositoryFile::path_only(format!(
+                "src/vendor/f{:05}.bin",
+                files.len()
+            )));
+        }
+        CARGO_ROOT_SET_BUILDS.with(|counter| counter.set(0));
+        let compiled = compile_contract(&request(
+            "Fix the refresh race and refactor the public surface",
+            RepositorySnapshot::from_files(files),
+        ));
+        let builds = CARGO_ROOT_SET_BUILDS.with(std::cell::Cell::get);
+        let touched_rs = compiled
+            .touched_files
+            .iter()
+            .filter(|path| path.ends_with(".rs"))
+            .count();
+        assert_eq!(
+            touched_rs, 64,
+            "every per-component refresh.rs must be matched: {:?}",
+            compiled.touched_files
+        );
+        assert_eq!(
+            builds, 1,
+            "the Cargo-root set must be built exactly once per compile \
+             ({touched_rs} touched files would have rebuilt it at least {touched_rs} times)"
+        );
+        assert!(
+            compiled.build_systems.iter().any(|s| s == "cargo"),
+            "the cargo path must actually run: {:?}",
+            compiled.build_systems
+        );
+        assert!(
+            compiled
+                .contract
+                .proof_obligations
+                .iter()
+                .any(|o| o.evidence_binding.is_bound()),
+            "the cargo manifest obligations must still be derived"
+        );
+    }
+
+    #[test]
+    fn cargo_root_lookup_takes_the_deepest_manifest_and_tolerates_duplicates() {
+        // Adversarial snapshot: nested manifests (a, a/b, a/b/c), a duplicate
+        // path with/without content, and a touched path OUTSIDE the
+        // snapshot. The deepest ancestor manifest must own the constraint,
+        // and the duplicate/absent paths must not panic or misroot.
+        let files = vec![
+            RepositoryFile::with_content("Cargo.toml", "[package]\nname = \"root\"\n"),
+            RepositoryFile::with_content("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            RepositoryFile::with_content("a/b/Cargo.toml", "[package]\nname = \"ab\"\n"),
+            RepositoryFile::with_content("a/b/c/Cargo.toml", "[package]\nname = \"abc\"\n"),
+            RepositoryFile::with_content("a/b/src/refresh.rs", "pub fn refresh() {}\n"),
+            RepositoryFile::path_only("a/b/src/refresh.rs"),
+            RepositoryFile::with_content("a/b/src/noa.rs", "pub fn rename_a() {}\n"),
+        ];
+        let compiled = compile_contract(&request(
+            "Rename the public api in refresh",
+            RepositorySnapshot::from_files(files),
+        ));
+        let deepest = |root: &str| {
+            compiled
+                .contract
+                .proof_obligations
+                .iter()
+                .any(|o| match &o.evidence_binding {
+                    EvidenceBinding::CheckIds(ids) => {
+                        ids.iter().any(|id| id == &format!("{root}:rust_check"))
+                    }
+                    _ => false,
+                })
+        };
+        assert!(
+            deepest("a/b"),
+            "the deepest manifest (a/b) owns its tree: {:?}",
+            compiled
+                .contract
+                .proof_obligations
+                .iter()
+                .map(|o| o.evidence_binding.clone())
+                .collect::<Vec<_>>()
+        );
+        // The duplicate path (content-bearing first, path-only second) never
+        // double-counts or panics: the compile stays deterministic under any
+        // input order (the duplicate pair keeps its relative order — the
+        // digest is order-sensitive only for genuinely unordered input).
+        let again = compile_contract(&request(
+            "Rename the public api in refresh",
+            RepositorySnapshot::from_files(vec![
+                RepositoryFile::with_content("a/b/src/noa.rs", "pub fn rename_a() {}\n"),
+                RepositoryFile::with_content("a/b/src/refresh.rs", "pub fn refresh() {}\n"),
+                RepositoryFile::path_only("a/b/src/refresh.rs"),
+                RepositoryFile::with_content("a/b/c/Cargo.toml", "[package]\nname = \"abc\"\n"),
+                RepositoryFile::with_content("a/b/Cargo.toml", "[package]\nname = \"ab\"\n"),
+                RepositoryFile::with_content("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+                RepositoryFile::with_content("Cargo.toml", "[package]\nname = \"root\"\n"),
+            ]),
+        ));
+        assert_eq!(compiled, again, "input ordering must not change output");
+        // The duplicate pair never doubles the constraint counts.
+        assert_eq!(compiled.contract.constraints.len(), 1, "{compiled:?}");
     }
 }

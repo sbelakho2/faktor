@@ -1137,3 +1137,211 @@ mod typed_ledger_tests {
         assert_eq!(free_micro(&store, s.id, tid), 10_000);
     }
 }
+
+#[cfg(test)]
+mod scan_perf_tests {
+    use super::super::*;
+    use super::task_tests::tmp_store;
+
+    fn seed_session(store: &Store) -> SessionId {
+        let ws = store.create_workspace("/w").unwrap();
+        store.create_session(ws, "t", "p", "m").unwrap().id
+    }
+
+    /// Bounded deterministic measurement + adversarial classification on a
+    /// realistic large table pair: 4,000 tasks and 20k verification records
+    /// (the former record/task `iter().any()` sweeps were O(tasks x records)
+    /// = 80M comparisons here). Every expected issue is crafted explicitly
+    /// (orphan records, a Passed record on an uncompleted task, completed
+    /// tasks with and without their certifying record, a duplicate
+    /// certificate), so the scan's output is pinned exactly.
+    #[test]
+    fn verification_invariants_are_exact_and_bounded_at_scale() {
+        let (_d, store) = tmp_store();
+        let sid = seed_session(&store);
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for task_id in 1..=4_000i64 {
+                tx.execute(
+                    "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
+                                       spent_tokens, spent_turns, state, revision, created_ms, updated_ms)
+                     VALUES (?1, ?2, 'g', '[]', '[]', 0, 0, '\"pending\"', 1, 1, 1)",
+                    params![task_id, sid.raw() as i64],
+                )
+                .unwrap();
+            }
+            for task_id in 5_001..=6_000i64 {
+                tx.execute(
+                    "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
+                                       spent_tokens, spent_turns, state, revision, created_ms, updated_ms)
+                     VALUES (?1, ?2, 'g', '[]', '[]', 0, 0, '\"verified_complete\"', 2, 1, 1)",
+                    params![task_id, sid.raw() as i64],
+                )
+                .unwrap();
+            }
+            let record = |task_id: i64, revision: i64, status: &str| {
+                tx.execute(
+                    "INSERT INTO verification_record(task_id, revision, workspace_id, worktree_id,
+                        criteria_json, checks_json, changed_files_json, unrelated_changes_json,
+                        status, started_ms)
+                     VALUES (?1, ?2, 1, 1, '[]', '[]', '[]', '[]', ?3, 1)",
+                    params![task_id, revision, format!("\"{status}\"")],
+                )
+                .unwrap();
+            };
+            // 500 completed tasks carry their certificate (revision N-1),
+            // 500 do not. Task 5_501 carries a DUPLICATE certificate.
+            for task_id in 5_001..=5_501i64 {
+                record(task_id, 1, "passed");
+            }
+            record(5_501, 1, "passed");
+            // 100 orphan records (no task row at all).
+            for task_id in 9_001..=9_100i64 {
+                record(task_id, 1, "passed");
+            }
+            // ONE Passed record certifying the current revision of a task
+            // that is NOT VerifiedComplete.
+            record(1, 1, "passed");
+            // Non-passed noise records of EXISTING tasks never violate
+            // anything (12k against pending tasks, 1k against completed ones
+            // at a non-certifying revision).
+            for i in 0..12_000i64 {
+                record((i % 4_000) + 1, 3, "failed");
+            }
+            for task_id in 5_001..=6_000i64 {
+                record(task_id, 3, "failed");
+            }
+            tx.commit().unwrap();
+        }
+        let started = std::time::Instant::now();
+        let scan = store.verification_record_invariants().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(scan.relevant_tasks, 1_000);
+        assert_eq!(scan.completed_tasks, 1_000);
+        assert_eq!(scan.total_records, 501 + 1 + 100 + 1 + 12_000 + 1_000);
+        let kind_counts = |kind: &str| {
+            scan.issues
+                .iter()
+                .filter(|issue| issue.kind == kind)
+                .count()
+        };
+        assert_eq!(kind_counts("record_without_task"), 100);
+        assert_eq!(kind_counts("passed_on_uncompleted"), 1);
+        assert_eq!(kind_counts("verified_without_record"), 499);
+        assert_eq!(scan.issues.len(), 600);
+        // Ordering: orphan records (ascending id), then passed_on_uncompleted
+        // (tasks), then verified_without_record (tasks).
+        assert_eq!(scan.issues[0].kind, "record_without_task");
+        assert_eq!(scan.issues[99].kind, "record_without_task");
+        assert_eq!(scan.issues[100].kind, "passed_on_uncompleted");
+        assert_eq!(scan.issues[101].kind, "verified_without_record");
+        assert!(
+            scan.issues[101]
+                .detail
+                .contains("task 1/5502 is VerifiedComplete"),
+            "{}",
+            scan.issues[101].detail
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "scan over 4k tasks / 20k records took {elapsed:?}; pairwise sweeps are back"
+        );
+    }
+
+    /// The active-turn ownership scan classifies every anchor shape exactly
+    /// as the former per-row point probes did, and stays bounded on a large
+    /// unrecoverable set (the former loop ran up to four COUNT queries per
+    /// row).
+    #[test]
+    fn active_turn_anchors_match_the_point_probe_contract() {
+        let (_d, store) = tmp_store();
+        let sid = seed_session(&store);
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO message(session_id, seq, role, data, created_ms)
+                 VALUES (?1, 7, 'user', '{}', 1)",
+                params![sid.raw() as i64],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, status, requested_at)
+                 VALUES (?1, 3, 103, 'p', 'pending', 1)",
+                params![sid.raw() as i64],
+            )
+            .unwrap();
+            for (seq, op_id) in [(2i64, 103i64), (3, 104)] {
+                tx.execute(
+                    "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms)
+                     VALUES (?1, ?2, ?3, 'turn_started', '\"running\"', 1)",
+                    params![seq, sid.raw() as i64, op_id],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms,
+                                      effect_status, recovery)
+                 VALUES (?1, 105, 'read_file', '{}', 'running', 1, 'none', 'none')",
+                params![sid.raw() as i64],
+            )
+            .unwrap();
+            let turn = |op_id: i64, queue_seq: Option<i64>, message_id: Option<i64>| {
+                tx.execute(
+                    "INSERT INTO turn_record(session_id, turn_op_id, queue_seq, prompt_message_id,
+                        started_at, status, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4, 1, 'active', 1)",
+                    params![sid.raw() as i64, op_id, queue_seq, message_id],
+                )
+                .unwrap();
+            };
+            turn(101, None, Some(7)); // message anchor
+            turn(102, Some(3), None); // queue anchor
+            turn(103, None, None); // event anchor
+            turn(104, None, None); // event anchor via seq 1 op 104
+            turn(105, None, None); // tool-run anchor
+            turn(106, None, Some(99)); // message id absent -> unrecoverable
+            turn(107, Some(42), None); // queue seq absent -> unrecoverable
+            tx.commit().unwrap();
+        }
+        let scan = store.active_turn_ownership_invariants().unwrap();
+        assert_eq!(scan.active_turns, 7);
+        assert_eq!(scan.recoverable, 5);
+        assert_eq!(scan.unrecoverable.len(), 2);
+        let ops: Vec<u64> = scan
+            .unrecoverable
+            .iter()
+            .map(|u| u.turn_op_id.raw())
+            .collect();
+        assert_eq!(ops, vec![106, 107]);
+        assert!(scan.unrecoverable[0]
+            .detail
+            .contains("has no prompt message row"));
+
+        // Scale: 2,000 more active turns, no anchors at all.
+        {
+            let conn = store.raw_conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..2_000i64 {
+                tx.execute(
+                    "INSERT INTO turn_record(session_id, turn_op_id, started_at, status, updated_ms)
+                     VALUES (?1, ?2, 1, 'active', 1)",
+                    params![sid.raw() as i64, 1_000 + i],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let started = std::time::Instant::now();
+        let scan = store.active_turn_ownership_invariants().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(scan.active_turns, 2_007);
+        assert_eq!(scan.recoverable, 5);
+        assert_eq!(scan.unrecoverable.len(), 2_002);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "scan over 2k active turns took {elapsed:?}; per-row point probes are back"
+        );
+    }
+}

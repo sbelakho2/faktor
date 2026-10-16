@@ -279,26 +279,35 @@ impl OrchestratorRuntime {
         };
         let rows_by_child: HashMap<&str, &ChildRuntime> =
             rows.iter().map(|r| (r.child_id.as_str(), r)).collect();
+        // First assignment row per item, exactly like the per-item scan this
+        // replaces (the assignment shape was validated just above).
+        let mut assignments_by_item: HashMap<&str, &WorkItemAssignment> =
+            HashMap::with_capacity(assignments.len());
+        for a in &assignments {
+            assignments_by_item.entry(a.item_id.as_str()).or_insert(a);
+        }
         // Spawn evidence of the run: the env snapshot every spawn binds is
         // the FIRST durable write of a spawn (key `<run>/env-<child>`).
         // The graph uses it to tell "assigned but never admitted" (no
         // node) apart from "child row deleted after a real spawn"
         // (MissingChild).
         let spawn_evidence = env_snapshot_keys(self.manager.clone(), parent_session, run_id)?;
+        let spawn_evidence: HashSet<&str> = spawn_evidence.iter().map(|k| k.as_str()).collect();
         let mut children = Vec::with_capacity(rows.len());
         let mut claimed: HashSet<&str> = HashSet::new();
         for item in &plan.work_items {
             if !specs.get(&item.id).map(|s| s.spawn).unwrap_or(true) {
                 continue; // auto item: never spawns, owns no child node
             }
-            let Some(assignment) = assignments.iter().find(|a| a.item_id == item.id) else {
+            let Some(assignment) = assignments_by_item.get(item.id.as_str()).copied() else {
                 return Err(GraphError::MissingAssignment {
                     run_id: run_id.to_string(),
                     item_id: item.id.clone(),
                 });
             };
             let Some(row) = rows_by_child.get(assignment.child_id.as_str()) else {
-                if spawn_evidence.contains(&format!("{run_id}/env-{}", assignment.child_id)) {
+                if spawn_evidence.contains(format!("{run_id}/env-{}", assignment.child_id).as_str())
+                {
                     return Err(GraphError::MissingChild {
                         run_id: run_id.to_string(),
                         child_id: assignment.child_id.clone(),
