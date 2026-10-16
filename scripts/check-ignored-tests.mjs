@@ -3,13 +3,12 @@
 //
 // Every `#[ignore]`d test in the workspace must:
 //   1. follow the documented tag convention
-//      `[fault] [soak] [security] [release] [perf] [live-paid]` (plus the
-//      AGENTS.md `[visual]` baseline category), and
-//   2. be either assigned to a known lane (`fault` / `release` / `soak`
-//      nightly lanes, plus the `perf` and `live-paid` lanes documented in
-//      `scripts/certification/ignored-tests.json`), or explicitly documented
-//      as manual/live-paid with a reason, or registered as a non-test helper
-//      (the Windows re-exec helper is the only such case).
+//      `[fault] [security] [release]` (plus the AGENTS.md `[visual]`
+//      baseline category), and
+//   2. be either assigned to a known lane (`fault` / `release` nightly
+//      lanes documented in `scripts/certification/ignored-tests.json`), or
+//      explicitly documented as manual with a reason, or registered as a
+//      non-test helper (the Windows re-exec helper is the only such case).
 //
 // "Assigned to a lane" is checked executably, not declaratively: the lane's
 // step must exist in `.woodpecker/trusted/<workflow>.yaml`, its recorded
@@ -242,7 +241,7 @@ function runCheck({ root, registryPath }) {
       } else {
         add(
           'unassigned',
-          `${site.file}#${site.fn || `line${site.line}`} is [${site.tag}] but has no lane assignment and no documented manual/live-paid reason`,
+          `${site.file}#${site.fn || `line${site.line}`} is [${site.tag}] but has no lane assignment and no documented manual reason`,
         );
       }
       continue;

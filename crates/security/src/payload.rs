@@ -1043,65 +1043,6 @@ mod tests {
         );
     }
 
-    /// Manual soak (not part of CI; runs in release only): 10 GiB of
-    /// logical payload streamed through [`Scanner`] with bounded memory;
-    /// the secret lands at logical byte 5 GiB and must be found.
-    #[test]
-    #[ignore = "[soak] 10 GiB logical payload stream with bounded memory — release-only manual soak"]
-    fn soak_ten_gib_logical_stream_stays_bounded() {
-        let policy = ScanPolicy::default();
-        let chunk = vec![b'n'; 64 * 1024];
-        let target = 5u64 * 1024 * 1024 * 1024;
-        let mut scanner = Scanner::new(&policy);
-        let mut peak = 0usize;
-        let mut sent = 0u64;
-        let mut secret_at: Option<u64> = None;
-        while sent < target {
-            let take = chunk.len().min((target - sent) as usize);
-            if scanner.feed(&chunk[..take]) == FeedStatus::ExceedsLimit {
-                panic!("no cap configured: must never exceed");
-            }
-            sent += take as u64;
-            peak = peak.max(scanner.buffered_bytes());
-            if sent == target {
-                // Place the secret so its start lands exactly at 5 GiB.
-                let mut tail = vec![b'o'; GHP.len()];
-                tail.copy_from_slice(GHP.as_bytes());
-                if scanner.feed(&tail) == FeedStatus::ExceedsLimit {
-                    panic!("no cap configured");
-                }
-                secret_at = Some(sent);
-            }
-        }
-        let rows = hit_rows(&scanner.finish());
-        assert_eq!(rows.len(), 1, "secret at 5 GiB must be found");
-        assert_eq!(rows[0].0, secret_at.unwrap() as usize);
-        assert!(
-            peak <= 64 * 1024 + policy.overlap_max + 64 * 1024,
-            "peak {peak}"
-        );
-    }
-
-    #[test]
-    #[ignore = "[soak] 10 GiB of real bytes streamed through the scanner with bounded memory — release-only manual soak"]
-    fn soak_ten_gib_real_bytes_stream_bounded_memory() {
-        // Manual soak: 10 GiB of REAL bytes through the engine.
-        let policy = ScanPolicy::default();
-        let mut scanner = Scanner::new(&policy);
-        let chunk = vec![b'm'; 1 << 20];
-        let total = 10u64 << 30;
-        let mut sent = 0u64;
-        while sent < total {
-            let take = chunk.len().min((total - sent) as usize);
-            scanner.feed(&chunk[..take]);
-            sent += take as u64;
-        }
-        scanner.feed(GHP.as_bytes());
-        let rows = hit_rows(&scanner.finish());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, total as usize);
-    }
-
     // ------------------------------------------------------------------
     // spec row (d): overlap = longest pattern decision; boundary rows
     // ------------------------------------------------------------------

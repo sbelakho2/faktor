@@ -381,10 +381,10 @@ enabled but unused ⇒ 0 schema appearances, 0 extra input tokens, 0 model
 calls, 0 HTTP calls, 0 browser launches; a Mouser price question ⇒ exactly
 one `source_market` invocation, 0 internal model calls; a 500-line BOM ⇒
 one initiating interaction, deterministic job, full result in artifact,
-compact context result, no hidden summarizer. Long-run soak, live canary
-(opt-in, `[live-paid]`/`[soak]` ignored lane per repo convention,
-`crates/commerce-connectors/tests/live_canary.rs`) and browser-crash/quota
-exhaustion/restart-recovery suites.
+compact context result, no hidden summarizer. Browser-crash/quota
+exhaustion/restart-recovery suites; live vendor canaries are never
+automated — the `canary` registry reports the doctor's per-source
+configured/absent status and no test or lane contacts a vendor.
 
 ## 17. Build order (normative)
 
@@ -416,5 +416,5 @@ exhaustion/restart-recovery suites.
 16. CommerceSourceService in the daemon graph exactly once; construction
     order tests updated
 17. admin login/status/doctor commands
-18. security, robustness (fixture replay), canary, soak, and
-    token-economics certification suites
+18. security, robustness (fixture replay), and token-economics
+    certification suites

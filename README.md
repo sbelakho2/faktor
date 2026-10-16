@@ -120,7 +120,7 @@ implementations of the neutral `SystemIntelligenceProvider` and
 apps/        (Faktor-owned IDE panels: the VS Code extension host/chat/cockpit and the JetBrains split-mode frontend/backend — task tree, blockers, tournament, board, evidence)
 crates/      (the Rust engine workspace, incl. winjob/pty/agent/verify/sandbox/index/cas/snapshot)
 fixtures/    (protocol, providers, screenshots, repositories)
-tests/       (integration, soak, fault, visual, performance — adversarial only)
+tests/       (integration, fault, visual, security, fuzz — adversarial only)
 ui/          (historical UI attribution only: LICENSES/ for the removed vendored code)
 ```
 
@@ -169,20 +169,12 @@ precedence over a root `.woodpecker.yml`, and this repository has none):
   `jetbrains-smoke`, then the aggregate `certificate`. A `storage-policy`
   step fails closed if the PR workflow ever declares volumes.
 - **`trusted.yaml`** (`push`/`tag`, darwin/windows on `push` to `main`) — the
-  full lane set including the release `[perf]` lane and the darwin/windows
-  matrix combos, using the trusted named-volume caches (`faktor-trusted-*`).
+  full lane set and the darwin/windows matrix combos, using the trusted
+  named-volume caches (`faktor-trusted-*`).
 - **`nightly.yaml`** (`cron` job `nightly`) — `[fault]` campaigns at scale,
-  longrun, efficiency, economy, coding-benchmark smoke (provider-key runs are
-  recorded as explicit skips, never silent) and supply-chain evidence.
-  Registration is in `scripts/woodpecker/setup.md`;
-  `scripts/woodpecker/activate.sh` does it via the Woodpecker API.
-
-The trusted `soak-smoke` lane runs the per-release 30–60 min accelerated
-churn with the mandatory quiescent-convergence checker, and the nightly
-`soak` lane owns the real 12–24 h real-time convergence run
-(`scripts/soak.sh --mode churn|realtime`): a missing metric sample or any
-failed metric fails the lane, and both lanes' certificates parse
-`target/certification/soak.json` for the exact commit.
+  longrun and supply-chain evidence. Registration is in
+  `scripts/woodpecker/setup.md`; `scripts/woodpecker/activate.sh` does it via
+  the Woodpecker API.
 
 The `certificate` job is the aggregate gate in every workflow: every lane
 emits a `faktor-woodpecker-lane/v2` marker with the exact commit and tree,
@@ -278,7 +270,7 @@ authoritative surface and is scan-enforced.
   Residuals (reported, not hidden): external services are represented by
   in-process fakes/loopback servers — the certification executes the daemon
   path, never a live vendor; live-provider/network behavior is covered by
-  the adapters' own contract suites and the `[soak]`/`[fault]` lanes.
+  the adapters' own contract suites and the `[fault]` lanes.
 
 <!-- capability-axes:start -->
 | Capability | wired | adapter_test_defined | daemon_e2e_test_defined | platform_lane_defined | adapter_certified | daemon_e2e_certified | platforms_certified | external_dependency |

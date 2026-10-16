@@ -390,8 +390,6 @@ const SCRIPT_ALLOWLIST = new Map(
       'release install-matrix lane (clean-prefix extract + doctor + archive structure); requires built release artifacts and runs in the full certify-local profile.',
     'scripts/package-artifacts.sh':
       'release artifact packaging lane (certify.sh release-artifacts); requires built release binaries, out of scope for the local dogfood suite.',
-    'scripts/soak.sh':
-      'bounded soak driver; long [soak] runs execute in the nightly/soak-smoke lanes with wall-clock budgets, never in the interactive dogfood suite.',
     'scripts/supply-chain.sh':
       'static-lane supply-chain gate; needs SUPPLY_CHAIN_BUILD=1 and a release build, executed by the trusted static lane.',
     'scripts/update-iana-special-registry.sh':
@@ -405,7 +403,7 @@ const SCRIPT_ALLOWLIST = new Map(
     'scripts/certification/fixtures/woodpecker-api/mock_server.py':
       'fixture mock Woodpecker API; spawned by scripts/certify.sh release gates and the certification selftests.',
     'scripts/certification/prove-all.mjs':
-      'certificate aggregate binding the checkout bytes; its component selftests (discovery, workflow graph, publisher, visual, soak) each run in dogfood §2.',
+      'certificate aggregate binding the checkout bytes; its component selftests (discovery, workflow graph, publisher, visual) each run in dogfood §2.',
     'scripts/certification/publish-status.py':
       'Python publisher implementation pinned to the same canonical payload vector as publish-status.mjs (whose selftest runs in dogfood §2).',
     'scripts/certification/lane-marker.py':
@@ -2526,7 +2524,7 @@ function workflowFiles(root) {
 
 /**
  * Test-support crates under tests/ (direct children only: `tests/<name>/
- * Cargo.toml`; fixture corpora nested deeper are benchmark inputs, not
+ * Cargo.toml`; fixture corpora nested deeper are corpus inputs, not
  * crates). They must be workspace members so `cargo test --workspace` (§1)
  * compiles and runs them. A crate that is not a member is a gap unless the
  * workspace-membership decision is explicitly reviewed here WITH a reason; an

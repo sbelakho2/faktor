@@ -1392,8 +1392,8 @@ mod tests {
             &cache,
         )
         .unwrap();
-        // (Performance is a release-mode distribution gate in
-        // tests/performance — see perf_context_plan_20k_message_window.)
+        // Performance distribution gates are release-mode only and run
+        // outside the default CI suite.
         assert!(plan.messages.len() < 20_000, "window must be bounded");
         assert!(!plan.messages.is_empty());
         assert_eq!(

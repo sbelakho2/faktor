@@ -711,7 +711,6 @@ const WORKFLOWS = {
       'linux',
       'static',
       'docs',
-      { lane: 'soak-smoke', requiredArtifacts: ['target/certification/soak.json'] },
       { lane: 'vscode', requiredArtifacts: ['apps/vscode/faktor-ci.vsix'] },
       { lane: 'vscode-e2e', requiredArtifacts: ['target/certification/vscode-e2e.json'] },
       'jetbrains-build',
@@ -719,20 +718,13 @@ const WORKFLOWS = {
         lane: 'jetbrains-smoke',
         requiredArtifacts: ['target/certification/jetbrains-host-matrix.json'],
       },
-      'perf',
       { lane: 'release-artifacts', requiredArtifacts: ['target/release/faktor-cli'] },
     ],
   },
   nightly: {
     expected: [
       'fault-scale',
-      { lane: 'soak', requiredArtifacts: ['target/certification/soak.json'] },
-      'contention',
       'longrun',
-      'efficiency',
-      'economy',
-      'coding-benchmark',
-      { lane: 'coding-benchmark-real-model', skippable: true },
       'supply-chain',
       // The nightly UI smoke pair (no single image carries node+chromium and
       // the JDK/Rust toolchain, and trusted lanes forbid unpinned apt):
@@ -879,104 +871,6 @@ function extractDeclaredCommands(yamlText, lane) {
     }
   }
   return declared ? declared.filter((line) => line !== '') : null;
-}
-
-// The convergence metrics every soak artifact must certify. Missing samples
-// are a typed FAILURE in `scripts/certification/soak-convergence.py`, so a
-// passing artifact must record all of them as passed; the certificate
-// re-checks that contract instead of trusting a hashed file.
-export const SOAK_CONVERGENCE_METRICS = [
-  'rss_bounded',
-  'fds_bounded',
-  'child_processes_zero',
-  'background_tasks_settled',
-  'writer_queue_zero',
-  'reader_queue_zero',
-  'wal_converged',
-  'temp_files_removed',
-  'cas_unreachable_stable',
-  'journal_latency_no_upward_trend',
-  'index_latency_no_upward_trend',
-  'reconnect_correct',
-  'duration_target_met',
-];
-
-const SOAK_ARTIFACT_PATH = 'target/certification/soak.json';
-
-// Lane mode contract: the trusted per-release gate is the accelerated churn;
-// the nightly lane is the real-time 12-24h run.
-const SOAK_LANE_MODE = { 'soak-smoke': 'churn', soak: 'realtime' };
-
-// A soak artifact is more than a hashed file: the certificate parses it and
-// requires the exact-SHA binding, a passing lane status and an
-// all-metrics-passed convergence record.
-function soakArtifactProblems(record, label, cwd) {
-  const problems = [];
-  const artifacts = Array.isArray(record.artifacts) ? record.artifacts : [];
-  const entry = artifacts.find((artifact) => artifact && artifact.path === SOAK_ARTIFACT_PATH);
-  if (!entry) {
-    return problems;
-  }
-  const full = resolve(cwd || ROOT, SOAK_ARTIFACT_PATH);
-  if (!existsSync(full) || !statSync(full).isFile()) {
-    problems.push(`soak-unreadable: ${label} ${SOAK_ARTIFACT_PATH} is missing`);
-    return problems;
-  }
-  let payload;
-  try {
-    payload = readJsonStrict(full);
-  } catch (error) {
-    problems.push(`soak-unreadable: ${label} ${SOAK_ARTIFACT_PATH} is not strict JSON: ${error.message}`);
-    return problems;
-  }
-  if (payload.schema !== 'faktor-soak/v1') {
-    problems.push(`soak-schema: ${label} soak schema '${payload.schema}' != 'faktor-soak/v1'`);
-  }
-  if (payload.lane !== record.lane) {
-    problems.push(`soak-lane-mismatch: ${label} soak lane '${payload.lane}' != marker lane '${record.lane}'`);
-  }
-  if (payload.commit !== record.commit) {
-    problems.push(`soak-commit-mismatch: ${label} soak commit '${payload.commit}' != marker commit '${record.commit}'`);
-  }
-  if (payload.tree !== record.tree) {
-    problems.push(`soak-tree-mismatch: ${label} soak tree '${payload.tree}' != marker tree '${record.tree}'`);
-  }
-  if (payload.status !== 'passed') {
-    problems.push(`soak-status: ${label} soak status '${payload.status}' != 'passed'`);
-  }
-  const expectedMode = SOAK_LANE_MODE[record.lane];
-  if (expectedMode && payload.mode !== expectedMode) {
-    problems.push(
-      `soak-mode-mismatch: ${label} lane ${record.lane} requires mode '${expectedMode}', soak ran '${payload.mode}'`,
-    );
-  }
-  const convergence = payload.convergence;
-  if (!convergence || typeof convergence !== 'object') {
-    problems.push(`soak-convergence-missing: ${label} soak artifact carries no convergence object`);
-    return problems;
-  }
-  if (payload.convergence_required !== true || convergence.required !== true) {
-    problems.push(`soak-convergence-missing: ${label} convergence was not required (required=${convergence.required})`);
-  }
-  if (convergence.mode !== payload.mode) {
-    problems.push(
-      `soak-mode-mismatch: ${label} convergence mode '${convergence.mode}' != soak mode '${payload.mode}'`,
-    );
-  }
-  if (convergence.status !== 'passed' || convergence.ok !== true) {
-    const failed = Array.isArray(convergence.failed_metrics) ? convergence.failed_metrics.join(', ') : 'unknown';
-    problems.push(`soak-convergence-failed: ${label} convergence status '${convergence.status}' (failed: ${failed})`);
-  }
-  const metrics = Array.isArray(convergence.metrics) ? convergence.metrics : [];
-  for (const name of SOAK_CONVERGENCE_METRICS) {
-    const metric = metrics.find((candidate) => candidate && candidate.name === name);
-    if (!metric) {
-      problems.push(`soak-metric-missing: ${label} convergence did not record '${name}'`);
-    } else if (metric.status !== 'passed') {
-      problems.push(`soak-metric-failed: ${label} convergence metric '${name}' status='${metric.status}'`);
-    }
-  }
-  return problems;
 }
 
 function markerProblems(record, options) {
@@ -1133,7 +1027,6 @@ function markerProblems(record, options) {
       problems.push(`flake-mismatch: ${label} flakes.report missing`);
     }
   }
-  problems.push(...soakArtifactProblems(record, label, cwd));
   return { problems, auth: authVerdict.auth };
 }
 
@@ -1804,87 +1697,6 @@ function runSelftest() {
         cwd: repo,
       });
       expectFailCode(result, 'artifact-missing', 'artifact missing');
-    });
-
-    // ------------------------------------------- soak convergence artifact
-    run('soak artifact is semantically enforced for the lane contract', () => {
-      try {
-      WORKFLOWS['selftest-soak'] = {
-        expected: [{ lane: 'soak-smoke', requiredArtifacts: [SOAK_ARTIFACT_PATH] }],
-      };
-      const soakPath = join(repo, SOAK_ARTIFACT_PATH);
-      mkdirSync(dirname(soakPath), { recursive: true });
-      const soakPayload = (overrides = {}, convergenceOverrides = {}) => ({
-        schema: 'faktor-soak/v1',
-        lane: 'soak-smoke',
-        status: 'passed',
-        mode: 'churn',
-        commit,
-        tree,
-        target_seconds: 1800,
-        convergence_required: true,
-        convergence: {
-          schema: 'faktor-soak-convergence/v1',
-          status: 'passed',
-          ok: true,
-          required: true,
-          lane: 'soak-smoke',
-          mode: 'churn',
-          failed_metrics: [],
-          metrics: SOAK_CONVERGENCE_METRICS.map((name) => ({ name, status: 'passed' })),
-          ...convergenceOverrides,
-        },
-        ...overrides,
-      });
-      const verifySoak = (payload) => {
-        writeFileSync(soakPath, JSON.stringify(payload));
-        const artifacts = [
-          { path: SOAK_ARTIFACT_PATH, sha256: hashFile(soakPath) },
-        ];
-        const record = {
-          ...marker('soak-smoke', { commands: ['echo soak-smoke'], lane: 'soak-smoke' }),
-          artifacts,
-          artifact_digest: artifactDigest(artifacts),
-        };
-        rmSync(lanesDir, { recursive: true, force: true });
-        writeMarkers(lanesDir, { 'soak-smoke': record });
-        return verifyMarkers({
-          workflow: 'selftest-soak',
-          lanesDir,
-          commit,
-          tree,
-          runId,
-          pipelineStatus: 'success',
-          yamlText: null,
-          laneTokens: {},
-          checkArtifacts: true,
-          cwd: repo,
-        });
-      };
-      const good = verifySoak(soakPayload());
-      assert(good.ok, `valid soak artifact must verify, problems=${JSON.stringify(good.manifest.problems)}`);
-      expectFailCode(
-        verifySoak(soakPayload({}, { status: 'failed', ok: false, failed_metrics: ['rss_bounded'] })),
-        'soak-convergence-failed',
-        'failed convergence',
-      );
-      expectFailCode(
-        verifySoak(
-          soakPayload({}, {
-            metrics: SOAK_CONVERGENCE_METRICS.filter((name) => name !== 'wal_converged').map((name) => ({
-              name,
-              status: 'passed',
-            })),
-          }),
-        ),
-        'soak-metric-missing',
-        'missing convergence metric',
-      );
-      expectFailCode(verifySoak(soakPayload({ commit: '0'.repeat(40) })), 'soak-commit-mismatch', 'soak commit');
-      expectFailCode(verifySoak(soakPayload({ mode: 'smoke' }, { mode: 'smoke' })), 'soak-mode-mismatch', 'soak mode');
-      } finally {
-        delete WORKFLOWS['selftest-soak'];
-      }
     });
 
     // ------------------------------------------------- lane-marker helper

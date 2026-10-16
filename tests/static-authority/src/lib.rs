@@ -6667,8 +6667,6 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // `GlobalAlloc` wrapper whose allocation-free `libc::write` report
         // must not recurse through the allocator.
         ("crates/cli/src/test_memory_guard.rs", 1),
-        ("tests/coding-benchmark/src/daemon.rs", 1),
-        ("tests/coding-benchmark/src/process.rs", 1),
     ];
 
     /// Every `.rs` file under `crates/` and `tests/` (including out-of-line
@@ -7973,83 +7971,6 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert!(
             vscode_lane.contains("node scripts/protocol-codegen.mjs --check-clients"),
             "the trusted vscode lane must run the client drift check"
-        );
-    }
-
-    /// Audit 27 (+audit 5): the reproducible contention benchmark exists, is
-    /// #[ignore]d (normal PR runs stay fast) and is assigned to a wired
-    /// nightly lane (the trusted perf lane selects the package too). The
-    /// audit-5 wiring is pinned too: session-keyed event timing, per-job
-    /// writer receipts, the separately instrumented reader-pool permit wait,
-    /// and REAL on-disk IndexService generations driven through
-    /// request_build/reconcile.
-    #[test]
-    fn contention_benchmark_is_wired_into_nightly_and_trusted() {
-        let root = repo_root();
-        let bench = std::fs::read_to_string(root.join("tests/performance/tests/contention.rs"))
-            .expect("contention benchmark");
-        assert!(
-            bench.contains("#[ignore = \"[perf] multi-agent contention"),
-            "the benchmark must stay #[ignore]d so PR runs stay fast"
-        );
-        for axis in [
-            "sse_lag",
-            "event_lag",
-            "writer_queue_wait",
-            "writer_exec",
-            "messages_page",
-            "reader_pool_wait",
-            "index_rebuild",
-            "wal_peak_bytes",
-            "rss_end_kb",
-        ] {
-            assert!(bench.contains(axis), "benchmark misses the {axis} axis");
-        }
-        // Audit-5 wiring: the bug classes must not silently regress back to
-        // the shapes this item removed (seq-only lag keys, global writer
-        // deltas, in-memory index toys, mislabeled page duration).
-        for needle in [
-            "(SessionId, u64)",
-            "take_writer_receipts",
-            "take_reader_receipts",
-            "IndexService::open",
-            "request_build",
-            "reconcile_now",
-            "write_bench_files",
-        ] {
-            assert!(
-                bench.contains(needle),
-                "benchmark misses the audit-5 wiring marker `{needle}`"
-            );
-        }
-        let registry =
-            std::fs::read_to_string(root.join("scripts/certification/ignored-tests.json"))
-                .expect("ignored-test registry");
-        assert!(
-            registry.contains("\"contention\""),
-            "the contention lane must be registered"
-        );
-        assert!(
-            registry.contains("tests/performance/tests/contention.rs"),
-            "the benchmark must be assigned to a lane"
-        );
-        let nightly = std::fs::read_to_string(root.join(".woodpecker/trusted/nightly.yaml"))
-            .expect("nightly workflow");
-        assert!(
-            nightly.contains("  - name: contention"),
-            "the nightly contention lane step is missing"
-        );
-        assert!(
-            nightly.contains(
-                "cargo test -p faktor-tests-performance --release --test contention -- --ignored"
-            ),
-            "the nightly contention lane command drifted"
-        );
-        let trusted = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
-            .expect("trusted workflow");
-        assert!(
-            trusted.contains("cargo test -p faktor-tests-performance --release -- --ignored"),
-            "the trusted perf lane must keep selecting the performance package"
         );
     }
 

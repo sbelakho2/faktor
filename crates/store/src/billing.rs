@@ -639,8 +639,8 @@ pub(crate) fn validate_prefix_segments_json(json: &str) -> StoreResult<()> {
 // the legacy logical-op columns already carry the linkage, but only at the
 // SQL level. The derivation itself (summing input/output tokens, counting
 // usage rows, attributing cache from the durable prefix observation) lives
-// in the test-only `faktor-tests-efficiency` crate; this method is the
-// durable read it derives from.
+// in test-only harnesses; this method is the durable read they derive
+// from.
 // ---------------------------------------------------------------------------
 
 /// One `provider_call` row attributable to one task, as read by

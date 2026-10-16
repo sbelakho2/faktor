@@ -19,9 +19,9 @@
 //!   hard cap is a typed `UnknownPrice`; without a cap it records a
 //!   documented Unknown spend with nothing folded).
 //!
-//! The full 5000-seed durable cross-check is `#[ignore]`-gated (`[soak]`);
-//! the CI smoke runs a deterministic subset. The pure-model property driver
-//! runs the full 5000 traces per seed in normal mode.
+//! The durable cross-check smoke runs a deterministic subset in CI; the
+//! pure-model property driver runs the full 5000 traces per seed in normal
+//! mode.
 
 #![cfg_attr(
     not(test),
@@ -1114,17 +1114,6 @@ async fn durable_reference_comparison_smoke() {
     for seed in SEEDS {
         let fixture = fixture();
         for trace in 0..100u64 {
-            durable_trace(&fixture, seed, trace, 60_000).await;
-        }
-    }
-}
-
-#[tokio::test]
-#[ignore = "[soak] accounting reservation state machine vs the durable ledger, 5000 seeded traces per seed"]
-async fn durable_reference_comparison_full() {
-    for seed in SEEDS {
-        let fixture = fixture();
-        for trace in 0..TRACES_PER_SEED {
             durable_trace(&fixture, seed, trace, 60_000).await;
         }
     }

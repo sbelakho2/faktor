@@ -1063,12 +1063,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
- "faktor-browser",
- "faktor-cas",
  "faktor-commerce",
- "faktor-core",
  "faktor-security",
- "faktor-terminal",
  "hmac",
  "serde",
  "serde_json",
@@ -1721,54 +1717,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "faktor-tests-benchmark"
-version = "0.1.0"
-dependencies = [
- "faktor-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "faktor-tests-coding-benchmark"
-version = "0.1.0"
-dependencies = [
- "faktor-cli",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "faktor-tests-economy"
 version = "0.1.0"
 dependencies = [
  "faktor-agent",
  "faktor-core",
- "faktor-provider",
- "faktor-router",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "faktor-tests-efficiency"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "faktor-context",
- "faktor-core",
- "faktor-evidence",
- "faktor-memory",
- "faktor-router",
- "faktor-session",
- "faktor-store",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -1853,27 +1806,6 @@ dependencies = [
  "faktor-instructions",
  "faktor-provider",
  "faktor-session",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "faktor-tests-performance"
-version = "0.1.0"
-dependencies = [
- "faktor-agent",
- "faktor-cas",
- "faktor-context",
- "faktor-core",
- "faktor-fs",
- "faktor-index",
- "faktor-instructions",
- "faktor-protocol",
- "faktor-provider",
- "faktor-server",
- "faktor-session",
- "faktor-store",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1971,31 +1903,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "faktor-tests-router-economics"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "faktor-agent",
- "faktor-core",
- "faktor-edit",
- "faktor-fs",
- "faktor-instructions",
- "faktor-ollama",
- "faktor-openai",
- "faktor-provider",
- "faktor-router",
- "faktor-security",
- "faktor-session",
- "faktor-snapshot",
- "faktor-store",
- "futures",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "faktor-tests-router-properties"
 version = "0.1.0"
 dependencies = [
@@ -2020,27 +1927,6 @@ dependencies = [
  "faktor-session",
  "faktor-store",
  "faktor-verify",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "faktor-tests-soak"
-version = "0.1.0"
-dependencies = [
- "faktor-agent",
- "faktor-cas",
- "faktor-context",
- "faktor-core",
- "faktor-fs",
- "faktor-instructions",
- "faktor-protocol",
- "faktor-provider",
- "faktor-server",
- "faktor-session",
- "faktor-store",
- "rand",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3497,7 +3383,6 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

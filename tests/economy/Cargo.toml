@@ -6,12 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-faktor-router.workspace = true
 faktor-core.workspace = true
 faktor-agent.workspace = true
-faktor-provider.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

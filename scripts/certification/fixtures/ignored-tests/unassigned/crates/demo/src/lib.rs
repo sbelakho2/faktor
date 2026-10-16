@@ -1,5 +1,5 @@
-#[ignore = "[soak] planted bounded demo soak"]
-fn demo_soak_bounded() {}
+#[ignore = "[fault] planted bounded demo fault"]
+fn demo_fault_bounded() {}
 
-#[ignore = "[soak] planted unassigned ignored test"]
+#[ignore = "[fault] planted unassigned ignored test"]
 fn demo_unassigned() {}

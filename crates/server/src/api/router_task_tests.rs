@@ -2350,8 +2350,30 @@ async fn native_mutating_multi_agent_task_isolated_then_explicit_integration_and
     }
     assert_eq!(modes, vec![serde_json::json!("orchestrated")], "{start}");
 
-    // Durable assignments exist BEFORE/while the children drive.
-    let assignments = OrchestratorRuntime::assignment_rows(manager.clone(), sid, &run_id).unwrap();
+    // Durable assignments exist BEFORE/while the children drive. The list
+    // surface reports the run as soon as its plan row commits, and the plan
+    // row deliberately precedes the (atomic, single-transaction) assignment
+    // commit — so synchronize on the assignment rows themselves, bounded,
+    // and fail closed if any child row ever appears while the assignment set
+    // is still incomplete (the durable identity contract: nothing spawns
+    // before the whole set is durable).
+    let assignment_deadline = std::time::Instant::now() + Duration::from_secs(240);
+    let assignments = loop {
+        let rows = OrchestratorRuntime::assignment_rows(manager.clone(), sid, &run_id).unwrap();
+        if rows.len() == 3 {
+            break rows;
+        }
+        let children = OrchestratorRuntime::registry_rows(manager.clone(), sid, &run_id).unwrap();
+        assert!(
+            children.is_empty(),
+            "child rows are durable before the assignment rows: {children:?}"
+        );
+        assert!(
+            std::time::Instant::now() < assignment_deadline,
+            "assignment rows never committed for run {run_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert_eq!(assignments.len(), 3, "one durable assignment per item");
     let a_of = |id: &str| assignments.iter().find(|a| a.item_id == id).unwrap();
     assert_eq!(

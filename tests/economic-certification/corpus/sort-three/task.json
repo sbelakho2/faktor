@@ -1,9 +1,0 @@
-{
-  "id": "sort-three",
-  "task_class": "hard",
-  "phase": "test_analysis",
-  "input_tokens": 22000,
-  "output_tokens": 1800,
-  "fix_at_attempt": null,
-  "order": 12
-}

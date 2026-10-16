@@ -4,19 +4,18 @@
 //! module is the registry and shared vocabulary for the **opt-in** live
 //! canaries that exercise a connector against the real vendor only when an
 //! operator explicitly provides that source's credentials. Nothing here
-//! performs I/O: the canary tests (`tests/live_canary.rs`) read the
-//! environment, and the daemon's doctor reports the same per-source
-//! configured/absent status from [`canary_statuses_from_env`] so the two can
-//! never drift.
+//! performs I/O: [`canary_statuses_from_env`] reads the environment, and the
+//! daemon's doctor reports the same per-source configured/absent status so
+//! the two can never drift.
 //!
 //! Non-negotiables:
 //!
 //! * **Opt-in only.** A source is [`CanaryStatus::Configured`] only when
 //!   every one of its `required_env` variables is set and non-empty. An
 //!   absent source makes no request; there is no default credential.
-//! * **Never in CI by default.** The canary tests are `#[ignore]`-gated and
-//!   assigned to the key-gated `live-paid` lane; the lane itself is a
-//!   recorded skip until an operator provides credentials.
+//! * **Never in CI by default.** No automated path imports vendor
+//!   credentials or performs a request; a source is configured only when an
+//!   operator explicitly provides its credentials.
 //! * **Structural validity, never golden constants.** Live vendor data
 //!   changes; the canaries assert shape invariants ([`structural_discovery_check`],
 //!   [`structural_offer_check`]) and never compare against captured vendor
@@ -73,8 +72,8 @@ pub struct LiveCanarySource {
 }
 
 /// The live-canary sources, in deterministic order. The environment variable
-/// names are the contract between an operator, the canary tests and the
-/// doctor line; they are names only, never values.
+/// names are the contract between an operator and the doctor line; they are
+/// names only, never values.
 pub const LIVE_CANARY_SOURCES: [LiveCanarySource; 5] = [
     LiveCanarySource {
         source: "mouser",
@@ -142,8 +141,8 @@ pub fn canary_status(
 }
 
 /// The status of every source under an injected environment lookup. The
-/// canary tests and the doctor share this function so their notions of
-/// "configured" can never drift.
+/// doctor consumes this function so the operator's environment and the
+/// reported notion of "configured" can never drift.
 pub fn canary_statuses(
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(&'static str, CanaryStatus)> {

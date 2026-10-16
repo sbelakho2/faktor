@@ -135,7 +135,7 @@ apps/        Faktor-owned IDE clients
   vscode/       extension host + hand-written chat panel (Faktor-owned; selftest + VSIX surface verify)
   jetbrains/    native Kotlin bridge + Swing panel (Faktor-owned; behavioral+visual matrices IMPLEMENTED, HEAD-bound)
 fixtures/    protocol/, providers/, screenshots/, repositories/ test data
-tests/       integration/, soak/, performance/, fault/, visual/ (adversarial-only)
+tests/       integration/, fault/, longrun/, visual/, security/ (adversarial-only)
 crates/      the Rust engine workspace
 docs/        architecture.md (this spec), native-protocol.md (Faktor Native
              Protocol v1), api-contracts.md, specs/*.md (frozen sub-specs)
@@ -776,7 +776,7 @@ Each dependency edge carries a `DependencyPolicy`:
 ## 13. Performance budgets (§37)
 
 Numbers are enforced by tests as gates. `cargo test --workspace` runs
-them; soak/perf runs are `#[ignore]`-gated (see §14).
+them; long `[fault]`/`[visual]` runs are `#[ignore]`-gated (see §14).
 
 | Budget | Value | Enforced by |
 |---|---|---|
@@ -813,8 +813,8 @@ Test crates (each an independent workspace member):
 - `tests/integration` — end-to-end behavior against the daemon: crash
   recovery, permissions, compaction, paging and the native HTTP surface.
 - `tests/fault` — fault injection: crash, corruption, truncation, races.
-- `tests/soak` — long-run stability (memory bounds, journal growth).
-- `tests/performance` — perf gates (§13) — `[perf]`.
+- `tests/longrun` / `tests/quality` — cross-restart durability and
+  no-quality-regression invariants.
 - `tests/visual` — pixel-level UI compatibility: zero-pixel-diff **outside
   branding masks** (`BrandingMask` + `compose_plus_overlay` for the "+"
   overlay region). The frozen 16-case audit matrix is rendered at test time
@@ -822,8 +822,8 @@ Test crates (each an independent workspace member):
 
 Ignore conventions (AGENTS.md, verified by CI):
 
-- Long tests are `#[ignore]`-gated and named with `[soak]`, `[perf]`,
-  `[visual]`, or `[fault]` prefixes; they do not run in normal CI.
+- Long tests are `#[ignore]`-gated and named with `[fault]` or `[visual]`
+  prefixes; they do not run in normal CI.
 - `cargo test --workspace` runs everything else; each crate's unit tests
   must pass before the crate is considered done.
 

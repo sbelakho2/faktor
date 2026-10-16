@@ -505,8 +505,8 @@ pub trait Summarizer: Send + Sync {
 }
 
 /// Compactor with a per-instance evidence archive. Production wires one
-/// compactor per compaction call; tests/soaks may reuse one instance and
-/// read the archive back through [`Compactor::evidence`].
+/// compactor per compaction call; long-lived harnesses may reuse one
+/// instance and read the archive back through [`Compactor::evidence`].
 pub struct Compactor {
     summarizer: Option<Arc<dyn Summarizer>>,
     evidence: Mutex<EvidenceArchive>,

@@ -23,13 +23,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # bytes, independently of the production signer, and refuses any mismatch.
 hmac = "0.12"
 sha1 = "0.10"
-# Live-canary only (tests/live_canary.rs): the opt-in browser canaries drive
-# the real browser authority over an operator's stored logged-in profile.
-# The library itself still has no HTTP client and never launches Chromium.
-faktor-browser.workspace = true
-faktor-cas.workspace = true
-faktor-core.workspace = true
-faktor-terminal.workspace = true
+
 
 [lints]
 workspace = true

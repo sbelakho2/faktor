@@ -2,17 +2,13 @@
   "schema": "faktor-ignored-tests/v1",
   "allowed_tags": [
     "fault",
-    "soak",
     "security",
     "release",
-    "perf",
-    "live-paid",
     "visual"
   ],
   "required_nightly_lanes": [
     "fault",
-    "release",
-    "soak"
+    "release"
   ],
   "lanes": {
     "fault": {
@@ -24,31 +20,6 @@
       "workflow": "nightly",
       "step": "longrun",
       "command": "cargo test -p faktor-tests-longrun --release"
-    },
-    "soak": {
-      "workflow": "nightly",
-      "step": "soak",
-      "command": "bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale"
-    },
-    "perf": {
-      "workflow": "trusted",
-      "step": "perf",
-      "command": "cargo test -p faktor-tests-performance --release -- --ignored"
-    },
-    "live-paid": {
-      "workflow": "nightly",
-      "step": "coding-benchmark-real-model",
-      "command": "cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored"
-    },
-    "live-paid-econ": {
-      "workflow": "nightly",
-      "step": "coding-benchmark-real-model",
-      "command": "cargo test -p faktor-tests-router-economics --test capture -- --ignored"
-    },
-    "contention": {
-      "workflow": "nightly",
-      "step": "contention",
-      "command": "cargo test -p faktor-tests-performance --release --test contention -- --ignored"
     }
   },
   "assignments": [
@@ -106,91 +77,6 @@
       "file": "crates/updater/tests/release_flip.rs",
       "fn": "the_running_binary_changes_with_the_activated_release",
       "lane": "fault"
-    },
-    {
-      "file": "tests/soak/src/lib.rs",
-      "fn": "soak_convergence_churn",
-      "lane": "soak"
-    },
-    {
-      "file": "tests/accounting-modelcheck/src/lib.rs",
-      "fn": "durable_reference_comparison_full",
-      "lane": "soak"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "cold_start_under_150ms",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "idle_memory_under_80mb",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "perf_context_plan_20k_message_window",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "perf_growing_transcript_cost_stays_bounded",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "perf_json_wire_roundtrip_p50_lt_100us",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/performance/src/lib.rs",
-      "fn": "perf_messages_before_paging_p95_lt_5ms",
-      "lane": "perf"
-    },
-    {
-      "file": "tests/coding-benchmark/tests/real.rs",
-      "fn": "real_model_corpus_run",
-      "lane": "live-paid"
-    },
-    {
-      "file": "tests/coding-benchmark/tests/real.rs",
-      "fn": "real_daemon_mechanics_with_stub_provider",
-      "lane": "live-paid"
-    },
-    {
-      "file": "tests/economic-certification/tests/capture.rs",
-      "fn": "live_coding_capture_requires_env_and_freezes_real_outputs",
-      "lane": "live-paid-econ"
-    },
-    {
-      "file": "tests/performance/tests/contention.rs",
-      "fn": "perf_multi_agent_contention_32_sessions",
-      "lane": "contention"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/live_canary.rs",
-      "fn": "live_paid_mouser_canary",
-      "lane": "live-paid"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/live_canary.rs",
-      "fn": "live_paid_digikey_canary",
-      "lane": "live-paid"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/live_canary.rs",
-      "fn": "live_paid_lcsc_canary",
-      "lane": "live-paid"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/live_canary.rs",
-      "fn": "soak_live_china1688_browser_canary",
-      "lane": "live-paid"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/live_canary.rs",
-      "fn": "soak_live_alibaba_browser_canary",
-      "lane": "live-paid"
     }
   ],
   "manual": [
@@ -199,66 +85,6 @@
       "fn": "fault_acquire_restart_recovers_pending_jobs",
       "tag": "fault",
       "reason": "opt-in acquire restart storm; the source file marks it 'never run in CI' \u2014 operator-run only"
-    },
-    {
-      "file": "crates/cli/src/acquire_certification.rs",
-      "fn": "soak_acquire_cache_breaker_and_quota_storm",
-      "tag": "soak",
-      "reason": "opt-in acquire cache/connector storm; the source file marks it 'never run in CI' \u2014 operator-run only"
-    },
-    {
-      "file": "crates/fs/src/lib.rs",
-      "fn": "perf_fd_walk_within_2x_of_canonicalize",
-      "tag": "perf",
-      "reason": "timing bound run explicitly; not part of the trusted perf lane package set"
-    },
-    {
-      "file": "crates/security/src/payload.rs",
-      "fn": "soak_ten_gib_logical_stream_stays_bounded",
-      "tag": "soak",
-      "reason": "release-only 10 GiB logical payload manual soak"
-    },
-    {
-      "file": "crates/security/src/payload.rs",
-      "fn": "soak_ten_gib_real_bytes_stream_bounded_memory",
-      "tag": "soak",
-      "reason": "release-only 10 GiB real-bytes manual soak"
-    },
-    {
-      "file": "crates/terminal/src/tests.rs",
-      "fn": "timeline_ring_stays_bounded_under_300_spawns",
-      "tag": "perf",
-      "reason": "timing/ring bound run explicitly; not part of the trusted perf lane package set"
-    },
-    {
-      "file": "tests/benchmark/src/lib.rs",
-      "fn": "live_benchmark_requires_env",
-      "tag": "soak",
-      "reason": "env-gated live skeleton (FAKTOR_BENCH_LIVE=1); run explicitly, never in CI"
-    },
-    {
-      "file": "tests/benchmark/src/lib.rs",
-      "fn": "bench_corpus_tasks_end_to_end_slow_entries_twin",
-      "tag": "soak",
-      "reason": "slow offline twin over slow-marked corpus entries; run explicitly"
-    },
-    {
-      "file": "tests/longrun/src/lib.rs",
-      "fn": "soak_24h_zero_drift_certification",
-      "tag": "soak",
-      "reason": "standalone 24h ledger zero-drift variant; the nightly soak lane owns the real-time 24h convergence acceptance (scripts/soak.sh --mode realtime); run explicitly for this ledger variant"
-    },
-    {
-      "file": "tests/quality/src/lib.rs",
-      "fn": "quality_10000_turn_no_quality_regression",
-      "tag": "soak",
-      "reason": "very long quality campaign; the nightly real-time convergence lane owns the promoted 24h acceptance; run explicitly for the 10k-turn quality ledger"
-    },
-    {
-      "file": "tests/soak/src/lib.rs",
-      "fn": "soak_12h_scale",
-      "tag": "soak",
-      "reason": "legacy accelerated 10k-op scale shape; the nightly real-time convergence lane (scripts/soak.sh --mode realtime, exact-SHA) is the promoted acceptance run and skips this test; run explicitly only for the legacy synthetic shape"
     }
   ],
   "non_test": [

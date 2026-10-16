@@ -41,8 +41,8 @@ pipeline path.
 | File (workflow) | Project | Event filter | Storage | Contents |
 | --- | --- | --- | --- | --- |
 | `.woodpecker/untrusted/pr.yaml` (`pr`) | untrusted | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
-| `.woodpecker/trusted/trusted.yaml` (`trusted`) | trusted | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set incl. release `[perf]` + `certificate`; darwin/windows matrix combos + per-platform certificates |
-| `.woodpecker/trusted/nightly.yaml` (`nightly`) | trusted | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, efficiency, economy, coding-benchmark smoke, provider-key real-model run (recorded skip by default), supply-chain, then `certificate-nightly` |
+| `.woodpecker/trusted/trusted.yaml` (`trusted`) | trusted | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set + `certificate`; darwin/windows matrix combos + per-platform certificates |
+| `.woodpecker/trusted/nightly.yaml` (`nightly`) | trusted | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, supply-chain, nightly UI smoke, then `certificate-nightly` |
 
 `labels: platform: ${platform}` (trusted) or `labels: platform: linux/amd64`
 (pr/cron) routes workflows to agents. The deprecated `runs_on` key is **not**
@@ -68,8 +68,7 @@ docker compose up -d
 The compose file starts `woodpecker-server` (port 8000 for UI/API, port 9000
 for the agent gRPC channel, data in the `woodpecker-data` volume) and one
 linux docker agent. It also raises `WOODPECKER_MAX_PIPELINE_TIMEOUT` (default
-1560 minutes / 26h) so the nightly longrun campaign AND the 24h real-time
-soak lane (`scripts/soak.sh --mode realtime`, <= 25h wall) can be admitted;
+1560 minutes / 26h) so the nightly longrun campaign can be admitted;
 see §6.
 Port 9000 must be reachable from the macOS/Windows agent hosts and should be
 firewalled otherwise (only the shared agent secret crosses it). Server state
@@ -198,17 +197,10 @@ workflow's final `attestation` step is the one exception: it is
 step fails with the typed `signing-key-missing` error and writes no
 attestation (release certification is then impossible, though the build/test
 lanes still record their markers).
-Provider-key (real-model) runs are deliberately not part of the PR/trusted
-pipelines; the nightly `coding-benchmark-real-model` lane records an explicit
-skip marker unless `FAKTOR_BENCH_PROVIDER`, `FAKTOR_BENCH_MODEL` and
-`FAKTOR_BENCH_API_KEY` are present in the step environment. Note that a
+Provider-key (real-model) runs are deliberately not part of any CI
+pipeline; no lane in this repository spends provider money, and a
 `from_secret` reference to a secret that does not exist is a config compile
-error in Woodpecker, so the workflow does not reference secrets blindly. To
-enable real nightly runs, either provide those variables to the agent's step
-environment (self-hosted) or register project secrets with
-`activate.sh --secret NAME=VALUE` and add explicit
-`environment: {FAKTOR_BENCH_API_KEY: {from_secret: ...}}` entries to the lane
-in `.woodpecker/trusted/nightly.yaml`.
+error in Woodpecker, so the workflows do not reference secrets blindly.
 
 Lane-marker auth tokens (optional, recommended). The trusted linux and
 nightly campaign lanes emit their `faktor-woodpecker-lane/v2` markers through
@@ -218,8 +210,8 @@ JSON)`. Register one token per lane on the trusted project and map it into
 BOTH that lane's step environment and the aggregate certificate step:
 
 ```
-for lane in linux static docs soak_smoke vscode vscode_e2e jetbrains_build \
-            jetbrains_smoke perf release_artifacts; do
+for lane in linux static docs vscode vscode_e2e jetbrains_build \
+            jetbrains_smoke release_artifacts; do
   bash scripts/woodpecker/activate.sh <owner/repo> \
     --secret "faktor_lane_token_${lane}=$(openssl rand -hex 32)"
 done
@@ -503,10 +495,8 @@ backend-derived one, which is exactly what the workflows need.
 - Docker backend requirements: Docker Engine on the agent host, the workspace
   needs ~40 GB free disk for the parallel lanes.
 - Recommended sizing: **≥ 8 vCPU, 16 GB RAM, 60 GB disk**. The mandatory
-  lanes run in parallel inside one workflow; `perf` is serialized after the
-  other Rust lanes so release budget assertions do not race a loaded agent.
-  Cron lanes use separate target volumes so their parallel cargo processes
-  do not contend.
+  lanes run in parallel inside one workflow. Cron lanes use separate target
+  volumes so their parallel cargo processes do not contend.
 - To run several pipelines at once raise `WOODPECKER_MAX_WORKFLOWS`; the lane
   set is resource-heavy, so keep it low on shared hosts.
 
@@ -571,9 +561,7 @@ are not possible; the aggregate gate therefore lives **inside** each workflow:
   `failure` when any earlier step failed, and writes
   `target/certification/ci-certification.json`
   (`faktor-ci-certification/v1`, with `workflow` recorded).
-- The only accepted non-`passed` marker is `skipped` on
-  `coding-benchmark-real-model` in the nightly certificate, and only with a
-  non-empty `reason` — a silent skip is a failure.
+- Every marker must be `passed`; a silent skip is a failure.
 - The trusted workflow's `attestation` step (after `certificate`, only on
   success) publishes a signed `faktor-build-attestation/v1` object into its
   step log, binding source/tree, workflow/event, pipeline id/number, the CI

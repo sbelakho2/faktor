@@ -15,7 +15,7 @@
 # used by `.woodpecker/trusted/trusted.yaml`) and the cron caches
 # (`faktor-nightly-*`) are therefore out of reach of PR code.
 #
-# The step set is deliberately reduced: the release `[perf]` budgets (and the
+# The step set is deliberately reduced: long release lanes (and the
 # trusted/platform certificates) belong to the trusted project; a PR still
 # runs the full correctness set (fmt/clippy/check/test/doctor,
 # static+security+fuzz, docs-sync, VSIX build+verify, the `vscode-render`
@@ -493,7 +493,7 @@ steps:
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and lane-assigned in .woodpecker/trusted/nightly.yaml
-      # or documented as manual/live-paid (scripts/certification/ignored-tests.json).
+      # or documented as manual (scripts/certification/ignored-tests.json).
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs

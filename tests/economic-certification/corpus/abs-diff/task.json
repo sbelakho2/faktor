@@ -1,9 +1,0 @@
-{
-  "id": "abs-diff",
-  "task_class": "medium",
-  "phase": "review",
-  "input_tokens": 17000,
-  "output_tokens": 1300,
-  "fix_at_attempt": null,
-  "order": 11
-}

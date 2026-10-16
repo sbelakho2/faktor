@@ -8,9 +8,9 @@ not legal advice; per-source counsel and vendor agreements decide.
 Relevant implementation surfaces: `docs/acquire.md` (site strategy),
 `crates/commerce-connectors` (the connectors), `crates/browser` (the
 browser authority and stored profiles), `crates/cli/src/config/commerce.rs`
-(the strict `[commerce]` section), the opt-in live canaries
-(`crates/commerce-connectors/tests/live_canary.rs`), and the doctor
-live-canary line (`faktor-cli doctor`).
+(the strict `[commerce]` section), the live-canary registry
+(`crates/commerce-connectors/src/canary.rs`), and the doctor live-canary
+line (`faktor-cli doctor`).
 
 ## 1. Scope and authorization
 
@@ -61,9 +61,9 @@ live-canary line (`faktor-cli doctor`).
 - Retries use typed, bounded backoff; no unbounded request storms. The
   browser path uses lazy Chromium startup with idle shutdown, bounded pages
   per profile, and a bounded browser count.
-- Live canaries are strictly opt-in and each performs a handful of
-  requests; they are never part of the default CI run and never run without
-  the operator's own credentials.
+- Live vendor exercises are strictly opt-in operator procedures that
+  perform a handful of requests each; no automated test or lane performs
+  vendor requests, and none runs without the operator's own credentials.
 
 ## 4. Stored sessions, cookies and privacy
 
@@ -127,21 +127,19 @@ strict config decision:
   `FAKTOR_LIVE_DIGIKEY_CLIENT_SECRET`, `FAKTOR_LIVE_LCSC_KEY`,
   `FAKTOR_LIVE_1688_PROFILE` + `FAKTOR_LIVE_DATA_DIR`,
   `FAKTOR_LIVE_ALIBABA_PROFILE` + `FAKTOR_LIVE_DATA_DIR`.
-- Nothing runs without those variables: each canary skips (with a printed
-  line) and makes zero vendor requests. The canaries are `#[ignore]`-gated
-  and assigned to the key-gated `live-paid` nightly lane; the default CI
-  run never spends and never contacts a vendor.
+- Nothing runs without those variables: `faktor-cli doctor` reports
+  `absent` and no vendor request happens. No CI lane spends and no CI lane
+  contacts a vendor.
 - `faktor-cli doctor --config <path>` prints one informational line per
   source: `live-canary <source>: configured` when every required variable
   is present in the environment, else `live-canary <source>: absent`.
   Absence is the default and is never an error.
-- Each canary asserts structural validity (shapes and domain invariants,
-  never captured vendor constants) and records a BLAKE3 evidence digest
-  over the secret-scrubbed structural summary, plus a bounded
-  `faktor-live-canary/v1` evidence line; setting
-  `FAKTOR_LIVE_CANARY_EVIDENCE_DIR` additionally writes the record as JSON
-  (it contains no credential: values are scrubbed with the same scanner
-  used for outbound traffic).
+- Each operator canary asserts structural validity (shapes and domain
+  invariants, never captured vendor constants) through the registry's
+  structural checks and records a BLAKE3 evidence digest over the
+  secret-scrubbed structural summary plus a bounded `faktor-live-canary/v1`
+  evidence line (`canary::{evidence_digest, evidence_line}`; no credential:
+  values are scrubbed with the same scanner used for outbound traffic).
 - A canary failure is a signal to investigate the vendor change or the
   operator's credentials; it never weakens the offline fixture suites,
   which remain the authoritative regression gates.

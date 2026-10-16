@@ -56,9 +56,9 @@ before pushing:
 - `cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci`
 
 - Each crate's unit tests must pass before the crate is considered done.
-- Long tests are `#[ignore]`-gated and named with `[soak]`, `[perf]`,
-  `[visual]`, or `[fault]` prefixes; they are excluded from the CI test
-  run and executed manually.
+- Long tests are `#[ignore]`-gated and named with `[fault]` or `[visual]`
+  prefixes; they are excluded from the CI test run and executed manually
+  (or via the fault lane in `.woodpecker/trusted/nightly.yaml`).
 
 ## Workspace identity
 
