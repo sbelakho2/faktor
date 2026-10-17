@@ -1242,6 +1242,28 @@ const CP_MIGRATIONS: &[&str] = &[
     // cannot carry ids above i64::MAX exactly; a row that cannot be
     // recovered exactly refuses the whole migration rather than guessing.
     crate::billing_store::BILLING_TASK_ID_TEXT_SCHEMA_V6,
+    // v7 — query-plan audit (additive indexes only). The idempotency-retention
+    // tick runs on EVERY file-backed open and ordered/scanned the whole table
+    // (three variants): one (created_ms DESC, key DESC) index serves the
+    // ORDER BY, the range delete and the MAX(created_ms) bound. Approval
+    // pagination with a NULL status filter needs (organization_id, id) in
+    // addition to the existing status-led index. The in-flight listing orders
+    // by started_ms, so the old (organization_id, ended_ms) index is replaced
+    // (same name, no extra index) by the query's order. The audit retention
+    // boundary reads MAX(seq) filtered by occurred_at_ms, which the existing
+    // (organization_id, seq) index cannot bound. Report-period listing orders
+    // by first_seen_ms; the due index stays for the scheduler path.
+    "CREATE INDEX IF NOT EXISTS idx_cp_idempotency_created
+        ON cp_idempotency(created_ms DESC, key DESC);
+     CREATE INDEX IF NOT EXISTS idx_cp_approval_org_id
+        ON cp_approval(organization_id, id);
+     DROP INDEX IF EXISTS idx_billing_in_flight_org;
+     CREATE INDEX IF NOT EXISTS idx_billing_in_flight_org
+        ON billing_in_flight(organization_id, started_ms, id);
+     CREATE INDEX IF NOT EXISTS idx_ent_audit_org_occurred
+        ON ent_audit_event(organization_id, occurred_at_ms, seq);
+     CREATE INDEX IF NOT EXISTS idx_billing_report_period_org_seen
+        ON billing_report_period(organization_id, first_seen_ms DESC, period DESC);",
 ];
 
 impl SqliteControlPlaneStore {
@@ -2519,6 +2541,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
 mod tests {
     use super::*;
     use crate::ids::{ExternalIdentityId, MembershipId};
+
     use crate::rbac::{Action, Role};
     use std::sync::Arc;
 

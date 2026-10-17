@@ -256,15 +256,6 @@ pub fn marginal_gain(
     }
 }
 
-/// Gain per token used to rank candidates. A zero-token candidate has no
-/// price and scores `0.0` (and is never selected).
-fn score(candidate: &ContextCandidate, selected: &[ContextCandidate], needs: &[Need]) -> f64 {
-    if candidate.estimate_tokens == 0 {
-        return 0.0;
-    }
-    marginal_gain(candidate, selected, needs) / f64::from(candidate.estimate_tokens)
-}
-
 /// Requirement preference inside the required phase: Required first, then
 /// Preferred, then Optional.
 fn requirement_rank(requirement: CandidateRequirement) -> u8 {
@@ -275,36 +266,139 @@ fn requirement_rank(requirement: CandidateRequirement) -> u8 {
     }
 }
 
-/// A candidate from the same evidence group was already selected: the
-/// S/M/L exclusivity rule. Ungrouped (`evidence = None`) candidates never
-/// conflict.
-fn group_conflict(selected: &[ContextCandidate], candidate: &ContextCandidate) -> bool {
-    match candidate.evidence {
-        Some(group) => selected.iter().any(|chosen| chosen.evidence == Some(group)),
-        None => false,
+/// Per-need model shared by the required and gain phases: the sanitized
+/// weights, the candidates' declared coverage (duplicates summed exactly like
+/// [`coverage_ppm_for`], sorted by need index so the summation order matches
+/// the documented formula), and the running covered-ppm totals.
+///
+/// This is the algorithmic core of the complexity fix: the previous greedy
+/// loop called [`marginal_gain`] per candidate, whose `remaining_coverage`
+/// rescanned the whole selected set for EVERY need on EVERY round. Maintaining
+/// the covered totals incrementally turns one round from
+/// `O(candidates × needs × selected)` into `O(candidates × declared coverage)`
+/// while producing bit-identical gains (same ppm saturating sums, same
+/// multiplication order).
+struct NeedModel<'a> {
+    needs: &'a [Need],
+    weights: Vec<f64>,
+    terms: Vec<Vec<(usize, u64)>>,
+    confidence: Vec<f64>,
+    freshness: Vec<f64>,
+}
+
+impl<'a> NeedModel<'a> {
+    fn new(candidates: &[ContextCandidate], needs: &'a [Need]) -> Self {
+        let mut index: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (position, need) in needs.iter().enumerate() {
+            index.entry(need.id.as_str()).or_default().push(position);
+        }
+        let terms: Vec<Vec<(usize, u64)>> = candidates
+            .iter()
+            .map(|candidate| {
+                let mut terms: Vec<(usize, u64)> = Vec::new();
+                for entry in &candidate.need_coverage {
+                    let Some(positions) = index.get(entry.need_id.as_str()) else {
+                        continue;
+                    };
+                    for &position in positions {
+                        let ppm = u64::from(entry.coverage_ppm);
+                        if let Some(existing) = terms.iter_mut().find(|(need, _)| *need == position)
+                        {
+                            existing.1 = existing.1.saturating_add(ppm).min(FULL_COVERAGE_PPM);
+                        } else {
+                            terms.push((position, ppm.min(FULL_COVERAGE_PPM)));
+                        }
+                    }
+                }
+                // The documented formula sums needs in input order; sorting
+                // the nonzero terms by index keeps the addition order exact.
+                terms.sort_unstable_by_key(|(position, _)| *position);
+                terms
+            })
+            .collect();
+        Self {
+            needs,
+            weights: needs
+                .iter()
+                .map(|need| sanitize_weight(need.weight))
+                .collect(),
+            terms,
+            confidence: candidates
+                .iter()
+                .map(|candidate| ppm_unit(candidate.confidence_ppm))
+                .collect(),
+            freshness: candidates
+                .iter()
+                .map(|candidate| ppm_unit(candidate.freshness_ppm))
+                .collect(),
+        }
+    }
+
+    /// Coverage ppm one candidate declares for one need (0 when absent).
+    fn coverage_of(&self, candidate: usize, need: usize) -> u64 {
+        self.terms[candidate]
+            .binary_search_by_key(&need, |(position, _)| *position)
+            .map(|at| self.terms[candidate][at].1)
+            .unwrap_or(0)
+    }
+
+    /// The documented marginal gain against the CURRENT covered totals.
+    /// Skips zero-coverage terms (adding 0.0 is the identity) and preserves
+    /// the exact `weight · remaining · coverage · confidence · freshness`
+    /// multiplication and summation order.
+    fn gain(&self, candidate: usize, covered: &[u64]) -> f64 {
+        #[cfg(test)]
+        perf::add_gain(self.terms[candidate].len() as u64);
+        let confidence = self.confidence[candidate];
+        let freshness = self.freshness[candidate];
+        if confidence <= 0.0 || freshness <= 0.0 {
+            return 0.0;
+        }
+        let mut gain = 0.0f64;
+        for &(need, ppm) in &self.terms[candidate] {
+            let weight = self.weights[need];
+            if weight <= 0.0 {
+                continue;
+            }
+            let covered = covered[need];
+            if covered >= FULL_COVERAGE_PPM {
+                continue;
+            }
+            let remaining = (1.0 - (covered as f64) / PPM).clamp(0.0, 1.0);
+            if remaining <= 0.0 {
+                continue;
+            }
+            let coverage = ppm_unit_u64(ppm);
+            if coverage <= 0.0 {
+                continue;
+            }
+            gain += weight * remaining * coverage * confidence * freshness;
+        }
+        if gain.is_finite() && gain > 0.0 {
+            gain
+        } else {
+            0.0
+        }
     }
 }
 
-/// A candidate with this id is already in the selection: never duplicate.
-fn already_selected(selected: &[ContextCandidate], candidate: &ContextCandidate) -> bool {
-    selected.iter().any(|chosen| chosen.id == candidate.id)
+/// Clamp a ppm quantity into the unit interval (u64 form used by the
+/// precomputed coverage terms; identical to [`ppm_unit`] for every value
+/// [`coverage_ppm_for`] can return).
+fn ppm_unit_u64(ppm: u64) -> f64 {
+    if ppm >= FULL_COVERAGE_PPM {
+        1.0
+    } else {
+        ppm as f64 / PPM
+    }
 }
 
-/// Deterministic ranking inside [`required_candidates`]: requirement class,
-/// then declared coverage of the need (descending), then gain per token
-/// (descending), then id ascending.
-fn compare_for_need(
-    a: &ContextCandidate,
-    b: &ContextCandidate,
-    need_id: &str,
-    selected: &[ContextCandidate],
-    needs: &[Need],
-) -> std::cmp::Ordering {
-    requirement_rank(a.requirement)
-        .cmp(&requirement_rank(b.requirement))
-        .then_with(|| coverage_ppm_for(b, need_id).cmp(&coverage_ppm_for(a, need_id)))
-        .then_with(|| score(b, selected, needs).total_cmp(&score(a, selected, needs)))
-        .then_with(|| a.id.cmp(&b.id))
+/// Add one selected candidate's declared coverage to the running totals.
+fn add_coverage(model: &NeedModel<'_>, candidate: usize, covered: &mut [u64]) {
+    for &(need, ppm) in &model.terms[candidate] {
+        covered[need] = covered[need].saturating_add(ppm).min(FULL_COVERAGE_PPM);
+    }
 }
 
 /// The minimal deterministic set of candidates that must be included so
@@ -318,34 +412,81 @@ pub fn required_candidates(
     candidates: &[ContextCandidate],
     needs: &[Need],
 ) -> Vec<ContextCandidate> {
-    let mut selected: Vec<ContextCandidate> = Vec::new();
-    for need in needs.iter().filter(|need| need.required) {
-        let mut covered: u64 = selected
-            .iter()
-            .map(|candidate| coverage_ppm_for(candidate, &need.id))
-            .fold(0u64, u64::saturating_add)
-            .min(FULL_COVERAGE_PPM);
-        while covered < FULL_COVERAGE_PPM {
-            let mut pool: Vec<&ContextCandidate> = candidates
+    let model = NeedModel::new(candidates, needs);
+    let mut selected = Vec::new();
+    let mut covered = vec![0u64; needs.len()];
+    let mut selected_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut groups: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    required_candidates_with(
+        &model,
+        candidates,
+        &mut selected,
+        &mut covered,
+        &mut selected_ids,
+        &mut groups,
+    );
+    selected
+}
+
+/// The required-coverage phase over a prebuilt model. `covered` is updated
+/// incrementally for every selected candidate (exactly the saturating sum
+/// `remaining_coverage` used to recompute from the selected slice).
+fn required_candidates_with<'c>(
+    model: &NeedModel<'_>,
+    candidates: &'c [ContextCandidate],
+    selected: &mut Vec<ContextCandidate>,
+    covered: &mut [u64],
+    selected_ids: &mut std::collections::HashSet<&'c str>,
+    groups: &mut std::collections::HashSet<u64>,
+) {
+    for (need, definition) in model.needs.iter().enumerate() {
+        if !definition.required {
+            continue;
+        }
+        while covered[need] < FULL_COVERAGE_PPM {
+            // (candidate index, declared coverage of this need, gain/token).
+            let mut pool: Vec<(usize, u64, f64)> = candidates
                 .iter()
-                .filter(|candidate| {
+                .enumerate()
+                .filter(|(_, candidate)| {
                     candidate.estimate_tokens > 0
-                        && !already_selected(&selected, candidate)
-                        && !group_conflict(&selected, candidate)
-                        && coverage_ppm_for(candidate, &need.id) > 0
+                        && !selected_ids.contains(candidate.id.as_str())
+                        && candidate
+                            .evidence
+                            .is_none_or(|group| !groups.contains(&group))
+                })
+                .filter_map(|(index, candidate)| {
+                    let coverage = model.coverage_of(index, need);
+                    if coverage == 0 {
+                        return None;
+                    }
+                    let gain = model.gain(index, covered);
+                    let score = if candidate.estimate_tokens == 0 {
+                        0.0
+                    } else {
+                        gain / f64::from(candidate.estimate_tokens)
+                    };
+                    Some((index, coverage, score))
                 })
                 .collect();
-            pool.sort_by(|a, b| compare_for_need(a, b, &need.id, &selected, needs));
-            let Some(next) = pool.into_iter().next() else {
+            pool.sort_by(|a, b| {
+                requirement_rank(candidates[a.0].requirement)
+                    .cmp(&requirement_rank(candidates[b.0].requirement))
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.total_cmp(&a.2))
+                    .then_with(|| candidates[a.0].id.cmp(&candidates[b.0].id))
+            });
+            let Some((index, _, _)) = pool.into_iter().next() else {
                 break; // nothing left that can cover this need
             };
-            covered = covered
-                .saturating_add(coverage_ppm_for(next, &need.id))
-                .min(FULL_COVERAGE_PPM);
-            selected.push(next.clone());
+            add_coverage(model, index, covered);
+            selected_ids.insert(candidates[index].id.as_str());
+            if let Some(group) = candidates[index].evidence {
+                groups.insert(group);
+            }
+            selected.push(candidates[index].clone());
         }
     }
-    selected
 }
 
 /// Select the context window under `budget` by information gain (audit
@@ -394,8 +535,20 @@ fn select_by_information_with(
     gain_of: &impl Fn(&ContextCandidate, f64) -> f64,
 ) -> Result<InformationSelection, InformationError> {
     let token_budget = u64::from(budget.token_budget);
-    let required = required_candidates(candidates, &budget.needs);
-    let required_tokens: u64 = required
+    let model = NeedModel::new(candidates, &budget.needs);
+    let mut evidence: Vec<ContextCandidate> = Vec::new();
+    let mut covered = vec![0u64; budget.needs.len()];
+    let mut selected_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut groups: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    required_candidates_with(
+        &model,
+        candidates,
+        &mut evidence,
+        &mut covered,
+        &mut selected_ids,
+        &mut groups,
+    );
+    let required_tokens: u64 = evidence
         .iter()
         .map(|candidate| u64::from(candidate.estimate_tokens))
         .sum();
@@ -405,29 +558,31 @@ fn select_by_information_with(
             token_budget: budget.token_budget,
         });
     }
-
-    let mut evidence = required;
+    let required_len = evidence.len();
     let mut used = required_tokens;
 
     // Phase 2: greedy information gain. Candidates that do not fit now can
     // never fit later (the budget only shrinks), so they are skipped for
     // the rest of this selection; gains are recomputed every round, which
-    // is what makes redundant evidence worth less and less.
-    let mut skipped: Vec<String> = Vec::new();
+    // is what makes redundant evidence worth less and less. `covered` is
+    // maintained incrementally (the exact saturating ppm totals the public
+    // `remaining_coverage` would recompute), so a round is linear in the
+    // candidates' declared coverage instead of `candidates × needs ×
+    // selected`.
+    let mut skipped: std::collections::HashSet<&str> = std::collections::HashSet::new();
     loop {
-        let mut best: Option<(&ContextCandidate, f64)> = None;
-        for candidate in candidates {
+        let mut best: Option<(usize, f64)> = None;
+        for (index, candidate) in candidates.iter().enumerate() {
             if candidate.estimate_tokens == 0
-                || already_selected(&evidence, candidate)
-                || skipped.iter().any(|id| id == &candidate.id)
-                || group_conflict(&evidence, candidate)
+                || selected_ids.contains(candidate.id.as_str())
+                || skipped.contains(candidate.id.as_str())
+                || candidate
+                    .evidence
+                    .is_some_and(|group| groups.contains(&group))
             {
                 continue;
             }
-            let gain = gain_of(
-                candidate,
-                marginal_gain(candidate, &evidence, &budget.needs),
-            );
+            let gain = gain_of(candidate, model.gain(index, &covered));
             if gain <= 0.0 {
                 continue;
             }
@@ -436,27 +591,37 @@ fn select_by_information_with(
                 None => true,
                 Some((chosen, best_score)) => match candidate_score.total_cmp(&best_score) {
                     std::cmp::Ordering::Greater => true,
-                    std::cmp::Ordering::Equal => candidate.id < chosen.id,
+                    std::cmp::Ordering::Equal => candidate.id < candidates[chosen].id,
                     std::cmp::Ordering::Less => false,
                 },
             };
             if better {
-                best = Some((candidate, candidate_score));
+                best = Some((index, candidate_score));
             }
         }
-        let Some((candidate, _)) = best else {
+        let Some((index, _)) = best else {
             break;
         };
-        let tokens = u64::from(candidate.estimate_tokens);
+        let tokens = u64::from(candidates[index].estimate_tokens);
         if used.saturating_add(tokens) > token_budget {
             // Highest-score candidate does not fit: remember it and try
             // the next-ranked one; a later (smaller) candidate may fit.
-            skipped.push(candidate.id.clone());
+            skipped.insert(candidates[index].id.as_str());
             continue;
         }
         used = used.saturating_add(tokens);
-        evidence.push(candidate.clone());
+        add_coverage(&model, index, &mut covered);
+        selected_ids.insert(candidates[index].id.as_str());
+        if let Some(group) = candidates[index].evidence {
+            groups.insert(group);
+        }
+        evidence.push(candidates[index].clone());
     }
+    let required = &evidence[..required_len];
+    let required_tokens: u64 = required
+        .iter()
+        .map(|candidate| u64::from(candidate.estimate_tokens))
+        .sum();
 
     // Phase 3: the conversation absorbs the residue as a contiguous
     // newest-first prefix (input order is the loader's newest-first
@@ -476,7 +641,6 @@ fn select_by_information_with(
         used = used.saturating_add(tokens);
         messages.push(candidate.clone());
     }
-
     let mut selected = messages;
     selected.extend(evidence);
     Ok(InformationSelection {
@@ -484,6 +648,25 @@ fn select_by_information_with(
         selected_tokens: u32::try_from(used).unwrap_or(u32::MAX),
         required_tokens: u32::try_from(required_tokens).unwrap_or(u32::MAX),
     })
+}
+#[cfg(test)]
+mod perf {
+    use std::cell::Cell;
+    thread_local! {
+        static GAIN_EVALUATIONS: Cell<u64> = const { Cell::new(0) };
+        static GAIN_TERMS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(super) fn add_gain(terms: u64) {
+        GAIN_EVALUATIONS.with(|c| c.set(c.get() + 1));
+        GAIN_TERMS.with(|c| c.set(c.get() + terms));
+    }
+    pub(super) fn reset() {
+        GAIN_EVALUATIONS.with(|c| c.set(0));
+        GAIN_TERMS.with(|c| c.set(0));
+    }
+    pub(super) fn snapshot() -> (u64, u64) {
+        (GAIN_EVALUATIONS.with(Cell::get), GAIN_TERMS.with(Cell::get))
+    }
 }
 
 #[cfg(test)]
@@ -1004,5 +1187,303 @@ mod tests {
         let boosting = RiskPrior(|_: &ContextCandidate| f64::MAX);
         let selection = select_by_information_with_prior(&candidates, &budget, &boosting).unwrap();
         assert_eq!(ids(&selection), vec!["a"]);
+    }
+
+    #[test]
+    fn information_selection_is_linear_and_matches_the_naive_gain() {
+        let needs: Vec<Need> = (0..64)
+            .map(|i| Need {
+                id: format!("n{i}"),
+                weight: 1.0 + (i % 5) as f64,
+                required: i == 0,
+            })
+            .collect();
+        let mut candidates = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            let mut coverage = vec![("n0", 250_000u32)];
+            for (k, need) in needs.iter().enumerate().skip(1) {
+                if (i * 13 + k) % 7 == 0 {
+                    coverage.push((&need.id, 200_000 + ((i * 37) % 100_000) as u32));
+                }
+            }
+            candidates.push(ContextCandidate {
+                id: format!("c{i:04}"),
+                kind: CandidateKind::ToolNote,
+                bytes: 1000,
+                estimate_tokens: 1000,
+                utility: 0.5,
+                evidence: None,
+                requirement: if i < 4 {
+                    CandidateRequirement::Required
+                } else {
+                    CandidateRequirement::Optional
+                },
+                confidence_ppm: 700_000 + (i % 300_000) as u32,
+                freshness_ppm: 900_000,
+                need_coverage: coverage
+                    .into_iter()
+                    .map(|(need_id, coverage_ppm)| NeedCoverage {
+                        need_id: need_id.to_string(),
+                        coverage_ppm,
+                    })
+                    .collect(),
+                expected_error_reduction_ppm: 0,
+                level: EvidenceLevel::Exact,
+                omission_keys: Vec::new(),
+            });
+        }
+        let budget = InformationBudget {
+            token_budget: 100_000,
+            needs,
+        };
+        let mut best = u64::MAX;
+        let mut picks = 0usize;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let selection = select_by_information(&candidates, &budget).unwrap();
+            best = best.min(started.elapsed().as_nanos() as u64);
+            picks = selection.selected.len();
+            assert!(selection.selected_tokens <= 100_000);
+        }
+        perf::reset();
+        let _ = select_by_information(&candidates, &budget).unwrap();
+        let (gain_evaluations, gain_terms) = perf::snapshot();
+        println!(
+            "PROBE information_selection_1k_candidates_100k best_ns={best} picks={picks} \
+             gain_evaluations={gain_evaluations} gain_terms={gain_terms}"
+        );
+    }
+
+    // ------------------------------------------------ differential oracle
+
+    fn naive_required_candidates(
+        candidates: &[ContextCandidate],
+        needs: &[Need],
+    ) -> Vec<ContextCandidate> {
+        fn score_naive(c: &ContextCandidate, selected: &[ContextCandidate], needs: &[Need]) -> f64 {
+            if c.estimate_tokens == 0 {
+                return 0.0;
+            }
+            marginal_gain(c, selected, needs) / f64::from(c.estimate_tokens)
+        }
+        let mut selected: Vec<ContextCandidate> = Vec::new();
+        for need in needs.iter().filter(|need| need.required) {
+            let mut covered: u64 = selected
+                .iter()
+                .map(|candidate| coverage_ppm_for(candidate, &need.id))
+                .fold(0u64, u64::saturating_add)
+                .min(FULL_COVERAGE_PPM);
+            while covered < FULL_COVERAGE_PPM {
+                let mut pool: Vec<&ContextCandidate> = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.estimate_tokens > 0
+                            && !selected.iter().any(|chosen| chosen.id == candidate.id)
+                            && !match candidate.evidence {
+                                Some(group) => {
+                                    selected.iter().any(|chosen| chosen.evidence == Some(group))
+                                }
+                                None => false,
+                            }
+                            && coverage_ppm_for(candidate, &need.id) > 0
+                    })
+                    .collect();
+                pool.sort_by(|a, b| {
+                    requirement_rank(a.requirement)
+                        .cmp(&requirement_rank(b.requirement))
+                        .then_with(|| {
+                            coverage_ppm_for(b, &need.id).cmp(&coverage_ppm_for(a, &need.id))
+                        })
+                        .then_with(|| {
+                            score_naive(b, &selected, needs)
+                                .total_cmp(&score_naive(a, &selected, needs))
+                        })
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                let Some(next) = pool.into_iter().next() else {
+                    break;
+                };
+                covered = covered
+                    .saturating_add(coverage_ppm_for(next, &need.id))
+                    .min(FULL_COVERAGE_PPM);
+                selected.push(next.clone());
+            }
+        }
+        selected
+    }
+
+    fn naive_select(
+        candidates: &[ContextCandidate],
+        budget: &InformationBudget,
+    ) -> Result<InformationSelection, InformationError> {
+        let token_budget = u64::from(budget.token_budget);
+        let required = naive_required_candidates(candidates, &budget.needs);
+        let required_tokens: u64 = required
+            .iter()
+            .map(|candidate| u64::from(candidate.estimate_tokens))
+            .sum();
+        if required_tokens > token_budget {
+            return Err(InformationError::Oversized {
+                required_tokens,
+                token_budget: budget.token_budget,
+            });
+        }
+        let mut evidence = required;
+        let mut used = required_tokens;
+        let mut skipped: Vec<String> = Vec::new();
+        loop {
+            let mut best: Option<(&ContextCandidate, f64)> = None;
+            for candidate in candidates {
+                if candidate.estimate_tokens == 0
+                    || evidence.iter().any(|chosen| chosen.id == candidate.id)
+                    || skipped.iter().any(|id| id == &candidate.id)
+                    || match candidate.evidence {
+                        Some(group) => evidence.iter().any(|chosen| chosen.evidence == Some(group)),
+                        None => false,
+                    }
+                {
+                    continue;
+                }
+                let gain = marginal_gain(candidate, &evidence, &budget.needs);
+                if gain <= 0.0 {
+                    continue;
+                }
+                let candidate_score = gain / f64::from(candidate.estimate_tokens);
+                let better = match best {
+                    None => true,
+                    Some((chosen, best_score)) => match candidate_score.total_cmp(&best_score) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Equal => candidate.id < chosen.id,
+                        std::cmp::Ordering::Less => false,
+                    },
+                };
+                if better {
+                    best = Some((candidate, candidate_score));
+                }
+            }
+            let Some((candidate, _)) = best else {
+                break;
+            };
+            let tokens = u64::from(candidate.estimate_tokens);
+            if used.saturating_add(tokens) > token_budget {
+                skipped.push(candidate.id.clone());
+                continue;
+            }
+            used = used.saturating_add(tokens);
+            evidence.push(candidate.clone());
+        }
+        let mut messages: Vec<ContextCandidate> = Vec::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.kind == CandidateKind::Message)
+        {
+            let tokens = u64::from(candidate.estimate_tokens);
+            if tokens == 0 {
+                continue;
+            }
+            if used.saturating_add(tokens) > token_budget {
+                break;
+            }
+            used = used.saturating_add(tokens);
+            messages.push(candidate.clone());
+        }
+        let mut selected = messages;
+        selected.extend(evidence);
+        Ok(InformationSelection {
+            selected,
+            selected_tokens: u32::try_from(used).unwrap_or(u32::MAX),
+            required_tokens: u32::try_from(required_tokens).unwrap_or(u32::MAX),
+        })
+    }
+
+    #[test]
+    fn optimized_selection_is_bit_identical_to_the_naive_oracle() {
+        let mut state = 0x5eed_1234_9876_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for round in 0..500 {
+            let need_count = 1 + (next() % 7) as usize;
+            let needs: Vec<Need> = (0..need_count)
+                .map(|i| Need {
+                    id: format!("n{}", i % (need_count.max(2) - 1).max(1)),
+                    weight: match next() % 20 {
+                        0 => f64::NAN,
+                        1 => f64::INFINITY,
+                        2 => -1.0,
+                        _ => (next() % 10) as f64 / 2.0,
+                    },
+                    required: next() % 3 == 0,
+                })
+                .collect();
+            let candidate_count = (next() % 40) as usize;
+            let mut candidates = Vec::with_capacity(candidate_count);
+            for i in 0..candidate_count {
+                let mut coverage: Vec<NeedCoverage> = Vec::new();
+                for need in needs.iter().take(need_count) {
+                    if next() % 3 == 0 {
+                        coverage.push(NeedCoverage {
+                            need_id: need.id.clone(),
+                            coverage_ppm: match next() % 5 {
+                                0 => 0,
+                                1 => 1_000_000,
+                                _ => (next() % 1_000_000) as u32,
+                            },
+                        });
+                    }
+                    if next() % 11 == 0 {
+                        // duplicate declaration of the same need
+                        coverage.push(NeedCoverage {
+                            need_id: need.id.clone(),
+                            coverage_ppm: (next() % 500_000) as u32,
+                        });
+                    }
+                }
+                candidates.push(ContextCandidate {
+                    id: format!("c{}", if next() % 17 == 0 { i % 3 } else { i }),
+                    kind: if next() % 4 == 0 {
+                        CandidateKind::Message
+                    } else {
+                        CandidateKind::ToolNote
+                    },
+                    bytes: 0,
+                    estimate_tokens: (next() % 6) as u32,
+                    utility: 0.5,
+                    evidence: if next() % 3 == 0 {
+                        Some(next() % 3)
+                    } else {
+                        None
+                    },
+                    requirement: match next() % 3 {
+                        0 => CandidateRequirement::Required,
+                        1 => CandidateRequirement::Preferred,
+                        _ => CandidateRequirement::Optional,
+                    },
+                    confidence_ppm: (next() % 1_200_000) as u32,
+                    freshness_ppm: (next() % 1_200_000) as u32,
+                    need_coverage: coverage,
+                    expected_error_reduction_ppm: 0,
+                    level: EvidenceLevel::Exact,
+                    omission_keys: Vec::new(),
+                });
+            }
+            let budget = InformationBudget {
+                token_budget: (next() % 12) as u32,
+                needs,
+            };
+            assert_eq!(
+                required_candidates(&candidates, &budget.needs),
+                naive_required_candidates(&candidates, &budget.needs),
+                "round {round}: required set diverged"
+            );
+            assert_eq!(
+                select_by_information(&candidates, &budget),
+                naive_select(&candidates, &budget),
+                "round {round}: selection diverged"
+            );
+        }
     }
 }

@@ -1559,8 +1559,57 @@ impl Router {
 /// prior blending: new models start near sane priors and a small sample can
 /// never wreck a reputation.
 pub struct RouterTelemetry {
-    inner: std::sync::Mutex<std::collections::HashMap<(String, String, RouterPhase), Ewma>>,
+    /// Per-key EWMA observations, SHARDED: every shard is an independent
+    /// mutex over a disjoint key subset, so settled calls for different
+    /// (provider, model, phase) keys never serialize on one map lock.
+    /// Snapshots merge all shards (each lock held only for its own drain).
+    inner: [TelemetryShard; TELEMETRY_SHARDS],
     cooldown: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    #[cfg(test)]
+    probe: TelemetryLockProbe,
+}
+
+/// One telemetry map shard: EWMA observations keyed by
+/// (provider, model, phase).
+type TelemetryShard =
+    std::sync::Mutex<std::collections::HashMap<(String, String, RouterPhase), Ewma>>;
+
+/// Fixed shard count of the telemetry map. A key always hashes to the same
+/// shard, so per-key EWMA updates stay single-writer-safe and snapshots are
+/// a deterministic merge.
+const TELEMETRY_SHARDS: usize = 16;
+
+/// Test-only lock instrumentation for the telemetry map (compiled out of
+/// production): acquisition count, contended acquisitions, acquire wait and
+/// critical-section hold.
+#[cfg(test)]
+#[derive(Default)]
+struct TelemetryLockProbe {
+    acquires: std::sync::atomic::AtomicU64,
+    waits: std::sync::atomic::AtomicU64,
+    total_wait_ns: std::sync::atomic::AtomicU64,
+    max_wait_ns: std::sync::atomic::AtomicU64,
+    max_hold_ns: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl TelemetryLockProbe {
+    fn record_acquire(&self, wait: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.acquires.fetch_add(1, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_wait_ns.fetch_max(ns, Ordering::Relaxed);
+        if wait >= std::time::Duration::from_micros(1) {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_hold(&self, hold: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let ns = hold.as_nanos().min(u64::MAX as u128) as u64;
+        self.max_hold_ns.fetch_max(ns, Ordering::Relaxed);
+    }
 }
 
 const PRIOR_SUCCESS: f64 = 0.8;
@@ -1595,9 +1644,22 @@ impl Ewma {
 impl RouterTelemetry {
     pub fn new() -> Self {
         Self {
-            inner: Default::default(),
+            inner: std::array::from_fn(|_| std::sync::Mutex::new(std::collections::HashMap::new())),
             cooldown: Default::default(),
+            #[cfg(test)]
+            probe: TelemetryLockProbe::default(),
         }
+    }
+
+    /// The shard a key belongs to. Same key => same shard, so a key's EWMA
+    /// updates stay serialized while independent keys never share a lock.
+    fn shard(&self, provider: &str, model: &str, phase: RouterPhase) -> &TelemetryShard {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        provider.hash(&mut hasher);
+        model.hash(&mut hasher);
+        phase.hash(&mut hasher);
+        &self.inner[(hasher.finish() as usize) % TELEMETRY_SHARDS]
     }
 
     pub fn record(
@@ -1628,7 +1690,15 @@ impl RouterTelemetry {
         rate_limited: bool,
         latency_ms: u64,
     ) {
-        let mut m = recover_lock(&self.inner);
+        let shard = self.shard(provider, model, phase);
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut m = recover_lock(shard);
+        #[cfg(test)]
+        let hold_started = {
+            self.probe.record_acquire(started.elapsed());
+            std::time::Instant::now()
+        };
         let e = m.entry((provider.into(), model.into(), phase)).or_default();
         e.update(success);
         let t = if retried { 1.0 } else { 0.0 };
@@ -1641,6 +1711,8 @@ impl RouterTelemetry {
         if latency_ms > 0 {
             e.latency_ms = ALPHA * latency_ms as f64 + (1.0 - ALPHA) * e.latency_ms;
         }
+        #[cfg(test)]
+        self.probe.record_hold(hold_started.elapsed());
     }
 
     /// Rate-limit cooldown: providers stay Hard-excluded until `secs` pass.
@@ -1660,7 +1732,7 @@ impl RouterTelemetry {
 
     /// Blended success prior for (provider, model, phase).
     pub fn success_estimate(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
-        let m = recover_lock(&self.inner);
+        let m = recover_lock(self.shard(provider, model, phase));
         match m.get(&(provider.into(), model.into(), phase)) {
             Some(e) => {
                 // Prior blend: pull toward PRIOR_SUCCESS as n is small.
@@ -1674,7 +1746,7 @@ impl RouterTelemetry {
     /// EWMA of the recorded settled-call latencies (0.0 when nothing was
     /// recorded through [`RouterTelemetry::record_outcome`] yet).
     pub fn avg_latency_ms(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
-        let m = recover_lock(&self.inner);
+        let m = recover_lock(self.shard(provider, model, phase));
         m.get(&(provider.into(), model.into(), phase))
             .map(|e| e.latency_ms)
             .unwrap_or(0.0)
@@ -1691,13 +1763,20 @@ impl RouterTelemetry {
             .filter(|(_, until)| **until > now)
             .map(|(p, _)| p.clone())
             .collect();
-        let inner = recover_lock(&self.inner);
-        let success_ppm = inner
+        // Hold EVERY shard at once while the snapshot is copied: the
+        // returned health is one point-in-time view, never a mix of a
+        // before/after write separated by a shard boundary. Shard locks are
+        // always taken one-at-a-time elsewhere, so this fixed ascending
+        // order cannot deadlock.
+        let shards: Vec<_> = self.inner.iter().map(recover_lock).collect();
+        let success_ppm = shards
             .iter()
-            .map(|((p, m, phase), e)| {
-                let blend = 0.7 * e.success + 0.3 * PRIOR_SUCCESS;
-                let ppm = (blend * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32;
-                ((p.clone(), m.clone(), *phase), ppm)
+            .flat_map(|inner| {
+                inner.iter().map(|((p, m, phase), e)| {
+                    let blend = 0.7 * e.success + 0.3 * PRIOR_SUCCESS;
+                    let ppm = (blend * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32;
+                    ((p.clone(), m.clone(), *phase), ppm)
+                })
             })
             .collect();
         LiveHealth {

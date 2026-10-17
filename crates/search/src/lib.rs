@@ -328,14 +328,18 @@ impl SearchService {
                 "embedding provider returned a document vector with a different dimension or non-finite component",
             ));
         }
+        let query_norm = vector_norm(query_vector);
         let mut scored: Vec<(String, FileRevision, f64)> = candidates
             .iter()
             .zip(doc_embs.iter())
             .map(|(candidate, vector)| {
+                #[cfg(test)]
+                perf::add_vector();
+                let document_norm = vector_norm(vector);
                 (
                     candidate.path.clone(),
                     candidate.revision.clone(),
-                    cosine(query_vector, vector),
+                    unit_cosine(dot_product(query_vector, vector), query_norm, document_norm),
                 )
             })
             .collect();
@@ -593,9 +597,30 @@ fn semantic_from_persisted(
             query_vector.len()
         )));
     }
-    let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for (path, vector) in index.chunk_vectors(ws, MAX_PERSISTED_VECTORS_PER_QUERY) {
-        let score = cosine(query_vector, vector);
+    // The query norm is a property of the query, not of each pair: compute it
+    // once (the document norms were precomputed at index time). Every vector
+    // is still scored with the same sequential accumulation order.
+    let query_norm = vector_norm(query_vector);
+    let mut best: std::collections::HashMap<&str, f64> =
+        std::collections::HashMap::with_capacity(MAX_PERSISTED_VECTORS_PER_QUERY.min(4096));
+    for (path, vector, document_norm) in index.chunk_vectors(ws, MAX_PERSISTED_VECTORS_PER_QUERY) {
+        #[cfg(test)]
+        perf::add_vector();
+        let score =
+            if vector.len() != active_dimension || query_norm <= 0.0 || !query_norm.is_finite() {
+                0.0
+            } else {
+                // A precomputed norm of 0.0 is a zero vector (score 0 either
+                // way); a non-finite norm is a finite vector whose square
+                // overflowed f32, also score 0. Recompute only when a legacy
+                // record reaches this path without `sanitize` having run.
+                let document_norm = if document_norm > 0.0 && document_norm.is_finite() {
+                    document_norm
+                } else {
+                    vector_norm(vector)
+                };
+                unit_cosine(dot_product(query_vector, vector), query_norm, document_norm)
+            };
         best.entry(path)
             .and_modify(|current| {
                 if score > *current {
@@ -607,38 +632,126 @@ fn semantic_from_persisted(
     let mut out: Vec<Hit> = best
         .into_iter()
         .map(|(path, score)| Hit {
-            snippet: snippet_for(&path),
-            path,
+            snippet: snippet_for(path),
+            path: path.to_string(),
             score,
             symbol: None,
         })
         .collect();
-    out.sort_by(|a, b| {
+    sort_truncate_topk_by(&mut out, limit, |a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.path.cmp(&b.path))
     });
-    out.truncate(limit);
     Ok(out)
 }
 
+/// Sort `items` by `cmp` and keep the first `limit` (a total-order top-k
+/// selection). The result is identical to `sort; truncate` for a total
+/// order, but a 10k-vector scan only sorts the requested page.
+fn sort_truncate_topk_by<T>(
+    items: &mut Vec<T>,
+    limit: usize,
+    mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    if limit == 0 {
+        items.clear();
+        return;
+    }
+    if items.len() > limit {
+        items.select_nth_unstable_by(limit, &mut cmp);
+        items.truncate(limit);
+    }
+    items.sort_by(cmp);
+}
+
+/// Sequential f32 sum of squares. The accumulation order is exactly the
+/// order the per-pair cosine used, so hoisting a norm out of the scoring
+/// loop cannot change a single score bit.
+fn vector_norm(vector: &[f32]) -> f32 {
+    #[cfg(test)]
+    perf::add_norm(vector.len() as u64);
+    let mut sum = 0f32;
+    for value in vector {
+        sum += value * value;
+    }
+    sum
+}
+
+/// Sequential f32 dot product (same accumulation order as the old per-pair
+/// loop). Counted in test builds only.
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(test)]
+    perf::add_dot(a.len() as u64);
+    let mut dot = 0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+    }
+    dot
+}
+
+/// Cosine from a precomputed dot and SQUARED norms (the sum of squares that
+/// [`vector_norm`] accumulates). The square roots are taken here, exactly as
+/// the pre-optimization per-pair formula did, so hoisting the sums cannot
+/// change a score bit. A zero or non-finite norm (a zero vector, or a
+/// hostile finite vector whose squared norm overflows f32) scores 0.0; the
+/// previous formula could turn the latter into NaN.
+fn unit_cosine(dot: f32, query_norm_sq: f32, document_norm_sq: f32) -> f64 {
+    if query_norm_sq <= 0.0
+        || document_norm_sq <= 0.0
+        || !query_norm_sq.is_finite()
+        || !document_norm_sq.is_finite()
+        || !dot.is_finite()
+    {
+        return 0.0;
+    }
+    (dot / (query_norm_sq.sqrt() * document_norm_sq.sqrt())) as f64
+}
+
+#[cfg(test)]
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    let mut dot = 0f32;
-    let mut na = 0f32;
-    let mut nb = 0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
+    let query_norm = vector_norm(a);
+    let document_norm = vector_norm(b);
+    unit_cosine(dot_product(a, b), query_norm, document_norm)
+}
+
+#[cfg(test)]
+mod perf {
+    use std::cell::Cell;
+    thread_local! {
+        static DOT_COMPONENTS: Cell<u64> = const { Cell::new(0) };
+        static DOT_PAIRS: Cell<u64> = const { Cell::new(0) };
+        static VECTORS_SCORED: Cell<u64> = const { Cell::new(0) };
+        static NORM_COMPONENTS: Cell<u64> = const { Cell::new(0) };
     }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
+    pub(super) fn add_dot(components: u64) {
+        DOT_COMPONENTS.with(|c| c.set(c.get() + components));
+        DOT_PAIRS.with(|c| c.set(c.get() + 1));
     }
-    (dot / (na.sqrt() * nb.sqrt())) as f64
+    pub(super) fn add_vector() {
+        VECTORS_SCORED.with(|c| c.set(c.get() + 1));
+    }
+    pub(super) fn add_norm(components: u64) {
+        NORM_COMPONENTS.with(|c| c.set(c.get() + components));
+    }
+    pub(super) fn reset() {
+        DOT_COMPONENTS.with(|c| c.set(0));
+        DOT_PAIRS.with(|c| c.set(0));
+        VECTORS_SCORED.with(|c| c.set(0));
+        NORM_COMPONENTS.with(|c| c.set(0));
+    }
+    pub(super) fn snapshot() -> (u64, u64, u64, u64) {
+        (
+            DOT_COMPONENTS.with(Cell::get),
+            DOT_PAIRS.with(Cell::get),
+            VECTORS_SCORED.with(Cell::get),
+            NORM_COMPONENTS.with(Cell::get),
+        )
+    }
 }
 
 /// Reciprocal-rank fusion: score = Σ w / (k + rank), k = 60.
@@ -670,13 +783,12 @@ pub fn fuse(rankings: &[(f64, Vec<Hit>)], limit: usize) -> Vec<Hit> {
             symbol,
         })
         .collect();
-    out.sort_by(|a, b| {
+    sort_truncate_topk_by(&mut out, limit, |a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.path.cmp(&b.path))
     });
-    out.truncate(limit);
     out
 }
 
@@ -2202,5 +2314,218 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    // ---------------------------------------------------- perf probes (audit)
+    fn lcg_f32(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+    }
+
+    fn persisted_vectors_index(n: usize, dim: usize) -> (WI, WorkspaceId) {
+        let ws = WorkspaceId::new(77);
+        let mut idx = WI::new();
+        idx.set_embedding_model(ws, &EmbeddingModel::new("m", "r"));
+        let mut state = 0x5eed_u64;
+        for i in 0..n {
+            let text = format!("chunk-{i}");
+            let rel = format!("src/f{i:06}.rs");
+            idx.index_file(ws, std::path::Path::new(&rel), text.as_bytes(), i as i64)
+                .unwrap();
+            let vector: Vec<f32> = (0..dim).map(|_| lcg_f32(&mut state)).collect();
+            idx.put_embedding(ws, &content_hash(&text), vector).unwrap();
+        }
+        (idx, ws)
+    }
+
+    #[test]
+    fn persisted_semantic_scan_is_linear_and_bit_identical() {
+        let (idx, ws) = persisted_vectors_index(10_000, 768);
+        let mut state = 0xabcdef_u64;
+        let query: Vec<f32> = (0..768).map(|_| lcg_f32(&mut state)).collect();
+        let mut best = u64::MAX;
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            let hits = semantic_from_persisted(&idx, ws, &query, 10).unwrap();
+            assert_eq!(hits.len(), 10);
+            best = best.min(started.elapsed().as_nanos() as u64);
+        }
+        // Instrumented complexity proof: one dot per scored vector (the 8192
+        // per-query bound, not all 10k), one norm pass over the QUERY only
+        // (document norms are precomputed at index time).
+        perf::reset();
+        let hits = semantic_from_persisted(&idx, ws, &query, 10).unwrap();
+        let (dot_components, dot_pairs, vectors_scored, norm_components) = perf::snapshot();
+        assert_eq!(
+            vectors_scored, 8_192,
+            "the documented per-query vector bound"
+        );
+        assert_eq!(dot_pairs, 8_192, "one distance per vector");
+        assert_eq!(dot_components, 8_192 * 768);
+        assert_eq!(norm_components, 768, "the query norm is hoisted once");
+        // Differential oracle: the pre-fix full-scan/scoring code must rank
+        // and score identically (same sequential f32 accumulation order).
+        let mut naive: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+        for (path, vector, _) in idx.chunk_vectors(ws, MAX_PERSISTED_VECTORS_PER_QUERY) {
+            let score = cosine(&query, vector);
+            naive
+                .entry(path)
+                .and_modify(|current| {
+                    if score > *current {
+                        *current = score;
+                    }
+                })
+                .or_insert(score);
+        }
+        let mut naive_hits: Vec<Hit> = naive
+            .into_iter()
+            .map(|(path, score)| Hit {
+                path: path.to_string(),
+                score,
+                snippet: path.to_string(),
+                symbol: None,
+            })
+            .collect();
+        naive_hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.path.cmp(&b.path))
+        });
+        naive_hits.truncate(10);
+        assert_eq!(hits, naive_hits, "optimized scoring must be bit-identical");
+        println!("PROBE persisted_semantic_10k_768 best_ns={best}");
+    }
+
+    /// The PRE-OPTIMIZATION per-pair formula (one loop, sqrt of each sum of
+    /// squares). The optimized path is only equivalent if it reproduces this
+    /// on non-unit vectors; a missing sqrt silently shrinks every score and
+    /// changes the ranking when document norms differ.
+    fn legacy_cosine(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let mut dot = 0f32;
+        let mut na = 0f32;
+        let mut nb = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        (dot / (na.sqrt() * nb.sqrt())) as f64
+    }
+
+    #[test]
+    fn cosine_matches_the_pre_optimization_formula_bit_for_bit() {
+        // Direct value witnesses: the summed-norm form must take the square
+        // root, so 3-4-5 is 0.6, not 3/25 = 0.12.
+        assert!((cosine(&[3.0, 4.0], &[1.0, 0.0]) - 0.6).abs() < 1e-6);
+        assert!((cosine(&[1.0, 2.0], &[2.0, 4.0]) - 1.0).abs() < 1e-6);
+        let mut state = 0x5eed_c0de_u64;
+        for dim in [1usize, 2, 3, 7, 32, 768] {
+            for _ in 0..40 {
+                let a: Vec<f32> = (0..dim)
+                    .map(|_| lcg_f32(&mut state) * (((state >> 40) % 9) as f32 + 1.0))
+                    .collect();
+                let b: Vec<f32> = (0..dim)
+                    .map(|_| lcg_f32(&mut state) * (((state >> 41) % 7) as f32 + 1.0))
+                    .collect();
+                assert_eq!(
+                    cosine(&a, &b).to_bits(),
+                    legacy_cosine(&a, &b).to_bits(),
+                    "dim {dim}: optimized cosine diverged from the per-pair formula"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_non_unit_vectors_keep_true_cosine_scores() {
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(92);
+        let text = "non-unit chunk";
+        idx.index_file(ws, std::path::Path::new("src/n.rs"), text.as_bytes(), 0)
+            .unwrap();
+        idx.set_embedding_model(ws, &EmbeddingModel::new("m", "r"));
+        idx.put_embedding(ws, &content_hash(text), vec![3.0, 4.0])
+            .unwrap();
+        let hits = semantic_from_persisted(&idx, ws, &[1.0, 0.0], 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score - 0.6).abs() < 1e-6,
+            "persisted score must be the true cosine 0.6, got {}",
+            hits[0].score
+        );
+    }
+
+    /// `select_nth_unstable_by` may reorder equal elements; with the total
+    /// (score desc, path asc) order the top-k result must still be
+    /// byte-identical to a full stable sort + truncate, including at score
+    /// ties and every limit boundary.
+    #[test]
+    fn topk_selection_is_byte_identical_to_full_sort_for_ties() {
+        fn cmp(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.path.cmp(&b.path))
+        }
+        for n in [0usize, 1, 2, 7, 64, 257, 1000] {
+            let items: Vec<Hit> = (0..n)
+                .map(|i| Hit {
+                    path: format!("src/p{i:05}.rs"),
+                    score: (i % 5) as f64 / 4.0,
+                    snippet: String::new(),
+                    symbol: None,
+                })
+                .collect();
+            for limit in [0usize, 1, 2, 3, 7, 64, 256, 1000, 1001] {
+                let mut expected = items.clone();
+                expected.sort_by(cmp);
+                expected.truncate(limit);
+                let mut actual = items.clone();
+                sort_truncate_topk_by(&mut actual, limit, cmp);
+                assert_eq!(actual, expected, "n={n} limit={limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_is_total_on_non_finite_and_overflowed_vectors() {
+        // Dimension mismatch and empty inputs score zero (never panic).
+        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine(&[], &[]), 0.0);
+        // NaN / infinity never escape as a NaN score.
+        assert_eq!(cosine(&[f32::NAN, 1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 0.0], &[f32::INFINITY, 0.0]), 0.0);
+        // Zero vectors score zero.
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        // Finite components whose squared norm OVERFLOWS f32 used to yield
+        // NaN (inf / inf); the total form scores 0.0 deterministically.
+        let huge = [f32::MAX, f32::MAX];
+        assert_eq!(cosine(&huge, &huge), 0.0);
+    }
+
+    #[test]
+    fn persisted_overflowed_norm_scores_zero_not_nan() {
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(91);
+        let text = "overflow chunk";
+        idx.index_file(ws, std::path::Path::new("src/huge.rs"), text.as_bytes(), 0)
+            .unwrap();
+        idx.set_embedding_model(ws, &EmbeddingModel::new("m", "r"));
+        idx.put_embedding(ws, &content_hash(text), vec![f32::MAX; 4])
+            .unwrap();
+        let query = vec![1.0f32; 4];
+        let hits = semantic_from_persisted(&idx, ws, &query, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 0.0, "overflowed norm is a zero score");
+        assert!(hits[0].score.is_finite());
     }
 }

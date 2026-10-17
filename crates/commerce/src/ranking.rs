@@ -14,11 +14,12 @@
 //! constraint simply does not apply (no MOQ, no order multiple, no
 //! requested variant attributes) contributes full credit.
 
-use crate::matching::{match_offer, PartQuery};
+use crate::matching::{match_signals_in_view, PartQuery, QueryView};
 use crate::offer::{CommercialOffer, StockState};
 use crate::quantity::Quantity;
 use crate::quote::{
-    effective_terms, resolve_quote, selected_scope, PricingContext, QuoteStatus, VariantRequest,
+    effective_terms, resolve_quote_scoped, selected_scope, PricingContext, QuoteStatus,
+    VariantRequest,
 };
 use crate::text::AccountScope;
 
@@ -230,8 +231,9 @@ fn seller_completeness(offer: &CommercialOffer) -> ScoreComponent {
     component(ScoreKey::SellerCompleteness, (supplier + manufacturer) / 20)
 }
 
-fn score_offer(query: &PartQuery, offer: &CommercialOffer, ctx: &RankingContext) -> RankScore {
-    let signals = match_offer(query, offer, 0).signals;
+fn score_offer(view: &QueryView<'_>, offer: &CommercialOffer, ctx: &RankingContext) -> RankScore {
+    let query = view.query();
+    let signals = match_signals_in_view(view, offer);
 
     // `exact_mpn` normalizes the strength of the part-number relation:
     // identical canonical form 1000, equal base with only packaging
@@ -295,9 +297,17 @@ fn score_offer(query: &PartQuery, offer: &CommercialOffer, ctx: &RankingContext)
     // MOQ, order multiple and stock are scored from the SELECTED
     // variant/packaging scope when the context selects one, exactly like the
     // price; offer-level terms only apply when no scope was selected.
-    let (scope_variant, scope_packaging) = selected_scope(offer, &pricing_ctx);
+    let (resolution, resolved_variant, resolved_packaging) =
+        resolve_quote_scoped(offer, &pricing_ctx, ctx.quantity);
+    // A resolved quote already carries the variant/packaging it priced;
+    // reuse that scope instead of re-running variant matching. Refused or
+    // ambiguous quotes keep the exact pre-fix `selected_scope` behavior.
+    let (scope_variant, scope_packaging) = if resolution.status == QuoteStatus::Resolved {
+        (resolved_variant, resolved_packaging)
+    } else {
+        selected_scope(offer, &pricing_ctx)
+    };
     let scoped_terms = effective_terms(offer, scope_variant, scope_packaging);
-    let resolution = resolve_quote(offer, &pricing_ctx, ctx.quantity);
     let quantity_compatibility = component(
         ScoreKey::QuantityCompatibility,
         match resolution.status {
@@ -406,10 +416,11 @@ pub fn rank_offers<'a>(
     offers: &'a [CommercialOffer],
     ctx: &RankingContext,
 ) -> Vec<RankedOffer<'a>> {
+    let view = QueryView::new(query);
     let mut scored: Vec<(RankScore, usize, &'a CommercialOffer)> = offers
         .iter()
         .enumerate()
-        .map(|(index, offer)| (score_offer(query, offer, ctx), index, offer))
+        .map(|(index, offer)| (score_offer(&view, offer, ctx), index, offer))
         .collect();
     // The tie-break key is built ONCE per offer (`sort_by_cached_key`); the
     // pre-fix comparator rebuilt it inside EVERY comparison — four fresh
@@ -429,4 +440,222 @@ pub fn rank_offers<'a>(
             offer,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::offer::{
+        CommercialOffer, LifecycleStatus, ObservationOrigin, OfferProvenance, PriceVisibility,
+        StockState, VariantAttribute, VariantOffer,
+    };
+    use crate::text::{SourceId, Text};
+
+    fn source() -> SourceId {
+        SourceId::new("test").unwrap()
+    }
+
+    fn attr(name: &str, value: &str) -> VariantAttribute {
+        VariantAttribute {
+            name: Text::new(name).unwrap(),
+            value: Text::new(value).unwrap(),
+        }
+    }
+
+    fn variant(index: usize, attrs: usize) -> VariantOffer {
+        VariantOffer {
+            variant_id: crate::text::VariantId::new(&format!("sku-{index}")).unwrap(),
+            attributes: (0..attrs)
+                .map(|a| attr(&format!("attr{a}"), &format!("val{index}-{a}")))
+                .collect(),
+            packaging: None,
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            price_breaks: Vec::new(),
+            lead_time: None,
+        }
+    }
+
+    fn offer(index: usize, variants: usize, attrs: usize) -> CommercialOffer {
+        CommercialOffer {
+            source: source(),
+            identity: crate::identity::ProductIdentity {
+                manufacturer: Some(Text::new("ACME").unwrap()),
+                manufacturer_part_number: Some(Text::new(&format!("PART{index}")).unwrap()),
+                source_part_number: None,
+                offer_id: None,
+                canonical_url: None,
+                category: None,
+            },
+            title: Text::new(&format!("ACME PART{index} res 10K case 0603")).unwrap(),
+            description: None,
+            currency: crate::money::Currency::CNY,
+            price_breaks: vec![crate::offer::PriceBreak {
+                min_quantity: crate::quantity::NonZeroQuantity::ONE,
+                max_quantity: None,
+                unit_price: crate::money::Money::parse(crate::money::Currency::CNY, "1.00")
+                    .unwrap(),
+                visibility: PriceVisibility::Public,
+                account_scope: None,
+                promotion: None,
+            }],
+            variants: (0..variants).map(|v| variant(v, attrs)).collect(),
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::Unknown,
+            lead_time: None,
+            packaging: Vec::new(),
+            supplier: None,
+            manufacturer: None,
+            provenance: OfferProvenance {
+                origin: ObservationOrigin::OfficialApi,
+                source: source(),
+                extractor_version: None,
+                connector_version: None,
+                normalization_version: None,
+                content_digest: None,
+                account_scope: None,
+                locale: None,
+                market: None,
+                source_confidence_bp: None,
+            },
+            observed_at_ms: 1,
+            price_visibility: PriceVisibility::Public,
+            lifecycle: LifecycleStatus::Unknown,
+        }
+    }
+
+    fn query() -> PartQuery {
+        PartQuery {
+            manufacturer: Some(Text::new("ACME").unwrap()),
+            part_number: Text::new("PART7").unwrap(),
+            package: Some(Text::new("0603").unwrap()),
+            packaging: None,
+            quantity: Some(crate::quantity::Quantity::new(100).unwrap()),
+            attributes: vec![
+                attr("attr1", "VAL3-1"),
+                attr("attr2", "val3-2"),
+                attr(" attr3 ", "Val3-3"),
+                attr("attr4", "val3-4"),
+            ],
+        }
+    }
+
+    fn pricing_ctx<'a>(
+        query: &'a PartQuery,
+        ctx: &'a RankingContext,
+    ) -> crate::quote::PricingContext<'a> {
+        crate::quote::PricingContext {
+            variant: if query.attributes.is_empty() {
+                VariantRequest::None
+            } else {
+                VariantRequest::Attributes(&query.attributes)
+            },
+            packaging: ctx.packaging,
+            account: ctx.account.as_ref(),
+            now_ms: ctx.now_ms,
+            apply_promotions: ctx.apply_promotions,
+            shipping: None,
+            tax: None,
+            duty: None,
+        }
+    }
+
+    #[test]
+    fn resolved_scoped_quote_reports_the_same_scope_as_selected_scope() {
+        for index in [0usize, 7, 42] {
+            let offer = offer(index, 4, 8);
+            let query = query();
+            let ctx = RankingContext::at_quantity(crate::quantity::Quantity::new(100).unwrap());
+            let pctx = pricing_ctx(&query, &ctx);
+            let (resolution, variant, packaging) =
+                crate::quote::resolve_quote_scoped(&offer, &pctx, ctx.quantity);
+            if resolution.status != QuoteStatus::Resolved {
+                continue;
+            }
+            let (expected_variant, expected_packaging) =
+                crate::quote::selected_scope(&offer, &pctx);
+            assert_eq!(
+                variant.map(|value| value.variant_id.as_str()),
+                expected_variant.map(|value| value.variant_id.as_str())
+            );
+            assert_eq!(
+                packaging.map(|value| value.packaging),
+                expected_packaging.map(|value| value.packaging)
+            );
+        }
+    }
+
+    #[test]
+    fn ranking_pipeline_drops_the_per_candidate_query_and_quantity_work() {
+        let offers: Vec<CommercialOffer> = (0..10_000).map(|i| offer(i, 4, 8)).collect();
+        let query = query();
+        let ctx = RankingContext::at_quantity(crate::quantity::Quantity::new(100).unwrap());
+        let mut old_best = u64::MAX;
+        let mut new_best = u64::MAX;
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            for offer in &offers {
+                let pctx = pricing_ctx(&query, &ctx);
+                // The pre-fix ranking path: a fresh QueryView + full match
+                // (including a quantity quote), then its own scope/quote.
+                let signals = crate::matching::match_offer(&query, offer, 0).signals;
+                let _ = crate::quote::selected_scope(offer, &pctx);
+                let _ = crate::quote::resolve_quote(offer, &pctx, ctx.quantity);
+                std::hint::black_box(signals);
+            }
+            old_best = old_best.min(started.elapsed().as_nanos() as u64);
+
+            let started = std::time::Instant::now();
+            let view = QueryView::new(&query);
+            for offer in &offers {
+                let pctx = pricing_ctx(&query, &ctx);
+                let signals = match_signals_in_view(&view, offer);
+                let _ = crate::quote::resolve_quote_scoped(offer, &pctx, ctx.quantity);
+                std::hint::black_box(signals);
+            }
+            new_best = new_best.min(started.elapsed().as_nanos() as u64);
+        }
+        println!(
+            "PROBE rank_pipeline_10k old_ns={old_best} new_ns={new_best} \
+             reduction_pct={}",
+            (old_best.saturating_sub(new_best)) * 100 / old_best.max(1)
+        );
+    }
+
+    #[test]
+    fn ranking_builds_the_query_view_once_for_10k_candidates() {
+        let offers: Vec<CommercialOffer> = (0..10_000).map(|i| offer(i, 4, 8)).collect();
+        let query = query();
+        let ctx = RankingContext::at_quantity(crate::quantity::Quantity::new(100).unwrap());
+        crate::offer::normalization_work::reset();
+        crate::matching::query_view_work::reset();
+        let mut best = u64::MAX;
+        let mut ranked = 0usize;
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let out = rank_offers(&query, &offers, &ctx);
+            best = best.min(started.elapsed().as_nanos() as u64);
+            ranked = out.len();
+        }
+        let normalizations = crate::offer::normalization_work::snapshot();
+        let query_views = crate::matching::query_view_work::snapshot();
+        assert_eq!(ranked, 10_000);
+        // The pre-fix path rebuilt the query view inside every candidate:
+        // one view per rank call, never one per candidate.
+        assert_eq!(query_views, 2, "one query view per rank call");
+        // Candidate attributes are still normalized by matching + quote
+        // resolution; the query side is not repeated per candidate.
+        assert!(
+            normalizations < 10_000 * 216 * 2,
+            "query-side normalization must not repeat per candidate: {normalizations}"
+        );
+        println!(
+            "PROBE rank_10k_offers best_ns={best} ranked={ranked} \
+             normalizations={normalizations} query_views={query_views}"
+        );
+    }
 }

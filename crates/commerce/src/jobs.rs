@@ -320,20 +320,31 @@ impl JobWork {
                 variant: variant.clone(),
                 packaging: *packaging,
             }],
-            Self::Bom { bom } => bom
-                .items()
-                .iter()
-                .enumerate()
-                .map(|(ordinal, item)| JobLine {
-                    item_key: bom_line_key(ordinal as u32, item),
-                    ordinal: ordinal as u32,
-                    query: Some(item.q.clone()),
-                    quantity: Some(item.qty),
-                    reference: None,
-                    variant: item.variant.clone(),
-                    packaging: item.packaging,
-                })
-                .collect(),
+            Self::Bom { bom } => {
+                let mut normalized: std::collections::HashMap<&str, String> =
+                    std::collections::HashMap::new();
+                bom.items()
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, item)| {
+                        let canonical = normalized
+                            .entry(item.q.as_str())
+                            .or_insert_with(|| crate::query::canonical_query(item.q.as_str()));
+                        JobLine {
+                            item_key: bom_line_key_from_content(
+                                ordinal as u32,
+                                &item.key_from_normalized(canonical),
+                            ),
+                            ordinal: ordinal as u32,
+                            query: Some(item.q.clone()),
+                            quantity: Some(item.qty),
+                            reference: None,
+                            variant: item.variant.clone(),
+                            packaging: item.packaging,
+                        }
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -376,7 +387,11 @@ fn synthetic_item_key(canonical: &str) -> String {
 /// items — the `(job_id, item_key)` primary key can never collapse requested
 /// lines — while [`Bom::digest`] stays the content digest of the request.
 pub fn bom_line_key(ordinal: u32, item: &BomItem) -> String {
-    let content = item.key();
+    bom_line_key_from_content(ordinal, &item.key())
+}
+
+/// [`bom_line_key`] over an already-computed item key.
+fn bom_line_key_from_content(ordinal: u32, content: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(BOM_LINE_KEY_DOMAIN);
     hasher.update(&ordinal.to_le_bytes());
@@ -1089,5 +1104,39 @@ mod tests {
             scoped.owner_key(),
             "the same identity derives the same key"
         );
+    }
+
+    #[test]
+    fn bom_line_and_digest_normalize_duplicate_spellings_once() {
+        for distinct in [500usize, 5] {
+            let pairs: Vec<(String, u64)> = (0..500)
+                .map(|i| (format!("PART-{:04} 10K 0603", i % distinct), 100 + i as u64))
+                .collect();
+            let refs: Vec<(&str, u64)> = pairs.iter().map(|(q, n)| (q.as_str(), *n)).collect();
+            let bom = crate::bom::Bom::from_pairs(&refs).expect("bom");
+            let work = JobWork::Bom { bom: bom.clone() };
+            let mut best = u64::MAX;
+            for _ in 0..9 {
+                let started = std::time::Instant::now();
+                let l = work.lines();
+                let d = bom.digest();
+                assert_eq!(d.len(), 64);
+                assert_eq!(l.len(), 500);
+                best = best.min(started.elapsed().as_nanos() as u64);
+            }
+            crate::query::canonical_work::reset();
+            let _ = work.lines();
+            let _ = bom.digest();
+            let canonicalizations = crate::query::canonical_work::snapshot();
+            assert_eq!(
+                canonicalizations,
+                (distinct * 2) as u64,
+                "each distinct spelling canonicalizes once per digest and once per line pass"
+            );
+            println!(
+                "PROBE bom_lines_and_digest_500 distinct={distinct} best_ns={best} \
+                 canonicalizations={canonicalizations}"
+            );
+        }
     }
 }

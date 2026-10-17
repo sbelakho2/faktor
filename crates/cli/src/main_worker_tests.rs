@@ -1107,11 +1107,13 @@ async fn workers_disabled_daemon_creates_no_workers_db_and_enabled_opens_the_pla
                 workers_db.exists(),
                 "{label}: an enabled [workers] section must open its durable plane"
             );
-            // The plane's OWN migration ladder is applied (v2: the v1
-            // schema + the durability policy marker) — the commercial
-            // control-plane user_version is untouched.
+            // The plane's OWN migration ladder is applied to its HEAD — the
+            // commercial control-plane user_version is untouched.
             let store = faktor_worker::SqliteWorkerStore::open(&workers_db).unwrap();
-            assert_eq!(faktor_worker::schema_version(&store).unwrap(), 2);
+            assert_eq!(
+                faktor_worker::schema_version(&store).unwrap(),
+                faktor_worker::WORKER_SCHEMA_HEAD
+            );
             let plane = faktor_worker::WorkerPlane::with_system_clock(std::sync::Arc::new(store));
             let organization = faktor_cloud::OrganizationId::try_new("org_local").unwrap();
             assert!(plane

@@ -782,6 +782,29 @@ pub const COMMERCE_MIGRATIONS: &[&str] = &[
             finished_ms = COALESCE(finished_ms, updated_ms),
             last_error = 'owner_scope_missing'
       WHERE owner_key IS NULL AND state IN ('queued', 'running');",
+    // v4 — query-plan audit. The latest-offer read keys
+    // (source, source_offer_id) and orders by (observed_at_ms,
+    // offer_snapshot_id); the v1 index stopped at the key columns, so every
+    // read sorted all matching history. The cache retention predicate wrapped
+    // BOTH columns in COALESCE, which no column index can serve; an
+    // expression index on the exact predicate makes the age purge a range
+    // SEARCH (the class-led index it replaces had no read path). The two
+    // partial job indexes match the two active-job reads exactly (owner+digest
+    // lookup and the global FIFO scan), so both orders are index-provided and
+    // only live rows pay maintenance.
+    "DROP INDEX IF EXISTS idx_offer_snapshot_offer;
+     CREATE INDEX IF NOT EXISTS idx_offer_snapshot_offer
+        ON offer_snapshot(source, source_offer_id, observed_at_ms DESC,
+                          offer_snapshot_id DESC);
+     DROP INDEX IF EXISTS idx_search_cache_expiry;
+     CREATE INDEX IF NOT EXISTS idx_search_cache_expiry
+        ON search_cache(COALESCE(revalidated_at_ms, observed_at_ms));
+     CREATE INDEX IF NOT EXISTS idx_job_owner_active
+        ON job(owner_key, digest, created_ms DESC, job_id DESC)
+        WHERE state IN ('queued', 'running');
+     CREATE INDEX IF NOT EXISTS idx_job_active_created
+        ON job(created_ms ASC, job_id ASC)
+        WHERE state IN ('queued', 'running') AND owner_key IS NOT NULL;",
 ];
 
 /// The newest schema version this binary knows.
@@ -1789,7 +1812,8 @@ impl CommerceStore {
             "SELECT job_id, digest, kind, state, request_json, created_ms, updated_ms,
                     started_ms, finished_ms, matched, ambiguous, unmatched, artifact_digest,
                     artifact_bytes, compact_json, last_error, owner_key
-             FROM job WHERE state IN ('queued', 'running') AND owner_key IS NOT NULL
+             FROM job INDEXED BY idx_job_active_created
+             WHERE state IN ('queued', 'running') AND owner_key IS NOT NULL
              ORDER BY created_ms ASC, job_id ASC",
         )?;
         let rows = stmt.query_map([], decode_job_row)?;
@@ -2468,6 +2492,8 @@ fn verified_pre_migration_backup(
 mod tests {
     use super::*;
     use crate::text::CanonicalUrl;
+
+    include!("query_plan_tests.rs");
 
     fn identity(url: &str) -> ProductIdentity {
         ProductIdentity {

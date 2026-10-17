@@ -83,10 +83,17 @@ impl BomItem {
     /// selections)`. The selection tags are appended only when present, so
     /// an unselected line keeps the exact legacy key.
     pub fn key(&self) -> String {
-        let normalized = canonical_query(self.q.as_str());
+        self.key_from_normalized(&canonical_query(self.q.as_str()))
+    }
+
+    /// [`Self::key`] over an already-canonicalized query. Batch callers (BOM
+    /// digests and job-line construction) canonicalize each distinct spelling
+    /// once and hash it here, instead of re-normalizing the same query for
+    /// every pass.
+    pub(crate) fn key_from_normalized(&self, normalized: &str) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(BOM_ITEM_DOMAIN);
-        hash_base(&mut hasher, &normalized, self.qty.get());
+        hash_base(&mut hasher, normalized, self.qty.get());
         if let Some(variant) = &self.variant {
             hasher.update(&[1, b'v']);
             let value = variant.as_str();
@@ -190,8 +197,15 @@ impl Bom {
         let mut hasher = blake3::Hasher::new();
         hasher.update(BOM_DIGEST_DOMAIN);
         hasher.update(&(self.0.len() as u64).to_le_bytes());
+        // Batch dedupe: identical raw spellings canonicalize once even when
+        // they repeat across lines; the digest bytes are unchanged.
+        let mut normalized: std::collections::HashMap<&str, String> =
+            std::collections::HashMap::new();
         for item in &self.0 {
-            let key = item.key();
+            let canonical = normalized
+                .entry(item.q.as_str())
+                .or_insert_with(|| canonical_query(item.q.as_str()));
+            let key = item.key_from_normalized(canonical);
             hasher.update(key.as_bytes());
         }
         hasher.finalize().to_hex().to_string()

@@ -223,5 +223,9 @@ mod outcome_ledger;
 pub use outcome_ledger::*;
 
 #[cfg(test)]
+#[path = "query_plan_tests.rs"]
+mod query_plan_tests;
+
+#[cfg(test)]
 #[path = "hostile_corpus_tests.rs"]
 mod hostile_corpus_tests;

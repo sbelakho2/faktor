@@ -120,7 +120,7 @@ impl Store {
     ///   `max_bytes = 0` yields the newest message, not an empty window).
     ///
     /// Rows older than the returned window are NEVER read: the statement is
-    /// stepped lazily over the `idx_message_session_seq` backward index and
+    /// stepped lazily over the UNIQUE `(session_id, seq)` autoindex backward and
     /// the loop breaks before stepping past a bound. `before_seq` cuts
     /// strictly (`seq < before_seq`); values above `i64::MAX` clamp to "no
     /// older bound" (the newest page).

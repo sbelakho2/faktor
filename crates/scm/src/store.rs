@@ -373,6 +373,16 @@ const SCM_MIGRATIONS: &[&str] = &[
     // separate probe connection). Owned by the durability stack
     // (`faktor_cloud::durability`), the same marker cloud records.
     faktor_cloud::durability::POLICY_SCHEMA_V5,
+    // v3 — query-plan audit (additive indexes only). The installation
+    // listing orders repositories by id while the only existing key is
+    // (installation_id, owner, name), so every row needed a temp sort; the
+    // webhook receipt listing orders by received_ms while the table is keyed
+    // by delivery_id, so it scanned + sorted the whole table. Both indexes
+    // carry the selected columns so the reads are covering.
+    "CREATE INDEX IF NOT EXISTS idx_scm_repository_installation
+        ON scm_repository(installation_id, id);
+     CREATE INDEX IF NOT EXISTS idx_scm_webhook_received
+        ON scm_webhook_delivery(received_ms, delivery_id, event);",
 ];
 
 impl SqliteScmStore {
@@ -847,6 +857,8 @@ impl ScmStore for SqliteScmStore {
 mod tests {
     use super::*;
 
+    include!("query_plan_tests.rs");
+
     /// P1 durability: the commercial SCM writer connection acknowledges a
     /// commit only after an fsync (`synchronous = FULL`), so a crash/power
     /// loss cannot roll back an acknowledged repository/webhook mutation.
@@ -947,7 +959,8 @@ mod tests {
         // Migration restore points are a separate class: never rotated as
         // rotating backups. The claim must match the live schema version so
         // the point self-verifies (see `faktor_cloud::durability`).
-        faktor_cloud::durability::migration_backup(&conn, &path, 2).unwrap();
+        faktor_cloud::durability::migration_backup(&conn, &path, SCM_MIGRATIONS.len() as i64)
+            .unwrap();
         assert_eq!(
             faktor_cloud::durability::list_rotating_backups(&path).len(),
             faktor_cloud::durability::MAX_BACKUP_FILES

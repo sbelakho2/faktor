@@ -101,6 +101,24 @@ pub struct EmbeddingRecord {
     pub model_revision: String,
     pub dimension: u32,
     pub vector: Vec<f32>,
+    /// Precomputed L2 norm of `vector` (sequential f32 accumulation, exactly
+    /// the order `cosine` used before it was hoisted). Derived data: a loaded
+    /// record recomputes it in [`EmbeddingIndex::sanitize`], so a hostile or
+    /// stale persisted value can never poison ranking. The field is
+    /// `#[serde(skip)]`: it is derived at `put`/`sanitize` time, so a
+    /// reserialized generation stays byte-identical to the pre-norm shape.
+    #[serde(skip)]
+    pub norm: f32,
+}
+
+/// Sequential f32 sum of squares — the exact accumulation order the original
+/// per-pair cosine used, so hoisting the norm cannot change any score bit.
+pub fn vector_norm(vector: &[f32]) -> f32 {
+    let mut sum = 0f32;
+    for value in vector {
+        sum += value * value;
+    }
+    sum
 }
 
 /// Hard byte bound of the persisted degraded-build reason (a hostile
@@ -512,6 +530,7 @@ impl EmbeddingIndex {
                 model_id: self.model_id.clone(),
                 model_revision: self.model_revision.clone(),
                 dimension: dimension as u32,
+                norm: vector_norm(&vector),
                 vector,
             },
         );
@@ -570,6 +589,10 @@ impl EmbeddingIndex {
                     );
             if !valid {
                 tracing::warn!(key = %key, "dropping invalid persisted embedding record");
+            } else {
+                // The norm is DERIVED: recompute it from the surviving vector
+                // so a hostile persisted norm can never steer a ranking.
+                record.norm = vector_norm(&record.vector);
             }
             valid
         });
@@ -944,6 +967,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_content_hash_replaces_and_the_norm_is_derived_not_trusted() {
+        let mut idx = EmbeddingIndex::default();
+        idx.set_identity("m", "r");
+        idx.put("same-hash", vec![0.0, 1.0]).unwrap();
+        idx.put("same-hash", vec![3.0, 4.0]).unwrap();
+        assert_eq!(idx.len(), 1, "one record per content hash");
+        assert_eq!(idx.active_vector("same-hash"), Some(&[3.0, 4.0][..]));
+        assert_eq!(vector_norm(&[3.0, 4.0]), 25.0, "f32 sum of squares");
+        // A hostile persisted norm is ignored: sanitize re-derives it.
+        let key = embedding_key("same-hash", "m", "r", 2);
+        let mut hostile = idx.clone();
+        hostile.records.get_mut(&key).unwrap().norm = f32::MAX;
+        let clean = hostile.sanitize();
+        assert_eq!(clean.records[&key].norm, 25.0);
+        // A non-finite norm from a finite-but-overflowed vector stays
+        // non-finite in the record; search turns it into a 0.0 score.
+        idx.put("huge", vec![f32::MAX; 2]).unwrap();
+        let huge = &idx.records[&embedding_key("huge", "m", "r", 2)];
+        assert!(!vector_norm(&huge.vector).is_finite());
+    }
+
+    #[test]
     fn pruning_is_bounded_and_deterministic() {
         let mut idx = EmbeddingIndex::default();
         idx.set_identity("m", "r");
@@ -969,6 +1014,7 @@ mod tests {
                 model_id: "m".into(),
                 model_revision: "r".into(),
                 dimension: 2,
+                norm: 0.0,
                 vector: vec![1.0, 2.0],
             },
         );
@@ -979,6 +1025,7 @@ mod tests {
                 model_id: "m".into(),
                 model_revision: "r".into(),
                 dimension: 2,
+                norm: 0.0,
                 vector: vec![f32::INFINITY, 0.0],
             },
         );
@@ -989,6 +1036,7 @@ mod tests {
                 model_id: "m".into(),
                 model_revision: "r".into(),
                 dimension: 9,
+                norm: 0.0,
                 vector: vec![0.0, 0.0],
             },
         );
@@ -1020,6 +1068,7 @@ mod tests {
                 model_id: "old".into(),
                 model_revision: "r0".into(),
                 dimension: 2,
+                norm: 0.0,
                 vector: vec![1.0, 0.0],
             },
         );

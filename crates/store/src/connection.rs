@@ -1253,6 +1253,49 @@ mod writer_service_tests {
             .unwrap();
     }
 
+    /// Bounded contention probe (third-angle performance audit): 16 threads
+    /// issue 2.5k reads each through the SAME reader-pool API. The pool is
+    /// DELIBERATELY capped at `READER_POOL` connections (SQLite WAL allows
+    /// concurrent readers; the cap is the resource bound), so permit waits
+    /// are expected and measured here rather than removed.
+    #[test]
+    fn reader_pool_16_thread_contention_probe() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 2_500;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/reader-probe").unwrap();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        assert_eq!(
+                            store.workspace_root(ws).unwrap().as_deref(),
+                            Some("/reader-probe")
+                        );
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        let telemetry = store.reader_telemetry();
+        eprintln!(
+            "store reader-pool probe: {THREADS} threads x {PER_THREAD} reads in {elapsed:?}              ({:.0} reads/s); reads={} permit_wait_total={}us max_wait={}us receipts_dropped={}",
+            (THREADS * PER_THREAD) as f64 / elapsed.as_secs_f64(),
+            telemetry.reads,
+            telemetry.permit_wait_total_ns / 1_000,
+            telemetry.permit_wait_max_ns / 1_000,
+            telemetry.receipts_dropped,
+        );
+        assert_eq!(telemetry.reads, (THREADS * PER_THREAD) as u64);
+        assert!(
+            telemetry.permit_wait_max_ns < BUSY_TIMEOUT.as_nanos() as u64,
+            "a reader waited past the busy timeout"
+        );
+        assert!(store.reader_pool_len() <= READER_POOL);
+    }
+
     /// Ephemeral store locks (reader-pool semaphore + connection cache,
     /// crash-seam state) recover from a deliberate panic while held: later
     /// reads/writes are healthy, never a panic and never a stuck store.

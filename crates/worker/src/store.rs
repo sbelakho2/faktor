@@ -118,6 +118,10 @@ pub const WORKER_SCHEMA_V1: &str = "
      CREATE INDEX IF NOT EXISTS idx_wp_journal_org_seq ON wp_journal(organization_id, seq);
 ";
 
+/// The worker plane's schema head (the ladder length). Public so cross-crate
+/// daemon tests can pin the head without duplicating the ladder count.
+pub const WORKER_SCHEMA_HEAD: i64 = WORKER_MIGRATIONS.len() as i64;
+
 const WORKER_MIGRATIONS: &[&str] = &[
     WORKER_SCHEMA_V1,
     // v2 — the durability policy marker (P1 audit): the writer RECORDS the
@@ -126,6 +130,17 @@ const WORKER_MIGRATIONS: &[&str] = &[
     // separate probe connection). Owned by the durability stack
     // (`faktor_cloud::durability`), the same marker cloud records.
     faktor_cloud::durability::POLICY_SCHEMA_V5,
+    // v3 — query-plan audit (index replacement, same names/count). Both live
+    // lease listings filter (organization|worker, state) and ORDER BY
+    // lease_id; the v1 indexes ended at the state key, so the planner fell
+    // back to a temp B-tree over every live lease. Appending lease_id makes
+    // the order index-provided without adding another write-path index.
+    "DROP INDEX IF EXISTS idx_wp_lease_org_state;
+     CREATE INDEX IF NOT EXISTS idx_wp_lease_org_state
+        ON wp_lease(organization_id, state, lease_id);
+     DROP INDEX IF EXISTS idx_wp_lease_worker;
+     CREATE INDEX IF NOT EXISTS idx_wp_lease_worker
+        ON wp_lease(worker_id, state, lease_id);",
 ];
 
 /// The outcome of one result landing attempt.
@@ -2624,6 +2639,8 @@ mod tests {
     use crate::model::WorkerCapabilities;
     use crate::model::{JobRequirements, JobState, NetworkProfile, RequeuePolicy};
 
+    include!("query_plan_tests.rs");
+
     /// P1 durability: the commercial worker-plane writer connection
     /// acknowledges a commit only after an fsync (`synchronous = FULL`), so a
     /// crash/power loss cannot roll back an acknowledged job/lease/result row.
@@ -2745,7 +2762,8 @@ mod tests {
         // Migration restore points are a separate class: never rotated as
         // rotating backups. The claim must match the live schema version so
         // the point self-verifies (see `faktor_cloud::durability`).
-        faktor_cloud::durability::migration_backup(&conn, &path, 2).unwrap();
+        faktor_cloud::durability::migration_backup(&conn, &path, WORKER_MIGRATIONS.len() as i64)
+            .unwrap();
         assert_eq!(
             faktor_cloud::durability::list_rotating_backups(&path).len(),
             faktor_cloud::durability::MAX_BACKUP_FILES
@@ -2942,16 +2960,22 @@ mod tests {
     }
 
     /// The schema is a real migration: opening twice is idempotent, and the
-    /// cursor lands on v2 (v1 schema + the durability policy marker).
+    /// cursor lands on the ladder head.
     #[test]
-    fn sqlite_schema_version_is_two_and_reopen_is_idempotent() {
+    fn sqlite_schema_version_is_the_ladder_head_and_reopen_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workers.db");
         let store = SqliteWorkerStore::open(&path).unwrap();
-        assert_eq!(schema_version(&store).unwrap(), 2);
+        assert_eq!(
+            schema_version(&store).unwrap(),
+            WORKER_MIGRATIONS.len() as i64
+        );
         drop(store);
         let store = SqliteWorkerStore::open(&path).unwrap();
-        assert_eq!(schema_version(&store).unwrap(), 2);
+        assert_eq!(
+            schema_version(&store).unwrap(),
+            WORKER_MIGRATIONS.len() as i64
+        );
     }
 
     /// Adversarial: corrupt the durable payload of one row and prove the

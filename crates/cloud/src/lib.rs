@@ -145,3 +145,7 @@ pub use vendor::{
     BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,
     MAX_REPORT_ATTEMPTS, MAX_REPORT_PAGES, MAX_REPORT_TASKS, VENDOR_HTTP_TIMEOUT_MS,
 };
+
+#[cfg(test)]
+#[path = "query_plan_tests.rs"]
+mod query_plan_tests;

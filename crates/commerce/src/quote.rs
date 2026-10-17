@@ -924,13 +924,27 @@ fn resolve_packaging(
 }
 
 /// Resolve a quote with an explicit pricing context.
-pub fn resolve_quote(
-    offer: &CommercialOffer,
+/// Resolve a quote and ALSO return the selected variant/packaging scope.
+/// The public [`resolve_quote`] is the resolution alone; ranking uses the
+/// scope to derive its stock/MOQ terms without re-running variant matching
+/// (the same scope [`selected_scope`] would compute) on the common resolved
+/// path. Every early/refused path returns the scope it actually resolved (or
+/// `None`), never a fabricated one.
+pub(crate) fn resolve_quote_scoped<'a>(
+    offer: &'a CommercialOffer,
     ctx: &PricingContext<'_>,
     quantity: Quantity,
-) -> QuoteResolution {
+) -> (
+    QuoteResolution,
+    Option<&'a VariantOffer>,
+    Option<&'a PackagingOption>,
+) {
     if offer.price_visibility == PriceVisibility::InquiryRequired {
-        return QuoteResolution::bare(QuoteStatus::InquiryRequired, quantity);
+        return (
+            QuoteResolution::bare(QuoteStatus::InquiryRequired, quantity),
+            None,
+            None,
+        );
     }
 
     let variant: Option<&VariantOffer> = match ctx.variant {
@@ -940,18 +954,30 @@ pub fn resolve_quote(
                 .iter()
                 .any(|variant| !variant.price_breaks.is_empty())
             {
-                return variant_ambiguous(offer, quantity, ctx);
+                return (variant_ambiguous(offer, quantity, ctx), None, None);
             }
             None
         }
         VariantRequest::Id(variant_id) => match offer.variant_by_id(variant_id) {
             Some(variant) => Some(variant),
-            None => return QuoteResolution::bare(QuoteStatus::VariantNotFound, quantity),
+            None => {
+                return (
+                    QuoteResolution::bare(QuoteStatus::VariantNotFound, quantity),
+                    None,
+                    None,
+                )
+            }
         },
         VariantRequest::Attributes(attributes) => {
             let matching = offer.variants_matching(attributes);
             match matching.len() {
-                0 => return QuoteResolution::bare(QuoteStatus::VariantNotFound, quantity),
+                0 => {
+                    return (
+                        QuoteResolution::bare(QuoteStatus::VariantNotFound, quantity),
+                        None,
+                        None,
+                    )
+                }
                 1 => Some(matching[0]),
                 _ => {
                     let mut resolution = variant_ambiguous(offer, quantity, ctx);
@@ -963,7 +989,7 @@ pub fn resolve_quote(
                         candidate_range(matching.iter().filter_map(|variant| {
                             candidate_unit_price(offer, Some(variant), None, quantity, ctx)
                         }));
-                    return resolution;
+                    return (resolution, None, None);
                 }
             }
         }
@@ -980,7 +1006,7 @@ pub fn resolve_quote(
             resolution.price_range = candidate_range(offer.packaging.iter().filter_map(|option| {
                 candidate_unit_price(offer, variant, Some(option), quantity, ctx)
             }));
-            return resolution;
+            return (resolution, variant, None);
         }
     };
 
@@ -991,7 +1017,7 @@ pub fn resolve_quote(
                     QuoteResolution::bare(QuoteStatus::PackagingMismatch, quantity);
                 resolution.variant_id = Some(variant.variant_id.clone());
                 resolution.packaging = Some(requested);
-                return resolution;
+                return (resolution, Some(variant), None);
             }
         }
     }
@@ -1006,27 +1032,27 @@ pub fn resolve_quote(
 
     let outcome = match price_with_terms(&terms, quantity, ctx) {
         Ok(outcome) => outcome,
-        Err(PricingFailure::NoPrice) => return resolution,
+        Err(PricingFailure::NoPrice) => return (resolution, variant, packaging),
         Err(PricingFailure::MoqViolation { moq }) => {
             resolution.status = QuoteStatus::MoqViolation;
             resolution.moq = Some(moq);
-            return resolution;
+            return (resolution, variant, packaging);
         }
         Err(PricingFailure::AmbiguousTier) => {
             resolution.status = QuoteStatus::AmbiguousTier;
-            return resolution;
+            return (resolution, variant, packaging);
         }
         Err(PricingFailure::QuantityStepUnsatisfiable) => {
             resolution.status = QuoteStatus::QuantityStepUnsatisfiable;
-            return resolution;
+            return (resolution, variant, packaging);
         }
         Err(PricingFailure::QuantityTooLarge) => {
             resolution.status = QuoteStatus::QuantityTooLarge;
-            return resolution;
+            return (resolution, variant, packaging);
         }
         Err(PricingFailure::AmountOverflow) => {
             resolution.status = QuoteStatus::AmountOverflow;
-            return resolution;
+            return (resolution, variant, packaging);
         }
     };
 
@@ -1034,11 +1060,11 @@ pub fn resolve_quote(
         Ok(quote) => quote,
         Err(QuoteError::CurrencyMismatch { .. }) => {
             resolution.status = QuoteStatus::CurrencyMismatch;
-            return resolution;
+            return (resolution, variant, packaging);
         }
         Err(_) => {
             resolution.status = QuoteStatus::AmountOverflow;
-            return resolution;
+            return (resolution, variant, packaging);
         }
     };
     resolution.status = QuoteStatus::Resolved;
@@ -1050,7 +1076,16 @@ pub fn resolve_quote(
     resolution.tier = Some(outcome.tier);
     resolution.applied_promotions = outcome.promotions;
     resolution.notes = outcome.notes;
-    resolution
+    (resolution, variant, packaging)
+}
+
+/// Resolve a quote with an explicit pricing context.
+pub fn resolve_quote(
+    offer: &CommercialOffer,
+    ctx: &PricingContext<'_>,
+    quantity: Quantity,
+) -> QuoteResolution {
+    resolve_quote_scoped(offer, ctx, quantity).0
 }
 
 /// The deterministic spec entry point: price `quantity` units of `offer`

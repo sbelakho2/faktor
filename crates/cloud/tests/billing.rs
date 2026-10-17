@@ -1335,7 +1335,7 @@ fn legacy_integer_task_ids_migrate_to_exact_reversible_text() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6, "the ladder advanced to v6");
+    assert!(version >= 6, "the ladder advanced past v6: {version}");
     for id in ids {
         let hex: String = conn
             .query_row(

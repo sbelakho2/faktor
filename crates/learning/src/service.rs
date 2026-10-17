@@ -468,12 +468,12 @@ impl<S: LearningStore> LearningService<S> {
         }
         let mut out: Vec<&ProjectLearning> = Vec::new();
         for scope in scopes {
-            if out.len() >= limit {
+            let remaining = limit.saturating_sub(out.len());
+            if remaining == 0 {
                 break;
             }
-            out.extend(self.store.page_for_scope(scope, 0, limit));
+            out.extend(self.store.page_for_scope(scope, 0, remaining));
         }
-        out.truncate(limit);
         Ok(out)
     }
 

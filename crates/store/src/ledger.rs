@@ -549,6 +549,49 @@ mod evidence_store_tests {
             "post-migrate"
         );
     }
+
+    /// Regression (query-plan audit): the newest page ordered by `created_ms`
+    /// while its cursor was `id < before`. A clock step or an explicit-id
+    /// import can make the two orders disagree, so page one could end at id 2
+    /// while the row with id 3 (older timestamp) had not been emitted yet:
+    /// page two then excluded it FOREVER. The order and cursor are both the
+    /// monotonic id now, and this test pins the exact formerly-skipped row.
+    #[test]
+    fn newest_evidence_pagination_never_skips_rows_when_timestamps_disagree() {
+        let (_d, store) = tmp();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let mut first = row(sid, ws, "id-1-newest-clock");
+        first.id = 1;
+        first.created_ms = 300;
+        let mut second = row(sid, ws, "id-2");
+        second.id = 2;
+        second.created_ms = 200;
+        let mut third = row(sid, ws, "id-3-oldest-clock");
+        third.id = 3;
+        third.created_ms = 100;
+        for r in [&first, &second, &third] {
+            store.evidence_insert(r).unwrap();
+        }
+
+        let page1 = store
+            .evidence_list_by_scope_newest(sid, ws, None, 2)
+            .unwrap();
+        assert_eq!(
+            page1.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![3, 2],
+            "newest page is id order"
+        );
+        let page2 = store
+            .evidence_list_by_scope_newest(sid, ws, Some(page1[1].id), 2)
+            .unwrap();
+        assert_eq!(
+            page2.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1],
+            "the row the old created_ms ordering skipped is served"
+        );
+        assert_eq!(page1.len() + page2.len(), 3, "every row is served once");
+    }
 }
 
 /// Raw (undecoded) result of one queue-admission writer job (audit finding
@@ -2601,11 +2644,14 @@ impl Store {
 
     /// Additive newest-first scoped listing for the evidence recency path:
     /// every row of one session+workspace with `id < before` (no bound when
-    /// `before` is `None`), ordered `created_ms DESC, id DESC` and limited.
-    /// `before` is the exclusive keyset cursor (evidence ids are assigned
-    /// monotonically, so it is the canonical recency boundary); scope/task
-    /// filtering stays in the evidence crate. `limit` is clamped to the same
-    /// hard bound as [`Store::evidence_list_by_scope`].
+    /// `before` is `None`), ordered `id DESC` and limited. `before` is the
+    /// exclusive keyset cursor; ids are assigned monotonically, so the id is
+    /// BOTH the sort key and the cursor. Ordering by `created_ms` instead let
+    /// a clock step (or an explicit-id import) reorder the page and permanently
+    /// skip rows whose id sat above the cursor; the scope index
+    /// (`session_id, workspace_id, id`) now serves the order directly, with no
+    /// temp B-tree. Scope/task filtering stays in the evidence crate. `limit`
+    /// is clamped to the same hard bound as [`Store::evidence_list_by_scope`].
     pub fn evidence_list_by_scope_newest(
         &self,
         session_id: SessionId,
@@ -2629,7 +2675,7 @@ impl Store {
                     compact, backing_cas_hash, completeness, created_ms
              FROM evidence
              WHERE session_id = ?1 AND workspace_id = ?2 AND id < ?3
-             ORDER BY created_ms DESC, id DESC LIMIT ?4",
+             ORDER BY id DESC LIMIT ?4",
         )?;
         let mut rows = stmt.query(params![
             session_id.raw() as i64,
