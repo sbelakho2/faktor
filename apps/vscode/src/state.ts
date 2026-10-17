@@ -548,6 +548,13 @@ export interface FaktorSnapshot {
    * never hosted an index service. */
   readonly indexCoverage: NativeIndexCoverageSnapshot | null;
   readonly transcript: readonly TranscriptEntry[];
+  /**
+   * Content digest of `transcript` (host-computed, bounded refresh cadence).
+   * The webview skips transcript key work and DOM mutation entirely while it
+   * is unchanged; a changed digest with identical lengths still re-keys the
+   * entries so same-length edits are never mistaken for a no-op.
+   */
+  readonly transcriptRevision: string;
   readonly streamStatus: string;
   /**
    * The ONE preflight/readiness presentation state (I06): the same view the
@@ -588,6 +595,7 @@ export function emptySnapshot(): FaktorSnapshot {
     indexCoverage: null,
     permissions: [],
     transcript: [],
+    transcriptRevision: '',
     streamStatus: 'stopped',
     preflight: null,
     lastError: null,
@@ -855,6 +863,111 @@ export function transcriptFromMessages(messages: readonly Json[]): TranscriptEnt
     entries.push(entryFromMessage(id, message));
   }
   return boundTranscript(entries);
+}
+
+/**
+ * Content digest of the transcript, not just its shape: two messages with
+ * the same lengths but different text must still reach the panel (a
+ * length-only signature froze such edits on screen). The digest is computed
+ * once per bounded refresh, never per token, and the webview uses it to skip
+ * all transcript key work while the stream is idle.
+ */
+export function transcriptSignature(entries: readonly TranscriptEntry[]): string {
+  // 128-bit content digest (four independent FNV-1a lanes). A 32/64-bit
+  // signature is cheaply collidable by construction; the webview skips ALL
+  // transcript work while its revision is unchanged, so the identity must
+  // make a deliberate different-content/same-digest state impractical.
+  let laneA = 2166136261;
+  let laneB = 2166136261 ^ 0x9e3779b9;
+  let laneC = 2166136261 ^ 0x85ebca6b;
+  let laneD = 2166136261 ^ 0xc2b2ae35;
+  const mix = (text: string, salt: number): void => {
+    laneA ^= salt;
+    laneA = Math.imul(laneA, 16777619) >>> 0;
+    laneB ^= salt ^ 0x9e3779b9;
+    laneB = Math.imul(laneB, 16777619) >>> 0;
+    laneC ^= salt ^ 0x85ebca6b;
+    laneC = Math.imul(laneC, 16777619) >>> 0;
+    laneD ^= salt ^ 0xc2b2ae35;
+    laneD = Math.imul(laneD, 16777619) >>> 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      laneA ^= code;
+      laneA = Math.imul(laneA, 16777619) >>> 0;
+      laneB ^= code + (index & 0xff);
+      laneB = Math.imul(laneB, 16777619) >>> 0;
+      laneC ^= code ^ (index << 1);
+      laneC = Math.imul(laneC, 16777619) >>> 0;
+      laneD ^= code + (index * 31);
+      laneD = Math.imul(laneD, 16777619) >>> 0;
+    }
+  };
+  for (const entry of entries) {
+    mix(entry.id, 1);
+    mix(entry.role, 2);
+    mix(entry.text, 3);
+    mix(entry.reasoning, 4);
+    mix(entry.summary, 5);
+    for (const tool of entry.tools) {
+      mix(tool.state, 6);
+      mix(tool.name, 7);
+      mix(tool.excerpt ?? '', 8);
+      mix(tool.artifact ?? '', 9);
+      mix(tool.exitCode === null ? 'n' : String(tool.exitCode), 10);
+    }
+  }
+  const hex = (lane: number): string => (lane >>> 0).toString(16).padStart(8, '0');
+  return `${entries.length}:${hex(laneA)}${hex(laneB)}${hex(laneC)}${hex(laneD)}`;
+}
+
+/**
+ * Exact equality over the fields the transcript panel renders (the same
+ * fields `transcriptSignature` mixes). The digest decides whether a patch is
+ * WORTH posting; this comparison guarantees a digest collision can never
+ * suppress a genuinely different document at the host either. It is O(n)
+ * string comparison on the already bounded page, not hashing.
+ */
+export function transcriptContentEqual(
+  left: readonly TranscriptEntry[] | null | undefined,
+  right: readonly TranscriptEntry[] | null | undefined,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (
+      a.id !== b.id ||
+      a.seq !== b.seq ||
+      a.role !== b.role ||
+      a.text !== b.text ||
+      a.reasoning !== b.reasoning ||
+      a.summary !== b.summary
+    ) {
+      return false;
+    }
+    if (a.tools.length !== b.tools.length) {
+      return false;
+    }
+    for (let tool = 0; tool < a.tools.length; tool += 1) {
+      const leftTool = a.tools[tool];
+      const rightTool = b.tools[tool];
+      if (
+        leftTool.state !== rightTool.state ||
+        leftTool.name !== rightTool.name ||
+        (leftTool.excerpt ?? '') !== (rightTool.excerpt ?? '') ||
+        (leftTool.artifact ?? '') !== (rightTool.artifact ?? '') ||
+        leftTool.exitCode !== rightTool.exitCode
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 /** Recursively bound a JSON value (depth, array/keys, string lengths). */

@@ -30,15 +30,16 @@ this runtime, not frozen compatibility envelopes.
 | Turn | One logical turn per prompt admission; `active → completed/cancelled/failed` | `opId` + durable turn record | Exactly one `TurnCompleted` journal event per genuine end |
 | Task | The durable structured task state of a session (`faktor-context` ledger): goal, steps, decisions, changed files | session-scoped JSON | Survives compaction; bounded by construction |
 | Operation | Any async op (`OpMeta` envelope: operation_id, session_id, state, start_time, deadline, retry, cancellation, recovery) | `opId` | Tools and provider calls are sub-operations of a turn |
-| Agent | A background agent session owned by the daemon (Agent Manager) | separate `sessionId` | Listed under `/session/{id}/agents` |
+| Agent | A background agent session owned by the daemon (Agent Manager) | separate `sessionId` | Listed by `GET /native/agents?session=<id>` |
 
 ## Paging and cursors
 
-- Message pages are **cursor-based**: `GET /session/{id}/messages?cursor=<seq>&limit=<n>`.
-  The cursor is the exclusive lower message sequence of the page
-  (`seq > cursor`), newest first; a page carries `nextCursor`
-  (`null` = end of history) and `hasMore`. The client never derives
-  ordering from offsets; inserts are append-only, so pages never shift.
+- Message pages are **cursor-based**: `GET /native/messages?session=<id>&before=<seq>&limit=<n>`.
+  `before` is the exclusive upper message sequence of the page (walking
+  OLDER; omit it for the newest page), newest first; a page carries
+  `nextBefore` (`null` = no older page) and `hasMore`. The client never
+  derives ordering from offsets; inserts are append-only, so pages never
+  shift. There is no `/session/{id}/messages` alias.
 - Event resumes are **journal-sequence cursors**: `after` is the last
   consumed event seq and replays `seq > after` (0 = from the beginning).
   The SSE `id:` field of every frame IS the event sequence, so a
@@ -286,8 +287,14 @@ The create-session contract validates BOTH the provider and the model against th
   stream, cursor-resumable: frames are `id: <seq>`, `event: <kind>`,
   `data: <native_event_row>` (the exact shape of the `/native/events`
   page rows); `event: heartbeat` keep-alives carry no id. Catch-up is
-  paged (bounded), so a reconnect against a huge journal never balloons
-  RAM and resumes exactly from the cursor.
+  paged (≤ 256 events per poll), so a reconnect against a huge journal
+  never balloons RAM and resumes exactly from the cursor. Frames are never
+  merged or renumbered; up to 64 frames are batched per HTTP chunk
+  (flushed at 64 KiB, a frame is never split), live delta-only tails
+  linger ≤ 8 ms for that batch, and every
+  non-delta event flushes immediately. An append wakes the stream through
+  the session's journal generation (250 ms fallback poll); heartbeats are
+  emitted once after the tail drains and then at most every 5 s.
 - `GET /native/usage` — cross-session aggregate with two documented
   layers. The legacy view keeps its frozen shape over the memory facts of
   kind `usage` (keys `budget`/`spent`): `{sessions, totals: {budget,
@@ -470,7 +477,9 @@ The create-session contract validates BOTH the provider and the model against th
   state, ptyId?}]` (`ptyId` only when a live PTY handle of this boot owns
   the row). The path session id is still validated (unknown → 404). The
   scoped control routes are `GET /native/terminals?session=`,
-  `GET /native/session/{id}/terminal/events`, output snapshots at
+  `GET /native/session/{id}/terminal/events` (durable-seq keyset pages:
+  `after` is strictly exclusive, ≤ 200 rows per page, `hasMore`/
+  `nextCursor`; a cursor never re-scans the whole ledger), output snapshots at
   `GET /native/session/{id}/terminals/{terminal_id}/output`, spawn at
   `POST /native/session/{id}/terminal`, and
   `input`/`resize`/`kill`/`reconcile` posts under the same terminal path.
@@ -541,6 +550,54 @@ a different request is a typed 409.
 - `GET,POST /native/approvals` and `POST /native/approvals/{id}/decide` —
   the approval queue (request is header-`Idempotency-Key`-keyed; a
   decision is idempotency-keyed and replays its recorded outcome).
+
+### Operational/admin surface (disabled by default)
+
+These route families have no IDE control on purpose: they are operator
+surfaces (and the worker-node protocol). Each is inert — a typed 409 naming
+the disabled section — until its config section is wired.
+
+- **SSO**: `POST /native/sso/start` mints the IdP authorization URL and
+  `POST /native/sso/callback` consumes the single-use state and mints ONE
+  control-plane session. Both ride the daemon password; enable with
+  `[cloud.sso] enabled = true` + `issuer` + `client_id` (optional
+  `client_secret` payload name), otherwise 409 `sso_disabled`. Clients use
+  only `POST /native/sso/logout` (daemon password + the session's own
+  `x-faktor-control-token`).
+- **Updater**: `GET /native/updater/status`; `POST
+  /native/updater/{check,stage,apply,rollback,downgrade}`. Daemon password +
+  control-plane principal (viewer for status/check, member for stage, admin
+  for apply/rollback/downgrade); enable with `[updater] enabled = true` and
+  an allowlisted `[[updater.keys]]`, otherwise 409 `updater_disabled`.
+  `faktor updater` is the local-parity admin CLI.
+- **Worker plane**: `POST /native/workers/register`, `POST
+  /native/workers/{id}/heartbeat`, `POST /native/jobs/claim` and `POST
+  /native/jobs/{id}/result` authenticate with the registration token in the
+  body (never the daemon password); `GET /native/workers`, `POST
+  /native/workers/tokens`, `POST /native/workers/{id}/revoke` and `GET
+  /native/jobs/{id}` are operator reads/writes over the daemon password +
+  control-plane principal (`WorkerRead`/`WorkerManage`). Enable with
+  `[workers] enabled = true` (and `[worker_plane]` for the second listener),
+  otherwise 409 `workers_disabled`. `faktor worker run` is the worker-node
+  client; job status is the operator diagnostic for a claimed job.
+- **Enterprise**: `GET /native/enterprise/{status,audit,settings,artifacts,
+  deletion-jobs,deletion-jobs/{id},tombstones/{scope_key}}`; `PUT
+  /native/enterprise/settings`; `POST /native/enterprise/{artifacts,
+  artifacts/{id}/eligible,retention/gc,deletion-jobs,
+  deletion-jobs/{id}/advance,effective-config}`. Daemon password +
+  control-plane principal; enable with `[enterprise] enabled = true` +
+  `database`/`organization`, otherwise 409 `enterprise_disabled`.
+  `faktor enterprise` is the local-parity admin CLI.
+- **SCM webhook**: `POST /native/scm/webhook` (signed GitHub delivery;
+  no user credential). Enable by wiring the sync inbox with `[cloud]
+  github_app enabled = true` + `payload_dir` + `webhook_secret`, otherwise
+  409 `scm_webhook_disabled`.
+- **Introspection**: `GET /native/semantic/status` and
+  `GET /native/semantic/capabilities` report the wired semantic provider
+  (status is consumed by both IDE clients); `GET /native/index/coverage`
+  (`?session=<id>`) reports the durable index coverage the Inspect surface
+  renders. They are read-only, daemon-password authenticated, and never
+  fabricate an available provider.
 
 ## UI-adaptation principle
 

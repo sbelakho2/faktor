@@ -22,7 +22,8 @@ class FaktorConfigurableTest : BasePlatformTestCase() {
                 FaktorSettingKeys.RUN_MODEL,
                 FaktorSettingKeys.RUN_MUTATION_MODE,
                 FaktorSettingKeys.CONTROL_PLANE_ENDPOINT,
-                FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION
+                FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION,
+                FaktorSettingKeys.CONTROL_PLANE_SESSION
             )) {
                 properties.unsetValue(key)
             }
@@ -45,6 +46,63 @@ class FaktorConfigurableTest : BasePlatformTestCase() {
         assertEquals("Faktor", created.displayName)
         // The EP carries no project scope: application-level registration.
         assertEquals("dev.faktor.settings", ep.id)
+    }
+
+    fun testLegacyProjectControlPlaneCoordinatesMigrateToTheSharedApplicationStore() {
+        val projectProperties = com.intellij.ide.util.PropertiesComponent.getInstance(project)
+        projectProperties.setValue(
+            FaktorSettingKeys.CONTROL_PLANE_ENDPOINT,
+            "http://127.0.0.1:9"
+        )
+        projectProperties.setValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION, "org-legacy")
+        projectProperties.setValue(FaktorSettingKeys.CONTROL_PLANE_SESSION, "sess-legacy")
+        val store = IntelliJControlPlaneScopeStore()
+        store.migrateFromProject(project)
+        val application = com.intellij.ide.util.PropertiesComponent.getInstance()
+        assertEquals(
+            "http://127.0.0.1:9",
+            application.getValue(FaktorSettingKeys.CONTROL_PLANE_ENDPOINT)
+        )
+        assertEquals(
+            "org-legacy",
+            application.getValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION)
+        )
+        assertEquals(
+            "sess-legacy",
+            application.getValue(FaktorSettingKeys.CONTROL_PLANE_SESSION)
+        )
+        // The legacy per-project keys are removed by the migration (exactly
+        // once); a stale project value can never resurrect after the
+        // application value is cleared.
+        for (key in listOf(
+            FaktorSettingKeys.CONTROL_PLANE_ENDPOINT,
+            FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION,
+            FaktorSettingKeys.CONTROL_PLANE_SESSION
+        )) {
+            assertNull(
+                "legacy project key $key must be removed by the migration",
+                projectProperties.getValue(key)
+            )
+        }
+        // Re-running the migration is a strict no-op.
+        store.migrateFromProject(project)
+        assertEquals(
+            "http://127.0.0.1:9",
+            application.getValue(FaktorSettingKeys.CONTROL_PLANE_ENDPOINT)
+        )
+        // An explicit application value wins over a legacy project copy (and
+        // the stale copy is still removed).
+        application.setValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION, "org-app")
+        projectProperties.setValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION, "org-stale")
+        store.migrateFromProject(project)
+        assertEquals(
+            "org-app",
+            application.getValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION)
+        )
+        assertNull(
+            "a stale project copy must not survive an application-scoped value",
+            projectProperties.getValue(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION)
+        )
     }
 
     fun testApplyPersistsValidValuesExactlyOnce() {

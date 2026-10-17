@@ -135,7 +135,7 @@ const LIGHT_THEME_CSS = `:root {
   --vscode-inputValidation-errorBorder: #be1100;
 }`;
 
-const THEMES = { dark: THEME_CSS, light: LIGHT_THEME_CSS };
+export const THEMES = { dark: THEME_CSS, light: LIGHT_THEME_CSS };
 // DPR leg: deviceScaleFactor values emulated on top of every width.
 const DPRS = [1.5, 2.0];
 // VAL-ZOOM leg: IDE UI scale values. A zoomed webview sees fewer CSS pixels
@@ -540,7 +540,13 @@ function harnessSnapshot(empty = false, permissions = false) {
 }
 
 /** Strip the CSP + nonces, point the template at real files, inject stubs. */
-export function buildHarnessHtml(empty = false, attachments = false, permissions = false, theme = 'dark') {
+export function buildHarnessHtml(
+  empty = false,
+  attachments = false,
+  permissions = false,
+  theme = 'dark',
+  options = {},
+) {
   const themeCss = THEMES[theme];
   if (!themeCss) {
     throw new Error(`unknown theme "${theme}" (expected dark or light)`);
@@ -580,11 +586,16 @@ export function buildHarnessHtml(empty = false, attachments = false, permissions
       { id: 'att-3', filename: 'archive.zip', mime: 'application/zip', bytes: 9999999, refusal: 'application/zip is outside the advertised attachment mime types' }
     ] }, '*');`
     : '';
-  const snapshotScript = `<script>
+  const snapshotScript = options.skipSnapshot
+    ? `<script>setTimeout(function () { window.__ready = true; }, 0);</script>`
+    : `<script>
     window.postMessage({ type: 'snapshot', snapshot: ${snapshotJson} }, '*');${attachmentsScript}
     setTimeout(function () { window.__ready = true; }, 120);
   </script>`;
   html = html.replace('</head>', `${themeStyle}</head>`);
+  if (typeof options.headScript === 'string' && options.headScript.length > 0) {
+    html = html.replace('</head>', `<script>${options.headScript}</script></head>`);
+  }
   html = html.replace('<body>', `<body>${apiStub}`);
   html = html.replace('</body>', `${snapshotScript}</body>`);
   return html;
@@ -664,11 +675,11 @@ class Cdp {
   }
 }
 
-function sleep(ms) {
+export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function connect(wsUrl) {
+export async function connect(wsUrl) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve, { once: true });
@@ -679,7 +690,7 @@ async function connect(wsUrl) {
   return new Cdp(ws);
 }
 
-async function launchChrome(chrome) {
+export async function launchChrome(chrome) {
   const profile = mkdtempSync(join(tmpdir(), 'faktor-render-profile-'));
   const child = spawn(
     chrome,

@@ -186,12 +186,45 @@
   var lastPermissionIds = null;
   /** True while an IME composition is active (chord/Enter must not submit). */
   var composing = false;
-  // Scroll-ownership state: the signature of the rendered transcript and the
-  // one-shot pin requested by the user's own submission.
+  // Scroll-ownership state: the content keys of the rendered transcript and
+  // the one-shot pin requested by the user's own submission. Long transcripts
+  // are windowed (only the visible slice plus overscan is materialized) so DOM
+  // nodes stay bounded; heights are cached per entry and the top/bottom
+  // spacers reproduce the full scroll range.
   var transcriptKey = null;
   var transcriptEntryKeys = null;
+  var transcriptEntryStructures = null;
+  var transcriptEntries = null;
+  var transcriptRevision = null;
   var transcriptPinRequested = false;
+  var transcriptWindowed = false;
+  var transcriptWindowStart = 0;
+  var transcriptWindowEnd = 0;
+  var transcriptHeights = [];
+  var transcriptPrefix = [0];
+  var transcriptScrollScheduled = false;
+  var transcriptScrollListenerAttached = false;
+  var transcriptSuppressScroll = false;
+  // Explicit scroll-ownership state machine. Pinned is only changed by an
+  // EXTERNAL scroll event (user intent) or an explicit own-submission pin;
+  // the programmatic writes made by this renderer are recognized by their
+  // exact position and can never flip the state themselves.
+  var transcriptPinned = true;
+  var transcriptAnchor = null;
+  var transcriptLastWrittenTop = 0;
+  // Only a real input gesture (wheel, touch, pointer/scrollbar, keyboard
+  // scroll keys) may change the pin. Browser-internal scroll adjustments and
+  // this renderer's own follow writes therefore never fight the user.
+  var transcriptUserScrollUntil = 0;
   var TRANSCRIPT_PIN_SLACK_PX = 24;
+  // Beyond this entry count only the visible slice is materialized. The cap
+  // below it keeps the common short conversation exactly as it rendered
+  // before (no spacers, no window bookkeeping).
+  var TRANSCRIPT_WINDOW_THRESHOLD = 120;
+  var TRANSCRIPT_WINDOW_OVERSCAN = 12;
+  var TRANSCRIPT_WINDOW_MIN_ROWS = 8;
+  var TRANSCRIPT_ESTIMATED_ENTRY_PX = 64;
+  var TRANSCRIPT_ENTRY_GAP_PX = 12;
   // Host-side attachment metadata (id + filename + mime + size only: the
   // host owns the bytes). Paste/drop bytes transit once through the webview,
   // bounded; a picker selection never ships base64 through here.
@@ -226,6 +259,7 @@
   var changeReviewState = null;
   var activeHistoryTab = 'conversations';
   var renderedOutcomes = null;
+  var renderedOutcomesKey = null;
   /**
    * Content keys of the last rendered Changes / History lists. The host
    * re-posts the WHOLE snapshot for every stream delta (the store object is
@@ -240,6 +274,9 @@
   var renderedHistoryKey = null;
   var renderedAgentsKey = null;
   var renderedBoardKey = null;
+  var renderedCockpitKey = null;
+  var renderedTaskKey = null;
+  var renderedPermissionsKey = null;
   /** TRUE while an explicit outcomes read awaits its snapshot. */
   var outcomesReading = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
@@ -292,6 +329,52 @@
       out += (h.toString(16) + '00000000').slice(0, 8);
     }
     return out;
+  }
+
+  /**
+   * JSON text for content keys. Outcome/usage projections carry exact money
+   * as BigInt in some hosts; plain JSON.stringify throws on those, so the
+   * replacer renders them without losing the exact value.
+   */
+  function jsonForHash(value) {
+    try {
+      var text = JSON.stringify(value, function (key, entry) {
+        return typeof entry === 'bigint' ? entry.toString() + 'n' : entry;
+      });
+      return text === undefined ? 'undefined' : text;
+    } catch (error) {
+      return String(value);
+    }
+  }
+
+  /**
+   * Bounded content cache for the pure derivations the transcript re-renders
+   * per delta (diff line counts, parsed permission-detail reasons). The hash
+   * is only the slot (bounded memory); the entry keeps the raw source and a
+   * hit must match it EXACTLY, so a hash collision can never serve another
+   * excerpt's counts/reason. The oldest slot is evicted past the cap.
+   */
+  var RENDER_CACHE_MAX = 512;
+  var renderCaches = { diff: {}, reason: {} };
+  var renderCacheOrder = { diff: [], reason: [] };
+
+  function cachedRender(kind, key, source, compute) {
+    var cache = renderCaches[kind];
+    var existing = Object.prototype.hasOwnProperty.call(cache, key) ? cache[key] : null;
+    if (existing && existing.source === source) {
+      return existing.value;
+    }
+    var value = compute();
+    cache[key] = { source: source, value: value };
+    var order = renderCacheOrder[kind];
+    if (!existing) {
+      order.push(key);
+    }
+    if (order.length > RENDER_CACHE_MAX) {
+      var drop = order.shift();
+      delete cache[drop];
+    }
+    return value;
   }
 
   /** Child-index path from `root` to `node`; null when not a descendant. */
@@ -387,11 +470,12 @@
     if (!node) {
       return;
     }
-    if (value === null || value === undefined || value === '') {
-      node.textContent = '—';
-      return;
+    var next = value === null || value === undefined || value === '' ? '—' : String(value);
+    // Same-value writes still replace the text node (a DOM mutation that can
+    // repaint the sticky header on every stream delta): skip them.
+    if (node.textContent !== next) {
+      node.textContent = next;
     }
-    node.textContent = String(value);
   }
 
   function line(parent, value, className) {
@@ -418,6 +502,20 @@
 
   function renderCockpit(view, sections) {
     var node = byId('cockpit');
+    // Content guard: every stream delta re-posts the whole snapshot, but an
+    // unchanged cockpit must not tear its controls, focus and disclosures
+    // down on every delta.
+    var guardKey =
+      activeSubview +
+      '#' +
+      hash128(jsonForHash(view === undefined ? null : view)) +
+      '#' +
+      hash128(jsonForHash(Array.isArray(sections) ? sections : []));
+    if (renderedCockpitKey !== null && renderedCockpitKey === guardKey) {
+      return;
+    }
+    renderedCockpitKey = guardKey;
+    renderProbe('cockpit');
     var focus = captureFocus(node);
     clear(node);
     if (!Array.isArray(sections) || sections.length === 0) {
@@ -996,7 +1094,10 @@
     var spec = subviewOf(activeSubview);
     var path = byId('inspect-breadcrumb-path');
     if (path) {
-      path.textContent = 'Inspect / ' + spec.label;
+      var pathText = 'Inspect / ' + spec.label;
+      if (path.textContent !== pathText) {
+        path.textContent = pathText;
+      }
     }
     var scope = byId('inspect-breadcrumb-scope');
     if (scope) {
@@ -1004,14 +1105,20 @@
         snapshot && typeof snapshot.workspaceName === 'string' && snapshot.workspaceName.trim().length > 0
           ? snapshot.workspaceName.trim()
           : null;
-      scope.textContent = name !== null ? 'scope ' + name : 'scope this window';
+      var scopeText = name !== null ? 'scope ' + name : 'scope this window';
+      if (scope.textContent !== scopeText) {
+        scope.textContent = scopeText;
+      }
     }
     var diagnostics = byId('inspect-breadcrumb-diagnostics-body');
     if (diagnostics) {
       var sessionId = snapshot && snapshot.session ? String(snapshot.session.id) : null;
       var runId = snapshot && snapshot.activeRunId ? String(snapshot.activeRunId) : null;
-      diagnostics.textContent =
+      var diagnosticsText =
         'session ' + (sessionId === null ? 'none' : sessionId) + ' \u00b7 run ' + (runId === null ? 'none' : runId);
+      if (diagnostics.textContent !== diagnosticsText) {
+        diagnostics.textContent = diagnosticsText;
+      }
     }
   }
 
@@ -1238,13 +1345,13 @@
     var guardRows = Array.isArray(changes.rows) ? changes.rows : [];
     var guardIndex = selectedIndexFor(guardRows);
     var guardKey =
-      hash128(JSON.stringify(changes)) +
+      hash128(jsonForHash(changes)) +
       '#' +
       guardIndex +
       '#' +
       (guardIndex >= 0 ? String(guardRows[guardIndex].path) : '') +
       '#' +
-      hash128(JSON.stringify(changeReviewState));
+      hash128(jsonForHash(changeReviewState));
     if (renderedChangesKey !== null && renderedChangesKey === guardKey) {
       return;
     }
@@ -1521,7 +1628,7 @@
     // history policy and the framing flags are part of the key, so an
     // identical delta never rebuilds up to a full 1000-row listing.
     var historyKey =
-      hash128(JSON.stringify(Array.isArray(snapshot.sessions) ? snapshot.sessions : [])) +
+      hash128(jsonForHash(Array.isArray(snapshot.sessions) ? snapshot.sessions : [])) +
       '#' +
       hash128(historyQuery) +
       '#' +
@@ -1654,10 +1761,15 @@
     }
     var view = lastSnapshot ? lastSnapshot.outcomes : null;
     outcomesReading = false;
-    if (view === renderedOutcomes) {
+    // The host re-posts a fresh object graph per stream delta, so identity is
+    // not a guard; the serialized ledger content is (it only changes on an
+    // explicit outcomes read).
+    var outcomesKey = view === null || view === undefined ? 'none' : hash128(jsonForHash(view));
+    if (renderedOutcomesKey !== null && renderedOutcomesKey === outcomesKey) {
       updateOutcomesControls(view);
       return;
     }
+    renderedOutcomesKey = outcomesKey;
     renderedOutcomes = view;
     var metrics = byId('outcomes-metrics');
     var runs = byId('outcomes-runs');
@@ -1796,6 +1908,26 @@
     var task = snapshot ? snapshot.task : null;
     var card = byId('task-card');
     var spec = runStateSpec(snapshot);
+    // Content guard: the run card is a pure function of the task, the run
+    // strip source, the agent count and the proof's embedded state. A stream
+    // delta that only grows transcript text must not rebuild it.
+    var guardKey =
+      (spec === null ? 'none' : spec.label) +
+      '#' +
+      hash128(jsonForHash(task)) +
+      '#' +
+      hash128(jsonForHash(snapshot ? snapshot.agents : null)) +
+      '#' +
+      String(snapshot ? snapshot.proofTaskState : null) +
+      '#' +
+      String(snapshot ? snapshot.activeRunId : null) +
+      '#' +
+      String(snapshot ? snapshot.busy : null);
+    if (renderedTaskKey !== null && renderedTaskKey === guardKey) {
+      return;
+    }
+    renderedTaskKey = guardKey;
+    renderProbe('task');
     // No task and no served run condition: an empty card full of em-dashes
     // would be pure noise. The Inspect sections carry whatever metadata
     // outlives the task. A served run condition (a terminal task-run row or
@@ -2034,23 +2166,25 @@
     if (typeof detail !== 'string' || detail.length === 0 || detail.charAt(0) !== '{') {
       return null;
     }
-    var parsed;
-    try {
-      parsed = JSON.parse(detail);
-    } catch (error) {
-      return null;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return null;
-    }
-    var keys = ['reason', 'purpose', 'why'];
-    for (var i = 0; i < keys.length; i++) {
-      var value = parsed[keys[i]];
-      if (typeof value === 'string' && value.trim().length > 0) {
-        return value.trim().slice(0, MAX_PERMISSION_REASON_CHARS);
+    return cachedRender('reason', hash128(detail), detail, function () {
+      var parsed;
+      try {
+        parsed = JSON.parse(detail);
+      } catch (error) {
+        return null;
       }
-    }
-    return null;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+      }
+      var keys = ['reason', 'purpose', 'why'];
+      for (var i = 0; i < keys.length; i++) {
+        var value = parsed[keys[i]];
+        if (typeof value === 'string' && value.trim().length > 0) {
+          return value.trim().slice(0, MAX_PERMISSION_REASON_CHARS);
+        }
+      }
+      return null;
+    });
   }
 
   /** Human decision headline: what the agent wants to do, and to what. */
@@ -2216,11 +2350,22 @@
     if (!card || !list) {
       return;
     }
-    var focus = captureFocus(list);
-    clear(list);
     var items = Array.isArray(permissions) ? permissions.slice(0, MAX_PENDING_PERMISSIONS) : [];
     lastPermissions = items;
     prunePermissionRefusals(items);
+    // Content guard: the pending set, the displayed refusals and the card
+    // visibility are the entire render input. An unchanged delta (the common
+    // streaming case has no new approval) keeps the card, its focus and its
+    // open details exactly as they are.
+    var guardKey =
+      hash128(jsonForHash(items)) + '#' + hash128(jsonForHash(permissionRefusals));
+    if (renderedPermissionsKey !== null && renderedPermissionsKey === guardKey) {
+      return;
+    }
+    renderedPermissionsKey = guardKey;
+    renderProbe('permissions');
+    var focus = captureFocus(list);
+    clear(list);
     // Bounded aria-live: a request id that was not pending in the previous
     // render is announced ONCE with its headline; an unchanged set never
     // re-announces, and focus is never moved.
@@ -2525,7 +2670,7 @@
     var guardKey =
       activeSubview +
       '#' +
-      (Array.isArray(agents) && agents.length > 0 ? hash128(JSON.stringify(agents)) : 'none');
+      (Array.isArray(agents) && agents.length > 0 ? hash128(jsonForHash(agents)) : 'none');
     if (renderedAgentsKey !== null && renderedAgentsKey === guardKey) {
       return;
     }
@@ -2799,19 +2944,255 @@
     }
   }
 
-  /** The first visible entry (index + pixel offset) of the CURRENT list. */
+  /** Structural identity: cheap lengths/counts used to reuse content keys. */
+  function transcriptEntryStructure(entry) {
+    var tools = entry.tools || [];
+    var out =
+      entry.id +
+      ':' +
+      entry.seq +
+      ':' +
+      entry.role +
+      ':' +
+      String(entry.text == null ? '' : entry.text).length +
+      ':' +
+      String(entry.reasoning == null ? '' : entry.reasoning).length +
+      ':' +
+      String(entry.summary == null ? '' : entry.summary).length +
+      ':';
+    for (var t = 0; t < tools.length; t++) {
+      out +=
+        String(tools[t].state) +
+        ':' +
+        String(tools[t].name == null ? '' : tools[t].name).length +
+        ':' +
+        String(tools[t].excerpt == null ? '' : tools[t].excerpt).length +
+        ':' +
+        String(tools[t].artifact == null ? '' : tools[t].artifact) +
+        ':' +
+        (tools[t].exitCode === null || tools[t].exitCode === undefined
+          ? 'n'
+          : tools[t].exitCode) +
+        ';';
+    }
+    return out;
+  }
+
+  function transcriptStructuresOf(entries) {
+    var out = [];
+    for (var i = 0; i < entries.length; i++) {
+      out.push(transcriptEntryStructure(entries[i]));
+    }
+    return out;
+  }
+
+  /**
+   * Per-entry content keys. The host supplies `transcriptRevision` (a content
+   * digest of the transcript it posts): when it is unchanged the transcript
+   * is skipped entirely, and when it changed only entries whose structural
+   * identity moved are hashed. A revision change with an unchanged structure
+   * (a same-length content edit) forces one full re-key so a hash, never a
+   * length, decides what reaches the DOM.
+   */
+  function transcriptKeysFor(entries, revisionChanged, forceFullHash) {
+    var structures = transcriptStructuresOf(entries);
+    if (forceFullHash) {
+      // No host content digest (an older/legacy snapshot): hash every entry so
+      // a same-length edit can never be mistaken for an unchanged row.
+      return { keys: transcriptKeysOf(entries), structures: structures };
+    }
+    var reusable =
+      transcriptEntries !== null &&
+      transcriptEntryKeys !== null &&
+      transcriptEntryStructures !== null &&
+      entries.length === transcriptEntryStructures.length;
+    var keys = [];
+    var hashed = 0;
+    for (var i = 0; i < entries.length; i++) {
+      if (reusable && structures[i] === transcriptEntryStructures[i]) {
+        keys.push(transcriptEntryKeys[i]);
+      } else {
+        keys.push(transcriptEntryKey(entries[i]));
+        hashed += 1;
+      }
+    }
+    if (revisionChanged && hashed === 0 && entries.length > 0) {
+      keys = transcriptKeysOf(entries);
+    }
+    return { keys: keys, structures: structures };
+  }
+
+  /**
+   * Documented-content equality for a revision that claims "nothing moved".
+   * A hash is not an authority: a collision (or a stale/forged revision)
+   * must never hide different content. The compare is O(entries) string
+   * equality over the same fields the keys hash; it does no hashing, layout
+   * or DOM work, so the idle no-op path stays cheap while remaining exact.
+   */
+  function transcriptContentSame(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    for (var index = 0; index < left.length; index += 1) {
+      var a = left[index];
+      var b = right[index];
+      if (!a || !b) {
+        return false;
+      }
+      if (a.id !== b.id || a.seq !== b.seq || a.role !== b.role) {
+        return false;
+      }
+      if (
+        String(a.text == null ? '' : a.text) !== String(b.text == null ? '' : b.text) ||
+        String(a.reasoning == null ? '' : a.reasoning) !==
+          String(b.reasoning == null ? '' : b.reasoning) ||
+        String(a.summary == null ? '' : a.summary) !==
+          String(b.summary == null ? '' : b.summary)
+      ) {
+        return false;
+      }
+      var leftTools = a.tools || [];
+      var rightTools = b.tools || [];
+      if (leftTools.length !== rightTools.length) {
+        return false;
+      }
+      for (var tool = 0; tool < leftTools.length; tool += 1) {
+        if (!toolContentSame(leftTools[tool], rightTools[tool])) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function sameTranscriptKeys(left, right) {
+    if (left === null || right === null || left.length !== right.length) {
+      return false;
+    }
+    for (var i = 0; i < left.length; i++) {
+      if (left[i] !== right[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function visibleTranscriptKeysSame(previous, next, start, end) {
+    if (previous === null || next.length < previous.length || end > previous.length) {
+      return false;
+    }
+    for (var index = start; index < end; index += 1) {
+      if (previous[index] !== next[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function prefixTranscriptKeys(previous, next) {
+    if (previous === null || previous.length === 0 || next.length <= previous.length) {
+      return false;
+    }
+    for (var i = 0; i < previous.length; i++) {
+      if (previous[i] !== next[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Capture focus inside the transcript (entry index + structural path). */
+  function captureTranscriptFocus(container) {
+    var active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!active || !container || !container.contains || !container.contains(active)) {
+      return null;
+    }
+    var index = -1;
+    var cursor = active;
+    while (cursor && cursor !== container) {
+      var attribute = cursor.getAttribute ? cursor.getAttribute('data-entry-index') : null;
+      if (attribute !== null && attribute !== undefined) {
+        index = Number(attribute);
+        break;
+      }
+      cursor = cursor.parentNode;
+    }
+    return {
+      index: index,
+      path: index >= 0 ? elementPath(container, active) : null,
+      tag: active.tagName,
+      text: active.textContent,
+      aria: active.getAttribute ? active.getAttribute('aria-label') : null,
+    };
+  }
+
+  function restoreTranscriptFocus(container, descriptor) {
+    if (!descriptor) {
+      return;
+    }
+    if (descriptor.path) {
+      var exact = elementAtPath(container, descriptor.path);
+      if (exact && exact.tagName === descriptor.tag && typeof exact.focus === 'function') {
+        exact.focus();
+        return;
+      }
+    }
+    var candidates = container.querySelectorAll
+      ? container.querySelectorAll('button, input, textarea, select, a, [tabindex]')
+      : [];
+    for (var i = 0; i < candidates.length; i++) {
+      var node = candidates[i];
+      var match =
+        descriptor.aria !== null && descriptor.aria !== undefined
+          ? node.getAttribute && node.getAttribute('aria-label') === descriptor.aria
+          : node.textContent === descriptor.text;
+      if (match && node.tagName === descriptor.tag) {
+        if (typeof node.focus === 'function') {
+          node.focus();
+        }
+        return;
+      }
+    }
+    // The focused entry scrolled out of the window: keep keyboard users in
+    // the transcript instead of dropping focus onto the document body.
+    if (typeof container.focus === 'function') {
+      container.focus();
+    }
+  }
+
+  /** The first visible entry, via a binary search over the cached heights. */
+  function transcriptAnchorFromScroll(prefix, scrollTop) {
+    var lo = 0;
+    var hi = Math.max(0, prefix.length - 2);
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      if (prefix[mid] <= scrollTop) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return { index: lo, offset: Math.max(0, scrollTop - prefix[lo]) };
+  }
+
+  /** The first visible entry of the short (non-windowed) list. */
   function transcriptAnchorOf(container) {
     var offset = container.scrollTop;
     var children = container.children || [];
-    for (var i = 0; i < children.length; i++) {
-      var node = children[i];
-      var top = typeof node.offsetTop === 'number' ? node.offsetTop : 0;
-      var height = typeof node.offsetHeight === 'number' ? node.offsetHeight : 0;
-      if (top + height > offset) {
-        return { index: i, offset: offset - top };
+    var lo = 0;
+    var hi = Math.max(0, children.length - 1);
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      var midTop = typeof children[mid].offsetTop === 'number' ? children[mid].offsetTop : 0;
+      if (midTop <= offset) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
       }
     }
-    return { index: Math.max(0, children.length - 1), offset: 0 };
+    var node = children[lo];
+    var top = node && typeof node.offsetTop === 'number' ? node.offsetTop : 0;
+    return { index: lo, offset: Math.max(0, offset - top) };
   }
 
   /** Restore the anchor pixel position of `anchor.index` after a rebuild. */
@@ -2823,105 +3204,763 @@
     var index = Math.min(Math.max(0, anchor.index), children.length - 1);
     var node = children[index];
     var top = typeof node.offsetTop === 'number' ? node.offsetTop : 0;
-    container.scrollTop = top + anchor.offset;
+    setTranscriptScroll(container, top + anchor.offset);
   }
 
-  function renderTranscript(entries) {
+  /**
+   * Programmatic scrolls are followed by a scroll event in a real browser.
+   * The window updater is a no-op when the current window already covers the
+   * position, so this flag only avoids redundant work inside the same task.
+   */
+  function setTranscriptScroll(container, top) {
+    transcriptSuppressScroll = true;
+    container.scrollTop = top;
+    // The browser may clamp to the real maximum; the written value is still
+    // the intent. Its own scroll event is ignored unless a user gesture is
+    // active, and a gesture inside the pin slack resolves back to following.
+    transcriptLastWrittenTop = top;
+    transcriptSuppressScroll = false;
+  }
+
+  function transcriptHeightAt(index) {
+    var height = transcriptHeights[index];
+    return typeof height === 'number' && height > 0 ? height : TRANSCRIPT_ESTIMATED_ENTRY_PX;
+  }
+
+  /** Prefix offsets of every entry (height + flex gap), used for windowing. */
+  function transcriptPrefixOf(entries) {
+    var prefix = [0];
+    for (var i = 0; i < entries.length; i++) {
+      prefix.push(prefix[i] + transcriptHeightAt(i) + TRANSCRIPT_ENTRY_GAP_PX);
+    }
+    return prefix;
+  }
+
+  function transcriptRows(container) {
+    var client = container.clientHeight;
+    if (!(typeof client === 'number' && client > 0)) {
+      client = 600;
+    }
+    var visible = Math.ceil(client / (TRANSCRIPT_ESTIMATED_ENTRY_PX + TRANSCRIPT_ENTRY_GAP_PX));
+    return Math.max(TRANSCRIPT_WINDOW_MIN_ROWS, visible + TRANSCRIPT_WINDOW_OVERSCAN);
+  }
+
+  function transcriptSpacer(className, height) {
+    var node = document.createElement('div');
+    node.className = 'transcript-spacer ' + className;
+    node.setAttribute('aria-hidden', 'true');
+    setSpacerHeight(node, height);
+    return node;
+  }
+
+  function setSpacerHeight(node, height) {
+    var value = Math.max(0, Math.round(height));
+    if (node && node.style && typeof node.style === 'object') {
+      node.style.height = value + 'px';
+    } else if (node && node.setAttribute) {
+      node.setAttribute('data-height', String(value));
+    }
+  }
+
+  /** Measure only the rendered window and cache the heights by entry index. */
+  function measureTranscriptHeights(container) {
+    var children = container.children || [];
+    for (var i = 0; i < children.length; i++) {
+      var node = children[i];
+      var attribute = node.getAttribute ? node.getAttribute('data-entry-index') : null;
+      if (attribute === null || attribute === undefined) {
+        continue;
+      }
+      var index = Number(attribute);
+      if (!isFinite(index) || index < 0) {
+        continue;
+      }
+      var height = typeof node.offsetHeight === 'number' ? node.offsetHeight : 0;
+      if (height > 0) {
+        transcriptHeights[index] = height;
+      }
+    }
+  }
+
+  /**
+   * Suppress the live region while a structural rebuild replaces entry nodes:
+   * only genuinely appended messages should be announced, never the preserved
+   * history a window shift re-materializes.
+   */
+  var transcriptLiveSuppressDepth = 0;
+  var transcriptLivePrevious = null;
+  var transcriptLiveRestoreToken = 0;
+
+  function withTranscriptLiveOff(container, mutate) {
+    if (transcriptLiveSuppressDepth === 0) {
+      if (transcriptLivePrevious === null) {
+        var current = container.getAttribute ? container.getAttribute('aria-live') : null;
+        transcriptLivePrevious = current && current !== 'off' ? current : 'polite';
+      }
+      if (container.setAttribute) {
+        container.setAttribute('aria-live', 'off');
+      }
+    }
+    transcriptLiveSuppressDepth += 1;
+    try {
+      mutate();
+    } finally {
+      transcriptLiveSuppressDepth -= 1;
+      if (transcriptLiveSuppressDepth === 0) {
+        var token = ++transcriptLiveRestoreToken;
+        var restore = function () {
+          if (token !== transcriptLiveRestoreToken || transcriptLiveSuppressDepth !== 0) {
+            return;
+          }
+          if (container.setAttribute) {
+            container.setAttribute('aria-live', transcriptLivePrevious || 'polite');
+          }
+          transcriptLivePrevious = null;
+        };
+        if (typeof Promise !== 'undefined' && typeof Promise.resolve === 'function') {
+          Promise.resolve().then(restore);
+        } else {
+          restore();
+        }
+      }
+    }
+  }
+
+  /** True when only the last entry's content moved (streaming fast path). */
+  function lastEntryOnlyChanged(keys, previous) {
+    if (previous === null || previous.length !== keys.length || keys.length === 0) {
+      return false;
+    }
+    if (previous[previous.length - 1] === keys[keys.length - 1]) {
+      return false;
+    }
+    for (var i = 0; i < keys.length - 1; i++) {
+      if (previous[i] !== keys[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Update a text part WITHOUT replacing its text node. `textContent = ...`
+   * detaches the old text node, which collapses a user's text selection and
+   * can drop focus while a delta streams; writing the existing node's data
+   * keeps the node identity (and therefore the selection offsets) intact.
+   * The fallback covers an element whose content is not exactly one text
+   * node (structured/legacy rows): there is no selection to preserve there.
+   */
+  /**
+   * Capture a text selection that lies ENTIRELY inside `textNode`.
+   * Any mutation of the node's character data collapses such a selection in
+   * Blink (even `nodeValue = sameLengthText`), so the offsets are restored
+   * after the patch. A selection spanning several nodes is left alone (this
+   * patch never removes the selected nodes).
+   */
+  function captureTextSelection(textNode) {
+    if (typeof window === 'undefined' || typeof window.getSelection !== 'function') {
+      return null;
+    }
+    var selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      return null;
+    }
+    var range = selection.getRangeAt(0);
+    if (range.startContainer !== textNode || range.endContainer !== textNode) {
+      return null;
+    }
+    var backward = false;
+    try {
+      backward =
+        selection.anchorNode === textNode &&
+        selection.focusNode === textNode &&
+        selection.anchorOffset > selection.focusOffset;
+    } catch (error) {
+      backward = false;
+    }
+    return { start: range.startOffset, end: range.endOffset, backward: backward };
+  }
+
+  function restoreTextSelection(textNode, saved) {
+    if (!saved || !textNode || textNode.nodeType !== 3) {
+      return;
+    }
+    if (typeof window === 'undefined' || typeof window.getSelection !== 'function') {
+      return;
+    }
+    var selection = window.getSelection();
+    if (!selection) {
+      return;
+    }
+    var max = textNode.nodeValue == null ? 0 : textNode.nodeValue.length;
+    var start = Math.min(Math.max(0, saved.start), max);
+    var end = Math.min(Math.max(0, saved.end), max);
+    try {
+      if (typeof selection.setBaseAndExtent === 'function') {
+        selection.setBaseAndExtent(
+          textNode,
+          saved.backward ? end : start,
+          textNode,
+          saved.backward ? start : end,
+        );
+      } else {
+        var range = document.createRange();
+        range.setStart(textNode, start);
+        range.setEnd(textNode, end);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    } catch (error) {
+      // A selection API without this node (detached) simply stays as-is.
+    }
+  }
+
+  function setPartText(part, value) {
+    if (!part) {
+      return;
+    }
+    var next = value == null ? '' : String(value);
+    var first = part.firstChild;
+    if (
+      first &&
+      first.nodeType === 3 &&
+      part.childNodes &&
+      part.childNodes.length === 1
+    ) {
+      if (first.nodeValue === next) {
+        return;
+      }
+      var selection = captureTextSelection(first);
+      first.nodeValue = next;
+      restoreTextSelection(first, selection);
+      return;
+    }
+    if (part.textContent !== next) {
+      part.textContent = next;
+    }
+  }
+
+  function toolContentSame(left, right) {
+    if (left === right) {
+      return true;
+    }
+    if (!left || !right) {
+      return false;
+    }
+    return (
+      left.state === right.state &&
+      left.name === right.name &&
+      left.excerpt === right.excerpt &&
+      left.artifact === right.artifact &&
+      left.exitCode === right.exitCode
+    );
+  }
+
+  /**
+   * Incremental update of one already-rendered entry: text/reasoning/summary
+   * are patched in place and only tool rows whose content moved are replaced.
+   * The article itself (and focus inside untouched descendants) survives the
+   * per-token delta.
+   */
+  function patchEntryNode(node, entry) {
+    var old = node ? node.__faktorEntry : null;
+    var parts = node ? node.__faktorParts : null;
+    if (!old || !parts || old.seq !== entry.seq || old.role !== entry.role) {
+      return false;
+    }
+    var oldTools = old.tools || [];
+    var newTools = entry.tools || [];
+    if (oldTools.length !== newTools.length) {
+      return false;
+    }
+    if (!!entry.text !== !!(parts.text && parts.text.__faktorPresent)) {
+      return false;
+    }
+    if (!!entry.reasoning !== !!(parts.reasoning && parts.reasoning.__faktorPresent)) {
+      return false;
+    }
+    if (!!entry.summary !== !!(parts.summary && parts.summary.__faktorPresent)) {
+      return false;
+    }
+    var focusInside =
+      typeof document !== 'undefined' &&
+      document.activeElement &&
+      node.contains &&
+      node.contains(document.activeElement);
+    var preserved = focusInside ? captureEntryState(node) : null;
+    setPartText(parts.text, entry.text);
+    setPartText(parts.reasoning, entry.reasoning);
+    setPartText(parts.summary, entry.summary);
+    var toolNodes = node.__faktorToolNodes || [];
+    for (var t = 0; t < newTools.length; t += 1) {
+      var oldTool = oldTools[t];
+      var newTool = newTools[t];
+      if (toolContentSame(oldTool, newTool)) {
+        continue;
+      }
+      var existingRow = toolNodes[t];
+      // Streamed tool output (same row identity, growing excerpt) is patched
+      // in place: the disclosure, focus and evidence controls survive.
+      var canPatchTool =
+        existingRow &&
+        existingRow.parentNode === node &&
+        oldTool &&
+        oldTool.state === newTool.state &&
+        oldTool.name === newTool.name &&
+        oldTool.artifact === newTool.artifact &&
+        oldTool.exitCode === newTool.exitCode;
+      if (canPatchTool) {
+        var oldExcerpt = oldTool.excerpt == null ? '' : String(oldTool.excerpt);
+        var newExcerpt = newTool.excerpt == null ? '' : String(newTool.excerpt);
+        if (existingRow.__faktorExcerpt) {
+          setPartText(existingRow.__faktorExcerpt, newExcerpt);
+        } else if (newExcerpt.length > 0) {
+          canPatchTool = false;
+        }
+      }
+      if (canPatchTool) {
+        var nextCounts =
+          existingRow.__faktorToolKind === 'edit' ? diffCounts(newTool.excerpt) : null;
+        if (nextCounts !== null) {
+          if (existingRow.__faktorDiffAdd && existingRow.__faktorDiffDel) {
+            var addText = '+' + nextCounts.adds;
+            var delText = '\u2212' + nextCounts.dels;
+            if (existingRow.__faktorDiffAdd.textContent !== addText) {
+              existingRow.__faktorDiffAdd.textContent = addText;
+            }
+            if (existingRow.__faktorDiffDel.textContent !== delText) {
+              existingRow.__faktorDiffDel.textContent = delText;
+            }
+          } else {
+            canPatchTool = false;
+          }
+        } else if (existingRow.__faktorDiffAdd || existingRow.__faktorDiffDel) {
+          // The excerpt is no longer diff-shaped: replace the row so the
+          // stale +N/−N chip cannot survive a streamed edit.
+          canPatchTool = false;
+        }
+      }
+      if (canPatchTool) {
+        existingRow.__faktorTool = newTool;
+        continue;
+      }
+      // Preserve the OLD row's open disclosure / delivered evidence even when
+      // focus has left it (the reader may have opened a tool card and then
+      // clicked into the composer). The capture is scoped to this row, so a
+      // per-token text patch never clones the whole entry.
+      var rowState = existingRow ? captureEntryState(existingRow) : null;
+      var fresh = renderToolNode(newTool);
+      if (existingRow && existingRow.parentNode === node) {
+        node.replaceChild(fresh, existingRow);
+      } else {
+        node.appendChild(fresh);
+      }
+      if (rowState) {
+        restoreEntryState(fresh, rowState);
+      }
+      toolNodes[t] = fresh;
+    }
+    node.__faktorToolNodes = toolNodes;
+    node.__faktorEntry = entry;
+    if (preserved) {
+      restoreEntryState(node, preserved);
+    }
+    return true;
+  }
+
+  /** Update only the last rendered entry (windowed or short list). */
+  function patchLastTranscriptEntry(container, entries, keys, pin, anchor, index) {
+    var children = container.children || [];
+    var node = children[children.length - 1];
+
+    if (!node || !node.getAttribute || Number(node.getAttribute('data-entry-index')) !== index) {
+      return false;
+    }
+    renderProbe('transcript-last');
+    var entry = entries[index];
+    var patched = patchEntryNode(node, entry);
+    renderProbe(patched ? 'transcript-patch' : 'transcript-patch-fallback');
+    if (!patched) {
+      var preserved = captureEntryState(node);
+      var fresh = renderEntry(entry);
+      fresh.setAttribute('data-entry-index', String(index));
+      container.replaceChild(fresh, node);
+      restoreEntryState(fresh, preserved);
+      node = fresh;
+    }
+    // No offsetHeight read here: a per-token measurement would force a
+    // synchronous layout on every delta. The visible-window render measures
+    // heights once per window change; the pinned follow uses the browser's
+    // own scroll height.
+    transcriptPrefix = transcriptPrefixOf(entries);
+    transcriptEntries = entries;
+    transcriptEntryKeys = keys;
+    transcriptEntryStructures = transcriptStructuresOf(entries);
+    transcriptKey = entries.length === 0 ? 'empty' : 'entries';
+    transcriptPinRequested = false;
+    transcriptPinned = pin;
+    transcriptAnchor = pin ? null : anchor;
+    if (pin) {
+      setTranscriptScroll(container, container.scrollHeight);
+    } else if (anchor !== null) {
+      setTranscriptScroll(
+        container,
+        transcriptPrefix[anchor.index] + anchor.offset,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Materialize one visible window with top/bottom spacers that reproduce the
+   * cached full height, so scroll position and total scroll range keep their
+   * meaning. Only window changes touch the DOM; a per-token delta goes through
+   * patchLastTranscriptEntry.
+   */
+  function renderTranscriptWindow(container, entries, keys, pin, anchor) {
+    var total = entries.length;
+    transcriptPrefix = transcriptPrefixOf(entries);
+    var rows = transcriptRows(container);
+    var start;
+    var end;
+    if (pin) {
+      end = total;
+      start = Math.max(0, total - rows);
+    } else {
+      var anchorIndex = anchor === null ? 0 : anchor.index;
+      start = Math.max(0, Math.min(anchorIndex - Math.floor(rows / 2), Math.max(0, total - rows)));
+      end = Math.min(total, start + rows);
+    }
+    var windowSame =
+      transcriptWindowed &&
+      start === transcriptWindowStart &&
+      end === transcriptWindowEnd;
+    if (windowSame && sameTranscriptKeys(keys, transcriptEntryKeys) && entries.length === transcriptEntries.length) {
+      transcriptEntries = entries;
+      transcriptEntryStructures = transcriptStructuresOf(entries);
+      transcriptKey = entries.length === 0 ? 'empty' : 'entries';
+      transcriptPinRequested = false;
+      transcriptPinned = pin;
+      transcriptAnchor = pin ? null : anchor;
+      if (pin) {
+        setTranscriptScroll(container, container.scrollHeight);
+      } else if (anchor !== null) {
+        var prefix = transcriptPrefix;
+        setTranscriptScroll(container, prefix[anchor.index] + anchor.offset);
+      }
+      return;
+    }
+    // While the reader is away from the bottom, a delta on an entry OUTSIDE
+    // the visible window must not re-materialize it: only the cached total
+    // height (and therefore the bottom spacer) changes.
+    if (
+      windowSame &&
+      !pin &&
+      entries.length >= transcriptEntries.length &&
+      end <= transcriptEntries.length &&
+      visibleTranscriptKeysSame(transcriptEntryKeys, keys, start, end)
+    ) {
+      renderProbe('transcript-window-offscreen');
+      var offscreenBottom = container.children[container.children.length - 1];
+      if (
+        offscreenBottom &&
+        offscreenBottom.className &&
+        String(offscreenBottom.className).indexOf('transcript-spacer-bottom') !== -1
+      ) {
+        setSpacerHeight(
+          offscreenBottom,
+          transcriptPrefix[total] - transcriptPrefix[end] - TRANSCRIPT_ENTRY_GAP_PX,
+        );
+      }
+      transcriptEntries = entries;
+      transcriptEntryKeys = keys;
+      transcriptEntryStructures = transcriptStructuresOf(entries);
+      transcriptKey = entries.length === 0 ? 'empty' : 'entries';
+      transcriptPinRequested = false;
+      transcriptAnchor = anchor;
+      return;
+    }
+    var focus = captureTranscriptFocus(container);
+    renderProbe(pin ? 'transcript-window-pinned' : 'transcript-window-anchored');
+    withTranscriptLiveOff(container, function () {
+      clear(container);
+      var fragment =
+        typeof document.createDocumentFragment === 'function' ? document.createDocumentFragment() : null;
+      var target = fragment || container;
+      if (start > 0) {
+        target.appendChild(transcriptSpacer('transcript-spacer-top', transcriptPrefix[start] - TRANSCRIPT_ENTRY_GAP_PX));
+      }
+      for (var i = start; i < end; i += 1) {
+        var node = renderEntry(entries[i]);
+        node.setAttribute('data-entry-index', String(i));
+        target.appendChild(node);
+      }
+      if (end < total) {
+        target.appendChild(
+          transcriptSpacer(
+            'transcript-spacer-bottom',
+            transcriptPrefix[total] - transcriptPrefix[end] - TRANSCRIPT_ENTRY_GAP_PX,
+          ),
+        );
+      }
+      if (fragment) {
+        container.appendChild(fragment);
+      }
+    });
+    measureTranscriptHeights(container);
+    transcriptPrefix = transcriptPrefixOf(entries);
+    var top = container.children[0];
+    if (top && top.className && String(top.className).indexOf('transcript-spacer-top') !== -1) {
+      setSpacerHeight(top, transcriptPrefix[start] - TRANSCRIPT_ENTRY_GAP_PX);
+    }
+    var bottom = container.children[container.children.length - 1];
+    if (bottom && bottom.className && String(bottom.className).indexOf('transcript-spacer-bottom') !== -1) {
+      setSpacerHeight(
+        bottom,
+        transcriptPrefix[total] - transcriptPrefix[end] - TRANSCRIPT_ENTRY_GAP_PX,
+      );
+    }
+    transcriptWindowed = true;
+    transcriptWindowStart = start;
+    transcriptWindowEnd = end;
+    transcriptEntries = entries;
+    transcriptEntryKeys = keys;
+    transcriptEntryStructures = transcriptStructuresOf(entries);
+    transcriptKey = entries.length === 0 ? 'empty' : 'entries';
+    transcriptPinRequested = false;
+    transcriptPinned = pin;
+    transcriptAnchor = pin ? null : anchor;
+    if (pin) {
+      setTranscriptScroll(container, container.scrollHeight);
+    } else if (anchor !== null) {
+      setTranscriptScroll(container, transcriptPrefix[anchor.index] + anchor.offset);
+    }
+    restoreTranscriptFocus(container, focus);
+  }
+
+  function onTranscriptScroll() {
+    if (transcriptEntries === null || transcriptSuppressScroll) {
+      return;
+    }
     var container = byId('entries');
-    var key = transcriptKeyOf(entries);
-    var keys = transcriptKeysOf(entries);
-    var previousKey = transcriptKey;
-    // Scroll intent is computed BEFORE any mutation: the streaming fast path
-    // must honor the same pinned-follows / unpinned-anchor contract as a
-    // rebuild, or a pinned reader silently stops following the stream.
+    // Only a recent input gesture makes this scroll user intent. A bare
+    // scroll event (programmatic write, browser anchoring, restoration) is
+    // ignored and can never flip the pin.
+    if (Date.now() > transcriptUserScrollUntil) {
+      return;
+    }
+    // A scroll event at the exact position this renderer wrote is its own
+    // follow, even inside the gesture window (e.g. the gesture settled at the
+    // bottom just before the delta): it must not unpin.
+    if (
+      transcriptPinned &&
+      Math.abs(container.scrollTop - transcriptLastWrittenTop) <= 1
+    ) {
+      renderProbe('scroll-programmatic');
+      return;
+    }
+    // Record the user's intent IMMEDIATELY (before any RAF): a snapshot that
+    // arrives in the same task must already see the new pin/anchor and never
+    // scroll the reader back to the bottom first.
     var plan = transcriptScrollPlan({
       scrollHeight: container.scrollHeight,
       scrollTop: container.scrollTop,
       clientHeight: container.clientHeight,
     });
-    var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;
-    var anchor = pin ? null : transcriptAnchorOf(container);
-    // Streaming fast path: every entry EXCEPT the last is byte-identical and
-    // the last entry changed (a text/reasoning/tool delta). Replacing only
-    // the last node preserves open details, delivered evidence, focus and
-    // the reading position; a full rebuild here re-announced the whole
-    // transcript and destroyed all of it on every chunk.
-    var lastOnlyChanged =
-      transcriptEntryKeys !== null &&
-      transcriptEntryKeys.length === keys.length &&
-      keys.length > 0 &&
-      container.children.length === keys.length &&
-      keys[keys.length - 1] !== transcriptEntryKeys[transcriptEntryKeys.length - 1] &&
-      (function () {
-        for (var p = 0; p < keys.length - 1; p++) {
-          if (keys[p] !== transcriptEntryKeys[p]) {
-            return false;
-          }
-        }
-        return true;
-      })();
-    if (lastOnlyChanged) {
-      var oldNode = container.children[container.children.length - 1];
-      var preserved = captureEntryState(oldNode);
-      var freshNode = renderEntry(entries[entries.length - 1]);
-      // Attach FIRST: focus() on a detached node is a real-browser no-op, so
-      // restoring before replaceChild lost keyboard focus on every delta.
-      container.replaceChild(freshNode, oldNode);
-      restoreEntryState(freshNode, preserved);
-      transcriptKey = key;
-      transcriptEntryKeys = keys;
-      transcriptPinRequested = false;
-      if (pin) {
-        container.scrollTop = container.scrollHeight;
-      } else {
-        scrollToTranscriptAnchor(container, anchor);
-      }
+    renderProbe(plan.pinned ? 'scroll-external-pinned' : 'scroll-external-anchored');
+    transcriptPinned = plan.pinned;
+    transcriptAnchor = plan.pinned
+      ? null
+      : transcriptWindowed
+        ? transcriptAnchorFromScroll(transcriptPrefix, container.scrollTop)
+        : transcriptAnchorOf(container);
+    if (!transcriptWindowed || transcriptScrollScheduled) {
       return;
     }
-    if (transcriptKey !== null && key === transcriptKey) {
-      // No transcript delta: no rebuild and ZERO scroll mutation, so an
-      // expanded evidence block and the reading position both survive a
-      // background snapshot.
+    transcriptScrollScheduled = true;
+    var run = function () {
+      transcriptScrollScheduled = false;
+      if (transcriptEntries === null) {
+        return;
+      }
+      renderTranscriptWindow(
+        container,
+        transcriptEntries,
+        transcriptEntryKeys,
+        transcriptPinned,
+        transcriptAnchor,
+      );
+    };
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 16);
+    }
+  }
+
+  function noteTranscriptUserScroll() {
+    transcriptUserScrollUntil = Date.now() + 300;
+  }
+
+  function ensureTranscriptScrollListener(container) {
+    if (transcriptScrollListenerAttached || !container.addEventListener) {
+      return;
+    }
+    transcriptScrollListenerAttached = true;
+    container.addEventListener('scroll', onTranscriptScroll, { passive: true });
+    container.addEventListener('wheel', noteTranscriptUserScroll, { passive: true });
+    container.addEventListener('touchstart', noteTranscriptUserScroll, { passive: true });
+    container.addEventListener('touchmove', noteTranscriptUserScroll, { passive: true });
+    container.addEventListener('pointerdown', noteTranscriptUserScroll, { passive: true });
+    container.addEventListener('mousedown', noteTranscriptUserScroll, { passive: true });
+    container.addEventListener('keydown', function (event) {
+      var key = event && event.key ? String(event.key) : '';
+      if (
+        key === 'PageUp' ||
+        key === 'PageDown' ||
+        key === 'ArrowUp' ||
+        key === 'ArrowDown' ||
+        key === 'Home' ||
+        key === 'End' ||
+        key === ' '
+      ) {
+        noteTranscriptUserScroll();
+      }
+    });
+  }
+
+  function renderTranscript(entries, revision) {
+    var container = byId('entries');
+    entries = Array.isArray(entries) ? entries : [];
+    ensureTranscriptScrollListener(container);
+    var nextRevision =
+      typeof revision === 'string' && revision.length > 0 ? revision : null;
+    var revisionUnchanged =
+      nextRevision !== null && transcriptRevision !== null && nextRevision === transcriptRevision;
+    var digestCollision = false;
+    if (revisionUnchanged && transcriptKey !== null) {
+      // The host's content digest says nothing moved. A digest is a hint,
+      // never an authority: verify the actual document before skipping, so a
+      // collision (or a stale/forged revision) cannot freeze different
+      // content on screen. Equal content does no hashing, layout or DOM work.
+      if (transcriptContentSame(transcriptEntries, entries)) {
+        return;
+      }
+      digestCollision = true;
+    }
+    var revisionChanged =
+      digestCollision ||
+      (nextRevision !== null && transcriptRevision !== null && nextRevision !== transcriptRevision);
+    var computed = transcriptKeysFor(
+      entries,
+      revisionChanged,
+      nextRevision === null || digestCollision,
+    );
+    var keys = computed.keys;
+    var previousKeys = transcriptEntryKeys;
+    var windowed = entries.length > TRANSCRIPT_WINDOW_THRESHOLD;
+    // Scroll intent is computed BEFORE any mutation so the streaming fast
+    // path honors the same pinned-follows / unpinned-anchor contract.
+    // The pin is explicit state, not a value re-derived from scrollTop: a
+    // browser-internal adjustment can never silently switch a reader back to
+    // follow mode. Only user gestures (handled below) change it.
+    var pin =
+      transcriptKey === null || transcriptPinRequested || transcriptPinned;
+    renderProbe(pin ? 'transcript-plan-pinned' : 'transcript-plan-anchored');
+    var anchor = pin ? null : transcriptAnchor;
+    var lastOnlyChanged = lastEntryOnlyChanged(keys, previousKeys);
+    if (
+      lastOnlyChanged &&
+      !windowed &&
+      !transcriptWindowed &&
+      container.children.length === entries.length
+    ) {
+      if (patchLastTranscriptEntry(container, entries, keys, pin, anchor, entries.length - 1)) {
+        transcriptRevision = nextRevision;
+        return;
+      }
+    }
+    if (windowed) {
+      if (
+        lastOnlyChanged &&
+        transcriptWindowed &&
+        transcriptWindowEnd === entries.length &&
+        container.children.length > 0
+      ) {
+        var lastIndex = entries.length - 1;
+        if (patchLastTranscriptEntry(container, entries, keys, pin, anchor, lastIndex)) {
+          transcriptRevision = nextRevision;
+          return;
+        }
+      }
+      renderTranscriptWindow(container, entries, keys, pin, anchor);
+      transcriptRevision = nextRevision;
+      return;
+    }
+    if (transcriptWindowed) {
+      // Crossing back under the threshold: drop the spacers with a full
+      // rebuild (the short-list path owns the DOM from here on).
+      transcriptWindowed = false;
+      transcriptWindowStart = 0;
+      transcriptWindowEnd = 0;
+    }
+    if (transcriptKey !== null && sameTranscriptKeys(keys, previousKeys)) {
+      transcriptEntries = entries;
+      transcriptEntryStructures = computed.structures;
+      transcriptRevision = nextRevision;
       return;
     }
     // A strict prefix extension (the common snapshot append) adds ONLY the
     // new entries: existing DOM nodes are never re-inserted, so the live
     // region announces additions instead of re-announcing the history.
     var appended =
-      previousKey !== null &&
-      previousKey !== 'empty' &&
-      key.length > previousKey.length &&
-      key.indexOf(previousKey) === 0 &&
+      previousKeys !== null &&
+      previousKeys.length > 0 &&
+      prefixTranscriptKeys(previousKeys, keys) &&
       container.children.length > 0 &&
       entries.length >= container.children.length;
     if (appended) {
+      renderProbe('transcript-append');
       for (var a = container.children.length; a < entries.length; a++) {
-        container.appendChild(renderEntry(entries[a]));
+        var appendedNode = renderEntry(entries[a]);
+        appendedNode.setAttribute('data-entry-index', String(a));
+        container.appendChild(appendedNode);
       }
     } else {
       renderProbe('transcript');
-      clear(container);
-      if (!entries || entries.length === 0) {
-        transcriptKey = key;
-        transcriptEntryKeys = keys;
-        transcriptPinRequested = false;
-        // The empty slot stays empty: the onboarding/welcome state right
-        // above the log explains the panel; a duplicated "no messages" line
-        // would only restate it.
-        if (pin) {
-          container.scrollTop = 0;
+      var focus = captureTranscriptFocus(container);
+      withTranscriptLiveOff(container, function () {
+        clear(container);
+        if (entries.length === 0) {
+          return;
         }
-        return;
-      }
-      for (var i = 0; i < entries.length; i++) {
-        container.appendChild(renderEntry(entries[i]));
-      }
+        for (var i = 0; i < entries.length; i++) {
+          var node = renderEntry(entries[i]);
+          node.setAttribute('data-entry-index', String(i));
+          container.appendChild(node);
+        }
+      });
+      restoreTranscriptFocus(container, focus);
     }
-    transcriptKey = key;
+    transcriptKey = keys.length === 0 ? 'empty' : 'entries';
     transcriptEntryKeys = keys;
+    transcriptEntryStructures = computed.structures;
+    transcriptEntries = entries;
+    transcriptRevision = nextRevision;
     transcriptPinRequested = false;
+    transcriptPinned = pin;
+    transcriptAnchor = pin ? null : anchor;
+    if (entries.length === 0) {
+      // The empty slot stays empty: the onboarding/welcome state right above
+      // the log explains the panel; a duplicated "no messages" line would
+      // only restate it.
+      if (pin) {
+        setTranscriptScroll(container, 0);
+      }
+      return;
+    }
     if (pin) {
-      container.scrollTop = container.scrollHeight;
+      setTranscriptScroll(container, container.scrollHeight);
     } else {
       scrollToTranscriptAnchor(container, anchor);
     }
@@ -3058,29 +4097,31 @@
     if (typeof excerpt !== 'string' || excerpt.length === 0) {
       return null;
     }
-    var lines = excerpt.split('\n');
-    var limit = Math.min(lines.length, DIFF_SCAN_MAX_LINES);
-    var adds = 0;
-    var dels = 0;
-    for (var i = 0; i < limit; i++) {
-      var text = lines[i];
-      if (text.length === 0) {
-        continue;
-      }
-      if (text.charCodeAt(0) === 43) {
-        if (text.indexOf('+++') !== 0) {
-          adds += 1;
+    return cachedRender('diff', hash128(excerpt), excerpt, function () {
+      var lines = excerpt.split('\n');
+      var limit = Math.min(lines.length, DIFF_SCAN_MAX_LINES);
+      var adds = 0;
+      var dels = 0;
+      for (var i = 0; i < limit; i++) {
+        var text = lines[i];
+        if (text.length === 0) {
+          continue;
         }
-      } else if (text.charCodeAt(0) === 45) {
-        if (text.indexOf('---') !== 0) {
-          dels += 1;
+        if (text.charCodeAt(0) === 43) {
+          if (text.indexOf('+++') !== 0) {
+            adds += 1;
+          }
+        } else if (text.charCodeAt(0) === 45) {
+          if (text.indexOf('---') !== 0) {
+            dels += 1;
+          }
         }
       }
-    }
-    if (adds === 0 && dels === 0) {
-      return null;
-    }
-    return { adds: adds, dels: dels };
+      if (adds === 0 && dels === 0) {
+        return null;
+      }
+      return { adds: adds, dels: dels };
+    });
   }
 
   /** The outcome tone of one tool from its exit code and durable state. */
@@ -3122,7 +4163,7 @@
     return { tone: outcome.tone, label: outcome.label };
   }
 
-  function renderTool(container, tool) {
+  function renderToolNode(tool) {
     var name = String(tool.name == null ? '' : tool.name);
     var kind = classifyTool(name);
     var outcome = toolOutcome(tool);
@@ -3143,20 +4184,23 @@
     summary.className = 'activity-summary';
     summary.appendChild(toolGlyph(kind));
     span(summary, name.length > 0 ? name : '(unnamed tool)', 'activity-name');
+    var diffAdd = null;
+    var diffDel = null;
     if (chip.tone === 'diff') {
       var diff = span(summary, '', 'activity-chip activity-chip-diff');
-      span(diff, '+' + counts.adds, 'activity-add');
-      span(diff, '\u2212' + counts.dels, 'activity-del');
+      diffAdd = span(diff, '+' + counts.adds, 'activity-add');
+      diffDel = span(diff, '\u2212' + counts.dels, 'activity-del');
     } else {
       span(summary, chip.label, 'activity-chip activity-chip-' + chip.tone);
     }
     details.appendChild(summary);
 
+    var excerptNode = null;
     if (tool.excerpt) {
-      var excerpt = document.createElement('pre');
-      excerpt.className = 'excerpt';
-      excerpt.textContent = tool.excerpt;
-      details.appendChild(excerpt);
+      excerptNode = document.createElement('pre');
+      excerptNode.className = 'excerpt';
+      excerptNode.textContent = tool.excerpt;
+      details.appendChild(excerptNode);
     }
 
     var evidenceId = evidenceIdOf(tool.artifact);
@@ -3184,7 +4228,21 @@
       details.appendChild(region);
     }
     row.appendChild(details);
-    container.appendChild(row);
+    row.__faktorExcerpt = excerptNode;
+    row.__faktorDiffAdd = diffAdd;
+    row.__faktorDiffDel = diffDel;
+    row.__faktorToolKind = kind;
+    row.__faktorTool = tool;
+    return row;
+  }
+
+  function textPart(wrapper, className, value) {
+    var node = document.createElement('div');
+    node.className = className;
+    node.textContent = value;
+    node.__faktorPresent = value !== null && value !== undefined && value !== '';
+    wrapper.appendChild(node);
+    return node;
   }
 
   function renderEntry(entry) {
@@ -3196,11 +4254,9 @@
     head.textContent = entry.role + ' #' + entry.seq;
     wrapper.appendChild(head);
 
+    var parts = { text: null, reasoning: null, summary: null };
     if (entry.text) {
-      var text = document.createElement('div');
-      text.className = 'entry-text';
-      text.textContent = entry.text;
-      wrapper.appendChild(text);
+      parts.text = textPart(wrapper, 'entry-text', entry.text);
     }
     if (entry.reasoning) {
       var details = document.createElement('details');
@@ -3211,26 +4267,34 @@
       var reasoning = document.createElement('pre');
       reasoning.className = 'reasoning';
       reasoning.textContent = entry.reasoning;
+      reasoning.__faktorPresent = true;
       details.appendChild(reasoning);
       wrapper.appendChild(details);
+      parts.reasoning = reasoning;
     }
     if (entry.summary) {
-      var summaryLine = document.createElement('div');
-      summaryLine.className = 'entry-summary';
-      summaryLine.textContent = entry.summary;
-      wrapper.appendChild(summaryLine);
+      parts.summary = textPart(wrapper, 'entry-summary', entry.summary);
     }
     var tools = Array.isArray(entry.tools) ? entry.tools : [];
+    var toolNodes = [];
     for (var i = 0; i < tools.length; i++) {
-      renderTool(wrapper, tools[i]);
+      var toolNode = renderToolNode(tools[i]);
+      wrapper.appendChild(toolNode);
+      toolNodes.push(toolNode);
     }
+    wrapper.__faktorEntry = entry;
+    wrapper.__faktorParts = parts;
+    wrapper.__faktorToolNodes = toolNodes;
     return wrapper;
   }
 
   function setDaemon(status, detail) {
     var dot = byId('daemon-dot');
     if (dot) {
-      dot.className = 'dot dot-' + (status || 'stopped');
+      var dotClass = 'dot dot-' + (status || 'stopped');
+      if (dot.className !== dotClass) {
+        dot.className = dotClass;
+      }
     }
     // The service URL/detail is diagnostics: it renders only inside the
     // Diagnostics card, never in the product header.
@@ -3702,7 +4766,7 @@
     // the post rows or the composer draft affordances. The card visibility
     // is part of the key (the board lives in the Agents subview).
     var guardKey =
-      activeSubview + '#' + hash128(JSON.stringify(board === undefined ? null : board));
+      activeSubview + '#' + hash128(jsonForHash(board === undefined ? null : board));
     if (renderedBoardKey !== null && renderedBoardKey === guardKey) {
       return;
     }
@@ -3971,6 +5035,7 @@
     if (!snapshot) {
       return;
     }
+    renderProbe('snapshot');
     var sessionId = snapshot.session ? String(snapshot.session.id) : null;
     if (currentSessionId !== null && sessionId !== currentSessionId) {
       // The host clears its store on a session switch (uploads are bound to
@@ -3978,6 +5043,22 @@
       // submission identity so a stale id can never leak into a new session.
       attachments = [];
       renderAttachments();
+      // Transcript ownership is per conversation: drop the window, height
+      // cache, content keys and pin/anchor state so the new conversation
+      // starts at its own bottom instead of inheriting the old position.
+      transcriptKey = null;
+      transcriptEntryKeys = null;
+      transcriptEntryStructures = null;
+      transcriptEntries = null;
+      transcriptRevision = null;
+      transcriptWindowed = false;
+      transcriptWindowStart = 0;
+      transcriptWindowEnd = 0;
+      transcriptHeights = [];
+      transcriptPrefix = [0];
+      transcriptPinned = true;
+      transcriptAnchor = null;
+      transcriptLastWrittenTop = 0;
     }
     currentSessionId = sessionId;
     machineStateValue =
@@ -4010,7 +5091,7 @@
     renderHistory(snapshot);
     renderOutcomes(snapshot);
     renderWelcome(snapshot.transcript);
-    renderTranscript(snapshot.transcript);
+    renderTranscript(snapshot.transcript, snapshot.transcriptRevision);
     // The raw last error lives in Diagnostics; the structured projection
     // reached the panel through `userError`. A last error with no posted
     // projection (e.g. a cockpit projection failure) still surfaces ONCE
@@ -4045,9 +5126,14 @@
     var model = session && session.model ? String(session.model) : '';
     var text = model.length > 0 && provider.length > 0 ? provider + ' / ' + model : model || provider;
     node.hidden = text.length === 0;
-    node.textContent = text;
+    if (node.textContent !== text) {
+      node.textContent = text;
+    }
     if (text.length > 0) {
-      node.setAttribute('title', 'Session model: ' + text);
+      var title = 'Session model: ' + text;
+      if (!node.getAttribute || node.getAttribute('title') !== title) {
+        node.setAttribute('title', title);
+      }
     } else if (node.removeAttribute) {
       node.removeAttribute('title');
     }
@@ -4246,10 +5332,67 @@
     renderComposerState();
   }
 
+  // ------------------------------------------------------- message coalescing
+  // The host posts one full snapshot per durable change. A fast stream can
+  // deliver hundreds per second; rendering each one is wasted work because a
+  // newer full snapshot supersedes the previous one. Consecutive snapshots
+  // are therefore collapsed to the LATEST one and flushed on the next
+  // animation frame (with a bounded timer fallback when frames are throttled,
+  // e.g. a hidden panel). Non-snapshot messages flush the pending snapshot
+  // first, so evidence/start/permission results keep their exact order.
+  var pendingSnapshot = null;
+  var snapshotFlushScheduled = false;
+  var snapshotFlushHandle = null;
+  var snapshotFlushTimer = null;
+
+  function flushPendingSnapshot() {
+    if (!snapshotFlushScheduled && pendingSnapshot === null) {
+      return;
+    }
+    snapshotFlushScheduled = false;
+    if (snapshotFlushTimer !== null) {
+      clearTimeout(snapshotFlushTimer);
+      snapshotFlushTimer = null;
+    }
+    if (snapshotFlushHandle !== null) {
+      if (typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(snapshotFlushHandle);
+      }
+      snapshotFlushHandle = null;
+    }
+    var next = pendingSnapshot;
+    pendingSnapshot = null;
+    if (next !== null) {
+      renderSnapshot(next);
+    }
+  }
+
+  function scheduleSnapshotFlush() {
+    if (snapshotFlushScheduled) {
+      renderProbe('snapshot-coalesced');
+      return;
+    }
+    snapshotFlushScheduled = true;
+    if (typeof window.requestAnimationFrame === 'function') {
+      snapshotFlushHandle = window.requestAnimationFrame(flushPendingSnapshot);
+    }
+    if (snapshotFlushScheduled) {
+      // Bounded: a throttled/hidden webview must still apply the newest state.
+      snapshotFlushTimer = setTimeout(flushPendingSnapshot, 64);
+    }
+  }
+
   window.addEventListener('message', function (event) {
     var message = event.data || {};
+    renderProbe('message');
+    // A non-snapshot message must observe the state that preceded it: apply
+    // the pending snapshot synchronously, then handle the message.
+    if (message.type !== 'snapshot') {
+      flushPendingSnapshot();
+    }
     if (message.type === 'snapshot') {
-      renderSnapshot(message.snapshot);
+      pendingSnapshot = message.snapshot;
+      scheduleSnapshotFlush();
     } else if (message.type === 'evidence') {
       deliverEvidence(message.id, message.text, message.truncated);
     } else if (message.type === 'boardPosted' || message.type === 'boardRefused') {
@@ -4534,9 +5677,17 @@
       message.budgetCostMicro = budget.cost;
     }
     transcriptPinRequested = true;
+    transcriptPinned = true;
+    transcriptAnchor = null;
     // A new submission supersedes a kept failed start (T08 -> T07).
     startFailed = false;
     setSubmitting(true);
+    // Run task becomes disabled while the submission is pending; keep
+    // keyboard focus in the composer instead of dropping it to the body.
+    var goalNode = byId('goal');
+    if (goalNode && typeof goalNode.focus === 'function') {
+      goalNode.focus();
+    }
     vscode.postMessage(message);
   }
 

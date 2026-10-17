@@ -36,3 +36,11 @@ pub use worker_plane::{
 #[cfg(test)]
 #[path = "worker_plane_tests.rs"]
 mod worker_plane_tests;
+
+/// Manual loopback streaming-delivery harness (frame/byte/allocation/latency
+/// counters). Feature-gated out of the standing suites; run explicitly with
+/// `cargo test -p faktor-server --features streaming-harness --lib \
+///  streaming_delivery -- --nocapture`.
+#[cfg(all(test, feature = "streaming-harness"))]
+#[path = "streaming_harness_tests.rs"]
+mod streaming_harness_tests;

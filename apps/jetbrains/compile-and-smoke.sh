@@ -75,7 +75,7 @@ fi
 # `--offline` there).
 EXTRA_JVM_ARGS=""
 SMOKE_SELECTION=()
-KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix"
+KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork"
 while [ $# -gt 0 ]; do
   case "$1" in
     --write-baselines)
@@ -163,7 +163,8 @@ $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/ControlPlaneCredentialSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsHostMatrixSmoke.kt
-$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt"
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/EdtWorkHarness.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
@@ -189,7 +190,8 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TerminalPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/DiagnosticsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AgentsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt
-$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt"
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UiWork.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
@@ -383,6 +385,11 @@ fi
 if smoke_selected JetBrainsParity; then
   echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
   run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke || exit $?
+fi
+
+if smoke_selected EdtWork; then
+  echo "[compile-and-smoke] running EdtWorkHarness (10k-token stream / 500-message transcript / 200 deltas/s / 1k rows)"
+  run_smoke EdtWorkHarness dev.faktor.frontend.EdtWorkHarness || exit $?
 fi
 
 if smoke_selected HostMatrix; then

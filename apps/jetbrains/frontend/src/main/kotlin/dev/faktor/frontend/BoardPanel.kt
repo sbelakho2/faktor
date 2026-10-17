@@ -82,6 +82,9 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     private var loadedPosts: Int = 0
 
+    /** The last rendered newest page (identical auto refresh = no-op). */
+    private var appliedPage: NativeBoardPage? = null
+
     private var nextBeforeRevision: Long? = null
 
     private var hasMore: Boolean = false
@@ -92,6 +95,12 @@ class BoardPanel : JPanel(BorderLayout()) {
         bodyArea.lineWrap = true
         bodyArea.wrapStyleWord = true
         bodyArea.font = uiPanelFont()
+        subjectField.a11y("Board post subject", "Subject of the coordination note.")
+        bodyArea.a11y("Board post message", "Message body of the coordination note.")
+        postsArea.a11y("Board activity", "Coordination posts for this session.")
+        advancedArea.a11y("Board advanced detail", "Revision, author ids and evidence refs.")
+        postButton.a11y("Post note", "Posts the composed note to the session board.")
+        readButton.a11y("Read board", "Acknowledges the current board head.")
         postButton.isEnabled = false
         readButton.isEnabled = false
         loadOlderButton.isEnabled = false
@@ -172,6 +181,15 @@ class BoardPanel : JPanel(BorderLayout()) {
      * Automatic refreshes never mark posts read.
      */
     fun setBoard(page: NativeBoardPage, acknowledge: Boolean = false) {
+        // The stream refresh re-posts the same newest page; an identical
+        // automatic render must not rebuild the documents or drop an older
+        // page window the operator loaded. An unread acknowledgement still
+        // updates the watermark.
+        if (page == appliedPage && (!acknowledge || unread == 0)) {
+            setAvailable(true)
+            return
+        }
+        appliedPage = page
         setAvailable(true)
         if (acknowledge) {
             seenRevision = maxOf(seenRevision, page.revision)
@@ -182,8 +200,10 @@ class BoardPanel : JPanel(BorderLayout()) {
         nextBeforeRevision = page.nextBeforeRevision
         hasMore = page.hasMore
         pagingNote = null
-        postsArea.text = humanPosts(page.posts)
-        advancedArea.text = advancedPosts(page.posts)
+        val human = humanPosts(page.posts)
+        val advanced = advancedPosts(page.posts)
+        if (postsArea.text != human) postsArea.text = human
+        if (advancedArea.text != advanced) advancedArea.text = advanced
         renderHeader()
         updateLoadOlder()
     }
@@ -287,6 +307,7 @@ class BoardPanel : JPanel(BorderLayout()) {
      * ever fabricated and the composer is disabled.
      */
     fun setUnavailable(reason: String) {
+        appliedPage = null
         setAvailable(false)
         latestRevision = 0L
         unread = 0
@@ -302,6 +323,7 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     /** Clears to the pre-read state (daemon stopped / session switched). */
     fun reset() {
+        appliedPage = null
         seenRevision = 0L
         latestRevision = 0L
         unread = 0

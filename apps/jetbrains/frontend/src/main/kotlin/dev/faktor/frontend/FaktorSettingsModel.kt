@@ -24,6 +24,9 @@ object FaktorSettingKeys {
     const val RUN_MUTATION_MODE = "faktor.run.defaultMutationMode"
     const val CONTROL_PLANE_ENDPOINT = "faktor.controlPlane.endpoint"
     const val CONTROL_PLANE_ORGANIZATION = "faktor.controlPlane.organization"
+
+    /** Non-secret auth-session coordinate named by the sign-out revoke. */
+    const val CONTROL_PLANE_SESSION = "faktor.controlPlane.session"
 }
 
 /**

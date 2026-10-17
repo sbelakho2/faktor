@@ -131,8 +131,9 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
 
     fun setEvidence(refs: List<EvidenceRef>) {
         val selectedId = evidenceList.selectedValue?.id
-        evidenceModel.clear()
-        for (ref in refs) evidenceModel.addElement(ref)
+        // Keyed by id/label: a refresh that re-posts the same refs keeps the
+        // selection and fires no model events.
+        KeyedListSync.sync(evidenceModel, refs) { it.id?.toString() ?: it.label }
         if (selectedId != null) {
             for (i in 0 until evidenceModel.size()) {
                 if (evidenceModel.getElementAt(i).id == selectedId) {
@@ -148,8 +149,7 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
     fun messageCount(): Int = messagesModel.size()
 
     fun setMessages(messages: List<NativeMessage>) {
-        messagesModel.clear()
-        for (message in messages) messagesModel.addElement(message)
+        KeyedListSync.sync(messagesModel, messages) { it.seq.toString() }
     }
 
     /** Selects one ref and immediately retrieves it (one-click from the tree). */
@@ -170,6 +170,14 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             return
         }
         modeBox.selectedItem = "all"
+        evidenceList.a11y("Evidence references", "Served evidence refs for this run.")
+        messagesList.a11y("Recent messages", "Select a message to jump the transcript.")
+        output.a11y("Evidence content", "Retrieved evidence preview.")
+        transcriptArea.a11y("Child transcript slice", "Transcript window of the selected child session.")
+        modeBox.a11y("Evidence selector mode", "All, byte range, line range or search.")
+        queryField.a11y("Evidence search query", "Text to search within the evidence.")
+        startField.a11y("Range start", "Start byte or line of the range.")
+        endField.a11y("Range end", "End byte or line of the range.")
     }
 
     fun showRetrieval(evidenceId: Long, text: String, byteLen: Long, truncated: Boolean) {
@@ -196,6 +204,14 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
         messagesList.clearSelection()
         transcriptArea.text = ""
         modeBox.selectedItem = "all"
+        evidenceList.a11y("Evidence references", "Served evidence refs for this run.")
+        messagesList.a11y("Recent messages", "Select a message to jump the transcript.")
+        output.a11y("Evidence content", "Retrieved evidence preview.")
+        transcriptArea.a11y("Child transcript slice", "Transcript window of the selected child session.")
+        modeBox.a11y("Evidence selector mode", "All, byte range, line range or search.")
+        queryField.a11y("Evidence search query", "Text to search within the evidence.")
+        startField.a11y("Range start", "Start byte or line of the range.")
+        endField.a11y("Range end", "End byte or line of the range.")
         startField.text = ""
         endField.text = ""
         queryField.text = ""

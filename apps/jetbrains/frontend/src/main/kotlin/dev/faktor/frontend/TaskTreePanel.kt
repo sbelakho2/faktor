@@ -90,6 +90,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     /** Suppresses action dispatch while an update restores selection. */
     private var suppressSelectionEvents = false
 
+    /** The last detail text written (identical refresh = no document churn). */
+    private var appliedDetail: String? = null
+
     /** Captured UI state keyed by stable node ids across one update. */
     private data class TreeUiState(
         val expandedKeys: Set<String>,
@@ -100,6 +103,11 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     init {
         tree.isRootVisible = true
         tree.showsRootHandles = true
+        // Large-model mode keeps the tree's fixed row height path for 1k-row
+        // plans instead of measuring every visible row on each repaint.
+        tree.setLargeModel(true)
+        tree.a11y("Task plan", "Plan, agents, evidence, verification and spend.")
+        detailArea.a11y("Selected task node", "Details of the selected plan node.")
         tree.rowHeight = Math.max(24, tree.getFontMetrics(uiPanelFont()).height + 10)
         tree.cellRenderer = TaskTreeRenderer()
         tree.addMouseMotionListener(
@@ -233,8 +241,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                 // re-expand rows the operator collapsed).
                 for (row in 0 until tree.rowCount) tree.expandRow(row)
             } else {
-                mergeNode(existingRoot, desired)
+                val changed = mergeNode(existingRoot, desired)
                 restoreUiState(state)
+                if (!changed) return
             }
         } finally {
             suppressSelectionEvents = false
@@ -268,15 +277,53 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         return parts.asReversed().joinToString("/")
     }
 
+    /**
+     * One O(n) key-path index for the whole tree. The historical capture
+     * recomputed [keyPath] per visible row (which itself scanned siblings),
+     * making every refresh O(n^2) on a 1k-row plan. Duplicate sibling keys
+     * keep the same `key#n` suffix contract.
+     */
+    private class KeyIndex {
+        val byNode = java.util.IdentityHashMap<DefaultMutableTreeNode, String>()
+        val byKey = HashMap<String, DefaultMutableTreeNode>()
+    }
+
+    private fun buildKeyIndex(root: DefaultMutableTreeNode): KeyIndex {
+        val index = KeyIndex()
+        val suffixCounts = java.util.IdentityHashMap<DefaultMutableTreeNode, HashMap<String, Int>>()
+        fun visit(node: DefaultMutableTreeNode) {
+            val parent = node.parent as? DefaultMutableTreeNode
+            val suffix = keyOf(node)
+            val uniqueSuffix = if (parent == null) {
+                suffix
+            } else {
+                val counts = suffixCounts.getOrPut(parent) { HashMap() }
+                val seen = counts[suffix] ?: 0
+                counts[suffix] = seen + 1
+                if (seen == 0) suffix else "$suffix#$seen"
+            }
+            val key = parent?.let { index.byNode[it] + "/" + uniqueSuffix } ?: uniqueSuffix
+            index.byNode[node] = key
+            index.byKey[key] = node
+            for (child in 0 until node.childCount) {
+                visit(node.getChildAt(child) as DefaultMutableTreeNode)
+            }
+        }
+        visit(root)
+        return index
+    }
+
     private fun captureUiState(): TreeUiState {
+        val root = treeModel.root as? DefaultMutableTreeNode ?: return TreeUiState(emptySet(), null, null)
+        val index = buildKeyIndex(root)
         val expanded = LinkedHashSet<String>()
         for (row in 0 until tree.rowCount) {
             val path = tree.getPathForRow(row) ?: continue
             val node = path.lastPathComponent as? DefaultMutableTreeNode ?: continue
-            if (tree.isExpanded(path)) expanded.add(keyPath(node))
+            if (tree.isExpanded(path)) index.byNode[node]?.let { expanded.add(it) }
         }
         val selected = (tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode)
-            ?.let { keyPath(it) }
+            ?.let { index.byNode[it] }
         val viewPosition = treeScroll.viewport.viewPosition
         return TreeUiState(
             expanded,
@@ -288,15 +335,16 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private fun restoreUiState(state: TreeUiState) {
         val root = treeModel.root as? DefaultMutableTreeNode ?: return
         if (state.expandedKeys.isNotEmpty()) {
-            walk(root) { node ->
-                if (!node.isLeaf && state.expandedKeys.contains(keyPath(node))) {
-                    tree.expandPath(TreePath(node.path))
-                }
+            val index = buildKeyIndex(root)
+            for (key in state.expandedKeys) {
+                val node = index.byKey[key] ?: continue
+                if (!node.isLeaf) tree.expandPath(TreePath(node.path))
             }
         }
         val selectedKey = state.selectedKey
         if (selectedKey != null) {
-            val target = findFirst(root) { keyPath(it) == selectedKey }
+            val index = buildKeyIndex(root)
+            val target = index.byKey[selectedKey]
             if (target != null) {
                 tree.selectionPath = TreePath(target.path)
             }
@@ -304,34 +352,23 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         state.scrollPosition?.let { treeScroll.viewport.viewPosition = it }
     }
 
-    private fun walk(node: DefaultMutableTreeNode, visit: (DefaultMutableTreeNode) -> Unit) {
-        visit(node)
-        for (index in 0 until node.childCount) {
-            walk(node.getChildAt(index) as DefaultMutableTreeNode, visit)
-        }
-    }
-
-    private fun findFirst(
-        node: DefaultMutableTreeNode,
-        match: (DefaultMutableTreeNode) -> Boolean
-    ): DefaultMutableTreeNode? {
-        if (match(node)) return node
-        for (index in 0 until node.childCount) {
-            val found = findFirst(node.getChildAt(index) as DefaultMutableTreeNode, match)
-            if (found != null) return found
-        }
-        return null
-    }
-
     /** Updates [existing] from [desired], reusing matching children by key. */
-    private fun mergeNode(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode) {
+    private fun mergeNode(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode): Boolean {
+        var changed = false
         if (existing.userObject != desired.userObject) {
             existing.userObject = desired.userObject
+            // Direct userObject assignment does NOT notify DefaultTreeModel;
+            // without this the row keeps rendering the old label even though
+            // the structural merge preserved the node object.
+            treeModel.nodeChanged(existing)
+            changed = true
         }
-        mergeChildren(existing, desired)
+        if (mergeChildren(existing, desired)) changed = true
+        return changed
     }
 
-    private fun mergeChildren(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode) {
+    private fun mergeChildren(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode): Boolean {
+        var changed = false
         val buckets = LinkedHashMap<String, ArrayDeque<DefaultMutableTreeNode>>()
         for (index in 0 until existing.childCount) {
             val child = existing.getChildAt(index) as DefaultMutableTreeNode
@@ -342,7 +379,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             val wanted = desired.getChildAt(index) as DefaultMutableTreeNode
             val reused = buckets[keyOf(wanted)]?.removeFirstOrNull()
             if (reused != null) {
-                mergeNode(reused, wanted)
+                if (mergeNode(reused, wanted)) changed = true
                 ordered.add(reused)
             } else {
                 ordered.add(wanted)
@@ -350,7 +387,10 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         }
         for (bucket in buckets.values) {
             for (dead in bucket) {
-                if (dead.parent != null) treeModel.removeNodeFromParent(dead)
+                if (dead.parent != null) {
+                    treeModel.removeNodeFromParent(dead)
+                    changed = true
+                }
             }
         }
         val currentOrder = ArrayList<DefaultMutableTreeNode>(existing.childCount)
@@ -364,16 +404,21 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             for ((index, child) in ordered.withIndex()) {
                 treeModel.insertNodeInto(child, existing, index)
             }
+            changed = true
         }
+        return changed
     }
 
     private fun updateDetail() {
         val node = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
-        detailArea.text = if (node == null) {
+        val text = if (node == null) {
             "Select a node to inspect its details."
         } else {
             detailText(node)
         }
+        if (text == appliedDetail) return
+        appliedDetail = text
+        detailArea.text = text
     }
 
     private fun detailText(node: DefaultMutableTreeNode): String =

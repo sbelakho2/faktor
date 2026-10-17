@@ -69,9 +69,19 @@ class AgentsPanel : JPanel(BorderLayout()) {
     /** The plan-derived spend lookup: agent id to exact micro-USD spend. */
     private var spends: Map<String, java.math.BigInteger> = emptyMap()
 
+    /** The last applied snapshot: an identical refresh is a strict no-op. */
+    private var appliedAgents: List<NativeAgent>? = null
+    private var appliedModel: TaskTreeModel? = null
+    private var appliedAdvanced: String = ""
+
     init {
         val refreshAgents = secondaryButton("Refresh agents")
         refreshAgents.addActionListener { listener?.onRefresh() }
+        agentsCombo.a11y("Agents", "Select an agent to control. Press Enter to open the roster.")
+        agentsArea.a11y("Agent detail", "Exact identities, ownership, budget and spend.")
+        installActivateKey(agentsCombo, "faktor.openAgents") {
+            primaryAction.requestFocusInWindow()
+        }
         // The combo renders one bounded human row (role — state + action);
         // the full row stays available as tooltip.
         agentsCombo.renderer = object : javax.swing.DefaultListCellRenderer() {
@@ -261,6 +271,14 @@ class AgentsPanel : JPanel(BorderLayout()) {
      * the plan-derived role column when the plan knows the agent's step.
      */
     fun update(agents: List<NativeAgent>, model: TaskTreeModel? = null) {
+        // The host re-posts the whole projection on every stream refresh; an
+        // identical snapshot must not rebuild the combo model or the document.
+        if (agents == appliedAgents && model == appliedModel) {
+            syncAgentControls()
+            return
+        }
+        appliedAgents = agents
+        appliedModel = model
         val roleMap = LinkedHashMap<String, String>()
         val spendMap = LinkedHashMap<String, java.math.BigInteger>()
         if (model != null) {
@@ -272,11 +290,10 @@ class AgentsPanel : JPanel(BorderLayout()) {
         }
         roles = roleMap
         spends = spendMap
-        val selectedId = (agentsCombo.selectedItem as? NativeAgent)?.agentId
-        agentsModel.removeAllElements()
-        for (agent in agents) agentsModel.addElement(agent)
-        if (selectedId != null) selectAgent(selectedId)
-        agentsArea.text = if (agents.isEmpty()) {
+        // Keyed by agent id: unchanged rows keep their identity (and the
+        // selection/scroll), only genuinely changed rows are replaced.
+        KeyedListSync.syncCombo(agentsModel, agents) { it.agentId }
+        val advanced = if (agents.isEmpty()) {
             "No agents yet. Rows appear here while a run works."
         } else {
             val sb = StringBuilder()
@@ -285,8 +302,15 @@ class AgentsPanel : JPanel(BorderLayout()) {
             }
             sb.toString()
         }
+        if (advanced != appliedAdvanced) {
+            appliedAdvanced = advanced
+            agentsArea.text = advanced
+        }
         syncAgentControls()
     }
+
+    /** The live combo model (perf harness assertion hook). */
+    internal fun modelForTest(): DefaultComboBoxModel<NativeAgent> = agentsModel
 
     /** The rendered human roster (smoke observable, no display needed). */
     fun rosterText(): String {

@@ -108,7 +108,7 @@ implementations of the neutral `SystemIntelligenceProvider` and
   PTY authority (`crates/pty`, ACP-negotiated `faktor.terminal`) spawns
   ConPTY children `CREATE_SUSPENDED`, assigns them to a
   `KILL_ON_JOB_CLOSE` job, then resumes: no child runs outside the job.
-- **Provider normalization** — ~10 transport families + dynamic model registry.
+- **Provider normalization** — six transport families + dynamic model registry.
   OpenAI Chat Completions and the native **Responses** API are both
   first-class (`api=chat|responses`, Responses by default for the official
   endpoint; strict parsing, streaming/deadline/retry/terminal tests). No
@@ -238,8 +238,8 @@ authoritative surface and is scan-enforced.
   step while no provider is configured records the explicit
   `native_pr_scm_not_configured` durable blocker (never a silent skip); the
   legacy `pr_command`/`pr_program` expert command remains available but can
-  never certify the native PR step. Both IDEs expose the Task-mode checkboxes
-  and report the durable step provenance; a serving daemon without the
+  never certify the native PR step. Both IDEs expose the Task-mode
+  finish-level controls and report the durable step provenance; a serving daemon without the
   additive completion read shows `unavailable`, never a fabricated success.
   Normative semantics and the exact seams are in `docs/certification.md`
   §3.3.
@@ -312,7 +312,7 @@ the marked block.
 | Windows containment (Job Objects + ConPTY) | IMPLEMENTED | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs` (`JobGuard`), `crates/pty/src/windows.rs` (spawn suspended → assign → resume; no taskkill guarantee) |
 | Certification evidence chain | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`), `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), v2 lane markers in `.woodpecker/untrusted/pr.yaml` |
 | VS Code Faktor panel | IMPLEMENTED | `apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js` (`apps/vscode/scripts/selftest.mjs`, `apps/vscode/scripts/verify-vsix.mjs`) |
-| JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json` (generated): 11/11 rows against canned frames and the fake daemon |
+| JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json` (generated): 13/13 rows against canned frames and the fake daemon |
 | JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned per-platform baselines; certification is per platform, never inherited) | same matrix: 8 rendered panels compared against THIS platform's own record in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` — a platform with no record reads not certified on that platform (Windows today) and the release claim stays refused by `scripts/check-visual-platforms.mjs --release` until every required record exists |
 | UI parity (`ui_parity`) | IMPLEMENTED (derived in `target/certification/capabilities.json` (generated)) | Faktor-owned VS Code panel + JetBrains behavioral/visual axes |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |

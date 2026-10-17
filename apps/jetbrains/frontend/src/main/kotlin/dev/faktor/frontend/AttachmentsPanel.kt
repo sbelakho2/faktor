@@ -42,6 +42,7 @@ import java.io.OutputStream
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Base64
+import java.util.concurrent.Executors
 import javax.imageio.ImageIO
 import javax.swing.AbstractAction
 import javax.swing.DefaultListModel
@@ -52,6 +53,7 @@ import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
+import javax.swing.SwingUtilities
 import javax.swing.TransferHandler
 
 /**
@@ -755,6 +757,17 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
 
     private val binaryList = JList(binaries)
 
+    /**
+     * Off-EDT PNG conversion for UI-originated images (paste/drop). The
+     * clipboard image can be tens of megapixels; encoding it on the EDT
+     * would freeze the tool window. The synchronous
+     * [addClipboardImage]/[pasteImageFromClipboard] contracts remain for
+     * callers/tests that already own the bytes.
+     */
+    private val imageWorker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "faktor-attachment-image").apply { isDaemon = true }
+    }
+
     private val binaryScroll = JScrollPane(binaryList)
 
     private val addButton = secondaryButton("Add files...")
@@ -931,16 +944,56 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
     }
 
     private fun requestPasteFromClipboard() {
-        val refusal = pasteImageFromClipboard()
-        if (refusal != null) {
-            onNotice?.invoke(refusal)
-        } else {
-            onNotice?.invoke(
-                "clipboard image attached in memory (image/png, " +
-                    (binaries.lastElementOrNull()?.size() ?: 0) +
-                    " bytes); it uploads as a durable attachment on start"
-            )
+        if (GraphicsEnvironment.isHeadless()) {
+            onNotice?.invoke("the system clipboard is unavailable in this environment")
+            return
         }
+        val clipboard: Clipboard = try {
+            Toolkit.getDefaultToolkit().systemClipboard
+        } catch (e: Exception) {
+            onNotice?.invoke("the system clipboard is unavailable in this environment")
+            return
+        }
+        if (!clipboard.isDataFlavorAvailable(DataFlavor.imageFlavor)) {
+            onNotice?.invoke("the clipboard holds no image")
+            return
+        }
+        val image = try {
+            clipboard.getData(DataFlavor.imageFlavor) as? Image
+        } catch (e: Exception) {
+            null
+        }
+        if (image == null) {
+            onNotice?.invoke("the clipboard image could not be read")
+            return
+        }
+        stageImageOffEdt(image, "clipboard.png", "clipboard image")
+    }
+
+    /** PNG conversion on the worker; staging and notices on the EDT. */
+    private fun stageImageOffEdt(image: Image, filename: String, label: String) {
+        imageWorker.execute {
+            val bytes = AttachmentImages.pngBytes(image)
+            SwingUtilities.invokeLater {
+                if (bytes == null || !addBinary("image/png", filename, bytes)) {
+                    onNotice?.invoke(
+                        "the $label is refused: it exceeds the bounded PNG conversion " +
+                            "(${AttachmentImages.MAX_IMAGE_BYTES} bytes / " +
+                            "${AttachmentImages.MAX_CLIPBOARD_PIXELS} pixels)"
+                    )
+                } else {
+                    onNotice?.invoke(
+                        "$label attached in memory (image/png, ${bytes.size} bytes); " +
+                            "it uploads as a durable attachment on start"
+                    )
+                }
+            }
+        }
+    }
+
+    /** Stops the image worker on panel disposal (no orphan thread). */
+    fun shutdown() {
+        imageWorker.shutdownNow()
     }
 
     private fun attachmentTransferHandler(): TransferHandler = object : TransferHandler() {
@@ -966,17 +1019,9 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
                     onNotice?.invoke("the dropped image could not be read")
                     return false
                 }
-                if (!addClipboardImage(image)) {
-                    onNotice?.invoke(
-                        "the dropped image is refused: it exceeds the bounded PNG conversion"
-                    )
-                    return false
-                }
-                onNotice?.invoke(
-                    "image attached in memory (image/png, " +
-                        (binaries.lastElementOrNull()?.size() ?: 0) +
-                        " bytes); it uploads as a durable attachment on start"
-                )
+                // The drop is accepted immediately; the bounded conversion
+                // and the typed refusal notice happen off the EDT.
+                stageImageOffEdt(image, "dropped-image.png", "dropped image")
                 return true
             }
             return false

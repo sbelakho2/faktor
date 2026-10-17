@@ -15,7 +15,8 @@ val smokeMains = mapOf(
         "Frontend" to "dev.faktor.frontend.FrontendSmoke",
         "ControlPlaneCredential" to "dev.faktor.frontend.ControlPlaneCredentialSmoke",
         "JetBrainsParity" to "dev.faktor.frontend.JetBrainsParitySmoke",
-        "HostMatrix" to "dev.faktor.frontend.JetBrainsHostMatrixSmoke"
+        "HostMatrix" to "dev.faktor.frontend.JetBrainsHostMatrixSmoke",
+        "EdtWork" to "dev.faktor.frontend.EdtWorkHarness"
     )
 )
 

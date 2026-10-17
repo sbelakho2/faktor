@@ -734,10 +734,20 @@ feature).
 - **Per-session journal SSE:** `GET /native/session/{id}/events?after=<seq>`
   streams durable journal frames (`id: <seq>`, `event: <kind>`, `data:` the
   `/native/events` row shape); `after` replays `seq > after` (0 = from the
-  beginning). Catch-up is paged (≤ 256 events per poll), so a reconnect
-  against a huge journal never balloons RAM and resumes exactly from the
-  cursor. While the page is exhausted the stream emits `event: heartbeat`
-  frames (250 ms poll cadence, 5 s SSE keep-alive), so it stays open.
+  beginning). Catch-up is paged (≤ 256 events per poll / ≤ 64 frames per
+  HTTP chunk, flushed at 64 KiB; a frame is never split), so a reconnect
+  against a huge journal never
+  balloons RAM and resumes exactly from the cursor. Frames are **never
+  merged**: every durable event keeps its own `id`/`event`/`data` triple
+  (ordering and chunk semantics are unchanged). Batching happens only at
+  the HTTP chunk boundary: live `model_chunk_received` deltas linger for at
+  most 8 ms to fill a chunk, while any non-delta event (state, permission,
+  tool, lifecycle) is flushed immediately and never waits behind a delta
+  window. With no durable tail the stream sleeps on the session's journal
+  generation (an append wakes it immediately) with a 250 ms fallback poll,
+  and emits `event: heartbeat` frames once after the tail drains and then
+  at most every 5 s while idle. There is no per-subscriber clone: each
+  connection reads its own keyset page and serializes borrowed payloads.
 - **Cursor pages:** `GET /native/events?session=&after=&limit=` serves the
   same durable read as a strict-DTO page (`hasMore`/`nextCursor`);
   `GET /native/messages?session=&before=&limit=` pages durable message rows
@@ -826,6 +836,7 @@ them; long `[fault]`/`[visual]` runs are `#[ignore]`-gated (see §14).
 | Tool result excerpt | truncated to 2000 chars on the wire | agent runtime |
 | Agent chunk coalescing | 1024-event bounded channel; 64 KiB drop-oldest pending frame | agent `ChunkSink` tests |
 | Journal SSE catch-up page | ≤ 256 events per poll, cursor-resumable | server native SSE tests |
+| Journal SSE flush | ≤ 64 frames per HTTP chunk, flushed at 64 KiB (no frame split); 8 ms delta linger; non-delta immediate; 250 ms fallback poll; 5 s heartbeat | streaming harness + server native SSE tests |
 | Message page | ≤ 200 messages per page, `has_more` | session paging tests |
 | Prompt bound | 512 KiB (max 64 files, 4 KiB path each) | session bounds |
 | Message / part / tool-args / ledger / artifact / verify caps | 1 MiB / 4 MiB / 4 MiB / 1 MiB / 64 MiB / 64 MiB | session bounds |

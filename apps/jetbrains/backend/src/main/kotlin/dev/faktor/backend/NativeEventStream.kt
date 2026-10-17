@@ -37,7 +37,13 @@ import java.time.Duration
 import java.util.Random
 
 /** One journal frame: [id] is the resume cursor, [event] the projection type. */
-data class NativeSseEvent(val id: Long, val event: String, val data: JsonValue)
+data class NativeSseEvent(
+    val id: Long,
+    val event: String,
+    val data: JsonValue,
+    /** UTF-8 bytes of the raw frame data (queue memory weight; 0 in tests). */
+    val dataBytes: Int = 0
+)
 
 /**
  * A STABLE durable-stream protocol block: the journal stream itself is
@@ -529,7 +535,14 @@ class NativeEventStream(
         }
         if (frameId == cursorValue) return
         cursorValue = frameId
-        onEvent(NativeSseEvent(frameId, tagged, parsed))
+        onEvent(
+            NativeSseEvent(
+                frameId,
+                tagged,
+                parsed,
+                utf8Length(raw).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            )
+        )
     }
 
     /** UTF-8 byte length of a char sequence (surrogate pairs count once). */

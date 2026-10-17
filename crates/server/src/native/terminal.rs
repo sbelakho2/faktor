@@ -124,10 +124,6 @@ pub(crate) async fn native_terminal_output(
 /// Bound of one session-scoped terminal listing.
 pub(crate) const MAX_NATIVE_TERMINALS: usize = 256;
 
-/// Bounded daemon-wide terminal lifetime-event cache depth (strictly derived
-/// from the durable rows on every read).
-pub(crate) const TERMINAL_EVENT_RING: usize = 512;
-
 /// Cap on one terminal spawn (mirrors `/pty/create`).
 pub(crate) const MAX_NATIVE_TERMINAL_FIELD_BYTES: usize = 4096;
 
@@ -153,14 +149,28 @@ fn terminal_event_frame(record: &faktor_session::TerminalLedgerRecord) -> serde_
     })
 }
 
-/// The newest bounded slice of one session's durable terminal rows — the
+/// One keyset page of a session's durable terminal rows strictly after
+/// `after` (`limit + 1` rows so the caller can detect `hasMore`). The
 /// authority every page is derived from, never the cache.
 fn terminal_event_records(
     state: &AppState,
-    session_id: &str,
+    handle: &faktor_session::SessionHandle,
+    after: u64,
+    limit: i64,
 ) -> Result<Vec<faktor_session::TerminalLedgerRecord>, TerminalServiceError> {
+    // No durable ledger seq is at/above i64::MAX, so such a cursor is an
+    // empty page (never a wrap back to the beginning).
+    if after >= i64::MAX as u64 {
+        return Ok(Vec::new());
+    }
+    // Checked at the SQLite boundary (the static cast gate): the bound above
+    // guarantees the cursor fits, and the validated page limit is 1..=200.
+    let after = i64::try_from(after)
+        .map_err(|_| TerminalServiceError::Invalid("terminal cursor out of range".into()))?;
+    let limit = u64::try_from(limit)
+        .map_err(|_| TerminalServiceError::Invalid("terminal page limit out of range".into()))?;
     let service = terminal_service(state);
-    let (records, _) = service.events(session_id, None, TERMINAL_EVENT_RING as u64)?;
+    let (records, _) = service.events_on(handle, Some(after), limit + 1)?;
     Ok(records)
 }
 
@@ -175,6 +185,7 @@ fn terminal_event_records(
 /// cannot swap the ring contents mid-read; the per-frame session filter is
 /// belt-and-braces so no other session's frame can ever be emitted even if
 /// a future writer planted one.
+#[cfg(test)]
 fn terminal_events_page(
     state: &AppState,
     session_id: &str,
@@ -182,35 +193,55 @@ fn terminal_events_page(
     limit: i64,
     refresh: impl FnOnce(),
 ) -> Result<serde_json::Value, TerminalServiceError> {
-    let records = terminal_event_records(state, session_id)?;
+    let raw: u64 = session_id
+        .parse()
+        .map_err(|_| TerminalServiceError::Invalid(format!("invalid session id {session_id:?}")))?;
+    let handle = state
+        .deps
+        .session
+        .get_session(faktor_core::id::SessionId::new(raw))
+        .map_err(|e| TerminalServiceError::Refused(e.message))?
+        .ok_or_else(|| TerminalServiceError::Invalid(format!("unknown session {session_id:?}")))?;
+    terminal_events_page_for(state, &handle, session_id, after, limit, refresh)
+}
+
+/// [`terminal_events_page`] over an already resolved handle (the HTTP
+/// handler resolved it once on entry; the keyset page does not re-verify).
+fn terminal_events_page_for(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+    session_id: &str,
+    after: u64,
+    limit: i64,
+    refresh: impl FnOnce(),
+) -> Result<serde_json::Value, TerminalServiceError> {
+    let records = terminal_event_records(state, handle, after, limit)?;
     refresh();
+    let more = records.len() as i64 > limit;
     let mut ring = state
         .terminal_events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ring.clear();
+    let mut page: Vec<serde_json::Value> = Vec::with_capacity(limit as usize);
+    let mut last: Option<u64> = None;
     for record in records {
+        let frame = terminal_event_frame(&record);
+        let event_id = record.seq.max(0) as u64;
         let cache_id = state
             .next_terminal_event_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        ring.push_back((cache_id, terminal_event_frame(&record)));
-    }
-    let mut page: Vec<serde_json::Value> = Vec::new();
-    let mut more = false;
-    let mut last: Option<u64> = None;
-    for (_cache_id, event) in ring.iter() {
-        if event.get("sessionId").and_then(|v| v.as_str()) != Some(session_id) {
-            continue;
-        }
-        let event_id = event.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        if event_id <= after {
-            continue;
-        }
+        ring.push_back((cache_id, frame.clone()));
         if page.len() as i64 >= limit {
-            more = true;
-            break;
+            continue;
         }
-        page.push(event.clone());
+        // The keyset read already returns rows strictly after `after`; keep
+        // the belt-and-braces filter and the bounded ring for overlap.
+        if event_id <= after || frame.get("sessionId").and_then(|v| v.as_str()) != Some(session_id)
+        {
+            continue;
+        }
+        page.push(frame);
         last = Some(event_id);
     }
     Ok(serde_json::json!({
@@ -338,7 +369,7 @@ pub(crate) async fn native_terminal_events(
     };
     let sid_string = handle.id().to_string();
     let after = q.after.unwrap_or(0);
-    match terminal_events_page(&state, &sid_string, after, limit, || {}) {
+    match terminal_events_page_for(&state, &handle, &sid_string, after, limit, || {}) {
         Ok(body) => Json(body).into_response(),
         Err(e) => terminal_error_response(e),
     }
@@ -806,6 +837,61 @@ mod terminal_event_tests {
             .iter()
             .map(|event| event["id"].as_u64().unwrap())
             .collect()
+    }
+
+    /// Regression: the old reader fetched a fixed cache-sized prefix from
+    /// the start of the ledger, so a session with more terminal rows than
+    /// that prefix could never page past it (10k planted rows surfaced only
+    /// 500). Keyset paging must walk the whole durable book.
+    #[tokio::test]
+    async fn terminal_event_paging_reaches_every_row_beyond_the_old_prefix_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let state = test_state(deps);
+        let manager = state.deps.session.clone();
+        let sid = create_session(&manager, "term-deep");
+        mark_recovered(&state, &sid);
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let now = manager.now_ms();
+        for i in 0..700u32 {
+            let row = faktor_session::TerminalDurableRow {
+                terminal_id: format!("deep-{i}"),
+                session_id: sid.parse().unwrap(),
+                task_id: 1,
+                agent_id: None,
+                operation_id: 1,
+                pid: 50_000 + i,
+                start_time_ms: now,
+                at_ms: now,
+                execution_profile: String::new(),
+            };
+            handle.ledger_terminal_created(&row).unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (status, page) = read_page(&state, &sid, Some(cursor), Some(200)).await;
+            assert_eq!(status, StatusCode::OK);
+            let ids = event_ids(&page);
+            assert!(!ids.is_empty(), "a non-empty tail must page: {page}");
+            for id in &ids {
+                assert!(*id > cursor, "cursor must stay strictly exclusive");
+            }
+            seen.extend(ids);
+            if page["hasMore"].as_bool().unwrap() {
+                cursor = page["nextCursor"].as_u64().unwrap();
+            } else {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 700, "every row must be reachable");
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "durable order without duplicates"
+        );
     }
 
     #[tokio::test]

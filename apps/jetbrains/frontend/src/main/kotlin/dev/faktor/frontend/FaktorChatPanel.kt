@@ -69,6 +69,12 @@ private const val MAX_TRANSCRIPT_CHARS = 400_000
 private const val MAX_EVIDENCE_PREVIEW_CHARS = 4000
 private const val MAX_CHILD_USAGE_FETCHES = 12
 
+/** Routine provider chunks never reach the transcript; durable milestones do. */
+private const val MAX_NOTABLE_EVENTS_PER_FLUSH = 8
+
+/** One stream frame plus the session that produced it (stale batches drop). */
+private data class StreamDelta(val sessionId: String?, val event: NativeSseEvent)
+
 /**
  * One completion-contract FINISH LEVEL of the four-level selector. The wire
  * mapping is EXACT and hierarchical: every later level explicitly includes
@@ -144,6 +150,12 @@ class FaktorChatPanel(
 
     private val refreshQueued = AtomicBoolean(false)
 
+    /** True when a stream flush arrived while a slow refresh was in flight. */
+    private val refreshDirty = AtomicBoolean(false)
+
+    /** EDT/work counters (test + harness observable; never rendered). */
+    private val uiMetrics = UiWorkMetrics()
+
     /**
      * Urgent control-plane actions (abort/cancel/stop/permission reply) must
      * NOT serialize behind slow refresh/read work: they get their own
@@ -173,6 +185,56 @@ class FaktorChatPanel(
     internal var taskStartObserver: ((String, String) -> Unit)? = null
 
     private val transcript = JTextArea()
+
+    /** The transcript viewport + the follow/detach scroll policy. */
+    private val transcriptScroll = insetScroll(transcript)
+
+    private val transcriptPin = ScrollPinController(transcriptScroll)
+
+    /** One batched document insert per flush; offsets survive incrementally. */
+    private val transcriptSink = TranscriptSink(
+        transcript,
+        transcriptPin,
+        uiMetrics,
+        MAX_TRANSCRIPT_CHARS,
+        MAX_TRANSCRIPT_LINES
+    )
+
+    /** Per-session teardown (queued deltas, offsets, transient view state). */
+    private var sessionScope = SessionUiScope(uiMetrics)
+
+    /**
+     * The delta pump: the stream thread only enqueues; the EDT sees one
+     * bounded flush per interval instead of one invokeLater per journal
+     * frame. Order is preserved and each flush drains at most
+     * [UI_FLUSH_MAX_BATCH] frames, so a sustained producer cannot starve the
+     * event queue.
+     */
+    private val streamPump = EdtFlushPump<StreamDelta>(
+        "stream",
+        UI_FLUSH_INTERVAL_MS,
+        UI_FLUSH_MAX_BATCH,
+        uiMetrics,
+        { delta: StreamDelta -> delta.event.dataBytes }
+    ) { batch -> applyStreamBatch(batch) }
+
+    /**
+     * Slow-surface refresh cadence: message/board/tree/agent reads are
+     * expensive (several HTTP reads + JSON parses), so they run at most once
+     * per [UI_REFRESH_INTERVAL_MS] while the stream is hot.
+     */
+    private val refreshDelayTimer = javax.swing.Timer(UI_REFRESH_INTERVAL_MS) {
+        refreshIfDirty()
+    }.apply {
+        isRepeats = false
+        isCoalesce = true
+    }
+
+    /** The last applied durable sequence of the current session (replay dedupe). */
+    private var lastAppliedEventSeq = 0L
+
+    /** True once the panel's own children exist (guards construction-time updateUI). */
+    private var uiInitialized = false
 
     /** The ONE composer input: every request to Faktor starts here. */
     private val input = JTextArea(3, 60)
@@ -448,10 +510,13 @@ class FaktorChatPanel(
 
     private var pendingPermissions: List<NativePermissionEntry> = emptyList()
 
-    private val transcriptOffsets = LinkedHashMap<Long, Pair<Int, Int>>()
+
 
     init {
         service.setListener(this)
+        // Per-session teardown: queued deltas from the old session must never
+        // render into the new one.
+        sessionScope.onDispose { streamPump.discardPending() }
         // Clipboard/paste staging notices (refusals included) surface in the
         // transcript exactly once, on the EDT.
         attachments.onNotice = { message -> onEdt { appendSystem(message) } }
@@ -477,6 +542,23 @@ class FaktorChatPanel(
         } else {
             null
         }
+        uiInitialized = true
+    }
+
+    /**
+     * A live IDE theme/HiDPI font change updates the components this panel
+     * owns (the platform recreates other UIs). Re-wrapped labels invalidate
+     * their HTML on [setFont] independently.
+     */
+    override fun updateUI() {
+        super.updateUI()
+        if (!uiInitialized) return
+        transcript.font = uiPanelFont().deriveFont(13f)
+        input.font = uiPanelFont()
+        runSummaryArea.font = uiPanelFont()
+        transcriptSink.trimIfNeeded()
+        revalidate()
+        repaint()
     }
 
     // ------------------------------------------------------------------ UI
@@ -486,10 +568,18 @@ class FaktorChatPanel(
         transcript.lineWrap = true
         transcript.wrapStyleWord = true
         transcript.font = uiPanelFont().deriveFont(13f)
+        transcript.a11y(
+            "Conversation transcript",
+            "Live conversation. Routine stream chunks are coalesced; durable milestones appear here."
+        )
 
         input.lineWrap = true
         input.wrapStyleWord = true
         input.font = uiPanelFont()
+        input.a11y(
+            "Message to Faktor",
+            "Describe a goal or ask a question. Ctrl+Enter runs the task; Escape closes Task options."
+        )
         // Ctrl+Enter in the composer is the keyboard twin of Run task.
         input.inputMap.put(
             javax.swing.KeyStroke.getKeyStroke(
@@ -514,6 +604,22 @@ class FaktorChatPanel(
                 if (taskOptionsSheetOpen()) closeTaskOptionsSheet()
             }
         })
+        // The same Escape contract works from anywhere in the panel (a list,
+        // a field, a card): close the options/utility surface and return to
+        // the surface the operator came from. Focused components that bind
+        // Escape themselves keep their own action.
+        getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).put(
+            javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0),
+            "faktor.globalClose"
+        )
+        actionMap.put("faktor.globalClose", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(event: java.awt.event.ActionEvent?) {
+                when {
+                    taskOptionsSheetOpen() -> closeTaskOptionsSheet()
+                    utilityShown -> hideUtility()
+                }
+            }
+        })
 
         // The utilities toolbar WRAPS at narrow host widths (ActionRowPanel
         // pattern) instead of revealing overflow through a horizontal
@@ -532,11 +638,17 @@ class FaktorChatPanel(
         // value stays missing) whose Open reuses the exact HistoryPanel open
         // path. It refreshes with every snapshot.
         sessionChooser.toolTipText = "Open a durable session"
+        sessionChooser.a11y(
+            "Durable sessions",
+            "Choose a prior conversation, then press Enter to open it."
+        )
         sessionChooser.maximumRowCount = 12
         sessionChooser.minimumSize = java.awt.Dimension(140, sessionChooser.minimumSize.height)
         sessionChooser.renderer = SessionChooserRenderer()
+        installActivateKey(sessionChooser, "faktor.openSession") { openSelectedSession() }
         toolbar.add(sessionChooser)
         openSessionButton.toolTipText = "Open the selected durable session"
+        openSessionButton.a11y("Open selected session", "Opens the chosen durable conversation.")
         openSessionButton.addActionListener { openSelectedSession() }
         toolbar.add(openSessionButton)
         val moreButton = secondaryButton("More ▾")
@@ -628,7 +740,7 @@ class FaktorChatPanel(
     private fun buildWorkPlane() {
         val transcriptBody = JPanel(BorderLayout())
         transcriptBody.isOpaque = false
-        transcriptBody.add(insetScroll(transcript), BorderLayout.CENTER)
+        transcriptBody.add(transcriptScroll, BorderLayout.CENTER)
         val conversation = card("Conversation", transcriptBody)
         // The center host swaps ONE visible surface: the conversation or the
         // bounded Task options sheet (never a blocking modal dialog).
@@ -651,6 +763,8 @@ class FaktorChatPanel(
         runSummaryArea.lineWrap = true
         runSummaryArea.wrapStyleWord = true
         runSummaryArea.font = uiPanelFont()
+        runSummaryArea.a11y("Current run summary", "Served run state, phase, steps and candidate boundary.")
+        runsCombo.a11y("Task runs", "Choose the task run whose summary is shown.")
         val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
         runsBody.add(runsCombo)
         runsBody.add(insetScroll(runSummaryArea))
@@ -667,8 +781,10 @@ class FaktorChatPanel(
         prSetupBody.isVisible = false
         runsBody.add(prSetupBody)
         inspectRunsButton.toolTipText = "Open the Overview detail of the current run"
+        inspectRunsButton.a11y("Inspect current run", "Opens the Overview detail of the current run.")
         inspectRunsButton.addActionListener { inspectCurrentRun() }
         cancelRunButton.toolTipText = "Cancel the selected task run"
+        cancelRunButton.a11y("Cancel selected run", "Cancels the selected task run.")
         runsBody.add(actionRow(inspectRunsButton, cancelRunButton))
         south.add(card("Current run", runsBody))
 
@@ -689,6 +805,11 @@ class FaktorChatPanel(
             "Task mode: Run task sends the goal with criteria, contract, finish actions and attachments"
         askModeButton.toolTipText =
             "Ask mode (design addition): Run task/Ctrl+Enter sends the plain prompt, no contract"
+        taskModeButton.a11y("Task mode", "Run task sends the goal with its options.")
+        askModeButton.a11y("Ask mode", "Run task sends the plain prompt without a contract.")
+        startTaskButton.a11y("Run task", "Submits the composer as a task or ask, per the selected mode.")
+        sendButton.a11y("Ask", "Sends the composer as a plain prompt.")
+        abortButton.a11y("Abort", "Requests abort of the active local operation.")
         val modeRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.XS, 0))
         modeRow.isOpaque = false
         modeRow.add(sectionHeader("Mode", muted = true))
@@ -781,10 +902,12 @@ class FaktorChatPanel(
      */
     private fun taskOptionsBody(): JPanel {
         criteriaField.toolTipText = "Optional: acceptance criteria, comma separated"
+        criteriaField.a11y("Acceptance criteria", "Comma-separated acceptance criteria for this task.")
         val finishBox = JPanel(GridLayout(FinishLevel.values().size, 1, Spacing.XS, Spacing.XS))
         finishBox.isOpaque = false
         for (button in completionLevels) {
             completionGroup.add(button)
+            button.a11y(button.text, "Finish level for this task: ${button.text}")
             finishBox.add(button)
         }
         completionLevels.first().isSelected = true
@@ -792,6 +915,12 @@ class FaktorChatPanel(
             "max_tokens for this run: a positive integer; empty uses the run default"
         budgetCostField.toolTipText =
             "max_cost_micro for this run: a positive decimal integer; empty uses the run default"
+        budgetTokensField.a11y("Max tokens", "Per-run max_tokens; empty uses the run default.")
+        budgetCostField.a11y("Max cost micro", "Per-run max_cost_micro; empty uses the run default.")
+        constraintField.a11y("Constraints", "One engineering constraint per line.")
+        invariantField.a11y("Invariants", "One engineering invariant per line.")
+        riskField.a11y("Risks", "One engineering risk per line.")
+        obligationField.a11y("Proof obligations", "One proof obligation per line.")
         val budgetGrid = FormGrid()
         budgetGrid.row("max tokens", budgetTokensField)
         budgetGrid.row("max cost (microUSD)", budgetCostField)
@@ -2601,8 +2730,7 @@ class FaktorChatPanel(
     ) {
         val selectedId = (sessionChooser.selectedItem as? NativeSessionSummary)?.id
         val previousCount = sessionChooserModel.size
-        sessionChooserModel.removeAllElements()
-        for (session in sessions) sessionChooserModel.addElement(session)
+        KeyedListSync.syncCombo(sessionChooserModel, sessions) { it.id }
         val preferred = selectedId ?: currentId
         if (preferred != null) {
             for (i in 0 until sessionChooserModel.size) {
@@ -2733,18 +2861,26 @@ class FaktorChatPanel(
         if (label.startsWith("index: ")) label.substring("index: ".length) else label
 
     private fun refreshMessagesBlocking() {
+        // Capture the session before the read: a read that finishes after a
+        // session switch must never append the old transcript into the new
+        // session (the durable seq spaces are independent).
+        val sessionAtRead = service.currentSessionId()
         val page = service.messages(limit = 50)
         onEdt {
+            if (service.currentSessionId() != sessionAtRead) return@onEdt
             navigator.setMessages(page.messages)
             val fresh = page.messages.filter { it.seq > renderedSeq }.sortedBy { it.seq }
             for (message in fresh) {
                 renderedSeq = maxOf(renderedSeq, message.seq)
                 appendMessage(message)
             }
+            // ONE document insert for the whole page's fresh rows.
+            transcriptSink.flush()
         }
     }
 
     private fun refreshTaskRunsBlocking() {
+        val sessionAtRead = service.currentSessionId()
         val runs = service.taskRuns()
         val views = try {
             service.taskViews()
@@ -2752,12 +2888,12 @@ class FaktorChatPanel(
             emptyList<dev.faktor.shared.NativeTaskView>()
         }
         onEdt {
+            if (service.currentSessionId() != sessionAtRead) return@onEdt
             // Preserve the selected run across an async refresh when the same
             // logical run is still served (a newer snapshot must not jump the
             // selection back to the first row).
             val selectedRunId = (runsCombo.selectedItem as? NativeTaskRun)?.runId
-            runsModel.removeAllElements()
-            for (run in runs) runsModel.addElement(run)
+            KeyedListSync.syncCombo(runsModel, runs) { it.runId }
             if (selectedRunId != null) {
                 val index = runs.indexOfFirst { it.runId == selectedRunId }
                 if (index >= 0) runsCombo.selectedIndex = index
@@ -2876,16 +3012,21 @@ class FaktorChatPanel(
     }
 
     private fun refreshAgentsBlocking() {
+        val sessionAtRead = service.currentSessionId()
         val agents = service.agents()
-        currentAgents = agents
-        val model = currentTree
-        onEdt { agentsPanel.update(agents, model) }
+        onEdt {
+            if (service.currentSessionId() != sessionAtRead) return@onEdt
+            currentAgents = agents
+            agentsPanel.update(agents, currentTree)
+        }
     }
 
     private fun refreshUsageBlocking() {
+        val sessionAtRead = service.currentSessionId()
         val usage = service.usage()
         val sessionUsage = service.sessionUsage()
         onEdt {
+            if (service.currentSessionId() != sessionAtRead) return@onEdt
             diagnosticsPanel.setUsage(
                 "usage: sessions=${usage.sessions} tokens=${sessionUsage.tokens} " +
                     "taskCostMicro=${usage.settledCostMicro}"
@@ -3110,18 +3251,24 @@ class FaktorChatPanel(
      * `acknowledge` moves the read watermark (explicit read/post only).
      */
     private fun refreshBoardBlocking(acknowledge: Boolean = false) {
-        if (!service.isRunning() || service.currentSessionId() == null) return
+        val sessionAtRead = service.currentSessionId()
+        if (!service.isRunning() || sessionAtRead == null) return
         try {
             val page = service.board(limit = 100L)
-            onEdt { boardPanel.setBoard(page, acknowledge) }
+            onEdt {
+                if (service.currentSessionId() != sessionAtRead) return@onEdt
+                boardPanel.setBoard(page, acknowledge)
+            }
         } catch (e: NativeApiException) {
             val routeMissing = e.status == 404 || e.status == 405 || e.status == 501
             val label = if (routeMissing) "no board route" else "board read refused"
             onEdt {
+                if (service.currentSessionId() != sessionAtRead) return@onEdt
                 boardPanel.setUnavailable("$label (status ${e.status} ${e.code}: ${e.detail})")
             }
         } catch (e: Exception) {
             onEdt {
+                if (service.currentSessionId() != sessionAtRead) return@onEdt
                 boardPanel.setUnavailable("board read failed: ${e.message ?: e.javaClass.simpleName}")
             }
         }
@@ -3222,6 +3369,7 @@ class FaktorChatPanel(
             proofUnavailable = proofUnavailable
         )
         onEdt {
+            if (service.currentSessionId() != sessionAtRead) return@onEdt
             currentTree = model
             treePanel.update(model)
             blockersPanel.update(model.blockers, model.taskBlockers)
@@ -3440,20 +3588,19 @@ class FaktorChatPanel(
     }
 
     private fun appendMessage(message: NativeMessage) {
-        val start = transcript.text.length
-        transcript.append("${message.role}: ${message.text}\n")
-        transcriptOffsets[message.seq] = Pair(start, transcript.text.length)
-        trimTranscript()
+        transcriptSink.appendMessage(message.role, message.text, message.seq)
     }
 
     private fun jumpToTranscript(seq: Long) {
-        val range = transcriptOffsets[seq]
+        val range = transcriptSink.offsetOf(seq)
         if (range == null) {
             appendSystem("message #$seq is outside the retained transcript window")
             return
         }
         try {
             transcript.requestFocusInWindow()
+            // An explicit jump is user intent to follow again.
+            transcriptPin.pin.onJump()
             transcript.select(range.first, range.second)
             transcript.caretPosition = range.second
             val view = transcript.modelToView(range.first)
@@ -3500,6 +3647,8 @@ class FaktorChatPanel(
     }
 
     override fun onStreamBlocked(block: ProtocolBlocked) {
+        // Deliver the frames already accepted before the block notice.
+        streamPump.flushNow()
         onEdt {
             // Stable durable-stream block: the stream stopped reconnecting and
             // the cursor did not move past the offending event. Surface the
@@ -3514,11 +3663,57 @@ class FaktorChatPanel(
         }
     }
 
+    /**
+     * The stream thread NEVER touches Swing: it enqueues the frame and the
+     * pump flushes a bounded batch on the EDT. This is the single per-delta
+     * entry point, so 200 journal frames/s become at most 25 EDT flushes/s.
+     */
     override fun onEvent(event: NativeSseEvent) {
-        onEdt {
-            appendSystem("[${event.event}] id=${event.id} ${eventSummary(event.data)}")
-            scheduleStatusRefresh()
+        streamPump.offer(StreamDelta(service.currentSessionId(), event))
+    }
+
+    /**
+     * ONE EDT render pass for a coalesced batch: stale-session frames and
+     * replayed cursors are dropped, only durable milestones are written to
+     * the transcript (routine model chunks stay off the screen-reader
+     * channel), the whole batch is ONE document insert, and the slow
+     * surfaces refresh at their own bounded cadence.
+     */
+    private fun applyStreamBatch(batch: List<StreamDelta>) {
+        val session = service.currentSessionId()
+        val notable = ArrayList<StreamDelta>(minOf(batch.size, MAX_NOTABLE_EVENTS_PER_FLUSH))
+        var accepted = 0
+        for (delta in batch) {
+            if (delta.sessionId != session) {
+                uiMetrics.droppedStaleEvents.incrementAndGet()
+                continue
+            }
+            if (delta.event.id <= lastAppliedEventSeq) {
+                uiMetrics.duplicateEvents.incrementAndGet()
+                continue
+            }
+            lastAppliedEventSeq = delta.event.id
+            accepted++
+            if (isNotableEvent(delta.event.event)) notable.add(delta)
         }
+        if (accepted == 0) return
+        for (delta in notable.takeLast(MAX_NOTABLE_EVENTS_PER_FLUSH)) {
+            transcriptSink.append(
+                "[faktor] [${delta.event.event}] id=${delta.event.id} " +
+                    eventSummary(delta.event.data) + "\n"
+            )
+        }
+        transcriptSink.flush()
+        scheduleStatusRefresh()
+    }
+
+    /** Durable lifecycle milestones; per-chunk frames stay silent. */
+    private fun isNotableEvent(kind: String): Boolean = when (kind) {
+        "failed", "session_ended", "suspended", "resumed", "turn_completed",
+        "permission_granted", "permission_denied", "permission_expired",
+        "subagent_completed", "tool_cancelled", "context_compacted",
+        "compact_rejected", "replay_started", "crash_detected", "recovery_applied" -> true
+        else -> false
     }
 
     override fun onError(message: String) {
@@ -3535,8 +3730,30 @@ class FaktorChatPanel(
         return parts.joinToString(" ")
     }
 
+    /**
+     * Marks the slow surfaces dirty and arms ONE delayed refresh. While a
+     * refresh is in flight further flushes only set the dirty flag, so a hot
+     * stream cannot queue a refresh per delta; the in-flight run re-arms once
+     * it finishes (the flag is never lost, so the last delta always lands).
+     */
     private fun scheduleStatusRefresh() {
-        if (!refreshQueued.compareAndSet(false, true)) return
+        refreshDirty.set(true)
+        if (SwingUtilities.isEventDispatchThread()) {
+            if (!refreshDelayTimer.isRunning && !refreshQueued.get()) {
+                refreshDelayTimer.restart()
+            }
+        } else {
+            SwingUtilities.invokeLater { scheduleStatusRefresh() }
+        }
+    }
+
+    private fun refreshIfDirty() {
+        if (!refreshDirty.getAndSet(false)) return
+        if (!refreshQueued.compareAndSet(false, true)) {
+            refreshDirty.set(true)
+            refreshDelayTimer.restart()
+            return
+        }
         worker.execute {
             try {
                 if (service.isRunning() && service.currentSessionId() != null) {
@@ -3544,11 +3761,15 @@ class FaktorChatPanel(
                     refreshMessagesBlocking()
                     refreshBoardBlocking()
                     refreshTaskTreeBlocking()
+                    uiMetrics.refreshRuns.incrementAndGet()
                 }
             } catch (e: Exception) {
                 // The stream may race a shutdown; errors surface via onError.
             } finally {
                 refreshQueued.set(false)
+                if (refreshDirty.get()) {
+                    SwingUtilities.invokeLater { refreshDelayTimer.restart() }
+                }
             }
         }
     }
@@ -3556,7 +3777,15 @@ class FaktorChatPanel(
     // ------------------------------------------------------------- plumbing
 
     fun shutdown() {
+        // Detach FIRST: no late stream/status callback may touch a disposed
+        // panel. Then stop the per-session scope (queued deltas are dropped),
+        // the timers and the workers.
+        service.setListener(null)
         controlPlaneWatcher?.stop()
+        refreshDelayTimer.stop()
+        streamPump.stop()
+        attachments.shutdown()
+        sessionScope.disposeAll()
         service.stopStream()
         worker.shutdownNow()
         controlWorker.shutdownNow()
@@ -3565,6 +3794,39 @@ class FaktorChatPanel(
     /** One synchronous credential-watch poll (internal smoke hook). */
     internal fun pollControlPlaneWatcherOnce(): Boolean =
         controlPlaneWatcher?.pollOnce() ?: false
+
+    /** EDT/work counters after any workload (perf harness + smoke). */
+    internal fun edtMetricsForTest(): UiWorkSnapshot = uiMetrics.snapshot()
+
+    /** Frames waiting for the next coalesced flush. */
+    internal fun pendingStreamDeltasForTest(): Int = streamPump.pending
+
+    /**
+     * Flush queued stream frames synchronously on the EDT (deterministic
+     * smoke/harness hook; production always goes through the timer).
+     */
+    internal fun flushStreamForTest() {
+        if (SwingUtilities.isEventDispatchThread()) {
+            streamPump.flushNow()
+        } else {
+            SwingUtilities.invokeAndWait { streamPump.flushNow() }
+        }
+    }
+
+    /** True while the transcript follows appended content. */
+    internal fun transcriptPinnedForTest(): Boolean = transcriptPin.pin.isPinned
+
+    /** The pure scroll-pin state (pinned/detached). */
+    internal fun scrollPinStateForTest(): ScrollPin.State = transcriptPin.pin.stateForTest
+
+    /** Simulate a user scrollbar move for the follow/detach contract. */
+    internal fun userScrolledTranscriptForTest(value: Int, maximum: Int, extent: Int) {
+        transcriptPin.pin.onUserScroll(value, maximum, extent)
+    }
+
+    /** The current ephemeral session scope disposal count. */
+    internal fun sessionScopesDisposedForTest(): Long =
+        uiMetrics.snapshot().sessionScopesDisposed
 
     // ------------------------------------------------------------- test hooks
     // Internal (module-visible) seams used by the Kotlin parity smoke to
@@ -3992,28 +4254,29 @@ class FaktorChatPanel(
         }
     }
 
+    /**
+     * A direct system line (user action, typed refusal, status): queued and
+     * flushed ONCE on the EDT. High-rate stream frames never take this path;
+     * they batch through [applyStreamBatch].
+     */
     private fun appendSystem(text: String) {
-        transcript.append("[faktor] " + text + "\n")
-        trimTranscript()
+        appendTranscript("[faktor] " + text + "\n")
     }
 
     private fun appendUser(text: String) {
-        transcript.append("you: " + text + "\n")
-        trimTranscript()
+        appendTranscript("you: " + text + "\n")
     }
 
-    private fun trimTranscript() {
-        val text = transcript.text
-        if (text.length <= MAX_TRANSCRIPT_CHARS) {
-            val lineCount = text.count { it == '\n' }
-            if (lineCount <= MAX_TRANSCRIPT_LINES) return
+    private fun appendTranscript(text: String) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            transcriptSink.append(text)
+            transcriptSink.flush()
+        } else {
+            SwingUtilities.invokeLater {
+                transcriptSink.append(text)
+                transcriptSink.flush()
+            }
         }
-        val kept = text.split('\n').takeLast(MAX_TRANSCRIPT_LINES).joinToString("\n")
-        transcript.text = safeTakeLast(kept, MAX_TRANSCRIPT_CHARS)
-        transcript.caretPosition = transcript.text.length
-        // Offsets no longer map onto the rebuilt text; message navigation
-        // falls back to a loud "outside the retained window" notice.
-        transcriptOffsets.clear()
     }
 
     private fun onEdt(block: () -> Unit) {
@@ -4051,8 +4314,16 @@ class FaktorChatPanel(
      */
     private fun resetSessionView() {
         onEdt {
-            transcript.text = ""
-            transcriptOffsets.clear()
+            // Dispose the old session's scope (queued deltas + offsets) and
+            // start a fresh one; a late flush from the previous session can
+            // never render into the new view.
+            sessionScope.disposeAll()
+            sessionScope = SessionUiScope(uiMetrics)
+            sessionScope.onDispose { streamPump.discardPending() }
+            refreshDirty.set(false)
+            refreshDelayTimer.stop()
+            lastAppliedEventSeq = 0L
+            transcriptSink.reset()
             renderedSeq = 0
             boardPanel.reset()
             navigator.resetSessionView()

@@ -121,10 +121,14 @@ class HistoryPanel : JPanel(BorderLayout()) {
         RowRhythm.install(list, lines = 2)
         list.cellRenderer = HistoryCellRenderer()
         list.addListSelectionListener { updateButtons() }
+        list.a11y("Prior work", "Durable conversations. Press Enter to open the selection.")
+        installActivateKey(list, "faktor.openHistorySession") { submitOpen() }
         openButton.addActionListener { submitOpen() }
+        openButton.a11y("Open conversation", "Opens the selected durable conversation.")
         refreshButton.addActionListener { listener?.onRefresh() }
         refreshHistoryButton.addActionListener { listener?.onRefresh() }
         searchField.toolTipText = "Filter prior work by title"
+        searchField.a11y("Filter prior work", "Filters the conversation listing by title.")
         searchField.document.addDocumentListener(
             object : javax.swing.event.DocumentListener {
                 override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = applyFilter()
@@ -168,9 +172,17 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     /** Replaces the durable listing; a still-served selection is preserved. */
     fun update(sessions: List<NativeSessionSummary>, currentId: String?) {
+        val unchanged = available && sessions == all && currentId == currentSessionId
         available = true
         reason = null
         currentSessionId = currentId
+        if (unchanged) {
+            updateButtons()
+            // The current-row marker is session-owned: repaint without a
+            // model reset (selection, scroll and focus survive).
+            list.repaint()
+            return
+        }
         val selectedId = list.selectedValue?.id
         all.clear()
         all.addAll(sessions)
@@ -181,6 +193,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
     }
 
     fun setUnavailable(detailText: String) {
+        if (!available && reason == detailText) return
         available = false
         reason = detailText
         model.clear()
@@ -191,6 +204,9 @@ class HistoryPanel : JPanel(BorderLayout()) {
         revalidate()
         repaint()
     }
+
+    /** The live list model (perf harness assertion hook). */
+    internal fun listForTest(): JList<NativeSessionSummary> = list
 
     /** One bounded human row: title · time · outcome. */
     private fun sessionLabel(session: NativeSessionSummary): String {
@@ -249,12 +265,13 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     private fun applyFilter(preserveId: String? = list.selectedValue?.id) {
         val needle = searchField.text.trim().lowercase()
-        model.clear()
-        for (session in all) {
+        val visible = all.filter { session ->
             val title = session.title.ifEmpty { "Untitled conversation" }
-            if (needle.isNotEmpty() && !title.lowercase().contains(needle)) continue
-            model.addElement(session)
+            needle.isEmpty() || title.lowercase().contains(needle)
         }
+        // Keyed by durable id: an identical snapshot cannot reset selection
+        // or scroll; only genuinely changed rows fire list events.
+        KeyedListSync.sync(model, visible) { it.id }
         val preferred = preserveId ?: currentSessionId
         if (preferred != null) {
             for (i in 0 until model.size()) {

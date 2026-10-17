@@ -39,6 +39,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private view: vscode.WebviewView | null = null;
   private snapshot: FaktorSnapshot | null = null;
+  /**
+   * One pending full snapshot. The store can emit several patches in a burst
+   * (session patches, task patches, transcript patch); a newer full snapshot
+   * supersedes all of them, so the webview receives at most one frame per
+   * flush window instead of one per patch. Non-snapshot messages are posted
+   * immediately and stay ordered behind the flushed snapshot because the
+   * webview applies the queue in order.
+   */
+  private pendingSnapshot: FaktorSnapshot | null = null;
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -57,7 +67,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     view.onDidDispose(() => {
       this.view = null;
+      if (this.flushTimer !== null) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      this.pendingSnapshot = null;
     });
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.pendingSnapshot = null;
     if (this.snapshot !== null) {
       this.post({ type: 'snapshot', snapshot: this.snapshot });
     }
@@ -67,7 +87,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Push a full state snapshot; the webview re-renders from it. */
   postSnapshot(snapshot: FaktorSnapshot): void {
     this.snapshot = snapshot;
-    this.post({ type: 'snapshot', snapshot });
+    this.pendingSnapshot = snapshot;
+    if (this.flushTimer !== null) {
+      return;
+    }
+    this.flushTimer = setTimeout(() => this.flushPendingSnapshot(), 16);
+  }
+
+  /**
+   * Deliver the newest queued snapshot NOW. Every non-snapshot message calls
+   * this first: a result/evidence/notice must never overtake the state it was
+   * derived from, and a stale snapshot must never land after (and visually
+   * undo) a newer result.
+   */
+  private flushPendingSnapshot(): void {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    const next = this.pendingSnapshot;
+    this.pendingSnapshot = null;
+    if (next !== null) {
+      void this.view?.webview.postMessage({ type: 'snapshot', snapshot: next });
+    }
   }
 
   /** Deliver the decoded bytes of one expanded evidence artifact. */
@@ -197,6 +239,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private post(message: unknown): void {
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type !== 'snapshot'
+    ) {
+      this.flushPendingSnapshot();
+    }
     void this.view?.webview.postMessage(message);
   }
 
@@ -368,7 +417,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <li><button type="button" class="welcome-chip" data-prompt="Implement the next item in the plan">Implement the next item in the plan</button></li>
       </ul>
     </section>
-    <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
+    <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript" tabindex="-1"></div>
   </section>
   <form id="composer">
     <label for="goal" class="composer-label">Ask Faktor…</label>

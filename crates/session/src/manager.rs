@@ -308,6 +308,12 @@ pub struct SessionManager {
     /// the TASK's lifetime is bounded by its budget, never by a single
     /// future. `0` disables the wall-clock turn bound.
     turn_budget_ms: AtomicU64,
+    /// Monotonic journal-append generation: a BEST-EFFORT wake signal for
+    /// live journal readers (the SSE stream). Every handle append bumps it;
+    /// a subscriber that misses a notification still makes progress through
+    /// its bounded fallback poll, and the durable journal remains the only
+    /// source of truth (the generation is never a cursor).
+    journal_gen: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -403,6 +409,7 @@ impl SessionManager {
             resources: Mutex::new(HashMap::new()),
             artifact_sizes: ArtifactSizes::default(),
             turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
+            journal_gen: tokio::sync::watch::channel(0u64).0,
         }))
     }
 
@@ -410,6 +417,25 @@ impl SessionManager {
     pub fn set_turn_budget_ms(&self, ms: u64) {
         self.turn_budget_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Best-effort wake for live journal readers. Called after a durable
+    /// append succeeds; a missed wake only costs one fallback poll.
+    pub(crate) fn note_journal_append(&self) {
+        self.journal_gen
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// The current journal generation (monotonic, wrap-tolerant; compare
+    /// for change only, never as a durable cursor).
+    pub fn journal_generation(&self) -> u64 {
+        *self.journal_gen.borrow()
+    }
+
+    /// Subscribe to journal-append wake signals. The receiver observes
+    /// changes after it last called `borrow_and_update`/`changed`.
+    pub fn subscribe_journal(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.journal_gen.subscribe()
     }
 
     /// The configured per-turn wall-clock budget; `0` means unbounded.

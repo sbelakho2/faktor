@@ -507,6 +507,11 @@ where
                 continue;
             }
         };
+        // SSE frames are small writes: Nagle would coalesce them behind a
+        // delayed ACK (up to ~40 ms of avoidable event->client latency).
+        // `nodelay` keeps every emitted chunk on the wire immediately; the
+        // daemon already batches frames per chunk above this layer.
+        let _ = io.set_nodelay(true);
         tracing::trace!(?remote_addr, "connection accepted");
         let builder = builder.clone();
         let service = service.clone();
@@ -935,9 +940,14 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
     let shared = Arc::new(ServerShared::new(shutdown_tx));
     // The handle OWNS this task: its result is recorded in `shared` and
     // returned to `shutdown()`; nothing is discarded here.
+    let ready_on_shutdown = Arc::clone(&ready);
     let task = spawn_server_task(addr, Arc::clone(&shared), async move {
         serve_with_half_close(listener, app, async move {
             let _ = shutdown_rx.await;
+            // Long-lived SSE streams observe this bounded flag (one fallback
+            // tick) and end, so graceful shutdown never waits on a client
+            // that already dropped its body.
+            ready_on_shutdown.store(false, std::sync::atomic::Ordering::SeqCst);
         })
         .await
     });

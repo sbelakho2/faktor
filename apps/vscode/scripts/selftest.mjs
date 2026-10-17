@@ -19,6 +19,7 @@
 import * as nc from '../src/nativeClient.ts';
 import * as es from '../src/eventStream.ts';
 import * as st from '../src/state.ts';
+import * as rs from '../src/refreshScheduler.ts';
 import * as dm from '../src/daemon.ts';
 import * as lf from '../src/lifecycleFence.ts';
 import * as ts from '../src/taskStart.ts';
@@ -2976,6 +2977,50 @@ async function stateTests() {
     const entries = st.transcriptFromMessages(messages);
     assertEqual(entries.length, st.MAX_TRANSCRIPT_ENTRIES);
     assertEqual(entries[entries.length - 1].seq, 0, 'newest messages survive the bound');
+  });
+
+  await test('transcript content digest detects same-length text and tool edits', () => {
+    const before = [transcriptEntry(1, 'two')];
+    const sameLength = [transcriptEntry(1, 'TWO')];
+    assert(
+      st.transcriptSignature(before) !== st.transcriptSignature(sameLength),
+      'a same-length text edit must change the digest',
+    );
+    const tool = (excerpt) =>
+      transcriptEntry(2, 'reply', {
+        tools: [
+          {
+            toolCallId: 'tool-1',
+            name: 'bash',
+            state: 'done',
+            input: null,
+            excerpt,
+            exitCode: 0,
+            artifact: null,
+          },
+        ],
+      });
+    assert(
+      st.transcriptSignature([tool('abc')]) !== st.transcriptSignature([tool('abd')]),
+      'a same-length tool excerpt edit must change the digest',
+    );
+    assertEqual(
+      st.transcriptSignature(before),
+      st.transcriptSignature([transcriptEntry(1, 'two')]),
+      'identical transcripts keep the same digest (the webview no-op path)',
+    );
+    assert(
+      st.transcriptContentEqual(before, [transcriptEntry(1, 'two')]),
+      'exact content equality holds for an identical page',
+    );
+    assert(
+      !st.transcriptContentEqual(before, sameLength),
+      'a digest collision is not an authority: the host still sees different content',
+    );
+    assert(
+      !st.transcriptContentEqual([tool('abc')], [tool('abd')]),
+      'the exact tool-excerpt comparison catches a same-length edit',
+    );
   });
 }
 
@@ -7551,12 +7596,23 @@ function makeFakeDom() {
       disabled: false,
       checked: false,
       offsetTop: 0,
-      // Entries occupy layout in the real panel; the fake gives every
-      // article a fixed height so anchor preservation is measurable.
-      offsetHeight: tagName === 'article' ? 40 : 0,
+      // Inline spacer heights (virtualization) are expressed through style in
+      // the real DOM; the fake mirrors just the one property the renderer sets.
+      style: {},
       clientHeight: 0,
       focused: false,
     };
+    Object.defineProperty(node, 'offsetHeight', {
+      get: () => {
+        var inline = /^([0-9.]+)px$/.exec(String(node.style.height || ''));
+        if (inline) {
+          return Number(inline[1]);
+        }
+        // Entries occupy layout in the real panel; the fake gives every
+        // article a fixed height so anchor preservation is measurable.
+        return tagName === 'article' ? 40 : 0;
+      },
+    });
     node.focus = () => {
       node.focused = true;
       // Mirror the browser: focus() on a DETACHED node is a no-op.
@@ -7572,17 +7628,22 @@ function makeFakeDom() {
       }
     };
     Object.defineProperty(node, 'scrollHeight', {
-      get: () =>
-        Math.max(
+      get: () => {
+        const gap = node.attributes && node.attributes.id === 'entries' ? 12 : 0;
+        return Math.max(
           node.clientHeight,
-          node.children.reduce((sum, child) => sum + (child.offsetHeight || 0), 0),
-        ),
+          node.children.reduce((sum, child) => sum + (child.offsetHeight || 0), 0) +
+            Math.max(0, node.children.length - 1) * gap,
+        );
+      },
     });
     node.appendChild = (child) => {
+      const gap = node.attributes && node.attributes.id === 'entries' ? 12 : 0;
       child.offsetTop = node.children.reduce(
         (sum, entry) => sum + (entry.offsetHeight || 0),
         0,
       );
+      child.offsetTop += Math.max(0, node.children.length) * gap;
       node.children.push(child);
       child.parentNode = node;
       return child;
@@ -7700,7 +7761,9 @@ function makeFakeDom() {
     },
     getElementById(id) {
       if (!nodesById.has(id)) {
-        nodesById.set(id, makeNode('div'));
+        const node = makeNode('div');
+        node.attributes.id = id;
+        nodesById.set(id, node);
       }
       return nodesById.get(id);
     },
@@ -7919,6 +7982,14 @@ function runChatWebview(snapshot) {
           keydownHandler = callback;
         }
       },
+      // The real webview coalesces snapshots to the next animation frame.
+      // The fake runs the frame synchronously so each deliver() observes the
+      // rendered DOM, exactly like awaiting a frame in the browser.
+      requestAnimationFrame(callback) {
+        callback();
+        return 0;
+      },
+      cancelAnimationFrame() {},
       __faktorRenderProbe: {
         count(kind) {
           renderCounts[kind] = (renderCounts[kind] || 0) + 1;
@@ -7942,7 +8013,16 @@ function runChatWebview(snapshot) {
     posted,
     dom,
     renderCounts,
+    window: sandbox.window,
     deliver: (message) => messageHandler({ data: message.data ? message.data : message }),
+    // A real reader scrolls with an input gesture. The webview's explicit pin
+    // state machine only treats a recent gesture as user intent, so tests
+    // dispatch the wheel event before moving the scroll position.
+    scroll: (element, top) => {
+      element.dispatch('wheel', { type: 'wheel' });
+      element.scrollTop = top;
+      element.dispatch('scroll', { type: 'scroll' });
+    },
     keydown: (event) => {
       if (keydownHandler) {
         keydownHandler(event);
@@ -8707,8 +8787,8 @@ async function composerAttachmentTests() {
       'faktor.newTask': 'New Task',
       'faktor.cancelTask': 'Stop Current Run',
       'faktor.replyPermission': 'Reply to Permission',
-      'faktor.controlPlaneSignIn': 'Sign In',
-      'faktor.controlPlaneSignOut': 'Sign Out',
+      'faktor.controlPlaneSignIn': 'Sign in to Control Plane',
+      'faktor.controlPlaneSignOut': 'Sign out of Control Plane',
       'faktor.startServer': 'Diagnostics: Start Service',
       'faktor.stopServer': 'Diagnostics: Stop Service',
       'faktor.refresh': 'Diagnostics: Refresh State',
@@ -10521,7 +10601,7 @@ async function transcriptScrollTests() {
     assertEqual(container.children.length, 3, 'the rebuilt transcript carries every entry');
 
     // 3px from the bottom (inside the slack) -> still pinned.
-    container.scrollTop = container.scrollHeight - container.clientHeight - 3;
+    harness.scroll(container, container.scrollHeight - container.clientHeight - 3);
     entries.push(transcriptEntry(4, 'four'));
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
     assertEqual(
@@ -10582,7 +10662,46 @@ async function transcriptScrollTests() {
     );
   });
 
-  await test('a same-length content change updates the DOM; streaming replaces only the last entry', () => {
+  await test('a replaced tool row keeps its open disclosure and delivered evidence without focus', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const entries = [
+      transcriptEntry(1, 'one'),
+      transcriptEntry(2, 'two', {
+        tools: [
+          { name: 'read', state: 'completed', excerpt: 'a', exitCode: null, artifact: 'evidence:9' },
+        ],
+      }),
+    ];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    harness.deliver({ type: 'evidence', id: 9, text: 'ROW-EVIDENCE', truncated: false });
+    const container = harness.dom.document.getElementById('entries');
+    const row = container.children[1];
+    const disclosure = row.querySelectorAll('details')[0];
+    assert(disclosure !== undefined && disclosure !== null, 'the tool disclosure exists');
+    disclosure.open = true;
+    // A reader opens the tool card, then clicks away into the composer: the
+    // next semantic tool change REPLACES the row, so its disclosure/evidence
+    // must be captured and restored even though focus is outside the entry.
+    harness.dom.document.getElementById('goal').focus();
+    entries[1] = transcriptEntry(2, 'two plus', {
+      tools: [
+        { name: 'read', state: 'running', excerpt: 'a', exitCode: null, artifact: 'evidence:9' },
+      ],
+    });
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    const refreshed = container.children[1];
+    const refreshedDetails = refreshed.querySelectorAll('details')[0];
+    assertEqual(refreshedDetails.open, true, 'the open tool disclosure survives the row replace');
+    const holders = refreshed.querySelectorAll('[data-evidence="9"]');
+    assertEqual(holders.length, 1, 'the evidence holder survives');
+    assertEqual(
+      holders[0].querySelectorAll('pre')[0].textContent,
+      'ROW-EVIDENCE',
+      'the delivered evidence survives without focus',
+    );
+  });
+
+  await test('a same-length content change updates the DOM; streaming patches only the last entry', () => {
     const harness = runChatWebview(transcriptSnapshot([]));
     const container = harness.dom.document.getElementById('entries');
     const entries = [transcriptEntry(1, 'one'), transcriptEntry(2, 'two')];
@@ -10603,14 +10722,18 @@ async function transcriptScrollTests() {
       false,
       'the old same-length text must be gone',
     );
-    // A streaming delta on the last entry replaces ONLY that node: earlier
-    // nodes (and their open details/evidence/focus) are never rebuilt.
+    // A streaming delta on the last entry patches that entry in place: the
+    // article (and focus/open disclosures inside it) survives, and earlier
+    // nodes are never touched.
     const lastNode = container.children[1];
+    const rebuilds = harness.renderCounts.transcript;
     entries[1] = transcriptEntry(2, 'TWO and more text');
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
     assertEqual(container.children.length, 2);
     assertEqual(container.children[0], firstNode, 'streaming must not rebuild earlier entries');
-    assert(container.children[1] !== lastNode, 'the changed last entry is re-rendered');
+    assertEqual(container.children[1], lastNode, 'the changed last entry is patched in place');
+    assert(harness.renderCounts['transcript-patch'] >= 1, 'the incremental patch path runs');
+    assertEqual(harness.renderCounts.transcript, rebuilds, 'no list rebuild on a streaming delta');
     assert(
       fakeText(container.children[1]).includes('TWO and more text'),
       fakeText(container.children[1]),
@@ -10618,7 +10741,7 @@ async function transcriptScrollTests() {
     // The fast path must honor the pinned-follows contract: a reader at the
     // bottom keeps following the stream.
     container.clientHeight = 200;
-    container.scrollTop = container.scrollHeight;
+    harness.scroll(container, container.scrollHeight);
     entries[1] = transcriptEntry(2, 'TWO and more text, streamed further');
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
     assertEqual(
@@ -10626,6 +10749,32 @@ async function transcriptScrollTests() {
       container.scrollHeight,
       'a pinned reader keeps following through the streaming fast path',
     );
+  });
+
+  await test('a colliding or stale transcript digest never skips different content', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    const entries = [transcriptEntry(1, 'one'), transcriptEntry(2, 'two')];
+    const revision = st.transcriptSignature(entries);
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...transcriptSnapshot(entries), transcriptRevision: revision },
+    });
+    assert(fakeText(container).includes('two'), fakeText(container));
+    // A stale/forged revision (or an impossible hash collision): the CONTENT
+    // differs, so the panel must still re-key and render it. Revision-only
+    // skipping would freeze the old row forever.
+    const changed = [transcriptEntry(1, 'one'), transcriptEntry(2, 'TWO')];
+    assert(
+      st.transcriptSignature(changed) !== revision,
+      'a different document normally has a different digest',
+    );
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...transcriptSnapshot(changed), transcriptRevision: revision },
+    });
+    assert(fakeText(container).includes('TWO'), 'different content must reach the DOM');
+    assert(!fakeText(container).includes('two '), 'the stale content must be gone');
   });
 
   await test('an unpinned reader keeps the first visible entry and pixel offset', () => {
@@ -10638,7 +10787,7 @@ async function transcriptScrollTests() {
     }
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
     // 500px above the bottom of an 800px transcript.
-    container.scrollTop = 500;
+    harness.scroll(container, 500);
     const anchorNode = container.children[12];
     const anchorOffset = 500 - anchorNode.offsetTop;
     entries.push(transcriptEntry(21, 'message 21'));
@@ -10663,7 +10812,7 @@ async function transcriptScrollTests() {
     const container = harness.dom.document.getElementById('entries');
     container.clientHeight = 200;
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
-    container.scrollTop = 0;
+    harness.scroll(container, 0);
     harness.deliver({ type: 'evidence', id: 42, text: 'DETAIL', truncated: false });
     assert(
       fakeText(container).includes('DETAIL'),
@@ -10698,7 +10847,7 @@ async function transcriptScrollTests() {
       entries.push(transcriptEntry(seq, `message ${seq}`));
     }
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
-    container.scrollTop = 500;
+    harness.scroll(container, 500);
     // The user's own submission requests the pin; the next changed render
     // consumes it and jumps to the bottom.
     harness.dom.document.getElementById('goal').value = 'my new goal';
@@ -10710,10 +10859,238 @@ async function transcriptScrollTests() {
     assertEqual(container.scrollTop, container.scrollHeight, 'own submission pins to the bottom');
     // The one-shot pin was consumed: a later changed render respects the
     // reading position again.
-    container.scrollTop = 500;
+    harness.scroll(container, 500);
     entries.push(transcriptEntry(22, 'assistant reply'));
     harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
     assert(container.scrollTop < container.scrollHeight - container.clientHeight);
+  });
+
+  await test('transcript-only deltas never rebuild the task, cockpit or permission surfaces', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.permissions = [
+      {
+        id: 'perm-1',
+        sessionId: snapshot.session.id,
+        capability: 'shell',
+        detail: 'Action requested for this run.',
+      },
+    ];
+    const harness = runChatWebview(snapshot);
+    const baseline = {
+      task: harness.renderCounts.task,
+      cockpit: harness.renderCounts.cockpit,
+      permissions: harness.renderCounts.permissions,
+    };
+    const entries = [transcriptEntry(1, 'stream 0')];
+    for (let index = 1; index <= 100; index += 1) {
+      entries[0] = transcriptEntry(1, `stream ${index}`);
+      harness.deliver({ type: 'snapshot', snapshot: { ...snapshot, transcript: entries } });
+    }
+    assertEqual(harness.renderCounts.task, baseline.task, 'the task card is not rebuilt per delta');
+    assertEqual(
+      harness.renderCounts.cockpit,
+      baseline.cockpit,
+      'the cockpit is not rebuilt per delta',
+    );
+    assertEqual(
+      harness.renderCounts.permissions,
+      baseline.permissions,
+      'the approval card (and its focus) is not rebuilt per delta',
+    );
+  });
+
+  await test('stream snapshots coalesce to one render per frame and preserve the latest order', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const pendingFrames = [];
+    harness.window.requestAnimationFrame = (callback) => {
+      pendingFrames.push(callback);
+      return pendingFrames.length;
+    };
+    harness.window.cancelAnimationFrame = () => {};
+    const entries = [transcriptEntry(1, 'stream 0')];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    const rendersBefore = harness.renderCounts.snapshot;
+    for (let index = 1; index <= 200; index += 1) {
+      entries[0] = transcriptEntry(1, `stream ${index}`);
+      harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    }
+    assertEqual(
+      harness.renderCounts.snapshot,
+      rendersBefore,
+      '200 messages inside one frame must not render 200 times',
+    );
+    assert(
+      harness.renderCounts['snapshot-coalesced'] >= 199,
+      'superseded snapshots are counted as coalesced',
+    );
+    assert(pendingFrames.length >= 1, 'the newest snapshot is queued on a frame');
+    while (pendingFrames.length > 0) {
+      pendingFrames.shift()();
+    }
+    assertEqual(
+      harness.renderCounts.snapshot,
+      rendersBefore + 1,
+      'the frame applies exactly one full snapshot',
+    );
+    const container = harness.dom.document.getElementById('entries');
+    assert(
+      fakeText(container).includes('stream 200'),
+      'the LAST snapshot wins (order preserved, no stale replay)',
+    );
+  });
+
+  await test('the stream refresh scheduler coalesces without starving and never drops a trailing frame', () => {
+    const timers = [];
+    let now = 0;
+    let nextId = 1;
+    const clock = {
+      setTimeout(callback, ms) {
+        const id = nextId++;
+        timers.push({ id, due: now + ms, callback });
+        return id;
+      },
+      clearTimeout(id) {
+        const index = timers.findIndex((timer) => timer.id === id);
+        if (index !== -1) {
+          timers.splice(index, 1);
+        }
+      },
+    };
+    const fireDue = () => {
+      for (;;) {
+        const index = timers.findIndex((timer) => timer.due <= now);
+        if (index === -1) {
+          return;
+        }
+        const [timer] = timers.splice(index, 1);
+        timer.callback();
+      }
+    };
+    let runs = 0;
+    const scheduler = new rs.CoalescingRefreshScheduler((done) => {
+      runs += 1;
+      done();
+    }, clock, 120);
+    for (let frame = 0; frame < 500; frame += 1) {
+      now += 5;
+      scheduler.request();
+      fireDue();
+    }
+    assert(runs >= 15 && runs <= 23, `500 frames over 2.5s refresh in bounded windows (runs=${runs})`);
+    assert(!scheduler.busy, 'a settled stream leaves no armed timer');
+
+    // In-flight refresh: requests are remembered, and a trailing run is
+    // started after the running refresh reports done.
+    let heldDone = null;
+    let heldRuns = 0;
+    const held = new rs.CoalescingRefreshScheduler((done) => {
+      heldRuns += 1;
+      heldDone = done;
+    }, clock, 120);
+    held.request();
+    now += 120;
+    fireDue();
+    assertEqual(heldRuns, 1, 'the first request starts one refresh');
+    for (let frame = 0; frame < 50; frame += 1) {
+      now += 5;
+      held.request();
+      fireDue();
+    }
+    assertEqual(heldRuns, 1, 'no overlapping refresh while one is in flight');
+    heldDone();
+    now += 120;
+    fireDue();
+    assertEqual(heldRuns, 2, 'the frames that arrived during the refresh produce one trailing run');
+    held.dispose();
+  });
+
+  await test('a 500-entry transcript is windowed, follows the bottom and never rebuilds offscreen deltas', async () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    container.clientHeight = 240;
+    const entries = [];
+    for (let seq = 1; seq <= 500; seq += 1) {
+      entries.push(transcriptEntry(seq, `message ${seq}`));
+    }
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assert(
+      container.children.length < 60,
+      `virtualization bounds DOM nodes (got ${container.children.length})`,
+    );
+    assert(
+      harness.renderCounts['transcript-window-pinned'] >= 1,
+      'the first long render opens a pinned window',
+    );
+    const lastEntry = () => {
+      const articles = container.children.filter((node) => String(node.className).includes('entry-'));
+      return articles[articles.length - 1];
+    };
+    const pinnedLast = lastEntry();
+    const rebuilds = harness.renderCounts.transcript;
+    entries[499] = transcriptEntry(500, 'message 500 streamed');
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(lastEntry(), pinnedLast, 'the pinned last article is patched in place');
+    assert(fakeText(lastEntry()).includes('streamed'), 'the streamed text reaches the last node');
+    assertEqual(harness.renderCounts.transcript, rebuilds, 'no full transcript rebuild while pinned');
+
+    // Reader scrolls to the top. An offscreen last-entry delta must not
+    // re-materialize the window or move the reading position.
+    harness.scroll(container, 0);
+    assertEqual(container.scrollTop, 0, 'the reader position is preserved');
+    const visibleArticles = container.children.filter((node) =>
+      String(node.className).includes('entry-'),
+    );
+    const visibleFirst = visibleArticles[0];
+    entries[499] = transcriptEntry(500, 'message 500 streamed offscreen');
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    const visibleAfter = container.children.filter((node) =>
+      String(node.className).includes('entry-'),
+    );
+    assertEqual(visibleAfter[0], visibleFirst, 'offscreen deltas keep every visible node');
+    assertEqual(container.scrollTop, 0, 'offscreen deltas never fight the reader');
+    assert(
+      harness.renderCounts['transcript-window-offscreen'] >= 1,
+      'the offscreen fast path handles the delta',
+    );
+    const offscreenRenders = harness.renderCounts['transcript-window-offscreen'];
+    entries.push(transcriptEntry(501, 'message 501 appended offscreen'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assert(
+      harness.renderCounts['transcript-window-offscreen'] > offscreenRenders,
+      'an offscreen append takes the spacer-only path',
+    );
+    const visibleAfterAppend = container.children.filter((node) =>
+      String(node.className).includes('entry-'),
+    );
+    assertEqual(visibleAfterAppend[0], visibleFirst, 'appends never rebuild the visible window');
+    assertEqual(container.scrollTop, 0, 'appends never move the reader');
+
+    // Scrolling back to the bottom re-enters follow mode.
+    harness.scroll(container, container.scrollHeight);
+    entries[entries.length - 1] = transcriptEntry(
+      entries.length,
+      `message ${entries.length} streamed at bottom`,
+    );
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(
+      container.scrollTop,
+      container.scrollHeight,
+      'returning to the bottom resumes following',
+    );
+    assert(
+      fakeText(lastEntry()).includes('at bottom'),
+      'the final streamed text is rendered at the bottom',
+    );
+    assert(
+      container.children.length < 60,
+      'the node count stays bounded after scrolling and streaming',
+    );
+    await Promise.resolve();
+    assertEqual(
+      container.getAttribute('aria-live'),
+      'polite',
+      'the live region is restored after structural rebuilds (no permanent mute)',
+    );
   });
 
   await test('the composer is single-flight: submit locks controls and only an explicit result releases', () => {
@@ -15360,6 +15737,167 @@ async function outcomeTests() {
   });
 }
 
+// ------------------------------------------------- capacity: feature-use matrix
+
+/**
+ * Static product-capability matrix: every contributed command must be
+ * activated, registered, and reach a real host handler that calls the ONE
+ * service path for it; every contributed setting must be consumed; every
+ * webview control must be wired and every webview message must round-trip.
+ * Adding a contribution without a handler (or a handler without a
+ * contribution) turns this red, so a dead/placeholder surface cannot ship.
+ */
+async function capabilityMatrixTests() {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const extensionSource = readFileSync(
+    new URL('../src/extension.ts', import.meta.url),
+    'utf8',
+  );
+  const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+  const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+
+  await test('capability matrix: every contributed command is activated, registered and reaches a real service path', () => {
+    const contributed = pkg.contributes.commands.map((entry) => entry.command).sort();
+    const registered = [
+      ...extensionSource.matchAll(/vscode\.commands\.registerCommand\('([^']+)'/g),
+    ]
+      .map((match) => match[1])
+      .sort();
+    assertDeepEqual(
+      registered,
+      contributed,
+      'no contributed command may lack a registration and no registered command may be hidden',
+    );
+    const activation = new Set(pkg.activationEvents ?? []);
+    for (const command of contributed) {
+      assert(
+        activation.has(`onCommand:${command}`),
+        `${command} must declare onCommand activation (explicit, not host-implicit)`,
+      );
+    }
+    for (const event of activation) {
+      if (typeof event === 'string' && event.startsWith('onCommand:')) {
+        assert(
+          contributed.includes(event.slice('onCommand:'.length)),
+          `${event} activates a command that is not contributed`,
+        );
+      }
+    }
+    // Command -> handler symbol, then handler -> the real service/client call
+    // the capability actually performs. This is the matrix that makes a
+    // renamed/removed service seam fail instead of silently no-oping.
+    const matrix = {
+      'faktor.startServer': ['startServer(', ['startServer', ['startDaemon(', 'resolveDaemon(']]],
+      'faktor.stopServer': ['stopServer(', ['stopServer', ['stopDaemon(']]],
+      'faktor.openChat': ['chatProvider?.focus(', null],
+      'faktor.newTask': ['newTaskFromCommand(', ['newTaskFromCommand', ['startTask(']]],
+      'faktor.cancelTask': ['cancelActiveRun(', ['cancelActiveRun', ['cancelTaskRun(']]],
+      'faktor.replyPermission': [
+        'replyPermissionFromCommand(',
+        ['replyPermissionFromCommand', ['client.permissions(', 'replyPermissionEntry(']],
+      ],
+      'faktor.refresh': ['refreshFromUserGesture(', ['refreshFromUserGesture', ['await refresh()']]],
+      'faktor.controlPlaneSignIn': [
+        'controlPlaneSignIn(',
+        ['controlPlaneSignIn', ['storeControlPlaneToken(']],
+      ],
+      'faktor.controlPlaneSignOut': [
+        'controlPlaneSignOut(',
+        ['controlPlaneSignOut', ['logoutControlPlane(']],
+      ],
+      'faktor.reconnectStream': ['recoverEventStream(', ['recoverEventStream', ['stream.recover()']]],
+      'faktor.switchSession': [
+        'switchSessionFromCommand(',
+        ['switchSessionFromCommand', ['switchSession(']],
+      ],
+      'faktor.locateDaemon': ['locateDaemon(', ['locateDaemon', ['applyMachineScopedWrite(']]],
+    };
+    assertDeepEqual(
+      Object.keys(matrix).sort(),
+      contributed,
+      'the capability matrix covers exactly the contributed command set',
+    );
+    for (const command of contributed) {
+      const [invocation, handler] = matrix[command];
+      const start = extensionSource.indexOf(`registerCommand('${command}'`);
+      assert(start >= 0, `${command} registration must exist`);
+      const next = extensionSource.indexOf('vscode.commands.registerCommand(', start + 1);
+      const registration = extensionSource.slice(start, next === -1 ? undefined : next);
+      assert(registration.includes(invocation), `${command} must invoke ${invocation}`);
+      if (handler !== null) {
+        const [declaration, serviceCalls] = handler;
+        const body = sourceFunctionSlice(extensionSource, `function ${declaration}(`);
+        for (const serviceCall of serviceCalls) {
+          assert(
+            body.includes(serviceCall),
+            `${command} handler ${declaration} must reach ${serviceCall}`,
+          );
+        }
+      }
+    }
+  });
+
+  await test('capability matrix: every contributed setting is consumed by a production path', () => {
+    const sections = Array.isArray(pkg.contributes.configuration)
+      ? pkg.contributes.configuration
+      : [pkg.contributes.configuration];
+    const settings = Object.assign({}, ...sections.map((section) => section.properties ?? {}));
+    const consumers = {
+      'faktor.defaultProvider': "config('defaultProvider'",
+      'faktor.defaultModel': "config('defaultModel'",
+      'faktor.mutationMode': "config('mutationMode'",
+      'faktor.budgetTokens': "config('budgetTokens'",
+      'faktor.budgetCostMicro': "config('budgetCostMicro'",
+      'faktor.binaryPath': "machineSetting('binaryPath'",
+      'faktor.dataDir': "machineSetting('dataDir'",
+      'faktor.installRoot': "machineSetting('installRoot'",
+      'faktor.extraArgs': "machineSetting<string[]>('extraArgs'",
+      'faktor.startupTimeoutMs': "machineSetting('startupTimeoutMs'",
+      'faktor.controlPlaneEndpoint': "machineSetting('controlPlaneEndpoint'",
+      'faktor.controlPlaneOrganization': "machineSetting('controlPlaneOrganization'",
+      'faktor.controlPlaneAuthSession': "machineSetting('controlPlaneAuthSession'",
+      'faktor.controlToken': "machineSetting('controlToken'",
+    };
+    assertDeepEqual(
+      Object.keys(consumers).sort(),
+      Object.keys(settings).sort(),
+      'every contributed setting has a named production consumer',
+    );
+    for (const [id, consumer] of Object.entries(consumers)) {
+      assert(
+        extensionSource.includes(consumer),
+        `${id} is contributed but no production path consumes ${consumer}`,
+      );
+    }
+  });
+
+  await test('capability matrix: every webview control and message round-trips to a host handler', () => {
+    const sent = new Set(
+      [...chatSource.matchAll(/type:\s*'([a-zA-Z]+)'/g)].map((match) => match[1]),
+    );
+    const handled = new Set(
+      [...extensionSource.matchAll(/case '([a-zA-Z]+)':/g)].map((match) => match[1]),
+    );
+    for (const kind of sent) {
+      assert(handled.has(kind), `webview message ${kind} has no host handler`);
+    }
+    for (const kind of handled) {
+      assert(sent.has(kind), `host handles ${kind} but no webview control sends it`);
+    }
+    for (const match of markup.matchAll(/<button[^>]*id="([^"]+)"[^>]*>/g)) {
+      const id = match[1];
+      const tag = match[0];
+      const direct = chatSource.includes(`byId('${id}').addEventListener`);
+      const tablist = chatSource.includes(`'${id}'`) && /^(nav|subtab|history-tab)-/.test(id);
+      const submit = /type="submit"/.test(tag);
+      assert(
+        direct || tablist || submit,
+        `webview control #${id} is not wired to a listener, tablist or form submit`,
+      );
+    }
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -15404,6 +15942,7 @@ async function main() {
   await tournamentWebviewTests();
   await reducedMotionTests();
   await verdictContrastTests();
+  await capabilityMatrixTests();
   if (packagedDir !== null && packagedDir !== undefined) {
     await packagedLayoutTests(packagedDir);
   }

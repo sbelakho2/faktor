@@ -839,6 +839,28 @@ button.toggle[aria-expanded='true'] {
   max-height: min(64vh, 640px);
   overflow-y: auto;
   padding-right: 2px;
+  /* The transcript owns scroll preservation explicitly (anchor index +
+     cached heights). Browser scroll anchoring would fight the windowing
+     spacers and silently jump a reader back to the bottom. */
+  overflow-anchor: none;
+}
+
+/* Virtualization spacers: they hold the scroll range of the entries outside
+   the rendered window. Width is reserved so the flex column's cross-size does
+   not change when a spacer replaces real content. */
+.transcript-spacer {
+  flex: none;
+  width: 1px;
+  align-self: stretch;
+  pointer-events: none;
+}
+
+/* Keyboard focus fallback when the focused entry scrolls out of the rendered
+   window: the transcript itself takes focus programmatically (tabindex="-1"),
+   never the document body. */
+#entries:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: 2px;
 }
 
 .entry {

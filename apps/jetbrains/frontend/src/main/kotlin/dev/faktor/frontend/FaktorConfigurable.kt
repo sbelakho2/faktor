@@ -61,6 +61,8 @@ class FaktorConfigurable : Configurable {
 
     private val credentialStore = ControlPlaneCredentialStore(IntelliJPasswordSafeVault())
 
+    private val sessionStore = IntelliJControlPlaneSessionStore()
+
     private var component: JComponent? = null
 
     private var binaryField: JTextField? = null
@@ -142,7 +144,13 @@ class FaktorConfigurable : Configurable {
             organization.text = ""
             refreshSignedIn()
         }
-        val signOutButton = secondaryButton("Sign out")
+        // Local deletion only: this Configurable has no daemon client, so it
+        // must not label itself a full sign-out. The tool window's sign-out is
+        // the revoking path (it deletes the local row too).
+        val signOutButton = secondaryButton("Remove stored credential")
+        signOutButton.toolTipText =
+            "Delete the PasswordSafe row for this endpoint + organization. The tool window's " +
+                "Sign out also revokes the remote session."
         signOutButton.addActionListener { signOutControlPlane() }
 
         val serviceBody = pageColumn(gap = Spacing.XS, padding = 0).apply {
@@ -321,10 +329,15 @@ class FaktorConfigurable : Configurable {
         return scope.takeIf { it.valid() }
     }
 
-    /** Deletes the credential row only; no settings value is touched. */
+    /**
+     * Deletes the credential row and the dead session coordinate; the
+     * endpoint/organization settings values are untouched. Remote revocation
+     * belongs to the tool window's sign-out (the only path with a client).
+     */
     private fun signOutControlPlane() {
         val scope = controlPlaneScopeOf() ?: return
         credentialStore.delete(scope)
+        sessionStore.write(null)
         refreshSignedIn()
     }
 

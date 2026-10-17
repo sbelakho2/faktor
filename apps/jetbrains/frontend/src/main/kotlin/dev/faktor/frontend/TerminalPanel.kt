@@ -112,10 +112,19 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
     private var outputDisplayCap = OUTPUT_INITIAL_CHARS
 
+    private var appliedPage: NativeTerminalPage? = null
+
     /** Bounded local record of argv observed at spawn time (id to spec). */
     private val spawns = LinkedHashMap<String, SpawnSpec>()
 
     init {
+        terminalsList.a11y("Session terminals", "Processes owned by this conversation.")
+        commandField.a11y("Program", "Program to run; arguments are one per line.")
+        argsArea.a11y("Arguments", "One argument per line; spaces inside a line are preserved.")
+        shellArea.a11y("Shell command", "Shell command line, when shell mode is enabled.")
+        cwdField.a11y("Working directory", "Working directory for the spawned process.")
+        eventsArea.a11y("Terminal events", "Durable terminal lifetime events.")
+        outputArea.a11y("Terminal output", "Output snapshot of the selected process.")
         terminalsList.selectionMode = ListSelectionModel.SINGLE_SELECTION
         terminalsList.visibleRowCount = 4
         RowRhythm.install(terminalsList)
@@ -218,6 +227,8 @@ class TerminalPanel : JPanel(BorderLayout()) {
     }
 
     fun update(page: NativeTerminalPage) {
+        if (page == appliedPage && available) return
+        appliedPage = page
         available = true
         reason = null
         val selectedId = terminalsList.selectedValue?.id
