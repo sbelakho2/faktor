@@ -1166,7 +1166,7 @@ profile).
 | VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
 | VS Code Extension Host E2E | pinned VS Code `1.140.0`/commit `07f806f9…`/sha256 `d32031e9…` + `scripts/vscode-e2e/extension-host-smoke.cjs` inside the real host; per-cell timeout from a same-run Electron cold-start calibration (`timeout` field) | trusted `vscode-e2e` lane; `target/certification/vscode-e2e.json` (exact `does_not_prove` list) | CI-LANE (real host activation + registered commands + compiled webview HTML surface; NOT rendered pixels or a displayed workbench) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
-| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
+| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 13/13 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
 | JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; pinned font env (`parity/fonts/core-fonts.conf` via `FONTCONFIG_FILE`); regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`; the Windows platform record is gated by `scripts/windows-visual-baseline.ps1` | IMPLEMENTED (offline component-tree/state comparison on linux/macos; a real-IDE screenshot comparison stays a host capability not claimed here; windows is NOT certified until the Windows agent records its own record) |
 | JetBrains packaged-plugin host matrix | `JetBrainsHostMatrixSmoke` (`target/certification/jetbrains-host-matrix.json`) | BUILT plugin ZIP extracted with `faktor/lib/*.jar` first on the classpath + class-provenance assertion; width 240/320/480/800, zoom 100/125/200 %, light/dark/high-contrast UIManager themes, keyboard-only Tab/SPACE traversal, empty/loading/error/blocked/reconnect states; `FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1` in the trusted `jetbrains-smoke` lane | IMPLEMENTED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
@@ -1321,18 +1321,19 @@ Implementation map:
 
 Task-mode IDE controls (both IDEs):
 
-- VS Code: the built-in Task composer shows the Commit/Push/Create-PR
-  checkboxes and posts a strict `completionContract`; the host builds the
-  explicit `main` Implementation work item plus `completion_contract` in
-  `apps/vscode/src/taskStart.ts` and forwards composer `files`; the
-  `faktor.newTask` command offers the same multi-select for the command
-  path; the host accepts the contract only as three exact booleans (a
-  malformed contract is a loud refusal, never a silently contract-free
-  start) and the cockpit/task card renders the step rows with their
-  provenance.
-- JetBrains: the Task tab owns the same three checkboxes; the request
-  builder emits the explicit work item plus contract; the task tree renders
-  the contract and its step statuses.
+- VS Code: the built-in Task composer shows the four-level finish control
+  (Leave / Commit / Push / PR radio group) and posts a strict
+  `completionContract`; the host builds the explicit `main` Implementation
+  work item plus `completion_contract` in `apps/vscode/src/taskStart.ts` and
+  forwards composer `files`; the `faktor.newTask` command offers the
+  three-step Commit/Push/Create-PR multi-select for the command path; the
+  host accepts the contract only as three exact booleans (a malformed
+  contract is a loud refusal, never a silently contract-free start) and the
+  cockpit/task card renders the step rows with their provenance.
+- JetBrains: the Work sheet owns the same four-level finish selector
+  (Local / Commit / Push / PR); the request builder emits the explicit work
+  item plus contract; the task tree renders the contract and its step
+  statuses.
 - Neither client fabricates statuses. When a daemon serves the additive
   `completion` block on the task view the rows are `source=daemon`; without
   it the block is derived from the DURABLE task-run state (pending, or

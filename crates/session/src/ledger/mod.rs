@@ -152,6 +152,20 @@ pub const ENTRY_TERMINAL_KILLED: &str = "terminal_killed";
 pub const ENTRY_TERMINAL_LOST: &str = "terminal_lost";
 pub const ENTRY_TERMINAL_RECONCILED: &str = "terminal_reconciled";
 
+/// Whether a durable ledger entry type is one of the six terminal lifetime
+/// tags (the terminal projection reads only these).
+pub(crate) fn is_terminal_entry_type(tag: &str) -> bool {
+    matches!(
+        tag,
+        ENTRY_TERMINAL_CREATED
+            | ENTRY_TERMINAL_RUNNING
+            | ENTRY_TERMINAL_EXITED
+            | ENTRY_TERMINAL_KILLED
+            | ENTRY_TERMINAL_LOST
+            | ENTRY_TERMINAL_RECONCILED
+    )
+}
+
 /// Hard bound on one durable terminal UUID (UTF-8 bytes). The daemon mints
 /// canonical 36-byte UUID v4 strings; the bound admits every honest id.
 pub const MAX_TERMINAL_ID_BYTES: usize = 64;
@@ -3400,6 +3414,27 @@ impl SessionHandle {
         &self,
         after_seq: Option<i64>,
     ) -> faktor_core::Result<Vec<TerminalLedgerRecord>> {
+        self.ledger_terminal_rows_bounded(after_seq, usize::MAX)
+    }
+
+    /// Keyset-bounded twin of [`SessionHandle::ledger_terminal_rows`]: reads
+    /// the session ledger from `after_seq` forward, skips non-terminal rows
+    /// WITHOUT decoding their payload JSON, and stops as soon as
+    /// `max_records` terminal rows are materialized.
+    ///
+    /// This is the cursor page behind `/native/session/{id}/terminal/events`:
+    /// a reconnect at seq N never re-scans or re-decodes the whole session
+    /// ledger, and a page of `limit + 1` terminal rows costs O(page), not
+    /// O(entire history). The durable `seq` is the cursor, so paging stays
+    /// gapless and duplicate-free across restarts.
+    pub fn ledger_terminal_rows_bounded(
+        &self,
+        after_seq: Option<i64>,
+        max_records: usize,
+    ) -> faktor_core::Result<Vec<TerminalLedgerRecord>> {
+        if max_records == 0 {
+            return Ok(Vec::new());
+        }
         let store = self.manager.store();
         let mut cursor = after_seq;
         let mut out: Vec<TerminalLedgerRecord> = Vec::new();
@@ -3412,9 +3447,18 @@ impl SessionHandle {
             }
             cursor = page.last().map(|r| r.seq);
             for row in page {
+                // Cheap tag gate BEFORE the JSON decode: non-terminal rows
+                // (messages, task history, ...) never pay a parse on this
+                // streaming read path.
+                if !is_terminal_entry_type(&row.entry_type) {
+                    continue;
+                }
                 let entry = self.decode_row(&row)?;
                 if let Some(record) = terminal_record_of(entry) {
                     out.push(record);
+                    if out.len() >= max_records {
+                        return Ok(out);
+                    }
                 }
             }
             if cursor.is_none() {

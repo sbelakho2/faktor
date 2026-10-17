@@ -8,7 +8,6 @@
 // decide/abort/load/start are delegated to a Listener.
 package dev.faktor.frontend
 
-import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeTournamentSummary
 import java.awt.BorderLayout
 import java.awt.Component
@@ -88,9 +87,17 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     private var currentTournament: TournamentView? = null
 
+    private var tournamentApplied = false
+
+    private var appliedSummaries: List<NativeTournamentSummary>? = null
+
     init {
         cards.layout = javax.swing.BoxLayout(cards, javax.swing.BoxLayout.Y_AXIS)
         candidatesTable.fillsViewportHeight = true
+        candidatesTable.a11y("Approach candidates", "Candidate comparison details.")
+        loadField.a11y("Comparison id", "Durable comparison id to load.")
+        goalField.a11y("Comparison goal", "Goal for a new comparison.")
+        criteriaField.a11y("Comparison criteria", "Comma-separated criteria for a new comparison.")
         TableRhythm.install(candidatesTable)
         candidatesTable.showVerticalLines = false
         candidatesTable.intercellSpacing = java.awt.Dimension(0, 1)
@@ -219,6 +226,8 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     /** The durable listing of the session's comparisons (newest last). */
     fun setSummaries(summaries: List<NativeTournamentSummary>) {
+        if (summaries == appliedSummaries) return
+        appliedSummaries = summaries
         if (summaries.isEmpty()) {
             summariesLabel.text = "No saved comparisons in this session yet."
             return
@@ -230,6 +239,8 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     /** Renders (or clears) the comparison; null means "no comparison exists". */
     fun setTournament(tournament: TournamentView?) {
+        if (tournamentApplied && currentTournament == tournament) return
+        tournamentApplied = true
         currentTournament = tournament
         decideButton.isEnabled = tournament != null && tournament.canDecide
         abortButton.isEnabled = tournament != null && tournament.open
@@ -394,6 +405,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
         private var candidates: List<TournamentCandidateView> = emptyList()
 
         fun setCandidates(value: List<TournamentCandidateView>) {
+            if (candidates == value) return
             candidates = value
             fireTableDataChanged()
         }
@@ -465,7 +477,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
 }
 
 /** Exact currency of one micro-USD amount (never a rounded float). */
-internal fun currency(value: BigInteger): String = "$" + MicroMoney.usdText(value)
+internal fun currency(value: BigInteger): String = FormattedValues.currency(value)
 
 /** Human duration: milliseconds under a second, then one decimal second, then minutes. */
 internal fun humanDuration(millis: Long): String {

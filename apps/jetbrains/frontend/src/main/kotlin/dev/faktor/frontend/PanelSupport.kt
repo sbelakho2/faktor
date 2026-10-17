@@ -331,9 +331,17 @@ internal class WrappedLabel(
 
     private var rendering = false
 
+    private var textInitialized = false
+
     var fullText: String = ""
         set(value) {
-            field = DISPLAY_CONTROL_CHARS.replace(value, "")
+            val clean = DISPLAY_CONTROL_CHARS.replace(value, "")
+            // The first assignment (including an empty label) must still
+            // build the HTML form; later identical refreshes are no-ops (the
+            // host re-posts whole projections, so this is the common path).
+            if (textInitialized && clean == field) return
+            textInitialized = true
+            field = clean
             wrappedWidth = -1
             refresh()
         }

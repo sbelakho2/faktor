@@ -166,7 +166,7 @@ impl SessionHandle {
         // persistence of an undecodable row. The append path validates only:
         // decoding would clone the payload into a value it immediately drops.
         crate::payload::validate_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
-        Ok(self
+        let seq = self
             .manager
             .store()
             .append_event_v(
@@ -178,7 +178,9 @@ impl SessionHandle {
                 payload,
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
-            .map_err(crate::map_store_err)?)
+            .map_err(crate::map_store_err)?;
+        self.manager.note_journal_append();
+        Ok(seq)
     }
 
     // ---------------------------------------------------------------- read state
@@ -245,7 +247,7 @@ impl SessionHandle {
         payload: Option<serde_json::Value>,
     ) -> faktor_core::Result<EventSeq> {
         crate::payload::validate_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
-        Ok(self
+        let seq = self
             .manager
             .store()
             .append_event_v(
@@ -257,7 +259,9 @@ impl SessionHandle {
                 payload,
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
-            .map_err(crate::map_store_err)?)
+            .map_err(crate::map_store_err)?;
+        self.manager.note_journal_append();
+        Ok(seq)
     }
 
     /// Async twin of [`SessionHandle::append_event`] (hot journal path):
@@ -286,10 +290,12 @@ impl SessionHandle {
             )?;
         }
         let handle = self.manager.actor().handle();
-        Ok(handle
+        let seq = handle
             .append_journal_event(self.id, op_id, kind, to_state, self.now_ms(), payload)
             .await
-            .map_err(crate::map_store_err)?)
+            .map_err(crate::map_store_err)?;
+        self.manager.note_journal_append();
+        Ok(seq)
     }
 
     pub fn events_after(&self, after: EventSeq) -> faktor_core::Result<Vec<Event>> {
@@ -297,6 +303,17 @@ impl SessionHandle {
             .store()
             .events_after(self.id, after)
             .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// The current journal-append generation (change signal only).
+    pub fn journal_generation(&self) -> u64 {
+        self.manager.journal_generation()
+    }
+
+    /// Subscribe to journal-append wake signals (best-effort; a missed wake
+    /// falls back to polling the durable cursor).
+    pub fn subscribe_journal(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.manager.subscribe_journal()
     }
 
     pub fn events_range(
@@ -1712,6 +1729,36 @@ pub(crate) mod tests {
         for (i, e) in events.iter().enumerate() {
             assert_eq!(e.seq.raw(), (i + 1) as u64);
         }
+    }
+
+    /// The live-stream wake is a best-effort CHANGE signal: a successful
+    /// append bumps it, a refused append does not, and a pre-existing
+    /// receiver observes the change exactly once.
+    #[test]
+    fn journal_generation_bumps_only_on_successful_appends() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let mut rx = s.subscribe_journal();
+        let before = s.journal_generation();
+        s.force_append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(s.journal_generation(), before);
+        assert!(rx.has_changed().unwrap(), "a subscriber must wake");
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+
+        // An illegal transition fails before the write: no bump, no wake.
+        let generation = s.journal_generation();
+        assert!(s
+            .append_event(EventKind::TurnCompleted, AgentState::Completed, None, None)
+            .is_err());
+        assert_eq!(s.journal_generation(), generation);
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[test]

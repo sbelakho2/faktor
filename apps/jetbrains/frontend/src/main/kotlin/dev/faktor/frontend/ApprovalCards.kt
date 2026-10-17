@@ -119,19 +119,27 @@ class ApprovalReplyGate {
 
     private val inFlight = Collections.synchronizedSet(LinkedHashSet<String>())
 
+    private val revision = java.util.concurrent.atomic.AtomicLong()
+
     /** Claims [id]; false when a reply for it is already in flight. */
     fun tryBegin(id: String): Boolean {
         synchronized(inFlight) {
             if (inFlight.contains(id)) return false
             inFlight.add(id)
+            revision.incrementAndGet()
             return true
         }
     }
 
     /** Releases [id] after its typed result (success or refusal). */
     fun finish(id: String) {
-        synchronized(inFlight) { inFlight.remove(id) }
+        synchronized(inFlight) {
+            if (inFlight.remove(id)) revision.incrementAndGet()
+        }
     }
+
+    /** Monotonic claim/finish revision: a rebuild observes gating changes. */
+    fun revision(): Long = revision.get()
 
     fun pending(id: String): Boolean = synchronized(inFlight) { inFlight.contains(id) }
 
@@ -298,6 +306,8 @@ internal class WorkApprovalCard(private val gate: ApprovalReplyGate) : JPanel(Bo
 
     private var permissions: List<NativePermissionEntry> = emptyList()
 
+    private var appliedGateRevision = -1L
+
     private val refusals = LinkedHashMap<String, String>()
 
     private val announced = LinkedHashSet<String>()
@@ -339,6 +349,12 @@ internal class WorkApprovalCard(private val gate: ApprovalReplyGate) : JPanel(Bo
 
     /** Replaces the pending set (same snapshot the Approvals list renders). */
     fun update(permissionList: List<NativePermissionEntry>) {
+        // Identical snapshot + unchanged gate = no rebuild (the host posts
+        // the same pending set on every slow refresh). A claim/finish bumps
+        // the gate revision and must re-render the button state.
+        val gateRevision = gate.revision()
+        if (permissionList == permissions && gateRevision == appliedGateRevision) return
+        appliedGateRevision = gateRevision
         permissions = permissionList
         val live = HashSet<String>()
         for (permission in permissionList) live.add(permission.id)

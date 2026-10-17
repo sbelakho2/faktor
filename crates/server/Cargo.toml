@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+# Manual loopback streaming-delivery harness (ignored by default). Enabling
+# it installs a counting global allocator for the lib-test binary only.
+streaming-harness = []
+
 [dependencies]
 faktor-core.workspace = true
 faktor-protocol.workspace = true
@@ -42,6 +48,7 @@ tower-http = { version = "0.7", features = ["limit"] }
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
+bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true

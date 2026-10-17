@@ -2118,11 +2118,25 @@ impl TerminalService {
         limit: u64,
     ) -> Result<(Vec<TerminalLedgerRecord>, bool), TerminalServiceError> {
         let handle = self.session_handle(session_id)?;
+        self.events_on(&handle, after, limit)
+    }
+
+    /// [`Self::events`] over an ALREADY resolved session handle: the native
+    /// handler verified the session on entry, so a keyset page must not pay
+    /// a second full open verification per page.
+    pub fn events_on(
+        &self,
+        handle: &SessionHandle,
+        after: Option<i64>,
+        limit: u64,
+    ) -> Result<(Vec<TerminalLedgerRecord>, bool), TerminalServiceError> {
         let limit = limit.clamp(1, 500);
-        self.ensure_recovered(&handle, handle.id().raw())?;
+        self.ensure_recovered(handle, handle.id().raw())?;
         self.sweep_live();
+        // Keyset page: read at most `limit + 1` terminal rows strictly after
+        // the cursor, so catch-up never scans/re-decodes the whole ledger.
         let mut records = handle
-            .ledger_terminal_rows(after)
+            .ledger_terminal_rows_bounded(after, limit as usize + 1)
             .map_err(|e| TerminalServiceError::Refused(e.message))?;
         let has_more = records.len() as u64 > limit;
         records.truncate(limit as usize);
@@ -2270,7 +2284,14 @@ impl TerminalService {
             .pty
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let output = String::from_utf8_lossy(&pty.snapshot()).into_owned();
+        // One retained-ring copy: `snapshot()` already owns the bytes, so
+        // valid UTF-8 (the common case) is adopted without a second copy;
+        // only genuinely torn multi-byte output pays the lossy rebuild.
+        let raw = pty.snapshot();
+        let output = match String::from_utf8(raw) {
+            Ok(text) => text,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
         Ok((output, pty.is_alive()))
     }
 

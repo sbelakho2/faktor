@@ -41,6 +41,10 @@ class VerificationPanel : JPanel(BorderLayout()) {
 
     private var criterionCount = 0
 
+    private var appliedModel: TaskTreeModel? = null
+
+    private var modelApplied = false
+
     init {
         criteriaColumn.layout = BoxLayout(criteriaColumn, BoxLayout.Y_AXIS)
         contractColumn.layout = BoxLayout(contractColumn, BoxLayout.Y_AXIS)
@@ -65,6 +69,11 @@ class VerificationPanel : JPanel(BorderLayout()) {
 
     /** Replaces the view with the served model; null is an honest empty state. */
     fun updateModel(model: TaskTreeModel?) {
+        // The stream refresh re-posts the whole model; identical input is a
+        // strict no-op (cards, claim selection and scroll survive).
+        if (modelApplied && appliedModel == model) return
+        modelApplied = true
+        appliedModel = model
         criteriaColumn.removeAll()
         contractColumn.removeAll()
         criterionCards.clear()

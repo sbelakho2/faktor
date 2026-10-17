@@ -70,12 +70,13 @@ pub struct ServerDeps {
     /// `/native/semantic/{status,capabilities}`. `None` = no provider is
     /// configured; the endpoints report the fallback registry shape.
     pub semantic: Option<Arc<faktor_semantic::registry::SemanticProviderRegistry>>,
-    /// Live chunk stream from the agent (audit round 11): when present,
-    /// serve() drains it into low-latency session.next.*.delta frames.
-    /// Bounded (audit 41): the agent's [`faktor_agent::ChunkSink`] sender
-    /// half coalesces ephemeral deltas under backpressure instead of
-    /// growing memory; this receiver half stays drained eagerly into the
-    /// bounded global ring.
+    /// Live chunk stream from the agent (audit round 11). The native
+    /// surface is durable and journal-driven (clients page
+    /// `/native/events` and `/native/messages`), so no live subscriber
+    /// exists: serve() drains this bounded receiver eagerly and drops the
+    /// ephemeral text (the durable message parts are the authority). The
+    /// agent's [`faktor_agent::ChunkSink`] sender half still coalesces
+    /// under backpressure instead of growing memory.
     pub chunk_rx: Option<tokio::sync::mpsc::Receiver<faktor_agent::ChunkEvent>>,
     /// Deterministic readiness knob (audit 55; mirrors the suggested
     /// `FAKTOR_SIMULATE_NOT_READY=1` gate as a field — an env gate would

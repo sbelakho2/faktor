@@ -50,6 +50,8 @@ class BlockersPanel : JPanel(BorderLayout()) {
 
     private var listener: Listener? = null
 
+    private var applied: Triple<List<BlockerRow>, List<NativePermissionEntry>?, List<String>>? = null
+
     init {
         add(JScrollPane(cards), BorderLayout.CENTER)
         render()
@@ -70,20 +72,7 @@ class BlockersPanel : JPanel(BorderLayout()) {
      * is omitted here entirely rather than claiming "no pending permissions".
      */
     fun update(blockers: List<BlockerRow>, taskBlockers: List<String>) {
-        this.blockers = blockers
-        this.permissions = null
-        this.taskBlockers = taskBlockers
-        taskBlockersArea.text = if (taskBlockers.isEmpty()) {
-            "No task-level blockers."
-        } else {
-            taskBlockers.joinToString("\n")
-        }
-        taskBlockersArea.foreground = if (taskBlockers.isEmpty()) {
-            mutedForeground()
-        } else {
-            textForeground()
-        }
-        render()
+        apply(blockers, null, taskBlockers)
     }
 
     fun update(
@@ -91,6 +80,17 @@ class BlockersPanel : JPanel(BorderLayout()) {
         permissions: List<NativePermissionEntry>,
         taskBlockers: List<String>
     ) {
+        apply(blockers, permissions, taskBlockers)
+    }
+
+    private fun apply(
+        blockers: List<BlockerRow>,
+        permissions: List<NativePermissionEntry>?,
+        taskBlockers: List<String>
+    ) {
+        val signature = Triple(blockers, permissions, taskBlockers)
+        if (signature == applied) return
+        applied = signature
         this.blockers = blockers
         this.permissions = permissions
         this.taskBlockers = taskBlockers

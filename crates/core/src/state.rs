@@ -32,6 +32,31 @@ pub enum AgentState {
 }
 
 impl AgentState {
+    /// The exact snake_case wire/durable tag (identical to the serde
+    /// representation) without allocating. The exhaustive
+    /// `as_tag_matches_serde` test pins every variant to its serde bytes.
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            AgentState::Idle => "idle",
+            AgentState::Preparing => "preparing",
+            AgentState::BuildingContext => "building_context",
+            AgentState::WaitingForModel => "waiting_for_model",
+            AgentState::Streaming => "streaming",
+            AgentState::ToolRequested => "tool_requested",
+            AgentState::WaitingForPermission => "waiting_for_permission",
+            AgentState::ExecutingTool => "executing_tool",
+            AgentState::Validating => "validating",
+            AgentState::UpdatingMemory => "updating_memory",
+            AgentState::ReadyForNextTurn => "ready_for_next_turn",
+            AgentState::Completed => "completed",
+            AgentState::Cancelled => "cancelled",
+            AgentState::FailedRecoverable => "failed_recoverable",
+            AgentState::FailedPermanent => "failed_permanent",
+            AgentState::NeedsUserInput => "needs_user_input",
+            AgentState::Suspended => "suspended",
+        }
+    }
+
     /// All states a session may legally transition into from `self`.
     /// The state machine is intentionally conservative: unknown or
     /// ambiguous transitions are rejected loudly instead of silently
@@ -2260,6 +2285,39 @@ impl EditTxnStrategy {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    /// Every static tag is byte-identical to the serde wire name.
+    #[test]
+    fn as_tag_matches_serde() {
+        let all = [
+            AgentState::Idle,
+            AgentState::Preparing,
+            AgentState::BuildingContext,
+            AgentState::WaitingForModel,
+            AgentState::Streaming,
+            AgentState::ToolRequested,
+            AgentState::WaitingForPermission,
+            AgentState::ExecutingTool,
+            AgentState::Validating,
+            AgentState::UpdatingMemory,
+            AgentState::ReadyForNextTurn,
+            AgentState::Completed,
+            AgentState::Cancelled,
+            AgentState::FailedRecoverable,
+            AgentState::FailedPermanent,
+            AgentState::NeedsUserInput,
+            AgentState::Suspended,
+        ];
+        assert_eq!(all.len(), 17, "the enum grew: extend this matrix");
+        for state in all {
+            let wire = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(state.as_tag()),
+                "{state:?}: as_tag must equal the serde wire name"
+            );
+        }
+    }
 
     #[test]
     fn happy_chain_is_legal() {

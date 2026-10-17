@@ -47,6 +47,8 @@ class PermissionsPanel(
 
     private var reason: String? = null
 
+    private var appliedGateRevision = -1L
+
     /** Per-request typed reply refusals, pruned to still-pending ids. */
     private val refusals = LinkedHashMap<String, String>()
 
@@ -81,6 +83,13 @@ class PermissionsPanel(
 
     /** Replaces the pending cards; a still-served selection is preserved. */
     fun update(permissionList: List<NativePermissionEntry>) {
+        val gateRevision = gate.revision()
+        if (available && reason == null && permissionList == permissions &&
+            gateRevision == appliedGateRevision
+        ) {
+            return
+        }
+        appliedGateRevision = gateRevision
         available = true
         reason = null
         permissions = permissionList

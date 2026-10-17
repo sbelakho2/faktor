@@ -61,6 +61,12 @@ class ChangesPanel : JPanel(BorderLayout()) {
 
     private val rowButtons = ArrayList<FaktorToggleButton>()
 
+    /** The path each retained button renders (keyed row reuse). */
+    private val rowPaths = ArrayList<String>()
+
+    /** The last rendered conflict facts (identical recheck = no rebuild). */
+    private var appliedFacts: List<String>? = null
+
     private val detailColumn = ScrollableColumn()
 
     private val emptyLabel = mutedLabel(CHANGES_EMPTY_COPY)
@@ -126,6 +132,8 @@ class ChangesPanel : JPanel(BorderLayout()) {
         returnButton.addActionListener { listener?.onReturnToRun() }
         recheckButton.addActionListener { listener?.onRecheckBasis() }
         installKeyboardNavigation()
+        rawHashesArea.a11y("Raw candidate hashes", "Advanced candidate identity details.")
+        a11y("Changes", "Candidate changes and the immutable diff review.")
 
         val candidateBody = pageColumn(gap = Spacing.XS, padding = 0)
         candidateBody.add(candidateLabel)
@@ -190,6 +198,12 @@ class ChangesPanel : JPanel(BorderLayout()) {
 
     /** Replaces the view with the served model (selection survives refresh). */
     fun update(value: ChangeReviewModel) {
+        // A stream refresh re-posts the same projection; identical input is a
+        // strict no-op (the open-state cards, selection and scroll survive).
+        if (model == value) {
+            updateButtons()
+            return
+        }
         val preferredPath = model?.rows?.getOrNull(selectedRowIndex)?.path
         model = value
         rebuildRows(value, preferredPath)
@@ -255,6 +269,8 @@ class ChangesPanel : JPanel(BorderLayout()) {
 
     /** Renders the S15 re-derived conflict facts (never a rebase control). */
     fun showConflictFacts(facts: List<String>) {
+        if (facts == appliedFacts) return
+        appliedFacts = ArrayList(facts)
         conflictColumn.removeAll()
         if (facts.isEmpty()) {
             conflictColumn.add(mutedLabel("No basis recheck has been run yet."))
@@ -313,23 +329,38 @@ class ChangesPanel : JPanel(BorderLayout()) {
     // ------------------------------------------------------------ rendering
 
     private fun rebuildRows(value: ChangeReviewModel, preferredPath: String?) {
-        rowsColumn.removeAll()
-        rowGroup = ButtonGroup()
-        rowButtons.clear()
+        val wantedPaths = value.rows.map { it.path }
         emptyLabel.isVisible = value.unavailable == null && value.rows.isEmpty()
         unavailableHeadline.isVisible = value.unavailable != null
         unavailableCopy.isVisible = value.unavailable != null
         unavailableCopy.fullText = value.unavailable ?: ""
-        for (index in value.rows.indices) {
-            val row = value.rows[index]
-            val button = FaktorToggleButton(rowButtonText(row))
-            button.toolTipText = rowTooltip(row)
-            button.alignmentX = Component.LEFT_ALIGNMENT
-            button.addActionListener { selectIndex(index) }
-            rowGroup.add(button)
-            rowButtons.add(button)
-            rowsColumn.add(button)
-            rowsColumn.add(vSpace(Spacing.XS))
+        val rebuilt = wantedPaths != rowPaths
+        if (!rebuilt) {
+            // Same rows in the same order: update only the changed labels.
+            for (index in value.rows.indices) {
+                val row = value.rows[index]
+                val text = rowButtonText(row)
+                val tooltip = rowTooltip(row)
+                val button = rowButtons[index]
+                if (button.text != text) button.text = text
+                if (button.toolTipText != tooltip) button.toolTipText = tooltip
+            }
+        } else {
+            rowsColumn.removeAll()
+            rowGroup = ButtonGroup()
+            rowButtons.clear()
+            rowPaths.clear()
+            for (row in value.rows) {
+                val button = FaktorToggleButton(rowButtonText(row))
+                button.toolTipText = rowTooltip(row)
+                button.alignmentX = Component.LEFT_ALIGNMENT
+                button.addActionListener { selectPath(row.path) }
+                rowGroup.add(button)
+                rowButtons.add(button)
+                rowPaths.add(row.path)
+                rowsColumn.add(button)
+                rowsColumn.add(vSpace(Spacing.XS))
+            }
         }
         val target = when {
             value.rows.isEmpty() -> -1
@@ -339,7 +370,13 @@ class ChangesPanel : JPanel(BorderLayout()) {
         }
         selectedRowIndex = target
         if (target >= 0) rowButtons[target].isSelected = true
-        rowsColumn.revalidate()
+        if (rebuilt) rowsColumn.revalidate()
+    }
+
+    /** Row activation keyed by PATH, so a reused button keeps its meaning. */
+    private fun selectPath(path: String) {
+        val index = model?.rows?.indexOfFirst { it.path == path } ?: -1
+        if (index >= 0) selectIndex(index)
     }
 
     private fun rowButtonText(row: ChangeRow): String {

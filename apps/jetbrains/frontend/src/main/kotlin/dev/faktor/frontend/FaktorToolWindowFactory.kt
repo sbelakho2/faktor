@@ -33,10 +33,13 @@ class FaktorToolWindowFactory : ToolWindowFactory {
         // Parity with the VS Code extension: the control-plane credential is
         // read from the OS/IDE secret store (PasswordSafe, credential
         // attributes = service + "endpoint|organization") and handed to the
-        // client; the non-secret coordinates live in project properties.
+        // client; the non-secret coordinates are the SAME application-level
+        // keys the platform Configurable writes, so both surfaces resolve one
+        // credential row in every project.
         val credentialStore = ControlPlaneCredentialStore(IntelliJPasswordSafeVault())
-        val scopeStore = IntelliJControlPlaneScopeStore(project)
-        val sessionStore = IntelliJControlPlaneSessionStore(project)
+        val scopeStore = IntelliJControlPlaneScopeStore()
+        scopeStore.migrateFromProject(project)
+        val sessionStore = IntelliJControlPlaneSessionStore()
         val service = FaktorFrontendService(
             daemonBinaryResolver(project),
             dataDir,

@@ -87,8 +87,12 @@ data class UsagePanelModel(
      * (and disabled whenever the billing surface itself is not usable). */
     fun grantEnabled(): Boolean = canGrantCredits && state == "ok"
 
-    /** The bounded display lines of the panel. */
-    fun lines(): List<String> {
+    /** The bounded display lines of the panel: formatted once per model. */
+    private val cachedLines: List<String> by lazy { buildLines() }
+
+    fun lines(): List<String> = cachedLines
+
+    private fun buildLines(): List<String> {
         val out = ArrayList<String>()
         when (state) {
             "disabled" -> out.add(
@@ -181,8 +185,8 @@ data class UsagePanelModel(
     }
 }
 
-/** Exact micro-unit display of one money value (never scientific notation). */
-fun micro(value: BigInteger): String = MicroMoney.microText(value)
+/** Exact micro-unit display of one money value, memoized by exact value. */
+fun micro(value: BigInteger): String = FormattedValues.micro(value)
 
 private fun utcSeconds(ms: Long): String {
     val instant = java.time.Instant.ofEpochMilli(ms)
@@ -336,6 +340,7 @@ class UsagePanel : JPanel(BorderLayout()) {
     private val tokenLabel = WrappedLabel("Tokens — not reported")
 
     private val tokenBar = javax.swing.JProgressBar(0, 100).apply {
+        a11y("Token quota", "Share of the plan token limit used this period.")
         isStringPainted = false
         isVisible = false
         alignmentX = java.awt.Component.LEFT_ALIGNMENT
@@ -347,7 +352,9 @@ class UsagePanel : JPanel(BorderLayout()) {
 
     private val planLabel = WrappedLabel("Plan — not reported")
 
-    private val linesArea = compactArea(10)
+    private val linesArea = compactArea(10).apply {
+        a11y("Usage detail", "Exact token, spend and credit lines.")
+    }
 
     private val advancedToggle = secondaryButton("Show advanced")
 
@@ -362,6 +369,7 @@ class UsagePanel : JPanel(BorderLayout()) {
     private var listener: Listener? = null
 
     private var model: UsagePanelModel? = null
+    private var applied = false
 
     init {
         linesArea.isOpaque = false
@@ -442,10 +450,7 @@ class UsagePanel : JPanel(BorderLayout()) {
         val observed = quota.observed ?: return null
         val limit = quota.value
         if (limit.signum() <= 0) return null
-        val percent = observed.multiply(java.math.BigInteger.valueOf(100))
-            .divide(limit)
-            .toInt()
-        return percent.coerceIn(0, 100)
+        return FormattedValues.percent(observed, limit)
     }
 
     /** The primary currency/token lines (smoke observable). */
@@ -471,6 +476,8 @@ class UsagePanel : JPanel(BorderLayout()) {
     }
 
     private fun apply(value: UsagePanelModel?) {
+        if (applied && model == value) return
+        applied = true
         model = value
         val text = value?.lines() ?: emptyList()
         linesArea.text = text.joinToString("\n")

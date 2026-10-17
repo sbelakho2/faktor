@@ -44,6 +44,10 @@ import {
 import { ReadinessCancelledError, awaitReady } from './readiness';
 import { LifecycleFence } from './lifecycleFence';
 import {
+  CoalescingRefreshScheduler,
+  nodeSchedulerTimers,
+} from './refreshScheduler';
+import {
   FetchLike,
   NativeApiError,
   NativeBillingUsage,
@@ -95,7 +99,9 @@ import {
   parseBoardReadRequest,
   permissionSummaries,
   summarizeAgents,
+  transcriptContentEqual,
   transcriptFromMessages,
+  transcriptSignature,
   unavailableBoardState,
 } from './state';
 import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf, usagePanelSections } from './cockpit';
@@ -268,6 +274,21 @@ const active: ActiveSession = {
 
 const store = new FaktorStore();
 let chatProvider: ChatViewProvider | null = null;
+
+/**
+ * Stream frames coalesce into bounded refreshes. `refresh()` itself is
+ * single-flight; a frame that arrives while a refresh is running asks the
+ * scheduler for the next window instead of being dropped.
+ */
+let streamRefresh: CoalescingRefreshScheduler | null = null;
+streamRefresh = new CoalescingRefreshScheduler((done) => {
+  if (active.refreshing) {
+    streamRefresh?.request();
+    done();
+    return;
+  }
+  void refresh().finally(done);
+}, nodeSchedulerTimers);
 let statusBar: vscode.StatusBarItem | null = null;
 /** The activation context, so deactivate-time paths can still publish. */
 let activeContext: vscode.ExtensionContext | null = null;
@@ -1240,6 +1261,11 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
   // its abort signal so a concurrently-starting daemon cannot be leaked.
   startAttempt?.controller.abort();
   startAttempt = null;
+  streamRefresh?.reset();
+  if (active.refreshTimer !== null) {
+    clearTimeout(active.refreshTimer);
+    active.refreshTimer = null;
+  }
   preflightHost.startingAttempt = false;
   preflightHost.readiness = 'idle';
   preflightHost.readinessDetail = null;
@@ -1389,7 +1415,8 @@ async function ensureSession(
   composerAttachmentsSessionId = sessionId;
   try {
     const page = await client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT });
-    store.patch({ transcript: transcriptOf(page) });
+    const transcript = transcriptOf(page);
+    store.patch({ transcript, transcriptRevision: transcriptSignature(transcript) });
   } catch (error) {
     recordBackgroundError(error);
   }
@@ -1431,6 +1458,11 @@ async function switchSession(
   }
   active.sessionId = decision.sessionId;
   bumpLifecycle();
+  streamRefresh?.reset();
+  if (active.refreshTimer !== null) {
+    clearTimeout(active.refreshTimer);
+    active.refreshTimer = null;
+  }
   active.activeRunId = null;
   active.taskVerificationCache.clear();
   active.taskProofKey = null;
@@ -1471,12 +1503,14 @@ async function switchSession(
     activeRunId: null,
     busy: false,
     transcript: [],
+    transcriptRevision: '',
     streamStatus: 'stopped',
     lastError: null,
   });
   try {
     const page = await client.messages(decision.sessionId, { limit: HISTORY_PAGE_LIMIT });
-    store.patch({ transcript: transcriptOf(page) });
+    const transcript = transcriptOf(page);
+    store.patch({ transcript, transcriptRevision: transcriptSignature(transcript) });
   } catch (error) {
     recordBackgroundError(error);
   }
@@ -1552,19 +1586,6 @@ async function switchSessionFromCommand(context: vscode.ExtensionContext): Promi
   await switchSession(picked.sessionId, context);
 }
 
-/** Cheap structural signature: refresh the transcript only when it changed. */
-function transcriptSignature(entries: readonly TranscriptEntry[]): string {
-  let out = '';
-  for (const entry of entries) {
-    out += `${entry.id}:${entry.text.length}:${entry.reasoning.length}:${entry.summary.length}:`;
-    for (const tool of entry.tools) {
-      out += `${tool.state}:${tool.excerpt?.length ?? 0}:${tool.exitCode ?? 'n'};`;
-    }
-    out += '|';
-  }
-  return out;
-}
-
 function transcriptOf(page: NativeMessagePage): TranscriptEntry[] {
   return transcriptFromMessages(page.messages as unknown as Json[]);
 }
@@ -1585,8 +1606,10 @@ function startStream(): void {
       // The journal stream is a LIVENESS signal only: its `EventKind` frames
       // do not carry the bounded message/part page shapes, so the reducer
       // deliberately does not fabricate incremental transcript state from
-      // them. Every durable frame schedules one bounded page refresh.
-      scheduleRefresh();
+      // them. Frames coalesce into one bounded page refresh per window, so a
+      // continuous 200/s stream can neither starve the refresh (a trailing
+      // debounce) nor refresh 200 times a second.
+      streamRefresh?.request();
     },
     onStatus: (status: EventStreamStatus, detail) => {
       if (status === 'protocol_blocked') {
@@ -1830,8 +1853,15 @@ async function refresh(): Promise<void> {
     // Assistant/status/tool lines are durable message rows; re-render the
     // bounded newest page only when its structure actually changed.
     const transcript = transcriptOf(messages);
-    if (transcriptSignature(transcript) !== transcriptSignature(store.snapshot().transcript)) {
-      store.patch({ transcript });
+    const transcriptRevision = transcriptSignature(transcript);
+    const previous = store.snapshot();
+    if (
+      transcriptRevision !== previous.transcriptRevision ||
+      // A digest is a cheap gate, never an authority: a collision must not
+      // suppress a genuinely different (same-length/same-digest) document.
+      !transcriptContentEqual(transcript, previous.transcript)
+    ) {
+      store.patch({ transcript, transcriptRevision });
     }
   } catch (error) {
     if (current()) {

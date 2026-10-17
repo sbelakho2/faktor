@@ -5,7 +5,6 @@
 // blocking/approval cards stay on their own actionable surfaces.
 package dev.faktor.frontend
 
-import dev.faktor.shared.MicroMoney
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Dimension
@@ -25,6 +24,12 @@ class OverviewPanel : JPanel(BorderLayout()) {
     private val goalLabel = WrappedLabel("No run yet. Describe a task in the composer.")
 
     private val rows = LinkedHashMap<String, WrappedLabel>()
+
+    private var appliedModel: TaskTreeModel? = null
+
+    private var modelApplied = false
+
+    private var appliedChip: Pair<String, SemanticState>? = null
 
     init {
         goalLabel.font = sectionTitleFont()
@@ -66,6 +71,9 @@ class OverviewPanel : JPanel(BorderLayout()) {
 
     /** Replaces the view with the served model; null renders the honest empty state. */
     fun updateModel(model: TaskTreeModel?) {
+        if (modelApplied && appliedModel == model) return
+        modelApplied = true
+        appliedModel = model
         if (model == null) {
             header.text = "overview: no run yet"
             setChip("No run yet", SemanticState.DIM)
@@ -126,8 +134,8 @@ class OverviewPanel : JPanel(BorderLayout()) {
         rows["Spend"]?.fullText = if (spend == null || spent == null) {
             "Cost unavailable"
         } else {
-            "$" + MicroMoney.usdText(spent) +
-                (spend.maxCostMicro?.let { " of $" + MicroMoney.usdText(it) } ?: "") +
+            "$" + FormattedValues.usd(spent) +
+                (spend.maxCostMicro?.let { " of $" + FormattedValues.usd(it) } ?: "") +
                 " · " + (spend.spentTokens?.let { "$it tokens" } ?: "tokens unavailable") +
                 (spend.maxTokens?.let { " of $it" } ?: "")
         }
@@ -150,6 +158,9 @@ class OverviewPanel : JPanel(BorderLayout()) {
     }
 
     private fun setChip(text: String, state: SemanticState) {
+        val signature = Pair(text, state)
+        if (appliedChip == signature) return
+        appliedChip = signature
         stateChip.removeAll()
         // A plain tone-colored label rather than a bordered chip: the state
         // must stay legible in every offscreen/theme render, and the header

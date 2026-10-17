@@ -1,0 +1,198 @@
+{
+  "schema": "faktor-vscode-stream-probe/v1",
+  "capturedAt": "2026-10-17T10:13:06.311Z",
+  "label": "before",
+  "transcriptMessages": 500,
+  "scenarios": [
+    {
+      "scenario": "pinned",
+      "config": {
+        "tokens": 10000,
+        "deltas": 500,
+        "tokensPerDelta": 20,
+        "deltasPerSecond": 200
+      },
+      "seed": {
+        "passed": {
+          "messages": 1,
+          "renders": 1,
+          "nodes": 1508,
+          "children": 500,
+          "layoutReads": 4,
+          "layoutWrites": 1,
+          "queries": 0,
+          "mutations": 552
+        },
+        "chrome": {
+          "LayoutCount": 3,
+          "RecalcStyleCount": 5,
+          "LayoutDuration": 0.033419,
+          "ScriptDuration": 0.017511
+        }
+      },
+      "stream": {
+        "elapsedMs": 4828,
+        "passed": {
+          "messages": 500,
+          "snapshotMessages": 500,
+          "layoutReads": 2002,
+          "layoutWrites": 501,
+          "queries": 1500,
+          "mutations": 16755,
+          "frames": 0,
+          "renderCounts": {
+            "message": 500,
+            "snapshot": 500,
+            "transcript-last": 500
+          }
+        },
+        "renderCounts": {
+          "message": 500,
+          "snapshot": 500,
+          "transcript-last": 500
+        },
+        "final": {
+          "done": true,
+          "nodes": 1510,
+          "children": 500,
+          "scrollTop": 90276,
+          "scrollHeight": 90852,
+          "clientHeight": 576
+        },
+        "chromeDelta": {
+          "Timestamp": 4.832,
+          "AudioHandlers": 0,
+          "AudioWorkletProcessors": 0,
+          "Documents": -3,
+          "Frames": -3,
+          "JSEventListeners": 0,
+          "LayoutObjects": 58,
+          "MediaKeySessions": 0,
+          "MediaKeys": 0,
+          "Nodes": -22,
+          "Resources": 0,
+          "ContextLifecycleStateObservers": -5,
+          "V8PerContextDatas": -1,
+          "WorkerGlobalScopes": 0,
+          "UACSSResources": 0,
+          "RTCPeerConnections": 0,
+          "ResourceFetchers": -3,
+          "AdSubframes": 0,
+          "DetachedScriptStates": -1,
+          "ArrayBufferContents": 0,
+          "LayoutCount": 1001,
+          "RecalcStyleCount": 1001,
+          "LayoutDuration": 1.926,
+          "RecalcStyleDuration": 0.096,
+          "DevToolsCommandDuration": 0.015,
+          "ScriptDuration": 2.162,
+          "V8CompileDuration": 0,
+          "TaskDuration": 4.571,
+          "TaskOtherDuration": 0.372,
+          "ThreadTime": 4.564,
+          "ProcessTime": 5.133,
+          "JSHeapUsedSize": -662244,
+          "JSHeapTotalSize": 64749568,
+          "FirstMeaningfulPaint": 0,
+          "DomContentLoaded": 0,
+          "NavigationStart": 0
+        }
+      }
+    },
+    {
+      "scenario": "unpinned",
+      "config": {
+        "tokens": 10000,
+        "deltas": 500,
+        "tokensPerDelta": 20,
+        "deltasPerSecond": 200
+      },
+      "seed": {
+        "passed": {
+          "messages": 1,
+          "renders": 1,
+          "nodes": 1508,
+          "children": 500,
+          "layoutReads": 4,
+          "layoutWrites": 1,
+          "queries": 0,
+          "mutations": 552
+        },
+        "chrome": {
+          "LayoutCount": 3,
+          "RecalcStyleCount": 3,
+          "LayoutDuration": 0.006411,
+          "ScriptDuration": 0.005288
+        }
+      },
+      "stream": {
+        "elapsedMs": 4067,
+        "passed": {
+          "messages": 500,
+          "snapshotMessages": 500,
+          "layoutReads": 5000,
+          "layoutWrites": 501,
+          "queries": 1500,
+          "mutations": 16755,
+          "frames": 0,
+          "renderCounts": {
+            "message": 500,
+            "snapshot": 500,
+            "transcript-last": 500
+          }
+        },
+        "renderCounts": {
+          "message": 500,
+          "snapshot": 500,
+          "transcript-last": 500
+        },
+        "final": {
+          "done": true,
+          "nodes": 1510,
+          "children": 500,
+          "scrollTop": 0,
+          "scrollHeight": 90852,
+          "clientHeight": 576
+        },
+        "chromeDelta": {
+          "Timestamp": 4.069,
+          "AudioHandlers": 0,
+          "AudioWorkletProcessors": 0,
+          "Documents": -2,
+          "Frames": -3,
+          "JSEventListeners": -63,
+          "LayoutObjects": -2559,
+          "MediaKeySessions": 0,
+          "MediaKeys": 0,
+          "Nodes": -3234,
+          "Resources": 0,
+          "ContextLifecycleStateObservers": -16,
+          "V8PerContextDatas": -1,
+          "WorkerGlobalScopes": 0,
+          "UACSSResources": 0,
+          "RTCPeerConnections": 0,
+          "ResourceFetchers": -2,
+          "AdSubframes": 0,
+          "DetachedScriptStates": -1,
+          "ArrayBufferContents": 0,
+          "LayoutCount": 1001,
+          "RecalcStyleCount": 1001,
+          "LayoutDuration": 1.626,
+          "RecalcStyleDuration": 0.094,
+          "DevToolsCommandDuration": 0.01,
+          "ScriptDuration": 1.762,
+          "V8CompileDuration": 0,
+          "TaskDuration": 3.742,
+          "TaskOtherDuration": 0.249,
+          "ThreadTime": 3.74,
+          "ProcessTime": 4.012,
+          "JSHeapUsedSize": 1433724,
+          "JSHeapTotalSize": -262144,
+          "FirstMeaningfulPaint": 0,
+          "DomContentLoaded": 0,
+          "NavigationStart": 0
+        }
+      }
+    }
+  ]
+}

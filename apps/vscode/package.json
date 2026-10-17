@@ -22,6 +22,7 @@
     "onCommand:faktor.refresh",
     "onCommand:faktor.controlPlaneSignIn",
     "onCommand:faktor.controlPlaneSignOut",
+    "onCommand:faktor.reconnectStream",
     "onCommand:faktor.switchSession",
     "onCommand:faktor.locateDaemon",
     "onView:faktor.chat"
@@ -67,12 +68,12 @@
       },
       {
         "command": "faktor.controlPlaneSignIn",
-        "title": "Sign In",
+        "title": "Sign in to Control Plane",
         "category": "Faktor"
       },
       {
         "command": "faktor.controlPlaneSignOut",
-        "title": "Sign Out",
+        "title": "Sign out of Control Plane",
         "category": "Faktor"
       },
       {

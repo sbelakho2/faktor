@@ -748,14 +748,12 @@ pub(crate) async fn native_events(
 /// under either `serde_json` object map — the alphabetical field order below
 /// is the BTree order and stays the order `preserve_order` produces.
 pub(crate) fn native_event_row(e: &faktor_core::event::Event) -> serde_json::Value {
-    let kind = super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default());
-    let state = agent_state_tag(e.state);
     serde_json::to_value(NativeEventRowRef {
-        kind: &kind,
-        op_id: e.op_id.map(|o| o.to_string()),
+        kind: e.kind.as_tag(),
+        op_id: e.op_id.map(OpIdWire),
         payload: &e.payload,
         seq: e.seq.raw(),
-        state: &state,
+        state: e.state.as_tag(),
         ts_ms: e.ts_ms,
     })
     .unwrap_or(serde_json::Value::Null)
@@ -773,7 +771,7 @@ struct NativeEventRowRef<'a> {
     #[serde(rename = "kind")]
     kind: &'a str,
     #[serde(rename = "opId")]
-    op_id: Option<String>,
+    op_id: Option<OpIdWire>,
     #[serde(rename = "payload")]
     payload: &'a Option<serde_json::Value>,
     #[serde(rename = "seq")]
@@ -784,12 +782,110 @@ struct NativeEventRowRef<'a> {
     ts_ms: i64,
 }
 
+/// Wire form of a durable op id: a DECIMAL STRING, exactly like the
+/// historical `o.to_string()` field, but written through the serializer's
+/// `collect_str` without building an intermediate `String`.
+#[derive(Clone, Copy)]
+struct OpIdWire(faktor_core::id::OpId);
+
+impl serde::Serialize for OpIdWire {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
 /// Strict native SSE query of `/native/session/{id}/events`.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeSessionEventsQuery {
     #[serde(default)]
     after: Option<u64>,
+}
+
+/// Bounded flush policy of the native journal SSE stream.
+///
+/// Frames are NEVER merged: every durable event keeps its own `id:`/`event:`/
+/// `data:` triple, so ordering, cursor resume and per-event semantics are
+/// unchanged. Coalescing happens one layer below the protocol, at the HTTP
+/// chunk boundary: up to [`SSE_CHUNK_MAX_FRAMES`] frames are written per
+/// body chunk, flushing once [`SSE_CHUNK_MAX_BYTES`] is reached (a single
+/// frame is never split), which cuts write/syscall and task-wakeup count
+/// without changing a single wire byte of any frame.
+///
+/// - Live deltas (`model_chunk_received`) are collected for at most
+///   [`SSE_DELTA_COALESCE_MS`] so a 100-300 token/s stream becomes a few
+///   chunks per second instead of one wakeup per token.
+/// - Any non-delta event (state/permission/tool/lifecycle) disables the
+///   linger and is flushed immediately: attention events never wait behind
+///   a delta window.
+/// - Catch-up pages are already batched (up to
+///   [`MAX_NATIVE_EVENT_PAGE`] rows) and never linger.
+/// - With no durable tail change the stream sleeps on the session's journal
+///   generation (an append wakes it immediately) with a
+///   [`SSE_FALLBACK_POLL_MS`] fallback poll, and emits a heartbeat frame at
+///   most every [`SSE_HEARTBEAT_MS`] (clients ignore heartbeats).
+pub(crate) const SSE_DELTA_COALESCE_MS: u64 = 8;
+pub(crate) const SSE_FALLBACK_POLL_MS: u64 = 250;
+pub(crate) const SSE_HEARTBEAT_MS: u64 = 5_000;
+pub(crate) const SSE_CHUNK_MAX_FRAMES: usize = 64;
+pub(crate) const SSE_CHUNK_MAX_BYTES: usize = 64 * 1024;
+
+/// `io::Write` adapter so serde_json serializes a row DIRECTLY into the
+/// reused chunk buffer (no intermediate `String`, no `Value` tree).
+struct ChunkWriter<'a>(&'a mut bytes::BytesMut);
+
+impl std::io::Write for ChunkWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Append a decimal u64 without allocating (stack digits + one extend).
+fn put_u64(buf: &mut bytes::BytesMut, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&digits[at..]);
+}
+
+/// Encode ONE durable journal event as an SSE frame into `buf`:
+/// `id: <seq>\nevent: <kind>\ndata: <native_event_row>\n\n`. Byte-identical
+/// to the `axum::response::sse::Event` encoding this stream used before;
+/// `native_event_row` and this writer share one row serializer.
+pub(crate) fn write_native_event_frame(buf: &mut bytes::BytesMut, e: &faktor_core::event::Event) {
+    buf.extend_from_slice(b"id: ");
+    put_u64(buf, e.seq.raw());
+    buf.extend_from_slice(b"\nevent: ");
+    buf.extend_from_slice(e.kind.as_tag().as_bytes());
+    buf.extend_from_slice(b"\ndata: ");
+    let frame_start = buf.len();
+    let row = NativeEventRowRef {
+        kind: e.kind.as_tag(),
+        op_id: e.op_id.map(OpIdWire),
+        payload: &e.payload,
+        seq: e.seq.raw(),
+        state: e.state.as_tag(),
+        ts_ms: e.ts_ms,
+    };
+    if serde_json::to_writer(ChunkWriter(buf), &row).is_err() {
+        // A row that cannot serialize must never produce a torn frame: roll
+        // back to the data start and emit the historical `{}` fallback.
+        buf.truncate(frame_start);
+        buf.extend_from_slice(b"{}");
+    }
+    buf.extend_from_slice(b"\n\n");
 }
 
 /// `GET /native/session/{id}/events?after=<seq>` — the native durable
@@ -817,115 +913,266 @@ pub(crate) async fn native_session_events(
         Err(r) => return *r,
     };
     let cursor = q.after.unwrap_or(0) as i64;
-    let stream = native_journal_stream(handle, cursor);
-    axum::response::sse::Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(std::time::Duration::from_secs(5))
-                .text("keep-alive"),
-        )
-        .into_response()
+    let stream = native_journal_stream(handle, cursor, std::sync::Arc::clone(&state.ready));
+    let mut response = Response::new(axum::body::Body::from_stream(stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
-/// The bounded, paged journal poll behind the native SSE stream: at most
-/// [`MAX_NATIVE_EVENT_PAGE`] frames per poll are materialized; when the
-/// page is exhausted the stream sleeps and emits a heartbeat. The journal
-/// is the source of truth and the frame `id:` is the resume cursor. A
-/// journal read failure is terminal: the stream emits one `error` frame
-/// naming `journal_read_failed` and then ends — it never heartbeats over a
-/// corrupt or unreadable authority.
+type JournalStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::convert::Infallible>> + Send>,
+>;
+
+/// The bounded, paged journal poll behind the native SSE stream.
+///
+/// One durable page (<= [`MAX_NATIVE_EVENT_PAGE`]) is read per catch-up
+/// iteration; at most [`SSE_CHUNK_MAX_FRAMES`] frames /
+/// [`SSE_CHUNK_MAX_BYTES`] bytes are emitted per HTTP chunk. A journal read
+/// failure is terminal: the stream emits one `error` frame naming
+/// `journal_read_failed` and then ends — it never heartbeats over a corrupt
+/// or unreadable authority.
 fn native_journal_stream(
     handle: faktor_session::SessionHandle,
     cursor: i64,
-) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
-       + Send
-       + 'static {
-    futures_util::stream::unfold(
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> JournalStream {
+    let rx = handle.subscribe_journal();
+    let state = futures_util::stream::unfold(
         (
             handle,
             cursor,
-            std::collections::VecDeque::<axum::response::sse::Event>::new(),
+            std::collections::VecDeque::new(),
+            rx,
+            bytes::BytesMut::new(),
             false,
+            tokio::time::Instant::now(),
+            false,
+            tokio::time::Instant::now(),
         ),
-        move |(handle, mut cursor, mut queue, terminated)| async move {
-            if terminated {
-                return None;
-            }
-            if let Some(frame) = queue.pop_front() {
-                return Some((
-                    Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
-                    (handle, cursor, queue, terminated),
-                ));
-            }
-            let events = match handle.events_range(
-                cursor.saturating_add(1) as u64,
-                Some(MAX_NATIVE_EVENT_PAGE as u64),
-            ) {
-                Ok(events) => events,
-                Err(e) => {
-                    tracing::error!(
-                        session_id = %handle.id(),
-                        error = %e,
-                        "native journal read failed; terminating the SSE stream"
-                    );
-                    return Some((
-                        Ok::<axum::response::sse::Event, std::convert::Infallible>(
-                            axum::response::sse::Event::default()
-                                .event("error")
-                                .data(r#"{"code":"journal_read_failed"}"#),
-                        ),
-                        (handle, cursor, queue, true),
-                    ));
+        move |(
+            handle,
+            mut cursor,
+            mut pending,
+            mut rx,
+            mut buf,
+            terminated,
+            mut last_emit,
+            mut saw_data,
+            mut linger_until,
+        )| {
+            let ready = std::sync::Arc::clone(&ready);
+            async move {
+                if terminated {
+                    return None;
                 }
-            };
-            let mut batch = std::collections::VecDeque::new();
-            let mut advanced = false;
-            for e in events {
-                let seq = e.seq.raw();
-                let kind =
-                    super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default());
-                // Direct serialization of the borrowed row: the payload is
-                // borrowed from the event (the historical path deep-cloned it
-                // through `json!` into a `Value` tree and then re-serialized
-                // the tree). Byte-identical: same fields, same order.
-                let state = agent_state_tag(e.state);
-                let data = serde_json::to_string(&NativeEventRowRef {
-                    seq,
-                    kind: &kind,
-                    state: &state,
-                    op_id: e.op_id.map(|o| o.to_string()),
-                    ts_ms: e.ts_ms,
-                    payload: &e.payload,
-                })
-                .unwrap_or_else(|_| "{}".into());
-                batch.push_back(
-                    axum::response::sse::Event::default()
-                        .event(kind)
-                        .id(seq.to_string())
-                        .data(data),
-                );
-                cursor = e.seq.raw() as i64;
-                advanced = true;
-            }
-            if advanced {
-                if let Some(frame) = batch.pop_front() {
-                    return Some((
-                        Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
-                        (handle, cursor, batch, terminated),
-                    ));
+                // `drain_now` flushes the queued frames on the next iteration;
+                // `false` after a journal wake means "read the newer tail first"
+                // so the coalescing window can absorb it.
+                let mut drain_now = false;
+                loop {
+                    // Graceful daemon shutdown ends every long-lived stream on
+                    // the next bounded tick; a dropped client body can never
+                    // hold the listener open past that bound.
+                    if !ready.load(std::sync::atomic::Ordering::Relaxed) {
+                        return None;
+                    }
+                    // Drain whenever a flush was decided, the queued frames
+                    // already fill a chunk, or the coalescing window expired.
+                    // The deadline term is REQUIRED for a partially drained
+                    // page: a 65..255-event catch-up leaves 1..63 frames after
+                    // the first 64-frame chunk, and with no newer durable tail
+                    // a pending-only stream would otherwise never flush them
+                    // (the old state machine only flushed on a new read).
+                    if !pending.is_empty()
+                        && (drain_now
+                            || pending.len() >= SSE_CHUNK_MAX_FRAMES
+                            || tokio::time::Instant::now() >= linger_until)
+                    {
+                        let mut frames = 0usize;
+                        while let Some(e) = pending.pop_front() {
+                            if frames > 0
+                                && (frames >= SSE_CHUNK_MAX_FRAMES
+                                    || buf.len() >= SSE_CHUNK_MAX_BYTES)
+                            {
+                                pending.push_front(e);
+                                break;
+                            }
+                            write_native_event_frame(&mut buf, &e);
+                            cursor = e.seq.raw() as i64;
+                            frames += 1;
+                        }
+                        let chunk = bytes::Bytes::copy_from_slice(&buf);
+                        buf.clear();
+                        last_emit = tokio::time::Instant::now();
+                        saw_data = true;
+                        return Some((
+                            Ok::<bytes::Bytes, std::convert::Infallible>(chunk),
+                            (
+                                handle,
+                                cursor,
+                                pending,
+                                rx,
+                                buf,
+                                terminated,
+                                last_emit,
+                                saw_data,
+                                linger_until,
+                            ),
+                        ));
+                    }
+
+                    // Mark the generation BEFORE the read: an append that lands
+                    // after this point changes the watched value, so the wait
+                    // below wakes immediately instead of sleeping the fallback.
+                    rx.borrow_and_update();
+                    // Resume the READ at the last queued frame: a coalescing
+                    // wake re-enters this loop with pending events that are not
+                    // yet emitted, and re-reading them would duplicate frames.
+                    let read_after = pending.back().map(|e| e.seq.raw() as i64).unwrap_or(cursor);
+                    let events = match handle.events_range(
+                        read_after.saturating_add(1) as u64,
+                        Some(MAX_NATIVE_EVENT_PAGE as u64),
+                    ) {
+                        Ok(events) => events,
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %handle.id(),
+                                error = %e,
+                                "native journal read failed; terminating the SSE stream"
+                            );
+                            buf.extend_from_slice(
+                                b"event: error\ndata: {\"code\":\"journal_read_failed\"}\n\n",
+                            );
+                            let chunk = bytes::Bytes::copy_from_slice(&buf);
+                            buf.clear();
+                            return Some((
+                                Ok::<bytes::Bytes, std::convert::Infallible>(chunk),
+                                (
+                                    handle,
+                                    cursor,
+                                    pending,
+                                    rx,
+                                    buf,
+                                    true,
+                                    last_emit,
+                                    saw_data,
+                                    linger_until,
+                                ),
+                            ));
+                        }
+                    };
+
+                    if events.is_empty() {
+                        if !pending.is_empty() {
+                            // The durable tail is caught up while frames from a
+                            // partially drained page are still queued. Flush
+                            // them NOW: waiting for a new append (or the idle
+                            // heartbeat/fallback loop) would strand the final
+                            // delta-only frames of this connection.
+                            drain_now = true;
+                            continue;
+                        }
+                        if saw_data {
+                            // One heartbeat immediately after the durable tail
+                            // drains (clients/proxies see liveness right away),
+                            // then at most one per SSE_HEARTBEAT_MS while idle.
+                            saw_data = false;
+                            buf.extend_from_slice(b"event: heartbeat\ndata: {}\n\n");
+                            let chunk = bytes::Bytes::copy_from_slice(&buf);
+                            buf.clear();
+                            last_emit = tokio::time::Instant::now();
+                            return Some((
+                                Ok::<bytes::Bytes, std::convert::Infallible>(chunk),
+                                (
+                                    handle,
+                                    cursor,
+                                    pending,
+                                    rx,
+                                    buf,
+                                    terminated,
+                                    last_emit,
+                                    saw_data,
+                                    linger_until,
+                                ),
+                            ));
+                        }
+                        let now = tokio::time::Instant::now();
+                        let heartbeat_due = last_emit
+                            .checked_add(std::time::Duration::from_millis(SSE_HEARTBEAT_MS))
+                            .unwrap_or(now);
+                        let fallback = tokio::time::sleep(std::time::Duration::from_millis(
+                            SSE_FALLBACK_POLL_MS,
+                        ));
+                        tokio::pin!(fallback);
+                        let heartbeat = tokio::time::sleep_until(heartbeat_due);
+                        tokio::pin!(heartbeat);
+                        tokio::select! {
+                            changed = rx.changed() => {
+                                // A missed/failed watch channel falls back to
+                                // the bounded poll; the durable cursor decides.
+                                let _ = changed;
+                                drain_now = false;
+                            }
+                            _ = &mut fallback => drain_now = false,
+                            _ = &mut heartbeat => {
+                                buf.extend_from_slice(b"event: heartbeat\ndata: {}\n\n");
+                                let chunk = bytes::Bytes::copy_from_slice(&buf);
+                                buf.clear();
+                                last_emit = tokio::time::Instant::now();
+                                return Some((
+                                    Ok::<bytes::Bytes, std::convert::Infallible>(chunk),
+                                    (handle, cursor, pending, rx, buf, terminated, last_emit, saw_data, linger_until),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
+                    let page_full = events.len() >= MAX_NATIVE_EVENT_PAGE as usize;
+                    let was_empty = pending.is_empty();
+                    let mut has_non_delta = false;
+                    for e in events {
+                        has_non_delta |=
+                            e.kind != faktor_core::event::EventKind::ModelChunkReceived;
+                        pending.push_back(e);
+                    }
+                    if was_empty {
+                        // The linger window is anchored at the FIRST unflushed
+                        // delta, never reset by later arrivals: an unbounded
+                        // reset would starve a continuous stream.
+                        linger_until = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(SSE_DELTA_COALESCE_MS);
+                    }
+
+                    // Immediate flush for non-delta events, full catch-up pages
+                    // and an already-full chunk. Only a caught-up delta-only
+                    // tail lingers for the bounded coalescing window.
+                    if has_non_delta
+                        || page_full
+                        || pending.len() >= SSE_CHUNK_MAX_FRAMES
+                        || tokio::time::Instant::now() >= linger_until
+                    {
+                        drain_now = true;
+                        continue;
+                    }
+                    let linger = tokio::time::sleep_until(linger_until);
+                    tokio::pin!(linger);
+                    tokio::select! {
+                        _ = rx.changed() => drain_now = false,
+                        _ = &mut linger => drain_now = true,
+                    }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            Some((
-                Ok::<axum::response::sse::Event, std::convert::Infallible>(
-                    axum::response::sse::Event::default()
-                        .event("heartbeat")
-                        .data("{}"),
-                ),
-                (handle, cursor, queue, terminated),
-            ))
         },
-    )
+    );
+    Box::pin(state)
 }
 
 // ------------------------------------------------------------ permissions
@@ -2062,11 +2309,36 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let (frames, ended) = read_sse(response, 6, std::time::Duration::from_secs(5)).await;
+        let (frames, ended) = read_sse(response, 2, std::time::Duration::from_secs(5)).await;
         assert!(!ended, "a healthy journal stream stays open: {frames}");
         assert!(frames.contains("event: phase_changed"), "{frames}");
         assert!(frames.contains("id: 2"), "{frames}");
         assert!(frames.contains("event: heartbeat"), "{frames}");
+    }
+
+    /// Graceful daemon shutdown must END a long-lived stream on the next
+    /// bounded tick. The readiness flag is the signal: a client that keeps its
+    /// body open can never hold the listener past the 250 ms poll bound.
+    #[tokio::test]
+    async fn native_journal_sse_ends_when_readiness_turns_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-shutdown");
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(0) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+            .ready
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (frames, ended) = read_sse(response, 2, std::time::Duration::from_secs(2)).await;
+        assert!(
+            ended,
+            "a shutdown readiness flag must end the stream: {frames}"
+        );
     }
 
     /// Finding 4 (P1) hostile: a corrupt durable event must terminate the
@@ -2119,6 +2391,380 @@ mod tests {
         assert!(
             !frames.contains("heartbeat"),
             "no heartbeat may follow a failed authority read: {frames}"
+        );
+    }
+
+    /// Read complete SSE frames off a body stream until `wanted` data
+    /// frames arrived (heartbeats/comment lines are skipped). Returns
+    /// `(id, event, data)` triples in wire order and the number of body
+    /// chunks consumed.
+    async fn read_wire_frames(
+        body: axum::body::Body,
+        wanted: usize,
+        deadline: std::time::Duration,
+    ) -> (Vec<(u64, String, String)>, usize) {
+        use futures_util::StreamExt as _;
+        let mut stream = body.into_data_stream();
+        let mut pending = Vec::new();
+        let mut frames = Vec::new();
+        let mut chunks = 0usize;
+        while frames.len() < wanted {
+            let next = tokio::time::timeout(deadline, stream.next())
+                .await
+                .expect("SSE read deadline");
+            let Some(Ok(chunk)) = next else { break };
+            chunks += 1;
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
+                let raw: Vec<u8> = pending.drain(..end + 2).collect();
+                let text = String::from_utf8_lossy(&raw);
+                let mut id = None;
+                let mut event = None;
+                let mut data = String::new();
+                for line in text.lines() {
+                    if let Some(v) = line.strip_prefix("id: ") {
+                        id = v.trim().parse::<u64>().ok();
+                    } else if let Some(v) = line.strip_prefix("event: ") {
+                        event = Some(v.trim().to_string());
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        if !data.is_empty() {
+                            data.push('\n');
+                        }
+                        data.push_str(v);
+                    }
+                }
+                if let (Some(id), Some(event)) = (id, event) {
+                    if event != "heartbeat" {
+                        frames.push((id, event, data));
+                    }
+                }
+            }
+            // A single coalesced chunk may carry more frames than the
+            // consumer reads before disconnecting; model exactly that.
+            frames.truncate(wanted);
+        }
+        (frames, chunks)
+    }
+
+    /// Coalescing is a TRANSPORT concern only: a pre-seeded catch-up page is
+    /// batched into one HTTP chunk (≤ 64 frames), yet every journal event
+    /// keeps its own complete frame, id and payload, in journal order.
+    #[tokio::test]
+    async fn native_journal_sse_coalesced_chunks_preserve_every_frame_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-coalesce");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for i in 0..40u64 {
+            let kind = if i % 2 == 0 {
+                faktor_core::event::EventKind::ModelChunkReceived
+            } else {
+                faktor_core::event::EventKind::PhaseChanged
+            };
+            handle
+                .force_append_event(
+                    kind,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(1) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (frames, chunks) =
+            read_wire_frames(response.into_body(), 40, std::time::Duration::from_secs(5)).await;
+        assert_eq!(frames.len(), 40, "every durable event must be delivered");
+        assert_eq!(
+            chunks, 1,
+            "a 40-frame catch-up page must coalesce into one HTTP chunk"
+        );
+        for (index, (id, event, data)) in frames.iter().enumerate() {
+            assert_eq!(*id, index as u64 + 2, "journal order is preserved");
+            let expected_kind = if index % 2 == 0 {
+                "model_chunk_received"
+            } else {
+                "phase_changed"
+            };
+            assert_eq!(event, expected_kind);
+            let row: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(row["seq"], serde_json::json!(*id));
+            assert_eq!(row["kind"], serde_json::json!(expected_kind));
+            assert_eq!(row["payload"]["i"], serde_json::json!(index));
+            assert_eq!(row["opId"], serde_json::json!("1"));
+        }
+    }
+
+    /// An abrupt disconnect after an arbitrary frame plus a reconnect at the
+    /// last delivered id yields EXACTLY the events the client missed: no
+    /// duplicate of the last id, no gap, no dropped final frame (the
+    /// coalescing buffer is never a cursor authority).
+    #[tokio::test]
+    async fn native_journal_sse_reconnect_is_duplicate_and_gap_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-reconnect");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for i in 0..20u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        let first = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(0) })),
+        )
+        .await;
+        let (head, _) =
+            read_wire_frames(first.into_body(), 7, std::time::Duration::from_secs(5)).await;
+        assert_eq!(head.len(), 7);
+        let last = head.last().unwrap().0;
+        assert_eq!(last, 7, "seq 1 is the durable SessionCreated");
+
+        // More events land while the client is disconnected, including the
+        // one the dropped connection would have coalesced.
+        for i in 20..25u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        let second = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(last) })),
+        )
+        .await;
+        // The first connection had already coalesced ALL 20 seeded frames
+        // into one chunk; the client consumed 7 of them before dropping the
+        // body. Reconnect from id 7 must replay 8..=21 plus the 5 new
+        // events: nothing is lost just because the server buffered it.
+        let (tail, _) =
+            read_wire_frames(second.into_body(), 19, std::time::Duration::from_secs(5)).await;
+        assert_eq!(tail.len(), 19, "20 seeded - 7 already seen + 5 new");
+        let ids: Vec<u64> = head.iter().chain(tail.iter()).map(|f| f.0).collect();
+        assert_eq!(
+            ids,
+            (1..=26u64).collect::<Vec<_>>(),
+            "reconnect resumes strictly above the last delivered id"
+        );
+        let payloads: Vec<u64> = tail
+            .iter()
+            .map(|(_, _, data)| {
+                serde_json::from_str::<serde_json::Value>(data).unwrap()["payload"]["i"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(payloads, (6..=24u64).collect::<Vec<_>>());
+    }
+
+    /// The emitted chunk bounds are hard: at most 64 data frames and a flush
+    /// once 64 KiB is reached (a single frame is never split). The byte bound
+    /// is exercised with ~4 KiB payloads so the flushes happen well below 64
+    /// frames; the tail remainder must still flush (65..255 partial page).
+    #[tokio::test]
+    async fn native_journal_sse_chunk_bounds_never_split_or_reorder_frames() {
+        use futures_util::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-bounds");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let pad = "x".repeat(4000);
+        for i in 0..200u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i, "pad": pad})),
+                )
+                .unwrap();
+        }
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(1) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut ids: Vec<u64> = Vec::new();
+        let mut chunks = 0usize;
+        while ids.len() < 200 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(3), body.next())
+                .await
+                .expect("SSE chunk deadline")
+                .expect("stream ended before every seeded frame")
+                .expect("SSE body read failed");
+            chunks += 1;
+            let text = String::from_utf8_lossy(&chunk);
+            let frame_ids: Vec<u64> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("id: "))
+                .filter_map(|raw| raw.parse::<u64>().ok())
+                .collect();
+            assert!(
+                frame_ids.len() <= 64,
+                "chunk {chunks} carries {} frames (>64)",
+                frame_ids.len()
+            );
+            assert!(
+                chunk.len() <= 64 * 1024 + 8 * 1024,
+                "chunk {chunks} is {} bytes (64 KiB + one ~4 KiB frame max)",
+                chunk.len()
+            );
+            ids.extend(frame_ids);
+        }
+        assert!(
+            ids == (2..=201u64).collect::<Vec<_>>(),
+            "every seeded frame exactly once in journal order"
+        );
+        assert!(
+            chunks >= 4,
+            "the 4 KiB payloads must trigger the byte flush, not just the frame cap (got {chunks})"
+        );
+    }
+
+    /// A non-delta event flushes the pending delta batch WITH it in one
+    /// chunk: it never waits behind the delta linger window, and the deltas
+    /// before/after it stay in journal order.
+    #[tokio::test]
+    async fn native_journal_sse_non_delta_flushes_the_pending_delta_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-non-delta");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for i in 0..10u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        handle
+            .force_append_event(
+                faktor_core::event::EventKind::PhaseChanged,
+                faktor_core::state::AgentState::WaitingForModel,
+                None,
+                None,
+            )
+            .unwrap();
+        for i in 10..20u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Ok(Query(NativeSessionEventsQuery { after: Some(1) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (first, ended) = read_sse(response, 1, std::time::Duration::from_secs(2)).await;
+        assert!(
+            !ended,
+            "the live stream stays open after the flush: {first}"
+        );
+        assert_eq!(
+            first.matches("event: model_chunk_received").count(),
+            20,
+            "all 20 pending deltas flush with the non-delta: {first}"
+        );
+        assert_eq!(
+            first.matches("event: phase_changed").count(),
+            1,
+            "the non-delta is in the same chunk: {first}"
+        );
+        let phase_at = first.find("event: phase_changed").unwrap();
+        let before = first[..phase_at]
+            .matches("event: model_chunk_received")
+            .count();
+        assert_eq!(
+            before, 10,
+            "the 10 deltas before the non-delta stay ahead of it"
+        );
+    }
+
+    /// Regression: a delta-only catch-up page of 65..255 events is emitted as
+    /// a 64-frame chunk plus a small remainder. With no newer durable tail the
+    /// remainder must still flush at the coalescing deadline (it is the FINAL
+    /// data of this connection); it must never be stranded behind the idle
+    /// heartbeat/fallback loop until another append or a reconnect.
+    #[tokio::test]
+    async fn native_journal_sse_partial_delta_page_tail_flushes_without_a_new_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-partial-tail");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for i in 0..100u64 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    faktor_core::state::AgentState::Streaming,
+                    Some(faktor_core::id::OpId::new(1)),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            // Seq 1 is the durable SessionCreated row; the 100 deltas follow.
+            Ok(Query(NativeSessionEventsQuery { after: Some(1) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The stream stays open after the tail (it is a live subscription), so
+        // stop reading as soon as every seeded data frame arrived. A stranded
+        // remainder hits the per-read deadline and panics.
+        let started = std::time::Instant::now();
+        let (frames, chunks) =
+            read_wire_frames(response.into_body(), 100, std::time::Duration::from_secs(3)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the final delta frames must flush at the 8 ms coalescing deadline"
+        );
+        assert_eq!(frames.len(), 100, "every seeded delta must be delivered");
+        let ids: Vec<u64> = frames.iter().map(|f| f.0).collect();
+        assert_eq!(ids, (2..=101u64).collect::<Vec<_>>(), "journal order");
+        let payloads: Vec<u64> = frames
+            .iter()
+            .map(|(_, _, data)| {
+                serde_json::from_str::<serde_json::Value>(data).unwrap()["payload"]["i"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(payloads, (0..100u64).collect::<Vec<_>>());
+        assert!(
+            chunks <= 4,
+            "the 100-frame tail coalesces into the 64-frame chunk plus one remainder (got {chunks})"
         );
     }
 
@@ -2892,19 +3538,17 @@ mod tests {
             })
             .collect();
 
+        // Independent historical shape: the row exactly as the `json!`
+        // path built it (opId a decimal STRING, alphabetical fields).
         let render = |e: &faktor_core::event::Event| -> String {
-            let kind = super::super::serde_name_in_place(
-                serde_json::to_string(&e.kind).unwrap_or_default(),
-            );
-            let state = super::super::agent_state_tag(e.state);
-            serde_json::to_string(&NativeEventRowRef {
-                seq: e.seq.raw(),
-                kind: &kind,
-                state: &state,
-                op_id: e.op_id.map(|o| o.to_string()),
-                ts_ms: e.ts_ms,
-                payload: &e.payload,
-            })
+            serde_json::to_string(&serde_json::json!({
+                "kind": e.kind.as_tag(),
+                "opId": e.op_id.map(|o| o.to_string()),
+                "payload": &e.payload,
+                "seq": e.seq.raw(),
+                "state": e.state.as_tag(),
+                "tsMs": e.ts_ms,
+            }))
             .unwrap()
         };
         for e in &events {
@@ -2929,9 +3573,23 @@ mod tests {
         let old_elapsed = t0.elapsed();
         let t1 = std::time::Instant::now();
         let mut new_bytes = 0usize;
+        let mut row_buf: Vec<u8> = Vec::with_capacity(4096);
         for _ in 0..3 {
             for e in &events {
-                new_bytes += render(e).len();
+                row_buf.clear();
+                serde_json::to_writer(
+                    &mut row_buf,
+                    &NativeEventRowRef {
+                        kind: e.kind.as_tag(),
+                        op_id: e.op_id.map(OpIdWire),
+                        payload: &e.payload,
+                        seq: e.seq.raw(),
+                        state: e.state.as_tag(),
+                        ts_ms: e.ts_ms,
+                    },
+                )
+                .unwrap();
+                new_bytes += row_buf.len();
             }
         }
         let new_elapsed = t1.elapsed();

@@ -53,6 +53,43 @@ pub enum EventKind {
     Failed,
 }
 impl EventKind {
+    /// The exact snake_case wire/durable tag (identical to the serde
+    /// representation) without allocating. Hot streaming paths use this to
+    /// avoid a `serde_json::to_string` per frame; the exhaustive
+    /// `as_tag_matches_serde` test pins every variant to its serde bytes.
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            EventKind::SessionCreated => "session_created",
+            EventKind::PromptReceived => "prompt_received",
+            EventKind::ContextPrepared => "context_prepared",
+            EventKind::ModelStarted => "model_started",
+            EventKind::ModelChunkReceived => "model_chunk_received",
+            EventKind::ToolRequested => "tool_requested",
+            EventKind::ToolStarted => "tool_started",
+            EventKind::FileChanged => "file_changed",
+            EventKind::ToolCompleted => "tool_completed",
+            EventKind::ToolCancelled => "tool_cancelled",
+            EventKind::CheckpointCreated => "checkpoint_created",
+            EventKind::ContextCompacted => "context_compacted",
+            EventKind::CompactRejected => "compact_rejected",
+            EventKind::SubagentStarted => "subagent_started",
+            EventKind::SubagentCompleted => "subagent_completed",
+            EventKind::TurnCompleted => "turn_completed",
+            EventKind::PermissionGranted => "permission_granted",
+            EventKind::PermissionDenied => "permission_denied",
+            EventKind::PermissionExpired => "permission_expired",
+            EventKind::PromptAdmitted => "prompt_admitted",
+            EventKind::PhaseChanged => "phase_changed",
+            EventKind::ReplayStarted => "replay_started",
+            EventKind::CrashDetected => "crash_detected",
+            EventKind::RecoveryApplied => "recovery_applied",
+            EventKind::SessionEnded => "session_ended",
+            EventKind::Suspended => "suspended",
+            EventKind::Resumed => "resumed",
+            EventKind::Failed => "failed",
+        }
+    }
+
     /// The CANONICAL vocabulary (audit: 28 variants). Adding a variant fails
     /// [`EventKind::exhaustive`] and the `ALL` length, so neither the
     /// persistence vocabulary nor the documented contract can drift silently.
@@ -230,6 +267,21 @@ mod tests {
         );
     }
 
+    /// Every static tag is byte-identical to the serde wire name, so the
+    /// allocation-free streaming path can never drift from the durable
+    /// (serde) representation.
+    #[test]
+    fn as_tag_matches_serde() {
+        for kind in EventKind::ALL {
+            let wire = serde_json::to_value(kind).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(kind.as_tag()),
+                "{kind:?}: as_tag must equal the serde wire name"
+            );
+        }
+    }
+
     #[test]
     fn timestamps_never_decrease() {
         assert_eq!(JournalInvariants::monotonic_ts(None, 100), 100);
@@ -310,9 +362,10 @@ mod vocabulary_tests {
                 format!("{kind:?}"),
                 "EventKind::ALL[{index}] must match the compiled declaration order"
             );
-            assert!(
-                !variant.wire.is_empty(),
-                "EventKind::{kind:?} has an empty serde wire name"
+            assert_eq!(
+                variant.wire,
+                kind.as_tag(),
+                "EventKind::{kind:?}: frozen wire name must equal as_tag"
             );
             assert!(
                 doc.contains(&format!("{kind:?}")),

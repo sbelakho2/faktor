@@ -514,7 +514,7 @@ private fun moneyGlyph(metrics: ProtocolOutcomeMetrics): BigInteger? {
 /** Exact micro-USD display: `$1234.5678 · 1234567890µ$` (never scientific). */
 internal fun moneyText(micro: String): String {
     val value = MicroMoney.parseDecimal(micro) ?: return OUTCOMES_NOT_MEASURED
-    return "$" + MicroMoney.usdText(value) + " \u00b7 " + value.toString() + "\u00b5\$"
+    return "$" + FormattedValues.usd(value) + " \u00b7 " + FormattedValues.micro(value)
 }
 
 /**
@@ -581,6 +581,8 @@ class OutcomesPanel : JPanel(BorderLayout()) {
 
     private var model: OutcomesPanelModel? = null
 
+    private var applied = false
+
     private var explainExpanded = false
 
     init {
@@ -639,6 +641,8 @@ class OutcomesPanel : JPanel(BorderLayout()) {
 
     /** Applies one model (null = nothing read yet). */
     fun setModel(value: OutcomesPanelModel?) {
+        if (applied && model == value) return
+        applied = true
         model = value
         when (value?.state) {
             "ok" -> {

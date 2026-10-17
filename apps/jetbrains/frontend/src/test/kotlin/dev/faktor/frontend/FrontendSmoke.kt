@@ -5511,6 +5511,133 @@ object FrontendSmoke {
             val reset = controller.reset()
             assertEquals("", reset.controlPlaneEndpoint)
         }
+
+        // Static capability matrix (feature-use audit): a panel action is only
+        // real when its listener override reaches the ONE service symbol, and
+        // that symbol exists on the service. A renamed/removed seam or a
+        // listener that stops calling its service turns this red.
+        step("capability matrix: every panel action reaches its service symbol") {
+            val root = ParityPath.repoRoot()
+            val panel = java.io.File(
+                root,
+                "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt"
+            ).readText()
+            val service = java.io.File(
+                root,
+                "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt"
+            ).readText()
+            val matrix = listOf(
+                "onPermissionReply" to "replyPermission",
+                "onPause" to "pauseAgent",
+                "onResume" to "resumeAgent",
+                "onCancel" to "cancelAgent",
+                "onRetry" to "retryAgent",
+                "onSteer" to "steerAgent",
+                "onSetModel" to "setAgentModel",
+                "onSetTokenBudget" to "setAgentBudget",
+                "onSetCostBudget" to "setAgentBudget",
+                "onStartTournament" to "startTournament",
+                "onDecideTournament" to "decideTournament",
+                "onAbortTournament" to "abortTournament",
+                "onPost" to "boardPost",
+                "onSpawn" to "spawnTerminal",
+                "onOutput" to "terminalOutput"
+            )
+            for ((listener, method) in matrix) {
+                assertTrue(
+                    panel.contains("fun $listener("),
+                    "$listener must be implemented by the panel"
+                )
+                assertTrue(
+                    panel.contains("service.$method("),
+                    "the $listener handler must call service.$method"
+                )
+                assertTrue(
+                    service.contains("fun $method("),
+                    "FaktorFrontendService must expose $method"
+                )
+            }
+        }
+
+        // Contributed platform extensions are capability entries too: each
+        // plugin.xml class reference must resolve to a compiled source.
+        step("capability matrix: every contributed platform extension has its handler class") {
+            val root = ParityPath.repoRoot()
+            val plugin = java.io.File(
+                root,
+                "apps/jetbrains/frontend/src/main/resources/META-INF/plugin.xml"
+            ).readText()
+            assertTrue(
+                plugin.contains("dev.faktor.frontend.FaktorToolWindowFactory"),
+                "the tool window contribution must name its factory"
+            )
+            assertTrue(
+                plugin.contains("dev.faktor.frontend.FaktorConfigurable"),
+                "the settings contribution must name its Configurable"
+            )
+            assertTrue(
+                java.io.File(
+                    root,
+                    "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorToolWindowFactory.kt"
+                ).isFile,
+                "the contributed tool-window factory source must exist"
+            )
+            assertTrue(
+                java.io.File(
+                    root,
+                    "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorConfigurable.kt"
+                ).isFile,
+                "the contributed Configurable source must exist"
+            )
+        }
+
+        // The control-plane coordinates are ONE application-scoped value: the
+        // platform Configurable and the tool-window Settings panel must not
+        // each write a different PropertiesComponent scope (a project-scoped
+        // copy made the Configurable endpoint/organization inert).
+        step("capability matrix: control-plane coordinates use the shared application store") {
+            val root = ParityPath.repoRoot()
+            val stores = java.io.File(
+                root,
+                "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/IntelliJPasswordSafe.kt"
+            ).readText()
+            assertTrue(
+                stores.contains("class IntelliJControlPlaneScopeStore : ControlPlaneScopeStore"),
+                "the tool window must use the application-scoped scope store"
+            )
+            assertTrue(
+                stores.contains("PropertiesComponent.getInstance()"),
+                "scope/session coordinates must be application-scoped"
+            )
+            assertTrue(
+                !stores.contains("class IntelliJControlPlaneScopeStore(private val project"),
+                "a project-scoped control-plane store would diverge from the Configurable"
+            )
+            assertTrue(
+                stores.contains("fun migrateFromProject"),
+                "legacy project-scoped values must migrate to the shared store once"
+            )
+            assertTrue(
+                stores.contains("FaktorSettingKeys.CONTROL_PLANE_ENDPOINT"),
+                "the endpoint key must be shared with the Configurable"
+            )
+            assertTrue(
+                stores.contains("FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION"),
+                "the organization key must be shared with the Configurable"
+            )
+            val factory = java.io.File(
+                root,
+                "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorToolWindowFactory.kt"
+            ).readText()
+            assertTrue(
+                factory.contains("IntelliJControlPlaneScopeStore()"),
+                "the tool window must construct the shared application store"
+            )
+            assertTrue(
+                factory.contains("IntelliJControlPlaneSessionStore()"),
+                "the tool window must construct the shared application session store"
+            )
+        }
     }
 
     private fun step(name: String, body: () -> Unit) {

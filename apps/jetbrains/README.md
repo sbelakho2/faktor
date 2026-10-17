@@ -84,7 +84,7 @@ state the host warns about and requires the operator to confirm.
 | verification | `GET /native/session/{id}/verification`, `GET /native/session/{id}/tasks/{task_id}/verification` |
 | evidence | `GET /native/evidence/{id}`, `POST /native/evidence/{id}/retrieve` |
 | providers | `GET /native/providers` (registry view; `/models` catalog remains the fallback join) |
-| terminals | `GET /native/terminals?session={id}`, `GET /native/session/{id}/terminal/events`, `POST /native/session/{id}/terminal` (session-owned spawn), `GET /pty/{pty_id}/output` (snapshot) |
+| terminals | `GET /native/terminals?session={id}`, `GET /native/session/{id}/terminal/events`, `POST /native/session/{id}/terminal` (session-owned spawn), `GET /native/session/{id}/terminals/{terminal_id}/output` (snapshot) |
 | history / lifecycle | `GET /native/sessions`, start/stop/attach, `restart()` (session+cursor preserved), `reconnectStream()` (SSE cursor resume) |
 | permissions | `GET /native/permissions?session={id}`, `POST /native/permission/reply` (strict `{session_id, permission_id, decision}`; typed 409 `conflict` / `permission_session_mismatch`) |
 
@@ -252,10 +252,11 @@ This builds `faktor-cli` if missing and then:
 5. runs `JetBrainsParitySmoke <binary>` — first the Faktor-owned tree
    check (`FAKTOR-OWNED TREE PASS`: root resolves, no vendored upstream UI
    corpus exists, the panel sources are present, all offline), then the
-   eleven parity families over canned frames (`task mode`, `agent tree with
+   thirteen parity families over canned frames (`task mode`, `agent tree with
    blockers/presentation/pixel identity`, `criterion proofs`, `permissions`,
    `terminal`, `review/tournament`, `evidence navigation`, `settings`,
-   `provider selection`, `history`, `restart/reconnect`), then a raw-socket fake
+   `provider selection`, `history`, `restart/reconnect`, `change review`,
+   `outcomes`), then a raw-socket fake
    daemon driving the REAL `FaktorFrontendService` + `FaktorChatPanel`
    end to end (permission reply, terminal spawn, task-run body,
    session-from-selection, history open, SSE cursor resume), then the
