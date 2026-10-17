@@ -57,7 +57,7 @@ pub use service::{
 };
 pub use store::{
     schema_version, MemoryWorkerStore, ResultAppend, SqliteWorkerStore, WorkerStore,
-    WORKER_SCHEMA_V1,
+    WORKER_SCHEMA_HEAD, WORKER_SCHEMA_V1,
 };
 
 #[cfg(test)]

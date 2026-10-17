@@ -485,8 +485,14 @@ impl WorkspaceIndex {
     /// The persisted vectors of every indexed chunk, deterministically
     /// ordered (sorted path, then chunk order) and bounded by `limit`.
     /// Borrowed from the index snapshot: callers (search) hold the snapshot
-    /// lock and score in place — no vector is cloned.
-    pub fn chunk_vectors(&self, workspace: WorkspaceId, limit: usize) -> Vec<(String, &[f32])> {
+    /// lock and score in place — no vector or path is cloned.
+    ///
+    /// Active records are resolved ONCE per call into a borrowed map keyed by
+    /// content hash, instead of formatting the composite
+    /// `(hash, model, revision, dimension)` key for every chunk. The returned
+    /// norm was precomputed at index time (and re-derived in `sanitize`), so
+    /// the per-query scoring loop does not recompute it.
+    pub fn chunk_vectors(&self, workspace: WorkspaceId, limit: usize) -> Vec<(&str, &[f32], f32)> {
         let Some(embeddings) = self.embeddings.get(&workspace) else {
             return Vec::new();
         };
@@ -496,9 +502,19 @@ impl WorkspaceIndex {
         let Some(files) = self.files.get(&workspace) else {
             return Vec::new();
         };
+        let mut active: std::collections::HashMap<&str, &EmbeddingRecord> =
+            std::collections::HashMap::with_capacity(embeddings.records.len());
+        for record in embeddings.records.values() {
+            if record.model_id == embeddings.model_id
+                && record.model_revision == embeddings.model_revision
+                && record.dimension == embeddings.dimension
+            {
+                active.insert(record.content_hash.as_str(), record);
+            }
+        }
         let mut paths: Vec<&String> = files.keys().collect();
         paths.sort();
-        let mut out: Vec<(String, &[f32])> = Vec::new();
+        let mut out: Vec<(&str, &[f32], f32)> = Vec::new();
         for path in paths {
             if out.len() >= limit {
                 break;
@@ -507,8 +523,8 @@ impl WorkspaceIndex {
                 if out.len() >= limit {
                     break;
                 }
-                if let Some(vector) = embeddings.active_vector(hash) {
-                    out.push((path.clone(), vector));
+                if let Some(record) = active.get(hash.as_str()) {
+                    out.push((path.as_str(), record.vector.as_slice(), record.norm));
                 }
             }
         }

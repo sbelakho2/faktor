@@ -1018,7 +1018,7 @@ impl AgentRuntime {
             .collect();
         failed.sort_by_key(|record| std::cmp::Reverse(record.record_id.raw()));
         failed.truncate(LEARNING_FAILURE_SCAN);
-        let current: Vec<FileHash> = failed
+        let current: std::collections::HashSet<FileHash> = failed
             .iter()
             .filter_map(|record| Self::record_failure_fingerprint(record))
             .map(|failure| failure.digest())

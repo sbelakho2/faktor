@@ -1055,6 +1055,61 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // validates the tag on write and fails closed on an unknown tag at read;
     // a zero-cost HOSTED row keeps its hosted authority (it is never local).
     "ALTER TABLE cost_reservation ADD COLUMN execution_class TEXT;",
+    // v35 — query-plan audit (schema target 36; array index 35). PURELY
+    // additive index changes; no row/column semantics move.
+    //
+    // Two DUPLICATE indexes are dropped from the hottest append tables:
+    // `event` PRIMARY KEY (session_id, seq) and `message` UNIQUE
+    // (session_id, seq) already create autoindexes with exactly the audited
+    // key order, so the v1 named copies only paid a second B-tree update on
+    // every event/message insert. `idx_task_session_updated` is replaced by
+    // `(session_id, created_ms, task_id)` — the only durable task ordering
+    // any read uses (`list_tasks` / the usage window); nothing orders tasks
+    // by updated_ms.
+    //
+    // The remaining indexes mirror the production WHERE/ORDER BY shapes:
+    // part-by-message reads (was a full table scan), permission sweeps and
+    // the global pending count/list, workspace session listing, the legacy
+    // task ledger, the startup global non-terminal queue scan (the per-session
+    // FIFO head already rides the table's (session_id, seq) primary key), the
+    // per-open memory-fact MAX(kind)
+    // scans, the once-per-turn `turn_completed` count, crash recovery's
+    // running tool-run scan, the per-session provider-call order (prefix
+    // stability reads; a plain session+id index so the column stays
+    // droppable on a schema downgrade), and the global active turn recovery
+    // scan. Each is either partial (only the rows its query names) or
+    // replaces a scan that grew with the session/task count; none is a
+    // speculative index. The pre-manifest recovery listing stays a bounded
+    // per-session scan: it runs once per crash, and a partial index on
+    // `pre_manifest` would block the documented ALTER TABLE downgrade path.
+    "DROP INDEX IF EXISTS idx_event_session_seq;
+     DROP INDEX IF EXISTS idx_message_session_seq;
+     DROP INDEX IF EXISTS idx_task_session_updated;
+     CREATE INDEX IF NOT EXISTS idx_task_session_created
+        ON task(session_id, created_ms, task_id);
+     CREATE INDEX IF NOT EXISTS idx_part_message ON part(message_id);
+     CREATE INDEX IF NOT EXISTS idx_permission_session_pending
+        ON permission(session_id, decision, id, expires_ms);
+     CREATE INDEX IF NOT EXISTS idx_permission_decision_id
+        ON permission(decision, id);
+     CREATE INDEX IF NOT EXISTS idx_session_workspace_updated
+        ON session(workspace_id, updated_ms DESC);
+     CREATE INDEX IF NOT EXISTS idx_task_ledger_session_updated
+        ON task_ledger(session_id, updated_ms DESC);
+     CREATE INDEX IF NOT EXISTS idx_prompt_queue_status_session
+        ON prompt_queue(status, session_id, seq);
+     CREATE INDEX IF NOT EXISTS idx_memory_fact_kind_session
+        ON memory_fact(kind, session_id);
+     CREATE INDEX IF NOT EXISTS idx_memory_fact_updated
+        ON memory_fact(updated_ms);
+     CREATE INDEX IF NOT EXISTS idx_event_session_turn_completed
+        ON event(session_id) WHERE kind = 'turn_completed';
+     CREATE INDEX IF NOT EXISTS idx_tool_run_running
+        ON tool_run(started_ms, id) WHERE status = 'running';
+     CREATE INDEX IF NOT EXISTS idx_provider_call_session_id
+        ON provider_call(session_id, id);
+     CREATE INDEX IF NOT EXISTS idx_turn_record_active
+        ON turn_record(started_at, id) WHERE status = 'active';",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

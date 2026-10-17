@@ -1236,3 +1236,125 @@ fn fast_open_recovers_migrations_and_data_and_refuses_corruption() {
         other => panic!("fast open must refuse truncation, got {other:?}"),
     }
 }
+
+/// previous-head -> head (query-plan indexes): a predecessor database must gain every
+/// audited index in ONE transactional migration, keep its rows, and keep the
+/// new plans. A verified backup of the migrated store must restore the same
+/// indexes and plans. `user_version` is set back to the predecessor AFTER
+/// dropping the new indexes, so the replay is exactly the production path.
+#[test]
+fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let sid = {
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "hello"}))
+            .unwrap();
+        {
+            let conn = store.raw_conn();
+            for index in [
+                "idx_part_message",
+                "idx_permission_session_pending",
+                "idx_permission_decision_id",
+                "idx_session_workspace_updated",
+                "idx_task_ledger_session_updated",
+                "idx_prompt_queue_status_session",
+                "idx_memory_fact_kind_session",
+                "idx_memory_fact_updated",
+                "idx_event_session_turn_completed",
+                "idx_tool_run_running",
+                "idx_provider_call_session_id",
+                "idx_turn_record_active",
+                "idx_task_session_created",
+            ] {
+                conn.execute_batch(&format!("DROP INDEX IF EXISTS {index};"))
+                    .unwrap();
+            }
+            // The v1 duplicates are recreated so the replay also has to drop
+            // them again (the migration must be idempotent, not just additive).
+            let prev_head = SCHEMA_HEAD - 1;
+            conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event(session_id, seq);
+                 CREATE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
+                 PRAGMA user_version = {prev_head};"
+            ))
+            .unwrap();
+        }
+        s.id
+    };
+
+    let store = Store::open(dir.path(), true).unwrap();
+    {
+        let conn = store.raw_conn();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_HEAD, "the v35 step completed");
+        for index in [
+            "idx_part_message",
+            "idx_permission_session_pending",
+            "idx_permission_decision_id",
+            "idx_session_workspace_updated",
+            "idx_task_ledger_session_updated",
+            "idx_prompt_queue_status_session",
+            "idx_memory_fact_kind_session",
+            "idx_memory_fact_updated",
+            "idx_event_session_turn_completed",
+            "idx_tool_run_running",
+            "idx_provider_call_session_id",
+            "idx_turn_record_active",
+            "idx_task_session_created",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "v35 must create {index}");
+        }
+        for dropped in ["idx_event_session_seq", "idx_message_session_seq"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![dropped],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "v35 must drop the duplicate {dropped}");
+        }
+    }
+    assert_eq!(
+        store.messages_before(sid, None, 10).unwrap()[0].data["text"],
+        "hello",
+        "the predecessor row survives the migration"
+    );
+
+    // Backup/restore: the new indexes are schema objects, so the restored
+    // copy must answer the same plan with the same index.
+    let backup_path = dir.path().join("backup.db");
+    store.backup_to(&backup_path).unwrap();
+    let restored_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&backup_path, restored_dir.path().join("faktor-plus.db")).unwrap();
+    let restored = Store::open(restored_dir.path(), true).unwrap();
+    let conn = restored.raw_conn();
+    let parts_plan: Vec<String> = {
+        let mut stmt = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM part WHERE message_id = ?1 ORDER BY id ASC")
+            .unwrap();
+        let mut rows = stmt.query(params![1i64]).unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.push(row.get::<_, String>(3).unwrap());
+        }
+        out
+    };
+    assert_eq!(
+        parts_plan,
+        vec!["SEARCH part USING COVERING INDEX idx_part_message (message_id=?)"],
+        "a restored backup keeps the head plan"
+    );
+}

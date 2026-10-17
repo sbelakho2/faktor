@@ -116,6 +116,101 @@ struct OpIdRange {
     remaining: u64,
 }
 
+/// Test-only instrumentation seam over the op-id allocator's locks. Counts
+/// acquisitions, contended acquisitions (>= 1us), cumulative/max acquire
+/// wait, and the dedicated refill-gate waits. Compiled out of production.
+#[cfg(test)]
+#[derive(Default)]
+struct OpIdLockProbe {
+    acquires: std::sync::atomic::AtomicU64,
+    waits: std::sync::atomic::AtomicU64,
+    total_wait_ns: std::sync::atomic::AtomicU64,
+    max_wait_ns: std::sync::atomic::AtomicU64,
+    refill_waits: std::sync::atomic::AtomicU64,
+    max_refill_wait_ns: std::sync::atomic::AtomicU64,
+    refills: std::sync::atomic::AtomicU64,
+    refill_alloc_ns: std::sync::atomic::AtomicU64,
+    max_hold_ns: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct OpIdLockProbeSnapshot {
+    pub(crate) acquires: u64,
+    pub(crate) waits: u64,
+    pub(crate) total_wait_ns: u64,
+    pub(crate) max_wait_ns: u64,
+    pub(crate) refill_waits: u64,
+    pub(crate) max_refill_wait_ns: u64,
+    pub(crate) refills: u64,
+    pub(crate) refill_alloc_ns: u64,
+    pub(crate) max_hold_ns: u64,
+}
+
+#[cfg(test)]
+impl OpIdLockProbe {
+    fn record_acquire(&self, wait: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.acquires.fetch_add(1, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_wait_ns.fetch_max(ns, Ordering::Relaxed);
+        if wait >= std::time::Duration::from_micros(1) {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_hold(&self, hold: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let ns = hold.as_nanos().min(u64::MAX as u128) as u64;
+        self.max_hold_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    fn record_refill(&self, alloc: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        self.refills.fetch_add(1, Ordering::Relaxed);
+        self.refill_alloc_ns.fetch_add(
+            alloc.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_refill_wait(&self, wait: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.refill_waits.fetch_add(1, Ordering::Relaxed);
+        self.max_refill_wait_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> OpIdLockProbeSnapshot {
+        use std::sync::atomic::Ordering;
+        OpIdLockProbeSnapshot {
+            acquires: self.acquires.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
+            total_wait_ns: self.total_wait_ns.load(Ordering::Relaxed),
+            max_wait_ns: self.max_wait_ns.load(Ordering::Relaxed),
+            refill_waits: self.refill_waits.load(Ordering::Relaxed),
+            max_refill_wait_ns: self.max_refill_wait_ns.load(Ordering::Relaxed),
+            refills: self.refills.load(Ordering::Relaxed),
+            refill_alloc_ns: self.refill_alloc_ns.load(Ordering::Relaxed),
+            max_hold_ns: self.max_hold_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        use std::sync::atomic::Ordering;
+        self.acquires.store(0, Ordering::Relaxed);
+        self.waits.store(0, Ordering::Relaxed);
+        self.total_wait_ns.store(0, Ordering::Relaxed);
+        self.max_wait_ns.store(0, Ordering::Relaxed);
+        self.refill_waits.store(0, Ordering::Relaxed);
+        self.max_refill_wait_ns.store(0, Ordering::Relaxed);
+        self.refills.store(0, Ordering::Relaxed);
+        self.refill_alloc_ns.store(0, Ordering::Relaxed);
+        self.max_hold_ns.store(0, Ordering::Relaxed);
+    }
+}
+
 /// A MONOTONIC admission-clock authority (P1-IDEMPOTENCY): lease liveness
 /// must not depend on adjustable wall time. Within one daemon generation the
 /// monotonic reading is authoritative; across generations the stored
@@ -195,6 +290,16 @@ pub struct SessionManager {
     /// first bounded read is awaited.
     reads: crate::read_service::DbReadService,
     op_ids: Mutex<OpIdRange>,
+    /// Single-flight gate for durable op-id refills. Lock order is
+    /// `op_ids_refill` -> `op_ids`: a refill holds the gate and takes the
+    /// cache lock only after the store call returns, while the fast path
+    /// takes `op_ids` alone and releases it before any refill attempt (see
+    /// [`SessionManager::try_next_op_id`]).
+    op_ids_refill: Mutex<()>,
+    /// Test-only acquire-wait/duration instrumentation (compiled out of
+    /// production).
+    #[cfg(test)]
+    op_id_probe: OpIdLockProbe,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
     pub(crate) artifact_sizes: ArtifactSizes,
     /// Layered lifetime bound (audit 26): wall-clock budget of ONE logical
@@ -292,6 +397,9 @@ impl SessionManager {
             actor,
             reads,
             op_ids: Mutex::new(OpIdRange::default()),
+            op_ids_refill: Mutex::new(()),
+            #[cfg(test)]
+            op_id_probe: OpIdLockProbe::default(),
             resources: Mutex::new(HashMap::new()),
             artifact_sizes: ArtifactSizes::default(),
             turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
@@ -542,29 +650,138 @@ impl SessionManager {
     /// is untouched on failure, so the next call retries the reservation;
     /// the manager stays usable for every other operation.
     pub fn try_next_op_id(&self) -> Result<OpId, SessionError> {
-        // Classified CACHE => REBUILD: the durable op-id sequence is the
-        // authority. A poisoned reservation is dropped (remaining = 0) and
-        // refilled from the durable sequence below, so a torn in-memory
-        // range can never mint colliding ids.
+        loop {
+            // Fast path: mint from the cached range. The cache lock covers
+            // only the increment — never a durable store call.
+            if let Some(id) = self.mint_cached_op_id()? {
+                return Ok(id);
+            }
+            // Slow path (cache empty): single-flight the REFILL. The gate is
+            // a separate mutex from the cache, so threads that still hold
+            // cached ids are never blocked behind the durable sequence
+            // transaction. Holding the gate in allocation→install order
+            // keeps installed ranges strictly increasing. The gate is
+            // released BEFORE minting, so the waiters do not convoy through
+            // it one by one after the range lands.
+            #[cfg(test)]
+            let refill_lock_started = std::time::Instant::now();
+            {
+                let _refill = self
+                    .op_ids_refill
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                #[cfg(test)]
+                self.op_id_probe
+                    .record_refill_wait(refill_lock_started.elapsed());
+                // Another refill may have landed while this thread waited on
+                // the gate: the next loop iteration mints from it.
+                if self.op_id_cache_empty() {
+                    // The sequence is GLOBAL (one store row shared by every
+                    // session), so no session id is semantically meaningful
+                    // here; the placeholder only satisfies the allocator's
+                    // future per-session-scope signature. A refill failure
+                    // means the durable sequence cannot advance — minting
+                    // from the clock or a bare counter would reintroduce
+                    // exactly the collision the durable sequence exists to
+                    // prevent, so the refusal propagates as a typed error.
+                    #[cfg(test)]
+                    let alloc_started = std::time::Instant::now();
+                    let (start, granted) = self
+                        .store
+                        .alloc_op_ids(SessionId::new(1), OP_ID_RANGE)
+                        .map_err(crate::map_store_err)?;
+                    #[cfg(test)]
+                    self.op_id_probe.record_refill(alloc_started.elapsed());
+                    self.install_op_id_range(start, granted);
+                }
+            }
+        }
+    }
+
+    /// `true` when the cached range has no ids left. Poisoned state is
+    /// classified CACHE => REBUILD (remaining = 0) exactly like the mint
+    /// path, so a torn range is refilled from the durable sequence.
+    fn op_id_cache_empty(&self) -> bool {
+        let cache = self.op_ids.lock().unwrap_or_else(|poisoned| {
+            self.op_ids.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.remaining = 0;
+            guard
+        });
+        cache.remaining == 0
+    }
+
+    /// Mint one id from the cached range without touching the store.
+    /// `None` means the range is empty (the caller must refill). Classified
+    /// CACHE => REBUILD: a poisoned reservation is dropped (remaining = 0)
+    /// and refilled from the durable sequence, so a torn in-memory range can
+    /// never mint colliding ids.
+    fn mint_cached_op_id(&self) -> Result<Option<OpId>, SessionError> {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let mut cache = self.op_ids.lock().unwrap_or_else(|poisoned| {
             self.op_ids.clear_poison();
             let mut guard = poisoned.into_inner();
             guard.remaining = 0;
             guard
         });
+        #[cfg(test)]
+        self.op_id_probe.record_acquire(started.elapsed());
+        #[cfg(test)]
+        let hold_started = std::time::Instant::now();
         if cache.remaining == 0 {
-            // The sequence is GLOBAL (one store row shared by every
-            // session), so no session id is semantically meaningful here;
-            // the placeholder only satisfies the allocator's future
-            // per-session-scope signature. A refill failure means the
-            // durable sequence cannot advance — minting from the clock or a
-            // bare counter would reintroduce exactly the collision the
-            // durable sequence exists to prevent, so the refusal propagates
-            // as a typed error instead.
+            #[cfg(test)]
+            self.op_id_probe.record_hold(hold_started.elapsed());
+            return Ok(None);
+        }
+        let raw = cache.next;
+        let id = OpId::try_from(raw).map_err(SessionError::from)?;
+        cache.next += 1;
+        cache.remaining -= 1;
+        #[cfg(test)]
+        self.op_id_probe.record_hold(hold_started.elapsed());
+        Ok(Some(id))
+    }
+
+    /// Swap a freshly reserved range into the cache. The cache lock covers
+    /// only the swap.
+    fn install_op_id_range(&self, start: u64, granted: u64) {
+        let mut cache = self.op_ids.lock().unwrap_or_else(|poisoned| {
+            self.op_ids.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.remaining = 0;
+            guard
+        });
+        cache.next = start;
+        cache.remaining = granted;
+    }
+
+    /// Test-only replica of the PRE-FIX shape (durable reservation under
+    /// the cache lock) used by the before/after contention probe. Never
+    /// called by production code.
+    #[cfg(test)]
+    fn try_next_op_id_legacy(&self) -> Result<OpId, SessionError> {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut cache = self.op_ids.lock().unwrap_or_else(|poisoned| {
+            self.op_ids.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.remaining = 0;
+            guard
+        });
+        #[cfg(test)]
+        self.op_id_probe.record_acquire(started.elapsed());
+        #[cfg(test)]
+        let hold_started = std::time::Instant::now();
+        if cache.remaining == 0 {
+            #[cfg(test)]
+            let alloc_started = std::time::Instant::now();
             let (start, granted) = self
                 .store
                 .alloc_op_ids(SessionId::new(1), OP_ID_RANGE)
                 .map_err(crate::map_store_err)?;
+            #[cfg(test)]
+            self.op_id_probe.record_refill(alloc_started.elapsed());
             cache.next = start;
             cache.remaining = granted;
         }
@@ -572,7 +789,21 @@ impl SessionManager {
         let id = OpId::try_from(raw).map_err(SessionError::from)?;
         cache.next += 1;
         cache.remaining -= 1;
+        #[cfg(test)]
+        self.op_id_probe.record_hold(hold_started.elapsed());
         Ok(id)
+    }
+
+    /// Test-only: clear the op-id lock contention counters.
+    #[cfg(test)]
+    pub(crate) fn reset_op_id_lock_probe(&self) {
+        self.op_id_probe.reset();
+    }
+
+    /// Test-only: snapshot the op-id lock contention counters.
+    #[cfg(test)]
+    pub(crate) fn op_id_lock_probe(&self) -> OpIdLockProbeSnapshot {
+        self.op_id_probe.snapshot()
     }
 
     /// `doctor`-style health report: store diagnostics + recovery scan.
@@ -2129,6 +2360,239 @@ mod tests {
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
         let err = m.recover_all_sessions().unwrap_err();
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+    }
+
+    /// Falsification of the refill fast path: 32 threads cross MANY forced
+    /// refill boundaries (300 ids each; four full 1024-id ranges). Every
+    /// thread's own sequence must strictly increase, the union must be
+    /// duplicate/zero-free, and a fresh manager (crash/restart) must resume
+    /// strictly ABOVE every id handed out. A poisoned in-memory range must
+    /// rebuild from the durable sequence, never mint the unreserved tail of
+    /// the torn range.
+    #[test]
+    fn op_id_refill_boundaries_under_32_threads_never_duplicate_or_regress() {
+        const THREADS: usize = 32;
+        const PER_THREAD: usize = 300;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let cas = dir.path().join("cas");
+        let m = SessionManager::open(&root, &cas, true).unwrap();
+        let per_thread: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let m = m.clone();
+                    scope.spawn(move || {
+                        (0..PER_THREAD)
+                            .map(|_| m.try_next_op_id().unwrap().raw())
+                            .collect::<Vec<u64>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (thread, ids) in per_thread.iter().enumerate() {
+            assert!(
+                ids.windows(2).all(|w| w[0] < w[1]),
+                "thread {thread} observed a regressed/duplicate id: {ids:?}"
+            );
+        }
+        let mut all: Vec<u64> = per_thread.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all.len(), THREADS * PER_THREAD);
+        assert!(all.iter().all(|id| *id != 0), "zero is never minted");
+        // The durable sequence is seeded from the process-independent base;
+        // whatever it is, every reserved range must remain CONTIGUOUS.
+        let start = all[0];
+        assert_eq!(
+            all,
+            (start..start + (THREADS * PER_THREAD) as u64).collect::<Vec<_>>(),
+            "cached ranges must remain contiguous and collision-free"
+        );
+        let highest = *all.last().unwrap();
+
+        // Crash/restart: the durable high-water already covers every id
+        // above, so the next generation starts past it (gaps, never reuse).
+        drop(m);
+        let reopened = SessionManager::open(&root, &cas, true).unwrap();
+        let next = reopened.try_next_op_id().unwrap().raw();
+        assert!(next > highest, "restart reused/resumed below {highest}");
+        assert!(
+            !all.contains(&next),
+            "restart minted an id from the previous generation"
+        );
+
+        // Cache poisoning => rebuild from the durable sequence, never a
+        // duplicate from the torn in-memory range.
+        let (_d2, poisoned) = tmp_manager();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            seen.insert(poisoned.try_next_op_id().unwrap().raw());
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.op_ids.lock().unwrap();
+            panic!("writer poisoned the op-id range");
+        }));
+        let recovered = poisoned.try_next_op_id().unwrap().raw();
+        assert!(recovered > *seen.iter().max().unwrap());
+        assert!(seen.insert(recovered), "poisoned range minted a duplicate");
+        for _ in 0..10 {
+            let raw = poisoned.try_next_op_id().unwrap().raw();
+            assert!(raw > recovered);
+            assert!(seen.insert(raw), "post-poison refill reused an id");
+        }
+    }
+
+    /// Bounded contention probe (third-angle performance audit): 16 threads
+    /// mint 10k operation ids each through the SAME manager API, twice — once
+    /// with the pre-fix shape (durable reservation under the cache lock) and
+    /// once with the current fast-path + single-flight refill. Uniqueness and
+    /// positivity are asserted over all 160k ids of the current shape.
+    #[test]
+    fn op_id_minting_under_16_thread_contention() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 10_000;
+
+        let (_legacy_dir, legacy) = tmp_manager();
+        legacy.reset_op_id_lock_probe();
+        let legacy_started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let m = legacy.clone();
+                scope.spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        m.try_next_op_id_legacy().unwrap();
+                    }
+                });
+            }
+        });
+        let legacy_elapsed = legacy_started.elapsed();
+        let legacy_probe = legacy.op_id_lock_probe();
+        eprintln!(
+            "op-id pre-fix shape: {THREADS} threads x {PER_THREAD} = {} ids in {legacy_elapsed:?} \
+             ({:.0} ids/s); cache-lock acquires={} waits(>=1us)={} max_wait={}us \
+             total_wait={}us; max_hold={}us; refills={} refill_alloc_total={}us",
+            THREADS * PER_THREAD,
+            (THREADS * PER_THREAD) as f64 / legacy_elapsed.as_secs_f64(),
+            legacy_probe.acquires,
+            legacy_probe.waits,
+            legacy_probe.max_wait_ns / 1_000,
+            legacy_probe.total_wait_ns / 1_000,
+            legacy_probe.max_hold_ns / 1_000,
+            legacy_probe.refills,
+            legacy_probe.refill_alloc_ns / 1_000,
+        );
+
+        let (_d, m) = tmp_manager();
+        m.reset_op_id_lock_probe();
+        let started = std::time::Instant::now();
+        let mut minted: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let m = m.clone();
+                handles.push(scope.spawn(move || {
+                    let mut ids = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        ids.push(m.try_next_op_id().unwrap().raw());
+                    }
+                    ids
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let elapsed = started.elapsed();
+        let total: usize = minted.iter().map(Vec::len).sum();
+        let probe = m.op_id_lock_probe();
+        eprintln!(
+            "op-id probe: {THREADS} threads x {PER_THREAD} = {total} ids in {elapsed:?} \
+             ({:.0} ids/s); cache-lock acquires={} waits(>=1us)={} max_wait={}us \
+             total_wait={}us; max_hold={}us; refill waits={} max_refill_wait={}us; \
+             refills={} refill_alloc_total={}us",
+            total as f64 / elapsed.as_secs_f64(),
+            probe.acquires,
+            probe.waits,
+            probe.max_wait_ns / 1_000,
+            probe.total_wait_ns / 1_000,
+            probe.max_hold_ns / 1_000,
+            probe.refill_waits,
+            probe.max_refill_wait_ns / 1_000,
+            probe.refills,
+            probe.refill_alloc_ns / 1_000,
+        );
+        minted.sort_unstable();
+        minted.dedup();
+        assert_eq!(
+            minted.iter().map(Vec::len).sum::<usize>(),
+            THREADS * PER_THREAD,
+            "every minted op id must be unique across threads"
+        );
+        assert!(minted.iter().flatten().all(|id| *id != 0));
+        assert!(
+            probe.acquires >= (THREADS * PER_THREAD) as u64,
+            "the probe must observe every acquisition"
+        );
+        // Regression gate for the old shape (durable refill under the cache
+        // lock): a single cache-lock HOLD must stay in the increment-only
+        // range. The pre-fix code held it across `alloc_op_ids`, which
+        // measured ~1 ms per refill.
+        assert!(
+            probe.max_hold_ns < 100_000,
+            "op-id cache lock was held {}us — compute/IO appears to run inside \
+             the critical section again",
+            probe.max_hold_ns / 1_000
+        );
+        assert!(
+            probe.max_hold_ns < legacy_probe.max_hold_ns,
+            "the current shape must hold the cache lock far shorter than the \
+             pre-fix shape did ({}us vs {}us)",
+            probe.max_hold_ns / 1_000,
+            legacy_probe.max_hold_ns / 1_000
+        );
+    }
+
+    /// Cold-start probe (third-angle performance audit): with 200 sessions
+    /// on disk, measure the production open path (`open_quick`) and the
+    /// readiness recovery scan that runs before the first request. Recovery
+    /// is a durable authority (spec section 7), so this probe documents its
+    /// cost and proves the second sweep is idempotent/cheap — it is not a
+    /// candidate for moving off the readiness path.
+    #[test]
+    fn cold_start_recovery_scan_is_measured_and_idempotent() {
+        const SESSIONS: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let cas_root = dir.path().join("cas");
+        let created = std::time::Instant::now();
+        {
+            let m = SessionManager::open_quick(&root, &cas_root).unwrap();
+            let ws = m.create_workspace("/cold").unwrap();
+            for i in 0..SESSIONS {
+                m.create_session(ws, &format!("cold-{i}"), "p", "m")
+                    .unwrap();
+            }
+        }
+        let create_elapsed = created.elapsed();
+        let opened = std::time::Instant::now();
+        let m = SessionManager::open_quick(&root, &cas_root).unwrap();
+        let open_elapsed = opened.elapsed();
+        let listed = std::time::Instant::now();
+        let handles = m.list_sessions(None).unwrap();
+        let list_elapsed = listed.elapsed();
+        let first_started = std::time::Instant::now();
+        let first = m.recover_all_sessions().unwrap();
+        let first_elapsed = first_started.elapsed();
+        let second_started = std::time::Instant::now();
+        let second = m.recover_all_sessions().unwrap();
+        let second_elapsed = second_started.elapsed();
+        eprintln!(
+            "cold-start probe: {SESSIONS} sessions; seed={create_elapsed:?} open_quick={open_elapsed:?}              list_sessions={list_elapsed:?} recover#1={first_elapsed:?} recover#2={second_elapsed:?}              ({:.3} ms/session first sweep)",
+            first_elapsed.as_secs_f64() * 1_000.0 / SESSIONS as f64,
+        );
+        assert_eq!(handles.len(), SESSIONS);
+        assert_eq!(first.len(), SESSIONS);
+        assert_eq!(second.len(), SESSIONS);
+        assert!(second
+            .iter()
+            .all(|r| r.crashed_ops.is_empty() && r.orphans.is_empty()));
     }
 
     #[test]

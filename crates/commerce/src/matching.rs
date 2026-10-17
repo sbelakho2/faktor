@@ -227,6 +227,23 @@ fn tokenize(value: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(test)]
+pub(crate) mod query_view_work {
+    use std::cell::Cell;
+    thread_local! {
+        static VIEWS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn add(count: u64) {
+        VIEWS.with(|c| c.set(c.get() + count));
+    }
+    pub(crate) fn reset() {
+        VIEWS.with(|c| c.set(0));
+    }
+    pub(crate) fn snapshot() -> u64 {
+        VIEWS.with(Cell::get)
+    }
+}
+
 /// Query-side precomputation (complexity audit): the per-offer path used to
 /// re-tokenize and re-normalize the SAME query for every candidate — the
 /// part number + manufacturer + package tokens were rebuilt per offer, the
@@ -234,7 +251,7 @@ fn tokenize(value: &str) -> Vec<String> {
 /// were re-normalized per (variant × attribute) pair. One [`QueryView`] is
 /// built per call ([`match_offers`] shares it across the whole batch) and
 /// every candidate consumes the precomputed forms.
-struct QueryView<'a> {
+pub(crate) struct QueryView<'a> {
     query: &'a PartQuery,
     /// Normalized manufacturer, non-empty (the signal's `query` half).
     manufacturer: Option<String>,
@@ -249,7 +266,13 @@ struct QueryView<'a> {
 }
 
 impl<'a> QueryView<'a> {
-    fn new(query: &'a PartQuery) -> Self {
+    pub(crate) fn query(&self) -> &'a PartQuery {
+        self.query
+    }
+
+    pub(crate) fn new(query: &'a PartQuery) -> Self {
+        #[cfg(test)]
+        query_view_work::add(1);
         let manufacturer = query
             .manufacturer
             .as_ref()
@@ -453,30 +476,45 @@ pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usiz
     match_offer_with(&QueryView::new(query), offer, offer_index)
 }
 
-/// The shared implementation over a precomputed [`QueryView`].
-fn match_offer_with(
+/// Everything a match signals: the base signals (manufacturer, package,
+/// packaging, title/spec overlap) plus the part-number classification.
+/// Quantity compatibility is deliberately NOT computed here: ranking
+/// resolves the quote once itself and never needs the matching path's
+/// second tier resolution.
+fn full_match_signals(
     view: &QueryView<'_>,
     offer: &CommercialOffer,
-    offer_index: usize,
-) -> OfferMatch {
-    let query = view.query;
+) -> (MatchSignals, MatchCertainty, Option<String>, Option<String>) {
     let mut signals = empty_signals();
     let manufacturer = manufacturer_signal(view, offer);
-    let (manufacturer_exact, manufacturer_known, manufacturer_conflict) = (
-        manufacturer.exact,
-        manufacturer.known,
-        manufacturer.conflict,
-    );
-    signals.manufacturer_exact = manufacturer_exact;
-    signals.manufacturer_known = manufacturer_known;
-    signals.manufacturer_conflict = manufacturer_conflict;
+    signals.manufacturer_exact = manufacturer.exact;
+    signals.manufacturer_known = manufacturer.known;
+    signals.manufacturer_conflict = manufacturer.conflict;
     signals.package_match = package_match(view, offer);
-    signals.packaging_match = packaging_match(query, offer);
-    signals.quantity_compatible = quantity_compatible(query, offer);
+    signals.packaging_match = packaging_match(view.query, offer);
     signals.title_token_overlap_bp = Some(title_token_overlap_bp(view, offer.title.as_str()));
     signals.spec_overlap_bp = spec_overlap_bp(view, offer);
     signals.supplier_evidence = offer.supplier.is_some() || offer.manufacturer.is_some();
 
+    let classification = classify_match(view, offer, &mut signals);
+    (
+        signals,
+        classification.0,
+        classification.1,
+        classification.2,
+    )
+}
+
+/// The part-number relation and certainty, filling the part-number signals.
+/// Kept separate from [`full_match_signals`] so the ranking path gets the
+/// EXACT same signal values without paying for a quantity quote.
+fn classify_match(
+    view: &QueryView<'_>,
+    offer: &CommercialOffer,
+    signals: &mut MatchSignals,
+) -> (MatchCertainty, Option<String>, Option<String>) {
+    let manufacturer_exact = signals.manufacturer_exact;
+    let manufacturer_conflict = signals.manufacturer_conflict;
     // Borrow the precomputed canonical query part: the pre-fix code cloned
     // it (a `Result<NormalizedPartNumber, _>`) for EVERY candidate.
     let query_part = &view.part;
@@ -558,7 +596,27 @@ fn match_offer_with(
             .as_ref()
             .map(|value| value.as_str().to_string());
     }
+    (certainty, matched_part_number, matched_manufacturer)
+}
 
+/// Every match signal EXCEPT quantity compatibility, over a precomputed
+/// [`QueryView`]. Ranking consumes exactly these signals and resolves the
+/// quote itself ONCE, so it never pays for the matching path's second tier
+/// resolution per candidate. [`match_offer`] adds the quantity signal on top,
+/// preserving its public output exactly.
+pub(crate) fn match_signals_in_view(view: &QueryView<'_>, offer: &CommercialOffer) -> MatchSignals {
+    full_match_signals(view, offer).0
+}
+
+/// The shared implementation over a precomputed [`QueryView`].
+fn match_offer_with(
+    view: &QueryView<'_>,
+    offer: &CommercialOffer,
+    offer_index: usize,
+) -> OfferMatch {
+    let (mut signals, certainty, matched_part_number, matched_manufacturer) =
+        full_match_signals(view, offer);
+    signals.quantity_compatible = quantity_compatible(view.query, offer);
     OfferMatch {
         offer_index,
         certainty,
@@ -701,6 +759,28 @@ mod complexity_tests {
                 attr(" attr7 ", "VAL2-7"),
                 attr("attr10", "val1-10"),
             ],
+        }
+    }
+
+    #[test]
+    fn ranking_signals_are_the_full_signals_without_quantity() {
+        // Ranking skips the matching path's quantity quote (it resolves the
+        // quote itself exactly once); every other signal must be identical
+        // in value, so the ranking score cannot drift.
+        let mut query = query();
+        query.quantity = Some(crate::quantity::Quantity::new(100).unwrap());
+        let view = QueryView::new(&query);
+        for index in [0usize, 7, 42] {
+            let offer = offer(index, 4, 8);
+            let lean = match_signals_in_view(&view, &offer);
+            let mut full = match_offer(&query, &offer, index).signals;
+            assert_eq!(
+                full.quantity_compatible,
+                quantity_compatible(&query, &offer),
+                "the full path keeps its quantity signal"
+            );
+            full.quantity_compatible = lean.quantity_compatible;
+            assert_eq!(lean, full, "signal drift at offer {index}");
         }
     }
 

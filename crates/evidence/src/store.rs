@@ -228,7 +228,8 @@ fn ensure_scope(env: &EvidenceEnvelope, ctx: &EvidenceAccessContext) -> Result<(
 }
 
 /// One bounded newest-first page of scoped evidence envelopes. `rows` are
-/// ordered `created_ms DESC, id DESC` (newest first); `next_before` is the
+/// ordered `id DESC` (newest first; ids are issued monotonically, so
+/// the id is the durable recency boundary the `before` cursor must match); `next_before` is the
 /// exclusive id cursor for the next page, or `None` when the page was the
 /// last (empty input, or the caller consumed the whole scope).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -345,7 +346,7 @@ pub struct MemoryEvidenceStore {
     entries: HashMap<EvidenceId, StoredEvidence>,
     /// Insertion order (oldest first) so the newest-first page is a
     /// deterministic reverse walk, exactly like the durable
-    /// `created_ms DESC, id DESC` order.
+    /// `id DESC` order.
     order: Vec<EvidenceId>,
     backing_cap: usize,
 }
@@ -414,7 +415,7 @@ impl MemoryEvidenceStore {
     }
 
     /// The newest-first scoped page (mirror of the durable
-    /// `ORDER BY created_ms DESC, id DESC`): a reverse walk of the insertion
+    /// `ORDER BY id DESC`): a reverse walk of the insertion
     /// order with the exclusive `before` id cursor. `next_before` is the
     /// last returned id, or `None` when the scope was exhausted or the page
     /// was empty.
@@ -846,9 +847,12 @@ impl<'a> DurableEvidenceStore<'a> {
         Ok(out)
     }
 
-    /// One newest-first scoped page (`ORDER BY created_ms DESC, id DESC`),
-    /// bounded by `limit`; `before` is the exclusive keyset cursor taken from
-    /// the previous page's `next_before`. Scope filtering (session, workspace
+    /// One newest-first scoped page (`ORDER BY id DESC`), bounded by `limit`;
+    /// `before` is the exclusive keyset id cursor taken from the previous
+    /// page's `next_before`. Ids are issued monotonically, so the id cursor
+    /// and the sort key are the SAME durable boundary; ordering by a
+    /// separately supplied `created_ms` let a clock step or explicit-id
+    /// import skip rows between pages. Scope filtering (session, workspace
     /// and the declared task/admin scope) is applied to every row, and
     /// `next_before` advances past the last FETCHED row so a task-filtered
     /// page still makes progress.
@@ -1179,7 +1183,7 @@ impl DurableEvidenceAuthority {
         self.view().list_scoped_envelopes(ctx, limit)
     }
 
-    /// One newest-first scoped page (`ORDER BY created_ms DESC, id DESC`).
+    /// One newest-first scoped page (`ORDER BY id DESC`).
     pub fn list_scoped_newest(
         &self,
         ctx: &EvidenceAccessContext,

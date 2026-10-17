@@ -41,10 +41,17 @@ impl Estimator {
     /// below the chars/3.4 floor, plus a +1 structural envelope adder.
     /// Never returns 0 for non-empty input; never panics on any input.
     pub fn estimate_tokens(&self, text: &str) -> usize {
-        if text.is_empty() {
+        self.estimate_chars(text.chars().count())
+    }
+
+    /// [`Self::estimate_tokens`] for a known character count. Compaction
+    /// counts rendered turn characters incrementally instead of allocating
+    /// the rendered string just to measure it; calling this with the exact
+    /// char total is bit-identical to estimating the string.
+    pub fn estimate_chars(&self, chars: usize) -> usize {
+        if chars == 0 {
             return 0;
         }
-        let chars = text.chars().count();
         let floor_34 = ceil_div(chars.saturating_mul(10), 34);
         let dense = chars.saturating_div(3).saturating_add(1);
         // For chars >= 1 the dense term dominates, but the max stays

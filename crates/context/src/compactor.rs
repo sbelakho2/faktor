@@ -76,12 +76,38 @@ pub const DEFAULT_SUMMARIZER_RESIDUE_BUDGET_TOKENS: usize = 128;
 
 /// Insertion-ordered rendering of turns (`"{role}: {text}\n"`), the same
 /// shape the archive chunks use.
+#[cfg(test)]
 fn render_turns<'a>(turns: impl Iterator<Item = &'a RecentTurn>) -> String {
     let mut out = String::new();
     for t in turns {
         out.push_str(&format!("{}: {}\n", t.role, t.text));
     }
     out
+}
+
+/// Character count of one turn as the per-turn estimator rendered it
+/// (`"{role}: {text}"`, no trailing newline) without allocating the String.
+fn turn_chars(turn: &RecentTurn) -> usize {
+    turn.role
+        .chars()
+        .count()
+        .saturating_add(turn.text.chars().count())
+        .saturating_add(2)
+}
+
+/// Exact estimator value of one rendered turn (same formula as
+/// `Estimator::estimate_tokens(&format!("{role}: {text}"))`, no allocation).
+fn estimate_turn_tokens(turn: &RecentTurn) -> usize {
+    Estimator.estimate_chars(turn_chars(turn))
+}
+
+/// Exact estimator value of the concatenated rendering of `turns` (same
+/// formula, one pass over the characters, no intermediate String).
+fn estimate_rendered_tokens<'a>(turns: impl Iterator<Item = &'a RecentTurn>) -> usize {
+    let chars = turns
+        .map(|turn| turn_chars(turn).saturating_add(1))
+        .fold(0usize, |total, chars| total.saturating_add(chars));
+    Estimator.estimate_chars(chars)
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -560,11 +586,13 @@ impl Compactor {
         let mut refs: Vec<EvidenceRef> = Vec::new();
         {
             let mut archive = self.lock_evidence();
+            let mut seen_refs: std::collections::HashSet<EvidenceId> =
+                std::collections::HashSet::new();
             for turn in history {
                 if is_evidence_eligible(turn) {
                     if let Ok(ev) = archive.archive(EvidenceKind::ProcessLog, &turn.text) {
                         // Identical outputs content-address to ONE ref.
-                        if !refs.iter().any(|r| r.id == ev.id) {
+                        if seen_refs.insert(ev.id) {
                             refs.push(ev.clone());
                         }
                         prepared.push(RecentTurn {
@@ -625,7 +653,7 @@ impl Compactor {
         let durable_facts = projection.summarizable_render();
         let identity_tokens = Estimator.estimate_tokens(&identity);
         let facts_tokens = Estimator.estimate_tokens(&durable_facts);
-        let residue_tokens = Estimator.estimate_tokens(&render_turns(residue.iter()));
+        let residue_tokens = estimate_rendered_tokens(residue.iter());
 
         // (f): the LLM is invoked only above the residue budget.
         if let Some(summarizer) = &self.summarizer {
@@ -671,6 +699,8 @@ impl Compactor {
                     &residue,
                     &identity,
                     &durable_facts,
+                    identity_tokens,
+                    facts_tokens,
                     working_ledger,
                     req,
                     evidence_refs,
@@ -683,6 +713,8 @@ impl Compactor {
             &residue,
             &identity,
             &durable_facts,
+            identity_tokens,
+            facts_tokens,
             working_ledger,
             req,
             evidence_refs,
@@ -692,17 +724,18 @@ impl Compactor {
     /// Deterministic pruning: keep the durable projection in full, keep the
     /// newest residue turns that fit under the cap, archive the rest as
     /// references. `identity` and `durable_facts` are reserved up front.
+    #[allow(clippy::too_many_arguments)]
     fn deterministic_core(
         &self,
         residue: &[RecentTurn],
         identity: &str,
         durable_facts: &str,
+        identity_tokens: usize,
+        facts_tokens: usize,
         working_ledger: &TaskLedger,
         req: &CompactionRequest,
         evidence_refs: Vec<EvidenceRef>,
     ) -> CompactionPlan {
-        let identity_tokens = Estimator.estimate_tokens(identity);
-        let facts_tokens = Estimator.estimate_tokens(durable_facts);
         let cap = req.hard_cap();
         // The eviction digest rides the wire in kept_recent[0]; reserve its
         // budget up front so the after_tokens figure stays honest.
@@ -720,7 +753,7 @@ impl Compactor {
         if cap > reserved {
             // Newest first; each turn's cost = role + text.
             for turn in residue.iter().rev() {
-                let t = Estimator.estimate_tokens(&format!("{}: {}", turn.role, turn.text));
+                let t = estimate_turn_tokens(turn);
                 if used + t > cap {
                     archived.push(ArtifactRef {
                         inline: None,
@@ -790,10 +823,14 @@ impl Compactor {
         let (residue, evidence_refs) = self.prepare_history(history);
         let identity = projection.identity_render();
         let durable_facts = projection.summarizable_render();
+        let identity_tokens = Estimator.estimate_tokens(&identity);
+        let facts_tokens = Estimator.estimate_tokens(&durable_facts);
         self.deterministic_core(
             &residue,
             &identity,
             &durable_facts,
+            identity_tokens,
+            facts_tokens,
             ledger,
             req,
             evidence_refs,
@@ -1630,5 +1667,56 @@ mod tests {
             "residue above budget invokes the model once"
         );
         assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
+    }
+
+    #[test]
+    fn allocation_free_token_estimates_match_the_rendered_string_exactly() {
+        let turns = vec![
+            RecentTurn {
+                role: "user".into(),
+                text: "汉字😀 mixed 123".into(),
+            },
+            RecentTurn {
+                role: "tool".into(),
+                text: "\u{FFFE} hostile \t bytes".into(),
+            },
+            RecentTurn {
+                role: String::new(),
+                text: String::new(),
+            },
+        ];
+        for turn in &turns {
+            assert_eq!(
+                estimate_turn_tokens(turn),
+                Estimator.estimate_tokens(&format!("{}: {}", turn.role, turn.text))
+            );
+        }
+        assert_eq!(
+            estimate_rendered_tokens(turns.iter()),
+            Estimator.estimate_tokens(&render_turns(turns.iter()))
+        );
+    }
+
+    #[test]
+    fn compaction_100k_tokens_stays_allocation_free() {
+        let body = "x".repeat(296);
+        let history: Vec<RecentTurn> = (0..1000)
+            .map(|i| RecentTurn {
+                role: if i % 2 == 0 { "tool" } else { "assistant" }.to_string(),
+                text: format!("{i:04}-{body}"),
+            })
+            .collect();
+        let compactor = Compactor::deterministic_only();
+        let ledger = TaskLedger::default();
+        let req = CompactionRequest::new(100_000, 50_000);
+        let mut best = u64::MAX;
+        let mut after = 0usize;
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            let plan = compactor.deterministic_prune(&history, &ledger, &req);
+            best = best.min(started.elapsed().as_nanos() as u64);
+            after = plan.after_tokens;
+        }
+        println!("PROBE compaction_100k_tokens best_ns={best} after_tokens={after}");
     }
 }

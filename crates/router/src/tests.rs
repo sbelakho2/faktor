@@ -644,10 +644,17 @@ fn poisoned_telemetry_caches_are_recovered_not_propagated() {
         desc("b", "bm", true, 100_000, 4096, econ(5, 15, 95, 95)),
     ]);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = svc.telemetry.inner.lock().unwrap();
+        let _guard = svc
+            .telemetry
+            .shard("a", "am", RouterPhase::Implement)
+            .lock()
+            .unwrap();
         panic!("holder poisoned the outcome cache");
     }));
-    assert!(svc.telemetry.inner.is_poisoned());
+    assert!(svc
+        .telemetry
+        .shard("a", "am", RouterPhase::Implement)
+        .is_poisoned());
     // Cache => recover: advisory EWMA stats keep serving and rate-limit
     // cooldowns keep recording instead of panicking the routing path.
     svc.telemetry
@@ -656,7 +663,10 @@ fn poisoned_telemetry_caches_are_recovered_not_propagated() {
     assert!(svc.telemetry.cooldown_active("b"));
     let health = svc.telemetry.snapshot();
     assert!(health.success_ppm("a", "am", RouterPhase::Implement) > 0);
-    assert!(!svc.telemetry.inner.is_poisoned());
+    assert!(!svc
+        .telemetry
+        .shard("a", "am", RouterPhase::Implement)
+        .is_poisoned());
 }
 
 #[test]
@@ -2673,4 +2683,280 @@ fn tariff_dependent_cache_write_reserves_the_conservative_applicable_amount() {
         unix_now_ms(),
     )
     .is_err());
+}
+
+/// Bounded contention probe (third-angle performance audit): 16 threads
+/// record 10k settled-call outcomes each through the SAME telemetry API.
+/// The map is read-mostly across routing decisions (every decision takes a
+/// `snapshot`, while only settled calls write), so per-key sharding must
+/// keep independent keys from serializing on one mutex.
+#[test]
+fn telemetry_record_under_16_thread_contention() {
+    use std::sync::atomic::Ordering;
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 10_000;
+
+    let telemetry = RouterTelemetry::new();
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let telemetry = &telemetry;
+            scope.spawn(move || {
+                let provider = format!("provider-{t}");
+                let model = format!("model-{t}");
+                for i in 0..PER_THREAD {
+                    telemetry.record_outcome(
+                        &provider,
+                        &model,
+                        RouterPhase::Implement,
+                        i % 7 != 0,
+                        i % 5 == 0,
+                        i % 11 == 0,
+                        (i % 500) as u64,
+                    );
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    let acquires = telemetry.probe.acquires.load(Ordering::Relaxed);
+    let waits = telemetry.probe.waits.load(Ordering::Relaxed);
+    let total_wait = telemetry.probe.total_wait_ns.load(Ordering::Relaxed);
+    let max_wait = telemetry.probe.max_wait_ns.load(Ordering::Relaxed);
+    let max_hold = telemetry.probe.max_hold_ns.load(Ordering::Relaxed);
+    eprintln!(
+        "router telemetry probe: {THREADS} threads x {PER_THREAD} records in {elapsed:?} \
+         ({:.0} records/s); acquires={acquires} waits(>=1us)={waits} max_wait={}us \
+         total_wait={}us max_hold={}us",
+        (THREADS * PER_THREAD) as f64 / elapsed.as_secs_f64(),
+        max_wait / 1_000,
+        total_wait / 1_000,
+        max_hold / 1_000,
+    );
+    assert_eq!(acquires, (THREADS * PER_THREAD) as u64);
+    assert!(telemetry.success_estimate("provider-0", "model-0", RouterPhase::Implement) > 0.0);
+    // No compute or I/O may run inside the map lock: the two EWMA updates
+    // are arithmetic on the entry only. (Scheduler preemption can inflate a
+    // single hold; only a structural regression would approach milliseconds
+    // on average.)
+    assert!(
+        max_hold < 5_000_000,
+        "telemetry map lock was held {}us — the critical section grew",
+        max_hold / 1_000
+    );
+}
+
+/// Sharding regression: holding one key's shard must NOT block an update for
+/// a key in a different shard. The pre-shard implementation used one map
+/// mutex, so this test blocks for the full 500 ms hold and fails.
+#[test]
+fn telemetry_shards_are_independent() {
+    let telemetry = RouterTelemetry::new();
+    // Find two keys that live in different shards.
+    let mut key_a = None;
+    let mut key_b = None;
+    'outer: for p in 0..64 {
+        for m in 0..64 {
+            let provider = format!("sp-{p}");
+            let model = format!("sm-{m}");
+            let shard = telemetry.shard(&provider, &model, RouterPhase::Implement) as *const _;
+            match key_a {
+                None => key_a = Some((provider.clone(), model.clone(), shard)),
+                Some((_, _, first)) if first == shard => {}
+                Some(_) => {
+                    key_b = Some((provider, model));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (provider_a, model_a, _) = key_a.unwrap();
+    let (provider_b, model_b) = key_b.unwrap();
+    let guard = telemetry
+        .shard(&provider_a, &model_a, RouterPhase::Implement)
+        .lock()
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            telemetry.record_outcome(
+                &provider_b,
+                &model_b,
+                RouterPhase::Implement,
+                true,
+                false,
+                false,
+                1,
+            );
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("an unrelated shard was blocked by a held lock (single map mutex?)");
+    });
+    drop(guard);
+    assert!(telemetry.success_estimate(&provider_b, &model_b, RouterPhase::Implement) > 0.0);
+}
+
+/// Falsification of lost updates: 16 threads write disjoint keys with MIXED
+/// outcomes while one key is hammered by all 16 with successes. The final
+/// per-key state must be bit-identical to a single-threaded reference that
+/// records the same per-key sequence, and `snapshot()` must contain exactly
+/// that state (no update lost at a shard boundary).
+#[test]
+fn telemetry_sharded_recording_matches_a_single_threaded_reference() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 500;
+    let telemetry = RouterTelemetry::new();
+    let reference = RouterTelemetry::new();
+
+    let owned: Vec<(String, String)> = (0..THREADS)
+        .map(|t| (format!("ref-p{t}"), format!("ref-m{t}")))
+        .collect();
+    std::thread::scope(|scope| {
+        for (t, (provider, model)) in owned.iter().enumerate() {
+            let telemetry = &telemetry;
+            scope.spawn(move || {
+                for i in 0..PER_THREAD {
+                    telemetry.record_outcome(
+                        provider,
+                        model,
+                        RouterPhase::Implement,
+                        i % 7 != 0,
+                        i % 5 == 0,
+                        i % 11 == 0,
+                        (i % 500) as u64,
+                    );
+                }
+            });
+            let _ = t;
+        }
+        for _ in 0..THREADS {
+            let telemetry = &telemetry;
+            scope.spawn(move || {
+                for _ in 0..PER_THREAD {
+                    telemetry.record_outcome(
+                        "shared-p",
+                        "shared-m",
+                        RouterPhase::Implement,
+                        true,
+                        false,
+                        false,
+                        1,
+                    );
+                }
+            });
+        }
+    });
+    // Single-threaded reference for the same per-key sequences.
+    for (provider, model) in &owned {
+        for i in 0..PER_THREAD {
+            reference.record_outcome(
+                provider,
+                model,
+                RouterPhase::Implement,
+                i % 7 != 0,
+                i % 5 == 0,
+                i % 11 == 0,
+                (i % 500) as u64,
+            );
+        }
+    }
+    for _ in 0..THREADS * PER_THREAD {
+        reference.record_outcome(
+            "shared-p",
+            "shared-m",
+            RouterPhase::Implement,
+            true,
+            false,
+            false,
+            1,
+        );
+    }
+    let actual = telemetry.snapshot();
+    let expected = reference.snapshot();
+    assert_eq!(
+        actual.success_ppm, expected.success_ppm,
+        "sharded telemetry lost or reordered updates"
+    );
+    for (provider, model) in &owned {
+        assert_eq!(
+            actual.success_ppm(provider, model, RouterPhase::Implement),
+            expected.success_ppm(provider, model, RouterPhase::Implement),
+            "{provider}/{model} diverged from the reference"
+        );
+    }
+    assert_eq!(
+        actual.success_ppm("shared-p", "shared-m", RouterPhase::Implement),
+        expected.success_ppm("shared-p", "shared-m", RouterPhase::Implement),
+        "same-key concurrent updates diverged"
+    );
+    assert!(actual.cooldown.is_empty(), "no cooldown was recorded");
+}
+
+/// Point-in-time contract under sharding: `snapshot()` must acquire EVERY
+/// shard, so a write in progress in any shard is either wholly visible or
+/// wholly absent from the returned health view. Holding one shard blocks the
+/// snapshot until release (an implementation that drained shards one at a
+/// time would return early with a torn view).
+#[test]
+fn telemetry_snapshot_is_point_in_time_across_shards() {
+    let telemetry = RouterTelemetry::new();
+    let mut keys = Vec::new();
+    'outer: for p in 0..64 {
+        for m in 0..64 {
+            let provider = format!("pt-{p}");
+            let model = format!("ptm-{m}");
+            let shard = telemetry.shard(&provider, &model, RouterPhase::Implement) as *const _;
+            if keys.iter().all(|(_, _, s)| *s != shard) {
+                keys.push((provider, model, shard));
+                if keys.len() == 2 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (provider_a, model_a, _) = &keys[0];
+    let (provider_b, model_b, _) = &keys[1];
+    telemetry.record_outcome(
+        provider_a,
+        model_a,
+        RouterPhase::Implement,
+        true,
+        false,
+        false,
+        1,
+    );
+    telemetry.record_outcome(
+        provider_b,
+        model_b,
+        RouterPhase::Implement,
+        true,
+        false,
+        false,
+        1,
+    );
+
+    let guard = telemetry
+        .shard(provider_a, model_a, RouterPhase::Implement)
+        .lock()
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = done_tx.send(telemetry.snapshot());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "snapshot returned while one shard was held: the view is not point-in-time"
+        );
+        drop(guard);
+        let health = done_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("snapshot must complete once every shard is free");
+        assert!(health.success_ppm(provider_a, model_a, RouterPhase::Implement) > 0);
+        assert!(health.success_ppm(provider_b, model_b, RouterPhase::Implement) > 0);
+    });
 }

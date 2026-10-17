@@ -173,19 +173,23 @@ impl AgentRuntime {
     /// The bounded progress record of one session as JSON (runtime health),
     /// for the native projection. None when the session has no record.
     pub fn progress_view(&self, session: SessionId) -> Option<serde_json::Value> {
-        let map = self.progress.lock().unwrap();
-        let t = map.get(&session)?;
+        // The tracker is cloned under the map lock; the JSON value is built
+        // AFTER the lock is released (formatting must never block feeds for
+        // other sessions).
+        let mut t = {
+            let map = self.progress.lock().unwrap();
+            map.get(&session)?.clone()
+        };
         let now = self.deps.clock.now_ms();
-        let mut t2 = t.clone();
-        let silence = t2.silence_ms(now);
-        let stalled = t2.is_stalled() || silence > t2.threshold_ms();
+        let silence = t.silence_ms(now);
+        let stalled = t.is_stalled() || silence > t.threshold_ms();
         Some(serde_json::json!({
-            "lastOutputAt": t2.last_output_at(),
-            "lastProgressAt": t2.last_progress_at(),
-            "lastOpCompletedAt": t2.last_op_completed_at(),
-            "inFlightOp": t2.in_flight_op(),
+            "lastOutputAt": t.last_output_at(),
+            "lastProgressAt": t.last_progress_at(),
+            "lastOpCompletedAt": t.last_op_completed_at(),
+            "inFlightOp": t.in_flight_op(),
             "silenceMs": silence,
-            "stallThresholdMs": t2.threshold_ms(),
+            "stallThresholdMs": t.threshold_ms(),
             "stalled": stalled,
         }))
     }

@@ -416,6 +416,23 @@ pub fn normalize_query(raw: &str) -> String {
     out
 }
 
+#[cfg(test)]
+pub(crate) mod canonical_work {
+    use std::cell::Cell;
+    thread_local! {
+        pub(crate) static CANONICALIZATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn reset() {
+        CANONICALIZATIONS.with(|c| c.set(0));
+    }
+    pub(crate) fn add(count: u64) {
+        CANONICALIZATIONS.with(|c| c.set(c.get() + count));
+    }
+    pub(crate) fn snapshot() -> u64 {
+        CANONICALIZATIONS.with(Cell::get)
+    }
+}
+
 /// The NON-LOSSY canonical form of one query used for line/job identity:
 /// ASCII letters lowercased, runs of whitespace collapsed to one space, and
 /// every other character preserved. Identity must never erase punctuation
@@ -423,6 +440,8 @@ pub fn normalize_query(raw: &str) -> String {
 /// lines — while case/whitespace-equivalent spellings still share one
 /// identity.
 pub fn canonical_query(raw: &str) -> String {
+    #[cfg(test)]
+    canonical_work::add(1);
     let mut out = String::with_capacity(raw.len());
     let mut pending_space = false;
     for ch in raw.chars() {

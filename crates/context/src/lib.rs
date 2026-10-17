@@ -859,4 +859,25 @@ mod token_cache_tests {
             TokenEstimateKind::UpperBound
         );
     }
+
+    #[test]
+    fn repeated_100k_token_text_is_one_tokenization() {
+        // ~100k tokens of realistic prose/code: 340k chars at the 3.4 floor.
+        let unit = "fn handler(input: &str) -> Result<Output, Error> { /* audit */ }\n";
+        let text = unit.repeat(5_500);
+        let cache = TokenCache::new();
+        let started = std::time::Instant::now();
+        let first = cache.count_for_model("gpt-5", &text);
+        let first_ns = started.elapsed().as_nanos() as u64;
+        let started = std::time::Instant::now();
+        let second = cache.count_for_model("gpt-5", &text);
+        let second_ns = started.elapsed().as_nanos() as u64;
+        assert_eq!(first, second);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 1);
+        println!(
+            "PROBE token_cache_100k first_ns={first_ns} hit_ns={second_ns} count={}",
+            first.count
+        );
+    }
 }

@@ -544,6 +544,25 @@ CREATE TABLE IF NOT EXISTS update_high_water (
     // separate probe connection). Owned by the durability stack
     // (`faktor_cloud::durability`), the same marker cloud records.
     faktor_cloud::durability::POLICY_SCHEMA_V5,
+    // v4 — query-plan audit. `by_key` filtered on
+    // json_extract(payload,'$.idempotency_key') with no expression index, so
+    // every resume/lookup decoded the whole operation table; the expression
+    // index (ordered by the query's recency keys) makes the lookup a SEARCH.
+    // The list/running/latest orders append created_ms+id to the status and
+    // kind+status indexes (same names, same count) so no query needs a temp
+    // B-tree; one ordering index serves the unfiltered listing.
+    "DROP INDEX IF EXISTS update_operation_status;
+     CREATE INDEX IF NOT EXISTS update_operation_status
+        ON update_operation(status, created_ms, id);
+     DROP INDEX IF EXISTS update_operation_kind_status;
+     CREATE INDEX IF NOT EXISTS update_operation_kind_status
+        ON update_operation(kind, status, created_ms, id);
+     CREATE INDEX IF NOT EXISTS update_operation_created
+        ON update_operation(created_ms DESC, id DESC);
+     CREATE INDEX IF NOT EXISTS update_operation_idempotency_key
+        ON update_operation(json_extract(payload, '$.idempotency_key'),
+                            created_ms DESC, id DESC)
+        WHERE json_valid(payload);",
 ];
 
 impl SqliteUpdaterStore {
@@ -866,7 +885,8 @@ impl UpdaterStore for SqliteUpdaterStore {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM update_operation
-                 WHERE json_extract(payload, '$.idempotency_key') = ?1
+                 WHERE json_valid(payload)
+                   AND json_extract(payload, '$.idempotency_key') = ?1
                  ORDER BY created_ms DESC, id DESC LIMIT 1",
                 rusqlite::params![key],
                 |r| r.get(0),
@@ -954,6 +974,8 @@ impl UpdaterStore for SqliteUpdaterStore {
 mod tests {
     use super::*;
 
+    include!("query_plan_tests.rs");
+
     /// P1 durability: the updater database carries the anti-rollback
     /// high-water floor, so its writer connection acknowledges a commit only
     /// after an fsync (`synchronous = FULL`): a crash/power loss must not roll
@@ -1028,7 +1050,8 @@ mod tests {
         // Migration restore points are a separate class: never rotated as
         // rotating backups. The claim must match the live schema version so
         // the point self-verifies (see `faktor_cloud::durability`).
-        faktor_cloud::durability::migration_backup(&conn, &path, 3).unwrap();
+        faktor_cloud::durability::migration_backup(&conn, &path, UPDATER_MIGRATIONS.len() as i64)
+            .unwrap();
         assert_eq!(
             faktor_cloud::durability::list_rotating_backups(&path).len(),
             faktor_cloud::durability::MAX_BACKUP_FILES

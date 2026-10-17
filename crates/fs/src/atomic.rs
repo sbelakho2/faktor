@@ -440,6 +440,31 @@ struct PathLockRegistry {
     locks: HashMap<PathBuf, Arc<Mutex<()>>>,
 }
 
+/// Shard count of the path-lock registry. Path keys distribute uniformly
+/// across the shards; a path ALWAYS maps to the same shard (same hash), so
+/// the per-path `Arc<Mutex<()>>` uniqueness invariant is preserved while
+/// independent paths stop serializing on one global registry mutex.
+const PATH_LOCK_SHARDS: usize = 16;
+
+struct ShardedPathLocks {
+    shards: [Mutex<PathLockRegistry>; PATH_LOCK_SHARDS],
+}
+
+impl ShardedPathLocks {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(PathLockRegistry::default())),
+        }
+    }
+
+    fn shard_for(&self, path: &Path) -> &Mutex<PathLockRegistry> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % PATH_LOCK_SHARDS]
+    }
+}
+
 impl PathLockRegistry {
     /// Drop every entry no caller can still hold (strong count 1 = only the
     /// registry references it), so removing it cannot split a per-path lock.
@@ -451,24 +476,100 @@ impl PathLockRegistry {
     }
 }
 
-static PATH_LOCKS: OnceLock<Mutex<PathLockRegistry>> = OnceLock::new();
+static PATH_LOCKS: OnceLock<ShardedPathLocks> = OnceLock::new();
 
-fn path_lock_registry() -> &'static Mutex<PathLockRegistry> {
-    PATH_LOCKS.get_or_init(|| Mutex::new(PathLockRegistry::default()))
+/// Test-only contention instrumentation for the registry lock (compiled out
+/// of production). Armed by the audit probe so unrelated tests are inert.
+#[cfg(test)]
+pub(crate) mod path_lock_probe {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    pub(crate) static ARMED: AtomicBool = AtomicBool::new(false);
+    pub(crate) static ACQUIRES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TOTAL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static MAX_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn arm() {
+        ACQUIRES.store(0, Ordering::SeqCst);
+        WAITS.store(0, Ordering::SeqCst);
+        TOTAL_WAIT_NS.store(0, Ordering::SeqCst);
+        MAX_WAIT_NS.store(0, Ordering::SeqCst);
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn disarm() {
+        ARMED.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record(wait: Duration) {
+        if !ARMED.load(Ordering::SeqCst) {
+            return;
+        }
+        let ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        ACQUIRES.fetch_add(1, Ordering::Relaxed);
+        TOTAL_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+        MAX_WAIT_NS.fetch_max(ns, Ordering::Relaxed);
+        if wait >= Duration::from_micros(1) {
+            WAITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn path_lock_registry() -> &'static ShardedPathLocks {
+    PATH_LOCKS.get_or_init(ShardedPathLocks::new)
+}
+
+/// The registry key for a destination. Cooperative exclusion must cover the
+/// SAME file even when callers spell it differently: a relative target, a
+/// `.`/`..` component, or a symlinked parent otherwise produced a different
+/// key and split the per-path mutex, letting two CAS writers both pass the
+/// precondition before either rename (both "winners"). Resolve the
+/// destination when it exists; otherwise resolve the parent (a same-directory
+/// rename requires it) and append the final name. Lexical fallback when
+/// neither exists — such a write cannot rename successfully anyway.
+///
+/// Lock order: the registry shard is acquired ONLY to look up/clone the
+/// per-path mutex and is released before the caller locks the path mutex.
+/// No site acquires a path mutex and then a registry shard while holding it,
+/// so `shard -> path` can never invert.
+fn path_lock_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canonical_parent) = fs::canonicalize(parent) {
+            return canonical_parent.join(name);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn path_lock(path: &Path) -> Arc<Mutex<()>> {
     let registry = path_lock_registry();
-    let key = path.to_path_buf();
+    let key = path_lock_key(path);
     // Classified: the path-lock registry is a DERIVED cache. A poisoned
     // guard is recovered with the poison flag cleared so one panicking
     // writer can never wedge every later mutation; the on-disk CAS recheck
-    // below stays the authority.
-    let mut guard = registry.lock().unwrap_or_else(|poisoned| {
-        registry.clear_poison();
+    // below stays the authority. Each shard is capped at its share of the
+    // idle bound, so the registry's TOTAL retained size stays bounded.
+    let shard = registry.shard_for(&key);
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let mut guard = shard.lock().unwrap_or_else(|poisoned| {
+        shard.clear_poison();
         poisoned.into_inner()
     });
-    if guard.locks.len() >= PATH_LOCK_IDLE_CAP && !guard.locks.contains_key(&key) {
+    #[cfg(test)]
+    path_lock_probe::record(started.elapsed());
+    let shard_cap = (PATH_LOCK_IDLE_CAP / PATH_LOCK_SHARDS).max(1);
+    if guard.locks.len() >= shard_cap && !guard.locks.contains_key(&key) {
         guard.evict_idle();
     }
     guard
@@ -570,6 +671,265 @@ fn mismatch(path: &Path, expected: &FileState, actual: &FileState) -> Error {
 mod tests {
     use super::*;
     use faktor_core::error::ErrorKind;
+
+    /// Bounded contention probe (third-angle performance audit): 16 threads
+    /// resolve 10k DISTINCT path locks each through the SAME registry API.
+    /// Distinct paths are the read-mostly shape (independent namespace
+    /// entries), so the registry lookup must not serialize them. The probe
+    /// prints throughput and acquire-wait counters.
+    #[test]
+    fn path_lock_registry_distinct_paths_under_16_threads() {
+        use std::sync::atomic::Ordering;
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 10_000;
+
+        // Serialize the probe against other tests that also resolve locks;
+        // the ARMED flag keeps them out of the counters, but the static
+        // reset/read window must not overlap another probe run.
+        static PROBE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = PROBE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        super::path_lock_probe::arm();
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let path = PathBuf::from(format!("/probe/{t}/{i}"));
+                        let lock = path_lock(&path);
+                        // Same path while held must resolve to the same Arc.
+                        assert!(Arc::ptr_eq(&lock, &path_lock(&path)));
+                        drop(lock);
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        super::path_lock_probe::disarm();
+        let acquires = super::path_lock_probe::ACQUIRES.load(Ordering::Relaxed);
+        let waits = super::path_lock_probe::WAITS.load(Ordering::Relaxed);
+        let total_wait = super::path_lock_probe::TOTAL_WAIT_NS.load(Ordering::Relaxed);
+        let max_wait = super::path_lock_probe::MAX_WAIT_NS.load(Ordering::Relaxed);
+        eprintln!(
+            "fs path-lock probe: {THREADS} threads x {PER_THREAD} distinct locks in {elapsed:?}              ({:.0} locks/s); registry acquires={acquires} waits(>=1us)={waits}              max_wait={}us total_wait={}us",
+            (THREADS * PER_THREAD) as f64 / elapsed.as_secs_f64(),
+            max_wait / 1_000,
+            total_wait / 1_000,
+        );
+        // Other tests in this binary may resolve locks while the probe is
+        // armed; only the lower bound is asserted.
+        assert!(acquires >= (THREADS * PER_THREAD * 2) as u64);
+    }
+
+    /// Deterministic sharding regression: holding one registry shard must
+    /// NOT block a lock resolution for a path in another shard. The pre-fix
+    /// single-mutex registry blocks for the full 500 ms hold and fails.
+    #[test]
+    fn path_lock_registry_shards_are_independent() {
+        let registry = super::path_lock_registry();
+        let path_a = PathBuf::from("/probe/shard-a");
+        let path_b = loop_candidate_other_shard(registry, &path_a);
+        let shard_a = registry.shard_for(&path_a);
+        let guard = shard_a.lock().unwrap_or_else(|p| p.into_inner());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                drop(path_lock(&path_b));
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("an unrelated path shard was blocked by a held registry lock");
+        });
+        drop(guard);
+    }
+
+    /// Every spelling of one destination must resolve to ONE lock: relative
+    /// vs absolute, `.`/`..` components, and a symlinked parent. A split key
+    /// lets two CAS writers both pass the precondition (two "winners").
+    #[test]
+    fn path_lock_maps_all_alias_spellings_to_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = dir.path().join("alias-target.bin");
+        atomic_replace(&target, b"initial").unwrap();
+
+        let absolute = path_lock(&target);
+        let dot = dir.path().join(".").join("alias-target.bin");
+        let dotdot = sub.join("..").join("alias-target.bin");
+        assert!(Arc::ptr_eq(&absolute, &path_lock(&dot)), "`.` alias split");
+        assert!(
+            Arc::ptr_eq(&absolute, &path_lock(&dotdot)),
+            "`..` alias split"
+        );
+
+        // Relative spelling against the process CWD (a temporary dir INSIDE
+        // it, so the relative form is stable and cleaned up by the guard).
+        let cwd = std::env::current_dir().unwrap();
+        let rel_dir = tempfile::Builder::new()
+            .prefix(".faktor-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let rel_target = rel_dir.path().join("rel.bin");
+        atomic_replace(&rel_target, b"relative").unwrap();
+        let relative = PathBuf::from(rel_dir.path().file_name().unwrap()).join("rel.bin");
+        assert!(
+            Arc::ptr_eq(&path_lock(&rel_target), &path_lock(&relative)),
+            "relative/absolute spelling split"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            let through_link = link.join("alias-target.bin");
+            assert!(
+                Arc::ptr_eq(&absolute, &path_lock(&through_link)),
+                "symlinked-parent spelling split"
+            );
+        }
+    }
+
+    /// Deterministic alias exclusion: while the canonical path mutex is held
+    /// (as a cooperative CAS writer holds it across stage+check+rename), a
+    /// CAS through an alias spelling must BLOCK. A split lock lets it run,
+    /// pass the recheck and rename before the holder — two winners.
+    #[test]
+    fn cas_through_an_alias_waits_for_the_canonical_path_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = dir.path().join("alias-cas.bin");
+        atomic_replace(&target, b"base").unwrap();
+        let expected = FileState::now(&target).unwrap();
+        let alias = sub.join("..").join("alias-cas.bin");
+
+        let lock = path_lock(&target);
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = atomic_replace_cas(&alias, &expected, b"alias-winner");
+                let _ = done_tx.send(result.is_ok());
+            });
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "an alias spelling bypassed the canonical path lock"
+            );
+            drop(guard);
+            assert!(done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the alias writer must finish after the lock is released"));
+        });
+        assert_eq!(fs::read(&target).unwrap(), b"alias-winner");
+    }
+
+    /// 32 CAS writers race the SAME target through four DIFFERENT alias
+    /// spellings (absolute, `.`, `..`, symlinked parent). The canonical lock
+    /// must admit exactly one winner; every loser is a typed CAS conflict and
+    /// no staged temp may survive. Without alias unification several writers
+    /// pass the recheck and overwrite the winner.
+    #[test]
+    fn cas_alias_race_has_exactly_one_winner_and_no_torn_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = dir.path().join("race.bin");
+        atomic_replace(&target, &vec![b'0'; 8 * 1024]).unwrap();
+        let expected = FileState::now_with_digest(&target).unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            link
+        };
+        let mut aliases = vec![
+            target.clone(),
+            dir.path().join(".").join("race.bin"),
+            sub.join("..").join("race.bin"),
+        ];
+        #[cfg(unix)]
+        aliases.push(link.join("race.bin"));
+        const WRITERS: usize = 32;
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        let winners: Vec<(usize, String)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let alias = aliases[writer % aliases.len()].clone();
+                    let expected = expected.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let payload = format!("writer-{writer}-{}", "p".repeat(256));
+                        match atomic_replace_cas(&alias, &expected, payload.as_bytes()) {
+                            Ok(_) => Some((writer, payload)),
+                            Err(e) => {
+                                assert_eq!(
+                                    e.kind,
+                                    ErrorKind::Conflict,
+                                    "writer {writer} must be a typed CAS conflict: {e}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert_eq!(winners.len(), 1, "exactly one CAS winner: {winners:?}");
+        assert_eq!(fs::read(&target).unwrap(), winners[0].1.as_bytes());
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !is_faktor_temp(&name),
+                "a losing writer leaked a staged temp: {name}"
+            );
+        }
+    }
+
+    /// Lock-order witness: the shard mutex is never held while a caller waits
+    /// for a path mutex, so holding one path lock and resolving/locking a
+    /// different path cannot invert `shard -> path` and deadlock.
+    #[test]
+    fn path_lock_order_shard_then_path_cannot_invert() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        atomic_replace(&a, b"a").unwrap();
+        atomic_replace(&b, b"b").unwrap();
+        let lock_a = path_lock(&a);
+        let guard_a = lock_a.lock().unwrap_or_else(|p| p.into_inner());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let lock_b = path_lock(&b);
+                let _guard_b = lock_b.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("resolving/locking another path inverted under a held path lock");
+        });
+        drop(guard_a);
+    }
+
+    fn loop_candidate_other_shard(registry: &super::ShardedPathLocks, path_a: &Path) -> PathBuf {
+        let shard_a = registry.shard_for(path_a);
+        for i in 0..10_000 {
+            let candidate = PathBuf::from(format!("/probe/shard-b-{i}"));
+            if !std::ptr::eq(registry.shard_for(&candidate), shard_a) {
+                return candidate;
+            }
+        }
+        panic!("no candidate path landed in another shard");
+    }
 
     #[test]
     fn poisoned_path_lock_registry_is_recovered() {
@@ -976,11 +1336,12 @@ mod tests {
     #[test]
     fn idle_path_locks_are_evicted_at_the_bound() {
         fn registry_len() -> usize {
-            super::path_lock_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .locks
-                .len()
+            let registry = super::path_lock_registry();
+            registry
+                .shards
+                .iter()
+                .map(|shard| shard.lock().unwrap_or_else(|p| p.into_inner()).locks.len())
+                .sum()
         }
         let base = PathBuf::from("/nonexistent/faktor-path-lock-bound");
         for i in 0..(super::PATH_LOCK_IDLE_CAP + 64) {
