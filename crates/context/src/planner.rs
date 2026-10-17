@@ -250,6 +250,8 @@ fn plan_context_inner(
         .token_budget
         .saturating_sub(request.mode.static_tokens)
         .saturating_sub(request.mode.semi_stable_tokens);
+    let min_utility = request.min_utility;
+    let reserve = u64::from(request.mode.semi_stable_tokens);
 
     // Hostile utilities are not evidence: NaN/inf never select.
     let sanitize = |c: &mut ContextCandidate| {
@@ -257,25 +259,27 @@ fn plan_context_inner(
             c.utility = 0.0;
         }
     };
+    // The request is OWNED: every candidate is MOVED into the selection pool
+    // (no deep `.cloned()` of id/omission_keys/text per candidate) — the
+    // sanitize step is applied in place, so the plan is bit-identical to the
+    // historical clone-then-sanitize path.
     let messages: Vec<ContextCandidate> = request
         .messages
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|mut c| {
             sanitize(&mut c);
             c
         })
         .collect();
-    let mut rules = request.rules.clone();
+    let mut rules = request.rules;
     for c in &mut rules {
         sanitize(c);
     }
     let mut evidence: Vec<ContextCandidate> = request
         .index_evidence
-        .iter()
-        .chain(request.tool_notes.iter())
-        .chain(request.subagent_summaries.iter())
-        .cloned()
+        .into_iter()
+        .chain(request.tool_notes)
+        .chain(request.subagent_summaries)
         .map(|mut c| {
             sanitize(&mut c);
             c
@@ -286,7 +290,7 @@ fn plan_context_inner(
     // the caller's reserve cannot hold them, drop from the TAIL of the
     // rules list (deterministic; the first rules are the ones the caller
     // ordered first).
-    let reserve = u64::from(request.mode.semi_stable_tokens);
+    let rules_total = rules.len();
     let mut rules_kept = rules.len();
     let mut rules_tokens: u64 = rules.iter().map(|r| u64::from(r.estimate_tokens)).sum();
     while rules_tokens > reserve && rules_kept > 0 {
@@ -294,7 +298,7 @@ fn plan_context_inner(
         rules_tokens = rules_tokens.saturating_sub(u64::from(rules[rules_kept].estimate_tokens));
     }
     rules.truncate(rules_kept);
-    let rules_dropped = request.rules.len() - rules_kept;
+    let rules_dropped = rules_total - rules_kept;
 
     // One pool, one selector: volatile classes compete together. Rules are
     // pre-reserved semi-stable head content — they never compete for the
@@ -328,10 +332,7 @@ fn plan_context_inner(
             if let Some(prior) = prior {
                 apply_prior(&mut pool, prior);
             }
-            (
-                select_by_utility(&pool, volatile_budget, request.min_utility),
-                None,
-            )
+            (select_by_utility(&pool, volatile_budget, min_utility), None)
         }
     };
     let mut selected = rules;
@@ -1065,6 +1066,135 @@ mod tests {
                 );
                 assert!(c.utility <= 0.5, "risk {risk} exceeded the 2x clamp: {c:?}");
             }
+        }
+    }
+
+    /// Second-angle performance audit differential lock: the planner now
+    /// MOVES the owned request's candidates into its pool instead of
+    /// deep-cloning every one. This reference re-implements the historical
+    /// clone-based semantics literally (`iter().cloned()` for messages and
+    /// evidence, `request.rules.clone()`, `request.rules.len()` for the
+    /// dropped count) and requires a FULL plan equality (`selected`,
+    /// `ordering`, budget, tokens, rules_dropped) on adversarial inputs:
+    /// non-finite utilities, unicode ids, zero budget, empty pools.
+    #[test]
+    fn owned_request_path_is_plan_identical_to_the_clone_reference() {
+        fn reference_plan_old_semantics(request: &ContextPlanRequest) -> ContextPlan {
+            let volatile_budget = request
+                .token_budget
+                .saturating_sub(request.mode.static_tokens)
+                .saturating_sub(request.mode.semi_stable_tokens);
+            let sanitize = |c: &mut ContextCandidate| {
+                if !c.utility.is_finite() {
+                    c.utility = 0.0;
+                }
+            };
+            let messages: Vec<ContextCandidate> = request
+                .messages
+                .iter()
+                .cloned()
+                .map(|mut c| {
+                    sanitize(&mut c);
+                    c
+                })
+                .collect();
+            let mut rules = request.rules.clone();
+            for c in &mut rules {
+                sanitize(c);
+            }
+            let mut evidence: Vec<ContextCandidate> = request
+                .index_evidence
+                .iter()
+                .chain(request.tool_notes.iter())
+                .chain(request.subagent_summaries.iter())
+                .cloned()
+                .map(|mut c| {
+                    sanitize(&mut c);
+                    c
+                })
+                .collect();
+            let reserve = u64::from(request.mode.semi_stable_tokens);
+            let mut rules_kept = rules.len();
+            let mut rules_tokens: u64 = rules.iter().map(|r| u64::from(r.estimate_tokens)).sum();
+            while rules_tokens > reserve && rules_kept > 0 {
+                rules_kept -= 1;
+                rules_tokens =
+                    rules_tokens.saturating_sub(u64::from(rules[rules_kept].estimate_tokens));
+            }
+            rules.truncate(rules_kept);
+            let rules_dropped = request.rules.len() - rules_kept;
+            let mut pool = messages;
+            pool.append(&mut evidence);
+            let volatile_selected = select_by_utility(&pool, volatile_budget, request.min_utility);
+            let mut selected = rules;
+            let mut ordering: Vec<MemoryOrdering> =
+                vec![MemoryOrdering::SemiStable; selected.len()];
+            selected.extend(volatile_selected);
+            for c in &selected[rules_kept..] {
+                ordering.push(MemoryOrdering::of(c.kind));
+            }
+            let selected_tokens: u32 = selected
+                .iter()
+                .map(|c| c.estimate_tokens)
+                .fold(0u32, u32::saturating_add);
+            ContextPlan {
+                selected,
+                ordering,
+                volatile_budget,
+                selected_tokens,
+                rules_dropped,
+            }
+        }
+
+        let mut hostile = ContextCandidate::default();
+        hostile.id = "m-非有限-😀".into();
+        hostile.kind = CandidateKind::Message;
+        hostile.estimate_tokens = 7;
+        hostile.utility = f64::NAN;
+        let mut infinite = evidence("note-∞", CandidateKind::FileNote, 9, f64::INFINITY);
+        infinite.omission_keys = vec!["汉".into(), String::new()];
+        let corpus: Vec<ContextPlanRequest> = vec![
+            ContextPlanRequest::default(),
+            {
+                let mut req = ContextPlanRequest::default();
+                req.token_budget = 100;
+                req.messages = msgs_newest_first(20, 10);
+                req.messages.push(hostile.clone());
+                req.rules
+                    .push(evidence("rule-汉", CandidateKind::RepoRule, 10, 1.0));
+                req.rules
+                    .push(evidence("rule-2", CandidateKind::RepoRule, 90, 1.0));
+                req.index_evidence.push(infinite.clone());
+                req.index_evidence
+                    .push(evidence("sym-µ", CandidateKind::Symbol, 5, 0.7));
+                req.tool_notes
+                    .push(evidence("tool-note", CandidateKind::FileNote, 5, 0.2));
+                req.subagent_summaries.push(evidence(
+                    "child-summary",
+                    CandidateKind::SubagentSummary,
+                    5,
+                    0.3,
+                ));
+                req.mode.static_tokens = 11;
+                req.mode.semi_stable_tokens = 50;
+                req
+            },
+            {
+                let mut req = ContextPlanRequest::default();
+                req.token_budget = 0; // zero budget: empty volatile window
+                req.messages = msgs_newest_first(8, 10);
+                req.index_evidence
+                    .push(evidence("e", CandidateKind::FileNote, 1, 1.0));
+                req
+            },
+        ];
+        for (i, request) in corpus.into_iter().enumerate() {
+            let reference = reference_plan_old_semantics(&request);
+            let planned = plan_context(request);
+            assert_eq!(
+                planned, reference,
+                "row {i}: owned path drifted from the clone reference"
+            );
         }
     }
 }

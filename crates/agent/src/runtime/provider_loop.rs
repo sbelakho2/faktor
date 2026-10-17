@@ -350,12 +350,14 @@ impl AgentRuntime {
     /// missing sink is a no-op, and a slow consumer never blocks the turn:
     /// [`ChunkSink::try_send`] coalesces ephemeral deltas (drop-oldest,
     /// [`CHUNK_COALESCE_CAP_BYTES`] cap) instead of waiting for room.
+    /// `text` is taken by VALUE: streaming callers already own the chunk
+    /// buffer, so no per-delta copy is made on the way to the sink.
     pub(crate) fn emit_chunk(
         &self,
         session_id: SessionId,
         message_id: Option<i64>,
         kind: &'static str,
-        text: &str,
+        text: String,
     ) {
         // Output evidence for the stall record: text/reasoning deltas are
         // output; tool announcements are progress events.
@@ -369,7 +371,7 @@ impl AgentRuntime {
                 session_id,
                 message_id,
                 kind,
-                text: text.to_string(),
+                text,
             });
         }
     }

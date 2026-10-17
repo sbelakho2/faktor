@@ -238,6 +238,8 @@
    */
   var renderedChangesKey = null;
   var renderedHistoryKey = null;
+  var renderedAgentsKey = null;
+  var renderedBoardKey = null;
   /** TRUE while an explicit outcomes read awaits its snapshot. */
   var outcomesReading = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
@@ -2516,6 +2518,18 @@
     if (!card || !list) {
       return;
     }
+    // Same content-key guard as the changes/history lists: the host re-posts
+    // the WHOLE snapshot per stream delta, so an unchanged agent set must
+    // not tear down and re-create up to MAX_AGENT_ENTRIES rows (the renderer
+    // is a pure function of `agents` and the active subview).
+    var guardKey =
+      activeSubview +
+      '#' +
+      (Array.isArray(agents) && agents.length > 0 ? hash128(JSON.stringify(agents)) : 'none');
+    if (renderedAgentsKey !== null && renderedAgentsKey === guardKey) {
+      return;
+    }
+    renderedAgentsKey = guardKey;
     var focus = captureFocus(list);
     clear(list);
     // The agents surface belongs to the Inspect / Agents subview: another
@@ -2885,6 +2899,7 @@
         container.appendChild(renderEntry(entries[a]));
       }
     } else {
+      renderProbe('transcript');
       clear(container);
       if (!entries || entries.length === 0) {
         transcriptKey = key;
@@ -3682,6 +3697,16 @@
     if (!header || !list) {
       return;
     }
+    // Content-key guard (same contract as the changes/history lists): an
+    // unchanged board page re-posted by a stream delta must not re-create
+    // the post rows or the composer draft affordances. The card visibility
+    // is part of the key (the board lives in the Agents subview).
+    var guardKey =
+      activeSubview + '#' + hash128(JSON.stringify(board === undefined ? null : board));
+    if (renderedBoardKey !== null && renderedBoardKey === guardKey) {
+      return;
+    }
+    renderedBoardKey = guardKey;
     header.textContent = boardPolicy.boardHeader(board);
     clear(list);
     var posts = boardPolicy.boardPostsForDisplay(board);

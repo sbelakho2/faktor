@@ -583,20 +583,24 @@ fn now_ms() -> i64 {
 }
 
 /// Bound the supervisor's combined-output excerpt to the outcome's documented
-/// `SUMMARY_MAX_BYTES` tail (the ring already holds the LAST lines).
+/// `SUMMARY_MAX_BYTES` tail (the ring already holds the LAST lines). One
+/// reverse char-boundary walk over the excerpt: the tail is sliced in place
+/// (never collected through a `Vec<char>` scratch buffer).
 fn build_summary_from_text(excerpt: &str) -> Option<String> {
     if excerpt.trim().is_empty() {
         return None;
     }
-    let tail: String = excerpt
-        .chars()
-        .rev()
-        .take(SUMMARY_MAX_BYTES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    Some(tail)
+    // Start of the last `SUMMARY_MAX_BYTES` chars: walking char starts in
+    // reverse, the (N+1)-th start from the end is where the tail begins
+    // (`char::len_utf8` differences never split a codepoint).
+    let mut start = excerpt.len();
+    for (seen, (idx, _)) in excerpt.char_indices().rev().enumerate() {
+        if seen == SUMMARY_MAX_BYTES {
+            break;
+        }
+        start = idx;
+    }
+    Some(excerpt[start..].to_string())
 }
 
 // ------------------------------------------------------------------ budget
@@ -1092,6 +1096,57 @@ mod tests {
         let out = ex.run_check(&sh_spec("ok", "exit 0"), &c).await.unwrap();
         assert_eq!(out.status, CheckRunStatus::Passed);
         assert_eq!(out.exit, Some(0));
+    }
+
+    /// Second-angle performance audit differential lock: the char-boundary
+    /// slice must equal the historical `Vec<char>` reverse-`take`-reverse
+    /// algorithm on adversarial corpora (ascii, dense unicode, boundary
+    /// lengths, whitespace-only).
+    #[test]
+    fn summary_tail_slice_is_byte_identical_to_the_vec_char_reference() {
+        fn reference(excerpt: &str) -> Option<String> {
+            if excerpt.trim().is_empty() {
+                return None;
+            }
+            Some(
+                excerpt
+                    .chars()
+                    .rev()
+                    .take(SUMMARY_MAX_BYTES)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect(),
+            )
+        }
+        let mut at_boundary = "x".repeat(SUMMARY_MAX_BYTES);
+        at_boundary.push('汉');
+        let corpus = [
+            String::new(),
+            "   \n\t  ".to_string(),
+            "one line only".to_string(),
+            "a".repeat(SUMMARY_MAX_BYTES),
+            "a".repeat(SUMMARY_MAX_BYTES + 1),
+            "汉字😀".repeat(SUMMARY_MAX_BYTES), // 3 chars each: way over
+            at_boundary,
+            format!("{}😀tail", "z".repeat(SUMMARY_MAX_BYTES)),
+        ];
+        for (i, excerpt) in corpus.iter().enumerate() {
+            let got = build_summary_from_text(excerpt);
+            let want = reference(excerpt);
+            assert_eq!(got, want, "row {i}: tail slice drifted");
+            if let Some(tail) = got {
+                assert!(excerpt.ends_with(&tail), "row {i}: tail must be a suffix");
+                assert!(
+                    tail.chars().count() <= SUMMARY_MAX_BYTES,
+                    "row {i}: tail over the char bound"
+                );
+                assert!(excerpt.is_char_boundary(excerpt.len() - tail.len()));
+            }
+        }
+        // Whitespace-only and empty are the documented None.
+        assert_eq!(build_summary_from_text(""), None);
+        assert_eq!(build_summary_from_text(" \n\t"), None);
     }
 
     #[cfg(unix)]

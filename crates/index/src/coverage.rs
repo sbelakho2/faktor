@@ -339,6 +339,64 @@ impl FingerprintCoverage {
     pub fn needs_round(&self) -> bool {
         self.complete
     }
+
+    /// The shared walk cursor of the current round: the interleaved pass
+    /// advances EVERY incomplete shard along ONE physical walk, so their
+    /// durable cursors are always equal; this returns that position (the
+    /// first shard the rotation still owes). A complete round has no
+    /// incomplete shard and answers the round-start position.
+    pub fn shared_round_cursor(&self) -> ScanCursor {
+        for offset in 0..FINGERPRINT_SHARDS {
+            let shard = (self.shard + offset) % FINGERPRINT_SHARDS;
+            if !self.shard_done(shard) {
+                return self.cursor_for(shard);
+            }
+        }
+        ScanCursor::default()
+    }
+
+    /// Re-base the current round when its per-shard cursors DIVERGE.
+    ///
+    /// A pre-interleave envelope stored one independent continuation cursor
+    /// per shard (each shard's pass walked the tree alone). The interleaved
+    /// pass advances every incomplete shard along ONE shared walk position
+    /// and can therefore only resume from a uniform cursor set. Clearing a
+    /// divergent set restarts the round's walk from the root — safe,
+    /// because re-collecting an entry is idempotent: a baseline round
+    /// inserts the identical entry again, and a verification round repeats
+    /// the identical comparison (same difference decision). Returns true
+    /// when a divergent set was re-based, false when it was already
+    /// uniform (or the round is complete).
+    pub fn rebase_divergent_cursors(&mut self) -> bool {
+        if self.complete {
+            return false;
+        }
+        let mut seen: Option<ScanCursor> = None;
+        let mut divergent = false;
+        for shard in 0..FINGERPRINT_SHARDS {
+            if self.shard_done(shard) {
+                continue;
+            }
+            let cursor = self.cursor_for(shard);
+            match &seen {
+                None => seen = Some(cursor),
+                Some(first) => {
+                    if *first != cursor {
+                        divergent = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if divergent {
+            for shard in 0..FINGERPRINT_SHARDS {
+                if !self.shard_done(shard) {
+                    self.set_cursor(shard, ScanCursor::default());
+                }
+            }
+        }
+        divergent
+    }
 }
 
 /// Stable shard assignment of one workspace-relative path.

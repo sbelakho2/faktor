@@ -491,7 +491,9 @@ impl SessionHandle {
             }
             messages.push(WireMessage {
                 id: row.id.to_string(),
-                role: row.role.clone(),
+                // The row is owned by this loop: its role string is MOVED,
+                // never cloned.
+                role: row.role,
                 session_id: row.session_id.to_string(),
                 seq: row.seq,
                 created_ms: row.created_ms,

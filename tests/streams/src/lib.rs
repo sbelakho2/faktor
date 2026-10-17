@@ -1290,10 +1290,8 @@ mod streams_tests {
     async fn anthropic_tool_input_json_delta_bytewise_fragments_into_one_call() {
         // (d) input_json_delta fragmented one BYTE at a time (every fragment
         // is a single character) reassembles into ONE complete ToolCall.
-        // The call is flushed at stream end IN PLACE of the terminal marker:
-        // after the flush the adapter is done, so there is NO trailing Done
-        // chunk on a tool-use stream (adapter contract: a stream may end on
-        // a complete ToolCall — the runtime must treat that as terminal).
+        // The call is flushed at the terminal marker and the stream then
+        // emits exactly one Done (the runtime treats it as terminal).
         let args = r#"{"path":"a/b.rs","mode":"read"}"#;
         let mut events = vec![sse_frame(&anth_tool_start("toolu_1", "read_file"))];
         for byte in args.chars() {
@@ -1303,25 +1301,28 @@ mod streams_tests {
         let norms = anthropic_sse_norms(events).await;
         assert_eq!(
             norms,
-            vec![Norm::ToolCall {
-                id: "toolu_1".into(),
-                name: "read_file".into(),
-                args: json!({"path": "a/b.rs", "mode": "read"}),
-                complete: true,
-            }],
+            vec![
+                Norm::ToolCall {
+                    id: "toolu_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a/b.rs", "mode": "read"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
             "arbitrarily fragmented input_json_delta must reassemble into one complete call"
         );
     }
 
     #[tokio::test]
     async fn anthropic_tool_block_restart_mid_call_resets_accumulation() {
-        // (e) Anthropic ids/names ride content_block_start ONLY — there is
-        // no delta-carried id and NO index-keyed accumulation (single-slot
-        // state). A second tool block starting mid-accumulation therefore
-        // RESETS the slot (id/name replaced, args cleared): the first
-        // block's fragments never leak into the second call. A changed id
-        // inside one call is inexpressible on this wire — the only id
-        // transition is a fresh block, and it starts a fresh call.
+        // (e) Anthropic ids/names ride content_block_start ONLY, and tool
+        // blocks accumulate per wire `index` (parallel calls never collide).
+        // A second block at the SAME index is a restart: it replaces that
+        // slot's id/name and drops its prior args, so the first block's
+        // fragments never leak into the second call. A changed id inside one
+        // call is inexpressible on this wire; a distinct index is a distinct
+        // call.
         let norms = anthropic_sse_norms(vec![
             sse_frame(&anth_tool_start("toolu_a", "read_file")),
             sse_frame(&anth_json_delta(r#"{"path":""#)),
@@ -1332,13 +1333,16 @@ mod streams_tests {
         .await;
         assert_eq!(
             norms,
-            vec![Norm::ToolCall {
-                id: "toolu_b".into(),
-                name: "write_file".into(),
-                args: json!({"path": "x.txt"}),
-                complete: true,
-            }],
-            "a block restart replaces the single slot: last id/name win, prior args are dropped"
+            vec![
+                Norm::ToolCall {
+                    id: "toolu_b".into(),
+                    name: "write_file".into(),
+                    args: json!({"path": "x.txt"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
+            "a same-index block restart replaces its slot: last id/name win, prior args are dropped"
         );
     }
 

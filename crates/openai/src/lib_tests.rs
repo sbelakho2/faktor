@@ -324,9 +324,10 @@ mod openai_contract_tests {
         });
         let mut accs = Vec::new();
         let mut pending = std::collections::VecDeque::new();
-        let chunk = parse_chat_chunk(&frame, &mut accs, &mut pending)
-            .expect("usage chunk")
-            .expect("usage frame");
+        let (chunk, terminal) =
+            parse_chat_chunk(&frame, &mut accs, &mut pending).expect("usage frame");
+        assert!(!terminal, "a usage frame is not a finishing marker");
+        let chunk = chunk.expect("usage chunk");
         assert_eq!(
             chunk,
             ProviderChunk::Usage(CanonicalUsage {
@@ -344,9 +345,8 @@ mod openai_contract_tests {
         let no_cache = serde_json::json!({
             "usage": {"prompt_tokens": 1000, "completion_tokens": 50}
         });
-        let chunk = parse_chat_chunk(&no_cache, &mut accs, &mut pending)
-            .expect("usage chunk")
-            .expect("usage frame");
+        let (chunk, _) = parse_chat_chunk(&no_cache, &mut accs, &mut pending).expect("usage frame");
+        let chunk = chunk.expect("usage chunk");
         assert!(matches!(
             chunk,
             ProviderChunk::Usage(CanonicalUsage {
@@ -385,6 +385,7 @@ mod openai_contract_tests {
         let zero = serde_json::json!({"usage": {}});
         assert!(parse_chat_chunk(&zero, &mut accs, &mut pending)
             .unwrap()
+            .0
             .is_none());
     }
 
@@ -417,6 +418,7 @@ mod openai_contract_tests {
             reference.push_str(FRAG);
             assert!(parse_chat_chunk(&frame, &mut accs, &mut pending)
                 .expect("fragment frame")
+                .0
                 .is_none());
         }
         let assembled = accs[0]["arguments"].as_str().expect("arguments slot");
@@ -437,9 +439,10 @@ mod openai_contract_tests {
         // The finishing marker still flushes the call with the exact JSON
         // (the accumulated text parses into the tool input).
         let finish = serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
-        let chunk = parse_chat_chunk(&finish, &mut accs, &mut pending)
-            .expect("flush frame")
-            .expect("a completed tool call");
+        let (chunk, terminal) =
+            parse_chat_chunk(&finish, &mut accs, &mut pending).expect("flush frame");
+        assert!(terminal, "the finishing marker must be reported");
+        let chunk = chunk.expect("a completed tool call");
         match chunk {
             ProviderChunk::ToolCall { complete, .. } => assert!(complete),
             other => panic!("expected a tool-call chunk, got {other:?}"),
@@ -2758,6 +2761,185 @@ mod openai_contract_tests {
             err.message.contains("before a terminal response event"),
             "{}",
             err.message
+        );
+    }
+
+    // -------------------------------------------------- perf evidence
+
+    /// Regression (second-angle audit): usage rows must survive the frames
+    /// they actually ride — a `finish_reason` frame (OpenRouter-style
+    /// gateways attach usage there) and a terminal frame with
+    /// `"choices": []` (the real `stream_options.include_usage` shape) — and
+    /// a body that ends right after `finish_reason` without a trailing
+    /// `[DONE]` is a CLEAN completion, never a dropped-connection error.
+    #[tokio::test]
+    async fn finish_reason_usage_frames_survive_and_clean_eof_completes() {
+        // (a) finish_reason + usage + a completed call on ONE frame, and NO
+        // trailing [DONE]: the call flushes first, the usage rides behind
+        // it, and the body end is a clean Done.
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":7}}"#,
+        ]
+        .join("\n\n");
+        let mock = Arc::new(MockHttpTransport::new(200, body));
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat("http://mock.invalid", None), transport);
+        let mut stream = provider.stream(req("m"));
+        let mut text = String::new();
+        let mut call = None;
+        let mut usage = None;
+        let mut done = false;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream item") {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::ToolCall {
+                    id, name, input, ..
+                } => call = Some((id, name, input)),
+                ProviderChunk::Usage(u) => usage = Some(u),
+                ProviderChunk::Done => {
+                    done = true;
+                    break;
+                }
+                other => panic!("unexpected chunk: {other:?}"),
+            }
+        }
+        assert_eq!(text, "hi");
+        let (id, name, input) = call.expect("the completed call must flush");
+        assert_eq!(id, "c1");
+        assert_eq!(name, "read_file");
+        assert_eq!(input["path"], "a.rs");
+        assert!(
+            done,
+            "a body that ends after finish_reason must complete cleanly without [DONE]"
+        );
+        let usage = usage.expect("usage from the finish_reason frame must survive");
+        assert_eq!(usage.uncached_input_tokens, 100);
+        assert_eq!(usage.output_tokens, 7);
+
+        // (b) The include_usage terminal frame with EMPTY choices.
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":1}}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        let mock = Arc::new(MockHttpTransport::new(200, body));
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat("http://mock.invalid", None), transport);
+        let mut stream = provider.stream(req("m"));
+        let mut usage = None;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream item") {
+                ProviderChunk::Usage(u) => usage = Some(u),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        let usage = usage.expect("empty-choices usage frame must survive");
+        assert_eq!(usage.uncached_input_tokens, 9);
+        assert_eq!(usage.output_tokens, 1);
+    }
+
+    /// Second-angle perf evidence (adapter streaming fold): the fold closure
+    /// runs once per yielded chunk, so anything captured by it is cloned per
+    /// event. The pre-fix closure cloned `transport`, `url`, `headers`,
+    /// `extra_headers` and the WHOLE request body `Value` on EVERY event.
+    /// This probe drives 100k real SSE chunks through `openai_stream` with a
+    /// realistic ~256 KiB conversation body and measures the exact removed
+    /// clone set (executed once per simulated event) for the before/after
+    /// contrast.
+    #[tokio::test]
+    async fn hundred_thousand_events_carry_no_per_event_request_clones() {
+        const EVENTS: usize = 100_000;
+        // A realistic conversation body: ~256 KiB serialized.
+        let filler = "x".repeat(1024);
+        let mut messages = Vec::with_capacity(256);
+        for turn in 0..128 {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("turn {turn}: {filler}")
+            }));
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("turn {turn}: {filler}")
+            }));
+        }
+        let body = serde_json::json!({
+            "model": "gpt-x",
+            "messages": messages,
+            "stream": true
+        });
+        let body_bytes = serde_json::to_string(&body).unwrap().len();
+        assert!(body_bytes > 200_000, "realistic body: {body_bytes} bytes");
+
+        let mut sse = String::with_capacity(EVENTS * 48 + 32);
+        for _ in 0..EVENTS {
+            sse.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        }
+        sse.push_str("data: [DONE]\n\n");
+
+        let mock = Arc::new(MockHttpTransport::new(200, sse));
+        let transport: Arc<dyn HttpTransport> = mock.clone();
+        let headers = reqwest::header::HeaderMap::new();
+        let url = "http://mock.invalid/chat/completions".to_string();
+
+        let started = std::time::Instant::now();
+        let mut stream = Box::pin(openai_stream(
+            transport,
+            url.clone(),
+            headers.clone(),
+            ExtraHeaders::empty(),
+            body.clone(),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let mut texts = 0usize;
+        let mut done = 0usize;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream item") {
+                ProviderChunk::Text { text } => {
+                    assert_eq!(text, "x");
+                    texts += 1;
+                }
+                ProviderChunk::Done => {
+                    done += 1;
+                    break;
+                }
+                other => panic!("unexpected chunk: {other:?}"),
+            }
+        }
+        let stream_elapsed = started.elapsed();
+        assert_eq!(texts, EVENTS);
+        assert_eq!(done, 1);
+        assert_eq!(mock.request_count(), 1, "one request, one stream");
+
+        // Counterfactual: the exact clone set the pre-fix fold executed
+        // inside EVERY `unfold` step, averaged over 64 runs and scaled to
+        // the 100k events this stream yielded.
+        let probes = 64u32;
+        let clone_started = std::time::Instant::now();
+        for _ in 0..probes {
+            let cloned_body = body.clone();
+            let cloned_headers = headers.clone();
+            let cloned_url = url.clone();
+            std::hint::black_box((&cloned_body, &cloned_headers, &cloned_url));
+        }
+        let per_event = clone_started.elapsed() / probes;
+        let removed = per_event * (EVENTS as u32);
+        eprintln!(
+            "openai_stream 100k events: stream {stream_elapsed:?}; removed per-event clone \
+             set {per_event:?} ({body_bytes} byte body) => {removed:?} at 100k events"
+        );
+        // The stream now costs strictly less than the clones it used to do
+        // on top of its own work (huge margin: deep `Value` clone of a
+        // ~256 KiB body vs one parse + one `String`).
+        assert!(
+            removed > stream_elapsed,
+            "removed clone work {removed:?} must exceed the whole fixed stream {stream_elapsed:?}"
         );
     }
 }

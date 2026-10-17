@@ -167,8 +167,12 @@ impl TreeManifest {
 
     /// The canonical digest (`tm1:<64-hex>`), or the typed
     /// [`TreeManifestError::SpecialFile`] refusal while any special file
-    /// exists under the root. The entries are re-sorted canonically here so
-    /// the digest never depends on construction order.
+    /// exists under the root. The digest never depends on construction
+    /// order: both builders already store the entries canonically sorted,
+    /// so the canonical re-sort only runs when a manifest arrived through
+    /// serde carrying entries OUT of canonical order (proven by one linear
+    /// scan first — a canonically ordered manifest digests in one pass
+    /// instead of paying a second O(n log n) sort of the same list).
     pub fn digest(&self) -> Result<String, TreeManifestError> {
         if !self.special_files.is_empty() {
             return Err(TreeManifestError::SpecialFile {
@@ -176,7 +180,12 @@ impl TreeManifest {
             });
         }
         let mut entries: Vec<&TreeEntry> = self.entries.iter().collect();
-        entries.sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
+        let sorted = entries
+            .windows(2)
+            .all(|w| w[0].normalized_path <= w[1].normalized_path);
+        if !sorted {
+            entries.sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
+        }
         Ok(canonical_digest(&entries))
     }
 }
@@ -1077,6 +1086,41 @@ mod tests {
             .map(|e| e.normalized_path.as_str())
             .collect();
         assert_eq!(names, vec!["a/x.txt", "a/y/z.txt", "b.txt", "c.txt"]);
+    }
+
+    /// (perf) evidence: a canonically ordered (builder-constructed) manifest
+    /// digests in one linear pass — the canonical re-sort runs only for a
+    /// serde-delivered manifest whose entries are out of order — and the
+    /// digest VALUE is identical across construction orders either way.
+    #[test]
+    fn digest_skips_the_sort_for_canonically_ordered_manifests() {
+        let entries: Vec<TreeEntry> = (0..100_000)
+            .map(|i| TreeEntry {
+                normalized_path: format!("dir{:03}/file{i:06}.rs", i % 128),
+                kind: TreeEntryKind::Regular,
+                mode: CanonicalMode::RegularFile,
+                payload_digest: "ab".repeat(32),
+            })
+            .collect();
+        let mut sorted = TreeManifest {
+            entries: entries.clone(),
+            special_files: Vec::new(),
+        };
+        sorted
+            .entries
+            .sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
+        let started = std::time::Instant::now();
+        let fast = sorted.digest().unwrap();
+        let fast_elapsed = started.elapsed();
+        let mut scrambled = sorted.clone();
+        scrambled.entries.reverse();
+        let started = std::time::Instant::now();
+        let slow = scrambled.digest().unwrap();
+        let slow_elapsed = started.elapsed();
+        println!(
+            "tree_manifest digest 100k entries: canonically ordered {fast_elapsed:?}, scrambled (sort path) {slow_elapsed:?}"
+        );
+        assert_eq!(fast, slow, "construction order is not part of identity");
     }
 
     #[test]

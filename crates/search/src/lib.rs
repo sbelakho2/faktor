@@ -1981,4 +1981,226 @@ mod tests {
             assert_eq!(fuse(&base, 10), expected, "round {round}: replay drifted");
         }
     }
+
+    /// Differential verification against the repository history: the PRE-fix
+    /// `exact()` (git `b91bdcd:crates/search/src/lib.rs`) is replayed here —
+    /// per-call symbol materialization (`index_files` clones every symbol of
+    /// every file), `path.to_lowercase().contains(...)` over the map keys,
+    /// then token hits deduped against the already-collected output — and
+    /// must answer byte-identically to the rewritten path: same hit set,
+    /// same scores, same snippets, same truncated order. The oracle walks
+    /// the paths in REVERSED order to pin that the final (score, path) sort
+    /// makes the historical key-iteration order irrelevant.
+    #[test]
+    fn exact_matches_the_pre_fix_symbol_materializing_path() {
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+        let ws = WorkspaceId::new(31);
+        let mut idx = WI::new();
+        let files: Vec<(&str, &[u8])> = vec![
+            ("SRC/Lib.RS", b"parse token\nfn materialized() {}\n"),
+            ("src/lib.rs", b"parse parse\nfn another() {}\n"),
+            ("src/Ünicode_File.rs", "重量 π parse\n".as_bytes()),
+            ("src/颜色/文件.rs", "颜色 parse\n".as_bytes()),
+            ("docs/parse.md", b"parse\n"),
+            ("src/parse_helpers.rs", b"token only\n"),
+        ];
+        for (path, body) in &files {
+            idx.index_file(ws, std::path::Path::new(path), body, 0)
+                .unwrap();
+        }
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
+        // The historical `index_files` materialization, replayed (symbols
+        // are cloned per call and only the key set is consulted).
+        type IndexedFiles = Option<Vec<(String, Vec<faktor_index::Symbol>)>>;
+        fn old_index_files(index: &WI, ws: WorkspaceId) -> IndexedFiles {
+            let paths = index.file_paths(ws);
+            if paths.is_empty() {
+                return None;
+            }
+            Some(
+                paths
+                    .into_iter()
+                    .map(|p| {
+                        let syms = index.symbols_for(ws, &p);
+                        (p, syms)
+                    })
+                    .collect(),
+            )
+        }
+        fn old_exact(
+            index: &WI,
+            ws: WorkspaceId,
+            needle: &str,
+            limit: usize,
+        ) -> Vec<(String, f64, String)> {
+            let needle_l = needle.to_lowercase();
+            let mut out: Vec<(String, f64, String)> = Vec::new();
+            if let Some(mut files) = old_index_files(index, ws) {
+                files.reverse(); // historical HashMap key order is arbitrary
+                for (path, _symbols) in files {
+                    if path.to_lowercase().contains(&needle_l) {
+                        out.push((path.clone(), 3.0, format!("path match: {path}")));
+                    }
+                }
+            }
+            for token in faktor_index::tokenize(needle) {
+                for hit in index.files_for_token(ws, &token, limit) {
+                    if !out.iter().any(|(path, _, _)| *path == hit.path) {
+                        out.push((
+                            hit.path.clone(),
+                            hit.freq as f64,
+                            format!("token `{token}` × {}", hit.freq),
+                        ));
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            out.truncate(limit);
+            out
+        }
+        let corpus_needles = [
+            "parse", "PARSE", "lib", "LIB", "Ünicode", "ünicode", "颜色", "file", "fn", "token",
+        ];
+        let mut state = 0xF00D_u64;
+        for round in 0..200 {
+            let needle = corpus_needles[(lcg(&mut state) as usize) % corpus_needles.len()];
+            let limit = 1 + (lcg(&mut state) as usize) % 8;
+            let got: Vec<(String, f64, String)> = svc
+                .exact(ws, needle, limit)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.path, h.score, h.snippet))
+                .collect();
+            let index = svc.index.lock().unwrap();
+            let oracle = old_exact(&index, ws, needle, limit);
+            assert_eq!(
+                got, oracle,
+                "round {round}: needle {needle:?} limit {limit} diverged \
+                 (scores {got:?} vs {oracle:?})"
+            );
+        }
+        // Typed refusals are shared (blank / oversized), not differential —
+        // and the fast lowercase path must still match the full lowercase
+        // scan on non-ASCII and case-twin needles.
+        for needle in [
+            "ÜNICODE",
+            "Ünicode_File.RS",
+            "颜色/文件",
+            "SRC/LIB.RS",
+            "src/lib.RS",
+        ] {
+            let got: Vec<(String, f64, String)> = svc
+                .exact(ws, needle, 20)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.path, h.score, h.snippet))
+                .collect();
+            let index = svc.index.lock().unwrap();
+            assert_eq!(old_exact(&index, ws, needle, 20), got, "needle {needle:?}");
+        }
+    }
+
+    /// Differential verification of the `fuse` tie-break: the PRE-fix
+    /// comparator (score only, git `b91bdcd`) is replayed against the new
+    /// path-ascending comparator. Distinct scores keep the identical order;
+    /// within a tie group the new order is path-ascending for every
+    /// permutation of the input legs, while the pre-fix comparator provably
+    /// does NOT order ties by path (the falsification attempt below).
+    #[test]
+    fn fuse_is_a_strict_tie_break_refinement_of_the_pre_fix_comparator() {
+        // PRE-FIX comparator, verbatim: score only, ties left to the score
+        // map's iteration order.
+        fn old_score_only_sort(out: &mut [Hit]) {
+            out.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let hit = |path: &str, score: f64| Hit {
+            path: path.to_string(),
+            score,
+            snippet: path.to_string(),
+            symbol: None,
+        };
+        // Crafted ties: four equal-score paths fed to the old comparator in
+        // DESCENDING path order. The pre-fix comparator keeps that order
+        // (stable sort), so the old behavior is "ties in map-iteration
+        // order" — the attempt to have old == new MUST fail, proving the
+        // tie-break is a real semantic change (and the reason it exists).
+        let mut pre_fix_view = vec![
+            hit("d.rs", 1.0),
+            hit("c.rs", 1.0),
+            hit("b.rs", 1.0),
+            hit("a.rs", 1.0),
+        ];
+        old_score_only_sort(&mut pre_fix_view);
+        let old_paths: Vec<&str> = pre_fix_view.iter().map(|h| h.path.as_str()).collect();
+        assert_ne!(
+            old_paths,
+            vec!["a.rs", "b.rs", "c.rs", "d.rs"],
+            "pre-fix comparator must NOT be expected to order ties by path"
+        );
+
+        // The new comparator on the same tie multiset (weight 0 makes every
+        // fused score EXACTLY equal) is path-ascending and invariant under
+        // every permutation of the input leg's hit order.
+        let legs = |order: &[usize]| -> Vec<(f64, Vec<Hit>)> {
+            let names = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+            vec![(0.0, order.iter().map(|&i| hit(names[i], 0.0)).collect())]
+        };
+        let base: Vec<(f64, Vec<Hit>)> = legs(&[0, 1, 2, 3, 4]);
+        let expected = fuse(&base, 10);
+        let expected_paths: Vec<&str> = expected.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(expected_paths, vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]);
+        assert!(
+            expected.iter().all(|h| h.score == 0.0),
+            "the corpus must be one exact tie"
+        );
+        let mut permutations = 0usize;
+        for rotation in 0..5 {
+            for reversed in [false, true] {
+                let mut order: Vec<usize> = (0..5).map(|i| (i + rotation) % 5).collect();
+                if reversed {
+                    order.reverse();
+                }
+                assert_eq!(fuse(&legs(&order), 10), expected, "order {order:?}");
+                permutations += 1;
+            }
+        }
+        assert_eq!(permutations, 10);
+
+        // Distinct scores: the new fuse equals the pre-fix score ordering
+        // exactly (the tie-break only ever fires inside score groups).
+        let distinct: Vec<(f64, Vec<Hit>)> = vec![
+            (2.0, vec![hit("x1.rs", 0.0), hit("x2.rs", 0.0)]),
+            (1.0, vec![hit("y1.rs", 0.0), hit("x2.rs", 0.0)]),
+            (0.5, vec![hit("z1.rs", 0.0), hit("x1.rs", 0.0)]),
+        ];
+        let new_out = fuse(&distinct, 10);
+        let mut old_out = new_out.clone();
+        old_score_only_sort(&mut old_out);
+        assert_eq!(new_out, old_out, "no ties: order must be identical");
+        // Each tie group present in the corpus is path-ascending.
+        for pair in new_out.windows(2) {
+            assert!(
+                pair[0].score > pair[1].score
+                    || (pair[0].score == pair[1].score && pair[0].path < pair[1].path),
+                "tie group not path-ascending: {:?}",
+                new_out
+                    .iter()
+                    .map(|h| (&h.path, h.score))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

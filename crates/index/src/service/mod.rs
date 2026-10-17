@@ -431,10 +431,18 @@ struct ContentBatch {
     cancelled: bool,
 }
 
-/// Outcome of one bounded fingerprint shard pass (audit 6).
-struct FingerprintPass {
-    entries: Vec<FingerprintEntry>,
-    shard_completed: bool,
+/// Outcome of one bounded fingerprint round pass (audit 6, interleaved):
+/// ONE physical walk collects the entries of every shard the current round
+/// still owes.
+struct FingerprintRoundPass {
+    /// Entries per shard id (only incomplete shards have buckets; every
+    /// bucket is sorted by path after the walk).
+    entries: Vec<Vec<FingerprintEntry>>,
+    /// True when the walk exhausted the tree: every remaining shard was
+    /// visited to exhaustion by THIS pass.
+    walk_completed: bool,
+    /// The shared continuation cursor (resume exactly after the last
+    /// consumed entry; the stopping entry is re-visited).
     cursor: ScanCursor,
     reason: Option<String>,
     /// The cancellation token fired during the pass (audit 20): nothing is
@@ -2056,6 +2064,17 @@ impl IndexService {
         // clean. A capped round stays incomplete (never "fully clean") and
         // the next batch continues it.
         if coverage.complete {
+            // A pre-interleave envelope can carry per-shard cursors that
+            // diverged: the interleaved pass advances every incomplete shard
+            // along ONE shared walk, so a divergent set is re-based (the
+            // round restarts its walk; re-collecting entries is idempotent,
+            // nothing can be lost).
+            fp_cov.rebase_divergent_cursors();
+            // Each iteration is ONE physical walk advancing EVERY remaining
+            // shard; the loop bound keeps the per-call walk/entry budget
+            // identical to the former one-walk-per-shard rotation
+            // (`FINGERPRINT_SHARDS` passes), while a full round now needs a
+            // single tree enumeration instead of one per shard.
             for _ in 0..FINGERPRINT_SHARDS {
                 if fp_cov.complete {
                     break;
@@ -2063,11 +2082,9 @@ impl IndexService {
                 if cancel.is_some_and(CancellationToken::is_cancelled) {
                     return Ok(self.abort_build(workspace));
                 }
-                let shard = fp_cov.shard;
-                let pass = match fingerprint_pass(
+                let pass = match fingerprint_shared_pass(
                     &root,
-                    shard,
-                    &fp_cov.cursor_for(shard),
+                    &fp_cov,
                     cfg.fp_batch_files,
                     cfg.fp_batch_dirs,
                     pace,
@@ -2096,47 +2113,8 @@ impl IndexService {
                         break;
                     }
                 };
-                for entry in pass.entries {
-                    match fp_stored.get(&entry.path) {
-                        Some(previous) if *previous == entry => {}
-                        // A baseline round RECORDS the fingerprint; only a
-                        // verification round can call a difference a change.
-                        _ => {
-                            if fp_cov.verify {
-                                dirty_now = true;
-                            }
-                        }
-                    }
-                    fp_next.insert(entry.path.clone(), entry);
-                }
-                if pass.shard_completed {
-                    fp_cov.finish_shard(shard);
-                    if fp_cov.complete {
-                        // The round finished. A baseline round MERGES the
-                        // observed map into the accumulation it has been
-                        // publishing all along (nothing may be lost). A
-                        // verification round must have seen every stored
-                        // entry or the difference (a deletion) supersedes the
-                        // generation; the observed map then becomes the new
-                        // baseline.
-                        if fp_cov.verify {
-                            if fp_stored.len() != fp_next.len() {
-                                dirty_now = true;
-                            }
-                            fp_stored = std::mem::take(&mut fp_next);
-                        } else {
-                            for (path, entry) in std::mem::take(&mut fp_next) {
-                                fp_stored.insert(path, entry);
-                            }
-                        }
-                    }
-                } else {
-                    fp_cov.set_cursor(shard, pass.cursor);
-                    fp_cov.truncated_reason = Some(
-                        pass.reason
-                            .unwrap_or_else(|| "fingerprint_batch".to_string()),
-                    );
-                }
+                dirty_now |=
+                    apply_fingerprint_round_pass(&mut fp_cov, &mut fp_stored, &mut fp_next, pass);
                 fp_cov.scanned = if fp_cov.verify && !fp_cov.complete {
                     fp_next.len() as u64
                 } else {
@@ -3456,43 +3434,126 @@ fn scan_content_batch(
     })
 }
 
-/// One bounded FINGERPRINT shard pass (audit 6): stats at most `max_files`
-/// files of `shard` in canonical order; a pass that exhausts the walk marks
-/// the shard complete, a capped pass persists its cursor so the next pass
-/// continues it — a capped fingerprint is never reported clean. `pace`/
-/// `cancel` are the slow-filesystem seam and the caller's token (audit 20).
-fn fingerprint_pass(
+/// Apply one interleaved round pass to the durable round state: fold the
+/// pass's per-shard buckets, finish every owed shard when the walk exhausted
+/// the tree, or keep the SHARED STOP cursor when it was capped. Returns
+/// `true` when a verification round observed a difference (the caller
+/// supersedes the generation).
+fn apply_fingerprint_round_pass(
+    fp_cov: &mut FingerprintCoverage,
+    fp_stored: &mut BTreeMap<String, FingerprintEntry>,
+    fp_next: &mut BTreeMap<String, FingerprintEntry>,
+    pass: FingerprintRoundPass,
+) -> bool {
+    let mut dirty = false;
+    for bucket in pass.entries {
+        for entry in bucket {
+            match fp_stored.get(&entry.path) {
+                Some(previous) if *previous == entry => {}
+                // A baseline round RECORDS the fingerprint; only a
+                // verification round can call a difference a change.
+                _ => {
+                    if fp_cov.verify {
+                        dirty = true;
+                    }
+                }
+            }
+            fp_next.insert(entry.path.clone(), entry);
+        }
+    }
+    if pass.walk_completed {
+        // The walk exhausted the tree in ONE pass: every shard the round
+        // still owed was visited to exhaustion.
+        for shard in 0..FINGERPRINT_SHARDS {
+            if !fp_cov.shard_done(shard) {
+                fp_cov.finish_shard(shard);
+            }
+        }
+        if fp_cov.complete {
+            // A baseline round MERGES the observed map into the accumulation
+            // it has been publishing all along (nothing may be lost). A
+            // verification round must have seen every stored entry or the
+            // difference (a deletion) supersedes the generation; the observed
+            // map then becomes the new baseline.
+            if fp_cov.verify {
+                if fp_stored.len() != fp_next.len() {
+                    dirty = true;
+                }
+                *fp_stored = std::mem::take(fp_next);
+            } else {
+                for (path, entry) in std::mem::take(fp_next) {
+                    fp_stored.insert(path, entry);
+                }
+            }
+        }
+    } else {
+        // A capped walk keeps its STOP position: the stopping entry was not
+        // consumed and no incomplete shard was advanced past a file of its
+        // own.
+        for shard in 0..FINGERPRINT_SHARDS {
+            if !fp_cov.shard_done(shard) {
+                fp_cov.set_cursor(shard, pass.cursor.clone());
+            }
+        }
+        fp_cov.truncated_reason = Some(
+            pass.reason
+                .unwrap_or_else(|| "fingerprint_batch".to_string()),
+        );
+    }
+    dirty
+}
+
+/// One bounded INTERLEAVED fingerprint round pass (audit 6, revised): ONE
+/// physical walk over the round's shared cursor collects the entries of
+/// EVERY shard the round still owes, so a full round enumerates the tree
+/// once instead of once per shard (the former rotation paid one whole tree
+/// walk — and one per-directory re-sort — per shard; a 10k-file round cost
+/// 8 walks where 1 suffices). The rotation semantics are unchanged: a pass
+/// that exhausts the walk marks every remaining shard complete (the round
+/// then rotates `round_start`), a capped pass keeps the SHARED STOP cursor
+/// for every remaining shard, so no incomplete shard is ever advanced past
+/// a file of its own (no file can hide in a skipped suffix), and a capped
+/// fingerprint is never reported clean. `max_files` bounds the TOTAL
+/// entries collected in one pass (the former per-shard bound bounded the
+/// same total across its 8 passes). `pace`/`cancel` are the
+/// slow-filesystem seam and the caller's token (audit 20).
+fn fingerprint_shared_pass(
     root: &Path,
-    shard: u32,
-    cursor: &ScanCursor,
+    fp_cov: &FingerprintCoverage,
     max_files: usize,
     max_dirs: usize,
     pace: Option<Duration>,
     cancel: Option<&CancellationToken>,
-) -> Result<FingerprintPass, String> {
-    let shard = shard % FINGERPRINT_SHARDS;
-    let mut entries: Vec<FingerprintEntry> = Vec::new();
-    let walked = walk_batch(root, cursor, max_dirs, pace, cancel, |rel, path| {
-        if fingerprint_shard(rel) != shard {
+) -> Result<FingerprintRoundPass, String> {
+    let mut entries: Vec<Vec<FingerprintEntry>> =
+        (0..FINGERPRINT_SHARDS).map(|_| Vec::new()).collect();
+    let mut total = 0usize;
+    let cursor = fp_cov.shared_round_cursor();
+    let walked = walk_batch(root, &cursor, max_dirs, pace, cancel, |rel, path| {
+        let shard = fingerprint_shard(rel);
+        if fp_cov.shard_done(shard) {
             return WalkControl::Continue;
         }
-        if entries.len() >= max_files {
+        if total >= max_files {
             return WalkControl::Stop("fingerprint_files");
         }
         let Ok(meta) = fs::metadata(path) else {
             return WalkControl::Continue;
         };
-        entries.push(FingerprintEntry {
+        total += 1;
+        entries[shard as usize].push(FingerprintEntry {
             path: rel.to_string(),
             size: meta.len(),
             modified_ms: modified_ms_of(&meta),
         });
         WalkControl::Continue
     })?;
-    entries.sort();
-    Ok(FingerprintPass {
+    for bucket in &mut entries {
+        bucket.sort();
+    }
+    Ok(FingerprintRoundPass {
         entries,
-        shard_completed: walked.complete,
+        walk_completed: walked.complete,
         cursor: walked.cursor,
         reason: walked.reason,
         cancelled: walked.cancelled,

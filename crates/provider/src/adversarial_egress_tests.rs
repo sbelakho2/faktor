@@ -10,6 +10,7 @@ use crate::egress::{
     execute_get, execute_post_json, validate_provider_base_url, BudgetComponent, BudgetedBody,
     CheckedHttpClient, EgressError, MockHttpTransport, OutboundScanConfig,
     PolicyCheckedHttpTransport, RawRequest, ResponseBudget, SafeUrlDiagnostic, UrlRejectReason,
+    MAX_REDIRECT_HOPS,
 };
 use crate::transport::MAX_STREAM_BODY_BYTES;
 use faktor_security::destination::{DeniedReason, DestinationPolicy, RuleMatch};
@@ -724,6 +725,79 @@ async fn redirect_hop_limit_location_tricks_and_stream_bodies() {
     assert!(
         matches!(err, EgressError::RedirectBodyNotReplayable { .. }),
         "stream 307 variant: {err:?}"
+    );
+}
+
+/// Second-angle perf evidence (redirect hops): a redirect-preserving POST
+/// must NOT re-encode its body per hop — the checked client replays through
+/// `Request::try_clone`, which shares the refcounted body bytes serialized
+/// exactly ONCE by the caller. A 50-hop chain exercises the cap: it is
+/// refused after exactly [`MAX_REDIRECT_HOPS`] followed hops, every hop that
+/// ran carried byte-identical body bytes, and the over-limit hop is never
+/// requested.
+#[tokio::test]
+async fn fifty_hop_chain_never_re_encodes_the_body_and_is_refused_at_the_cap() {
+    let server = Server::start().await;
+    for i in 0..50 {
+        server.route(
+            &format!("/r{i}"),
+            Route::redirect(307, &format!("/r{}", i + 1)),
+        );
+    }
+    server.route("/r50", Route::ok("never"));
+    let client = CheckedHttpClient::with_policy_for_tests(local_policy());
+
+    let payload = serde_json::json!({
+        "model": "m",
+        "messages": [{
+            "role": "user",
+            "content": "x".repeat(64 * 1024),
+        }],
+    });
+    let started = std::time::Instant::now();
+    let err = client
+        .send_checked(client.post(&server.url("/r0")).unwrap().json(&payload))
+        .await
+        .expect_err("a 50-hop chain must be refused at the cap");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            err,
+            EgressError::TooManyRedirects {
+                limit: MAX_REDIRECT_HOPS,
+                ..
+            }
+        ),
+        "hop-cap refusal: {err:?}"
+    );
+
+    let seen = server.seen();
+    let followed: Vec<&Seen> = seen.iter().filter(|entry| entry.path != "/r50").collect();
+    assert_eq!(
+        followed.len(),
+        MAX_REDIRECT_HOPS + 1,
+        "the initial request plus exactly MAX_REDIRECT_HOPS followed hops"
+    );
+    assert!(
+        !server.seen_paths().contains(&"/r50".to_string()),
+        "the over-limit hop must never be requested"
+    );
+    // Every hop carried the SAME bytes: one serialization, refcounted replay
+    // (307 preserves method + body).
+    let body_bytes = serde_json::to_vec(&payload).unwrap();
+    for hop in &followed {
+        assert_eq!(hop.method, "POST", "307 preserves POST on {}", hop.path);
+        assert_eq!(
+            hop.body, body_bytes,
+            "hop {} body must be byte-identical (no re-encoding)",
+            hop.path
+        );
+    }
+    eprintln!(
+        "50-hop chain: refused after {} hops in {elapsed:?}; {} byte body byte-identical \
+         on every hop",
+        followed.len(),
+        body_bytes.len()
     );
 }
 

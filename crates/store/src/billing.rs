@@ -2132,12 +2132,18 @@ impl Store {
     /// durable settlement basis for the crashed attempt of the same op: the
     /// provider billed each dispatched attempt). When two attempts of one
     /// logical op exist, the attempt join guarantees each reservation
-    /// settles from ITS OWN attempt's row — never from the sibling's. Each
-    /// reservation settles in its own immediate transaction. Rows without a
+    /// settles from ITS OWN attempt's row — never from the sibling's. Every
+    /// candidate keeps its own SAVEPOINT rollback scope (a row that must
+    /// write nothing — Skipped / LeftUncertain / task row gone — is undone
+    /// row-locally), while the WHOLE candidate set commits in ONE writer
+    /// job: the single writer owner serialized the former per-candidate
+    /// jobs anyway, so per-row commit independence bought only one
+    /// transaction frame + one channel round-trip PER ROW. Rows without a
     /// completed provider-call row of their own attempt — or unpriced under
     /// a hard cap — stay UNCERTAIN (the task-completion finalize is their
     /// conservative backstop). Idempotent: a second pass finds the settled
-    /// rows closed.
+    /// rows closed; a pass that fails at the SQL layer writes NOTHING and
+    /// the next pass re-runs the still-uncertain rows.
     pub fn cost_reconcile_uncertain(
         &self,
         session_id: SessionId,
@@ -2174,12 +2180,29 @@ impl Store {
             }
             out
         };
-        for reservation_id in candidates {
-            // One prepared command per candidate: the transaction body runs
-            // on the writer owner; the report folds OUTSIDE it.
-            let snapshot_context = format!("reservation {reservation_id} pricing_snapshot_json");
-            let outcome = self.writer.execute("cost_reconcile_uncertain", move |conn| {
+        // ONE writer job for the WHOLE candidate set: every candidate runs
+        // inside its own SAVEPOINT and the pass commits ONCE (see the
+        // function docs). The report still folds OUTSIDE the job. The
+        // per-candidate snapshot context is materialized HERE (the caller's
+        // thread), never inside the single writer owner.
+        let candidates: Vec<(i64, String)> = candidates
+            .into_iter()
+            .map(|id| (id, format!("reservation {id} pricing_snapshot_json")))
+            .collect();
+        let candidate_count = candidates.len();
+        let outcomes: Vec<CostReconcileOutcome> = if candidate_count == 0 {
+            Vec::new()
+        } else {
+            self.writer.execute("cost_reconcile_uncertain", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut outcomes = Vec::with_capacity(candidate_count);
+                for (reservation_id, snapshot_context) in candidates {
+                    // ONE fixed savepoint name: each candidate's savepoint is
+                    // released before the next begins, and the constant text
+                    // lets the connection's statement cache reuse the
+                    // prepared statement (zero per-candidate allocation).
+                    tx.execute_batch("SAVEPOINT cost_reconcile_candidate")?;
+                    let outcome = (|| -> StoreResult<CostReconcileOutcome> {
                 // Only a row still UNCERTAIN settles (concurrent recovery or
                 // a previous pass may have closed it).
                 let row: Option<(u64, Option<String>)> = tx
@@ -2191,7 +2214,6 @@ impl Store {
                     )
                     .optional()?;
                 let Some((_predicted, snapshot_json)) = row else {
-                    tx.commit()?;
                     return Ok(CostReconcileOutcome::Skipped);
                 };
                 let snapshot = match snapshot_json {
@@ -2222,7 +2244,6 @@ impl Store {
                     )
                     .optional()?;
                 let Some((tokens_in, tokens_out)) = tokens else {
-                    tx.commit()?;
                     return Ok(CostReconcileOutcome::LeftUncertain);
                 };
                 let actual = snapshot.and_then(|s| {
@@ -2249,8 +2270,8 @@ impl Store {
                         )?;
                         if n == 0 {
                             // The task row is gone: nothing can fold into it —
-                            // roll the row back for doctor's dangling scan.
-                            tx.rollback()?;
+                            // the savepoint undo keeps it for doctor's
+                            // dangling scan.
                             return Ok(CostReconcileOutcome::LeftUncertain);
                         }
                         CostReconcileOutcome::Settled(cost.max(0) as u64)
@@ -2283,9 +2304,34 @@ impl Store {
                         }
                     }
                 };
+                        Ok(outcome)
+                    })();
+                    match outcome {
+                        Ok(outcome) => {
+                            // A mutating outcome keeps its writes (RELEASE); a
+                            // no-write outcome is undone to the savepoint,
+                            // exactly like the former per-candidate rollback.
+                            if matches!(
+                                outcome,
+                                CostReconcileOutcome::Settled(_)
+                                    | CostReconcileOutcome::ClosedUnknown
+                            ) {
+                                tx.execute_batch("RELEASE cost_reconcile_candidate")?;
+                            } else {
+                                tx.execute_batch("ROLLBACK TO cost_reconcile_candidate")?;
+                                tx.execute_batch("RELEASE cost_reconcile_candidate")?;
+                            }
+                            outcomes.push(outcome);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 tx.commit()?;
-                Ok(outcome)
-            })?;
+                Ok(outcomes)
+            })?
+        };
+        // The report folds OUTSIDE the writer job.
+        for outcome in outcomes {
             match outcome {
                 CostReconcileOutcome::Skipped => {}
                 CostReconcileOutcome::LeftUncertain => report.left_uncertain += 1,
@@ -2307,8 +2353,9 @@ impl Store {
     /// runtime's completion-gate site); idempotent — a second pass finds
     /// nothing UNCERTAIN and never double-charges. Rows whose task row is
     /// gone are left UNCERTAIN for doctor's dangling scan (nothing can fold
-    /// into a vanished envelope). Each reservation settles in its own
-    /// immediate transaction.
+    /// into a vanished envelope). Every candidate keeps its own SAVEPOINT
+    /// rollback scope while the whole set commits in ONE writer job (the
+    /// single writer owner serialized the former per-candidate jobs anyway).
     pub fn cost_finalize_uncertain(
         &self,
         session_id: SessionId,
@@ -2333,58 +2380,86 @@ impl Store {
             }
             out
         };
-        for reservation_id in candidates {
-            // One prepared command per candidate: the transaction body runs
-            // on the writer owner; the report folds OUTSIDE it.
-            let outcome = self
-                .writer
+        // ONE writer job for the WHOLE candidate set: every candidate runs
+        // inside its own SAVEPOINT and the pass commits ONCE. A candidate
+        // that must write nothing is rolled back to its savepoint
+        // (row-local, exactly like the former per-candidate `rollback()`).
+        let outcomes: Vec<CostFinalizeOutcome> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.writer
                 .execute("cost_finalize_uncertain", move |conn| {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let predicted: Option<u64> = tx
-                        .query_row(
-                            "SELECT predicted_micro FROM cost_reservation
-                         WHERE reservation_id = ?1 AND status = 'uncertain'",
-                            params![reservation_id],
-                            |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
-                        )
-                        .optional()?;
-                    let Some(predicted) = predicted else {
-                        tx.commit()?;
-                        return Ok(CostFinalizeOutcome::Skipped);
-                    };
-                    let predicted_i64 = predicted.min(i64::MAX as u64) as i64;
-                    tx.execute(
-                        "UPDATE cost_reservation
-                     SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
-                         provider_reported_micro = NULL,
-                         provider_reported_cost_micro = NULL,
-                         settled_cost_micro = ?2,
-                         estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
-                         cost_basis = ?3,
-                         delivery_state = NULL
-                     WHERE reservation_id = ?4 AND status = 'uncertain'",
-                        params![
-                            at_ms,
-                            predicted_i64,
-                            COST_BASIS_CONSERVATIVE_RESERVATION,
-                            reservation_id
-                        ],
-                    )?;
-                    let n = tx.execute(
-                        "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
-                     WHERE session_id = ?2 AND task_id = ?3",
-                        params![predicted_i64, session_id.raw() as i64, task_id.raw() as i64],
-                    )?;
-                    if n == 0 {
-                        // The task row is gone: nothing can fold — roll the row
-                        // back so the finalize stays idempotent and doctor's
-                        // dangling scan can see it.
-                        tx.rollback()?;
-                        return Ok(CostFinalizeOutcome::LeftUncertain);
+                    let mut outcomes = Vec::with_capacity(candidates.len());
+                    for reservation_id in candidates.iter() {
+                        tx.execute_batch("SAVEPOINT cost_finalize_candidate")?;
+                        let outcome = (|| -> StoreResult<CostFinalizeOutcome> {
+                            let predicted: Option<u64> = tx
+                                .query_row(
+                                    "SELECT predicted_micro FROM cost_reservation
+                                     WHERE reservation_id = ?1 AND status = 'uncertain'",
+                                    params![reservation_id],
+                                    |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
+                                )
+                                .optional()?;
+                            let Some(predicted) = predicted else {
+                                return Ok(CostFinalizeOutcome::Skipped);
+                            };
+                            let predicted_i64 = predicted.min(i64::MAX as u64) as i64;
+                            tx.execute(
+                                "UPDATE cost_reservation
+                                 SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
+                                     provider_reported_micro = NULL,
+                                     provider_reported_cost_micro = NULL,
+                                     settled_cost_micro = ?2,
+                                     estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
+                                     cost_basis = ?3,
+                                     delivery_state = NULL
+                                 WHERE reservation_id = ?4 AND status = 'uncertain'",
+                                params![
+                                    at_ms,
+                                    predicted_i64,
+                                    COST_BASIS_CONSERVATIVE_RESERVATION,
+                                    reservation_id
+                                ],
+                            )?;
+                            let n = tx.execute(
+                                "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                                 WHERE session_id = ?2 AND task_id = ?3",
+                                params![
+                                    predicted_i64,
+                                    session_id.raw() as i64,
+                                    task_id.raw() as i64
+                                ],
+                            )?;
+                            if n == 0 {
+                                // The task row is gone: nothing can fold —
+                                // the savepoint undo keeps the finalize
+                                // idempotent and doctor's dangling scan can
+                                // see the row.
+                                return Ok(CostFinalizeOutcome::LeftUncertain);
+                            }
+                            Ok(CostFinalizeOutcome::Settled(predicted))
+                        })();
+                        match outcome {
+                            Ok(outcome) => {
+                                if matches!(outcome, CostFinalizeOutcome::Settled(_)) {
+                                    tx.execute_batch("RELEASE cost_finalize_candidate")?;
+                                } else {
+                                    tx.execute_batch("ROLLBACK TO cost_finalize_candidate")?;
+                                    tx.execute_batch("RELEASE cost_finalize_candidate")?;
+                                }
+                                outcomes.push(outcome);
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     tx.commit()?;
-                    Ok(CostFinalizeOutcome::Settled(predicted))
-                })?;
+                    Ok(outcomes)
+                })?
+        };
+        // The report folds OUTSIDE the writer job.
+        for outcome in outcomes {
             match outcome {
                 CostFinalizeOutcome::Skipped => {}
                 CostFinalizeOutcome::LeftUncertain => report.left_uncertain += 1,

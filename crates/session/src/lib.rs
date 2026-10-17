@@ -138,7 +138,7 @@ pub use manager::{
     SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES, SHADOW_ROW_KEY, SHADOW_ROW_KIND,
 };
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
-pub use payload::{decode_payload, PAYLOAD_SCHEMA_V};
+pub use payload::{decode_payload, validate_payload, PAYLOAD_SCHEMA_V};
 pub use process::OwnedProcess;
 pub use read_service::{
     DbReadKind, DbReadService, DbReadServiceConfig, DbReadStats, DEFAULT_READ_QUEUE_CAPACITY,

@@ -617,3 +617,137 @@ fn ranking_ignores_promotion_expiry_noise_by_default() {
         1_000
     );
 }
+
+/// Second-angle perf evidence (ranking): the tie-break key must be built
+/// ONCE per offer, never per comparison. The pre-fix comparator rebuilt it
+/// inside every `sort_by` call — four fresh Strings per compared pair, i.e.
+/// ~2 x n log n full-title allocations for a 10k-candidate batch (these
+/// offers all score identically, so EVERY comparison took the tie-break
+/// path). This probe ranks 10k distinct candidates with the production
+/// cached-key path and with a faithful replica of the pre-fix comparator,
+/// requires byte-identical order, and prints both wall times.
+#[test]
+fn ten_thousand_candidates_build_the_tie_break_key_once_per_offer() {
+    const CANDIDATES: usize = 10_000;
+    // Deterministic permutation (7919 is coprime with 10000): the initial
+    // order is NOT the sorted order, so the sort does real n log n work
+    // instead of hitting the sorted-run fast path.
+    let mut offers = Vec::with_capacity(CANDIDATES);
+    for step in 0..CANDIDATES {
+        let index = (step * 7919) % CANDIDATES;
+        let mut offer = base_offer();
+        // Same identity signals for every candidate (identical scores), but
+        // a distinct title: only the tie-break key separates them.
+        offer.title = text(&format!("STM32F407VGT6 regulator variant {index:05}"));
+        offers.push(offer);
+    }
+    let q = query("STM32F407VGT6", Some("STMicroelectronics"));
+    let ctx = RankingContext::at_quantity(qty(100));
+
+    // Production path: scoring + cached-key sort, end to end.
+    let production_started = std::time::Instant::now();
+    let ranked = rank_offers(&q, &offers, &ctx);
+    let production_elapsed = production_started.elapsed();
+    let cached_order: Vec<usize> = ranked.iter().map(|entry| entry.offer_index).collect();
+    assert_eq!(cached_order.len(), CANDIDATES);
+
+    // Faithful replica of the pre-fix comparator: `tie_break_key` evaluated
+    // inside `sort_by` (same key construction, private in the crate).
+    let legacy_key = |offer: &CommercialOffer| -> (String, String, std::cmp::Reverse<u64>, String) {
+        (
+            offer.source.as_str().to_string(),
+            offer
+                .identity
+                .manufacturer_part_number
+                .as_ref()
+                .map(|value| value.as_str().to_string())
+                .or_else(|| {
+                    offer
+                        .identity
+                        .source_part_number
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                })
+                .or_else(|| {
+                    offer
+                        .identity
+                        .offer_id
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                })
+                .unwrap_or_default(),
+            std::cmp::Reverse(offer.observed_at_ms),
+            offer.title.as_str().to_string(),
+        )
+    };
+    // Identical score inputs for both sort strategies (scores computed once
+    // by the production pass above), rebuilt in the SHUFFLED input order so
+    // neither sort rides the sorted-run fast path.
+    let mut total_by_index = vec![0i64; CANDIDATES];
+    for entry in &ranked {
+        total_by_index[entry.offer_index] = entry.score.total;
+    }
+    assert!(
+        total_by_index.windows(2).all(|pair| pair[0] == pair[1]),
+        "probe premise: every candidate score must tie"
+    );
+    let scores: Vec<(i64, usize)> = total_by_index
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, total)| (total, index))
+        .collect();
+    let cached_key_builds = std::cell::Cell::new(0u64);
+    let mut cached_scores = scores.clone();
+    let cached_started = std::time::Instant::now();
+    cached_scores.sort_by_cached_key(|(total, index)| {
+        cached_key_builds.set(cached_key_builds.get() + 1);
+        (
+            std::cmp::Reverse(*total),
+            legacy_key(&offers[*index]),
+            *index,
+        )
+    });
+    let cached_sort_elapsed = cached_started.elapsed();
+    let legacy_key_builds = std::cell::Cell::new(0u64);
+    let mut legacy_scores = scores;
+    let legacy_started = std::time::Instant::now();
+    legacy_scores.sort_by(|left, right| {
+        legacy_key_builds.set(legacy_key_builds.get() + 2);
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| legacy_key(&offers[left.1]).cmp(&legacy_key(&offers[right.1])))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let legacy_sort_elapsed = legacy_started.elapsed();
+    let legacy_order: Vec<usize> = legacy_scores.iter().map(|(_, index)| *index).collect();
+    let cached_sort_order: Vec<usize> = cached_scores.iter().map(|(_, index)| *index).collect();
+    assert_eq!(
+        legacy_order, cached_order,
+        "pre-fix comparator order must be byte-identical"
+    );
+    assert_eq!(cached_sort_order, cached_order, "isolated cached-key order");
+    // Deterministic evidence: the cached-key sort evaluates the key exactly
+    // once per offer; the pre-fix comparator rebuilds it per comparison.
+    assert_eq!(cached_key_builds.get(), CANDIDATES as u64);
+    assert!(
+        legacy_key_builds.get() >= 8 * cached_key_builds.get(),
+        "per-comparison key builds {} must dwarf one-per-offer {}",
+        legacy_key_builds.get(),
+        cached_key_builds.get()
+    );
+    eprintln!(
+        "rank_offers {CANDIDATES} candidates (all totals tied): production end-to-end \
+         {production_elapsed:?}; isolated sort cached-key {cached_sort_elapsed:?} \
+         ({} key builds) vs per-comparison key {legacy_sort_elapsed:?} \
+         ({} key builds)",
+        cached_key_builds.get(),
+        legacy_key_builds.get()
+    );
+    assert!(
+        cached_sort_elapsed < legacy_sort_elapsed,
+        "cached-key sort {cached_sort_elapsed:?} must beat the per-comparison key \
+         {legacy_sort_elapsed:?}"
+    );
+}

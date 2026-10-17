@@ -1227,8 +1227,11 @@ pub(crate) fn compute_change_entries(
     let parent_idx = base_map_index(parent_base);
     let mut entries: Vec<ChangeEntry> = Vec::new();
     let mut paths: Vec<PathBuf> = now_idx.keys().cloned().collect();
+    // Set-membership probe (the historical `paths.contains(p)` was a linear
+    // scan per start key: O(start · now) on a large tree). The union and the
+    // sorted order are identical.
     for p in start_idx.keys() {
-        if !paths.contains(p) {
+        if !now_idx.contains_key(p.as_path()) {
             paths.push(p.clone());
         }
     }

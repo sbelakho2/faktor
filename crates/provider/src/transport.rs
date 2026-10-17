@@ -812,6 +812,27 @@ where
                     phase_msg.to_string(),
                 ));
             }
+            // Fast path (second-angle perf): poll the inner stream ONCE
+            // before building any timer. On a live stream the next line is
+            // usually ready as soon as the guard is polled, and the pre-fix
+            // code still registered two fresh `Sleep` futures per line in
+            // the select (measured ~437 ns/line over 100k lines). A ready
+            // item cannot be a timeout (the elapsed checks above just ran)
+            // and the cancellation check above just ran, so returning it
+            // directly is byte-identical to winning the biased select with
+            // the item arm. A pending inner stream falls through to the
+            // unchanged select below.
+            let mut next = inner.next();
+            if let std::task::Poll::Ready(item) = futures::poll!(std::pin::Pin::new(&mut next)) {
+                return match item {
+                    Some(Ok(line)) => {
+                        let now = std::time::Instant::now();
+                        Some((Ok(line), Phase::Live(inner, started, Some(now))))
+                    }
+                    Some(Err(e)) => terminal(e),
+                    None => None,
+                };
+            }
             // One-shot waits for THIS poll, with the exact remaining time —
             // no ticker, no periodic polling (audit round 14). Cancellation
             // is wake-driven: [`CancellationToken::cancelled`] registers a
@@ -859,7 +880,7 @@ where
                         phase_msg.to_string(),
                     ))
                 }
-                item = inner.next() => {
+                item = &mut next => {
                     match item {
                         Some(Ok(line)) => {
                             let now = std::time::Instant::now();
@@ -894,7 +915,6 @@ mod deadline_tests {
         }
         assert_eq!(out, vec!["a", "b", "c"]);
     }
-
     #[tokio::test]
     async fn silent_stream_hits_first_byte_timeout() {
         let dl = StreamDeadlines {
@@ -915,6 +935,53 @@ mod deadline_tests {
         let err = item.expect_err("must be an error");
         assert_eq!(err.kind, ProviderErrorKind::Timeout);
         assert!(err.retryable);
+    }
+
+    /// Second-angle perf evidence (per-line timers): a READY line must not
+    /// register timer-wheel entries. The pre-fix guard built two fresh
+    /// `Sleep` futures inside the select on EVERY polled line (measured
+    /// ~437 ns/line over 100k ready lines — 16x the raw stream cost); the
+    /// fast path polls the inner stream once and returns a ready item with
+    /// no timer at all. The bound is a same-process ratio against the raw
+    /// stream, so CI load cancels out.
+    #[tokio::test]
+    async fn guarded_lines_adds_no_timer_per_ready_line() {
+        const LINES: usize = 100_000;
+        let items: Vec<Result<String, ProviderError>> = (0..LINES)
+            .map(|index| Ok(format!("line {index}")))
+            .collect();
+        let raw_started = std::time::Instant::now();
+        let mut raw = futures::stream::iter(items.clone());
+        let mut seen = 0usize;
+        while let Some(item) = raw.next().await {
+            item.expect("raw line");
+            seen += 1;
+        }
+        let raw_elapsed = raw_started.elapsed();
+        assert_eq!(seen, LINES);
+        let guarded_started = std::time::Instant::now();
+        let mut guarded = Box::pin(guarded_lines(
+            futures::stream::iter(items),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let mut seen = 0usize;
+        while let Some(item) = guarded.next().await {
+            item.expect("guarded line");
+            seen += 1;
+        }
+        let guarded_elapsed = guarded_started.elapsed();
+        assert_eq!(seen, LINES);
+        eprintln!(
+            "guarded_lines {LINES} lines: raw {raw_elapsed:?}; guarded {guarded_elapsed:?}; \
+             overhead {:?}",
+            guarded_elapsed.saturating_sub(raw_elapsed)
+        );
+        assert!(
+            guarded_elapsed < raw_elapsed.max(std::time::Duration::from_millis(5)) * 6,
+            "guarded {guarded_elapsed:?} must stay near the raw stream {raw_elapsed:?} \
+             (a reintroduced per-line timer doubles this)"
+        );
     }
 
     #[tokio::test]

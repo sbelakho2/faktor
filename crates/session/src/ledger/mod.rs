@@ -1689,28 +1689,28 @@ pub struct LedgerCompactReport {
 
 // ---------------------------------------------------------------- head fold
 
-fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionError> {
+fn fold(head: &mut LedgerHead, payload: LedgerPayload) -> Result<(), SessionError> {
     match payload {
         LedgerPayload::GoalSet { goal } => {
-            head.goal = goal.clone();
+            head.goal = goal;
         }
         LedgerPayload::CriteriaSet {
             criteria,
             canonical,
         } => {
-            head.criteria = criteria.clone();
-            head.canonical_criteria = canonical.clone();
+            head.criteria = criteria;
+            head.canonical_criteria = canonical;
         }
         LedgerPayload::BlockerOpened { reason } => {
-            if !head.open_blockers.iter().any(|r| r == reason) {
-                head.open_blockers.push(reason.clone());
+            if !head.open_blockers.iter().any(|r| r == &reason) {
+                head.open_blockers.push(reason);
             }
         }
         LedgerPayload::BlockerResolved { reason } => {
             // Tolerant: resolving a blocker that is no longer open (its
             // opener was already pruned below the watermark) is a no-op,
             // never an error — the fold is a projection of what happened.
-            head.open_blockers.retain(|r| r != reason);
+            head.open_blockers.retain(|r| r != &reason);
         }
         LedgerPayload::Decision {
             step,
@@ -1718,9 +1718,9 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             rationale,
         } => {
             let entry = LedgerDecision {
-                step: step.clone(),
-                choice: choice.clone(),
-                rationale: rationale.clone(),
+                step,
+                choice,
+                rationale,
             };
             if head.decisions.first() != Some(&entry) {
                 head.decisions.insert(0, entry);
@@ -1733,14 +1733,14 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             parent_index,
         } => {
             let row = LedgerPlanStep {
-                step_index: *step_index,
-                text: text.clone(),
-                parent_index: *parent_index,
+                step_index,
+                text,
+                parent_index,
             };
             match head
                 .plan_steps
                 .iter_mut()
-                .find(|p| p.step_index == *step_index)
+                .find(|p| p.step_index == step_index)
             {
                 Some(existing) => *existing = row,
                 None => {
@@ -1756,13 +1756,13 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             purpose,
         } => {
             let row = LedgerChild {
-                agent_id: *agent_id,
-                task_id: *task_id,
-                worktree_id: *worktree_id,
-                purpose: purpose.clone(),
+                agent_id,
+                task_id,
+                worktree_id,
+                purpose,
                 outcome: None,
             };
-            match head.children.iter_mut().find(|c| c.agent_id == *agent_id) {
+            match head.children.iter_mut().find(|c| c.agent_id == agent_id) {
                 Some(existing) => *existing = row,
                 None => head.children.push(row),
             }
@@ -1771,9 +1771,9 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             if let Some(child) = head
                 .children
                 .iter_mut()
-                .find(|c| c.agent_id == *agent_id && c.outcome.is_none())
+                .find(|c| c.agent_id == agent_id && c.outcome.is_none())
             {
-                child.outcome = Some(outcome.clone());
+                child.outcome = Some(outcome);
             }
             // Tolerant when the running record was already pruned with its
             // start below the watermark (the fold is a projection).
@@ -1787,25 +1787,22 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         } => {
             head.routing_count = head.routing_count.saturating_add(1);
             head.routing_tail.push(LedgerRouting {
-                turn: *turn,
-                provider: provider.clone(),
-                model: model.clone(),
-                reasoning: reasoning.clone(),
-                cost_micro: *cost_micro,
+                turn,
+                provider,
+                model,
+                reasoning,
+                cost_micro,
             });
             if head.routing_tail.len() > MAX_LEDGER_ROUTING_TAIL {
                 head.routing_tail.remove(0);
             }
         }
         LedgerPayload::EpochBumped { from: _, to } => {
-            head.epoch = Some(*to);
+            head.epoch = Some(to);
         }
         LedgerPayload::FailureRecorded { .. } => {}
         LedgerPayload::VerifyRun { checks, outcome } => {
-            head.last_verify = Some(LedgerVerifySummary {
-                checks: checks.clone(),
-                outcome: outcome.clone(),
-            });
+            head.last_verify = Some(LedgerVerifySummary { checks, outcome });
         }
         LedgerPayload::TurnCompleted { .. } => {}
         // Learning records are corpus data, not head projections: they fold
@@ -1834,16 +1831,16 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         // a compaction watermark may have been pruned into the head already,
         // and the sequence order alone (last wins) is the projection rule.
         LedgerPayload::ChildPresentationChanged { child_id, to, .. } => {
-            head.presentations.insert(child_id.clone(), *to);
+            head.presentations.insert(child_id, to);
         }
         // Board rows project only their newest revision into the head (the
         // O(1) allocation/CAS cursor); the pinned rows themselves are the
         // authority the board reader reconstructs the live surface from.
         LedgerPayload::BoardPost { revision, .. } => {
-            head.board_revision = head.board_revision.max(*revision);
+            head.board_revision = head.board_revision.max(revision);
         }
         LedgerPayload::BoardReset { new_revision, .. } => {
-            head.board_revision = head.board_revision.max(*new_revision);
+            head.board_revision = head.board_revision.max(new_revision);
         }
         LedgerPayload::BoardRead { .. } | LedgerPayload::BoardReceipt { .. } => {}
         // Completion-contract rows are the durable authority the
@@ -1884,15 +1881,22 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
     Ok(())
 }
 
-fn fold_entries(head: &mut LedgerHead, entries: &[TypedLedgerEntry]) -> Result<(), SessionError> {
+/// Fold OWNED entries onto the head: every payload's strings are MOVED into
+/// the head projection (the entries are dropped right after — an entry never
+/// outlives its fold), so the fold never deep-clones goal/criteria/decision/
+/// routing/child text. `entries` must be ascending by `seq`.
+fn fold_entries(head: &mut LedgerHead, entries: Vec<TypedLedgerEntry>) -> Result<(), SessionError> {
     for entry in entries {
-        fold(head, &entry.payload)?;
-        head.checkpoint_seq = entry.seq;
+        let seq = entry.seq;
+        fold(head, entry.payload)?;
+        head.checkpoint_seq = seq;
     }
     Ok(())
 }
 
-fn head_to_json(head: &LedgerHead) -> Result<String, SessionError> {
+/// Serialize the head to a JSON value, enforcing the
+/// [`MAX_LEDGER_HEAD_BYTES`] bound as measured by [`json_bytes`].
+fn head_to_value(head: &LedgerHead) -> Result<serde_json::Value, SessionError> {
     let json = serde_json::to_value(head)
         .map_err(|e| SessionError::Internal(format!("ledger head serialization: {e}")))?;
     let bytes = json_bytes(&json);
@@ -1902,12 +1906,11 @@ fn head_to_json(head: &LedgerHead) -> Result<String, SessionError> {
              the ledger cannot be compacted to a larger head"
         )));
     }
-    serde_json::to_string(&json)
-        .map_err(|e| SessionError::Internal(format!("ledger head serialization: {e}")))
+    Ok(json)
 }
 
-fn head_from_json(raw: &serde_json::Value) -> Result<LedgerHead, SessionError> {
-    let head: LedgerHead = serde_json::from_value(raw.clone()).map_err(|e| {
+fn head_from_json(raw: serde_json::Value) -> Result<LedgerHead, SessionError> {
+    let head: LedgerHead = serde_json::from_value(raw).map_err(|e| {
         SessionError::Malformed(format!("ledger head JSON is corrupt (undecodable): {e}"))
     })?;
     if head.schema_ver != LEDGER_HEAD_SCHEMA_V {
@@ -2014,6 +2017,7 @@ impl SessionHandle {
             ..Default::default()
         };
         let mut after: Option<i64> = None;
+        let had_head_row = head_row.is_some();
         if let Some(row) = &head_row {
             if row.schema_ver != LEDGER_HEAD_SCHEMA_V {
                 // Unknown FUTURE head schema: silently rebuilding would
@@ -2025,7 +2029,10 @@ impl SessionHandle {
                 ))
                 .into());
             }
-            match head_from_json(&row.head_json) {
+        }
+        if let Some(row) = head_row {
+            // The head JSON is MOVED into the decoder (never cloned).
+            match head_from_json(row.head_json) {
                 Ok(h) => {
                     head = h;
                     after = Some(head.checkpoint_seq);
@@ -2040,7 +2047,7 @@ impl SessionHandle {
         }
         let stale = match after {
             Some(checkpoint) => checkpoint < max_seq,
-            None => max_seq > 0 || head_row.is_some(),
+            None => max_seq > 0 || had_head_row,
         };
         if !stale {
             return Ok(head);
@@ -2052,10 +2059,11 @@ impl SessionHandle {
         for row in rows {
             entries.push(self.decode_row(&row)?);
         }
-        fold_entries(&mut head, &entries)?;
-        let json = head_to_json(&head)?;
-        let head_value = serde_json::from_str(&json)
-            .map_err(|e| SessionError::Internal(format!("head json: {e}")))?;
+        fold_entries(&mut head, entries)?;
+        // Serialize the head ONCE to its JSON value: the historical
+        // string-then-`from_str` round trip materialized the whole head twice
+        // for no observable difference (the stored value is identical).
+        let head_value = head_to_value(&head)?;
         store
             .put_ledger_head(
                 self.id,
@@ -3482,7 +3490,7 @@ impl SessionHandle {
             for row in rows {
                 extra.push(self.decode_row(&row)?);
             }
-            fold_entries(&mut head, &extra)?;
+            fold_entries(&mut head, extra)?;
         }
         // Pinned never-evict set: the LAST GoalSet / CriteriaSet / Decision
         // entry, EVERY unresolved BlockerOpened's own opener entry, and
@@ -3617,9 +3625,7 @@ impl SessionHandle {
         pinned.extend(external_operation_seqs);
         pinned.sort_unstable();
         pinned.dedup();
-        let head_json = head_to_json(&head)?;
-        let head_value = serde_json::from_str(&head_json)
-            .map_err(|e| SessionError::Internal(format!("head json: {e}")))?;
+        let head_value = head_to_value(&head)?;
         let deleted = self
             .manager
             .store()

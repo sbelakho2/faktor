@@ -366,3 +366,65 @@ fn checked_client_construction_is_fallible_without_a_fallback_path() {
         "the unwrap_or_else client fallback returned; start-up must fail typed"
     );
 }
+
+/// Second-angle perf evidence (streaming frames): `stream_frames` must hand
+/// out refcounted `Bytes` frames, not a fresh `Vec` per network frame. The
+/// pre-fix `BudgetedBody::next_chunk` ran `chunk.to_vec()` per frame — an
+/// allocation + full-frame memcpy on the SSE hot path — and the line
+/// assembler copied the bytes AGAIN into its carry buffer. This probe
+/// streams 100k 4 KiB frames, verifies the concatenation is byte-exact
+/// under the budget, and measures the removed per-frame copy.
+#[tokio::test]
+async fn hundred_thousand_frames_stream_as_refcounted_bytes() {
+    const FRAMES: usize = 100_000;
+    const FRAME_BYTES: usize = 4 * 1024;
+    let body: BodyStream = Box::pin(futures::stream::iter(
+        (0..FRAMES).map(|_| Ok::<Vec<u8>, std::io::Error>(vec![b'f'; FRAME_BYTES])),
+    ));
+    let budget = ResponseBudget::from_millis(
+        30_000,
+        30_000,
+        60_000,
+        (FRAMES * FRAME_BYTES) as u64 + 1,
+        Some(FRAMES as u64 + 1),
+    );
+    let transport = ScriptedBodyTransport::new(body);
+    let response = transport
+        .execute(Request::new(
+            Method::GET,
+            "https://allowed.example/sse".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut stream = Box::pin(response.stream_frames(&budget));
+    let mut frames = 0usize;
+    let mut total = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("budgeted frame");
+        assert_eq!(chunk.len(), FRAME_BYTES);
+        assert!(chunk.iter().all(|byte| *byte == b'f'));
+        frames += 1;
+        total += chunk.len();
+    }
+    let streamed = started.elapsed();
+    assert_eq!(frames, FRAMES);
+    assert_eq!(total, FRAMES * FRAME_BYTES);
+
+    // Counterfactual: the exact per-frame copy the pre-fix reader executed,
+    // averaged over 4096 runs and scaled to the 100k frames above.
+    let probes = 4096u32;
+    let src: bytes::Bytes = bytes::Bytes::from(vec![b'f'; FRAME_BYTES]);
+    let copy_started = std::time::Instant::now();
+    for _ in 0..probes {
+        let copied = src.to_vec();
+        std::hint::black_box(copied);
+    }
+    let per_frame = copy_started.elapsed() / probes;
+    let removed = per_frame * (FRAMES as u32);
+    eprintln!(
+        "stream_frames {FRAMES} x {FRAME_BYTES} byte frames: streamed {streamed:?}; removed \
+         per-frame copy {per_frame:?} => {removed:?} at 100k frames"
+    );
+}

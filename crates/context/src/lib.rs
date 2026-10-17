@@ -61,11 +61,11 @@ pub use tokenizer::{
     TokenizerRegistry, MAX_EXACT_BYTES,
 };
 pub use wire_plan::{
-    classify_prefix_cache, measure_wire_request, plan_wire_request, recompact_stable_prefix,
-    size_request_for_model, CandidateFootprint, PrefixCachePolicy, PrefixCacheState,
-    PrefixObservation, PromptSegment, PromptSegments, PromptStability, SectionCosts, StablePrefix,
-    WirePlan, WirePlanError, MAX_PROMPT_OBSERVATION_SEGMENTS, PROMPT_CACHEABLE_PREFIX_SEGMENTS,
-    PROMPT_SEGMENT_COUNT,
+    classify_prefix_cache, measure_history_segment, measure_wire_request, plan_wire_request,
+    recompact_stable_prefix, size_request_for_model, CandidateFootprint, PrefixCachePolicy,
+    PrefixCacheState, PrefixObservation, PromptSegment, PromptSegments, PromptStability,
+    SectionCosts, StablePrefix, WirePlan, WirePlanError, MAX_PROMPT_OBSERVATION_SEGMENTS,
+    PROMPT_CACHEABLE_PREFIX_SEGMENTS, PROMPT_SEGMENT_COUNT,
 };
 
 /// THE one provenance-text sanitizer (audit 44; shared by the ledger fold,

@@ -161,10 +161,11 @@ impl SessionHandle {
         let current = self.state()?;
         crate::journal::validate_transition(current, kind, to_state)?;
         // Typed journal payloads (audits 71-72): every append goes through
-        // the versioned decoder — a registered kind whose payload violates
+        // the versioned validator — a registered kind whose payload violates
         // its v1 schema is a loud error before any write, never a silent
-        // persistence of an undecodable row.
-        crate::payload::decode_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
+        // persistence of an undecodable row. The append path validates only:
+        // decoding would clone the payload into a value it immediately drops.
+        crate::payload::validate_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
         Ok(self
             .manager
             .store()
@@ -243,7 +244,7 @@ impl SessionHandle {
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
     ) -> faktor_core::Result<EventSeq> {
-        crate::payload::decode_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
+        crate::payload::validate_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
         Ok(self
             .manager
             .store()
@@ -276,8 +277,9 @@ impl SessionHandle {
             let current = self.state()?;
             crate::journal::validate_transition(current, kind, to_state)?;
             // Typed journal payloads (audits 71-72): the hot append path
-            // validates the payload schema BEFORE the actor persists it.
-            crate::payload::decode_payload(
+            // validates the payload schema BEFORE the actor persists it
+            // (validation only — no decoded clone is built and dropped).
+            crate::payload::validate_payload(
                 kind,
                 crate::payload::PAYLOAD_SCHEMA_V,
                 payload.as_ref(),

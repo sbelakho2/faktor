@@ -36,6 +36,9 @@ use faktor_provider::transport::{
 };
 use futures::Stream;
 
+mod frame;
+use frame::parse_ollama_frame;
+
 /// Map a transport-level refusal onto the ollama host-facing error type.
 /// A genuine transport failure stays a retryable `Network` error (exactly
 /// what the raw client produced before); anything the policy/build layer
@@ -67,9 +70,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    CanonicalUsage, ContentKind, EmbeddingRequest, EmbeddingResponse, GenericAgentRequest,
-    Provider, ProviderChunk, ProviderError, ProviderErrorKind, ProviderStream, RequestMessage,
-    Role,
+    ContentKind, EmbeddingRequest, EmbeddingResponse, GenericAgentRequest, Provider, ProviderChunk,
+    ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
@@ -933,7 +935,15 @@ pub(crate) fn ollama_chat_stream(
         ErrorScrubber::new().with_request_credentials(&reqwest::header::HeaderMap::new(), &url);
 
     enum Stage {
-        Fresh,
+        /// Request inputs live in the state (consumed once, on `Fresh`)
+        /// instead of the per-chunk fold closure, which previously deep-
+        /// cloned the full request body `Value` on every yielded chunk.
+        Fresh {
+            transport: Arc<dyn HttpTransport>,
+            url: String,
+            body: serde_json::Value,
+            cancel: Option<faktor_core::cancellation::CancellationToken>,
+        },
         Streaming {
             lines: LineStream,
             /// Chunks produced by ONE parsed frame, drained one per poll so
@@ -945,204 +955,121 @@ pub(crate) fn ollama_chat_stream(
         },
         Done,
     }
-    futures::stream::unfold(Stage::Fresh, move |stage| {
-        let transport = transport.clone();
-        let url = url.clone();
-        let deadlines = deadlines;
-        let cancel = cancel.clone();
-        let body = body.clone();
-        let scrubber = scrubber.clone();
-        async move {
-            let (mut lines, mut pending, mut finished) = match stage {
-                Stage::Fresh => {
-                    let resp = execute_with_head_timeout(
-                        execute_post_json(
-                            transport.as_ref(),
-                            &url,
-                            reqwest::header::HeaderMap::new(),
-                            &body,
-                        ),
-                        deadlines,
-                    )
-                    .await;
-                    match resp {
-                        Ok(r) => {
-                            let status = r.status();
-                            if !status.is_success() {
-                                let text = read_error_body_bounded(
-                                    r,
-                                    OLLAMA_ERROR_BODY_MAX_BYTES,
-                                    request_head_timeout_ms(deadlines),
-                                )
-                                .await;
-                                return Some((
-                                    Err(status_to_provider_error(status, text, &scrubber)),
-                                    Stage::Done,
+    futures::stream::unfold(
+        Stage::Fresh {
+            transport,
+            url,
+            body,
+            cancel,
+        },
+        move |stage| {
+            // Only the scrubber (one `Arc`) is shared across events.
+            let scrubber = scrubber.clone();
+            async move {
+                let (mut lines, mut pending, mut finished) = match stage {
+                    Stage::Fresh {
+                        transport,
+                        url,
+                        body,
+                        cancel,
+                    } => {
+                        let resp = execute_with_head_timeout(
+                            execute_post_json(
+                                transport.as_ref(),
+                                &url,
+                                reqwest::header::HeaderMap::new(),
+                                &body,
+                            ),
+                            deadlines,
+                        )
+                        .await;
+                        match resp {
+                            Ok(r) => {
+                                let status = r.status();
+                                if !status.is_success() {
+                                    let text = read_error_body_bounded(
+                                        r,
+                                        OLLAMA_ERROR_BODY_MAX_BYTES,
+                                        request_head_timeout_ms(deadlines),
+                                    )
+                                    .await;
+                                    return Some((
+                                        Err(status_to_provider_error(status, text, &scrubber)),
+                                        Stage::Done,
+                                    ));
+                                }
+                                let lines: LineStream = Box::pin(guarded_lines(
+                                    utf8_line_stream(
+                                        r.stream_frames(&deadlines.response_budget()),
+                                        MAX_LINE_BYTES,
+                                    ),
+                                    deadlines,
+                                    cancel,
                                 ));
+                                (lines, VecDeque::new(), false)
                             }
-                            let lines: LineStream = Box::pin(guarded_lines(
-                                utf8_line_stream(
-                                    r.stream_frames(&deadlines.response_budget()),
-                                    MAX_LINE_BYTES,
-                                ),
-                                deadlines,
-                                cancel.clone(),
-                            ));
-                            (lines, VecDeque::new(), false)
-                        }
-                        Err(e) => {
-                            return Some((Err(e), Stage::Done));
+                            Err(e) => {
+                                return Some((Err(e), Stage::Done));
+                            }
                         }
                     }
-                }
-                Stage::Streaming {
-                    lines,
-                    pending,
-                    finished,
-                } => (lines, pending, finished),
-                Stage::Done => return None,
-            };
+                    Stage::Streaming {
+                        lines,
+                        pending,
+                        finished,
+                    } => (lines, pending, finished),
+                    Stage::Done => return None,
+                };
 
-            loop {
-                // Drain one frame's chunks before reading the next line.
-                if let Some(chunk) = pending.pop_front() {
-                    return Some((
-                        Ok(chunk),
-                        Stage::Streaming {
-                            lines,
-                            pending,
-                            finished,
-                        },
-                    ));
-                }
-                if finished {
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                }
-                let Some(next) = lines.next().await else {
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                };
-                let line = match next {
-                    Ok(l) => l,
-                    Err(e) => return Some((Err(e), Stage::Done)),
-                };
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                    return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Malformed,
-                            format!("bad ollama NDJSON line: {line:?}"),
-                        )),
-                        Stage::Done,
-                    ));
-                };
-                let chunks = parse_ollama_frame(&value, response_seq);
-                pending = VecDeque::from(chunks);
-                // A `done: true` frame only terminates the stream when it
-                // carried no chunk: a final frame can still hold tool_calls
-                // (or content), and a hostile server may keep sending.
-                if pending.is_empty() && value.get("done").and_then(|d| d.as_bool()) == Some(true) {
-                    finished = true;
+                loop {
+                    // Drain one frame's chunks before reading the next line.
+                    if let Some(chunk) = pending.pop_front() {
+                        return Some((
+                            Ok(chunk),
+                            Stage::Streaming {
+                                lines,
+                                pending,
+                                finished,
+                            },
+                        ));
+                    }
+                    if finished {
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    }
+                    let Some(next) = lines.next().await else {
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    };
+                    let line = match next {
+                        Ok(l) => l,
+                        Err(e) => return Some((Err(e), Stage::Done)),
+                    };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                        return Some((
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                format!("bad ollama NDJSON line: {line:?}"),
+                            )),
+                            Stage::Done,
+                        ));
+                    };
+                    let chunks = parse_ollama_frame(&value, response_seq);
+                    pending = VecDeque::from(chunks);
+                    // A `done: true` frame only terminates the stream when it
+                    // carried no chunk: a final frame can still hold tool_calls
+                    // (or content), and a hostile server may keep sending.
+                    if pending.is_empty()
+                        && value.get("done").and_then(|d| d.as_bool()) == Some(true)
+                    {
+                        finished = true;
+                    }
                 }
             }
-        }
-    })
-}
-
-/// One native NDJSON frame -> 0..n chunks, in the order they belong to the
-/// conversation: `message.thinking` (a Reasoning chunk) before `content`
-/// (a Text chunk), then one ToolCall chunk per `tool_calls` entry in array
-/// order. Tool ids: a provider-supplied `id` wins; otherwise
-/// `ollama:<response_seq>:<tool_index>` — never a synthesized
-/// `ollama_call_<name>` (the old ids collided across calls and responses).
-/// The final `done: true` frame also carries the token counters
-/// (`prompt_eval_count` / `eval_count`), which become a canonical
-/// [`ProviderChunk::Usage`] frame emitted LAST (before the stream's Done) —
-/// see the usage mapping notes at the bottom of this function.
-fn parse_ollama_frame(value: &serde_json::Value, response_seq: u64) -> Vec<ProviderChunk> {
-    let mut chunks: Vec<ProviderChunk> = Vec::new();
-    if let Some(msg) = value.get("message") {
-        if let Some(thinking) = msg.get("thinking").and_then(|t| t.as_str()) {
-            if !thinking.is_empty() {
-                chunks.push(ProviderChunk::Reasoning {
-                    text: thinking.to_string(),
-                });
-            }
-        }
-        if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-            if !text.is_empty() {
-                chunks.push(ProviderChunk::Text {
-                    text: text.to_string(),
-                });
-            }
-        }
-        if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-            for (idx, tc) in tool_calls.iter().enumerate() {
-                let function = tc.get("function");
-                let name = function
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    continue;
-                }
-                let args = function
-                    .and_then(|f| f.get("arguments"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let id = tc
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .filter(|i| !i.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("ollama:{response_seq}:{idx}"));
-                chunks.push(ProviderChunk::ToolCall {
-                    id,
-                    name: name.to_string(),
-                    input: args,
-                    complete: true,
-                });
-            }
-        }
-    }
-    // Usage mapping (audit Phase-1 item C): the native /api/chat final
-    // frame reports `prompt_eval_count` (prompt tokens evaluated) and
-    // `eval_count` (generated tokens; thinking tokens ARE part of the
-    // generation, so `output_tokens` already contains them and the
-    // informational `reasoning_tokens` subset stays zero — the API reports
-    // no separate thinking count, so reasoning can never be double-billed).
-    // The API exposes NO cache split: when the daemon reuses a loaded KV
-    // context the evaluated count is the uncached remainder, and without a
-    // reported split the conservative correct category is uncached = the
-    // reported count with zero cache lines (cache is never invented).
-    // Counts are integers; a hostile wrong-typed/negative counter is
-    // ignored (0) and yields no frame — unknown fields never panic.
-    let prompt_eval_count = value
-        .get("prompt_eval_count")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    let eval_count = value
-        .get("eval_count")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    if prompt_eval_count > 0 || eval_count > 0 {
-        let usage = CanonicalUsage {
-            uncached_input_tokens: prompt_eval_count,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            output_tokens: eval_count,
-            reasoning_tokens: 0,
-            reported_cost: None,
-            request_id: None,
-        };
-        // Contract with the stream loop: the usage frame must come BEFORE
-        // the synthetic Done, so it lands at the END of this frame's chunk
-        // list (after any reasoning/text/tool chunks of the same frame).
-        chunks.push(ProviderChunk::Usage(usage));
-    }
-    chunks
+        },
+    )
 }
 
 fn caps_from_show(model: &str, show: &ShowResponse) -> ModelCapabilities {
