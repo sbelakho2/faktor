@@ -114,21 +114,82 @@ struct VerifiedEntry {
 struct FileIdentity {
     len: u64,
     mtime: Option<SystemTime>,
+    /// The unix OBJECT identity (device, inode, ctime) — the half of the
+    /// key an unprivileged writer cannot forge: `utimes` cannot set ctime
+    /// and a rewrite (in place or via the CAS's own atomic rename) changes
+    /// either ctime or the inode. `len`/`mtime` alone are settable by any
+    /// writer, which is why the advisory (len, mtime) window stays
+    /// TTL-limited and documented. On platforms where no such identity is
+    /// available (Windows: even the creation time is `SetFileTime`-settable
+    /// by the file's owner) the strong half is `None` and the strict memo
+    /// is never consulted — the same discipline the updater's digest memo
+    /// uses.
+    #[cfg(unix)]
+    strong: Option<StrongIdentity>,
+}
+
+/// Bound of the identity-anchored strict-verification memo (unix): enough
+/// for a whole realistic store (~8k x ~48 bytes). A larger store has its
+/// excess blobs re-hashed by a later scan — the honest residual.
+#[cfg(unix)]
+const STRONG_VERIFIED_CACHE_MAX: usize = 8 * 1024;
+
+/// One identity-anchored strict-verification record: `hash` was decoded and
+/// re-hashed against this exact blob OBJECT. Newest at the back; evicted
+/// oldest-first at the bound.
+#[cfg(unix)]
+#[derive(Debug)]
+struct StrongEntry {
+    hash: FileHash,
+    identity: StrongIdentity,
+}
+
+/// The unix object identity of a blob file: device, inode and ctime
+/// (seconds + nanoseconds). Captured from the very handle that was decoded,
+/// and re-read at scan time; equality means the bytes on disk under this
+/// address are the bytes that were verified.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrongIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+impl StrongIdentity {
+    fn of_metadata(meta: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+
+    fn of_path(path: &Path) -> Option<Self> {
+        fs::metadata(path).ok().map(|m| Self::of_metadata(&m))
+    }
 }
 
 impl FileIdentity {
     fn of_file(file: &fs::File) -> Option<Self> {
-        file.metadata().ok().map(|m| Self {
-            len: m.len(),
-            mtime: m.modified().ok(),
-        })
+        file.metadata().ok().map(|m| Self::of_metadata(&m))
     }
 
     fn of_path(path: &Path) -> Option<Self> {
-        fs::metadata(path).ok().map(|m| Self {
+        fs::metadata(path).ok().map(|m| Self::of_metadata(&m))
+    }
+
+    fn of_metadata(m: &fs::Metadata) -> Self {
+        Self {
             len: m.len(),
             mtime: m.modified().ok(),
-        })
+            #[cfg(unix)]
+            strong: Some(StrongIdentity::of_metadata(m)),
+        }
     }
 }
 
@@ -264,6 +325,20 @@ pub struct Cas {
     /// LRU of blobs verified since startup (bounded, advisory). The cache is
     /// a performance seam for hot paths: every miss is verified streamingly.
     verified: Mutex<VecDeque<VerifiedEntry>>,
+    /// Identity-anchored strict-verification memo, consulted ONLY by
+    /// [`Cas::verify_integrity`] (the doctor scan): a blob strictly decoded
+    /// against its object identity (device, inode, ctime) is skipped by a
+    /// later scan of THIS process while the identity is unchanged. NO TTL:
+    /// the object identity is the invalidation (any write, replace or
+    /// permission change moves ctime or the inode); a forged `mtime` cannot
+    /// extend an entry. Unix only — elsewhere the table stays empty and the
+    /// scan streams every blob (never a weaker claim). Bounded.
+    #[cfg(unix)]
+    strong_verified: Mutex<VecDeque<StrongEntry>>,
+    /// Strict decodes (decode + re-hash) performed by this instance. Test
+    /// seam: proves the memo skips re-hashes and that every miss streams.
+    #[cfg(test)]
+    hashes: AtomicU64,
     seam: CrashSeam,
     /// Test-only interleave seam for the record-vs-corruption window; see
     /// [`RecordHook`].
@@ -278,6 +353,12 @@ impl Clone for Cas {
             writes: AtomicU64::new(self.writes.load(Ordering::Relaxed)),
             // The advisory cache never crosses a clone boundary.
             verified: Mutex::new(VecDeque::new()),
+            // The strict memo never crosses one either: identity claims are
+            // only ever made by the instance that decoded the bytes.
+            #[cfg(unix)]
+            strong_verified: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            hashes: AtomicU64::new(0),
             // A crash arm never crosses a clone boundary either: the clone
             // is a fresh instance with an inert seam.
             seam: CrashSeam::default(),
@@ -293,6 +374,10 @@ impl Cas {
             root,
             writes: AtomicU64::new(0),
             verified: Mutex::new(VecDeque::new()),
+            #[cfg(unix)]
+            strong_verified: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            hashes: AtomicU64::new(0),
             seam: CrashSeam::default(),
             #[cfg(test)]
             record_hook: RecordHook::default(),
@@ -486,6 +571,8 @@ impl Cas {
         sink: &mut W,
         cap_bytes: Option<u64>,
     ) -> CasResult<Option<u64>> {
+        #[cfg(test)]
+        self.hashes.fetch_add(1, Ordering::Relaxed);
         let mut hasher = blake3::Hasher::new();
         let size = decode_stream(file, sink, cap_bytes, Some(&mut hasher))?;
         if size.is_some() {
@@ -556,6 +643,22 @@ impl Cas {
         if FileIdentity::of_path(path) != Some(verified_identity) {
             return;
         }
+        #[cfg(unix)]
+        if let Some(identity) = verified_identity.strong {
+            // The identity-anchored half: this exact blob OBJECT was just
+            // decoded and re-hashed, and the handle-vs-path check above
+            // proves the object did not move under the decode. No TTL — a
+            // later scan of this process skips the re-hash while the
+            // identity holds.
+            let mut strong = self.strong_verified.lock().unwrap();
+            if let Some(pos) = strong.iter().position(|e| e.hash == hash) {
+                strong.remove(pos);
+            }
+            strong.push_back(StrongEntry { hash, identity });
+            while strong.len() > STRONG_VERIFIED_CACHE_MAX {
+                strong.pop_front();
+            }
+        }
         let mut verified = self.verified.lock().unwrap();
         if let Some(pos) = verified.iter().position(|e| e.hash == hash) {
             verified.remove(pos);
@@ -569,6 +672,37 @@ impl Cas {
         });
         while verified.len() > VERIFIED_CACHE_MAX {
             verified.pop_front();
+        }
+    }
+
+    /// The identity-anchored strict memo predicate: true when THIS process
+    /// decoded and re-hashed `hash` and the blob file's object identity
+    /// (device, inode, ctime) is unchanged. Consumed ONLY by
+    /// [`Cas::verify_integrity`]; the single-blob strict paths
+    /// ([`Cas::verify_now`], [`Cas::get_verified_now`]) keep re-hashing
+    /// unconditionally by contract. A miss (cold, evicted, identity moved,
+    /// missing file, non-unix) never claims anything: the caller streams.
+    fn verified_strong(&self, hash: FileHash) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(on_disk) = StrongIdentity::of_path(&self.blob_path(hash)) else {
+                return false;
+            };
+            let mut strong = self.strong_verified.lock().unwrap();
+            let Some(pos) = strong.iter().position(|e| e.hash == hash) else {
+                return false;
+            };
+            let entry = strong.remove(pos).unwrap();
+            if entry.identity != on_disk {
+                return false;
+            }
+            strong.push_back(entry);
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = hash;
+            false
         }
     }
 
@@ -870,7 +1004,14 @@ impl Cas {
     /// Verify integrity of the whole store; returns the list of corrupted
     /// hashes (empty = healthy). Every blob is checked through the STRICT
     /// path ([`Cas::verify_now`], decode + unconditional re-hash) — the
-    /// doctor integrity scan never trusts the advisory LRU (P0-52).
+    /// doctor integrity scan never trusts the advisory LRU (P0-52). The ONE
+    /// skip is the identity-anchored memo (`STRONG_VERIFIED_CACHE_MAX`):
+    /// a blob THIS process already decoded and re-hashed, whose object
+    /// identity (device, inode, ctime — none of them forgeable by an
+    /// unprivileged writer, and ctime moves on any write) is still
+    /// unchanged, cannot have different bytes; a miss always streams. On
+    /// platforms without that identity the memo is never populated and
+    /// every scan re-hashes (never a weaker claim).
     pub fn verify_integrity(&self) -> Vec<FileHash> {
         let mut corrupted = Vec::new();
         let mut read_dir = match fs::read_dir(&self.root) {
@@ -895,6 +1036,9 @@ impl Cas {
                     };
                     let hex = format!("{name}{fname}");
                     if let Some(hash) = FileHash::from_hex(&hex) {
+                        if self.verified_strong(hash) {
+                            continue;
+                        }
                         if self.verify_now(&hex).is_err() {
                             corrupted.push(hash);
                         }
@@ -903,6 +1047,13 @@ impl Cas {
             }
         }
         corrupted
+    }
+
+    /// Strict decodes (decode + re-hash) this instance performed. Test seam
+    /// for the memo evidence.
+    #[cfg(test)]
+    pub(crate) fn strict_decodes(&self) -> u64 {
+        self.hashes.load(Ordering::Relaxed)
     }
 
     /// Total blob count (integrity scan cost; for tests and `doctor`).
@@ -1647,6 +1798,76 @@ mod tests {
         assert!(
             cas.verify_now(&hex2).is_err(),
             "verify_now must catch length-changing tampering too"
+        );
+    }
+
+    /// (e) evidence: the identity-anchored memo makes a repeat scan of
+    /// unchanged blobs re-hash NOTHING, while an in-place rewrite (ctime
+    /// moves) and an atomic replacement (inode moves) both force the strict
+    /// decode again — and a corruption is still caught loudly.
+    #[cfg(unix)]
+    #[test]
+    fn verify_integrity_memo_skips_unchanged_blobs_and_invalidates_on_change() {
+        let (_d, cas) = tmp_cas();
+        let blobs: Vec<(FileHash, Vec<u8>)> = (0..1_000u32)
+            .map(|i| {
+                let payload = format!("blob-{i}-{}", "x".repeat(64)).into_bytes();
+                let h = cas.put(&payload).unwrap();
+                (h, payload)
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let first = cas.verify_integrity();
+        let first_elapsed = started.elapsed();
+        assert!(first.is_empty(), "fresh store must verify clean: {first:?}");
+        let decoded_first = cas.strict_decodes();
+        assert_eq!(
+            decoded_first,
+            blobs.len() as u64,
+            "the first scan hashes every blob"
+        );
+        // Repeat scan in the same process: every object identity unchanged.
+        let started = std::time::Instant::now();
+        let second = cas.verify_integrity();
+        let second_elapsed = started.elapsed();
+        assert!(second.is_empty());
+        assert_eq!(
+            cas.strict_decodes(),
+            decoded_first,
+            "unchanged blobs must never be re-hashed"
+        );
+        println!(
+            "cas verify_integrity 1k blobs: cold {first_elapsed:?} ({decoded_first} decodes), \
+             warm {second_elapsed:?} (0 decodes)"
+        );
+        // In-place same-length corruption: ctime moves, the memo misses.
+        let (h, payload) = &blobs[7];
+        let path = cas.blob_path(*h);
+        let stored = fs::read(&path).unwrap();
+        let mut evil = stored.clone();
+        let flip = evil.len() / 2;
+        evil[flip] ^= 0x5a;
+        assert_eq!(evil.len(), stored.len(), "same-length corruption");
+        fs::write(&path, &evil).unwrap();
+        let third = cas.verify_integrity();
+        assert_eq!(third, vec![*h], "in-place corruption must be caught");
+        assert!(
+            cas.strict_decodes() > decoded_first,
+            "the changed blob must have been re-decoded"
+        );
+        // An atomic REPAIR (new inode) re-arms the memo under the new
+        // identity: healthy again, and the next scan re-hashes nothing more.
+        let repaired = cas.put(payload).unwrap();
+        assert_eq!(repaired, *h);
+        let fourth = cas.verify_integrity();
+        assert!(fourth.is_empty(), "repaired store must verify clean");
+        let after_repair = cas.strict_decodes();
+        let fifth = cas.verify_integrity();
+        assert!(fifth.is_empty());
+        assert_eq!(
+            cas.strict_decodes(),
+            after_repair,
+            "a replacement re-arms the memo for the NEW object"
         );
     }
 

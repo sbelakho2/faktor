@@ -181,6 +181,16 @@ class TaskTreePanel : JPanel(BorderLayout()) {
      * reset all three on every refresh.
      */
     fun update(model: TaskTreeModel) {
+        // Per-refresh no-op guard: the host re-posts its whole projection on
+        // every stream-ticked refresh, and an identical model (data-class
+        // equality over the served DTO facts) must not rebuild the desired
+        // node tree or touch the Swing model at all — the keyed merge kept
+        // every row, selection and expansion, so skipping is exactly what a
+        // full update would leave behind. A model change (or the very first
+        // update) always renders.
+        if (currentModel == model && treeModel.root != null) {
+            return
+        }
         currentModel = model
         stateLabel.text = model.state
         phaseLabel.text = model.phase

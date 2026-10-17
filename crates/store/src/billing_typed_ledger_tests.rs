@@ -878,6 +878,193 @@ fn reconcile_settles_each_uncertain_attempt_from_its_own_provider_row() {
     assert_eq!(report, CostReconcileReport::default());
 }
 
+/// (c) evidence: the uncertain sweeps at a realistic candidate count. The
+/// pass must settle/close every candidate EXACTLY as the per-candidate
+/// implementation did, in ONE writer job with per-candidate savepoints.
+#[test]
+fn uncertain_sweep_batches_candidates_into_one_writer_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+    let now = 1_000i64;
+    let seed_uncertain = |base: u64, with_call: bool| {
+        for i in 0..2_000u64 {
+            let op = OpId::new(base + i);
+            let CostReserveOutcome::Granted(r) = store
+                .cost_reserve(s.id, task.task_id, op, 500, now)
+                .unwrap()
+            else {
+                panic!("reserve")
+            };
+            store.cost_mark_dispatched(r, now).unwrap();
+            assert_eq!(
+                store.cost_mark_uncertain(r, "wire", None, now).unwrap(),
+                CostReservationState::Applied
+            );
+            if with_call {
+                store
+                    .record_provider_call(
+                        s.id,
+                        op,
+                        "fake",
+                        "m",
+                        "completed",
+                        Some(10),
+                        Some(2),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+    };
+    // Reconcile candidates: a completed provider row exists, no price
+    // authority -> each closes as an honest Unknown spend.
+    seed_uncertain(10_000, true);
+    let started = std::time::Instant::now();
+    let report = store
+        .cost_reconcile_uncertain(s.id, task.task_id, now + 1)
+        .unwrap();
+    let reconcile = started.elapsed();
+    assert_eq!(report.closed_unknown, 2_000, "{report:?}");
+    assert_eq!(report.settled, 0);
+    assert_eq!(report.left_uncertain, 0);
+    // Idempotent: nothing remains uncertain.
+    assert_eq!(
+        store
+            .cost_reconcile_uncertain(s.id, task.task_id, now + 1)
+            .unwrap(),
+        CostReconcileReport::default()
+    );
+    // Finalize candidates: still-uncertain rows without a completed call
+    // close at the conservative reserved estimate.
+    seed_uncertain(20_000, false);
+    let started = std::time::Instant::now();
+    let finalized = store
+        .cost_finalize_uncertain(s.id, task.task_id, now + 2)
+        .unwrap();
+    let finalize = started.elapsed();
+    assert_eq!(finalized.settled, 2_000, "{finalized:?}");
+    assert_eq!(finalized.charged_micro, 2_000 * 500);
+    println!("uncertain sweep 2k candidates: reconcile {reconcile:?}, finalize {finalize:?}");
+}
+
+/// (c) per-candidate SAVEPOINT atomicity inside the batched sweep: a
+/// no-write candidate (LeftUncertain / task row gone / Skipped) is undone
+/// row-locally while its MUTATING sibling in the SAME pass still commits —
+/// and a vanished task's candidate never leaks its UPDATE into the store.
+#[test]
+fn uncertain_sweep_undoes_only_the_no_write_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let now = 1_000i64;
+    let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+    let uncertain = |op_base: u64, with_call: bool| {
+        let op = OpId::new(op_base);
+        let CostReserveOutcome::Granted(r) = store
+            .cost_reserve(s.id, task.task_id, op, 700, now)
+            .unwrap()
+        else {
+            panic!("reserve")
+        };
+        store.cost_mark_dispatched(r, now).unwrap();
+        assert_eq!(
+            store.cost_mark_uncertain(r, "wire", None, now).unwrap(),
+            CostReservationState::Applied
+        );
+        if with_call {
+            store
+                .record_provider_call(s.id, op, "fake", "m", "completed", Some(1), Some(1), None)
+                .unwrap();
+        }
+        r
+    };
+    // ONE pass over the task: the candidate WITH a completed call closes as
+    // an unknown spend; the row WITHOUT one is not a candidate at all (the
+    // candidate read is bounded to rows an honest settlement exists for) and
+    // stays uncertain with NOTHING written.
+    let r_settles = uncertain(1, true);
+    let r_stays = uncertain(2, false);
+    let report = store
+        .cost_reconcile_uncertain(s.id, task.task_id, now + 1)
+        .unwrap();
+    assert_eq!(report.closed_unknown, 1, "{report:?}");
+    assert_eq!(report.left_uncertain, 0, "{report:?}");
+    assert_eq!(report.settled, 0);
+    let rows = store.cost_reservations_of(s.id, task.task_id, 10).unwrap();
+    let settled_row = rows.iter().find(|r| r.reservation_id == r_settles).unwrap();
+    assert_eq!(settled_row.status, "settled");
+    assert!(settled_row.cost_basis.as_deref().is_some());
+    let stayed = rows.iter().find(|r| r.reservation_id == r_stays).unwrap();
+    assert_eq!(
+        stayed.status, "uncertain",
+        "the no-write candidate is undone"
+    );
+    assert_eq!(stayed.provider_cost_micro, None);
+    assert_eq!(stayed.settled_cost_micro, None);
+    // Finalize closes the still-uncertain candidate at its estimate.
+    let finalized = store
+        .cost_finalize_uncertain(s.id, task.task_id, now + 2)
+        .unwrap();
+    assert_eq!(finalized.settled, 1, "{finalized:?}");
+    assert_eq!(finalized.charged_micro, 700);
+    // A candidate whose task row vanished writes nothing and stays
+    // uncertain for doctor's dangling scan (savepoint undo).
+    let gone = seed_task(&store, s.id, TaskId::new(2), vec![], TaskState::Running);
+    let op = OpId::new(9);
+    // PRICED, so the settled branch really runs its task fold and finds the
+    // task row gone (the unpriced close writes no task row at all).
+    let CostReserveOutcome::Granted(r_gone) = store
+        .cost_reserve_priced(
+            s.id,
+            gone.task_id,
+            op,
+            300,
+            now,
+            Some(&known_snapshot_json()),
+            ExecutionClass::Unknown,
+        )
+        .unwrap()
+    else {
+        panic!("reserve")
+    };
+    store.cost_mark_dispatched(r_gone, now).unwrap();
+    store
+        .cost_mark_uncertain(r_gone, "wire", None, now)
+        .unwrap();
+    store
+        .record_provider_call(s.id, op, "fake", "m", "completed", Some(1), Some(1), None)
+        .unwrap();
+    {
+        let conn = store.raw_conn();
+        conn.execute(
+            "DELETE FROM task WHERE session_id = ?1 AND task_id = ?2",
+            params![s.id.raw() as i64, gone.task_id.raw() as i64],
+        )
+        .unwrap();
+    }
+    let gone_report = store
+        .cost_reconcile_uncertain(s.id, gone.task_id, now + 3)
+        .unwrap();
+    assert_eq!(gone_report.left_uncertain, 1, "{gone_report:?}");
+    assert_eq!(gone_report.closed_unknown, 0);
+    assert_eq!(gone_report.settled, 0);
+    let gone_rows = store.cost_reservations_of(s.id, gone.task_id, 10).unwrap();
+    let row = gone_rows
+        .iter()
+        .find(|r| r.reservation_id == r_gone)
+        .unwrap();
+    assert_eq!(
+        row.status, "uncertain",
+        "the undone candidate stays uncertain"
+    );
+    assert_eq!(row.provider_cost_micro, None);
+    assert_eq!(row.settled_cost_micro, None);
+}
+
 // ------------------------------------------------- model outcome stats
 // (migration v18 / schema target 19, audit items 13/14/L)
 

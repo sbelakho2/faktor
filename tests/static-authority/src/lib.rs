@@ -6652,6 +6652,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/winjob/tests/windows_tree.rs", 1),
         ("crates/cloud/tests/durability_memory.rs", 1),
         ("crates/server/tests/attachment_decode_alloc.rs", 1),
+        // The second-angle allocation probes: one file-level allow each backs
+        // a counting `GlobalAlloc` that forwards to `System` unchanged (the
+        // measurement instrument itself; every site carries SAFETY).
+        ("crates/context/tests/alloc_probe.rs", 1),
+        ("crates/session/tests/alloc_probe.rs", 1),
         ("crates/orchestrator/src/shadow_tests.rs", 1),
         // The terminal unix test module (moved out of lib.rs by the audit-17
         // split): the three libc probes keep their per-site SAFETY comments.

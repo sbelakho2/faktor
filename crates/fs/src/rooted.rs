@@ -2697,6 +2697,71 @@ mod tests {
             assert_eq!(dir.read_link(Path::new("link")).unwrap(), outside.join("t"));
         }
 
+        /// Second-angle challenge of the per-directory sort: readdir(3) has
+        /// no ordered keyset cursor, so the deterministic name order CANNOT
+        /// come from OS iteration (a keyset walk would be a full scan per
+        /// name). The probe measures the sort's share of a realistic 10k-file
+        /// / 200-dir walk: if it dominated, the walk itself would be the
+        /// problem; it does not.
+        #[test]
+        fn per_directory_sort_is_a_small_share_of_the_walk() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            for d in 0..200 {
+                let dir = root.join(format!("d{d:03}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in 0..50 {
+                    std::fs::write(dir.join(format!("f{f:03}.txt")), b"x").unwrap();
+                }
+            }
+            let dir = anchored(&root);
+            let mut seen = 0usize;
+            let mut budget = WalkBudget::new(1 << 20, 1 << 20, 64, 1 << 30, 1 << 30);
+            let t0 = std::time::Instant::now();
+            dir.walk_bounded(Path::new(""), &mut budget, &[], &mut |e, _d, _b| {
+                if e.kind == RootedEntryKind::File {
+                    seen += 1;
+                }
+                Ok(WalkStep::Continue)
+            })
+            .unwrap();
+            let walk = t0.elapsed();
+            assert_eq!(seen, 200 * 50, "every file is visited");
+
+            // The readdir+collect and sort's own cost over the same
+            // directories (no fstatat, no anchored open, no budget
+            // accounting), split so the sort share is exact.
+            let mut collected: Vec<Vec<std::ffi::OsString>> = Vec::new();
+            let t1 = std::time::Instant::now();
+            for d in 0..200 {
+                collected.push(
+                    std::fs::read_dir(root.join(format!("d{d:03}")))
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name())
+                        .collect(),
+                );
+            }
+            let collect_only = t1.elapsed();
+            let t2 = std::time::Instant::now();
+            let mut sorted = 0usize;
+            for names in &mut collected {
+                names.sort();
+                sorted += names.len();
+            }
+            let sort_only = t2.elapsed();
+            assert_eq!(sorted, 200 * 50);
+            eprintln!(
+                "fs walk (10k files / 200 dirs): sorted anchored walk {walk:?}; readdir+collect {collect_only:?}; per-dir sort {sort_only:?}"
+            );
+            // The sort is the cheaper half of the raw enumeration and a
+            // fraction of the walk; and no keyset alternative exists because
+            // readdir(3) has no ordered cursor.
+            assert!(
+                sort_only < walk,
+                "the per-directory sort must be a fraction of the walk: sort {sort_only:?} walk {walk:?}"
+            );
+        }
+
         // ----------------------------------------------------------------
         // Non-blocking read opens (FIFO swapped in at the read target)
         // ----------------------------------------------------------------

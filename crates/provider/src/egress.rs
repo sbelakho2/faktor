@@ -966,7 +966,7 @@ impl CheckedResponse {
     pub fn stream_frames(
         self,
         budget: &ResponseBudget,
-    ) -> impl Stream<Item = Result<Vec<u8>, EgressError>> + Send + 'static {
+    ) -> impl Stream<Item = Result<bytes::Bytes, EgressError>> + Send + 'static {
         self.into_budgeted(*budget).into_stream()
     }
 
@@ -1077,9 +1077,13 @@ impl BudgetedBody {
         }
     }
 
-    /// The next budget-checked chunk (`None` = body ended). See the type
-    /// docs for the enforcement contract.
-    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, EgressError> {
+    /// The next budget-checked chunk as a refcounted [`Bytes`] slice
+    /// (`None` = body ended). See the type docs for the enforcement
+    /// contract. This is the allocation-free inner form: the chunk handed
+    /// back by the transport is passed through by `move` (the pre-fix
+    /// `next_chunk` copied every network frame into a fresh `Vec` before the
+    /// line assembler copied it AGAIN into its carry buffer).
+    pub async fn next_chunk_bytes(&mut self) -> Result<Option<bytes::Bytes>, EgressError> {
         if self.finished {
             return Ok(None);
         }
@@ -1130,26 +1134,37 @@ impl BudgetedBody {
                 }
                 self.bytes = self.bytes.saturating_add(len);
                 self.last_activity = Some(Instant::now());
-                Ok(Some(chunk.to_vec()))
+                Ok(Some(chunk))
             }
         }
+    }
+
+    /// The next budget-checked chunk materialized as a `Vec` (`None` = body
+    /// ended). Byte-identical to [`BudgetedBody::next_chunk_bytes`]; the
+    /// streaming callers use the `Bytes` form and the materializing callers
+    /// use [`BudgetedBody::read_all`].
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, EgressError> {
+        Ok(self.next_chunk_bytes().await?.map(|chunk| chunk.to_vec()))
     }
 
     /// Read the whole body under the budget (the materializing helper).
     pub async fn read_all(&mut self) -> Result<Vec<u8>, EgressError> {
         let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = self.next_chunk().await? {
+        while let Some(chunk) = self.next_chunk_bytes().await? {
             body.extend_from_slice(&chunk);
         }
         Ok(body)
     }
 
-    /// Turn the budgeted reader into a stream of budget-checked chunks. The
-    /// stream yields exactly one terminal error (if any) and then ends.
-    pub fn into_stream(self) -> impl Stream<Item = Result<Vec<u8>, EgressError>> + Send + 'static {
+    /// Turn the budgeted reader into a stream of budget-checked refcounted
+    /// chunks. The stream yields exactly one terminal error (if any) and
+    /// then ends.
+    pub fn into_stream(
+        self,
+    ) -> impl Stream<Item = Result<bytes::Bytes, EgressError>> + Send + 'static {
         futures::stream::unfold(Some(self), |state| async move {
             let mut body = state?;
-            match body.next_chunk().await {
+            match body.next_chunk_bytes().await {
                 Ok(Some(chunk)) => Some((Ok(chunk), Some(body))),
                 Ok(None) => None,
                 Err(e) => Some((Err(e), None)),

@@ -2309,42 +2309,59 @@ async fn explicit_restart_is_idempotent_and_counted_once_per_generation() {
 
 // ------------------------------------------- audit 5/6/16: coverage
 
-/// The bounded shard pass resumes exactly after its cursor and every
-/// file is visited exactly once across a full round (termination proof).
+/// The bounded interleaved pass resumes exactly after its shared cursor and
+/// every file is visited exactly once across a full round (termination
+/// proof). The round loop mirrors the service: one shared walk per
+/// iteration until every remaining shard finished.
+fn fingerprint_round_loop(
+    dir: &Path,
+    coverage: &mut FingerprintCoverage,
+    max_files: usize,
+    max_dirs: usize,
+) -> (usize, Vec<String>) {
+    let mut visited: Vec<String> = Vec::new();
+    let mut walks = 0usize;
+    for _ in 0..1_000 {
+        if coverage.complete {
+            break;
+        }
+        coverage.rebase_divergent_cursors();
+        let pass = fingerprint_shared_pass(dir, coverage, max_files, max_dirs, None, None).unwrap();
+        walks += 1;
+        for bucket in &pass.entries {
+            for entry in bucket {
+                visited.push(entry.path.clone());
+            }
+        }
+        if pass.walk_completed {
+            for shard in 0..FINGERPRINT_SHARDS {
+                if !coverage.shard_done(shard) {
+                    coverage.finish_shard(shard);
+                }
+            }
+        } else {
+            for shard in 0..FINGERPRINT_SHARDS {
+                if !coverage.shard_done(shard) {
+                    coverage.set_cursor(shard, pass.cursor.clone());
+                }
+            }
+        }
+    }
+    (walks, visited)
+}
+
 #[test]
 fn fingerprint_pass_cursor_terminates_and_visits_every_file_once() {
     let dir = TempDir::new().unwrap();
     for i in 0..10 {
         write(dir.path(), &format!("x{i}.rs"), "fn x() {}");
     }
-    let mut visited: Vec<String> = Vec::new();
+    // A tiny per-pass budget forces MULTIPLE capped passes: every file must
+    // still be visited exactly once across the round.
     let mut coverage = FingerprintCoverage::round(0);
-    for pass_no in 0..1_000 {
-        let pass = fingerprint_pass(
-            dir.path(),
-            coverage.shard,
-            &coverage.cursor_for(coverage.shard),
-            1,
-            8,
-            None,
-            None,
-        )
-        .unwrap();
-        for entry in &pass.entries {
-            visited.push(entry.path.clone());
-        }
-        if pass.shard_completed {
-            coverage.finish_shard(coverage.shard);
-        } else {
-            let shard = coverage.shard;
-            coverage.set_cursor(shard, pass.cursor);
-        }
-        if coverage.complete {
-            assert!(pass_no < 999, "round must terminate");
-            break;
-        }
-    }
+    let (walks, mut visited) = fingerprint_round_loop(dir.path(), &mut coverage, 1, 8);
     assert!(coverage.complete, "round never completed: {coverage:?}");
+    assert!(walks < 1_000, "round must terminate");
     visited.sort();
     let before = visited.len();
     visited.dedup();
@@ -2354,6 +2371,32 @@ fn fingerprint_pass_cursor_terminates_and_visits_every_file_once() {
     let shards: std::collections::BTreeSet<u32> =
         visited.iter().map(|p| fingerprint_shard(p)).collect();
     assert!(shards.len() <= FINGERPRINT_SHARDS as usize);
+}
+
+/// (b) evidence: an UNCAPPED fingerprint round now completes every shard in
+/// ONE physical walk (was one walk per shard), and how long the round takes.
+#[test]
+fn fingerprint_round_walk_count_measurement() {
+    for files in [64usize, 10_000] {
+        let dir = TempDir::new().unwrap();
+        for i in 0..files {
+            write(dir.path(), &format!("f{i:05}.rs"), "fn x() {}");
+        }
+        let mut coverage = FingerprintCoverage::baseline();
+        let started = std::time::Instant::now();
+        let (walks, visited) =
+            fingerprint_round_loop(dir.path(), &mut coverage, FP_BATCH_FILES, FP_BATCH_DIRS);
+        let elapsed = started.elapsed();
+        assert!(coverage.complete, "round never completed for {files} files");
+        assert_eq!(visited.len(), files, "every file must be visited once");
+        // 64 files (one walk); 10k files (ceil(10k/FP_BATCH_FILES) walks).
+        let expected = files.div_ceil(FP_BATCH_FILES);
+        assert_eq!(
+            walks, expected,
+            "{files} files: {walks} walk(s) (expected {expected})"
+        );
+        println!("fingerprint round: {files} files, {walks} physical walk(s), elapsed {elapsed:?}");
+    }
 }
 
 /// Audit 5 adversarial: a non-root directory (and a file) that vanishes

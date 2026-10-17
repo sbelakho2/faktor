@@ -11,6 +11,48 @@ pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
+/// (d) evidence: the doctor journal sweep at 5k sessions. The sweep runs
+/// the per-session authority per session; THIS measurement pins what that
+/// costs at scale (before/after the batched rewrite).
+#[test]
+fn journal_sweep_measurement() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    {
+        let conn = store.raw_conn();
+        let tx = conn.unchecked_transaction().unwrap();
+        for sid in 1..=5_000i64 {
+            tx.execute(
+                "INSERT INTO session(id, workspace_id, title, provider, model, state,
+                                     created_ms, updated_ms)
+                 VALUES (?1, ?2, 't', 'p', 'm', '\"idle\"', 1, 1)",
+                params![sid, ws.raw() as i64],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO event(seq, session_id, kind, state, ts_ms)
+                 VALUES (1, ?1, 'session_created', '\"idle\"', 1)",
+                params![sid],
+            )
+            .unwrap();
+            for seq in 2..=5i64 {
+                tx.execute(
+                    "INSERT INTO event(seq, session_id, kind, state, ts_ms)
+                     VALUES (?1, ?2, 'auth_state_changed', '\"idle\"', ?1)",
+                    params![seq, sid],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+    let started = std::time::Instant::now();
+    let issues = store.journal_consistency_issues().unwrap();
+    let elapsed = started.elapsed();
+    assert!(issues.is_empty(), "{issues:?}");
+    println!("journal sweep 5k sessions x 5 events: {elapsed:?}");
+}
+
 #[test]
 fn journal_sequences_are_gapless_under_concurrent_append() {
     let (_d, store) = tmp_store();

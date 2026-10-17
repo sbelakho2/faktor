@@ -893,30 +893,47 @@ fn render_errors(errors: &str) -> String {
 
 /// Canonical tool-bundle segment: the schema JSON is the identity (tools
 /// travel as the wire `tools` field, never embedded in `system`), the token
-/// count is the renderer's own schema accounting.
+/// count is the renderer's own schema accounting. The bundle JSON is
+/// serialized ONCE into a reused scratch buffer (no per-render bundle
+/// `String`); the digest and byte count are byte-identical to hashing the
+/// full `to_string(specs)` output.
 fn measure_tool_bundle(counter: &dyn TokenCounter, specs: &[ToolSpec]) -> PromptSegment {
-    let canonical = serde_json::to_string(specs).unwrap_or_default();
+    let mut buf: Vec<u8> = Vec::new();
+    let (bytes, hash) = match serde_json::to_writer(&mut buf, specs) {
+        Ok(()) => (buf.len(), FileHash::from(*blake3::hash(&buf).as_bytes())),
+        // No serialized bytes exist: the empty-content digest, exactly the
+        // historical `to_string(..).unwrap_or_default()` fallback.
+        Err(_) => (0, FileHash::from(*blake3::hash(b"").as_bytes())),
+    };
     PromptSegment {
         class: PromptStability::Static,
-        bytes: canonical.len(),
-        hash: FileHash::from(*blake3::hash(canonical.as_bytes()).as_bytes()),
+        bytes,
+        hash,
         tokens: estimate_tools(counter, specs).count,
     }
 }
 
 /// Canonical history segment: incremental digest over each message's JSON
-/// (never materializing one huge string) and the renderer's exact
-/// per-message token accounting.
+/// (never materializing one huge string, never a fresh `String` per message:
+/// ONE scratch buffer is reused across the whole window and only the hashed
+/// bytes escape it) and the renderer's exact per-message token accounting.
+/// The digest/byte counts are byte-identical to serializing every message
+/// separately and hashing the concatenation.
 fn measure_history(counter: &dyn TokenCounter, messages: &[RequestMessage]) -> PromptSegment {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
     for m in messages {
-        match serde_json::to_string(m) {
-            Ok(json) => {
-                bytes = bytes.saturating_add(json.len());
-                hasher.update(json.as_bytes());
+        buf.clear();
+        match serde_json::to_writer(&mut buf, m) {
+            Ok(()) => {
+                bytes = bytes.saturating_add(buf.len());
+                hasher.update(&buf);
             }
             Err(_) => {
+                // A failed message contributes exactly one placeholder byte
+                // and no partial serialization (the scratch buffer is
+                // discarded, never hashed).
                 bytes = bytes.saturating_add(1);
                 hasher.update(b"\0");
             }
@@ -928,6 +945,17 @@ fn measure_history(counter: &dyn TokenCounter, messages: &[RequestMessage]) -> P
         hash: FileHash::from(*hasher.finalize().as_bytes()),
         tokens: estimate_messages(counter, messages).count,
     }
+}
+
+/// Public measurement seam of the canonical history segment: exactly the
+/// digest/byte/token accounting [`plan_wire_request`] charges for the
+/// conversation window (production renders through the renderer; the
+/// accounting parity and allocation probes consume this directly).
+pub fn measure_history_segment(
+    counter: &dyn TokenCounter,
+    messages: &[RequestMessage],
+) -> PromptSegment {
+    measure_history(counter, messages)
 }
 
 /// Saturating combine of two estimates: counts add, exactness is the AND
@@ -2703,5 +2731,164 @@ mod tests {
             with_tools.input_tokens > bare.input_tokens,
             "tool schemas must add to the footprint: {bare:?} vs {with_tools:?}"
         );
+    }
+
+    // ------------------------------------------- allocation/copy parity
+    // locks (second-angle performance audit): the scratch-buffer
+    // serialization must be BYTE-IDENTICAL to the historical
+    // serialize-each-item-to-its-own-String path, on adversarial corpora.
+
+    /// The reference algorithm: exactly the historical implementation
+    /// (fresh `String` per message, hash the concatenation). The fixed
+    /// implementation must reproduce its digest and byte total exactly.
+    fn reference_history_segment(
+        counter: &dyn TokenCounter,
+        messages: &[RequestMessage],
+    ) -> (usize, FileHash, u64) {
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0usize;
+        for m in messages {
+            match serde_json::to_string(m) {
+                Ok(json) => {
+                    bytes = bytes.saturating_add(json.len());
+                    hasher.update(json.as_bytes());
+                }
+                Err(_) => {
+                    bytes = bytes.saturating_add(1);
+                    hasher.update(b"\0");
+                }
+            }
+        }
+        (
+            bytes,
+            FileHash::from(*hasher.finalize().as_bytes()),
+            estimate_messages(counter, messages).count,
+        )
+    }
+
+    #[test]
+    fn history_segment_scratch_buffer_is_byte_identical_to_per_message_strings() {
+        let counter = GenericTokenCounter;
+        let long = "fn main() { let x = 1; } // ".repeat(4000);
+        let messages = vec![
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text("")],
+            },
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::text("汉字😀 mixed \u{1F600}\r\n\t\"quoted\"")],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text(long)],
+            },
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![
+                    ContentPart::tool_call("call_汉", "echo", serde_json::json!({"p": "\u{0}"})),
+                    ContentPart::tool_result("ok \u{1F642}", true, "call_汉"),
+                ],
+            },
+        ];
+        let segment = measure_history_segment(&counter, &messages);
+        let (bytes, hash, tokens) = reference_history_segment(&counter, &messages);
+        assert_eq!(segment.bytes, bytes, "byte total drifted");
+        assert_eq!(segment.hash, hash, "history digest drifted");
+        assert_eq!(segment.tokens, tokens, "history token accounting drifted");
+        assert_eq!(segment.class, PromptStability::Volatile);
+
+        // Empty history: the empty-content digest (never a panic).
+        let empty = measure_history_segment(&counter, &[]);
+        let (bytes, hash, tokens) = reference_history_segment(&counter, &[]);
+        assert_eq!(
+            (empty.bytes, empty.hash, empty.tokens),
+            (bytes, hash, tokens)
+        );
+        assert_eq!(
+            empty.hash,
+            PromptSegment::empty(PromptStability::Volatile).hash
+        );
+
+        // Ordering is part of the identity: swapping two messages changes
+        // the digest (a scratch buffer that leaked state across messages
+        // would also fail this).
+        let mut swapped = messages.clone();
+        swapped.swap(0, 1);
+        assert_ne!(
+            measure_history_segment(&counter, &swapped).hash,
+            segment.hash,
+            "message order must be part of the history digest"
+        );
+        // And re-measuring the SAME input twice is stable.
+        assert_eq!(
+            measure_history_segment(&counter, &messages).hash,
+            segment.hash
+        );
+    }
+
+    #[test]
+    fn tool_bundle_digest_is_byte_identical_to_full_bundle_serialization() {
+        let specs: Vec<ToolSpec> = (0..3)
+            .map(|i| ToolSpec {
+                name: format!("tool_{i}_汉"),
+                description: format!("desc {i} \u{1F600}"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "p": { "type": "string", "enum": ["a", "\u{0}"] } }
+                }),
+            })
+            .collect();
+        let canonical = serde_json::to_string(&specs).unwrap();
+        let want_bytes = canonical.len();
+        let want_hash = FileHash::from(*blake3::hash(canonical.as_bytes()).as_bytes());
+
+        let b = ContextBudget::default();
+        let plan = plan_wire_request(
+            "",
+            "",
+            &specs,
+            "",
+            &TaskLedger::default(),
+            "",
+            &[],
+            &[],
+            "",
+            &b,
+            &GenericTokenCounter,
+        )
+        .unwrap();
+        assert_eq!(plan.prompt_segments.tool_bundle.bytes, want_bytes);
+        assert_eq!(plan.prompt_segments.tool_bundle.hash, want_hash);
+        assert_eq!(
+            plan.prompt_segments.tool_bundle.class,
+            PromptStability::Static
+        );
+
+        // Empty tool bundle: "[]" is the canonical serialization (2 bytes),
+        // NOT the empty-content digest.
+        let empty_plan = plan_wire_request(
+            "",
+            "",
+            &[],
+            "",
+            &TaskLedger::default(),
+            "",
+            &[],
+            &[],
+            "",
+            &b,
+            &GenericTokenCounter,
+        )
+        .unwrap();
+        assert_eq!(empty_plan.prompt_segments.tool_bundle.bytes, 2);
+        assert_eq!(
+            empty_plan.prompt_segments.tool_bundle.hash,
+            want_hash_of(b"[]")
+        );
+    }
+
+    fn want_hash_of(bytes: &[u8]) -> FileHash {
+        FileHash::from(*blake3::hash(bytes).as_bytes())
     }
 }

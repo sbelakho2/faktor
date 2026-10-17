@@ -442,7 +442,9 @@ pub fn mine(episodes: &[FailureEpisode]) -> Vec<ProjectLearning> {
     }
     let mut learnings: Vec<ProjectLearning> =
         groups.into_values().filter_map(Group::finish).collect();
-    learnings.sort_by_key(|learning| learning.pattern_digest().to_hex());
+    // Digest BYTES sort exactly like the lowercase-hex text (byte 0x9a <
+    // 0xa0 both ways) with zero per-comparison allocations.
+    learnings.sort_by_key(|learning| learning.pattern_digest().bytes());
     learnings
 }
 

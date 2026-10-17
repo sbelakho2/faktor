@@ -456,6 +456,36 @@ impl Provider for AnthropicProvider {
     }
 }
 
+/// Accumulation state for ONE `tool_use` content block, keyed by its wire
+/// `index` so parallel tool calls never collide (the pre-fix single slot
+/// silently overwrote every call but the last).
+#[derive(Default)]
+struct ToolSlot {
+    id: Option<String>,
+    name: Option<String>,
+    args: String,
+}
+
+/// Complete every accumulated tool slot in `index` order. Only slots that
+/// carry BOTH an id and a name become `ToolCall` chunks (exactly the pre-fix
+/// single-slot rule); arguments that are not valid JSON lower to `Null`
+/// (never a partial or defaulted input).
+fn drain_tool_calls(calls: &mut std::collections::BTreeMap<u64, ToolSlot>) -> Vec<ProviderChunk> {
+    let mut out = Vec::new();
+    for (_, slot) in std::mem::take(calls) {
+        if let (Some(id), Some(name)) = (slot.id, slot.name) {
+            let input = serde_json::from_str(&slot.args).unwrap_or(serde_json::Value::Null);
+            out.push(ProviderChunk::ToolCall {
+                id,
+                name,
+                input,
+                complete: true,
+            });
+        }
+    }
+    out
+}
+
 pub(crate) fn anthropic_stream(
     transport: Arc<dyn HttpTransport>,
     url: String,
@@ -473,271 +503,313 @@ pub(crate) fn anthropic_stream(
     let scrubber = ErrorScrubber::new().with_request_credentials(&headers, &url);
 
     enum Stage {
-        Fresh,
+        /// Request inputs live in the state (consumed once, on `Fresh`)
+        /// instead of the per-chunk fold closure, which previously deep-
+        /// cloned the full request body `Value` and the header map on every
+        /// yielded chunk.
+        Fresh {
+            transport: Arc<dyn HttpTransport>,
+            url: String,
+            headers: reqwest::header::HeaderMap,
+            body: serde_json::Value,
+            cancel: Option<faktor_core::cancellation::CancellationToken>,
+        },
         Streaming {
             lines: LineStream,
-            tool_id: Option<String>,
-            tool_name: Option<String>,
-            tool_args: String,
+            /// One slot per `tool_use` content-block index; every complete
+            /// slot is emitted in index order at the terminal marker.
+            calls: std::collections::BTreeMap<u64, ToolSlot>,
+            /// Completed calls draining one per poll.
+            pending: std::collections::VecDeque<ProviderChunk>,
+            /// `[DONE]` seen: no line is ever read again; the queued chunks
+            /// drain first, then `Done`.
+            finished: bool,
         },
         Done,
     }
-    futures::stream::unfold(Stage::Fresh, move |stage| {
-        let transport = transport.clone();
-        let url = url.clone();
-        let deadlines = deadlines;
-        let cancel = cancel.clone();
-        let headers = headers.clone();
-        let body = body.clone();
-        let scrubber = scrubber.clone();
-        async move {
-            let (mut lines, mut tool_id, mut tool_name, mut tool_args) = match stage {
-                Stage::Fresh => {
-                    let resp = execute_with_head_timeout(
-                        execute_post_json(transport.as_ref(), &url, headers, &body),
-                        deadlines,
-                    )
-                    .await;
-                    match resp {
-                        Ok(r) => {
-                            let status = r.status();
-                            if !status.is_success() {
-                                let text = read_error_body_bounded(
-                                    r,
-                                    ANTHROPIC_ERROR_BODY_MAX_BYTES,
-                                    request_head_timeout_ms(deadlines),
-                                )
-                                .await;
-                                return Some((
-                                    Err(provider_error_for_http_with_scrubber(
-                                        status.as_u16(),
-                                        &text,
-                                        &scrubber,
-                                    )),
-                                    Stage::Done,
+    futures::stream::unfold(
+        Stage::Fresh {
+            transport,
+            url,
+            headers,
+            body,
+            cancel,
+        },
+        move |stage| {
+            // Only the scrubber (one `Arc`) is shared across events.
+            let scrubber = scrubber.clone();
+            async move {
+                let (mut lines, mut calls, mut pending, mut finished) = match stage {
+                    Stage::Fresh {
+                        transport,
+                        url,
+                        headers,
+                        body,
+                        cancel,
+                    } => {
+                        let resp = execute_with_head_timeout(
+                            execute_post_json(transport.as_ref(), &url, headers, &body),
+                            deadlines,
+                        )
+                        .await;
+                        match resp {
+                            Ok(r) => {
+                                let status = r.status();
+                                if !status.is_success() {
+                                    let text = read_error_body_bounded(
+                                        r,
+                                        ANTHROPIC_ERROR_BODY_MAX_BYTES,
+                                        request_head_timeout_ms(deadlines),
+                                    )
+                                    .await;
+                                    return Some((
+                                        Err(provider_error_for_http_with_scrubber(
+                                            status.as_u16(),
+                                            &text,
+                                            &scrubber,
+                                        )),
+                                        Stage::Done,
+                                    ));
+                                }
+                                let lines: LineStream = Box::pin(guarded_lines(
+                                    utf8_line_stream(
+                                        r.stream_frames(&deadlines.response_budget()),
+                                        MAX_LINE_BYTES,
+                                    ),
+                                    deadlines,
+                                    cancel,
                                 ));
+                                (
+                                    lines,
+                                    std::collections::BTreeMap::new(),
+                                    std::collections::VecDeque::new(),
+                                    false,
+                                )
                             }
-                            let lines: LineStream = Box::pin(guarded_lines(
-                                utf8_line_stream(
-                                    r.stream_frames(&deadlines.response_budget()),
-                                    MAX_LINE_BYTES,
-                                ),
-                                deadlines,
-                                cancel.clone(),
-                            ));
-                            (lines, None, None, String::new())
-                        }
-                        Err(e) => {
-                            return Some((Err(e), Stage::Done));
+                            Err(e) => {
+                                return Some((Err(e), Stage::Done));
+                            }
                         }
                     }
-                }
-                Stage::Streaming {
-                    lines,
-                    tool_id,
-                    tool_name,
-                    tool_args,
-                } => (lines, tool_id, tool_name, tool_args),
-                Stage::Done => return None,
-            };
+                    Stage::Streaming {
+                        lines,
+                        calls,
+                        pending,
+                        finished,
+                    } => (lines, calls, pending, finished),
+                    Stage::Done => return None,
+                };
 
-            loop {
-                let Some(next) = lines.next().await else {
-                    if let (Some(id), Some(name)) = (tool_id, tool_name) {
-                        let input =
-                            serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
+                loop {
+                    if let Some(chunk) = pending.pop_front() {
                         return Some((
-                            Ok(ProviderChunk::ToolCall {
-                                id,
-                                name,
-                                input,
-                                complete: true,
-                            }),
-                            Stage::Done,
+                            Ok(chunk),
+                            Stage::Streaming {
+                                lines,
+                                calls,
+                                pending,
+                                finished,
+                            },
                         ));
                     }
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                };
-                let line = match next {
-                    Ok(l) => l,
-                    Err(e) => return Some((Err(e), Stage::Done)),
-                };
-                let line = line.trim();
-                if !line.starts_with("data:") {
-                    continue;
-                }
-                let data = line[5..].trim();
-                if data == "[DONE]" {
-                    if let (Some(id), Some(name)) = (tool_id, tool_name) {
-                        let input =
-                            serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
+                    if finished {
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    }
+                    let Some(next) = lines.next().await else {
+                        // The body ended: flush every complete accumulated call
+                        // in index order, then the explicit terminal `Done`.
+                        pending.extend(drain_tool_calls(&mut calls));
+                        if let Some(chunk) = pending.pop_front() {
+                            return Some((
+                                Ok(chunk),
+                                Stage::Streaming {
+                                    lines,
+                                    calls,
+                                    pending,
+                                    finished: true,
+                                },
+                            ));
+                        }
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    };
+                    let line = match next {
+                        Ok(l) => l,
+                        Err(e) => return Some((Err(e), Stage::Done)),
+                    };
+                    let line = line.trim();
+                    if !line.starts_with("data:") {
+                        continue;
+                    }
+                    let data = line[5..].trim();
+                    if data == "[DONE]" {
+                        pending.extend(drain_tool_calls(&mut calls));
+                        finished = true;
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
                         return Some((
-                            Ok(ProviderChunk::ToolCall {
-                                id,
-                                name,
-                                input,
-                                complete: true,
-                            }),
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                scrubber.event_diagnostic(
+                                    "bad anthropic SSE",
+                                    data,
+                                    auth_shaped_text(data),
+                                ),
+                            )),
                             Stage::Done,
                         ));
-                    }
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Malformed,
-                            scrubber.event_diagnostic(
-                                "bad anthropic SSE",
-                                data,
-                                auth_shaped_text(data),
-                            ),
-                        )),
-                        Stage::Done,
-                    ));
-                };
-                let event = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match event {
-                    "content_block_start" => {
-                        if let Some(block) = value.get("content_block") {
-                            let block_type = block.get("type").and_then(|t| t.as_str());
-                            if block_type == Some("tool_use") {
-                                tool_id = block
-                                    .get("id")
-                                    .and_then(|i| i.as_str())
-                                    .map(|s| s.to_string());
-                                tool_name = block
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .map(|s| s.to_string());
-                                tool_args.clear();
-                            } else if block_type == Some("text") {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        return Some((
-                                            Ok(ProviderChunk::Text {
-                                                text: text.to_string(),
-                                            }),
-                                            Stage::Streaming {
-                                                lines,
-                                                tool_id,
-                                                tool_name,
-                                                tool_args,
-                                            },
-                                        ));
+                    };
+                    let event = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match event {
+                        "content_block_start" => {
+                            if let Some(block) = value.get("content_block") {
+                                let index =
+                                    value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                let block_type = block.get("type").and_then(|t| t.as_str());
+                                if block_type == Some("tool_use") {
+                                    let slot = calls.entry(index).or_default();
+                                    slot.id = block
+                                        .get("id")
+                                        .and_then(|i| i.as_str())
+                                        .map(|s| s.to_string());
+                                    slot.name = block
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(|s| s.to_string());
+                                    slot.args.clear();
+                                } else if block_type == Some("text") {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                        if !text.is_empty() {
+                                            return Some((
+                                                Ok(ProviderChunk::Text {
+                                                    text: text.to_string(),
+                                                }),
+                                                Stage::Streaming {
+                                                    lines,
+                                                    calls,
+                                                    pending,
+                                                    finished,
+                                                },
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    "content_block_delta" => {
-                        let delta = value.get("delta");
-                        if let Some(text) =
-                            delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
-                        {
-                            if !text.is_empty() {
-                                return Some((
-                                    Ok(ProviderChunk::Text {
-                                        text: text.to_string(),
-                                    }),
-                                    Stage::Streaming {
-                                        lines,
-                                        tool_id,
-                                        tool_name,
-                                        tool_args,
-                                    },
-                                ));
+                        "content_block_delta" => {
+                            let delta = value.get("delta");
+                            if let Some(text) =
+                                delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
+                            {
+                                if !text.is_empty() {
+                                    return Some((
+                                        Ok(ProviderChunk::Text {
+                                            text: text.to_string(),
+                                        }),
+                                        Stage::Streaming {
+                                            lines,
+                                            calls,
+                                            pending,
+                                            finished,
+                                        },
+                                    ));
+                                }
+                            }
+                            if let Some(args) = delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(|a| a.as_str())
+                            {
+                                // Fragments append to THEIR block's slot (keyed
+                                // by the frame index), so interleaved parallel
+                                // calls never mix arguments.
+                                let index =
+                                    value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                calls.entry(index).or_default().args.push_str(args);
                             }
                         }
-                        if let Some(args) = delta
-                            .and_then(|d| d.get("partial_json"))
-                            .and_then(|a| a.as_str())
-                        {
-                            tool_args.push_str(args);
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(usage) = value.get("usage") {
-                            // Wire semantics (audit Phase-1 item C):
-                            // anthropic `input_tokens` is the input total
-                            // EXCLUDING cache READS — cache reads arrive as
-                            // `cache_read_input_tokens` — but INCLUDING the
-                            // tokens written to cache this call, which also
-                            // ride `cache_creation_input_tokens` (the cache
-                            // WRITE line is priced separately from input).
-                            // `output_tokens` includes thinking tokens;
-                            // anthropic reports no separate reasoning count
-                            // (no separately-priced reasoning line), so the
-                            // informational subset stays zero and can never
-                            // be double-billed. A row whose cache writes
-                            // exceed the input total they must be a subset
-                            // of is impossible: typed Malformed.
-                            let input_total = usage
-                                .get("input_tokens")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let output_tokens = usage
-                                .get("output_tokens")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let cache_read_tokens = usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let cache_write_tokens = usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let canonical: Option<CanonicalUsage> = if input_total == 0
-                                && output_tokens == 0
-                                && cache_read_tokens == 0
-                                && cache_write_tokens == 0
-                            {
-                                // An all-zero usage envelope carries
-                                // nothing: keep reading, no chunk.
-                                None
-                            } else {
-                                let Some(uncached_input_tokens) =
-                                    input_total.checked_sub(cache_write_tokens)
-                                else {
-                                    return Some((
-                                        Err(ProviderError::new(
-                                            ProviderErrorKind::Malformed,
-                                            format!(
-                                                "hostile usage frame: cache write tokens \
+                        "message_delta" => {
+                            if let Some(usage) = value.get("usage") {
+                                // Wire semantics (audit Phase-1 item C):
+                                // anthropic `input_tokens` is the input total
+                                // EXCLUDING cache READS — cache reads arrive as
+                                // `cache_read_input_tokens` — but INCLUDING the
+                                // tokens written to cache this call, which also
+                                // ride `cache_creation_input_tokens` (the cache
+                                // WRITE line is priced separately from input).
+                                // `output_tokens` includes thinking tokens;
+                                // anthropic reports no separate reasoning count
+                                // (no separately-priced reasoning line), so the
+                                // informational subset stays zero and can never
+                                // be double-billed. A row whose cache writes
+                                // exceed the input total they must be a subset
+                                // of is impossible: typed Malformed.
+                                let input_total = usage
+                                    .get("input_tokens")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let output_tokens = usage
+                                    .get("output_tokens")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let cache_read_tokens = usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let cache_write_tokens = usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let canonical: Option<CanonicalUsage> = if input_total == 0
+                                    && output_tokens == 0
+                                    && cache_read_tokens == 0
+                                    && cache_write_tokens == 0
+                                {
+                                    // An all-zero usage envelope carries
+                                    // nothing: keep reading, no chunk.
+                                    None
+                                } else {
+                                    let Some(uncached_input_tokens) =
+                                        input_total.checked_sub(cache_write_tokens)
+                                    else {
+                                        return Some((
+                                            Err(ProviderError::new(
+                                                ProviderErrorKind::Malformed,
+                                                format!(
+                                                    "hostile usage frame: cache write tokens \
                                                  {cache_write_tokens} exceed the reported input \
                                                  total {input_total}"
-                                            ),
-                                        )),
-                                        Stage::Done,
-                                    ));
+                                                ),
+                                            )),
+                                            Stage::Done,
+                                        ));
+                                    };
+                                    Some(CanonicalUsage {
+                                        uncached_input_tokens,
+                                        cache_read_tokens,
+                                        cache_write_tokens,
+                                        output_tokens,
+                                        reasoning_tokens: 0,
+                                        reported_cost: None,
+                                        request_id: None,
+                                    })
                                 };
-                                Some(CanonicalUsage {
-                                    uncached_input_tokens,
-                                    cache_read_tokens,
-                                    cache_write_tokens,
-                                    output_tokens,
-                                    reasoning_tokens: 0,
-                                    reported_cost: None,
-                                    request_id: None,
-                                })
-                            };
-                            if let Some(usage) = canonical {
-                                let stage = Stage::Streaming {
-                                    lines,
-                                    tool_id,
-                                    tool_name,
-                                    tool_args,
-                                };
-                                return Some((Ok(ProviderChunk::Usage(usage)), stage));
+                                if let Some(usage) = canonical {
+                                    let stage = Stage::Streaming {
+                                        lines,
+                                        calls,
+                                        pending,
+                                        finished,
+                                    };
+                                    return Some((Ok(ProviderChunk::Usage(usage)), stage));
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1041,6 +1113,62 @@ mod tests {
         assert_eq!(id, "toolu_1");
         assert_eq!(name, "read_file");
         assert_eq!(input["path"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_use_blocks_all_complete_in_index_order() {
+        // Regression: two `tool_use` content blocks in ONE response. The
+        // pre-fix single accumulation slot overwrote the first call as soon
+        // as the second block started, so the model's first tool request
+        // silently vanished. Fragments interleave across blocks: each index
+        // accumulates its own arguments and every complete call is emitted
+        // in index order (never just the last).
+        let server = MockServer::new();
+        let body = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"sum","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"nums\":[1,2]}"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
+        let base = server.base_url().await;
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
+        let mut stream = provider.stream(req("claude-x"));
+        let mut calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::ToolCall {
+                    id, name, input, ..
+                } => calls.push((id, name, input)),
+                ProviderChunk::Done => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(done, "the terminal Done chunk must follow the calls");
+        assert_eq!(
+            calls.len(),
+            2,
+            "both parallel calls must complete: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "toolu_1", "index 0 emits first");
+        assert_eq!(calls[0].1, "read_file");
+        assert_eq!(calls[0].2["path"], "a.rs");
+        assert_eq!(calls[1].0, "toolu_2", "index 1 emits second");
+        assert_eq!(calls[1].1, "sum");
+        assert_eq!(calls[1].2["nums"], serde_json::json!([1, 2]));
     }
 
     #[tokio::test]

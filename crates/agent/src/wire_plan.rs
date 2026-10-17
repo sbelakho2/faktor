@@ -389,16 +389,18 @@ fn learning_omission_keys(path: &str) -> Vec<String> {
 /// texts go through THE unified counter (planner and renderer share it).
 /// Returns the message candidates (newest-first), the evidence candidates
 /// and the evidence index map, all reused by every replan pass of the
-/// caller.
+/// caller. The duplicate filter and the index map are keyed by BORROWED
+/// evidence paths (the evidence slice outlives every pass): the only owned
+/// path string per evidence row is the candidate's `id`.
 #[allow(clippy::type_complexity)]
-fn price_candidates(
+fn price_candidates<'a>(
     history: &[RequestMessage],
-    evidence: &[Evidence],
+    evidence: &'a [Evidence],
     counter: &dyn TokenCounter,
 ) -> (
     Vec<ContextCandidate>,
     Vec<ContextCandidate>,
-    std::collections::HashMap<String, usize>,
+    std::collections::HashMap<&'a str, usize>,
 ) {
     // Message candidates newest-first (the durable loader contract), sized
     // by the renderer's exact per-message accounting (text runs through the
@@ -421,11 +423,11 @@ fn price_candidates(
     // render of a selected block can never cost more than its candidate
     // priced. Utilities sanitized: non-finite → 0 (never selected), huge →
     // clamped to [0, 1].
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     let mut ev_candidates: Vec<ContextCandidate> = Vec::with_capacity(evidence.len());
-    let mut ev_by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ev_by_id: std::collections::HashMap<&'a str, usize> = std::collections::HashMap::new();
     for (idx, ev) in evidence.iter().enumerate() {
-        if !seen.insert(ev.path.clone()) {
+        if !seen.insert(ev.path.as_str()) {
             continue; // duplicate paths render once (first occurrence wins)
         }
         let block = format!("\n### {}\n{}\n", ev.path, truncate(&ev.snippet, 1500));
@@ -435,7 +437,7 @@ fn price_candidates(
         } else {
             0.0
         };
-        ev_by_id.insert(ev.path.clone(), idx);
+        ev_by_id.insert(ev.path.as_str(), idx);
         ev_candidates.push(ContextCandidate {
             id: ev.path.clone(),
             kind: CandidateKind::Symbol,
@@ -464,7 +466,7 @@ fn price_candidates(
 fn select_window(
     message_candidates: &[ContextCandidate],
     evidence_candidates: &[ContextCandidate],
-    ev_by_id: &std::collections::HashMap<String, usize>,
+    ev_by_id: &std::collections::HashMap<&str, usize>,
     evidence: &[Evidence],
     volatile_budget: u32,
     prior: Option<&(dyn FailurePrior + Send + Sync)>,
@@ -498,7 +500,7 @@ fn select_window(
         .count();
     let mut evidence_kept: Vec<Evidence> = Vec::new();
     for c in &plan.selected {
-        if let Some(&idx) = ev_by_id.get(&c.id) {
+        if let Some(&idx) = ev_by_id.get(c.id.as_str()) {
             evidence_kept.push(evidence[idx].clone());
         }
     }

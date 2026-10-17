@@ -5674,6 +5674,52 @@ async function boardAndForwardingTests() {
     assertEqual(second.dom.document.getElementById('board-posts').children.length, 0);
   });
 
+  await test('unchanged agent and board deltas never rebuild their lists', () => {
+    // The host re-posts the WHOLE snapshot per stream delta: the agent list
+    // (up to MAX_AGENT_ENTRIES rows) and the board post list must settle on
+    // an identical delta (content-key guard), and a real change must still
+    // render.
+    const snapshot = webviewSnapshot(st.summarizeAgents(nc.validateAgents(clone(agentsJson))));
+    snapshot.board = st.boardStateFromPage(clone(boardPageJson), 2).board;
+    const harness = runChatWebview(snapshot);
+    harness.dom.document.getElementById('subtab-agents').click();
+    const agents = harness.dom.document.getElementById('agent-list');
+    const posts = harness.dom.document.getElementById('board-posts');
+    const agentNodes = agents.children.slice();
+    const postNodes = posts.children.slice();
+    assert(agentNodes.length >= 2, 'the agent rows render');
+    assert(postNodes.length >= 2, 'the board rows render');
+
+    // Identical delta: the exact DOM nodes survive byte-for-byte.
+    harness.deliver({ type: 'snapshot', snapshot: JSON.parse(JSON.stringify(snapshot)) });
+    assertEqual(agentNodes.length, agents.children.length, 'the agent count is stable');
+    for (let i = 0; i < agentNodes.length; i += 1) {
+      assert(agents.children[i] === agentNodes[i], 'an identical delta keeps the agent node');
+    }
+    for (let i = 0; i < postNodes.length; i += 1) {
+      assert(posts.children[i] === postNodes[i], 'an identical delta keeps the board node');
+    }
+
+    // A real agent change (a serve-side state move) re-renders the list.
+    const changed = JSON.parse(JSON.stringify(snapshot));
+    changed.agents[0].state = 'Done';
+    harness.deliver({ type: 'snapshot', snapshot: changed });
+    assert(fakeText(agents).includes('Done'), 'the changed agent state renders');
+
+    // A new board post renders (and the guard key moved with the payload).
+    const withPost = JSON.parse(JSON.stringify(snapshot));
+    withPost.board.posts.push({
+      id: 9,
+      revision: 4,
+      author: 'root',
+      subject: 'fresh handoff',
+      body: 'body of the new post',
+    });
+    withPost.board.revision = 4;
+    harness.deliver({ type: 'snapshot', snapshot: withPost });
+    assert(fakeText(posts).includes('fresh handoff'), 'the new post renders');
+  });
+
   await test('display bounds are byte-accurate, surrogate-safe and control-free', () => {
     const emoji = '\u{1F600}';
     // Byte-accurate projection bound: 300 emoji (1200 bytes) must shrink to
@@ -10717,6 +10763,49 @@ async function transcriptScrollTests() {
     deliver({ type: 'startResult', goal: 'second goal typed while pending', ok: true });
     assertEqual(goal.value, '', 'a success clears the unchanged draft');
     assertEqual(send.disabled, false, 'a success leaves the composer enabled');
+  });
+
+  await test('500 streaming deltas rebuild the transcript exactly once (bounded render count)', () => {
+    const entries = [];
+    for (let seq = 1; seq <= 50; seq += 1) {
+      entries.push(transcriptEntry(seq, `message ${seq}`));
+    }
+    const harness = runChatWebview(transcriptSnapshot(entries));
+    const container = harness.dom.document.getElementById('entries');
+    assertEqual(
+      harness.renderCounts.transcript,
+      1,
+      'the initial snapshot builds the transcript once',
+    );
+    assertEqual(container.children.length, 50, 'every served entry renders');
+    // 500 streaming deltas: the host re-posts the WHOLE snapshot with only
+    // the last entry's text changed — the webview must touch only that node,
+    // never rebuild the list.
+    const stable = container.children[0];
+    for (let i = 0; i < 500; i += 1) {
+      entries[entries.length - 1] = transcriptEntry(50, `message 50 streamed ${i}`);
+      harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    }
+    assertEqual(harness.renderCounts.transcript, 1, '500 deltas must not rebuild the transcript');
+    assertEqual(container.children.length, 50, 'the entry count is stable');
+    assert(
+      fakeText(container.children[container.children.length - 1]).includes('streamed 499'),
+      'the final delta is rendered on the last node',
+    );
+    assertEqual(container.children[0], stable, 'earlier nodes are never rebuilt');
+    // A strict append (the common snapshot append) adds ONLY the new node.
+    entries.push(transcriptEntry(51, 'appended'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(harness.renderCounts.transcript, 1, 'an append must not rebuild');
+    assertEqual(container.children.length, 51, 'the appended entry renders');
+    // A reorder is a real structural delta: exactly one full rebuild.
+    const swapped = entries.slice();
+    const tmp = swapped[1];
+    swapped[1] = swapped[2];
+    swapped[2] = tmp;
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(swapped) });
+    assertEqual(harness.renderCounts.transcript, 2, 'a reorder rebuilds exactly once');
+    assertEqual(container.children.length, 51, 'the rebuilt transcript carries every entry');
   });
 }
 

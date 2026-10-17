@@ -743,16 +743,45 @@ pub(crate) async fn native_events(
 }
 
 /// One native journal frame row. The `/native/events` cursor pages and the
-/// native SSE stream carry the exact same shape.
+/// native SSE stream carry the exact same shape: BOTH serialize this one row
+/// (the paged path through [`serde_json::to_value`]), so their bytes agree
+/// under either `serde_json` object map — the alphabetical field order below
+/// is the BTree order and stays the order `preserve_order` produces.
 pub(crate) fn native_event_row(e: &faktor_core::event::Event) -> serde_json::Value {
-    serde_json::json!({
-        "seq": e.seq.raw(),
-        "kind": super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default()),
-        "state": agent_state_tag(e.state),
-        "opId": e.op_id.map(|o| o.to_string()),
-        "tsMs": e.ts_ms,
-        "payload": e.payload,
+    let kind = super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default());
+    let state = agent_state_tag(e.state);
+    serde_json::to_value(NativeEventRowRef {
+        kind: &kind,
+        op_id: e.op_id.map(|o| o.to_string()),
+        payload: &e.payload,
+        seq: e.seq.raw(),
+        state: &state,
+        ts_ms: e.ts_ms,
     })
+    .unwrap_or(serde_json::Value::Null)
+}
+
+/// Borrowed variant of [`native_event_row`] for the SSE hot path: the row is
+/// serialized straight from the event (payload borrowed, never deep-cloned
+/// into an intermediate `Value` tree). The pre-serialized `kind`/`state` tags
+/// are passed in so one frame serializes each tag once. Field declaration
+/// order is alphabetical (`kind`, `opId`, `payload`, `seq`, `state`, `tsMs`):
+/// the same row backs the paged path, so the two wire forms are byte-identical
+/// whether `serde_json` uses BTree (sorts) or `preserve_order` (declaration).
+#[derive(serde::Serialize)]
+struct NativeEventRowRef<'a> {
+    #[serde(rename = "kind")]
+    kind: &'a str,
+    #[serde(rename = "opId")]
+    op_id: Option<String>,
+    #[serde(rename = "payload")]
+    payload: &'a Option<serde_json::Value>,
+    #[serde(rename = "seq")]
+    seq: u64,
+    #[serde(rename = "state")]
+    state: &'a str,
+    #[serde(rename = "tsMs")]
+    ts_ms: i64,
 }
 
 /// Strict native SSE query of `/native/session/{id}/events`.
@@ -855,8 +884,20 @@ fn native_journal_stream(
                 let seq = e.seq.raw();
                 let kind =
                     super::serde_name_in_place(serde_json::to_string(&e.kind).unwrap_or_default());
-                let data =
-                    serde_json::to_string(&native_event_row(&e)).unwrap_or_else(|_| "{}".into());
+                // Direct serialization of the borrowed row: the payload is
+                // borrowed from the event (the historical path deep-cloned it
+                // through `json!` into a `Value` tree and then re-serialized
+                // the tree). Byte-identical: same fields, same order.
+                let state = agent_state_tag(e.state);
+                let data = serde_json::to_string(&NativeEventRowRef {
+                    seq,
+                    kind: &kind,
+                    state: &state,
+                    op_id: e.op_id.map(|o| o.to_string()),
+                    ts_ms: e.ts_ms,
+                    payload: &e.payload,
+                })
+                .unwrap_or_else(|_| "{}".into());
                 batch.push_back(
                     axum::response::sse::Event::default()
                         .event(kind)
@@ -2804,5 +2845,103 @@ mod tests {
                 "{id}: a fail-closed hook outcome is audit-only"
             );
         }
+    }
+
+    /// Perf-wave evidence for the SSE hot path: the borrowed
+    /// [`NativeEventRowRef`] serializer must emit BYTE-IDENTICAL JSON to the
+    /// historical `Value` round-trip (`json!` row + `to_string`), for the
+    /// full field matrix (op id present/absent, payload present (large
+    /// object + unicode)/absent, several kinds/states). The elapsed probe
+    /// runs the production 1k-frame replay shape with 2 KiB payloads.
+    #[test]
+    fn native_event_row_direct_serializer_is_byte_identical_and_cheaper() {
+        let session = faktor_core::id::SessionId::new(42);
+        let payload: serde_json::Value = serde_json::json!({
+            "kind": "tool_output",
+            "text": "x".repeat(2048),
+            "unicode": "颜色 π-😀",
+            "nested": { "a": [1, 2, 3], "b": null },
+        });
+        let events: Vec<faktor_core::event::Event> = (0..1000u64)
+            .map(|i| {
+                faktor_core::event::Event::new(
+                    faktor_core::id::EventSeq::new(i + 1),
+                    session,
+                    if i % 3 == 0 {
+                        Some(faktor_core::id::OpId::new(i + 7))
+                    } else {
+                        None
+                    },
+                    if i % 2 == 0 {
+                        faktor_core::event::EventKind::PhaseChanged
+                    } else {
+                        faktor_core::event::EventKind::PromptReceived
+                    },
+                    if i % 5 == 0 {
+                        faktor_core::state::AgentState::WaitingForModel
+                    } else {
+                        faktor_core::state::AgentState::Streaming
+                    },
+                    1_700_000_000_000 + i as i64,
+                    if i % 7 == 0 {
+                        None
+                    } else {
+                        Some(payload.clone())
+                    },
+                )
+            })
+            .collect();
+
+        let render = |e: &faktor_core::event::Event| -> String {
+            let kind = super::super::serde_name_in_place(
+                serde_json::to_string(&e.kind).unwrap_or_default(),
+            );
+            let state = super::super::agent_state_tag(e.state);
+            serde_json::to_string(&NativeEventRowRef {
+                seq: e.seq.raw(),
+                kind: &kind,
+                state: &state,
+                op_id: e.op_id.map(|o| o.to_string()),
+                ts_ms: e.ts_ms,
+                payload: &e.payload,
+            })
+            .unwrap()
+        };
+        for e in &events {
+            assert_eq!(
+                serde_json::to_string(&native_event_row(e)).unwrap(),
+                render(e),
+                "direct serializer must be byte-identical at seq {}",
+                e.seq.raw()
+            );
+        }
+
+        // 1k frames x 2 KiB payloads (the production catch-up page shape):
+        // the historical path deep-cloned the payload into a Value tree and
+        // re-serialized the tree; the direct path serializes once.
+        let t0 = std::time::Instant::now();
+        let mut old_bytes = 0usize;
+        for _ in 0..3 {
+            for e in &events {
+                old_bytes += serde_json::to_string(&native_event_row(e)).unwrap().len();
+            }
+        }
+        let old_elapsed = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let mut new_bytes = 0usize;
+        for _ in 0..3 {
+            for e in &events {
+                new_bytes += render(e).len();
+            }
+        }
+        let new_elapsed = t1.elapsed();
+        assert_eq!(old_bytes, new_bytes);
+        eprintln!(
+            "sse frame row (3 x 1000 frames, 2 KiB payloads): value round-trip {old_elapsed:?} -> direct {new_elapsed:?} ({old_bytes} bytes)"
+        );
+        assert!(
+            new_elapsed < old_elapsed,
+            "direct serialization must beat the Value round-trip: old {old_elapsed:?} new {new_elapsed:?}"
+        );
     }
 }

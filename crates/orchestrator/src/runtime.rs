@@ -943,9 +943,37 @@ impl OrchestratorRuntime {
         let Ok(Some(handle)) = manager.get_session(session_id) else {
             return;
         };
+        Self::derive_child_projection_with(&handle, row);
+    }
+
+    /// [`Self::derive_child_projection`] over an ALREADY-OPEN child handle:
+    /// readers that must open the child session anyway (the server's native
+    /// listing) apply the exact same derive without re-opening the session a
+    /// second time (each open runs the ledger + journal open-time
+    /// verification). Byte-identical semantics: the same row reads on the
+    /// same handle, lenient exactly like the manager form.
+    pub fn derive_child_projection_with(
+        handle: &faktor_session::SessionHandle,
+        row: &mut ChildRuntime,
+    ) {
         if let Ok(ds) = handle.orchestrator_drive_state_get() {
-            row.execution_phase = ds.execution_phase;
+            Self::derive_child_projection_from(handle, &ds, row);
         }
+    }
+
+    /// The derive over an already-read drive state: the projection's
+    /// execution-phase authority is exactly this row's value, so a reader
+    /// that must read the row anyway (the native listing reads it strictly
+    /// for `child_model`) applies the SAME assignment from that one read,
+    /// then the task-row budget half (lenient, exactly like the manager
+    /// form). On the lenient path the strict caller fails closed, so the
+    /// observable projection is identical.
+    pub fn derive_child_projection_from(
+        handle: &faktor_session::SessionHandle,
+        drive: &faktor_session::child::DriveState,
+        row: &mut ChildRuntime,
+    ) {
+        row.execution_phase = drive.execution_phase;
         if let Ok(task_id) = handle.task_id() {
             if let Ok(Some(task)) = handle.get_task(task_id) {
                 row.budget_max_tokens = task.budget.max_tokens;

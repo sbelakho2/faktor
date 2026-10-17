@@ -289,8 +289,9 @@ impl LearningStore for MemoryLearningStore {
             out.extend(pages.pages.values());
         }
         // Deterministic order regardless of hash-map iteration order; the
-        // digest is the store's stable identity for a learning.
-        out.sort_by_cached_key(|learning| learning.pattern_digest().to_hex());
+        // digest is the store's stable identity for a learning. Digest
+        // BYTES order equals the lowercase-hex text order (zero allocs).
+        out.sort_by_key(|learning| learning.pattern_digest().bytes());
         out
     }
 }
@@ -697,7 +698,7 @@ impl LearningStore for SessionLearningStore {
 
     fn all(&self) -> Vec<&ProjectLearning> {
         let mut out: Vec<&ProjectLearning> = self.pages.values().collect();
-        out.sort_by_cached_key(|learning| learning.pattern_digest().to_hex());
+        out.sort_by_key(|learning| learning.pattern_digest().bytes());
         out
     }
 }

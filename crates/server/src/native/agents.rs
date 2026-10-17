@@ -574,6 +574,111 @@ pub(crate) fn orchestrator_row_value(
     Ok(None)
 }
 
+/// One-pass read index over a session's durable fact rows, shared by the
+/// native agent listing. The historical readers ran a linear
+/// `facts.iter().find(...)` per value lookup AND a full facts scan per run /
+/// per child, so a listing of R runs × C children over F rows cost
+/// O((R + C) · F). The index answers every lookup in O(1) (non-chunked rows)
+/// while producing EXACTLY the historical results:
+///
+/// - [`Self::row_value`] mirrors [`orchestrator_row_value`]: FIRST fact wins,
+///   and a chunked first value routes through the chunk joiner unchanged;
+/// - [`Self::registry_rows_for_run`] mirrors the
+///   `key.strip_prefix(run + "/")` scan: each registry row is bucketed under
+///   EVERY slash-terminated key prefix, so a run sees exactly the rows whose
+///   key starts with `run + "/"`, in facts order (the order the scan
+///   produced);
+/// - [`Self::merge_best`] mirrors the per-child `.../merge/` prefix scan:
+///   each envelope is bucketed under every full `.../merge/` prefix with the
+///   historical strictly-greater sequence rule (first maximum wins).
+pub(crate) struct FactIndex<'a> {
+    first: std::collections::HashMap<(&'a str, &'a str), (&'a str, bool)>,
+    registry_by_run: std::collections::HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+    merge_by_prefix: std::collections::HashMap<&'a str, (u64, &'a str)>,
+}
+
+impl<'a> FactIndex<'a> {
+    pub(crate) fn new(facts: &'a [(String, String, String)]) -> Self {
+        let mut first: std::collections::HashMap<(&'a str, &'a str), (&'a str, bool)> =
+            std::collections::HashMap::new();
+        let mut registry_by_run: std::collections::HashMap<&'a str, Vec<(&'a str, &'a str)>> =
+            std::collections::HashMap::new();
+        let mut merge_by_prefix: std::collections::HashMap<&'a str, (u64, &'a str)> =
+            std::collections::HashMap::new();
+        for (kind, key, value) in facts {
+            let chunked = serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .and_then(|j| j.get("chunks").and_then(|c| c.as_u64()))
+                .unwrap_or(0)
+                > 0;
+            first
+                .entry((kind.as_str(), key.as_str()))
+                .or_insert((value.as_str(), chunked));
+            if kind == ORCH_REGISTRY_KIND {
+                for (i, _) in key.match_indices('/') {
+                    registry_by_run
+                        .entry(&key[..i])
+                        .or_default()
+                        .push((key.as_str(), value.as_str()));
+                }
+            }
+            if kind == ORCH_MERGE_KIND {
+                for (i, _) in key.match_indices("/merge/") {
+                    let end = i + "/merge/".len();
+                    let rest = &key[end..];
+                    let Some((_cs, seq_s)) = rest.rsplit_once('/') else {
+                        continue;
+                    };
+                    let Ok(seq) = seq_s.parse::<u64>() else {
+                        continue;
+                    };
+                    merge_by_prefix
+                        .entry(&key[..end])
+                        .and_modify(|(best, v)| {
+                            if seq > *best {
+                                *best = seq;
+                                *v = value.as_str();
+                            }
+                        })
+                        .or_insert((seq, value.as_str()));
+                }
+            }
+        }
+        Self {
+            first,
+            registry_by_run,
+            merge_by_prefix,
+        }
+    }
+
+    /// [`orchestrator_row_value`] over the index (see the struct docs).
+    pub(crate) fn row_value(
+        &self,
+        facts: &[(String, String, String)],
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        match self.first.get(&(kind, key)) {
+            Some((value, false)) => Ok(Some((*value).to_string())),
+            Some((_, true)) => orchestrator_row_value(facts, kind, key),
+            None => Ok(None),
+        }
+    }
+
+    /// Every registry row of `run` in facts order, exactly the historical
+    /// `strip_prefix(run + "/")` scan would have yielded.
+    pub(crate) fn registry_rows_for_run(&self, run: &str) -> Option<&Vec<(&'a str, &'a str)>> {
+        self.registry_by_run.get(run)
+    }
+
+    /// The latest merge envelope of one child under one run, exactly the
+    /// historical per-child prefix scan's winner.
+    pub(crate) fn merge_best(&self, run: &str, child: &str) -> Option<(u64, &'a str)> {
+        let prefix = format!("{run}/{child}/merge/");
+        self.merge_by_prefix.get(prefix.as_str()).copied()
+    }
+}
+
 /// The stable wire tag of one work state. This is pure presentation: the
 /// state itself ALWAYS comes from the shared canonical projection
 /// ([`faktor_orchestrator::project_child_state`]).
@@ -629,44 +734,16 @@ pub(crate) fn child_model(
 }
 
 /// The durable "latest result" summary of one child (wave-13/14 records):
-/// its task goal plus the latest durable merge envelope's counts.
+/// its task goal plus the latest durable merge envelope's counts. Both are
+/// served from the caller's ONE-PASS [`FactIndex`] (`merge_index`) and the
+/// already-read identity goal — the historical body re-opened the child
+/// session and re-scanned every fact row per child.
 pub(crate) fn child_result_entry(
-    state: &AppState,
-    facts: &[(String, String, String)],
-    run: &str,
-    row: &faktor_orchestrator::runtime::ChildRuntime,
-) -> Result<serde_json::Value, ApiError> {
-    let mut summary = String::new();
-    if let Ok(Some(h)) = state
-        .deps
-        .session
-        .get_session(SessionId::new(row.session_id))
-    {
-        summary = h
-            .orchestrator_child_identity_get()
-            .ok()
-            .flatten()
-            .map(|i| i.task_goal)
-            .unwrap_or_default();
-    }
+    identity_goal: &str,
+    merge_index: Option<(u64, &str)>,
+) -> serde_json::Value {
     let mut merge: Option<serde_json::Value> = None;
-    let prefix = format!("{run}/{}/merge/", row.child_id);
-    let mut best: Option<(u64, &str)> = None;
-    for (kind, key, value) in facts {
-        if kind != ORCH_MERGE_KIND {
-            continue;
-        }
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if let Some((_cs, seq_s)) = rest.rsplit_once('/') {
-                if let Ok(seq) = seq_s.parse::<u64>() {
-                    if best.map(|(b, _)| seq > b).unwrap_or(true) {
-                        best = Some((seq, value));
-                    }
-                }
-            }
-        }
-    }
-    if let Some((_seq, value)) = best {
+    if let Some((_seq, value)) = merge_index {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(value) {
             merge = Some(serde_json::json!({
                 "change_set_id": v.get("cs_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -676,10 +753,10 @@ pub(crate) fn child_result_entry(
             }));
         }
     }
-    Ok(serde_json::json!({
-        "summary": summary,
+    serde_json::json!({
+        "summary": identity_goal,
         "merge": merge,
-    }))
+    })
 }
 
 /// The live session-state tag of one TaskExecutor in-session run (single
@@ -700,18 +777,15 @@ pub(crate) fn session_run_state_tag(agent_state: faktor_core::state::AgentState)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn native_child_entry(
     state: &AppState,
-    facts: &[(String, String, String)],
+    index: &FactIndex<'_>,
     run: &str,
     mut row: faktor_orchestrator::runtime::ChildRuntime,
     default_model: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    // The registry JSON is never rewritten by controls: derive the mutable
-    // truth (task-row budget, drive-state phase) from the child's OWN
-    // durable rows before projecting anything.
-    faktor_orchestrator::runtime::OrchestratorRuntime::derive_child_projection(
-        &state.deps.session,
-        &mut row,
-    );
+    // ONE open of the child session per entry: the historical projection
+    // opened the same session up to three times (the derive, this
+    // projection, the result summary) and every open runs the ledger +
+    // journal open-time verification.
     let session = match state
         .deps
         .session
@@ -726,18 +800,26 @@ pub(crate) fn native_child_entry(
         }
         Err(e) => return Err(faktor_protocol::error::from_core(&e)),
     };
-    // The child session's own durable row is the authority for its provider:
-    // the same (provider, model) pair the catalog join at the UI needs, so
-    // two providers exposing one model id can never be conflated.
-    let child_row = session
-        .row()
-        .map_err(|e| faktor_protocol::error::from_core(&e))?;
+    // The ONE drive-state read of this entry. The registry JSON is never
+    // rewritten by controls: derive the mutable truth (task-row budget,
+    // drive-state phase) from the child's OWN durable rows before
+    // projecting anything — the same assignment the manager derive applies,
+    // from this (strict) read.
     let drive = session.orchestrator_drive_state_get().map_err(|e| {
         internal_graph_err(format!(
             "drive state of child {}: {}",
             row.child_id, e.message
         ))
     })?;
+    faktor_orchestrator::runtime::OrchestratorRuntime::derive_child_projection_from(
+        &session, &drive, &mut row,
+    );
+    // The child session's own durable row is the authority for its provider:
+    // the same (provider, model) pair the catalog join at the UI needs, so
+    // two providers exposing one model id can never be conflated.
+    let child_row = session
+        .row()
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
     // Presentation/attention state: the durable ledger fold of the child
     // session (foreground when it never transitioned). It is surfaced to
     // UIs only; the drive, budgets and lineage are untouched by it.
@@ -761,7 +843,7 @@ pub(crate) fn native_child_entry(
         .deps
         .agent
         .progress_view(SessionId::new(row.session_id));
-    let result = child_result_entry(state, facts, run, &row)?;
+    let result = child_result_entry(&goal, index.merge_best(run, &row.child_id));
     let state_tag = child_live_state(&row, &drive);
     let blocker = row.blocker().map(|b| {
         serde_json::json!({
@@ -808,6 +890,10 @@ pub(crate) fn native_agents_body(
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let parent = handle.id();
     let facts = orchestrator_graph_facts(handle).map_err(internal_graph_err)?;
+    // ONE pass over the fact rows for every lookup below: the historical
+    // body scanned facts per run and per child (O(runs · facts) for the run
+    // grouping, plus a scan per child row lookup and per child result).
+    let index = FactIndex::new(&facts);
 
     let push_run = |runs: &mut Vec<String>, run: &str| {
         if !runs.iter().any(|r| r == run) {
@@ -842,7 +928,7 @@ pub(crate) fn native_agents_body(
 
     // (a) In-session task runs: the parent's own single-item runs.
     for key in &in_session {
-        let value = match orchestrator_row_value(&facts, TASK_RUN_ROW_KIND, key) {
+        let value = match index.row_value(&facts, TASK_RUN_ROW_KIND, key) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(m) => return Err(internal_graph_err(m)),
@@ -889,7 +975,7 @@ pub(crate) fn native_agents_body(
     for run in &orchestrated {
         // The durable plan row (goal, steps, default model, owner).
         let plan_json: Option<serde_json::Value> =
-            match orchestrator_row_value(&facts, ORCH_PLAN_KIND, run) {
+            match index.row_value(&facts, ORCH_PLAN_KIND, run) {
                 Ok(Some(v)) => match serde_json::from_str::<serde_json::Value>(&v) {
                     Ok(j) => Some(j),
                     Err(_) => {
@@ -933,22 +1019,18 @@ pub(crate) fn native_agents_body(
         };
 
         // Every durable child row of this run (typed; tampered rows loud).
-        let prefix = format!("{run}/");
+        // The bucket holds exactly the rows the historical
+        // `strip_prefix("<run>/")` facts scan yielded, in facts order.
         let mut children: Vec<(i64, String, faktor_orchestrator::runtime::ChildRuntime)> =
             Vec::new();
-        for (kind, key, _) in &facts {
-            if kind != ORCH_REGISTRY_KIND {
-                continue;
-            }
-            let Some(rest) = key.strip_prefix(&prefix) else {
-                continue;
-            };
+        for (key, _value) in index.registry_rows_for_run(run).into_iter().flatten() {
+            let rest = &key[run.len() + 1..];
             if rest.is_empty() || rest.contains('/') {
                 return Err(internal_graph_err(format!(
                     "hostile registry row key {key:?} under run {run}"
                 )));
             }
-            let value = match orchestrator_row_value(&facts, ORCH_REGISTRY_KIND, key) {
+            let value = match index.row_value(&facts, ORCH_REGISTRY_KIND, key) {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(m) => return Err(internal_graph_err(m)),
@@ -995,7 +1077,7 @@ pub(crate) fn native_agents_body(
         for (_created, _child_id, row) in children {
             push(native_child_entry(
                 state,
-                &facts,
+                &index,
                 run,
                 row,
                 default_model.as_deref(),
@@ -1500,5 +1582,218 @@ pub(crate) fn child_cost_cap_change(
             let core: faktor_core::Error = e.into();
             api_err(&core)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Perf-wave evidence for [`FactIndex`]: every indexed lookup must be
+    /// EQUAL to the historical per-item scans (row value, run child set,
+    /// merge winner) over an adversarial corpus — duplicates, a chunked
+    /// row, overlapping/hostile keys — and the indexed trajectory must beat
+    /// the historical O(runs · facts + children · facts) one at the
+    /// realistic 5k-row size.
+    #[test]
+    fn fact_index_matches_the_per_item_scans_and_is_cheaper() {
+        fn old_child_rows<'a>(
+            facts: &'a [(String, String, String)],
+            run: &str,
+        ) -> Vec<(&'a str, &'a str)> {
+            let prefix = format!("{run}/");
+            let mut out = Vec::new();
+            for (kind, key, value) in facts {
+                if kind != ORCH_REGISTRY_KIND {
+                    continue;
+                }
+                if key.strip_prefix(&prefix).is_none() {
+                    continue;
+                }
+                out.push((key.as_str(), value.as_str()));
+            }
+            out
+        }
+        fn old_merge_best<'a>(
+            facts: &'a [(String, String, String)],
+            run: &str,
+            child: &str,
+        ) -> Option<(u64, &'a str)> {
+            let prefix = format!("{run}/{child}/merge/");
+            let mut best: Option<(u64, &'a str)> = None;
+            for (kind, key, value) in facts {
+                if kind != ORCH_MERGE_KIND {
+                    continue;
+                }
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    if let Some((_cs, seq_s)) = rest.rsplit_once('/') {
+                        if let Ok(seq) = seq_s.parse::<u64>() {
+                            if best.map(|(b, _)| seq > b).unwrap_or(true) {
+                                best = Some((seq, value));
+                            }
+                        }
+                    }
+                }
+            }
+            best
+        }
+
+        let runs = 250usize;
+        let per_run = 4usize;
+        let mut facts: Vec<(String, String, String)> = Vec::new();
+        for r in 0..runs {
+            let run = format!("run-{r:04}");
+            facts.push((
+                ORCH_PLAN_KIND.into(),
+                run.clone(),
+                format!("{{\"plan\":{{\"goal\":\"g{r}\"}}}}"),
+            ));
+            facts.push((
+                TASK_RUN_ROW_KIND.into(),
+                run.clone(),
+                format!("{{\"goal\":\"t{r}\"}}"),
+            ));
+            for c in 0..per_run {
+                let key = format!("{run}/child-{c}");
+                facts.push((
+                    ORCH_REGISTRY_KIND.into(),
+                    key.clone(),
+                    format!(
+                        "{{\"child_id\":\"child-{c}\",\"session_id\":{}}}",
+                        r * 10 + c + 1
+                    ),
+                ));
+                for seq in 1..=3u64 {
+                    facts.push((
+                        ORCH_MERGE_KIND.into(),
+                        format!("{key}/merge/cs-{c}/{seq}"),
+                        format!("{{\"cs_id\":\"cs-{c}\",\"merged_count\":{seq}}}"),
+                    ));
+                    facts.push((
+                        ORCH_MERGE_PART_KIND.into(),
+                        format!("{key}/merge/cs-{c}/{seq}/part/merged"),
+                        format!("[\"src/f{seq}.rs\"]"),
+                    ));
+                }
+            }
+        }
+        // Adversarial rows: a duplicate registry key (FIRST value wins for
+        // row_value; both rows are children for the run scan), a chunked
+        // registry row (header + chunk), a hostile key with an extra slash
+        // (refused by the caller's rest check, still bucketed exactly like
+        // the prefix scan), and a double `merge` key.
+        let hostile_run = "run-0000";
+        facts.push((
+            ORCH_REGISTRY_KIND.into(),
+            format!("{hostile_run}/child-0"),
+            "{\"duplicate\":true}".into(),
+        ));
+        facts.push((
+            ORCH_REGISTRY_KIND.into(),
+            format!("{hostile_run}/chunked"),
+            "{\"chunks\":1}".into(),
+        ));
+        facts.push((
+            ORCH_REGISTRY_KIND.into(),
+            format!("{hostile_run}/chunked/c000"),
+            "{\"chunk\":\"body\"}".into(),
+        ));
+        facts.push((
+            ORCH_REGISTRY_KIND.into(),
+            format!("{hostile_run}/bad/extra"),
+            "{}".into(),
+        ));
+        facts.push((
+            ORCH_MERGE_KIND.into(),
+            format!("{hostile_run}/child-0/merge/cs-9/5/merge/cs-x/42"),
+            "{\"cs_id\":\"cs-x\",\"merged_count\":42}".into(),
+        ));
+
+        let index = FactIndex::new(&facts);
+        // Row values: every (kind, key) lookup agrees with the scan.
+        for (kind, key, _) in &facts {
+            assert_eq!(
+                index.row_value(&facts, kind, key).unwrap(),
+                orchestrator_row_value(&facts, kind, key).unwrap(),
+                "row value drift at {kind}/{key}"
+            );
+        }
+        assert_eq!(index.row_value(&facts, "missing", "row").unwrap(), None);
+        // Child sets: exactly the historical prefix scan (order included).
+        for r in 0..runs {
+            let run = format!("run-{r:04}");
+            let naive = old_child_rows(&facts, &run);
+            let indexed: Vec<(&str, &str)> = index
+                .registry_rows_for_run(&run)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(naive, indexed, "child set drift for {run}");
+        }
+        // Merge winners: exactly the historical per-child scan.
+        let mut checked = 0usize;
+        for r in 0..runs {
+            let run = format!("run-{r:04}");
+            for c in 0..(per_run + 2) {
+                let child = format!("child-{c}");
+                assert_eq!(
+                    old_merge_best(&facts, &run, &child),
+                    index.merge_best(&run, &child),
+                    "merge winner drift for {run}/{child}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > runs);
+        assert_eq!(
+            old_merge_best(&facts, hostile_run, "child-0"),
+            index.merge_best(hostile_run, "child-0"),
+            "the double-merge key attributes exactly like the scan"
+        );
+
+        // Before/after probe: the historical trajectory scans ALL facts per
+        // run and per child; the indexed one builds once and probes.
+        let t0 = std::time::Instant::now();
+        let mut old_acc = 0usize;
+        for r in 0..runs {
+            let run = format!("run-{r:04}");
+            for (key, _) in old_child_rows(&facts, &run) {
+                old_acc += orchestrator_row_value(&facts, ORCH_REGISTRY_KIND, key)
+                    .unwrap()
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                if let Some((_seq, value)) = old_merge_best(&facts, &run, "child-0") {
+                    old_acc += value.len();
+                }
+            }
+        }
+        let old_elapsed = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let index = FactIndex::new(&facts);
+        let mut new_acc = 0usize;
+        for r in 0..runs {
+            let run = format!("run-{r:04}");
+            for (key, _) in index.registry_rows_for_run(&run).into_iter().flatten() {
+                new_acc += index
+                    .row_value(&facts, ORCH_REGISTRY_KIND, key)
+                    .unwrap()
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                if let Some((_seq, value)) = index.merge_best(&run, "child-0") {
+                    new_acc += value.len();
+                }
+            }
+        }
+        let new_elapsed = t1.elapsed();
+        assert_eq!(old_acc, new_acc);
+        eprintln!(
+            "agents listing index ({} facts, {runs} runs x {per_run} children): per-item scans {old_elapsed:?} -> one-pass index {new_elapsed:?}",
+            facts.len()
+        );
+        assert!(
+            new_elapsed < old_elapsed,
+            "the one-pass index must beat per-item scans: old {old_elapsed:?} new {new_elapsed:?}"
+        );
     }
 }

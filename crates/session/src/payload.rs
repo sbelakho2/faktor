@@ -76,13 +76,17 @@ pub fn decode_payload(
                     "Failed event without a payload violates the v1 schema".into(),
                 )
             })?;
-            if let Ok(abort) = serde_json::from_value::<FailedAbortPayload>(value.clone()) {
+            // Borrowed deserialization: the row's payload Value is never
+            // cloned just to be parsed (both shapes are tried in place; the
+            // strictness of `from_value` is identical because the SAME
+            // `Deserialize` impls run).
+            if let Ok(abort) = FailedAbortPayload::deserialize(value) {
                 return Ok(TypedEventPayload::FailedAborted {
                     error: abort.error,
                     op_id: abort.op_id,
                 });
             }
-            let parsed: FailedPayload = serde_json::from_value(value.clone()).map_err(|e| {
+            let parsed: FailedPayload = FailedPayload::deserialize(value).map_err(|e| {
                 SessionError::Malformed(format!("Failed event payload violates the v1 schema: {e}"))
             })?;
             Ok(TypedEventPayload::Failed {
@@ -90,6 +94,45 @@ pub fn decode_payload(
             })
         }
         _ => Ok(TypedEventPayload::Opaque(payload.cloned())),
+    }
+}
+
+/// [`decode_payload`]'s validation face for the hot APPEND path: the same
+/// version gate and the same strict v1 schema checks, but the payload is
+/// never materialized into a [`TypedEventPayload`] — an opaque kind's
+/// payload is not cloned just to be dropped, and a `Failed` payload is
+/// tried in place. `Ok(())` here is exactly the input set on which
+/// [`decode_payload`] returns `Ok(_)` (the differential lock is
+/// `validate_payload(..).is_ok() == decode_payload(..).is_ok()`).
+pub fn validate_payload(
+    kind: EventKind,
+    ver: i64,
+    payload: Option<&serde_json::Value>,
+) -> Result<(), SessionError> {
+    if ver != PAYLOAD_SCHEMA_V {
+        return Err(SessionError::Malformed(format!(
+            "journal payload schema version {ver} of kind {kind:?} is unknown \
+             (this reader understands v{PAYLOAD_SCHEMA_V}); refusing to parse a future payload shape"
+        )));
+    }
+    match kind {
+        EventKind::Failed => {
+            let value = payload.ok_or_else(|| {
+                SessionError::Malformed(
+                    "Failed event without a payload violates the v1 schema".into(),
+                )
+            })?;
+            if FailedAbortPayload::deserialize(value).is_ok() {
+                return Ok(());
+            }
+            FailedPayload::deserialize(value).map_err(|e| {
+                SessionError::Malformed(format!("Failed event payload violates the v1 schema: {e}"))
+            })?;
+            Ok(())
+        }
+        // Unregistered kinds are opaque: the version gate above is the whole
+        // schema check (identical to `decode_payload`'s Opaque arm).
+        _ => Ok(()),
     }
 }
 

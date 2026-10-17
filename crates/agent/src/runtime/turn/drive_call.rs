@@ -688,7 +688,8 @@ impl AgentRuntime {
                         Ok(ProviderChunk::Text { text }) => {
                             st.text_buf.push_str(&text);
                             let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
-                            self.emit_chunk(st.handle.id(), Some(mid), "text", &text);
+                            // The chunk buffer is MOVED to the sink (no copy).
+                            self.emit_chunk(st.handle.id(), Some(mid), "text", text);
                             st.iteration_progress = true;
                             // EPHEMERAL path: text deltas are NOT journaled per
                             // chunk (a multi-hour agent would commit millions of
@@ -703,7 +704,8 @@ impl AgentRuntime {
                         Ok(ProviderChunk::Reasoning { text }) => {
                             st.reasoning_buf.push_str(&text);
                             let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
-                            self.emit_chunk(st.handle.id(), Some(mid), "reasoning", &text);
+                            // The chunk buffer is MOVED to the sink (no copy).
+                            self.emit_chunk(st.handle.id(), Some(mid), "reasoning", text);
                             st.iteration_progress = true;
                             if st.reasoning_buf.len() >= STREAM_FLUSH_BYTES {
                                 st.handle.append_reasoning_part(mid, &st.reasoning_buf).await?;
@@ -733,7 +735,7 @@ impl AgentRuntime {
                                 st.handle.id(),
                                 Some(mid),
                                 "tool",
-                                &format!(
+                                format!(
                                     "{name}\n{}",
                                     serde_json::to_string(&input).unwrap_or_default()
                                 ),

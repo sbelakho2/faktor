@@ -408,7 +408,9 @@ struct ManufacturerSignal {
 }
 
 fn manufacturer_signal(view: &QueryView<'_>, offer: &CommercialOffer) -> ManufacturerSignal {
-    let query_manufacturer = view.manufacturer.clone();
+    // Borrowed query side and normalized offer side: the pre-fix code
+    // cloned the query manufacturer String for EVERY candidate.
+    let query_manufacturer = view.manufacturer.as_deref();
     let offer_manufacturer = offer
         .identity
         .manufacturer
@@ -416,7 +418,7 @@ fn manufacturer_signal(view: &QueryView<'_>, offer: &CommercialOffer) -> Manufac
         .map(|value| normalized_text(value.as_str()))
         .filter(|value| !value.is_empty());
     let known = query_manufacturer.is_some() || offer_manufacturer.is_some();
-    let (exact, conflict) = match (query_manufacturer, offer_manufacturer) {
+    let (exact, conflict) = match (query_manufacturer, offer_manufacturer.as_deref()) {
         (Some(left), Some(right)) => (left == right, left != right),
         _ => (false, false),
     };
@@ -475,7 +477,9 @@ fn match_offer_with(
     signals.spec_overlap_bp = spec_overlap_bp(view, offer);
     signals.supplier_evidence = offer.supplier.is_some() || offer.manufacturer.is_some();
 
-    let query_part = view.part.clone();
+    // Borrow the precomputed canonical query part: the pre-fix code cloned
+    // it (a `Result<NormalizedPartNumber, _>`) for EVERY candidate.
+    let query_part = &view.part;
     let offer_mpn: Result<Option<NormalizedPartNumber>, PartNumberError> =
         offer.identity.normalized_mpn();
     let offer_source_part = offer.identity.normalized_source_part_number();

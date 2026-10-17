@@ -411,13 +411,13 @@ pub fn rank_offers<'a>(
         .enumerate()
         .map(|(index, offer)| (score_offer(query, offer, ctx), index, offer))
         .collect();
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .total
-            .cmp(&left.0.total)
-            .then_with(|| tie_break_key(left.2).cmp(&tie_break_key(right.2)))
-            .then_with(|| left.1.cmp(&right.1))
+    // The tie-break key is built ONCE per offer (`sort_by_cached_key`); the
+    // pre-fix comparator rebuilt it inside EVERY comparison — four fresh
+    // Strings per offered pair, O(n log n) full-title allocations for a
+    // 10k-candidate batch. Order is byte-identical: total descending, then
+    // the tie-break tuple ascending, then input index ascending.
+    scored.sort_by_cached_key(|(score, index, offer)| {
+        (std::cmp::Reverse(score.total), tie_break_key(offer), *index)
     });
     scored
         .into_iter()

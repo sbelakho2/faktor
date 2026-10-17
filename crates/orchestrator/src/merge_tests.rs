@@ -347,6 +347,70 @@ fn decision_validation_is_one_pass_over_the_change_set() {
 }
 
 #[test]
+fn change_entry_union_is_one_pass_over_the_start_and_now_maps() {
+    // Evidence for the `compute_change_entries` union: the historical loop
+    // probed `paths.contains(p)` — a linear scan per start key, O(start ·
+    // now) on a large tree; the set-membership probe is O(start). The union
+    // and the final sorted entry order are asserted identical, and both
+    // paths run on the same 2000-file corpus (the hard `MAX_CHANGES` bound)
+    // for the before/after probe.
+    let n = MAX_CHANGES;
+    let start: Vec<(PathBuf, EntryState)> = (0..n)
+        .map(|i| (PathBuf::from(format!("src/f{i:04}.rs")), state(H)))
+        .collect();
+    // Child tree: 75% of the start files kept, 25% replaced by new files.
+    let now: Vec<(PathBuf, EntryState)> = (0..n)
+        .map(|i| {
+            if i % 4 == 3 {
+                (PathBuf::from(format!("src/new{i:04}.rs")), state(H2))
+            } else {
+                (PathBuf::from(format!("src/f{i:04}.rs")), state(H2))
+            }
+        })
+        .collect();
+    let start_idx = base_map_index(&start);
+    let now_idx = base_map_index(&now);
+
+    let old_union = || {
+        let mut paths: Vec<PathBuf> = now_idx.keys().cloned().collect();
+        for p in start_idx.keys() {
+            if !paths.contains(p) {
+                paths.push(p.clone());
+            }
+        }
+        paths.sort();
+        paths
+    };
+    let new_union = || {
+        let mut paths: Vec<PathBuf> = now_idx.keys().cloned().collect();
+        for p in start_idx.keys() {
+            if !now_idx.contains_key(p.as_path()) {
+                paths.push(p.clone());
+            }
+        }
+        paths.sort();
+        paths
+    };
+    assert_eq!(old_union(), new_union(), "identical union and order");
+    assert_eq!(new_union().len(), n + n / 4, "the union covers both maps");
+
+    let t0 = std::time::Instant::now();
+    let old_paths = old_union();
+    let old_elapsed = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let new_paths = new_union();
+    let new_elapsed = t1.elapsed();
+    assert_eq!(old_paths, new_paths);
+    eprintln!(
+        "change-entry union ({n} start x {n} now paths): linear-scan members {old_elapsed:?} -> set probe {new_elapsed:?}"
+    );
+    assert!(
+        new_elapsed < old_elapsed,
+        "the set-membership probe must beat the per-key scan: old {old_elapsed:?} new {new_elapsed:?}"
+    );
+}
+
+#[test]
 fn pack_chunks_roundtrips_and_empty_payloads_stay_readable() {
     let items: Vec<ChangeEntry> = (0..1000)
         .map(|i| entry(&format!("dir/f{i:04}.rs"), Some(H), None))

@@ -430,113 +430,132 @@ pub(crate) fn google_stream(
         ErrorScrubber::new().with_request_credentials(&reqwest::header::HeaderMap::new(), &url);
 
     enum Stage {
-        Fresh,
-        Streaming { lines: LineStream },
+        /// Request inputs live in the state (consumed once, on `Fresh`)
+        /// instead of the per-chunk fold closure, which previously deep-
+        /// cloned the full request body `Value` on every yielded chunk.
+        Fresh {
+            transport: Arc<dyn HttpTransport>,
+            url: String,
+            body: serde_json::Value,
+            cancel: Option<faktor_core::cancellation::CancellationToken>,
+        },
+        Streaming {
+            lines: LineStream,
+        },
         Done,
     }
-    futures::stream::unfold(Stage::Fresh, move |stage| {
-        let transport = transport.clone();
-        let url = url.clone();
-        let deadlines = deadlines;
-        let cancel = cancel.clone();
-        let body = body.clone();
-        let scrubber = scrubber.clone();
-        async move {
-            let mut lines = match stage {
-                Stage::Fresh => {
-                    let resp = execute_with_head_timeout(
-                        execute_post_json(
-                            transport.as_ref(),
-                            &url,
-                            reqwest::header::HeaderMap::new(),
-                            &body,
-                        ),
-                        deadlines,
-                    )
-                    .await;
-                    match resp {
-                        Ok(r) => {
-                            let status = r.status();
-                            if !status.is_success() {
-                                let text = read_error_body_bounded(
-                                    r,
-                                    GOOGLE_ERROR_BODY_MAX_BYTES,
-                                    request_head_timeout_ms(deadlines),
-                                )
-                                .await;
-                                return Some((
-                                    Err(provider_error_for_http_with_scrubber(
-                                        status.as_u16(),
-                                        &text,
-                                        &scrubber,
-                                    )),
-                                    Stage::Done,
-                                ));
-                            }
-                            let lines: LineStream = Box::pin(guarded_lines(
-                                utf8_line_stream(
-                                    r.stream_frames(&deadlines.response_budget()),
-                                    MAX_LINE_BYTES,
-                                ),
-                                deadlines,
-                                cancel.clone(),
-                            ));
-                            lines
-                        }
-                        Err(e) => {
-                            return Some((Err(e), Stage::Done));
-                        }
-                    }
-                }
-                Stage::Streaming { lines } => lines,
-                Stage::Done => return None,
-            };
-
-            loop {
-                let Some(next) = lines.next().await else {
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                };
-                let line = match next {
-                    Ok(l) => l,
-                    Err(e) => return Some((Err(e), Stage::Done)),
-                };
-                let line = line.trim();
-                if !line.starts_with("data:") {
-                    continue;
-                }
-                let data = line[5..].trim();
-                if data.is_empty() {
-                    continue;
-                }
-                if data == "[DONE]" {
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Malformed,
-                            scrubber.event_diagnostic(
-                                "bad gemini SSE",
-                                data,
-                                auth_shaped_text(data),
+    futures::stream::unfold(
+        Stage::Fresh {
+            transport,
+            url,
+            body,
+            cancel,
+        },
+        move |stage| {
+            // Only the scrubber (one `Arc`) is shared across events.
+            let scrubber = scrubber.clone();
+            async move {
+                let mut lines = match stage {
+                    Stage::Fresh {
+                        transport,
+                        url,
+                        body,
+                        cancel,
+                    } => {
+                        let resp = execute_with_head_timeout(
+                            execute_post_json(
+                                transport.as_ref(),
+                                &url,
+                                reqwest::header::HeaderMap::new(),
+                                &body,
                             ),
-                        )),
-                        Stage::Done,
-                    ));
-                };
-                match parse_gemini_chunk(&value) {
-                    Ok(Some(chunk)) => {
-                        return Some((Ok(chunk), Stage::Streaming { lines }));
+                            deadlines,
+                        )
+                        .await;
+                        match resp {
+                            Ok(r) => {
+                                let status = r.status();
+                                if !status.is_success() {
+                                    let text = read_error_body_bounded(
+                                        r,
+                                        GOOGLE_ERROR_BODY_MAX_BYTES,
+                                        request_head_timeout_ms(deadlines),
+                                    )
+                                    .await;
+                                    return Some((
+                                        Err(provider_error_for_http_with_scrubber(
+                                            status.as_u16(),
+                                            &text,
+                                            &scrubber,
+                                        )),
+                                        Stage::Done,
+                                    ));
+                                }
+                                let lines: LineStream = Box::pin(guarded_lines(
+                                    utf8_line_stream(
+                                        r.stream_frames(&deadlines.response_budget()),
+                                        MAX_LINE_BYTES,
+                                    ),
+                                    deadlines,
+                                    cancel,
+                                ));
+                                lines
+                            }
+                            Err(e) => {
+                                return Some((Err(e), Stage::Done));
+                            }
+                        }
                     }
-                    Ok(None) => {}
-                    // A hostile usage row (cache > prompt total, thoughts >
-                    // candidate total) is a typed Malformed error — never a
-                    // silent zero.
-                    Err(e) => return Some((Err(e), Stage::Done)),
+                    Stage::Streaming { lines } => lines,
+                    Stage::Done => return None,
+                };
+
+                loop {
+                    let Some(next) = lines.next().await else {
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    };
+                    let line = match next {
+                        Ok(l) => l,
+                        Err(e) => return Some((Err(e), Stage::Done)),
+                    };
+                    let line = line.trim();
+                    if !line.starts_with("data:") {
+                        continue;
+                    }
+                    let data = line[5..].trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == "[DONE]" {
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                        return Some((
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                scrubber.event_diagnostic(
+                                    "bad gemini SSE",
+                                    data,
+                                    auth_shaped_text(data),
+                                ),
+                            )),
+                            Stage::Done,
+                        ));
+                    };
+                    match parse_gemini_chunk(&value) {
+                        Ok(Some(chunk)) => {
+                            return Some((Ok(chunk), Stage::Streaming { lines }));
+                        }
+                        Ok(None) => {}
+                        // A hostile usage row (cache > prompt total, thoughts >
+                        // candidate total) is a typed Malformed error — never a
+                        // silent zero.
+                        Err(e) => return Some((Err(e), Stage::Done)),
+                    }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 fn parse_gemini_chunk(value: &serde_json::Value) -> Result<Option<ProviderChunk>, ProviderError> {

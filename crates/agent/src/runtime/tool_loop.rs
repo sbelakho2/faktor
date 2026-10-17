@@ -596,7 +596,10 @@ impl AgentRuntime {
         row: &ToolRunRow,
         raw: &serde_json::Value,
     ) -> faktor_core::Result<ReplayDescriptor> {
-        let desc: ReplayDescriptor = serde_json::from_value(raw.clone()).map_err(|e| {
+        // Borrowed deserialization: the stored descriptor Value is never
+        // cloned just to be parsed (identical strictness — the same
+        // `Deserialize` impl runs).
+        let desc: ReplayDescriptor = serde::Deserialize::deserialize(raw).map_err(|e| {
             Error::malformed(format!(
                 "tool_run {} carries a hostile replay descriptor: {e}",
                 row.op_id

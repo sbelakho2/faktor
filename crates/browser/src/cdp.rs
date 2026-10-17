@@ -537,7 +537,7 @@ async fn reader_loop(
     inner.mark_closed(reason);
 }
 
-fn route_message(value: Value, inner: &Arc<CdpInner>) {
+fn route_message(mut value: Value, inner: &Arc<CdpInner>) {
     if let Some(id) = value.get("id").and_then(Value::as_u64) {
         let outcome = match value.get("error") {
             Some(error) => CdpOutcome::Error {
@@ -548,7 +548,15 @@ fn route_message(value: Value, inner: &Arc<CdpInner>) {
                     .unwrap_or("unknown cdp error")
                     .to_string(),
             },
-            None => CdpOutcome::Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+            // Move the result out of the parsed message: a `Runtime.evaluate`
+            // / DOM-snapshot result is the largest part of the frame and the
+            // old `cloned()` deep-copied it on EVERY command response.
+            None => CdpOutcome::Ok(
+                value
+                    .as_object_mut()
+                    .and_then(|object| object.remove("result"))
+                    .unwrap_or(Value::Null),
+            ),
         };
         if let Some(tx) = faktor_core::lock::recover(&inner.pending).remove(&id) {
             let _ = tx.send(outcome);
@@ -558,32 +566,41 @@ fn route_message(value: Value, inner: &Arc<CdpInner>) {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return;
     };
-    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    // Classify while the method is still borrowed, then take the one owned
+    // copy the event needs.
+    let class = classify_event(method);
+    let method = method.to_string();
+    // Move `params` (and the session id string) out of the parsed message
+    // instead of deep-cloning the subtree: the pre-fix code cloned `params`
+    // once for the routing key and a second time into the event, per event.
+    let params = value
+        .as_object_mut()
+        .and_then(|object| object.remove("params"))
+        .unwrap_or(Value::Null);
     let session_id = value
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let event = CdpEvent {
-        session_id: session_id.clone(),
-        method: method.to_string(),
-        params: params.clone(),
-    };
-    match classify_event(method) {
+    match class {
         EventClass::Critical => {
             // Session-scoped critical events go to their session's bounded
             // queue only: never the lossy broadcast. `Target.detachedFromTarget`
             // arrives on the parent session and names the dying session in
             // its params; route it to that session.
-            let key = match method {
+            let key = match method.as_str() {
                 "Target.detachedFromTarget" => params
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .or(session_id),
-                _ => session_id,
+                    .or_else(|| session_id.clone()),
+                _ => session_id.clone(),
             };
             if let Some(key) = key {
-                inner.critical_queue(&key).push(event);
+                inner.critical_queue(&key).push(CdpEvent {
+                    session_id,
+                    method,
+                    params,
+                });
             } else {
                 tracing::debug!(method = %method, "cdp: browser-level critical event has no session");
             }
@@ -592,7 +609,11 @@ fn route_message(value: Value, inner: &Arc<CdpInner>) {
             // A full broadcast channel drops for the slowest receiver only;
             // the send error here means "no subscribers", which is not an
             // error.
-            let _ = inner.events.send(event);
+            let _ = inner.events.send(CdpEvent {
+                session_id,
+                method,
+                params,
+            });
         }
     }
 }
@@ -864,6 +885,106 @@ mod tests {
         assert!(
             client.is_closed(),
             "a message over the WS-layer limit must close the transport"
+        );
+    }
+
+    /// Second-angle perf evidence (CDP event routing): `route_message` must
+    /// MOVE the params subtree and session id out of the parsed message, not
+    /// deep-clone them. The pre-fix code deep-cloned `params` twice (once
+    /// for the routing key, once into the event) and the session id once,
+    /// per event — two full subtree copies for every 16 KiB
+    /// `Network.dataReceived` observation. This probe routes 10k large
+    /// events, verifies the delivered params are byte-exact, exercises the
+    /// `Target.detachedFromTarget` and command-response paths, and measures
+    /// the removed clone set.
+    #[test]
+    fn ten_thousand_large_events_are_moved_not_deep_cloned() {
+        const EVENTS: usize = 10_000;
+        const PAYLOAD_BYTES: usize = 16 * 1024;
+        let payload = "p".repeat(PAYLOAD_BYTES);
+        let inner = inner(CdpConfig::default());
+        let mut rx = inner.events.subscribe();
+
+        let routed_started = std::time::Instant::now();
+        for index in 0..EVENTS {
+            let message = json!({
+                "method": "Network.dataReceived",
+                "sessionId": "session-a",
+                "params": {
+                    "requestId": format!("r{index}"),
+                    "dataLength": index,
+                    "payload": payload,
+                }
+            });
+            route_message(message, &inner);
+            let event = rx.try_recv().expect("one observation per message");
+            assert_eq!(event.session_id.as_deref(), Some("session-a"));
+            assert_eq!(event.params["requestId"], format!("r{index}"));
+            assert_eq!(
+                event.params["payload"].as_str().map(str::len),
+                Some(PAYLOAD_BYTES)
+            );
+        }
+        let routed_elapsed = routed_started.elapsed();
+
+        // `Target.detachedFromTarget` routes to the session named in its
+        // params (the moved subtree is still readable for the key decision).
+        route_message(
+            json!({
+                "method": "Target.detachedFromTarget",
+                "sessionId": "parent",
+                "params": { "sessionId": "dying", "targetId": "t1" }
+            }),
+            &inner,
+        );
+        let queue = inner.critical_queue("dying");
+        {
+            let state = faktor_core::lock::recover(&queue.state);
+            assert!(!state.failed, "one critical event must not overflow");
+            assert_eq!(state.queue.len(), 1);
+            let event = state.queue.front().expect("routed critical event");
+            assert_eq!(event.session_id.as_deref(), Some("parent"));
+            assert_eq!(event.params["sessionId"], "dying");
+            assert_eq!(event.params["targetId"], "t1");
+        }
+
+        // Command responses move the result subtree out of the parsed frame.
+        let (sender, mut outcome_rx) = tokio::sync::oneshot::channel();
+        faktor_core::lock::recover(&inner.pending).insert(7, sender);
+        route_message(
+            json!({ "id": 7, "result": { "nodes": payload.as_str() } }),
+            &inner,
+        );
+        let outcome = outcome_rx.try_recv().expect("outcome delivered");
+        match outcome {
+            CdpOutcome::Ok(result) => {
+                assert_eq!(result["nodes"].as_str().map(str::len), Some(PAYLOAD_BYTES));
+            }
+            CdpOutcome::Error { message, .. } => panic!("unexpected error outcome: {message}"),
+        }
+
+        // Counterfactual: the exact per-event clone set the pre-fix routing
+        // executed (params for the key, params into the event, session id),
+        // averaged over 256 runs and scaled to the 10k routed events.
+        let probes = 256u32;
+        let params = json!({
+            "requestId": "r0",
+            "dataLength": 0u64,
+            "payload": payload,
+        });
+        let clone_started = std::time::Instant::now();
+        for _ in 0..probes {
+            let key_params = params.clone();
+            let event_params = params.clone();
+            let session_id = "session-a".to_string();
+            std::hint::black_box((&key_params, &event_params, &session_id));
+        }
+        let per_event = clone_started.elapsed() / probes;
+        let removed = per_event * (EVENTS as u32);
+        eprintln!(
+            "route_message {EVENTS} x {PAYLOAD_BYTES} byte events: routed+delivered \
+             {routed_elapsed:?}; removed per-event deep clones {per_event:?} => {removed:?} \
+             at 10k events"
         );
     }
 

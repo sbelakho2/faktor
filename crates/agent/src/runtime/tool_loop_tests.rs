@@ -2225,6 +2225,88 @@ async fn replay_descriptor_survives_reopen_and_replays_once() {
     assert!(handle.pending_tool_runs().unwrap().is_empty());
 }
 
+/// Second-angle performance audit: `validate_replay_descriptor` now
+/// deserializes the stored descriptor Value BORROWED (never a clone of the
+/// whole Value). This locks the equivalence: an exact round-trip (unicode
+/// capability path and args preserved), the same leniency for unknown
+/// fields, and the same loud refusals for hostile descriptors.
+#[tokio::test]
+async fn borrowed_descriptor_validation_round_trips_exactly_and_stays_hostile_aware() {
+    let dir = fresh_store_dir();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (deps, _keep) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(scripted_provider(vec![])),
+        vec![counting_tool(
+            "echo",
+            RecoveryHint::Idempotent,
+            counter.clone(),
+        )],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let ws = manager.create_workspace("/w").unwrap();
+    let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+    let receipt = handle.submit_prompt("echo it", &[]).unwrap();
+    let mut meta = op_meta(&manager, handle.id(), RecoveryStrategy::Idempotent);
+    let desc = ReplayDescriptor {
+        tool_name: "echo".into(),
+        validated_args: serde_json::json!({"x": 1, "note": "汉字😀"}),
+        workspace_id: WorkspaceId::new(1),
+        worktree_id: WorktreeId::new(1),
+        task_id: TaskId::new(1),
+        original_turn_op_id: receipt.op_id,
+        capability: Capability::ReadWorkspace {
+            path: "汉字😀/dir".into(),
+        },
+        recovery_kind: "idempotent".into(),
+    };
+    meta = meta.with_replay(serde_json::to_value(&desc).unwrap());
+    chain_to_streaming(&handle, receipt.op_id);
+    crash_tool_start(
+        &handle,
+        receipt.op_id,
+        "echo",
+        serde_json::json!({"x": 1, "note": "汉字😀"}),
+        "call_1",
+        meta,
+    );
+    let rows = handle.pending_tool_runs().unwrap();
+    let row = rows.iter().find(|r| r.tool == "echo").expect("pending row");
+    let raw = row
+        .replay_descriptor
+        .clone()
+        .expect("the descriptor is durable");
+    let validated = runtime.validate_replay_descriptor(row, &raw).unwrap();
+    assert_eq!(
+        validated, desc,
+        "borrowed deserialization must round-trip the descriptor exactly"
+    );
+
+    // Unknown fields stay accepted (identical leniency to `from_value`).
+    let mut lenient = raw.clone();
+    lenient["future_audit_field"] = serde_json::json!({"nested": true});
+    assert!(
+        runtime.validate_replay_descriptor(row, &lenient).is_ok(),
+        "unknown fields must not become a refusal"
+    );
+    // Hostile shapes stay loud: bad recovery kind, foreign tool, missing
+    // field, and a non-object descriptor.
+    let mut blind = raw.clone();
+    blind["recovery_kind"] = serde_json::json!("blind");
+    assert!(runtime.validate_replay_descriptor(row, &blind).is_err());
+    let mut foreign = raw.clone();
+    foreign["tool_name"] = serde_json::json!("rm_rf");
+    assert!(runtime.validate_replay_descriptor(row, &foreign).is_err());
+    let mut missing = raw.clone();
+    missing.as_object_mut().unwrap().remove("validated_args");
+    assert!(runtime.validate_replay_descriptor(row, &missing).is_err());
+    assert!(runtime
+        .validate_replay_descriptor(row, &serde_json::json!("not-an-object"))
+        .is_err());
+}
+
 #[tokio::test]
 async fn unknown_effect_tool_interrupted_is_never_replayed() {
     // Requirement 2b: tools with unknown/destructive external effects

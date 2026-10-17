@@ -136,6 +136,52 @@ async fn live_chunk_sink_delivers_text_deltas_under_normal_rates() {
 }
 
 #[tokio::test]
+async fn live_chunk_sink_moves_unicode_and_empty_deltas_byte_exact() {
+    // Second-angle performance audit: `emit_chunk` now MOVES the owned chunk
+    // buffer into the sink (no per-delta copy). Byte-exactness must hold for
+    // adversarial deltas: multi-byte unicode split across deltas, an empty
+    // delta (never a fabricated frame content), and a lone surrogate-like
+    // border pair.
+    let script = vec![
+        ScriptedResponse::Text("汉".into()),
+        ScriptedResponse::Text(String::new()),
+        ScriptedResponse::Text("字😀e\u{301}".into()),
+        ScriptedResponse::Text("".into()),
+        ScriptedResponse::End,
+    ];
+    let (mut deps, _dir) = deps(scripted_provider(script), vec![]);
+    let (sink, mut rx) = ChunkSink::channel();
+    deps.chunk_sink = Some(sink);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    runtime.run_turn(session, "hi", &[]).await.unwrap();
+    drop(runtime);
+    let mut frames = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        frames.push(ev);
+    }
+    let text: String = frames
+        .iter()
+        .filter(|f| f.kind == "text")
+        .map(|f| f.text.as_str())
+        .collect();
+    assert_eq!(
+        text, "汉字😀e\u{301}",
+        "moving the chunk buffer must preserve the exact delta bytes"
+    );
+    // Every delivered text frame is a literal slice of the expected stream:
+    // a moved frame can never carry borrowed/corrupted bytes from another
+    // delta.
+    for frame in frames.iter().filter(|f| f.kind == "text") {
+        assert!(
+            "汉字😀e\u{301}".contains(frame.text.as_str()),
+            "frame {:?} carries bytes outside its own delta",
+            frame.text
+        );
+    }
+}
+
+#[tokio::test]
 async fn live_chunk_turn_under_full_channel_completes_bounded() {
     // Audit 41 end-to-end: a turn whose model emits 5000 deltas into a
     // channel nobody drains must still complete (never blocked) and the

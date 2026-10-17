@@ -2036,3 +2036,83 @@ fn legacy_fnv_authority_digests_are_refused_at_the_ledger_boundary() {
     assert!(err.to_string().contains("legacy FNV"), "{err}");
     assert!(s.ledger_integration_record_for_task_read(7).is_missing());
 }
+
+/// Second-angle performance audit regression: the head fold now MOVES the
+/// owned entry payloads into the projection (and persists the head as its
+/// JSON value directly). This locks the observable outcome: unicode
+/// goal/criteria/decision text folds and survives, an unchanged second
+/// `ledger_ensure_head` is a no-op, the persisted head JSON is
+/// byte-identical across reads, and a hand-corrupted head row still
+/// recovers by replaying the entries.
+#[test]
+fn head_fold_moves_payloads_and_stays_replay_equivalent() {
+    let (_d, m) = test_manager();
+    let s = session(&m);
+    let goal = "重构 контекст 统一 ✨";
+    s.ledger_goal_set(goal).unwrap();
+    s.ledger_criteria_set(
+        &["criterion-汉字".to_string(), "second".to_string()],
+        "criterion-汉字\nsecond",
+    )
+    .unwrap();
+    s.ledger_decision("step-1", "选 A", "理由：unified counter")
+        .unwrap();
+    s.ledger_blocker_opened("blocker-😀").unwrap();
+
+    let head = s.ledger_ensure_head().unwrap();
+    assert_eq!(head.goal, goal, "unicode goal must fold by move");
+    assert_eq!(head.criteria, vec!["criterion-汉字", "second"]);
+    assert_eq!(head.canonical_criteria, "criterion-汉字\nsecond");
+    assert_eq!(
+        head.decisions.first().map(|d| d.choice.as_str()),
+        Some("选 A")
+    );
+    assert!(head.open_blockers.iter().any(|b| b == "blocker-😀"));
+    assert!(head.checkpoint_seq > 0);
+
+    // The persisted head row serializes deterministically and a second
+    // ensure_head (no stale entries) does not rewrite it.
+    let stored_first = s
+        .manager
+        .store()
+        .ledger_head(s.id)
+        .unwrap()
+        .expect("ensure_head persists the head");
+    let again = s.ledger_ensure_head().unwrap();
+    assert_eq!(again, head, "a clean ensure_head is a no-op fold");
+    let stored_second = s.manager.store().ledger_head(s.id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_string(&stored_first.head_json).unwrap(),
+        serde_json::to_string(&stored_second.head_json).unwrap(),
+        "the persisted head JSON must be byte-identical across reads"
+    );
+
+    // Hostile head row (undecodable schema): recovery re-folds the entries
+    // and never fails the open.
+    s.manager
+        .store()
+        .put_ledger_head(
+            s.id,
+            serde_json::json!({"schema_ver": "not-a-number"}),
+            0,
+            LEDGER_HEAD_SCHEMA_V,
+        )
+        .unwrap();
+    let recovered = s.ledger_ensure_head().unwrap();
+    assert_eq!(
+        recovered.goal, goal,
+        "replay recovery must restore the goal"
+    );
+    assert_eq!(recovered.criteria, head.criteria);
+    assert!(
+        recovered.open_blockers.iter().any(|b| b == "blocker-😀"),
+        "replay recovery restores blockers"
+    );
+
+    // Compaction folds the head too: the projection survives a prune.
+    let report = s.compact_typed_ledger().unwrap();
+    assert!(report.entries_before > 0);
+    let after = s.ledger_ensure_head().unwrap();
+    assert_eq!(after.goal, goal);
+    assert_eq!(after.canonical_criteria, "criterion-汉字\nsecond");
+}
