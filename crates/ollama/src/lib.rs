@@ -630,6 +630,26 @@ impl OllamaProvider {
     /// call is visible in this request). `GenericAgentRequest::system`
     /// becomes the first `role: system` message; images are omitted when
     /// the request carries none.
+    /// Resolve the adapter's synthetic `default` model id to a concrete
+    /// installed model (the first probed name, sorted) so a router that
+    /// legitimately selects the cheapest candidate can never send
+    /// `model: "default"` to Ollama (which has no such model and answers
+    /// 404). Concrete ids pass through unchanged; an empty probed set keeps
+    /// `default` (the provider then fails loudly with Ollama's own error
+    /// instead of fabricating a model name).
+    fn resolved_model_name(&self, model: &str) -> String {
+        if model != "default" {
+            return model.to_string();
+        }
+        let probed = self.probed.read().unwrap_or_else(|p| p.into_inner());
+        let mut names: Vec<&String> = probed.keys().collect();
+        names.sort();
+        names
+            .first()
+            .map(|m| (*m).clone())
+            .unwrap_or_else(|| model.to_string())
+    }
+
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if !req.system.is_empty() {
@@ -732,6 +752,8 @@ impl Provider for OllamaProvider {
     }
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
+        let resolved = self.resolved_model_name(model);
+        let model = resolved.as_str();
         if let Some(caps) = self.config.model_overrides.get(model) {
             return caps.clone();
         }
@@ -743,9 +765,10 @@ impl Provider for OllamaProvider {
         ModelCapabilities::small_local()
     }
     fn capability_resolution(&self, model: &str) -> CapabilityResolution {
-        let modeled = self.config.model_overrides.contains_key(model)
-            || self.probed.read().unwrap().contains_key(model);
-        CapabilityResolution::from_declaration(self.capabilities(model), modeled)
+        let resolved = self.resolved_model_name(model);
+        let modeled = self.config.model_overrides.contains_key(&resolved)
+            || self.probed.read().unwrap().contains_key(&resolved);
+        CapabilityResolution::from_declaration(self.capabilities(&resolved), modeled)
     }
 
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
@@ -811,7 +834,8 @@ impl Provider for OllamaProvider {
     /// status/transport class (429/5xx/network retryable; 4xx and
     /// policy/build refusals terminal), so the configured embedder retries
     /// exactly per policy and never more.
-    fn embed(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+    fn embed(&self, mut req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+        req.model = self.resolved_model_name(&req.model);
         // Model is REQUIRED: a directly-constructed hostile request must
         // never lower an empty model onto the wire. The bounded batch is
         // re-validated here (defense in depth): `EmbeddingRequest::new`
@@ -870,7 +894,11 @@ impl Provider for OllamaProvider {
         })
     }
 
-    fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+    fn stream(&self, mut req: GenericAgentRequest) -> ProviderStream {
+        // Resolve the synthetic `default` id to a real installed model
+        // BEFORE any capability gate or wire body (a routed `default`
+        // candidate must never reach Ollama as `model: "default"`).
+        req.model = self.resolved_model_name(&req.model);
         // Adapter-boundary media gate (defense in depth alongside the
         // agent-side `CapabilityValidator`): the adapter's OWN capability
         // data decides, BEFORE any wire byte and before the body is built —
@@ -1769,6 +1797,48 @@ mod tests {
             }
         }
         assert_eq!(text, "pong");
+    }
+
+    #[tokio::test]
+    async fn default_model_resolves_to_a_concrete_probed_model_on_the_wire() {
+        // Routing may legitimately choose the synthetic `default` id (it is
+        // the cheapest tie). The adapter must send the first probed concrete
+        // model instead — `model: "default"` is not an Ollama model and
+        // used to 404 end-to-end.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: r#"{"message":{"role":"assistant","content":"pong"},"done":true}"#.into(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    assert_eq!(body["model"], "qwen3.8:latest");
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
+        provider
+            .probed
+            .write()
+            .unwrap()
+            .insert("qwen3.8:latest".into(), ModelCapabilities::default());
+        let mut stream = provider.stream(req("default"));
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk.unwrap(), ProviderChunk::Done) {
+                break;
+            }
+        }
+        // AssertThenRespond proved the wire body carried the concrete id.
+    }
+
+    #[tokio::test]
+    async fn unresolved_default_is_kept_when_nothing_is_probed() {
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(
+            "http://127.0.0.1:1".into(),
+        )));
+        assert_eq!(provider.resolved_model_name("default"), "default");
     }
 
     #[tokio::test]

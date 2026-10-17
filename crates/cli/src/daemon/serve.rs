@@ -404,6 +404,54 @@ pub(crate) fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
     register_ollama_warmup(owner);
 }
 
+/// Bounded SYNCHRONOUS prefetch used by the daemon builder BEFORE router
+/// candidates are constructed: candidate admission reads `known_models()`,
+/// so an async warm-up racing the first turn leaves routing with only the
+/// synthetic `default` alias — or, worse, lets a pin be built before live
+/// models are visible. Local discovery is a millisecond-scale `GET
+/// /api/tags` + per-model capability probes; a bounded wait here (2 s work,
+/// 3 s join) makes model visibility deterministic at boot. An unreachable
+/// runtime keeps the conservative defaults with a loud warning (never a
+/// fabricated model), and the long-lived warm-up thread later refreshes
+/// capabilities as designed.
+pub(crate) fn prefetch_ollama_models(ollama: Arc<faktor_ollama::OllamaProvider>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("faktor-ollama-prefetch".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("runtime: {e}")));
+                    return;
+                }
+            };
+            let result = rt.block_on(async {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    ollama.refresh_from_live(),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => Ok(n),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("live discovery timed out".to_string()),
+                }
+            });
+            let _ = tx.send(result);
+            rt.shutdown_timeout(OLLAMA_WARMUP_RUNTIME_STOP_GRACE);
+        })
+        .ok();
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(Ok(n)) => tracing::info!(models = n, "ollama: live models visible at boot"),
+        Ok(Err(e)) => tracing::warn!("ollama prefetch failed (conservative defaults stay): {e}"),
+        Err(_) => tracing::warn!("ollama prefetch did not finish within the boot bound"),
+    }
+}
+
 /// Adversarial covers of the audited Ollama warm-up ownership gap: the
 /// handle is retained, the bounded join is honored, and the shutdown drain
 /// empties the process registry (idempotently) instead of leaking threads.

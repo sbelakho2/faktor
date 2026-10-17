@@ -1176,6 +1176,12 @@ pub(crate) fn build_daemon_core(
         providers,
         ollama_warmers,
     } = configured;
+    // Live-model PREFETCH before any router candidate exists (P0: routing
+    // must see the real installed models, not the synthetic `default`
+    // alias). Bounded and synchronous; failures keep conservative defaults.
+    for ollama in &ollama_warmers {
+        crate::daemon::serve::prefetch_ollama_models(ollama.clone());
+    }
     let providers = Arc::new(providers);
     let store = session.store();
     let cas = session.cas();
