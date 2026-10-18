@@ -10,6 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { platform, release, arch } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -25,6 +26,7 @@ const ROOT = resolve(HERE, '..', '..', '..');
 const OUT = resolve(ROOT, 'target/certification/edition8');
 const SCALE = 3;
 const MIN_BUTTONS = 30;
+const PLATFORM = platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux';
 
 function sha(bytes) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -150,6 +152,8 @@ async function main() {
   const document = {
     schema: 'faktor-edition8-optical/v1',
     host: 'vscode',
+    platform: PLATFORM,
+    os: `${platform()} ${release()} ${arch()}`,
     generated_at: new Date().toISOString(),
     method: '3x raster, interior crop excluding border and 7px per end',
     counts: {
@@ -161,7 +165,9 @@ async function main() {
     failures,
   };
   mkdirSync(OUT, { recursive: true });
-  writeFileSync(resolve(OUT, 'optical-vscode.raw.json'), `${JSON.stringify(document, null, 2)}\n`);
+  const payload = `${JSON.stringify(document, null, 2)}\n`;
+  writeFileSync(resolve(OUT, `optical-vscode.${PLATFORM}.raw.json`), payload);
+  writeFileSync(resolve(OUT, 'optical-vscode.raw.json'), payload);
   for (const failure of failures) console.error(`FAIL ${failure}`);
   console.log(
     `edition8 optical vscode: ${Object.entries(measurements).map(([theme, entry]) => `${theme} ${entry.buttons} buttons median ${entry.median.toFixed(2)}px`).join('; ')}`,

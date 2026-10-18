@@ -20,9 +20,34 @@ import { buildRegistry } from '../../tests/edition8/registry.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
 const OUT = resolve(ROOT, 'target/certification/edition8');
-const MATRIX = resolve(ROOT, 'target/certification/jetbrains-host-matrix.json');
+const MATRIX_ARG = process.argv.indexOf('--matrix');
+const MATRIX = MATRIX_ARG >= 0 && MATRIX_ARG + 1 < process.argv.length
+  ? resolve(ROOT, process.argv[MATRIX_ARG + 1])
+  : resolve(ROOT, 'target/certification/jetbrains-host-matrix.json');
+const MATRIX_LABEL = MATRIX_ARG >= 0 && MATRIX_ARG + 1 < process.argv.length
+  ? process.argv[MATRIX_ARG + 1]
+  : 'target/certification/jetbrains-host-matrix.json';
 const BASELINE = resolve(ROOT, 'apps/jetbrains/frontend/src/test/resources/parity/edition8-visual-baselines.json');
-const PLATFORM = platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux';
+const argv = process.argv.slice(2);
+function flag(name, fallback = null) {
+  const index = argv.indexOf(`--${name}`);
+  return index >= 0 && index + 1 < argv.length ? argv[index + 1] : fallback;
+}
+// The matrix JSON does not carry an OS field, so the caller names the
+// platform that actually rendered it. This is REQUIRED for a container run:
+// deriving the platform from the adapter host would relabel a Linux render
+// as macOS and look up the wrong reviewed digests (inherit them).
+const declared = flag('platform');
+const PLATFORM = declared ?? (platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux');
+if (!['macos', 'linux', 'windows'].includes(PLATFORM)) {
+  console.error(`edition8 jetbrains visual: unknown platform ${PLATFORM}`);
+  process.exit(1);
+}
+const OUT_FILE = flag('out', 'visual-platforms-jetbrains.raw.json');
+const OS_LABEL = flag('os', `${platform()} ${release()} ${arch()}`);
+const BUILD_LABEL = flag('build', null);
+const FONT_LABEL = flag('font', `java-host-ui-font-${PLATFORM}`);
+const IMAGE_LABEL = flag('image', 'host');
 
 if (!existsSync(MATRIX)) {
   console.error('edition8 jetbrains visual: missing target/certification/jetbrains-host-matrix.json; run compile-and-smoke.sh --smoke HostMatrix');
@@ -71,12 +96,14 @@ for (const screen of registry.screens) {
   });
 }
 
-let javaVersion = 'unknown';
-try {
-  const probe = spawnSync('java', ['-version'], { encoding: 'utf8' });
-  javaVersion = `${probe.stderr || probe.stdout || 'unknown'}`.split('\n')[0].trim() || 'unknown';
-} catch {
-  // The matrix itself proves Java was available; keep a typed unknown.
+let javaVersion = BUILD_LABEL ?? 'unknown';
+if (BUILD_LABEL === null) {
+  try {
+    const probe = spawnSync('java', ['-version'], { encoding: 'utf8' });
+    javaVersion = `${probe.stderr || probe.stdout || 'unknown'}`.split('\n')[0].trim() || 'unknown';
+  } catch {
+    // The matrix itself proves Java was available; keep a typed unknown.
+  }
 }
 const reviewed = baseline?.platforms?.[PLATFORM]?.reviewed === true;
 if (!reviewed) failures.push(`${PLATFORM} baseline is not marked reviewed`);
@@ -88,10 +115,11 @@ const document = {
   generated_at: new Date().toISOString(),
   method: 'Swing offscreen render; logical reviewed digests; no cross-platform inheritance',
   build: javaVersion,
-  os: `${platform()} ${release()} ${arch()}`,
-  font_fingerprint: `java-host-ui-font-${PLATFORM}`,
+  os: OS_LABEL,
+  image: IMAGE_LABEL,
+  font_fingerprint: FONT_LABEL,
   reviewed,
-  source_matrix: 'target/certification/jetbrains-host-matrix.json',
+  source_matrix: MATRIX_LABEL,
   source_baseline: 'apps/jetbrains/frontend/src/test/resources/parity/edition8-visual-baselines.json',
   cells: records.length * (widths.length + themes.length + 2),
   screens: records.length,
@@ -109,7 +137,12 @@ const document = {
   failures,
 };
 mkdirSync(OUT, { recursive: true });
-writeFileSync(resolve(OUT, 'visual-platforms-jetbrains.raw.json'), `${JSON.stringify(document, null, 2)}\n`);
+const payload = `${JSON.stringify(document, null, 2)}\n`;
+writeFileSync(resolve(OUT, OUT_FILE), payload);
+writeFileSync(resolve(OUT, `visual-platforms-jetbrains.${PLATFORM}.raw.json`), payload);
+if (OUT_FILE !== 'visual-platforms-jetbrains.raw.json') {
+  writeFileSync(resolve(OUT, 'visual-platforms-jetbrains.raw.json'), payload);
+}
 for (const failure of failures.slice(0, 40)) console.error(`FAIL ${failure}`);
 console.log(
   `jetbrains edition8 visual: ${records.length} screens, ${document.cells} cells, ` +

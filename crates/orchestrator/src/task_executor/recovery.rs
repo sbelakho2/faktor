@@ -567,6 +567,7 @@ mod admission_recovery_tests {
             budget_max_tokens: None,
             created_ms: 0,
             submission_digest: Some("some-other-digest".into()),
+            task_id: None,
         };
         handle
             .upsert_memory_fact(

@@ -1487,3 +1487,89 @@ async fn compression_and_ephemeral_outputs_cannot_write_completion_facts() {
         .iter()
         .any(|(k, key, _)| k == "compaction" && key == "provenance_admitted"));
 }
+
+/// Regression (Edition-8 scale probe): a prompt may start while the previous
+/// turn's settlement tail is still running and advance the session's task
+/// identity. Settlement must target the task id the drive was admitted under;
+/// re-reading the advanced identity folded the old turn's goal/spend/gate into
+/// the NEXT row and could mark it terminal before its first provider call.
+#[tokio::test]
+async fn settlement_is_bound_to_the_admitted_task_id() {
+    let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let worktree = handle.worktree_id().unwrap();
+    let first = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(Task {
+            task_id: first,
+            session_id: session,
+            goal: "first".into(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    // The next prompt advances the session identity before this turn's tail
+    // settles.
+    let second = TaskId::new(first.raw() + 1);
+    runtime
+        .deps
+        .session
+        .adopt_identity(session, worktree, second)
+        .unwrap();
+    handle
+        .create_task(Task {
+            task_id: second,
+            session_id: session,
+            goal: "second".into(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: TaskState::Pending,
+            created_ms: now + 1,
+            updated_ms: now + 1,
+        })
+        .unwrap();
+    assert_eq!(
+        runtime.session_task(&handle).unwrap().unwrap().task_id,
+        second
+    );
+
+    let ledger = TaskLedger {
+        goal: "first settled".into(),
+        ..Default::default()
+    };
+    let synced = runtime
+        .sync_task_row(&handle, first, &ledger, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        synced.task_id, first,
+        "row sync must target the admitted task"
+    );
+    assert_eq!(synced.goal, "first settled");
+    let untouched = handle.get_task(second).unwrap().unwrap();
+    assert_eq!(
+        untouched.goal, "second",
+        "the next task row must stay byte-clean"
+    );
+
+    runtime
+        .apply_gate_to_task_row_bound(&handle, first, Some(CompletionGate::Unverified), None)
+        .unwrap();
+    assert_eq!(
+        handle.get_task(second).unwrap().unwrap().state,
+        TaskState::Pending,
+        "the old turn's completion gate must never land on the next task"
+    );
+}

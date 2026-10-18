@@ -396,7 +396,7 @@ function convert() {
   });
 
   const perf = raw('perf.raw.json');
-  requireCounts(perf, { workloads: 7, failed: 0, baseline_present: 1 }, 'perf');
+  requireCounts(perf, { workloads: 9, failed: 0, baseline_present: 1 }, 'perf');
   writeGate('perf', {
     status: 'passed',
     counts: perf.counts,
@@ -411,6 +411,32 @@ function convert() {
     },
     artifacts: { raw: 'perf.raw.json', baseline: 'tests/edition8/perf-baseline.json' },
   });
+
+  const scale = rawOrNull('scale.raw.json');
+  if (scale !== null) {
+    requireCounts(
+      scale,
+      {
+        failed: 0,
+        probes: 10,
+        turns: 1000,
+        messages: 100000,
+        memory_facts: 5000,
+        history_sessions: 2000,
+        children: 500,
+        claims: 10000,
+        concurrent_sessions: 16,
+      },
+      'scale probe',
+    );
+    writeGate('scale', {
+      status: 'passed',
+      counts: scale.counts,
+      results: scale.probes,
+      detail: { metrics: scale.metrics, platform: scale.platform },
+      artifacts: { raw: 'scale.raw.json' },
+    });
+  }
 
   const daemon = rawOrNull('acceptance-daemon.raw.json');
   if (daemon !== null) {
@@ -500,6 +526,7 @@ async function main() {
     run('tests/edition8/visual-contracts.mjs');
     run('apps/vscode/scripts/edition8-control-exercise.mjs');
     run('apps/vscode/scripts/edition8-acceptance.mjs');
+    run('apps/vscode/scripts/transcript-deny-check.mjs');
     run('apps/vscode/scripts/edition8-workflows.mjs');
     if (!bootstrappedVisual) run('apps/vscode/scripts/edition8-visual.mjs', ['--check']);
     run('apps/vscode/scripts/edition8-optical.mjs');
@@ -528,7 +555,20 @@ async function main() {
       run('scripts/edition8/jetbrains-control-exercise.mjs');
       run('scripts/edition8/jetbrains-acceptance.mjs');
       run('scripts/edition8/jetbrains-workflows.mjs');
-      run('scripts/edition8/jetbrains-visual.mjs');
+      const jbPlatform = process.env.E8_JETBRAINS_PLATFORM;
+      const jbArgs = jbPlatform
+        ? [
+            '--platform',
+            jbPlatform,
+            '--os',
+            process.env.E8_JETBRAINS_OS ?? `${jbPlatform} render`,
+            '--build',
+            process.env.E8_JETBRAINS_BUILD ?? 'unknown',
+            '--font',
+            process.env.E8_JETBRAINS_FONT ?? `java-host-ui-font-${jbPlatform}`,
+          ]
+        : [];
+      run('scripts/edition8/jetbrains-visual.mjs', jbArgs);
       run('tests/edition8/platforms.mjs');
       run('tests/edition8/optical.mjs');
       run('tests/edition8/contrast.mjs');

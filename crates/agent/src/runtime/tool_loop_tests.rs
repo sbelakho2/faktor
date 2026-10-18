@@ -133,13 +133,12 @@ async fn activated_lazy_tool_is_dispatchable_and_executes() {
     assert!(load.found() && load.set.is_active("source_market"));
 }
 
-/// The bounded durable activation scan must stay LOUD when it cannot
-/// reach the fact: 16x200 newest facts newer than the activation fact
-/// push it out of the window. The scan keeps the safe inactive default
-/// AND emits the typed diagnostic (observable here through the test
-/// sink) — never a silent revert.
+/// Scale probe regression: the durable activation fact is a POINT lookup.
+/// Internal fact churn (taskexec/orchestrator rows written every turn) must
+/// never push a valid activation out of a bounded newest-first page and
+/// silently deactivate the tool set.
 #[tokio::test]
-async fn activation_scan_bound_exhaustion_is_loud_and_defaults_inactive() {
+async fn activation_point_lookup_survives_unrelated_fact_churn() {
     let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
     deps.tools = Arc::new(lazy_registry());
     let runtime = AgentRuntime::new(deps).unwrap();
@@ -156,7 +155,8 @@ async fn activation_scan_bound_exhaustion_is_loud_and_defaults_inactive() {
             "[\"source_market\"]",
         )
         .unwrap();
-    // ... then enough strictly-NEWER facts to exhaust the page bound.
+    // ... then far more strictly-newer internal facts than the old page
+    // bound could ever walk.
     let seeds: Vec<(String, String, String)> =
         (0..TOOL_ACTIVATION_MAX_PAGES * TOOL_ACTIVATION_PAGE as usize + 1)
             .map(|i| ("zzz_seed".to_string(), format!("k{i:05}"), "v".to_string()))
@@ -173,30 +173,15 @@ async fn activation_scan_bound_exhaustion_is_loud_and_defaults_inactive() {
         .unwrap();
 
     let load = runtime.load_tool_activation(&handle);
-    assert_eq!(load.scan, ToolActivationScan::BoundExhausted);
-    assert!(!load.found());
+    assert_eq!(load.scan, ToolActivationScan::Found, "{load:?}");
+    assert!(load.found());
     assert!(
-        load.set.is_empty(),
-        "the safe inactive default must apply: {load:?}"
+        load.set.is_active("source_market"),
+        "churn must not deactivate a durable activation: {load:?}"
     );
-    assert_eq!(
-        activation_scan_diagnostics_tests::events_for(&root),
-        vec![
-            activation_scan_diagnostics_tests::Diagnostic::BoundExhausted {
-                pages: TOOL_ACTIVATION_MAX_PAGES,
-                page_size: TOOL_ACTIVATION_PAGE,
-            }
-        ],
-        "bound exhaustion must be observable, never silent"
-    );
-
-    // The turn's bundle honors the inactive default (the exhausted scan
-    // cannot resurrect the tool).
-    let caps = ModelCapabilities::default();
-    let bundle = runtime.tools_bundle_for_turn(&handle, &[], &caps);
     assert!(
-        !bundle.tool_names().contains(&"source_market"),
-        "the safe inactive default must keep the lazy tool out of the bundle"
+        activation_scan_diagnostics_tests::events_for(&root).is_empty(),
+        "no bound-exhaustion diagnostic can fire for a point lookup"
     );
 }
 

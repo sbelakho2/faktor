@@ -43,9 +43,9 @@ pub(crate) use crate::runtime::completion_steps::commit_message;
 pub(crate) use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 pub(crate) use crate::runtime::task_executor::{
     compose_no_op_root_verification_status, compose_root_verification_status,
-    recover_pending_task_admissions, task_start_digest, MutationMode, PreparedRunIntegration,
-    RunSettlement, SettlementOutcome, ShadowFinalizeAction, TaskExecutor, TaskRunMode,
-    TaskRunReceipt, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    recover_pending_task_admissions, settlement_task_id, task_start_digest, MutationMode,
+    PreparedRunIntegration, RunSettlement, SettlementOutcome, ShadowFinalizeAction, TaskExecutor,
+    TaskRunMode, TaskRunReceipt, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 pub(crate) use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 pub(crate) use crate::test_support::heavy_guard;

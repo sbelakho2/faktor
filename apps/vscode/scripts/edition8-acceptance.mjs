@@ -129,7 +129,16 @@ const CHECKS = {
     state = stageRaw(state, 'G-04', 0.1, false).state;
     const applied = await applyDraft(backend, state, [...state.draft.set.values()], []);
     const changes = backend.calls[0]?.changes ?? [];
-    return { pass: applied.ok && changes.length === 2, observations: [`changes=${changes.map((entry) => entry.key).join(',')}`, applied.message] };
+    // Regression: diff rows carry `kind`; the webview dispatches on `type`.
+    // A patch posted without the explicit wire tag is silently ignored and
+    // every served row/control stays at its initial empty markup.
+    const panelSource = readFileSync(resolve(HERE, '../src/edition8/panel.ts'), 'utf8');
+    const webviewSource = readFileSync(resolve(HERE, '../media/edition8.js'), 'utf8');
+    const patchWire = panelSource.includes("type: 'e8Patch'") && webviewSource.includes("case 'e8Patch'");
+    return {
+      pass: applied.ok && changes.length === 2 && patchWire,
+      observations: [`changes=${changes.map((entry) => entry.key).join(',')}`, applied.message, `patchwire=${patchWire}`],
+    };
   },
   A04: async () => {
     const state = { snapshot: SNAPSHOT, draft: EMPTY_DRAFT, loading: false, error: null };

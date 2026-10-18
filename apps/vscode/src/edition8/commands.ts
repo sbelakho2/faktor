@@ -78,7 +78,7 @@ export async function pickModel(deps: Edition8PanelDeps): Promise<void> {
   }
   const pick = await vscode.window.showQuickPick(picks, {
     title: 'Faktor: choose a model',
-    placeHolder: 'The current call keeps its binding; the next call uses the selection.',
+    placeHolder: 'The current call keeps its binding; a new conversation uses the selection.',
     matchOnDescription: true,
     ignoreFocusOut: true,
   });
@@ -94,7 +94,11 @@ export async function pickModel(deps: Edition8PanelDeps): Promise<void> {
     void vscode.window.showErrorMessage(`Model was not saved: ${result.message}`);
     return;
   }
-  void vscode.window.showInformationMessage(`Default model: ${pick.label}. ${result.message}`);
+  const outcome =
+    deps.newConversation === undefined
+      ? 'It applies to new conversations.'
+      : await deps.newConversation(pick.provider, pick.model);
+  void vscode.window.showInformationMessage(`Default model: ${pick.label}. ${result.message} ${outcome}`);
 }
 
 interface AgentPick extends vscode.QuickPickItem {

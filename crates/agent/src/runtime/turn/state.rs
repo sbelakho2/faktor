@@ -2072,15 +2072,57 @@ pub(crate) const TOOL_ACTIVATION_FACT_KIND: &str = "tool_activation";
 pub(crate) const TOOL_ACTIVATION_FACT_KEY: &str = "set";
 
 /// Newest-first page size of the bounded durable scan.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const TOOL_ACTIVATION_PAGE: i64 = 200;
 
 /// Bounded page walk of the durable scan: a missed flag degrades to the
 /// in-turn deterministic detection, never to a wrong activation. Exhausting
 /// this bound without a decisive fact is diagnosed LOUDLY and falls back to
 /// the safe inactive default (never a silent revert).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const TOOL_ACTIVATION_MAX_PAGES: usize = 16;
 
 impl AgentRuntime {
+    /// Open the session's EFFECTIVE workspace root for this hop. A live
+    /// shadow root is process-local and short-lived: it is opened SCOPED
+    /// (no recursive watcher, no registry entry). Registering a watcher for
+    /// every shadowed turn cached one FSEvents thread per turn and paid the
+    /// bounded registration deadline (~2s) on each turn; the shadow drive
+    /// tracks changes through its tool/snapshot rows, not the watcher.
+    pub(crate) fn open_effective_workspace(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<faktor_fs::WorkspaceHandle> {
+        let row = handle.row().ok()?;
+        self.open_effective_workspace_for(handle.id(), row.workspace_id)
+    }
+
+    /// Same as [`Self::open_effective_workspace`] for call sites that carry
+    /// only the durable ids.
+    pub(crate) fn open_effective_workspace_for(
+        &self,
+        session_id: faktor_core::id::SessionId,
+        workspace_id: faktor_core::id::WorkspaceId,
+    ) -> Option<faktor_fs::WorkspaceHandle> {
+        let root = self
+            .deps
+            .session
+            .resolve_workspace_root(session_id)
+            .ok()??;
+        let shadow_active = self
+            .deps
+            .session
+            .active_root(session_id)
+            .ok()
+            .flatten()
+            .is_some();
+        if shadow_active {
+            faktor_fs::WorkspaceHandle::open_scoped(workspace_id, root).ok()
+        } else {
+            self.deps.workspaces.open(workspace_id, root).ok()
+        }
+    }
+
     pub fn new(deps: AgentDeps) -> faktor_core::Result<Arc<Self>> {
         if deps.model.is_empty() {
             return Err(Error::malformed("agent requires a model"));

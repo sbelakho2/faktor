@@ -241,6 +241,34 @@ pub(crate) fn ledger_strings(ledger: &serde_json::Value, key: &str) -> Vec<Strin
         .unwrap_or_default()
 }
 
+/// The served task-view state. A durable task row is authoritative (its own
+/// machine state, including `verifying`/`needs_verification`); the session
+/// row is only a fallback for pre-task ledgers. `ReadyForNextTurn` means the
+/// turn machine is idle between prompts, so it must never project as a live
+/// "running" task.
+fn task_view_state_tag(
+    durable: Option<faktor_core::state::TaskState>,
+    session_state: faktor_core::state::AgentState,
+    open: &[String],
+    completed: &[String],
+    goal: &str,
+) -> &'static str {
+    if let Some(state) = durable {
+        return state.label();
+    }
+    if session_state.is_active()
+        && session_state != faktor_core::state::AgentState::ReadyForNextTurn
+    {
+        "running"
+    } else if !open.is_empty() || (completed.is_empty() && !goal.is_empty()) {
+        "in_progress"
+    } else if !completed.is_empty() {
+        "done"
+    } else {
+        "idle"
+    }
+}
+
 /// `GET /native/session/{id}/tasks` — the durable task ledger as typed
 /// JSON (goal, milestones, decisions, failures, changed files) plus the
 /// session's durable verification facts. One entry per tracked task; today
@@ -284,22 +312,29 @@ pub(crate) async fn native_session_tasks(
         // task; list nothing rather than a phantom entry.
         return Json(serde_json::json!([])).into_response();
     }
-    // State derivation (documented): the live machine wins ("running");
-    // open milestones or a fresh goal with no completed work yet are
+    // State derivation (documented): a durable task row is authoritative.
+    // Without one, a genuinely live machine wins ("running"); open
+    // milestones or a fresh goal with no completed work yet are
     // "in_progress"; completed work with nothing left open is "done".
+    // `ReadyForNextTurn` is an idle-between-turns state, NOT a live
+    // operation: treating it as active left a completed turn rendered as
+    // "running" forever (the turn-level machine stays ready until the next
+    // prompt).
     let row = match handle.row() {
         Ok(r) => r,
         Err(e) => return api_err(&e),
     };
-    let state_tag = if row.state.is_active() {
-        "running"
-    } else if !open.is_empty() || (completed.is_empty() && !goal.is_empty()) {
-        "in_progress"
-    } else if !completed.is_empty() {
-        "done"
-    } else {
-        "idle"
+    let task_row = match handle.get_task(row.task_id) {
+        Ok(t) => t,
+        Err(e) => return api_err(&e),
     };
+    let state_tag = task_view_state_tag(
+        task_row.as_ref().map(|task| task.state),
+        row.state,
+        &open,
+        &completed,
+        &goal,
+    );
     // Additive progress + budget (audit P0-64): `progress` is the session's
     // live bounded progress record (null before the runtime tracked one);
     // `budget` is the DURABLE budget envelope of the session's typed task
@@ -308,12 +343,6 @@ pub(crate) async fn native_session_tasks(
     // typed task row exists yet (null-safe pre-first-reservation: a typed
     // row without any reservation reads openReservedMicro 0).
     let mut budget: Option<serde_json::Value> = None;
-    // Durable read failures are LOUD: a store error must never project as
-    // "no budget"/"$0 reserved" on the money surface (error is not absence).
-    let task_row = match handle.get_task(row.task_id) {
-        Ok(t) => t,
-        Err(e) => return api_err(&e),
-    };
     // The additive engineering contract projection (frozen
     // `faktor_core::contract::EngineeringContract`, schema v31): always
     // present on the task entry — an empty contract for rows written before
@@ -1456,32 +1485,82 @@ pub(crate) async fn native_create_session(
     }
 }
 
-/// `GET /native/sessions` — the durable session listing (newest first,
-/// bounded): `{sessions: [{id, title, provider, model, state}]}`. The
-/// listing is naturally bounded by the store's newest-first read; the
-/// response caps at [`MAX_NATIVE_SESSION_LISTING`] entries.
+/// Strict paging query for the durable History listing. `beforeMs` and
+/// `beforeId` must be supplied together; `limit` is bounded by
+/// [`MAX_NATIVE_SESSION_LISTING`] and rejected (not silently clamped) above
+/// it — paging is fundamental, not an afterthought.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeSessionListQuery {
+    #[serde(default, rename = "beforeMs")]
+    before_ms: Option<i64>,
+    #[serde(default, rename = "beforeId")]
+    before_id: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `GET /native/sessions?beforeMs=&beforeId=&limit=` — the durable session
+/// listing (newest first, cursor-paged): `{sessions, hasMore, nextBefore}`.
+/// ONE bounded statement reads at most `limit + 1` rows, so a 2,000-
+/// conversation History is reachable page by page without ever materializing
+/// the whole table. Only the first page is served when the client omits the
+/// cursor; `hasMore`/`nextBefore` are exact and drive the next read.
 pub(crate) async fn native_list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    query: Result<Query<NativeSessionListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    // ONE statement read of the durable listing per page: the historical
-    // shape ran the manager's listing (a whole-table read plus a journal
-    // verification per session) and then this batch join — the session
-    // table was read twice per page. The single listing now feeds the
-    // served page directly, in the same newest-first order the historical
-    // handle listing used (the manager listing and this read execute the
-    // same store listing), so the served DTO is byte-identical; an
-    // unreadable listing is a typed error, never a partial page.
-    let rows: Vec<faktor_store::SessionRow> = match state.deps.session.store().list_sessions(None) {
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
+    let cursor = match (q.before_ms, q.before_id) {
+        (None, None) => None,
+        (Some(ms), Some(id)) => Some((ms, i64::try_from(id).unwrap_or(i64::MAX))),
+        _ => {
+            return wire_status(malformed_body(
+                "session cursor requires beforeMs and beforeId together",
+            ))
+        }
+    };
+    let limit = match q.limit {
+        None => MAX_NATIVE_SESSION_LISTING,
+        Some(0) => return wire_status(malformed_body("limit must be >= 1")),
+        Some(value) if value > MAX_NATIVE_SESSION_LISTING as u64 => {
+            return wire_status(malformed_body(&format!(
+                "limit {value} exceeds the native page bound {MAX_NATIVE_SESSION_LISTING}"
+            )))
+        }
+        Some(value) => value as usize,
+    };
+    let page_limit = u64::try_from(limit).unwrap_or(0);
+    let rows: Vec<faktor_store::SessionRow> = match state
+        .deps
+        .session
+        .store()
+        .list_sessions_page(None, cursor, page_limit)
+    {
         Ok(rows) => rows,
         Err(e) => return api_err(&store_err_to_core(e)),
     };
-    let rows: Vec<serde_json::Value> = rows
-        .into_iter()
-        .take(MAX_NATIVE_SESSION_LISTING)
+    let has_more = rows.len() > limit;
+    let rows = &rows[..rows.len().min(limit)];
+    let next_before = if has_more {
+        rows.last().map(|row| {
+            serde_json::json!({
+                "beforeMs": row.updated_ms,
+                "beforeId": row.id.raw(),
+            })
+        })
+    } else {
+        None
+    };
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
         .map(|row| {
             serde_json::json!({
                 "id": row.id.to_string(),
@@ -1493,10 +1572,19 @@ pub(crate) async fn native_list_sessions(
                 // the clients parse it tolerantly and never fabricate a
                 // time).
                 "created_ms": row.created_ms,
+                // The paging sort key (additive): History pages order by
+                // `updated_ms DESC, id DESC`, so the served value must be
+                // the one the cursor is bound to, not a re-derived guess.
+                "updated_ms": row.updated_ms,
             })
         })
         .collect();
-    Json(serde_json::json!({ "sessions": rows })).into_response()
+    Json(serde_json::json!({
+        "sessions": sessions,
+        "hasMore": has_more,
+        "nextBefore": next_before,
+    }))
+    .into_response()
 }
 
 /// Hard cap of one native session listing.
@@ -1820,6 +1908,72 @@ mod tests {
         test_state(root, "abort")
     }
 
+    #[test]
+    fn ready_for_next_turn_is_not_a_running_task_view() {
+        use faktor_core::state::AgentState;
+        let done = vec!["step".to_string()];
+        assert_eq!(
+            super::task_view_state_tag(None, AgentState::ReadyForNextTurn, &[], &done, "goal"),
+            "done",
+            "a ready-between-turns session with completed work is done, not running"
+        );
+        assert_eq!(
+            super::task_view_state_tag(None, AgentState::ReadyForNextTurn, &[], &[], "goal"),
+            "in_progress"
+        );
+        assert_eq!(
+            super::task_view_state_tag(None, AgentState::Streaming, &[], &[], "goal"),
+            "running",
+            "a genuinely live machine still projects running"
+        );
+    }
+
+    #[test]
+    fn the_durable_task_state_wins_over_the_session_tag() {
+        use faktor_core::state::{AgentState, TaskState};
+        assert_eq!(
+            super::task_view_state_tag(
+                Some(TaskState::Verifying),
+                AgentState::ReadyForNextTurn,
+                &[],
+                &[],
+                "goal"
+            ),
+            "verifying",
+            "a verifying task must never be flattened to the ready session tag"
+        );
+        assert_eq!(
+            super::task_view_state_tag(
+                Some(TaskState::NeedsVerification),
+                AgentState::ReadyForNextTurn,
+                &[],
+                &[],
+                "goal"
+            ),
+            "needs_verification"
+        );
+        assert_eq!(
+            super::task_view_state_tag(
+                Some(TaskState::VerifiedComplete),
+                AgentState::ReadyForNextTurn,
+                &[],
+                &[],
+                "goal"
+            ),
+            "verified_complete"
+        );
+        assert_eq!(
+            super::task_view_state_tag(
+                Some(TaskState::Failed),
+                AgentState::ReadyForNextTurn,
+                &[],
+                &[],
+                "goal"
+            ),
+            "failed"
+        );
+    }
+
     #[tokio::test]
     async fn create_session_refuses_an_unregistered_provider_before_any_effect() {
         let dir = tempfile::tempdir().unwrap();
@@ -1897,6 +2051,7 @@ mod tests {
                     "model": row.model,
                     "state": agent_state_tag(row.state),
                     "created_ms": row.created_ms,
+                    "updated_ms": row.updated_ms,
                 }),
                 Err(_) => serde_json::json!({
                     "id": h.id().to_string(),
@@ -1926,6 +2081,7 @@ mod tests {
                     "model": row.model,
                     "state": agent_state_tag(row.state),
                     "created_ms": row.created_ms,
+                    "updated_ms": row.updated_ms,
                 })
             })
             .collect();
@@ -1937,7 +2093,16 @@ mod tests {
 
         let headers = authed_headers(&state);
         let reads_before = session.store().reader_telemetry().reads;
-        let response = super::native_list_sessions(State(state.clone()), headers).await;
+        let response = super::native_list_sessions(
+            State(state.clone()),
+            headers,
+            Ok(Query(super::NativeSessionListQuery {
+                before_ms: None,
+                before_id: None,
+                limit: None,
+            })),
+        )
+        .await;
         let reads_after = session.store().reader_telemetry().reads;
         let (status, body) = json_body(response).await;
         assert_eq!(status, StatusCode::OK);
@@ -1965,7 +2130,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, sid) = test_state(dir.path(), "history row");
         let headers = authed_headers(&state);
-        let response = super::native_list_sessions(State(state.clone()), headers).await;
+        let response = super::native_list_sessions(
+            State(state.clone()),
+            headers,
+            Ok(Query(super::NativeSessionListQuery {
+                before_ms: None,
+                before_id: None,
+                limit: None,
+            })),
+        )
+        .await;
         let (status, body) = json_body(response).await;
         assert_eq!(status, StatusCode::OK);
         let rows = body["sessions"].as_array().expect("sessions array");

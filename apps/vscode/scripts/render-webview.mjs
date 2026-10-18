@@ -716,6 +716,10 @@ export async function launchChrome(chrome) {
       '--force-device-scale-factor=1',
       '--allow-file-access-from-files',
       '--disable-extensions',
+      '--disable-dev-shm-usage',
+      // Root containers (the pinned Chromium CI image) cannot use the
+      // setuid sandbox; every other host keeps it.
+      ...(process.getuid?.() === 0 || process.env.FAKTOR_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
       'about:blank',
     ],
     { stdio: ['ignore', 'pipe', 'pipe'] },

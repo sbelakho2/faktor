@@ -19,6 +19,8 @@
 //! nulls, and the verdict distinguishes `missing` from `unavailable` from
 //! `corrupt` — a client never renders VERIFIED from a broken chain.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -795,26 +797,47 @@ fn criteria_block(
             truncated: false,
         };
     };
+    // O(1) typed-criterion lookup: the historical `task_criteria.iter()
+    // .find(...)` ran once per record criterion, so a 10k-criterion proof
+    // against a 10k-criterion task was O(n^2). Index the task's criteria by
+    // both accepted key forms once; the decoded-envelope form resolves
+    // through the text map.
+    let mut by_encoded: HashMap<String, &faktor_session::task::Criterion> = HashMap::new();
+    let mut by_text: HashMap<&str, &faktor_session::task::Criterion> = HashMap::new();
+    for criterion in task_criteria {
+        by_text.entry(criterion.text.as_str()).or_insert(criterion);
+        by_encoded
+            .entry(criterion.encoded_entry())
+            .or_insert(criterion);
+    }
     let mut items = Vec::new();
+    // Counts cover EVERY durable row; only `items` is paged. Reporting
+    // `total = items.len()` made a 10k-claim record look like a 500-claim
+    // record and made the pass/fail counts silently page-local.
     let mut passed = 0u64;
     let mut failed = 0u64;
     let mut unavailable = 0u64;
-    for criterion in record.criteria.iter().take(MAX_NATIVE_LIST) {
-        // Durable criterion keys are the RAW acceptance-criteria entries: a
-        // V2 task stores the encoded envelope, so the typed match decodes the
-        // key first (and still accepts a plain legacy text key).
-        let typed = task_criteria.iter().find(|t| {
-            t.encoded_entry() == criterion.criterion_key
-                || t.text == criterion.criterion_key
-                || faktor_session::task::Criterion::decode(&criterion.criterion_key)
-                    .is_some_and(|decoded| decoded.text == t.text)
-        });
+    for criterion in record.criteria.iter() {
         let verdict = criterion_verdict_label(criterion.passed, criterion.binding.as_ref());
         match verdict {
             "pass" => passed += 1,
             "fail" => failed += 1,
             _ => unavailable += 1,
         }
+        if items.len() >= MAX_NATIVE_LIST {
+            continue;
+        }
+        // Durable criterion keys are the RAW acceptance-criteria entries: a
+        // V2 task stores the encoded envelope, so the typed match resolves
+        // the encoded form first, then the plain key, then the decoded text.
+        let typed = by_encoded
+            .get(criterion.criterion_key.as_str())
+            .copied()
+            .or_else(|| by_text.get(criterion.criterion_key.as_str()).copied())
+            .or_else(|| {
+                faktor_session::task::Criterion::decode(&criterion.criterion_key)
+                    .and_then(|decoded| by_text.get(decoded.text.as_str()).copied())
+            });
         items.push(TaskProofCriterionRow {
             criterion_key: criterion.criterion_key.clone(),
             origin: typed.map(|t| t.origin.label().to_string()),
@@ -836,7 +859,7 @@ fn criteria_block(
         record_status: Some(status_tag(record.status)),
         record_revision: Some(record.revision.to_string()),
         certifies_completion,
-        total: items.len() as u64,
+        total: record.criteria.len() as u64,
         passed,
         failed,
         unavailable,
@@ -867,7 +890,7 @@ fn checks_block(record: Option<&VerificationRecord>) -> TaskProofChecks {
     let mut required_passed = 0u64;
     let mut required_failed = 0u64;
     let mut items = Vec::new();
-    for check in record.checks.iter().take(MAX_NATIVE_LIST) {
+    for check in record.checks.iter() {
         match check.status {
             VerificationStatus::Passed => passed += 1,
             VerificationStatus::Failed => failed += 1,
@@ -881,6 +904,9 @@ fn checks_block(record: Option<&VerificationRecord>) -> TaskProofChecks {
                 _ => {}
             }
         }
+        if items.len() >= MAX_NATIVE_LIST {
+            continue;
+        }
         items.push(TaskProofCheckRow {
             check: check.check.clone(),
             program: check.program.clone(),
@@ -891,7 +917,7 @@ fn checks_block(record: Option<&VerificationRecord>) -> TaskProofChecks {
         });
     }
     TaskProofChecks {
-        total: items.len() as u64,
+        total: record.checks.len() as u64,
         passed,
         failed,
         other,

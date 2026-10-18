@@ -429,11 +429,15 @@ impl Store {
         })
     }
 
-    /// Durable transcript search over one session's stored message payloads
-    /// (D-03): a bounded `instr(lower(...))` scan ordered newest-first. The
-    /// query is capped, the page is capped, and the scan never loads more
-    /// than `limit` rows into memory. It searches the durable message data
-    /// (which includes unloaded history), not only rendered parts.
+    /// Durable transcript search over one session's stored payloads (D-03):
+    /// a bounded `instr(lower(...))` scan ordered newest-first. The query is
+    /// capped, the page is capped, and the scan never loads more than
+    /// `limit` rows into memory. It searches BOTH the durable message data
+    /// (user prompts) and the durable per-message `part` rows (assistant
+    /// text, reasoning and tool results) — assistant answers live only in
+    /// parts (`message.data` is `{"parts":[]}`), so a data-only scan silently
+    /// missed every model response. The page is newest-first over the message
+    /// sequence, so Find reaches unloaded history, never only rendered rows.
     pub fn search_messages(
         &self,
         session_id: SessionId,
@@ -450,9 +454,14 @@ impl Store {
         })?;
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, seq, role, data, created_ms FROM message
-             WHERE session_id = ?1 AND instr(lower(data), lower(?2)) > 0
-             ORDER BY seq DESC LIMIT ?3",
+            "SELECT id, session_id, seq, role, data, created_ms FROM message m
+             WHERE m.session_id = ?1 AND (
+                 instr(lower(m.data), lower(?2)) > 0 OR
+                 EXISTS (SELECT 1 FROM part p
+                         WHERE p.message_id = m.id
+                           AND instr(lower(p.data), lower(?2)) > 0)
+             )
+             ORDER BY m.seq DESC LIMIT ?3",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64, query, limit])?;
         let mut out = Vec::new();
@@ -509,6 +518,82 @@ mod tests {
             cursor = Some(page.last().unwrap().seq);
         }
         assert_eq!(seen.len(), 100);
+    }
+
+    /// D-03: Find must reach model answers (stored ONLY as `part` rows), tool
+    /// results, and prompts (stored in `message.data`), newest-first, without
+    /// a false positive on a different session. This is the regression the
+    /// data-only scan silently passed: assistant text lived in parts, so the
+    /// newest answer was invisible to transcript search.
+    #[test]
+    fn transcript_search_reads_message_data_and_part_rows() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let a = store.create_session(ws, "a", "p", "m").unwrap();
+        let b = store.create_session(ws, "b", "p", "m").unwrap();
+        let prompt = store
+            .put_message(
+                a.id,
+                1,
+                "user",
+                serde_json::json!({"text": "please inspect the alpha needle"}),
+            )
+            .unwrap();
+        assert!(prompt > 0);
+        let answer = store
+            .put_message(a.id, 2, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(
+                answer,
+                "text",
+                serde_json::json!({"text": "the beta needle is in the answer"}),
+            )
+            .unwrap();
+        let tool = store
+            .put_message(a.id, 3, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(
+                tool,
+                "tool_result",
+                serde_json::json!({"excerpt": "gamma needle in tool output"}),
+            )
+            .unwrap();
+        let foreign = store
+            .put_message(
+                b.id,
+                1,
+                "user",
+                serde_json::json!({"text": "delta needle belongs to another session"}),
+            )
+            .unwrap();
+        assert!(foreign > 0);
+
+        let hits = store.search_messages(a.id, "needle", 200).unwrap();
+        assert_eq!(hits.len(), 3, "all three local rows must match");
+        assert_eq!(
+            hits.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        let beta = store.search_messages(a.id, "BETA", 200).unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].seq, 2);
+        let gamma = store.search_messages(a.id, "gamma", 200).unwrap();
+        assert_eq!(gamma.len(), 1);
+        assert_eq!(gamma[0].seq, 3);
+        assert!(
+            store
+                .search_messages(a.id, "delta", 200)
+                .unwrap()
+                .is_empty(),
+            "a foreign session's text must never surface"
+        );
+        assert_eq!(
+            store.search_messages(a.id, "needle", 2).unwrap().len(),
+            2,
+            "the page bound is exact"
+        );
     }
 
     /// Insert `n` messages with seq 1..=n and a controlled payload size

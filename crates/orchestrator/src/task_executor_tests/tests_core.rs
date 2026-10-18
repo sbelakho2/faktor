@@ -1348,6 +1348,7 @@ pub(crate) async fn shadowed_mutating_run_writes_never_reach_user_checkout_until
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: format!("tx-session-{}", env.parent.raw()),
+            task_id: None,
         })
         .await
         .expect("settlement is a typed outcome, not a failure");
@@ -2835,6 +2836,7 @@ pub(crate) async fn shadow_crash_mid_land_recovers_from_the_durable_txn_phase() 
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: format!("tx-session-{}", env.parent.raw()),
+            task_id: None,
         })
         .await
         .expect("resumed settlement");
@@ -2947,6 +2949,7 @@ pub(crate) async fn single_item_verified_complete_implies_owner_integration_land
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: format!("tx-session-{}", env.parent.raw()),
+            task_id: None,
         })
         .await
         .expect("resumed settlement");
@@ -3074,6 +3077,7 @@ pub(crate) async fn later_file_conflict_mid_land_rolls_back_earlier_applies_byte
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: format!("tx-session-{}", env.parent.raw()),
+            task_id: None,
         })
         .await
         .expect("a conflict is a typed settle outcome, not a failure");
@@ -3121,5 +3125,62 @@ pub(crate) async fn later_file_conflict_mid_land_rolls_back_earlier_applies_byte
         real_env_task_row(&env).state,
         TaskState::VerifiedComplete,
         "no completion without a successful owner integration"
+    );
+}
+
+/// Regression (Edition-8 scale probe): settlement must bind to the task id
+/// recorded on the run's linkage row. A new prompt can advance the session's
+/// task identity while an earlier run is still settling; re-reading the
+/// current identity settles the old run into the next row and can mark it
+/// terminal before its first provider call.
+#[tokio::test]
+async fn settlement_binds_to_the_runs_recorded_task_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let root = dir.path().to_str().unwrap();
+    let workspace = manager.create_workspace(root).unwrap();
+    let session = manager
+        .create_session(workspace, "runner", "fake", "m")
+        .unwrap()
+        .id();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let admitted = handle.task_id().unwrap();
+    let row = TaskRunRow {
+        run_id: "tx-settlement".into(),
+        session_id: session.raw(),
+        mode: TaskRunMode::InSession,
+        goal: "run".into(),
+        item_ids: vec!["main".into()],
+        files: Vec::new(),
+        attachments: Vec::new(),
+        op_id: Some(1),
+        model: None,
+        budget_max_tokens: None,
+        created_ms: 0,
+        submission_digest: None,
+        task_id: Some(admitted.raw()),
+    };
+    handle
+        .upsert_memory_fact(
+            TASK_RUN_ROW_KIND,
+            "tx-settlement",
+            &serde_json::to_string(&row).unwrap(),
+        )
+        .unwrap();
+    let advanced = TaskId::new(admitted.raw() + 1);
+    manager
+        .adopt_identity(session, handle.worktree_id().unwrap(), advanced)
+        .unwrap();
+    assert_eq!(handle.task_id().unwrap(), advanced);
+    assert_eq!(
+        settlement_task_id(&handle, "tx-settlement").unwrap(),
+        admitted,
+        "settlement must use the run's own task, not the advanced session identity"
+    );
+    assert_eq!(
+        settlement_task_id(&handle, "tx-unrecorded").unwrap(),
+        advanced,
+        "legacy/unknown runs keep the historical current-identity fallback"
     );
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Edition 8 performance gate.
 //
-// Seven workloads, each baseline-anchored per platform and chosen to fail an
+// Eleven workloads, each baseline-anchored per platform and chosen to fail an
 // O(n^2), unbounded or order-breaking path:
 //
 //   stream-order       10k events, bounded queue, zero dropped/duplicated/
@@ -183,15 +183,19 @@ const transcriptSmallMs = percentile(transcriptSmallSamples, 0.95);
 const transcriptLargeMs = percentile(transcriptLargeSamples, 0.95);
 const transcriptRatio = Math.max(transcriptLargeMs, FLOOR_MS) / Math.max(transcriptSmallMs, FLOOR_MS);
 
-// 4. Search over unloaded history: exact matches, bounded page.
-const history = messages(10_000).map((message, index) => ({
+// 4. Search over 100k unloaded history: exact matches, newest-first,
+// bounded page. The durable route scans all rows; the host consumes only
+// the bounded newest page, so it must never receive 5,883 matches.
+const HISTORY_MESSAGES = 100_000;
+const history = messages(HISTORY_MESSAGES).map((message, index) => ({
   ...message,
   parts: [{ type: 'text', text: `alpha beta item-${index} ${index % 17 === 0 ? 'needle' : ''}` }],
 }));
 function searchHistory(pageSize = 50) {
   const page = [];
   let total = 0;
-  for (const message of history) {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index];
     const text = message.parts[0].text;
     if (text.includes('needle')) {
       total += 1;
@@ -200,6 +204,8 @@ function searchHistory(pageSize = 50) {
   }
   return { page, total };
 }
+const expectedSearchTotal = Math.floor((HISTORY_MESSAGES - 1) / 17) + 1;
+const expectedNewestSearchId = Math.floor((HISTORY_MESSAGES - 1) / 17) * 17 + 1;
 const search = searchHistory();
 const searchSamples = Array.from({ length: 20 }, () => {
   const start = performance.now();
@@ -265,6 +271,63 @@ const patchLargeMs = percentile(patchSamples.filter((_, index) => index % 2 === 
 const patchRatio = patchLargeMs / Math.max(patchSmallMs, FLOOR_MS);
 const perControlSmall = patchSmallMs / Math.max(smallStage.staged, 1);
 const perControlLarge = patchLargeMs / Math.max(largeStage.staged, 1);
+
+// 8. Transcript paging at 100k messages: the host rebuilds from a
+// newest-first page and must materialize ONLY the bounded newest window.
+const newestFirst100k = messages(100_000).reverse();
+const transcript100kSamples = [];
+let transcript100k = [];
+for (let index = 0; index < 5; index += 1) {
+  const start = performance.now();
+  transcript100k = transcriptFromMessages(newestFirst100k);
+  transcript100kSamples.push(performance.now() - start);
+}
+const page100kSamples = [];
+for (let page = 0; page < newestFirst100k.length; page += 200) {
+  const slice = newestFirst100k.slice(page, page + 200);
+  const start = performance.now();
+  const built = transcriptFromMessages(slice);
+  page100kSamples.push(performance.now() - start);
+  if (built.length > MAX_TRANSCRIPT_ENTRIES) {
+    throw new Error(`a 200-message page built ${built.length} entries`);
+  }
+}
+
+// 9. 16 concurrent session streams: each bounded independently, no
+// cross-session bleed, no unbounded queue growth.
+const CONCURRENT_SESSIONS = 16;
+const PER_SESSION = 1_000;
+const sessionBuffers = Array.from({ length: CONCURRENT_SESSIONS }, () => []);
+const concurrentSamples = [];
+let concurrentProjection = [];
+for (let round = 0; round < PER_SESSION; round += 1) {
+  const start = performance.now();
+  for (let session = 0; session < CONCURRENT_SESSIONS; session += 1) {
+    const buffer = sessionBuffers[session];
+    buffer.push({
+      id: round + 1,
+      seq: round + 1,
+      role: 'assistant',
+      parts: [{ type: 'text', text: `s${session}-delta-${round}` }],
+    });
+    if (buffer.length > MAX_TRANSCRIPT_ENTRIES * 2) buffer.splice(0, buffer.length - MAX_TRANSCRIPT_ENTRIES * 2);
+  }
+  // Project through the SHIPPED transcript builder every 50 rounds; the
+  // input is newest-first, exactly as the native page arrives.
+  if (round % 50 === 49) {
+    concurrentProjection = sessionBuffers.map((buffer) =>
+      transcriptFromMessages([...buffer].reverse()),
+    );
+  }
+  concurrentSamples.push(performance.now() - start);
+}
+const concurrentBound = concurrentProjection.length === CONCURRENT_SESSIONS &&
+  concurrentProjection.every(
+    (entries, session) =>
+      entries.length <= MAX_TRANSCRIPT_ENTRIES &&
+      entries[entries.length - 1]?.text === `s${session}-delta-${PER_SESSION - 1}` &&
+      entries.every((entry) => entry.text.startsWith(`s${session}-`)),
+  );
 
 // 7. Refresh coalescing: bounded runs for 100 vs 10,000 frames.
 function coalesce(frameCount) {
@@ -342,9 +405,17 @@ const workloads = [
   },
   {
     samples: searchSamples,
-    metric: { page: search.page.length, total: search.total, exact: search.total === 589 },
-    passed: search.page.length <= 50 && search.total === 589,
-    detail: `search 10k unloaded messages: ${search.total} exact matches, page ${search.page.length}/50`,
+    metric: {
+      page: search.page.length,
+      total: search.total,
+      exact: search.total === expectedSearchTotal,
+      newest_first: search.page[0] === expectedNewestSearchId,
+    },
+    passed:
+      search.page.length <= 50 &&
+      search.total === expectedSearchTotal &&
+      search.page[0] === expectedNewestSearchId,
+    detail: `search ${HISTORY_MESSAGES} unloaded messages: ${search.total} exact newest-first matches, page ${search.page.length}/50`,
     id: 'search-unloaded',
   },
   {
@@ -385,6 +456,36 @@ const workloads = [
     passed: coalesce(100) === coalesce(10_000) && coalesce(10_000) <= 100,
     detail: `${coalesce(100)} runs for 100 frames vs ${coalesce(10_000)} for 10,000 (bounded)`,
     id: 'refresh-coalescing',
+  },
+  {
+    samples: transcript100kSamples,
+    metric: {
+      messages: newestFirst100k.length,
+      entries: transcript100k.length,
+      pages: page100kSamples.length,
+      page_p95_ms: percentile(page100kSamples, 0.95),
+      cap: MAX_TRANSCRIPT_ENTRIES,
+    },
+    passed:
+      transcript100k.length === MAX_TRANSCRIPT_ENTRIES &&
+      transcript100k[transcript100k.length - 1].text.includes('message 99999') &&
+      page100kSamples.every((value) => Number.isFinite(value) && value < 200),
+    detail: `100k newest-first messages -> ${transcript100k.length} entries; ${page100kSamples.length} pages; newest retained`,
+    id: 'transcript-100k',
+  },
+  {
+    samples: concurrentSamples,
+    metric: {
+      sessions: CONCURRENT_SESSIONS,
+      per_session: PER_SESSION,
+      projected: concurrentProjection.reduce((sum, entries) => sum + entries.length, 0),
+      cap: MAX_TRANSCRIPT_ENTRIES,
+    },
+    passed:
+      concurrentBound &&
+      concurrentProjection.every((entries) => entries.length <= MAX_TRANSCRIPT_ENTRIES),
+    detail: `${CONCURRENT_SESSIONS} sessions x ${PER_SESSION} deltas -> <=${MAX_TRANSCRIPT_ENTRIES}/session through the shipped builder, no cross-session bleed`,
+    id: 'concurrent-16-sessions',
   },
 ];
 

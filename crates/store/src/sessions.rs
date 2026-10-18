@@ -551,6 +551,57 @@ impl Store {
         Ok(out)
     }
 
+    /// One bounded, cursor-paged History listing. `before` is the
+    /// `(updated_ms, id)` cursor of the LAST row of the previous page; the
+    /// next page is strictly older (or the same millisecond with a smaller
+    /// id, matching the stable `updated_ms DESC, id DESC` order). At most
+    /// `limit + 1` rows are read so the caller can report `hasMore` exactly
+    /// without scanning the table. No workspace filter is applied when
+    /// `workspace_id` is `None` (the global History listing).
+    pub fn list_sessions_page(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        before: Option<(i64, i64)>,
+        limit: u64,
+    ) -> StoreResult<Vec<SessionRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = i64::try_from(limit.saturating_add(1)).map_err(|_| {
+            StoreError::Oversized("session page exceeds SQLite signed range".into())
+        })?;
+        let conn = self.read()?;
+        let mut sql = String::from(
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+             FROM session",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(workspace) = workspace_id {
+            clauses.push("workspace_id = ?");
+            params.push(rusqlite::types::Value::Integer(workspace.raw() as i64));
+        }
+        if let Some((updated_ms, id)) = before {
+            clauses.push("(updated_ms < ? OR (updated_ms = ? AND id < ?))");
+            params.push(rusqlite::types::Value::Integer(updated_ms));
+            params.push(rusqlite::types::Value::Integer(updated_ms));
+            params.push(rusqlite::types::Value::Integer(id));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY updated_ms DESC, id DESC LIMIT ?");
+        params.push(rusqlite::types::Value::Integer(bound));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(session_row_map(row)?);
+        }
+        Ok(out)
+    }
+
     /// Durably adopt a worktree/task identity (v8). The standalone session
     /// default is 1/1; WorktreeManager-created worktrees call this to make
     /// the identity durable so every later tool call (and crash recovery)

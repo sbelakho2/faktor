@@ -2116,3 +2116,39 @@ fn head_fold_moves_payloads_and_stays_replay_equivalent() {
     assert_eq!(after.goal, goal);
     assert_eq!(after.canonical_criteria, "criterion-汉字\nsecond");
 }
+
+/// Scale probe regression: session open verifies the ledger INCREMENTALLY
+/// from the process's verified cursor. A new corrupt row must still fail the
+/// open loudly, while the already-verified prefix is never re-decoded on
+/// every open (the O(n^2) turn-loop cost the 1,000-turn probe exposed).
+#[test]
+fn incremental_verify_catches_new_corruption_after_the_verified_prefix() {
+    let (_d, m) = test_manager();
+    let s = session(&m);
+    turn_entries(&s, 1);
+    turn_entries(&s, 2);
+    s.ledger_verify_open().unwrap();
+    let verified = m.store().ledger_max_seq(s.id()).unwrap();
+    assert!(verified > 0);
+    turn_entries(&s, 3);
+    raw_sql(
+        &m,
+        &format!(
+            "UPDATE ledger_entry SET payload = '{{not-json' WHERE session_id = {} AND seq = (SELECT MAX(seq) FROM ledger_entry WHERE session_id = {})",
+            s.id().raw(),
+            s.id().raw()
+        ),
+    );
+    let err = s.ledger_verify_after(verified).unwrap_err();
+    assert!(
+        matches!(
+            err.kind,
+            faktor_core::ErrorKind::Malformed | faktor_core::ErrorKind::Store
+        ),
+        "{err:?}"
+    );
+    assert!(err.message.contains("corrupt"), "{err:?}");
+    // A second open through the manager must not silently skip the new
+    // corrupt entry even though the prefix is already verified.
+    assert!(m.get_session(s.id()).is_err());
+}

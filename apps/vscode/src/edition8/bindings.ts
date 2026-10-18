@@ -130,18 +130,42 @@ function optionsFor(control: E8Control, optionsSource: E5OptionsSource, snapshot
   if (snapshot === null || optionsSource === null) return [];
   switch (optionsSource) {
     case 'models':
-      return arrayAt(snapshot.models, '')
+      // Model controls write the bare model id (the provider is a SEPARATE
+      // control/key); a served "provider/model" pair string would be written
+      // as a model name and refused by the daemon. Pair identity stays in
+      // the S02 rows and the snapshot itself.
+      // `models` is a bare JSON array in the daemon contract; `arrayAt`
+      // requires an object and therefore always returned []. Accept both the
+      // array and a future wrapped `{ models: [...] }` shape.
+      const modelEntries = Array.isArray(snapshot.models)
+        ? snapshot.models
+        : arrayAt(snapshot.models, 'models');
+      return modelEntries
         .map((entry) => {
           if (!isObject(entry)) return null;
-          const provider = entry.provider;
           const model = entry.model ?? entry.id;
-          return typeof provider === 'string' && typeof model === 'string' ? `${provider}/${model}` : null;
+          return typeof model === 'string' ? model : null;
         })
         .filter((entry): entry is string => entry !== null);
-    case 'providers':
-      return arrayAt(snapshot.connections, 'connections')
+    case 'providers': {
+      const connections = arrayAt(snapshot.connections, 'connections')
         .map((entry) => (isObject(entry) && typeof entry.id === 'string' ? entry.id : null))
         .filter((entry): entry is string => entry !== null);
+      if (connections.length > 0) return connections;
+      // The boot-time provider graph is served by the catalog even when the
+      // foundation connection registry is empty (config-file/environment
+      // provider). It is still a real selectable source.
+      const modelEntries = Array.isArray(snapshot.models)
+        ? snapshot.models
+        : arrayAt(snapshot.models, 'models');
+      return Array.from(
+        new Set(
+          modelEntries
+            .map((entry) => (isObject(entry) && typeof entry.provider === 'string' ? entry.provider : null))
+            .filter((entry): entry is string => entry !== null),
+        ),
+      );
+    }
     case 'mcp':
       return arrayAt(snapshot.mcp, 'servers')
         .map((entry) => {

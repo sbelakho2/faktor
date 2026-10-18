@@ -1185,14 +1185,45 @@ impl Store {
         &self,
         session_id: SessionId,
     ) -> StoreResult<Vec<ProviderCallPrefixRow>> {
+        self.provider_call_prefix_rows_limited(session_id, None)
+    }
+
+    /// The newest `limit` provider-call prefix rows of one session, returned
+    /// oldest-first. Routing stability only measures each turn against its
+    /// IMMEDIATELY previous turn, so the agent reads a bounded tail instead
+    /// of re-decoding every call the session ever made (the 1,000-turn probe
+    /// exposed the unbounded full-scan cost). `None` keeps the historical
+    /// full read for usage/projection callers that really aggregate history.
+    pub fn provider_call_prefix_rows_limited(
+        &self,
+        session_id: SessionId,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<ProviderCallPrefixRow>> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json
-             FROM provider_call
-             WHERE session_id = ?1 AND prompt_prefix_hash IS NOT NULL
-             ORDER BY id ASC",
-        )?;
-        let mut rows = stmt.query(params![session_id.raw() as i64])?;
+        let sql = match limit {
+            Some(_) => {
+                "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json
+                 FROM provider_call
+                 WHERE session_id = ?1 AND prompt_prefix_hash IS NOT NULL
+                 ORDER BY id DESC LIMIT ?2"
+            }
+            None => {
+                "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json
+                 FROM provider_call
+                 WHERE session_id = ?1 AND prompt_prefix_hash IS NOT NULL
+                 ORDER BY id ASC"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match limit {
+            Some(limit) => stmt.query(params![
+                session_id.raw() as i64,
+                i64::try_from(limit).map_err(|_| {
+                    StoreError::Oversized("provider prefix history limit exceeds i64".into())
+                })?
+            ])?,
+            None => stmt.query(params![session_id.raw() as i64])?,
+        };
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             let hash: Option<Vec<u8>> = r.get(1)?;
@@ -1240,6 +1271,9 @@ impl Store {
                 prefix_stability: stability,
                 prefix_segments_json,
             });
+        }
+        if limit.is_some() {
+            out.reverse();
         }
         Ok(out)
     }

@@ -2155,13 +2155,10 @@ impl AgentRuntime {
         legacy_path: &str,
         expected: FileHash,
     ) -> faktor_core::Result<Option<FilePostcondition>> {
-        let Some(root) = self.deps.session.resolve_workspace_root(handle.id())? else {
-            return Ok(None);
-        };
         let identity = handle.identity()?;
-        let ws = match self.deps.workspaces.open(identity.workspace_id, root) {
-            Ok(ws) => ws,
-            Err(_) => return Ok(None),
+        let ws = match self.open_effective_workspace(handle) {
+            Some(ws) => ws,
+            None => return Ok(None),
         };
         let Some(relative) = legacy_relative_path_within(ws.root(), legacy_path) else {
             return Ok(None);
@@ -2197,17 +2194,9 @@ impl AgentRuntime {
         session_id: SessionId,
         pc: &FilePostcondition,
     ) -> faktor_core::Result<Option<FileHash>> {
-        let Some(root) = self.deps.session.resolve_workspace_root(session_id)? else {
-            return Err(Error::malformed(format!(
-                "tool recovery: workspace {} is not registered",
-                pc.workspace_id
-            )));
-        };
         let ws = self
-            .deps
-            .workspaces
-            .open(pc.workspace_id, root)
-            .map_err(|e| Error::malformed(format!("tool recovery workspace open: {e}")))?;
+            .open_effective_workspace_for(session_id, pc.workspace_id)
+            .ok_or_else(|| Error::malformed("tool recovery workspace open failed".to_string()))?;
         // Traversal/symlink-unsafe relative paths are REJECTED loudly here —
         // recovery never touches a file outside the workspace root. The
         // host-side grammar runs FIRST: absolute Windows shapes (drive
@@ -2578,10 +2567,8 @@ impl AgentRuntime {
             .map_err(|e| format!("session row unresolvable: {e}"))?;
         let task_id = row.task_id;
         let ws = self
-            .deps
-            .workspaces
-            .open(row.workspace_id, root.to_path_buf())
-            .map_err(|e| format!("integration root could not be opened: {e}"))?;
+            .open_effective_workspace(handle)
+            .ok_or_else(|| "integration root could not be opened".to_string())?;
         let Some(candidate_snapshot) = root_snapshot_best_effort(&ws) else {
             return Err(format!(
                 "the integrated root {} has no provable content identity (special/oversized tree); \
@@ -3321,13 +3308,7 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> Option<faktor_fs::WorkspaceHandle> {
-        let row = handle.row().ok()?;
-        let root = self
-            .deps
-            .session
-            .resolve_workspace_root(handle.id())
-            .ok()??;
-        self.deps.workspaces.open(row.workspace_id, root).ok()
+        self.open_effective_workspace(handle)
     }
 
     /// The fingerprint's infallible half: everything observed from process

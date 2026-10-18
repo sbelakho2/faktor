@@ -59,11 +59,11 @@ const ROW_KIND_IDENTITY: &str = "orchestrator";
 const KEY_IDENTITY: &str = "identity";
 const KEY_DRIVE_STATE: &str = "drive_state";
 const ROW_KIND_CONTROL: &str = "orchestrator_ctl";
-/// A memory-fact scan walks pages of this size and stops after
-/// [`MAX_FACT_SCAN_PAGES`] pages (a hostile row space cannot stall a drive
-/// boundary with an unbounded scan).
-const FACT_PAGE: i64 = 200;
-const MAX_FACT_SCAN_PAGES: usize = 25;
+/// Control rows are paged by their OWN kind (the `(kind, session_id)` index),
+/// so unrelated per-turn fact churn can never push the control queue past a
+/// scan bound. The page bound still caps a hostile row space.
+const CONTROL_PAGE: i64 = 200;
+const MAX_CONTROL_PAGES: usize = 25;
 
 /// Ownership mode of a child, durably recorded on the child row and the
 /// child identity. Typed — never a free-form string.
@@ -341,49 +341,14 @@ fn parse_ctl_key(key: &str) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
-/// Collect every memory fact of `handle` with a bounded page scan.
-fn all_facts(handle: &SessionHandle) -> faktor_core::Result<Vec<(String, String, String)>> {
-    let mut out = Vec::new();
-    let mut after: Option<(i64, String, String)> = None;
-    for _ in 0..MAX_FACT_SCAN_PAGES {
-        let page = handle.memory_facts_page(after.as_ref(), FACT_PAGE)?;
-        out.extend(page.facts);
-        match page.cursor {
-            Some(c) => after = Some(c),
-            None => break,
-        }
-    }
-    if out.is_empty() {
-        return Ok(out);
-    }
-    // A scan that hit the page cap without an end is a hostile/broken row
-    // space: loud, never a silent truncation of control rows.
-    let total = out.len();
-    let ended = handle
-        .memory_facts_page(after.as_ref(), FACT_PAGE)?
-        .cursor
-        .is_none();
-    if !ended {
-        return Err(SessionError::Internal(format!(
-            "memory-fact scan of session {} exceeded {MAX_FACT_SCAN_PAGES} pages ({total} rows); refusing a partial control read",
-            handle.id()
-        ))
-        .into());
-    }
-    Ok(out)
-}
-
 /// Public, bounded control-queue and child-row surface (session layer,
 /// additive).
 impl SessionHandle {
     /// Read one value row by kind/key from this session's fact space.
     fn fact_get(&self, kind: &str, key: &str) -> faktor_core::Result<Option<String>> {
-        for (k, kk, v) in all_facts(self)? {
-            if k == kind && kk == key {
-                return Ok(Some(v));
-            }
-        }
-        Ok(None)
+        // Point lookup by (kind,key): a long session's internal fact churn
+        // must not turn a control read into an O(all facts) scan.
+        self.memory_fact_get(kind, key)
     }
 
     // ------------------------------------------------------- child identity
@@ -641,31 +606,42 @@ impl SessionHandle {
     /// Read every durable control row of this child, oldest first.
     pub fn orchestrator_ctl_all(&self) -> faktor_core::Result<Vec<ControlRow>> {
         let mut rows = Vec::new();
-        for (kind, key, value) in all_facts(self)? {
-            if kind != ROW_KIND_CONTROL {
-                continue;
+        let mut after: Option<(i64, String, String)> = None;
+        for _ in 0..MAX_CONTROL_PAGES {
+            let page = self.memory_facts_by_kind_page(ROW_KIND_CONTROL, after.as_ref(), CONTROL_PAGE)?;
+            for (_, key, value) in &page.facts {
+                let Some(seq) = parse_ctl_key(key) else {
+                    return Err(SessionError::Internal(format!(
+                        "child control row with hostile key {key:?} on session {}",
+                        self.id()
+                    ))
+                    .into());
+                };
+                let row: ControlRow = serde_json::from_str(value).map_err(|e| {
+                    SessionError::Internal(format!("child control row {seq} decode: {e}"))
+                })?;
+                if row.seq != seq {
+                    return Err(SessionError::Internal(format!(
+                        "child control row key/seq mismatch ({key:?} vs {})",
+                        row.seq
+                    ))
+                    .into());
+                }
+                rows.push(row);
             }
-            let Some(seq) = parse_ctl_key(&key) else {
-                return Err(SessionError::Internal(format!(
-                    "child control row with hostile key {key:?} on session {}",
-                    self.id()
-                ))
-                .into());
-            };
-            let row: ControlRow = serde_json::from_str(&value).map_err(|e| {
-                SessionError::Internal(format!("child control row {seq} decode: {e}"))
-            })?;
-            if row.seq != seq {
-                return Err(SessionError::Internal(format!(
-                    "child control row key/seq mismatch ({key:?} vs {})",
-                    row.seq
-                ))
-                .into());
+            match page.cursor {
+                Some(cursor) => after = Some(cursor),
+                None => {
+                    rows.sort_by_key(|r| r.seq);
+                    return Ok(rows);
+                }
             }
-            rows.push(row);
         }
-        rows.sort_by_key(|r| r.seq);
-        Ok(rows)
+        Err(SessionError::Internal(format!(
+            "control-row scan of session {} exceeded {MAX_CONTROL_PAGES} pages; refusing a partial control read",
+            self.id()
+        ))
+        .into())
     }
 
     /// The unapplied control rows (audit 23 delivery queue), oldest first.
@@ -786,6 +762,53 @@ mod tests {
         );
         assert!(rows[0].applied_ms.is_none());
         assert_eq!(s.orchestrator_ctl_pending().unwrap().len(), 2);
+    }
+
+    /// Scale probe regression: control reads must be filtered by their own
+    /// kind in SQL. Unrelated per-turn facts (taskexec/orchestrator rows)
+    /// previously pushed the whole-table scan past its 5,000-row bound and
+    /// failed the turn ("refusing a partial control read") on a long session.
+    #[test]
+    fn control_read_ignores_unrelated_fact_churn() {
+        let (_d, _m, s) = fixture();
+        s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap();
+        s.orchestrator_child_identity_put(&ChildIdentity {
+            parent_session_id: s.id(),
+            workspace_id: 1,
+            worktree_id: 1,
+            item_id: "main".into(),
+            task_goal: "goal".into(),
+            operation_id: 0,
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: "m".into(),
+            require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
+            created_ms: 0,
+        })
+        .unwrap();
+        let seeds: Vec<(String, String, String)> = (0..5_200)
+            .map(|i| {
+                (
+                    "taskexec_run".to_string(),
+                    format!("k{i:05}"),
+                    "{}".to_string(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = seeds
+            .iter()
+            .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        _m.store()
+            .upsert_memory_facts(s.id(), &refs)
+            .unwrap();
+        let rows = s.orchestrator_ctl_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].control, ChildControl::Pause);
+        assert!(
+            s.orchestrator_child_identity_get().unwrap().is_some(),
+            "the identity point lookup must survive fact churn"
+        );
     }
 
     #[test]

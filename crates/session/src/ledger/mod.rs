@@ -3710,16 +3710,40 @@ impl SessionHandle {
     /// ledger never silently drops a row. Called on every handle open
     /// (manager get/list); no entries => a fast no-op.
     pub fn ledger_verify_open(&self) -> faktor_core::Result<()> {
-        if self
+        let max_seq = self
             .manager
             .store()
             .ledger_max_seq(self.id)
-            .map_err(map_store_err)?
-            == 0
-        {
+            .map_err(map_store_err)?;
+        if max_seq == 0 {
             return Ok(());
         }
-        let _ = self.all_entries_decoded()?;
+        self.ledger_verify_after(0)?;
+        Ok(())
+    }
+
+    /// Verify the typed ledger stream STRICTLY from `after_seq` (exclusive)
+    /// through the newest entry, then fold the materialized head. Session
+    /// open uses this incrementally: entries verified once by this process
+    /// are not decoded again, so opening a session in a long turn loop is
+    /// O(new entries), not O(whole history) per open. A restart starts from
+    /// zero and verifies the full surviving stream again (never a silent
+    /// drop).
+    pub fn ledger_verify_after(&self, after_seq: i64) -> faktor_core::Result<()> {
+        let store = self.manager.store();
+        let mut cursor = after_seq;
+        loop {
+            let page = store
+                .ledger_entries(self.id, Some(cursor), 1000)
+                .map_err(map_store_err)?;
+            let Some(last) = page.last().map(|row| row.seq) else {
+                break;
+            };
+            for row in page {
+                let _ = self.decode_row(&row)?;
+            }
+            cursor = last;
+        }
         let _ = self.ledger_ensure_head()?;
         Ok(())
     }

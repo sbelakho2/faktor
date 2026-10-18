@@ -53,7 +53,10 @@ async function readJson(
   key: string,
 ): Promise<Json | null> {
   try {
-    const data = await native.edition5Json<Json>(method, path, body, (value) => value);
+    const data =
+      path === '/models' || path === '/capabilities'
+        ? await native.legacyCatalogJson('GET', path, (value) => value)
+        : await native.edition5Json<Json>(method, path, body, (value) => value);
     sources[key] = {
       state: 'ready',
       method,

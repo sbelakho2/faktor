@@ -30,12 +30,49 @@ pub(crate) fn in_session_run_state_tag(
     let task = handle
         .get_task(session_row.task_id)
         .map_err(|e| faktor_protocol::error::from_core(&e))?;
-    Ok(match task.map(|t| t.state) {
+    Ok(run_state_tag_for(task.map(|t| t.state), session_row.state))
+}
+
+/// Map the durable task phase to the run tag. A non-terminal task is NOT
+/// "Done" merely because the turn-level session machine settled into
+/// `ready_for_next_turn`; a waiting approval, budget stop or pending
+/// verification must stay visible as its own phase.
+fn run_state_tag_for(
+    task: Option<TaskState>,
+    session: faktor_core::state::AgentState,
+) -> &'static str {
+    // A failed/cancelled turn machine is authoritative over a stale row
+    // that still says Running/Pending: the run did not complete.
+    if matches!(
+        session,
+        faktor_core::state::AgentState::FailedRecoverable
+            | faktor_core::state::AgentState::FailedPermanent
+    ) {
+        return "Failed";
+    }
+    if session == faktor_core::state::AgentState::Cancelled {
+        return "Cancelled";
+    }
+    match task {
         Some(TaskState::VerifiedComplete) => "Done",
         Some(TaskState::Failed) => "Failed",
         Some(TaskState::Cancelled) => "Cancelled",
-        _ => session_run_state_tag(session_row.state),
-    })
+        Some(TaskState::NeedsVerification | TaskState::Verifying) => "Verifying",
+        Some(TaskState::Blocked) => "Blocked",
+        Some(TaskState::Waiting) => "Waiting",
+        // A stale task row that still says Running/Pending while the turn
+        // machine has already settled into `ready_for_next_turn` describes
+        // no live operation: the RUN is done (the task view reports the
+        // row's own phase separately). Genuine verification/blocked phases
+        // above never take this branch.
+        Some(TaskState::Pending | TaskState::Planning | TaskState::Running)
+            if session == faktor_core::state::AgentState::ReadyForNextTurn =>
+        {
+            "Done"
+        }
+        Some(TaskState::Pending | TaskState::Planning | TaskState::Running) => "Running",
+        None => session_run_state_tag(session),
+    }
 }
 
 /// The ORCHESTRATED run ids named by the session's durable facts rows. The
@@ -687,18 +724,12 @@ pub(crate) async fn native_task_run_start(
             }
         }
         None => {
-            // Budget fields are TASK-level caps: the plain-prompt path has
-            // no task-row seam to persist/enforce them, and silently
-            // dropping them admitted a paid call against `max_cost_micro:1`
-            // (observed: 1 upstream call, reservation 34092 micro). A typed
-            // refusal replaces the silent drop.
-            if req.max_tokens.is_some() || req.max_cost_micro.is_some() {
-                return wire_status(malformed_body(
-                    "max_tokens/max_cost_micro require explicit work_items; the plain-prompt path cannot enforce a task cap",
-                ));
-            }
             // The ordinary native prompt: one in-session mutating run
             // through the SAME PromptExecutionService (shadow by default).
+            // Budget caps ride the SAME durable task row the executor seeds
+            // for the prompt, so they are enforced instead of refused. A
+            // zero cap stays absent (the historical "no override" shape),
+            // exactly like the explicit task-start path.
             let request = PromptRequest {
                 prompt: req.goal,
                 submission_id: Some(req.submission_id),
@@ -709,6 +740,8 @@ pub(crate) async fn native_task_run_start(
                 files,
                 attachments,
                 model: req.model,
+                max_tokens: req.max_tokens,
+                max_cost_micro: req.max_cost_micro,
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
             };
@@ -1160,10 +1193,61 @@ mod run_mode_classification_tests {
     //! The task-run mode classification is a membership question scanned
     //! ONCE per projection: this pins the exact classification vocabulary
     //! and the bounded-work property at the 1k-run scan size.
-    use super::{orchestrated_run_ids, TASK_RUN_ROW_KIND};
+    use super::{orchestrated_run_ids, run_state_tag_for, TASK_RUN_ROW_KIND};
 
     fn fact(kind: &str, key: &str) -> (String, String, String) {
         (kind.to_string(), key.to_string(), "{}".to_string())
+    }
+
+    #[test]
+    fn non_terminal_task_phases_never_render_as_done() {
+        use faktor_core::state::{AgentState, TaskState};
+        assert_eq!(
+            run_state_tag_for(None, AgentState::ReadyForNextTurn),
+            "Done",
+            "no task row keeps the historical session-tag fallback"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Verifying), AgentState::ReadyForNextTurn),
+            "Verifying"
+        );
+        assert_eq!(
+            run_state_tag_for(
+                Some(TaskState::NeedsVerification),
+                AgentState::ReadyForNextTurn
+            ),
+            "Verifying"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Blocked), AgentState::ReadyForNextTurn),
+            "Blocked"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Waiting), AgentState::ReadyForNextTurn),
+            "Waiting"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Running), AgentState::ReadyForNextTurn),
+            "Done",
+            "a stale Running row with an idle turn machine is the run's completion"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Running), AgentState::Streaming),
+            "Running",
+            "a genuinely live turn still renders running"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::VerifiedComplete), AgentState::Idle),
+            "Done"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Failed), AgentState::ReadyForNextTurn),
+            "Failed"
+        );
+        assert_eq!(
+            run_state_tag_for(Some(TaskState::Cancelled), AgentState::Cancelled),
+            "Cancelled"
+        );
     }
 
     #[test]

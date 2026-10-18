@@ -260,7 +260,7 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
         )
         .join('')}
     </nav>
-    <span class="e8-status" data-level="${statusLevel}" aria-live="polite"><span aria-hidden="true">${statusGlyph(statusLevel)}</span> ${esc(status)}</span>
+    <span class="e8-status" id="e8-header-status" data-level="${statusLevel}" aria-live="polite"><span aria-hidden="true">${statusGlyph(statusLevel)}</span> ${esc(status)}</span>
     <button type="button" class="e8-secondary" id="e8-refresh" aria-label="Refresh served state">Refresh</button>
   </header>
   ${

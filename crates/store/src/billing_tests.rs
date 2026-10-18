@@ -461,3 +461,50 @@ fn cost_reservations_batch_never_double_serves_duplicate_pairs() {
         ghost.rows
     );
 }
+
+/// Scale probe regression: routing only needs the IMMEDIATELY previous
+/// prefix, so the agent's history read is a bounded newest tail. The limited
+/// read must stay oldest-first (the stability fold's contract) and must never
+/// silently include older calls.
+#[test]
+fn provider_prefix_history_tail_is_bounded_and_oldest_first() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "tail", "fake", "m").unwrap();
+    for i in 0..100u64 {
+        store
+            .record_provider_call_with_prefix(
+                s.id,
+                OpId::new(i + 1),
+                "fake",
+                "m",
+                "completed",
+                Some(i),
+                Some(1),
+                None,
+                Some([(i % 251) as u8; 32]),
+                Some(i),
+                Some(0.5),
+            )
+            .unwrap();
+    }
+    let all = store.provider_call_prefix_rows(s.id).unwrap();
+    assert_eq!(all.len(), 100);
+    assert!(all.windows(2).all(|w| w[0].row_id < w[1].row_id));
+    let tail = store
+        .provider_call_prefix_rows_limited(s.id, Some(10))
+        .unwrap();
+    assert_eq!(tail.len(), 10);
+    assert_eq!(
+        tail.iter().map(|r| r.row_id).collect::<Vec<_>>(),
+        all[90..].iter().map(|r| r.row_id).collect::<Vec<_>>(),
+        "the tail is the newest 10 rows in oldest-first order"
+    );
+    assert_eq!(
+        store
+            .provider_call_prefix_rows_limited(s.id, None)
+            .unwrap()
+            .len(),
+        100
+    );
+}

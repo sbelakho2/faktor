@@ -1335,6 +1335,40 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
   publishPreflight(context);
 }
 
+/**
+ * Create a session bound to the exact canonical workspace and persist the
+ * workspace binding. This is the ONE creation path for a new conversation;
+ * it never switches the active session by itself (callers decide whether the
+ * new row becomes active).
+ */
+async function createBoundSession(
+  client: NativeClient,
+  context: vscode.ExtensionContext,
+  provider: string,
+  model: string,
+): Promise<{ readonly id: string; readonly title: string; readonly created_ms: number }> {
+  const workspace = canonicalWorkspace(context);
+  const created = await client.createSession({
+    provider,
+    model,
+    workspace: workspace.fsPath,
+    title: workspaceTitle(),
+  });
+  const bindings = withBinding(readBindings(context), workspace.key, created.id);
+  await writeBindings(context, bindings);
+  store.patch({
+    session: {
+      id: created.id,
+      title: created.title,
+      provider,
+      model,
+      state: 'unknown',
+      createdMs: created.created_ms,
+    },
+  });
+  return created;
+}
+
 async function ensureSession(
   client: NativeClient,
   context: vscode.ExtensionContext,
@@ -1386,26 +1420,14 @@ async function ensureSession(
         // The catalog is optional; session creation below still applies.
       }
     }
-    const created = await client.createSession({
-      provider: provider || 'faktor',
-      model: model || 'default',
-      workspace: workspace.fsPath,
-      title: workspaceTitle(),
-    });
+    const created = await createBoundSession(
+      client,
+      context,
+      provider || 'faktor',
+      model || 'default',
+    );
     active.sessionId = created.id;
     bumpLifecycle();
-    bindings = withBinding(bindings, workspace.key, created.id);
-    await writeBindings(context, bindings);
-    store.patch({
-      session: {
-        id: created.id,
-        title: created.title,
-        provider: provider || '',
-        model: model || '',
-        state: 'unknown',
-        createdMs: created.created_ms,
-      },
-    });
   }
   const sessionId = active.sessionId;
   if (sessionId !== previousSessionId) {
@@ -1553,6 +1575,37 @@ async function refreshHistory(): Promise<void> {
  * durable listing the History surface renders: title + served state (no
  * fabricated date, no guessed session).
  */
+/**
+ * Bind the picked provider/model to a NEW conversation when the current one
+ * has a different binding. The selection is also saved as the default; the
+ * current transcript is not rewritten and an unsent draft is preserved by
+ * `switchSession` (the composer is never redirected/cleared by a model
+ * change). Returns the user-facing outcome copy.
+ */
+async function newConversationWith(
+  provider: string,
+  model: string,
+  context: vscode.ExtensionContext,
+): Promise<string> {
+  const client = active.client;
+  if (client === null) {
+    return 'Start the Faktor service, then choose again.';
+  }
+  const current = store.snapshot().session;
+  if (current !== null && current.provider === provider && current.model === model) {
+    return 'The current conversation already uses this model.';
+  }
+  try {
+    const previous = active.sessionId;
+    const created = await createBoundSession(client, context, provider, model);
+    active.sessionId = previous;
+    await switchSession(created.id, context);
+    return 'A new conversation now uses it; your draft is preserved.';
+  } catch (error) {
+    return `The default was saved, but the new conversation could not start: ${messageOf(error)}`;
+  }
+}
+
 async function switchSessionFromCommand(context: vscode.ExtensionContext): Promise<void> {
   const client = active.client;
   if (!client) {
@@ -1608,13 +1661,36 @@ function startStream(): void {
     bearerToken: daemon.bearerToken,
     sessionId,
     fetch: sseAdapter(),
-    onEvent: () => {
+    onEvent: (frame) => {
       // The journal stream is a LIVENESS signal only: its `EventKind` frames
       // do not carry the bounded message/part page shapes, so the reducer
       // deliberately does not fabricate incremental transcript state from
       // them. Frames coalesce into one bounded page refresh per window, so a
       // continuous 200/s stream can neither starve the refresh (a trailing
       // debounce) nor refresh 200 times a second.
+      //
+      // A `failed` frame DOES carry the typed reason the durable session
+      // entered `failed_recoverable` (provider failure, ambiguous
+      // instruction root, ...). The projection has no error field, so without
+      // this the panel showed only "failed, retrying" and no cause. Surface
+      // that one bounded reason once through the user-error renderer; the
+      // page refresh below remains the source of all structured state.
+      if (frame.event === 'failed') {
+        const data = frame.data;
+        const payload =
+          data !== null && typeof data === 'object' && !Array.isArray(data)
+            ? (data as Record<string, unknown>).payload
+            : null;
+        const message =
+          payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+            ? (payload as Record<string, unknown>).message
+            : null;
+        if (typeof message === 'string' && message.length > 0) {
+          const projection = projectOf(new Error(message), 'run_failure');
+          store.patch({ lastError: projection.technical });
+          chatProvider?.postUserError(projection);
+        }
+      }
       streamRefresh?.request();
     },
     onStatus: (status: EventStreamStatus, detail) => {
@@ -1631,6 +1707,22 @@ function startStream(): void {
         chatProvider?.postStreamBlocked(reason, active.stream?.blocked?.cursor ?? null);
       } else {
         store.patch({ streamStatus: status });
+        // The daemon line must not keep saying "Running" after the process
+        // is gone. The SSE status is the liveness signal the UI actually
+        // gets; map a retrying stream to the typed unavailable service
+        // state, and restore running only when the stream reopens. A
+        // session-switch stop is not a daemon death and leaves the line.
+        if (status === 'retrying') {
+          store.patch({
+            daemon: 'error',
+            daemonDetail: detail ?? 'the daemon connection was lost; retrying',
+          });
+        } else if (status === 'open') {
+          store.patch({
+            daemon: active.daemon !== null ? 'running' : 'stopped',
+            daemonDetail: '',
+          });
+        }
         if (status === 'open' || status === 'stopped') {
           // A recovered/stopped stream leaves the T27 reconnecting state.
           chatProvider?.postStreamRecovery(false);
@@ -3884,6 +3976,8 @@ function edition8Deps(context: vscode.ExtensionContext): Edition8PanelDeps {
       }
     },
     switchSession: (sessionId: string) => switchSession(sessionId, context),
+    newConversation: (provider: string, model: string) =>
+      newConversationWith(provider, model, context),
     output,
   };
 }

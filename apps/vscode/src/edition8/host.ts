@@ -382,6 +382,10 @@ export interface E8ControlPatch {
   readonly valueText: string;
   readonly disabled: boolean;
   readonly signature: string;
+  /** Served choices for a picker; omitted for non-choice controls. */
+  readonly options?: readonly string[];
+  /** Raw served configuration value (the picker's selected value). */
+  readonly value?: Json | null;
 }
 
 export interface E8ViewPatch {
@@ -434,6 +438,8 @@ export function diffView(
           valueText: control.valueText,
           disabled: control.disabled,
           signature,
+          ...(control.options.length > 0 ? { options: control.options } : {}),
+          value: control.configValue,
         });
       }
     }

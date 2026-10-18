@@ -89,6 +89,7 @@ internal object Edition8ScreenRegistry {
             "Revision 8 ${screen.group.lowercase()} screen. Primary action " +
                 "${screen.primaryAction}. ${screen.controls.size} controls."
         )
+        installScrollButtonAccessibility(panel)
         return panel
     }
 

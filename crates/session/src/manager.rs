@@ -301,6 +301,10 @@ pub struct SessionManager {
     #[cfg(test)]
     op_id_probe: OpIdLockProbe,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
+    /// Highest typed-ledger seq this process verified strictly. A session
+    /// open verifies only entries above it (O(new entries)); a restart
+    /// starts empty and re-verifies the surviving stream in full.
+    ledger_verified: Mutex<HashMap<SessionId, i64>>,
     pub(crate) artifact_sizes: ArtifactSizes,
     /// Layered lifetime bound (audit 26): wall-clock budget of ONE logical
     /// turn — the prompt operation's deadline and the runtime's per-turn
@@ -407,6 +411,7 @@ impl SessionManager {
             #[cfg(test)]
             op_id_probe: OpIdLockProbe::default(),
             resources: Mutex::new(HashMap::new()),
+            ledger_verified: Mutex::new(HashMap::new()),
             artifact_sizes: ArtifactSizes::default(),
             turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
             journal_gen: tokio::sync::watch::channel(0u64).0,
@@ -626,10 +631,15 @@ impl SessionManager {
         &self,
         session: SessionId,
     ) -> faktor_core::Result<Vec<faktor_store::ProviderCallPrefixRow>> {
+        // Routing stability compares each turn with the IMMEDIATELY previous
+        // turn; a bounded tail is sufficient and keeps a long session's
+        // per-turn cost constant. Usage projections still read the full
+        // history through `Store::provider_call_prefix_rows`.
+        const ROUTING_PREFIX_HISTORY: u64 = 64;
         self.reads
             .submit_tagged(DbReadKind::Prefix, move |store| {
                 store
-                    .provider_call_prefix_rows(session)
+                    .provider_call_prefix_rows_limited(session, Some(ROUTING_PREFIX_HISTORY))
                     .map_err(crate::map_store_err)
                     .map_err(Into::into)
             })
@@ -1246,6 +1256,28 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Strictly verify the typed ledger entries this process has not yet
+    /// verified for the session, then advance the in-memory verified cursor.
+    /// The lock is held across the decode so concurrent opens of the same
+    /// session do the work once.
+    fn verify_ledger_open_cached(&self, handle: &SessionHandle) -> faktor_core::Result<()> {
+        let max_seq = self
+            .store
+            .ledger_max_seq(handle.id())
+            .map_err(crate::map_store_err)?;
+        let mut verified = self
+            .ledger_verified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from = verified.get(&handle.id()).copied().unwrap_or(0);
+        if max_seq <= from {
+            return Ok(());
+        }
+        handle.ledger_verify_after(from)?;
+        verified.insert(handle.id(), max_seq);
+        Ok(())
+    }
+
     pub fn get_session(
         self: &Arc<Self>,
         id: SessionId,
@@ -1256,7 +1288,7 @@ impl SessionManager {
                 // Open-time typed-ledger verification (audit 27): an entry
                 // that fails its schema decode fails the session open
                 // loudly — never a silent drop.
-                handle.ledger_verify_open()?;
+                self.verify_ledger_open_cached(&handle)?;
                 // Open-time event-journal verification (audit consolidation):
                 // the bounded store authority checks the seed contract, the
                 // gapless 1..=N span and the tail-vs-projection state

@@ -21,6 +21,22 @@ const vscode = read('optical-vscode.raw.json');
 const jetbrains = read('optical-jetbrains.raw.json');
 const problems = [];
 const measurements = {};
+
+// Per-platform host evidence is authoritative where it exists. A Linux run
+// must stay in the gate after a macOS run refreshes the generic file.
+const platforms = {};
+for (const host of ['vscode', 'jetbrains']) {
+  for (const platformName of ['linux', 'macos', 'windows']) {
+    const document = read(`optical-${host}.${platformName}.raw.json`);
+    if (document === null) continue;
+    const entries = document.measurements ?? {};
+    const buttons = Object.values(entries).reduce((sum, entry) => sum + (entry.buttons ?? 0), 0);
+    const failed = document.counts?.failed ?? document.failures?.length ?? 0;
+    platforms[`${host}:${platformName}`] = { buttons, themes: Object.keys(entries).length, failed };
+    if (failed > 0) problems.push(`${host}/${platformName}: ${failed} optical failures`);
+    if (document.platform !== platformName) problems.push(`${host}/${platformName} evidence is labelled ${String(document.platform)}`);
+  }
+}
 for (const [host, document] of [['vscode', vscode], ['jetbrains', jetbrains]]) {
   if (document === null) {
     problems.push(`missing ${host} optical evidence`);
@@ -58,6 +74,7 @@ const document = {
     bound: { median_px: 0.5, max_abs_px: 2.0, min_buttons_per_theme: 30 },
     themes: [...new Set(Object.values(measurements).flatMap((themes) => Object.keys(themes)))].sort(),
     measurements,
+    platforms,
   },
   results: Object.entries(measurements).flatMap(([host, themes]) =>
     Object.entries(themes).map(([theme, entry]) => ({

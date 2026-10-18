@@ -757,3 +757,35 @@ fn batch_hot_writes_isolate_a_failing_write_to_its_savepoint() {
     // Empty groups are a no-op and never touch the writer.
     assert_eq!(store.batch_hot_writes(&[]).unwrap().0.len(), 0);
 }
+
+/// Scale probe regression: typed V2 memory pages filter the kind prefix in
+/// SQL. A turn loop writes internal facts (`taskexec_run`, orchestrator
+/// steps) newer than the durable memory records; filtering in Rust made every
+/// context prep page through all of them, so per-turn cost grew with turn
+/// count. The V2 page must return the newest V2 row directly.
+#[test]
+fn v2_memory_page_filters_internal_fact_churn_in_sql() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    for i in 0..200 {
+        store
+            .upsert_memory_fact(s.id, "taskexec_run", &format!("run-{i}"), "{}")
+            .unwrap();
+    }
+    store
+        .upsert_memory_fact(s.id, "memory_v2:decision", "framework", "rust")
+        .unwrap();
+    for i in 0..200 {
+        store
+            .upsert_memory_fact(s.id, "orchestrator_cs", &format!("step-{i}"), "{}")
+            .unwrap();
+    }
+    let (rows, more) = store
+        .memory_facts_v2_page(s.id, None, 64)
+        .unwrap();
+    assert!(!more);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "memory_v2:decision");
+    assert_eq!(rows[0].key, "framework");
+}

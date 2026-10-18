@@ -30,6 +30,8 @@ export interface Edition8PanelDeps {
   readonly workspace: () => { readonly workspace: string | null; readonly worktree: string | null; readonly daemon: string | null; readonly generation: number | null };
   readonly hostAction: (controlId: string) => Promise<string>;
   readonly switchSession?: (sessionId: string) => Promise<void>;
+  /** Bind a picked provider/model to a new conversation; returns the copy. */
+  readonly newConversation?: (provider: string, model: string) => Promise<string>;
   readonly output: vscode.OutputChannel;
 }
 
@@ -69,12 +71,22 @@ class Edition8Controller {
 
   constructor(
     private readonly deps: Edition8PanelDeps,
-    private readonly post: (message: unknown) => void,
+    private readonly post: (message: unknown) => Thenable<boolean> | void,
     private readonly revealScreen: (screen: string) => void,
   ) {}
 
   public dispose(): void {
     this.disposed = true;
+  }
+
+  /**
+   * Drop the keyed render cache so the next refresh posts a COMPLETE patch
+   * set. Used when the webview document is (re)created or becomes visible:
+   * a refresh that ran while the document had no listener must never leave
+   * the new document showing only its initial empty markup.
+   */
+  public resetView(): void {
+    this.cache = { controls: new Map(), rows: new Map() };
   }
 
   public async refresh(): Promise<void> {
@@ -88,10 +100,12 @@ class Edition8Controller {
           error: 'The Faktor service is not running. Start it to read the served state; the previous snapshot is preserved.',
         };
         this.post({ type: 'e8Error', message: this.state.error });
+        this.post({ type: 'e8Header', status: 'Service unavailable', level: 'error' });
         return;
       }
       const binding = this.deps.workspace();
       this.state = { ...this.state, loading: true };
+      this.post({ type: 'e8Header', status: 'Refreshing', level: 'waiting' });
       try {
         const snapshot = await backend.read({
           session: this.deps.session(),
@@ -108,12 +122,25 @@ class Edition8Controller {
           this.cache,
         );
         this.cache = diff.cache;
-        for (const patch of diff.patches) this.post(patch);
+        // Backpressure: a refresh can carry one patch per screen. Awaiting
+        // each post keeps a hidden/revealed WebviewView from dropping the
+        // batch (small header/notice messages would otherwise be the only
+        // ones to arrive).
+        // The webview dispatches on `type`; the diff rows carry the
+        // registry's `kind` discriminator. Add the wire tag explicitly so a
+        // patch is never silently ignored by the renderer.
+        for (const patch of diff.patches) await this.post({ type: 'e8Patch', ...patch });
+        this.post({
+          type: 'e8Header',
+          status: snapshot.stale ? 'Stale' : 'Ready',
+          level: snapshot.stale ? 'waiting' : 'quiet',
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.deps.output.appendLine(`edition8 refresh failed: ${message}`);
         this.state = { ...this.state, loading: false, error: message };
         this.post({ type: 'e8Error', message });
+        this.post({ type: 'e8Header', status: 'Refresh failed', level: 'error' });
       } finally {
         this.inFlight = null;
       }
@@ -127,9 +154,20 @@ class Edition8Controller {
     if (type === null) return;
     switch (type) {
       case 'e8Ready':
+        // The webview script only starts listening now. Any refresh that ran
+        // at view/panel resolve was posted into a document with no listener
+        // (or into the previous document after a re-render); its cache must
+        // not suppress the first complete patch set. Clearing it makes the
+        // ready handshake re-render every served row/control.
+        this.resetView();
         await this.refresh();
         return;
       case 'e8Refresh':
+        // An explicit refresh is also the recovery path for a document that
+        // missed earlier posts (hidden reveal, webview reload). Re-render the
+        // complete served state instead of trusting a cache the document
+        // never received.
+        this.resetView();
         await this.refresh();
         this.post({ type: 'e8Notice', message: 'Served state refreshed from the daemon.' });
         return;
@@ -294,21 +332,23 @@ export class Edition8Panel {
   ) {
     const initial = E8_SCREENS.some((entry) => entry.id === screen) ? screen : 'S29';
     this.controller = new Edition8Controller(deps, (message) => {
-      void this.panel.webview.postMessage(message);
+      return this.panel.webview.postMessage(message);
     }, (next) => {
       // Selection is a client-side view switch; re-rendering the whole
       // document would discard staged drafts and input focus.
       void next;
     });
-    panel.webview.html = this.render(initial);
+    // Register the message handler BEFORE handing the document to the
+    // webview: the script posts `e8Ready` as soon as it runs, and a gap here
+    // dropped that handshake (the panel then kept its initial empty rows).
     panel.webview.onDidReceiveMessage((message: PanelMessage) => {
       void this.controller.handle(message);
     });
+    panel.webview.html = this.render(initial);
     panel.onDidDispose(() => {
       this.controller.dispose();
       if (Edition8Panel.current === this) Edition8Panel.current = null;
     });
-    void this.controller.refresh();
   }
 
   private render(screen: string): string {
@@ -347,15 +387,24 @@ export class Edition8ViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
     };
     this.controller = new Edition8Controller(this.deps, (message) => {
-      void view.webview.postMessage(message);
+      return view.webview.postMessage(message);
     }, (screen) => {
       this.initialScreen = screen;
     });
-    view.webview.html = this.render(this.initialScreen);
+    // Handler before HTML: `e8Ready` is posted by the script immediately.
     view.webview.onDidReceiveMessage((message: PanelMessage) => {
       void this.controller?.handle(message);
     });
-    void this.controller.refresh();
+    view.webview.html = this.render(this.initialScreen);
+    // A WebviewView can be resolved while hidden; posts to a hidden document
+    // are not a durable replay buffer. On every reveal, invalidate the keyed
+    // cache so the visible document receives the complete served state (the
+    // snapshot itself is retained and never re-read here).
+    view.onDidChangeVisibility(() => {
+      if (view.visible !== true) return;
+      this.controller?.resetView();
+      void this.controller?.refresh();
+    });
   }
 
   public show(screen: string): void {

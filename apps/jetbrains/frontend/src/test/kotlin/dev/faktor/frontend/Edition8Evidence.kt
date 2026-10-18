@@ -23,6 +23,20 @@ import javax.swing.UIManager
 
 object Edition8Evidence {
 
+    private fun platformName(): String {
+        val os = System.getProperty("os.name").lowercase()
+        return when {
+            os.contains("mac") -> "macos"
+            os.contains("win") -> "windows"
+            else -> "linux"
+        }
+    }
+
+    private fun writeEvidence(root: File, name: String, text: String) {
+        File(root, "$name.raw.json").writeText(text)
+        File(root, "$name.${platformName()}.raw.json").writeText(text)
+    }
+
     private val failures = ArrayList<String>()
     private val themes = listOf("light", "dark", "high-contrast")
 
@@ -82,7 +96,7 @@ object Edition8Evidence {
                     )
                 }
             } catch (t: Throwable) {
-                failures.add("${screen.id} a11y build failed: ${t.message}")
+                failures.add("${screen.id} a11y build failed: ${t::class.java.name}: ${t.message} cause=${t.cause?.let { c -> "${c::class.java.name}: ${c.message}" }}")
             } finally {
                 host.shutdown()
             }
@@ -137,13 +151,18 @@ object Edition8Evidence {
             }
         }
 
+        val osLabel = "${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}"
+        val buildLabel = "OpenJDK ${System.getProperty("java.version")}"
         val opticalRoot = root()
-        File(opticalRoot, "optical-jetbrains.raw.json").writeText(
+        writeEvidence(opticalRoot, "optical-jetbrains", 
             JsonCodec.write(
                 JsonValue.Obj(
                     linkedMapOf(
                         "schema" to JsonValue.Str("faktor-edition8-optical/v1"),
                         "host" to JsonValue.Str("jetbrains"),
+                        "platform" to JsonValue.Str(platformName()),
+                        "os" to JsonValue.Str(osLabel),
+                        "build" to JsonValue.Str(buildLabel),
                         "method" to JsonValue.Str("FontMetrics cap-height vector against button box centre"),
                         "counts" to JsonValue.Obj(
                             linkedMapOf(
@@ -175,12 +194,15 @@ object Edition8Evidence {
         }
         if (contrastFailures > 0) failures.add("$contrastFailures Faktor-drawn contrast pairs below threshold")
         if (contrastPairs.size < 80) failures.add("contrast measured ${contrastPairs.size} pairs < 80")
-        File(opticalRoot, "contrast-jetbrains.raw.json").writeText(
+        writeEvidence(opticalRoot, "contrast-jetbrains", 
             JsonCodec.write(
                 JsonValue.Obj(
                     linkedMapOf(
                         "schema" to JsonValue.Str("faktor-edition8-contrast/v1"),
                         "host" to JsonValue.Str("jetbrains"),
+                        "platform" to JsonValue.Str(platformName()),
+                        "os" to JsonValue.Str(osLabel),
+                        "build" to JsonValue.Str(buildLabel),
                         "method" to JsonValue.Str("WCAG 2.2 AA from UIManager/component colours"),
                         "counts" to JsonValue.Obj(
                             linkedMapOf(
@@ -208,12 +230,15 @@ object Edition8Evidence {
             )
         )
 
-        File(opticalRoot, "assistive-jetbrains.raw.json").writeText(
+        writeEvidence(opticalRoot, "assistive-jetbrains", 
             JsonCodec.write(
                 JsonValue.Obj(
                     linkedMapOf(
                         "schema" to JsonValue.Str("faktor-edition8-assistive-host/v1"),
                         "host" to JsonValue.Str("jetbrains"),
+                        "platform" to JsonValue.Str(platformName()),
+                        "os" to JsonValue.Str(osLabel),
+                        "build" to JsonValue.Str(buildLabel),
                         "counts" to JsonValue.Obj(
                             linkedMapOf(
                                 "controls" to JsonValue.Int64(seenControls.size.toLong()),

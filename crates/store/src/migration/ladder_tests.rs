@@ -1274,11 +1274,13 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
             }
             // The v1 duplicates are recreated so the replay also has to drop
             // them again (the migration must be idempotent, not just additive).
-            // v35 is the hot-path index migration; start four steps back so
-            // later additive migrations (v36, v37, v38) do not skip it.
-            let prev_head = SCHEMA_HEAD - 4;
+            // v35 is the hot-path index migration. Start at its predecessor
+            // (v34) so every later additive migration (v36+) is also replayed;
+            // `SCHEMA_HEAD - N` silently skipped v35 once v39 moved the head.
+            let prev_head = 34;
             conn.execute_batch(&format!(
-                "CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event(session_id, seq);
+                "ALTER TABLE cost_reservation DROP COLUMN execution_class;
+                 CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event(session_id, seq);
                  CREATE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
                  PRAGMA user_version = {prev_head};"
             ))

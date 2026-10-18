@@ -61,6 +61,13 @@ pub struct PromptRequest {
     pub attachments: Vec<faktor_core::attachment::AttachmentId>,
     /// Per-run model override.
     pub model: Option<String>,
+    /// Per-run token cap ridden onto the run's durable task row and enforced
+    /// by the SAME budget path as an explicit task start. The ordinary
+    /// prompt path creates a task row, so a cap has a durable seam here; it
+    /// is never silently dropped.
+    pub max_tokens: Option<u64>,
+    /// Per-run monetary cap (micro-USD), enforced like `max_tokens`.
+    pub max_cost_micro: Option<u64>,
     /// Acceptance criteria ridden onto the run's durable task row.
     pub criteria: Vec<String>,
     /// The run's mutation policy. Legacy vocabulary only: the sole
@@ -203,6 +210,8 @@ impl PromptExecutionService {
             reserved_op_id: request.reserved_op_id,
             admission_digest: request.admission_digest,
             model: request.model,
+            max_tokens: request.max_tokens,
+            max_cost_micro: request.max_cost_micro,
             criteria: request.criteria,
             files: request.files,
             attachments: request.attachments,

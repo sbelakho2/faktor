@@ -715,6 +715,13 @@ impl AgentRuntime {
         settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
+        // Settlement is bound to the task identity this run was admitted
+        // under. A new chat prompt can start as soon as the TurnCompleted
+        // journal event below is visible, while this tail is still folding
+        // the row and applying the completion gate; re-reading the session's
+        // (now advanced) task id would settle the OLD turn into the NEXT
+        // task row.
+        let settlement_task_id = handle.task_id()?;
         // P0-2 remainder: generic-shell changes are attributed through the
         // durable `shell_change` facts, so a crash-resumed turn (or a live
         // settlement that could not open a workspace) still feeds its ACTUAL
@@ -786,7 +793,12 @@ impl AgentRuntime {
         // FINAL gate (after every durable refusal: budget, strict criteria)
         // drives the task-state machine and lands the completion proof.
         let mut gate = verdict.completion.clone();
-        let synced = self.sync_task_row(handle, ledger, verdict.criteria.as_deref())?;
+        let synced = self.sync_task_row(
+            handle,
+            settlement_task_id,
+            ledger,
+            verdict.criteria.as_deref(),
+        )?;
         if let Some(task) = &synced {
             if matches!(gate, Some(CompletionGate::VerifiedComplete)) && task_budget_exhausted(task)
             {
@@ -836,7 +848,7 @@ impl AgentRuntime {
                 changed_paths: turn_summary.files_changed.clone(),
                 ..Default::default()
             };
-            match handle.enforce_change_budget(handle.task_id()?, &observations) {
+            match handle.enforce_change_budget(settlement_task_id, &observations) {
                 Ok(()) => {}
                 Err(TaskError::ChangeBudgetRefused { violations, .. }) => {
                     gate = Some(CompletionGate::BlockedVerification {
@@ -939,7 +951,7 @@ impl AgentRuntime {
         // per-call verified feed and the next settlement retries the record
         // with the facts that exist.
         let pre_terminal = self
-            .session_task(handle)?
+            .session_task_bound(handle, settlement_task_id)?
             .is_some_and(|task| task.state.is_terminal());
         let mut terminal_facts: Option<TerminalRunFacts> = None;
         if !pre_terminal
@@ -980,8 +992,12 @@ impl AgentRuntime {
                 }
             }
         }
-        let gate_landed =
-            self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?;
+        let gate_landed = self.apply_gate_to_task_row_bound(
+            handle,
+            settlement_task_id,
+            gate.clone(),
+            verdict.proof.as_ref(),
+        )?;
         if let (Some(facts), Some(_refusal)) = (&terminal_facts, &gate_landed) {
             // The completion claim was refused AFTER the facts were
             // persisted: keep the terminal-turn facts TRUTHFUL — this
@@ -1017,7 +1033,7 @@ impl AgentRuntime {
             // conservatively AT its reserved estimate — the honest bound the
             // ledger already committed to. Idempotent; best-effort (a
             // finalize failure never rewinds the completion).
-            let task_id = handle.task_id()?;
+            let task_id = settlement_task_id;
             match self
                 .deps
                 .budgets
@@ -1124,7 +1140,7 @@ impl AgentRuntime {
             // persisted BEFORE the terminal transition — so the executor's
             // concurrent settlement produces the byte-identical row.
             let terminal = self
-                .session_task(handle)?
+                .session_task_bound(handle, settlement_task_id)?
                 .is_some_and(|task| task.state == TaskState::VerifiedComplete);
             // Single feed: the durable record's atomic append already
             // absorbed ITS samples (ours, or a concurrent winner's), so only
@@ -1574,9 +1590,9 @@ impl AgentRuntime {
                 );
             }
         };
-        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
-            Ok(w) => w,
-            Err(_) => {
+        let ws = match self.open_effective_workspace(handle) {
+            Some(w) => w,
+            None => {
                 return self.unverified_verdict(
                     handle,
                     changed,

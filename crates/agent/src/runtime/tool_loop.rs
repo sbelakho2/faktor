@@ -443,6 +443,7 @@ pub(crate) enum ToolActivationScan {
     /// scan could NOT prove the session's set. The safe inactive default
     /// applies and the exhaustion is emitted as a loud typed diagnostic —
     /// never a silent revert to inactive.
+    #[cfg_attr(not(test), allow(dead_code))]
     BoundExhausted,
     /// The durable read failed (already warned): the safe inactive default.
     ReadFailed,
@@ -675,12 +676,7 @@ impl AgentRuntime {
         // exactly where the original run executed.
         let root = self.deps.session.resolve_workspace_root(handle.id())?;
         let workspace = match &root {
-            Some(root) => self
-                .deps
-                .workspaces
-                .open(desc.workspace_id, root.clone())
-                .ok()
-                .map(Arc::new),
+            Some(_) => self.open_effective_workspace(handle).map(Arc::new),
             None => None,
         };
         let sandbox = match (&self.deps.sandbox, &root) {
@@ -878,15 +874,9 @@ impl AgentRuntime {
         // the session has no resolvable workspace the ctx carries None and
         // the tools error honestly.
         let row = handle.row()?;
-        let workspace_id = row.workspace_id;
         let root = self.deps.session.resolve_workspace_root(handle.id())?;
         let workspace = match &root {
-            Some(root) => self
-                .deps
-                .workspaces
-                .open(workspace_id, root.clone())
-                .ok()
-                .map(Arc::new),
+            Some(_) => self.open_effective_workspace(handle).map(Arc::new),
             None => None,
         };
         let sandbox = match (&self.deps.sandbox, &root) {

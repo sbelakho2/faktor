@@ -11,6 +11,7 @@
 
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { platform, release, arch } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { E8_SCREENS, E8_THEMES, renderScreenHtml } from './edition8/host.mjs';
@@ -19,6 +20,7 @@ import { connect, findChrome, launchChrome, sleep } from './render-webview.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..', '..');
 const OUT = resolve(ROOT, 'target/certification/edition8');
+const PLATFORM = platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux';
 const SAMPLE_SCREENS = ['S01', 'S14', 'S19', 'S22', 'S29', 'S34', 'S36', 'S54', 'S57', 'S58', 'S62', 'S65'];
 
 function sha(text) {
@@ -176,6 +178,8 @@ async function main() {
   const document = {
     schema: 'faktor-edition8-contrast/v1',
     host: 'vscode',
+    platform: PLATFORM,
+    os: `${platform()} ${release()} ${arch()}`,
     generated_at: new Date().toISOString(),
     method: 'WCAG 2.2 AA from rendered computed styles',
     counts: {
@@ -192,7 +196,9 @@ async function main() {
     digest: sha(JSON.stringify(unique)),
   };
   mkdirSync(OUT, { recursive: true });
-  writeFileSync(resolve(OUT, 'contrast-vscode.raw.json'), `${JSON.stringify(document, null, 2)}\n`);
+  const payload = `${JSON.stringify(document, null, 2)}\n`;
+  writeFileSync(resolve(OUT, `contrast-vscode.${PLATFORM}.raw.json`), payload);
+  writeFileSync(resolve(OUT, 'contrast-vscode.raw.json'), payload);
   for (const failure of failures.slice(0, 20)) {
     console.error(`FAIL ${failure.theme} ${failure.kind} ${failure.sample}: ${failure.ratio.toFixed(2)} < ${failure.required}`);
   }

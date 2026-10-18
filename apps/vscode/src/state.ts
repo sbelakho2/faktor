@@ -850,8 +850,17 @@ function boundTranscript(entries: TranscriptEntry[]): TranscriptEntry[] {
 
 /** Rebuild the transcript from a newest-first native message page. */
 export function transcriptFromMessages(messages: readonly Json[]): TranscriptEntry[] {
+  // Newest-first input: only the newest MAX_TRANSCRIPT_ENTRIES can survive
+  // `boundTranscript`, so never materialize entry objects for the rest. A
+  // 100k-message page fed by a hostile/legacy caller costs the same as a
+  // 500-message page (the previous loop built all 100k, then discarded
+  // 99.5% of them). Order is preserved: slice the newest prefix, then
+  // reverse it to oldest-to-newest exactly like the bounded result.
+  const newest = messages.length > MAX_TRANSCRIPT_ENTRIES
+    ? messages.slice(0, MAX_TRANSCRIPT_ENTRIES)
+    : messages;
   const entries: TranscriptEntry[] = [];
-  for (const raw of [...messages].reverse()) {
+  for (const raw of [...newest].reverse()) {
     const message = asObject(raw);
     if (!message) {
       continue;
@@ -862,7 +871,50 @@ export function transcriptFromMessages(messages: readonly Json[]): TranscriptEnt
     }
     entries.push(entryFromMessage(id, message));
   }
-  return boundTranscript(entries);
+  return boundTranscript(mergeCrossMessageToolResults(entries));
+}
+
+/**
+ * A denied call's durable result is written as its OWN assistant message
+ * (the denial path answers the model without re-opening the tool-call
+ * message). The renderer must still show ONE call with its refusal outcome,
+ * not a completed call plus an empty "(unnamed tool) exit 1" bubble. Merge
+ * by `toolCallId` across adjacent entries and drop a result-only message.
+ */
+function mergeCrossMessageToolResults(entries: readonly TranscriptEntry[]): TranscriptEntry[] {
+  const out = entries.map((entry) => ({ ...entry, tools: [...entry.tools] }));
+  const seen = new Map<string, { entry: number; tool: number }>();
+  const drop = new Set<number>();
+  for (let entryIndex = 0; entryIndex < out.length; entryIndex += 1) {
+    const kept: TranscriptTool[] = [];
+    for (const tool of out[entryIndex]!.tools) {
+      const prior = seen.get(tool.toolCallId);
+      if (prior !== undefined && prior.entry !== entryIndex) {
+        const target = out[prior.entry]!.tools[prior.tool]!;
+        out[prior.entry]!.tools[prior.tool] = {
+          ...target,
+          name: target.name.length > 0 ? target.name : tool.name,
+          excerpt: tool.excerpt ?? target.excerpt,
+          exitCode: tool.exitCode ?? target.exitCode,
+          artifact: tool.artifact ?? target.artifact,
+        };
+        continue;
+      }
+      seen.set(tool.toolCallId, { entry: entryIndex, tool: kept.length });
+      kept.push(tool);
+    }
+    out[entryIndex]!.tools = kept;
+    if (
+      kept.length === 0 &&
+      out[entryIndex]!.text.length === 0 &&
+      out[entryIndex]!.reasoning.length === 0 &&
+      out[entryIndex]!.summary.length === 0 &&
+      out[entryIndex]!.role === 'assistant'
+    ) {
+      drop.add(entryIndex);
+    }
+  }
+  return out.filter((_, index) => !drop.has(index));
 }
 
 /**

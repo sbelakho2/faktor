@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// Resolve the task identity a run was admitted under from its durable run
+/// linkage row. Legacy rows (written before the binding existed) fall back to
+/// the session's current identity. Never guesses a different task.
+pub(crate) fn settlement_task_id(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<faktor_core::TaskId, ExecError> {
+    if let Ok(Some(value)) = handle.memory_fact_get(TASK_RUN_ROW_KIND, run_id) {
+        if let Ok(row) = TaskRunRow::decode(&value) {
+            if let Some(task_id) = row.task_id {
+                return Ok(faktor_core::TaskId::new(task_id));
+            }
+        }
+    }
+    handle
+        .task_id()
+        .map_err(|e| ExecError::Internal(format!("task id read: {e}")))
+}
+
 impl TaskExecutor {
     // ------------------------------------------------- post-run settlement (P1)
 
@@ -18,14 +37,20 @@ impl TaskExecutor {
         self: &Arc<Self>,
         run: RunSettlement,
     ) -> Result<SettlementOutcome, ExecError> {
-        let (parent, run_id) = match &run {
-            RunSettlement::InSession { parent, run_id } => (*parent, run_id.clone()),
-            RunSettlement::Orchestrated { parent, run_id } => (*parent, run_id.clone()),
+        let (parent, run_id, bound_task) = match &run {
+            RunSettlement::InSession {
+                parent,
+                run_id,
+                task_id,
+            } => (*parent, run_id.clone(), *task_id),
+            RunSettlement::Orchestrated { parent, run_id } => (*parent, run_id.clone(), None),
         };
         let outcome = match run {
-            RunSettlement::InSession { parent, run_id } => {
-                self.settle_in_session(parent, run_id).await
-            }
+            RunSettlement::InSession {
+                parent,
+                run_id,
+                task_id,
+            } => self.settle_in_session(parent, run_id, task_id).await,
             RunSettlement::Orchestrated { parent, run_id } => {
                 self.settle_orchestrated(parent, run_id).await
             }
@@ -37,7 +62,7 @@ impl TaskExecutor {
         // its durable facts, with the router feed atomic in the store's
         // append transaction. A replay of the same settlement is a no-op
         // (an existing record short-circuits and never double-feeds).
-        self.record_terminal_run_outcome(parent, &run_id)?;
+        self.record_terminal_run_outcome(parent, &run_id, bound_task)?;
         Ok(outcome)
     }
 
@@ -64,14 +89,16 @@ impl TaskExecutor {
         &self,
         parent: SessionId,
         run_id: &str,
+        bound_task: Option<TaskId>,
     ) -> Result<(), ExecError> {
         let handle = self
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle
-            .task_id()
-            .map_err(|e| ExecError::Internal(format!("task id read: {e}")))?;
+        let task_id = match bound_task {
+            Some(task_id) => task_id,
+            None => settlement_task_id(&handle, &run_id)?,
+        };
         let task = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
@@ -216,6 +243,7 @@ impl TaskExecutor {
                 self.settle_run(RunSettlement::InSession {
                     parent,
                     run_id: run_id.clone(),
+                    task_id: None,
                 })
                 .await?
             }
@@ -331,12 +359,16 @@ impl TaskExecutor {
         self: &Arc<Self>,
         parent: SessionId,
         run_id: String,
+        bound_task: Option<TaskId>,
     ) -> Result<SettlementOutcome, ExecError> {
         let handle = self
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle.task_id()?;
+        let task_id = match bound_task {
+            Some(task_id) => task_id,
+            None => settlement_task_id(&handle, &run_id)?,
+        };
         if let Some(shadows) = self.shadows() {
             if let Some(row) = shadows.active_shadow(parent)? {
                 if row.state.is_live() {

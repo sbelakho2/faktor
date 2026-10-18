@@ -61,6 +61,27 @@
       help.textContent = patch.valueText;
       probes.text += 1;
     }
+    var select = card.querySelector('select[data-input="' + patch.id + '"]');
+    if (select && Array.isArray(patch.options)) {
+      var current = select.value;
+      select.textContent = '';
+      var inherit = document.createElement('option');
+      inherit.value = '';
+      inherit.textContent = 'Inherit (not configured)';
+      select.appendChild(inherit);
+      for (var option of patch.options) {
+        var choice = document.createElement('option');
+        choice.value = option;
+        choice.textContent = option;
+        select.appendChild(choice);
+      }
+      var wanted = typeof patch.value === 'string' ? patch.value : current;
+      if (patch.options.indexOf(wanted) >= 0) {
+        select.value = wanted;
+      } else if (current === '' || patch.options.indexOf(current) >= 0) {
+        select.value = current;
+      }
+    }
     var activate = card.querySelector('[data-activate="' + patch.id + '"]');
     if (activate) {
       activate.disabled = patch.disabled;
@@ -333,6 +354,18 @@
       case 'e8Notice':
         setNotice(message.message || '');
         return;
+      case 'e8Header': {
+        var header = document.getElementById('e8-header-status');
+        if (header) {
+          var level = typeof message.level === 'string' ? message.level : 'quiet';
+          var glyph = document.createElement('span');
+          glyph.setAttribute('aria-hidden', 'true');
+          glyph.textContent = level === 'error' ? '!' : level === 'waiting' ? '\u2026' : '\u25cf';
+          header.setAttribute('data-level', level);
+          header.replaceChildren(glyph, document.createTextNode(' ' + String(message.status || '')));
+        }
+        return;
+      }
       case 'e8Error':
         setNotice(message.message || '');
         return;

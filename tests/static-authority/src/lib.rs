@@ -7774,6 +7774,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/orchestrator/src/runtime_tests.rs", 5259),
         ("crates/provider/src/egress.rs", 5699),
         ("crates/scheduler/src/lib.rs", 4176),
+        // Rev8 History paging added the cursor/listing helpers and tests;
+        // split deferred (the ceiling test documents the exact count).
+        ("crates/store/src/sessions.rs", 4035),
     ];
 
     /// Every Rust source in scope for the ceiling: `crates/**` plus

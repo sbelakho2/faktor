@@ -1620,11 +1620,40 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        self.memory_facts_page_filtered(session_id, after, limit, None)
+    }
+
+    /// Newest-first page restricted to the typed V2 memory records. The
+    /// generic page is shared with high-churn internal facts (`taskexec_run`,
+    /// orchestrator steps); a V2 listing that filtered in Rust had to page
+    /// through every newer internal row on each turn (the 1,000-turn probe's
+    /// growing context-prep cost). The prefix predicate rides the
+    /// `(kind, session_id)` index, so the page is O(limit).
+    pub fn memory_facts_v2_page(
+        &self,
+        session_id: SessionId,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        self.memory_facts_page_filtered(session_id, after, limit, Some("memory_v2:"))
+    }
+
+    fn memory_facts_page_filtered(
+        &self,
+        session_id: SessionId,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+        kind_prefix: Option<&str>,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
         let conn = self.read()?;
         let mut sql = String::from(
             "SELECT kind, key, value, updated_ms FROM memory_fact
              WHERE session_id = ?1",
         );
+        if let Some(prefix) = kind_prefix {
+            // Trusted, compile-time prefix (never user input).
+            sql.push_str(&format!(" AND kind LIKE '{prefix}%'"));
+        }
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(5);
         params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
         if let Some((ms, kind, key)) = after {

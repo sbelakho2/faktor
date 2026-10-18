@@ -121,6 +121,16 @@
       label: 'Checking the change',
       copy: 'Required results remain attached to this candidate.',
     },
+    unverified: {
+      glyph: '!',
+      label: 'Verification needed',
+      copy: 'The change has no admitted verification result yet.',
+    },
+    providerFailed: {
+      glyph: '!',
+      label: 'Run needs recovery',
+      copy: 'The durable run is preserved as recoverable. Read the error, then send the task again; nothing was marked complete.',
+    },
     cancelled: {
       glyph: '\u2298',
       label: 'Run cancelled',
@@ -1968,7 +1978,14 @@
     if (value === 'cancelled' || value === 'canceled') {
       return 'cancelled';
     }
-    if (value === 'waiting' || value === 'pending' || value === 'paused' || value === 'blocked') {
+    if (
+      value === 'waiting' ||
+      value === 'pending' ||
+      value === 'paused' ||
+      value === 'blocked' ||
+      value === 'verifying' ||
+      value === 'needs_verification'
+    ) {
       return 'waiting';
     }
     return 'unknown';
@@ -2038,6 +2055,13 @@
     var newest = runs.length > 0 ? runs[0] : null;
     var runState =
       newest && newest.state != null ? String(newest.state).trim().toLowerCase() : '';
+    var machineState =
+      snapshot && snapshot.machineState != null
+        ? String(snapshot.machineState).trim().toLowerCase()
+        : '';
+    if (machineState === 'failed_recoverable' || machineState === 'failed') {
+      return RUN_STATES.providerFailed;
+    }
     if (runState === 'cancelled') {
       return RUN_STATES.cancelled;
     }
@@ -2049,8 +2073,20 @@
     )
       .trim()
       .toLowerCase();
-    if (proofState === 'verifying' || proofState === 'needs_verification') {
+    if (proofState === 'verifying') {
       return RUN_STATES.checking;
+    }
+    if (proofState === 'needs_verification') {
+      return RUN_STATES.unverified;
+    }
+    if (runState === 'verifying') {
+      return RUN_STATES.checking;
+    }
+    if (runState === 'needs_verification') {
+      return RUN_STATES.unverified;
+    }
+    if (runState === 'blocked' || runState === 'waiting' || runState === 'pending') {
+      return RUN_STATES.needsInput;
     }
     if (runState === 'running') {
       return RUN_STATES.running;
@@ -4137,6 +4173,16 @@
     }
     if (state === 'running' || state === 'in_progress' || state === 'pending' || state === 'validating') {
       return { tone: 'run', label: label };
+    }
+    // `completed` on a tool_call part means the MODEL finished emitting the
+    // call, not that the tool ran. Without a result (no exit code, no
+    // excerpt) the call was denied/cancelled/still waiting; never paint it
+    // green as "done".
+    var hasResult =
+      (typeof tool.excerpt === 'string' && tool.excerpt.length > 0) ||
+      (tool.artifact !== null && tool.artifact !== undefined);
+    if ((state === 'completed' || state === 'done') && !hasResult) {
+      return { tone: 'neutral', label: 'requested' };
     }
     if (state === 'completed' || state === 'done') {
       return { tone: 'pass', label: 'done' };

@@ -753,6 +753,18 @@ async fn execute_compaction(
             "no compactable history",
         );
     }
+    if before <= 1 {
+        // One token (or less) cannot be reduced by any positive ratio and
+        // `clamp(1, before - 1)` would panic on an inverted range. This is a
+        // typed refusal, not a daemon panic: the operation is terminal
+        // `failed` with the durable reason.
+        return finish_failed_with(
+            handle,
+            operation_id,
+            "empty_context",
+            "history is too small to compact",
+        );
+    }
     let target = target_tokens.unwrap_or_else(|| {
         let keep = ((before as f64) * (1.0 - min_reduction)).floor() as i64;
         keep.clamp(1, before - 1)

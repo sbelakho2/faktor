@@ -64,19 +64,27 @@ function fontFingerprint() {
 }
 
 function cells() {
-  const rows = [];
+  // A cell is identified by screen/theme/width/zoom/fixture. The state
+  // fixtures include `ready`, and the theme matrix already renders
+  // dark-modern/320/1/ready; emitting it twice wrote two records for one
+  // key (the baseline map silently kept the last) and made the reported
+  // cell count disagree with the number of screenshots. Dedupe by key.
+  const rows = new Map();
   for (const screen of E8_SCREENS) {
     for (const theme of THEMES) {
       for (const width of WIDTHS) {
-        rows.push({ screen: screen.id, theme, width, zoom: 1, fixture: 'ready' });
+        const row = { screen: screen.id, theme, width, zoom: 1, fixture: 'ready' };
+        rows.set(`${row.screen}/${row.theme}/${row.width}/${row.zoom}/${row.fixture}`, row);
       }
-      rows.push({ screen: screen.id, theme, width: 320, zoom: 2, fixture: 'ready' });
+      const zoomed = { screen: screen.id, theme, width: 320, zoom: 2, fixture: 'ready' };
+      rows.set(`${zoomed.screen}/${zoomed.theme}/${zoomed.width}/${zoomed.zoom}/${zoomed.fixture}`, zoomed);
     }
     for (const fixture of E8_FIXTURE_CLASSES) {
-      rows.push({ screen: screen.id, theme: 'dark-modern', width: 320, zoom: 1, fixture });
+      const row = { screen: screen.id, theme: 'dark-modern', width: 320, zoom: 1, fixture };
+      rows.set(`${row.screen}/${row.theme}/${row.width}/${row.zoom}/${row.fixture}`, row);
     }
   }
-  return rows;
+  return [...rows.values()];
 }
 
 async function evaluate(cdp, expression) {
@@ -226,8 +234,14 @@ async function main() {
     },
     failures,
   };
+  // Bind the certificate to the exact records it consumed. A per-platform
+  // copy is written as well, so a macOS run cannot overwrite the Linux
+  // evidence another lane produced.
+  raw.sha256 = sha(JSON.stringify({ platform: PLATFORM, manifest: raw.manifest, checks: raw.checks }));
   mkdirSync(OUT, { recursive: true });
-  writeFileSync(resolve(OUT, 'visual-platforms-vscode.raw.json'), `${JSON.stringify(raw, null, 2)}\n`);
+  const payload = `${JSON.stringify(raw, null, 2)}\n`;
+  writeFileSync(resolve(OUT, `visual-platforms-vscode.${PLATFORM}.raw.json`), payload);
+  writeFileSync(resolve(OUT, 'visual-platforms-vscode.raw.json'), payload);
   for (const failure of failures.slice(0, 50)) console.error(`FAIL ${failure}`);
   console.log(
     `edition8 visual vscode: ${records.length} cells (${E8_SCREENS.length} screens x ${THEMES.length} themes x ${WIDTHS.length} widths + 200% + 8 states); ${failures.length} failures ` +

@@ -1198,6 +1198,13 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         rows INTEGER NOT NULL,
         PRIMARY KEY (session_id, table_name)
      );",
+    // v39 — History paging. The global (workspace-unscoped) session listing
+    // orders by `updated_ms DESC` and pages with a `(updated_ms, id)` cursor;
+    // without this index the listing read sorted every session row (2,000+
+    // conversations) before the HTTP page cap could apply. The composite
+    // workspace index already serves the per-workspace listing.
+    "CREATE INDEX IF NOT EXISTS idx_session_updated_id
+        ON session(updated_ms DESC, id DESC);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

@@ -3960,6 +3960,22 @@ export class NativeClient {
     });
   }
 
+  /**
+   * The two READ-ONLY catalog routes that predate the `/native/` namespace
+   * (`GET /models`, `GET /capabilities`). They are the daemon's own catalog
+   * contract and are still served at those exact paths; the Edition 8
+   * surfaces read them through this ONE narrow allowlist instead of
+   * bypassing the native-path guard for every route. Non-allowlisted paths
+   * stay refused typed, exactly like `edition5Json`.
+   */
+  legacyCatalogJson<T>(
+    method: 'GET',
+    path: '/models' | '/capabilities',
+    validate: (json: Json, path: string) => T,
+  ): Promise<T> {
+    return this.request(method, path, { validate });
+  }
+
   health(): Promise<NativeHealth> {
     return this.request('GET', '/native/health', { validate: validateHealth });
   }

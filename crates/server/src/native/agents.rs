@@ -895,21 +895,28 @@ pub(crate) fn native_agents_body(
     // grouping, plus a scan per child row lookup and per child result).
     let index = FactIndex::new(&facts);
 
-    let push_run = |runs: &mut Vec<String>, run: &str| {
-        if !runs.iter().any(|r| r == run) {
-            runs.push(run.to_string());
-        }
-    };
+    // Dedupe in ONE hash pass. The historical `runs.iter().any(...)` made
+    // this O(runs^2) for a long-lived session: 2,000 durable runs meant ~2M
+    // string comparisons per /native/agents or /task-runs read. Insertion
+    // order is still the fact order; the vectors are sorted below anyway.
+    let mut seen_in_session: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_orchestrated: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut in_session: Vec<String> = Vec::new();
     let mut orchestrated: Vec<String> = Vec::new();
+    let push_run =
+        |runs: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, run: &str| {
+            if seen.insert(run.to_string()) {
+                runs.push(run.to_string());
+            }
+        };
     for (kind, key, _) in &facts {
         match kind.as_str() {
-            TASK_RUN_ROW_KIND => push_run(&mut in_session, key),
-            ORCH_PLAN_KIND => push_run(&mut orchestrated, key),
+            TASK_RUN_ROW_KIND => push_run(&mut in_session, &mut seen_in_session, key),
+            ORCH_PLAN_KIND => push_run(&mut orchestrated, &mut seen_orchestrated, key),
             ORCH_REGISTRY_KIND => {
                 if let Some(run) = key.rsplit_once('/').map(|(r, _c)| r) {
                     if !run.is_empty() {
-                        push_run(&mut orchestrated, run);
+                        push_run(&mut orchestrated, &mut seen_orchestrated, run);
                     }
                 }
             }

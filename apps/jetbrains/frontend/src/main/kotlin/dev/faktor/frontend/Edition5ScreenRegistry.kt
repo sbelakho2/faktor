@@ -63,6 +63,7 @@ internal object Edition5ScreenRegistry {
                 "Edition 5 ${screen.cluster.name.lowercase()} screen with ${screen.controls.size} controls."
             )
             installEdition5Accessibility(component, screen.id)
+            installScrollButtonAccessibility(component)
         }
     }
 

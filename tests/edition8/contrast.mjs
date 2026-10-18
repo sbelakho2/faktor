@@ -34,6 +34,21 @@ for (const [host, document] of [['vscode', vscode], ['jetbrains', jetbrains]]) {
     themes: [...new Set((document.pairs ?? []).map((pair) => pair.theme))].length,
   };
 }
+const platforms = {};
+for (const host of ['vscode', 'jetbrains']) {
+  for (const platformName of ['linux', 'macos', 'windows']) {
+    const document = read(`contrast-${host}.${platformName}.raw.json`);
+    if (document === null) continue;
+    const failed = document.counts?.faktor_drawn_failures ?? 0;
+    platforms[`${host}:${platformName}`] = {
+      measured_pairs: document.counts?.measured_pairs ?? document.counts?.pairs ?? 0,
+      faktor_drawn_failures: failed,
+      host_default_findings: document.counts?.host_default_failures ?? 0,
+    };
+    if (failed !== 0) problems.push(`${host}/${platformName}: ${failed} Faktor-drawn pairs below threshold`);
+    if (document.platform !== platformName) problems.push(`${host}/${platformName} evidence is labelled ${String(document.platform)}`);
+  }
+}
 const measured = Object.values(findings).reduce((total, entry) => total + entry.measured_pairs, 0);
 if (measured < 80) problems.push(`measured ${measured} distinct pairs < 80`);
 const document = {
@@ -49,6 +64,7 @@ const document = {
     hosts: Object.keys(findings).length,
   },
   findings,
+  platforms,
   failures: problems,
 };
 mkdirSync(OUT, { recursive: true });

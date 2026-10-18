@@ -252,6 +252,127 @@ object EdtWorkHarness {
         report["history.noopEvents"] = "0"
         report["history.oneRowEvents"] = historyEvents.toString()
 
+        // ---------------------------------------- 100k transcript paging
+        // 100,000 durable messages loaded in 200-message pages through the
+        // PRODUCTION TranscriptSink (400k-char / 4k-line budget). Pages are
+        // folded in chronological order (older page first, oldest row first),
+        // which is the sink's render contract: a paged read must never make
+        // the host materialize the whole transcript, every page is one
+        // bounded flush, the document stays inside its budget, and the
+        // retained suffix is the NEWEST one.
+        val totalMessages = 100_000
+        val pageSize = 200
+        val pageFill = "x".repeat(32)
+        val pageArea = JTextArea()
+        val pageSink = TranscriptSink(pageArea, null, UiWorkMetrics(), 400_000, 4_000)
+        var pages = 0
+        var maxDocument = 0
+        val pageStart = System.nanoTime()
+        for (page in 0 until totalMessages / pageSize) {
+            val first = page * pageSize
+            for (index in first until first + pageSize) {
+                pageSink.appendMessage("assistant", "message-$index $pageFill", index.toLong() + 1L)
+            }
+            pageSink.flush()
+            maxDocument = maxOf(maxDocument, pageArea.document.length)
+            check(pageArea.document.length <= 400_000) {
+                "transcript exceeded its char budget: ${pageArea.document.length}"
+            }
+            check(pageArea.document.length > 0) { "page $page produced no document" }
+            pages += 1
+        }
+        val pageElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - pageStart)
+        check(pages == totalMessages / pageSize) { "pages $pages" }
+        check(pageArea.text.trimEnd().endsWith("message-99999 $pageFill")) {
+            "newest message was not retained"
+        }
+        check(!pageArea.text.contains("message-0 ")) { "the oldest message must be trimmed" }
+        check(pageElapsedMs < 300_000) { "100k paging took ${pageElapsedMs}ms" }
+        report["scale.messages"] = totalMessages.toString()
+        report["scale.pages"] = pages.toString()
+        report["scale.pageMs"] = pageElapsedMs.toString()
+        report["scale.maxDocumentChars"] = maxDocument.toString()
+        report["scale.newestRetained"] = "message-99999"
+
+        // 16 concurrent session sinks: no cross-session bleed, each bounded.
+        val concurrentSessions = 16
+        val perSession = 1_000
+        val areas = Array(concurrentSessions) { JTextArea() }
+        val sinks = Array(concurrentSessions) { session ->
+            TranscriptSink(areas[session], null, UiWorkMetrics(), 64_000, 1_000)
+        }
+        val concurrentStart = System.nanoTime()
+        for (round in 0 until perSession) {
+            for (session in 0 until concurrentSessions) {
+                sinks[session].append("s$session-delta-$round ")
+                if (round % 100 == 99) sinks[session].flush()
+            }
+        }
+        sinks.forEach { it.flush() }
+        val concurrentElapsedMs =
+            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - concurrentStart)
+        areas.forEachIndexed { session, area ->
+            check(area.document.length <= 64_000) {
+                "session $session exceeded its budget: ${area.document.length}"
+            }
+            check(area.text.contains("s$session-delta-${perSession - 1}")) {
+                "session $session lost its newest delta"
+            }
+            for (other in 0 until concurrentSessions) {
+                if (other != session) {
+                    check(!area.text.contains("s$other-delta-")) {
+                        "session $session saw session $other's deltas"
+                    }
+                }
+            }
+        }
+        check(concurrentElapsedMs < 10_000) { "16 sessions took ${concurrentElapsedMs}ms" }
+        report["scale.concurrentSessions"] = concurrentSessions.toString()
+        report["scale.concurrentDeltas"] = (concurrentSessions * perSession).toString()
+        report["scale.concurrentMs"] = concurrentElapsedMs.toString()
+
+        // 2,000-session History: the production panel renders the whole list
+        // with keyed sync, an identical refresh is a no-op (no reset), and a
+        // one-row change fires exactly one event.
+        val largeHistory = HistoryPanel()
+        val manySessions = (0 until 2_000).map { index ->
+            NativeSessionSummary(
+                "h$index",
+                "history conversation $index",
+                "p1",
+                "m",
+                if (index % 3 == 0) "done" else "idle",
+                index.toLong()
+            )
+        }
+        largeHistory.update(manySessions, "h0")
+        check(largeHistory.totalCount() == 2_000 && largeHistory.count() == 2_000) {
+            "history projection ${largeHistory.totalCount()}/${largeHistory.count()}"
+        }
+        var largeHistoryEvents = 0
+        largeHistory.listForTest().model.addListDataListener(object : ListDataListener {
+            override fun intervalAdded(e: ListDataEvent) { largeHistoryEvents++ }
+            override fun intervalRemoved(e: ListDataEvent) { largeHistoryEvents++ }
+            override fun contentsChanged(e: ListDataEvent) { largeHistoryEvents++ }
+        })
+        val historyStart = System.nanoTime()
+        largeHistory.update(manySessions, "h0")
+        val historyElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - historyStart)
+        check(largeHistoryEvents == 0) { "identical 2k history refresh fired $largeHistoryEvents events" }
+        val renamed = manySessions.toMutableList().also { it[1_500] = it[1_500].copy(title = "renamed") }
+        val beforeLabel = largeHistory.label(1_500)
+        largeHistory.update(renamed, "h0")
+        check(largeHistory.label(1_500).contains("renamed")) {
+            "history row did not update: before=$beforeLabel after=${largeHistory.label(1_500)}"
+        }
+        check(largeHistoryEvents == 1) {
+            "one changed history row must fire one event, got $largeHistoryEvents (label=${largeHistory.label(1_500)})"
+        }
+        report["scale.historySessions"] = "2000"
+        report["scale.historyNoopEvents"] = "0"
+        report["scale.historyOneRowEvents"] = "1"
+        report["scale.historyMs"] = historyElapsedMs.toString()
+
         // ------------------------------------------------------ money cache
         FormattedValues.clear()
         val values = (1..TABLE_ROWS).map { BigInteger.valueOf(it.toLong() * 1_000_003L) }

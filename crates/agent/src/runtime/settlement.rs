@@ -561,10 +561,8 @@ impl AgentRuntime {
             .ok()
             .flatten()
             .ok_or_else(|| "session workspace root unresolvable".to_string())?;
-        self.deps
-            .workspaces
-            .open(row.workspace_id, root.clone())
-            .map_err(|e| format!("workspace could not be opened: {e}"))?;
+        self.open_effective_workspace(handle)
+            .ok_or_else(|| "workspace could not be opened".to_string())?;
         let attempt = handle
             .current_verification_attempt(row.task_id.raw())
             .map_err(|e| format!("verification attempt read: {e}"))?
@@ -706,9 +704,9 @@ impl AgentRuntime {
             }
         };
 
-        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
-            Ok(w) => w,
-            Err(_) => {
+        let ws = match self.open_effective_workspace(handle) {
+            Some(w) => w,
+            None => {
                 return self.verification_pending_verdict(
                     handle,
                     &[],
@@ -1098,15 +1096,27 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> faktor_core::Result<Option<Task>> {
+        let task_id = handle.task_id()?;
+        self.session_task_bound(handle, task_id)
+    }
+
+    /// The task row THIS drive is settling, bound at the drive's start. A
+    /// chat prompt that starts while the previous turn's settlement is still
+    /// running advances the session's task identity; re-reading
+    /// `handle.task_id()` here would fold the old turn's goal, criteria,
+    /// spend and completion gate into the NEXT task row (and could mark it
+    /// terminal before its first provider call). Settlement always targets
+    /// the identity the run was admitted under.
+    pub(crate) fn session_task_bound(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+    ) -> faktor_core::Result<Option<Task>> {
         let mut tasks = handle.list_tasks()?;
-        if tasks.is_empty() {
+        let Some(pos) = tasks.iter().position(|t| t.task_id == task_id) else {
             return Ok(None);
-        }
-        let preferred = handle.task_id()?;
-        if let Some(pos) = tasks.iter().position(|t| t.task_id == preferred) {
-            return Ok(Some(tasks.remove(pos)));
-        }
-        Ok(Some(tasks.remove(0)))
+        };
+        Ok(Some(tasks.remove(pos)))
     }
 
     /// Best-effort variant for INFALLIBLE rebuild/verdict paths whose
@@ -1265,13 +1275,13 @@ impl AgentRuntime {
     pub(crate) fn sync_task_row(
         &self,
         handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
         ledger: &TaskLedger,
         criteria: Option<&[String]>,
     ) -> faktor_core::Result<Option<Task>> {
-        let mut task = match self.session_task(handle)? {
+        let mut task = match self.session_task_bound(handle, task_id)? {
             Some(t) => t,
             None => {
-                let task_id = handle.task_id()?;
                 let now = handle.now_ms();
                 handle.create_task(Task {
                     task_id,
@@ -1426,16 +1436,30 @@ impl AgentRuntime {
     /// per-attempt record is still landed as evidence), a Failed/Cancelled
     /// row refuses every gate (a typed-refusal downgrade is returned for a
     /// VerifiedComplete request — the runtime never force-writes completion).
+    #[cfg(test)]
     pub(crate) fn apply_gate_to_task_row(
         &self,
         handle: &faktor_session::SessionHandle,
         gate: Option<CompletionGate>,
         proof: Option<&VerificationProof>,
     ) -> faktor_core::Result<Option<CompletionGate>> {
+        let task_id = handle.task_id()?;
+        self.apply_gate_to_task_row_bound(handle, task_id, gate, proof)
+    }
+
+    /// [`AgentRuntime::apply_gate_to_task_row`] bound to the task identity
+    /// the drive was admitted under (see [`AgentRuntime::session_task_bound`]).
+    pub(crate) fn apply_gate_to_task_row_bound(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        gate: Option<CompletionGate>,
+        proof: Option<&VerificationProof>,
+    ) -> faktor_core::Result<Option<CompletionGate>> {
         let Some(gate) = gate else {
             return Ok(None); // no completion claim this turn: nothing to drive
         };
-        let Some(task) = self.session_task(handle)? else {
+        let Some(task) = self.session_task_bound(handle, task_id)? else {
             return Ok(None); // no row (content sync created none): nothing to drive
         };
         let task_id = task.task_id;

@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { NativeApiError, NativeClient } from '../src/nativeClient.ts';
 import { commandCall } from '../src/edition5/commands.ts';
 import { E8_SCREENS, renderScreenHtml } from './edition8/host.mjs';
+import { loadEdition8Snapshot } from '../src/edition8/source.ts';
 import { E8_WORKFLOWS } from '../src/generated/edition8Registry.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -108,6 +109,44 @@ await flow('provider-config', async () => {
   const match = catalog.find((entry) => entry.provider === 'p1' && entry.model === 'm');
   if (!match) throw new Error('the configured p1/m is not visible to the host');
   return `catalog exposes p1/m (source ${match.source})`;
+});
+
+await flow('prompt-budget-admission', async () => {
+  // A per-run budget on the ordinary prompt path must ride the durable task
+  // row the executor seeds, not be refused as malformed. The old refusal
+  // made the composer's per-run budget a dead control.
+  const started = await client.startTaskRun(sessionId, {
+    goal: 'budget admission probe',
+    submission_id: randomUUID(),
+    max_tokens: 1,
+  });
+  if (typeof started.run_id !== 'string' || started.run_id.length === 0) {
+    throw new Error('budgeted prompt did not return a run id');
+  }
+  const settled = await cancelUnlessSettled(started.run_id);
+  return `admitted ${started.run_id}; ${settled}`;
+});
+
+await flow('edition8-live-snapshot', async () => {
+  const snapshot = await loadEdition8Snapshot(client, {
+    session: sessionId,
+    workspace,
+    worktree: null,
+    daemon: baseUrl,
+    generation: null,
+    previous: null,
+  });
+  if (!Array.isArray(snapshot.models)) throw new Error('live snapshot.models is not an array');
+  if (!snapshot.models.some((entry) => entry && entry.provider === 'p1' && entry.model === 'm')) {
+    throw new Error('live snapshot does not carry the configured p1/m');
+  }
+  if (snapshot.sources.models?.state !== 'ready') {
+    throw new Error(`live snapshot models source is ${snapshot.sources.models?.state}: ${snapshot.sources.models?.error}`);
+  }
+  if (snapshot.sources.capabilities?.state !== 'ready') {
+    throw new Error(`live snapshot capabilities source is ${snapshot.sources.capabilities?.state}: ${snapshot.sources.capabilities?.error}`);
+  }
+  return `models=${snapshot.models.length}; models/capabilities read through the catalog allowlist`;
 });
 
 await flow('rev8-field-contracts', async () => {

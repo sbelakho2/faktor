@@ -3635,3 +3635,29 @@ mod tests {
         );
     }
 }
+
+/// Scale probe regression: every shadowed turn opens a NEW root under the
+/// session's durable workspace id. The registry must stay bounded (one
+/// watcher thread per cached root), while still allowing the durable root and
+/// the live shadow root to coexist.
+#[test]
+fn cached_workspace_roots_are_hard_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    // A one-millisecond registration deadline forces the deterministic
+    // degraded (no-watcher) path: the test is about the REGISTRY bound, not
+    // the platform watcher backend's latency.
+    let service =
+        WorkspaceFileService::with_watch_registration_deadline(std::time::Duration::from_millis(1));
+    let id = faktor_core::id::WorkspaceId::new(7);
+    for i in 0..(crate::workspace_service::MAX_CACHED_ROOTS * 3) {
+        let root = dir.path().join(format!("shadow-{i}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let handle = service.open(id, root).unwrap();
+        assert_eq!(handle.workspace_id(), id);
+    }
+    assert!(
+        service.open_count() <= crate::workspace_service::MAX_CACHED_ROOTS,
+        "cached roots must not grow with turn count: {}",
+        service.open_count()
+    );
+}

@@ -1401,16 +1401,7 @@ impl AgentRuntime {
             return false;
         };
         let mut any = false;
-        let workspace = (|| {
-            let row = handle.row().ok()?;
-            let root = self
-                .deps
-                .session
-                .resolve_workspace_root(handle.id())
-                .ok()
-                .flatten()?;
-            self.deps.workspaces.open(row.workspace_id, root).ok()
-        })();
+        let workspace = (|| self.open_effective_workspace(handle))();
         for row in rows {
             let Some(envelope) = &row.pre_manifest else {
                 continue;

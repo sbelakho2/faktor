@@ -43,6 +43,7 @@ export const GATES = Object.freeze({
   'copy-retention': { kind: 'copy-retention', host: 'both' },
   assistive: { kind: 'assistive', host: 'both' },
   perf: { kind: 'perf', host: 'both' },
+  scale: { kind: 'scale', host: 'both' },
   dogfood: { kind: 'dogfood', host: 'both' },
   certificate: { kind: 'certificate', host: 'both' },
 });
@@ -183,6 +184,14 @@ export function writeSummary({ requireDogfood = false, allowUnreviewedPlatform =
       passed_gates: required.filter((name) => gates[name]?.status === 'passed').length,
       optional_gates_present: Object.keys(GATES).filter((name) => !required.includes(name) && gates[name]?.status === 'passed').length,
       ...(readGate('visual-platforms')?.counts ?? {}),
+      // Explicit certificate axes: platforms certified from their OWN render
+      // (macOS + Linux, both hosts), platform boundaries left typed, and the
+      // AT contracts that remain typed because no real screen-reader session
+      // ran. These are counts, never claims.
+      platforms_certified: readGate('visual-platforms')?.counts?.certified ?? 0,
+      platforms_typed: readGate('visual-platforms')?.counts?.not_certified ?? 0,
+      at_certified: readGate('assistive')?.detail?.at_certified ?? 0,
+      at_typed_boundaries: readGate('assistive')?.detail?.at_not_certified ?? 0,
     },
     status,
     missing_gates: missing,
@@ -413,7 +422,7 @@ export function verifyGates({ allowDirty = false, requireDogfood = false, allowU
 
   const perf = docs.perf;
   if (perf) {
-    requireCount(perf, 'workloads', 7, 'workloads', problems);
+    requireCount(perf, 'workloads', 9, 'workloads', problems);
     requireCount(perf, 'failed', 0, 'failed', problems);
     requireCount(perf, 'baseline_present', 1, 'baseline present', problems);
     const budget = perf.detail?.budget ?? {};

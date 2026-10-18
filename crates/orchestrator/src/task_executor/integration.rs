@@ -709,10 +709,18 @@ impl TaskExecutor {
     /// conflict awaits the user's drift resolution), a BOUNDED watcher
     /// re-runs the decision on the next poll instead of leaving the shadow
     /// live forever.
-    pub(super) async fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
+    pub(super) async fn after_shadowed_drive(
+        self: &Arc<Self>,
+        parent: SessionId,
+        task_id: Option<TaskId>,
+    ) {
         let run_id = format!("tx-session-{}", parent.raw());
         match self
-            .settle_run(RunSettlement::InSession { parent, run_id })
+            .settle_run(RunSettlement::InSession {
+                parent,
+                run_id,
+                task_id,
+            })
             .await
         {
             Ok(outcome) => {
@@ -721,7 +729,7 @@ impl TaskExecutor {
                     Some(ShadowFinalizeAction::Retained)
                         | Some(ShadowFinalizeAction::IntegrationBlocked)
                 ) {
-                    self.watch_shadow_settle(parent);
+                    self.watch_shadow_settle(parent, task_id);
                 }
             }
             Err(e) => eprintln!("shadowed-run settlement failed for session {parent}: {e}"),
@@ -881,7 +889,11 @@ impl TaskExecutor {
     /// start. Every decision stays on the durable rows (settlement is
     /// per-state idempotent), so a crash of the watcher is recovered by the
     /// next run's deterministic settlement.
-    pub(super) fn watch_shadow_settle(self: &Arc<Self>, parent: SessionId) {
+    pub(super) fn watch_shadow_settle(
+        self: &Arc<Self>,
+        parent: SessionId,
+        task_id: Option<TaskId>,
+    ) {
         let exec = self.clone();
         // Registry-owned watcher (audit spawn ownership): never a dropped
         // JoinHandle. A shut-down registry refuses the watcher — the durable
@@ -900,9 +912,26 @@ impl TaskExecutor {
                     if Instant::now() >= deadline {
                         return;
                     }
+                    // A retired/discarded shadow (or one whose directory is
+                    // already gone) has nothing left to watch. Retrying the
+                    // canonical-tree read for 120s produced a stale-shadow
+                    // error storm in the 1,000-turn probed run.
+                    let live = exec
+                        .shadows()
+                        .and_then(|shadows| shadows.active_shadow(parent).ok().flatten());
+                    let Some(live) = live else {
+                        return;
+                    };
+                    if live.state.is_live() && !std::path::Path::new(&live.root).exists() {
+                        return;
+                    }
                     let run_id = format!("tx-session-{}", parent.raw());
                     match exec
-                        .settle_run(RunSettlement::InSession { parent, run_id })
+                        .settle_run(RunSettlement::InSession {
+                            parent,
+                            run_id,
+                            task_id,
+                        })
                         .await
                     {
                         Ok(outcome)
@@ -1020,7 +1049,11 @@ impl TaskExecutor {
         // The terminal cancel is the run's ledger boundary: its ONE
         // engineering-outcome row is recorded now (the in-session identity
         // the post-drive settlement re-uses; a later settle is a no-op).
-        self.record_terminal_run_outcome(parent, &faktor_agent::session_terminal_run_id(parent))?;
+        self.record_terminal_run_outcome(
+            parent,
+            &faktor_agent::session_terminal_run_id(parent),
+            None,
+        )?;
         Ok(())
     }
 
@@ -1080,7 +1113,7 @@ impl TaskExecutor {
         }
         // The root task row is terminal: the run's ONE engineering-outcome
         // row is recorded now (a later settlement pass re-uses it verbatim).
-        self.record_terminal_run_outcome(handle.id(), run_id)?;
+        self.record_terminal_run_outcome(handle.id(), run_id, None)?;
         Ok(())
     }
 

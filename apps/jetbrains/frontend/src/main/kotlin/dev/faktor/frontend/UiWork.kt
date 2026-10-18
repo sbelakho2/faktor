@@ -795,6 +795,29 @@ internal fun <T : JComponent> T.a11y(name: String, description: String? = null):
 }
 
 /**
+ * Name the Metal LAF's scrollbar arrow buttons. They are real interactive
+ * controls in the component tree (a screen reader reaches them), but the LAF
+ * creates them without an accessible name, so every scrollable screen failed
+ * the Linux headful audit. Naming them is a product accessibility fix, not a
+ * test exemption: direction is the only thing the control does.
+ */
+internal fun installScrollButtonAccessibility(component: java.awt.Component) {
+    if (component is javax.swing.plaf.metal.MetalScrollButton) {
+        val label = when (component.direction) {
+            javax.swing.SwingConstants.NORTH -> "Scroll up"
+            javax.swing.SwingConstants.SOUTH -> "Scroll down"
+            javax.swing.SwingConstants.EAST -> "Scroll right"
+            javax.swing.SwingConstants.WEST -> "Scroll left"
+            else -> "Scroll"
+        }
+        component.a11y(label, "Scrolls the surrounding view.")
+    }
+    if (component is java.awt.Container) {
+        for (child in component.components) installScrollButtonAccessibility(child)
+    }
+}
+
+/**
  * The Enter/Space activation stroke for lists and choosers: the focused
  * component activates its primary action with the keyboard, exactly like a
  * click. Installed with WHEN_FOCUSED so typing in a text field is untouched.

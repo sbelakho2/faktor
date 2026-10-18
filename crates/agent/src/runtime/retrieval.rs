@@ -1529,13 +1529,9 @@ impl AgentRuntime {
         // session's EFFECTIVE root — the live shadow root while a shadowed
         // drive runs (the turn must read the world it mutates), else the
         // stored workspace root byte-identically.
-        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
-            Ok(Some(r)) => r,
-            _ => return (String::new(), String::new()),
-        };
-        let ws = match self.deps.workspaces.open(row.workspace_id, root) {
-            Ok(w) => w,
-            Err(_) => return (String::new(), String::new()),
+        let ws = match self.open_effective_workspace(handle) {
+            Some(w) => w,
+            None => return (String::new(), String::new()),
         };
         // Project rules: AGENTS.md at the canonical root, bounded.
         let mut rules = ws
@@ -1765,86 +1761,51 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> ToolActivationLoad {
-        let mut cursor: Option<(i64, String, String)> = None;
-        for _ in 0..TOOL_ACTIVATION_MAX_PAGES {
-            let page = match handle.memory_facts_page(cursor.as_ref(), TOOL_ACTIVATION_PAGE) {
-                Ok(page) => page,
-                Err(error) => {
+        // Point lookup by (kind, key). The old newest-first PAGE WALK made
+        // every turn scan the internal fact churn written since the durable
+        // activation fact (taskexec/orchestrator rows, ~3 per turn): context
+        // prep grew with turn count and, past the page bound, silently lost
+        // a valid activation (`BoundExhausted` -> inactive). The `(kind,
+        // session_id)` index makes this O(1) regardless of churn.
+        match handle.memory_fact_get(TOOL_ACTIVATION_FACT_KIND, TOOL_ACTIVATION_FACT_KEY) {
+            Ok(Some(value)) => {
+                // Authority law: a corrupt durable activation value is an
+                // UNREADABLE read, never an empty (inactive) set: the typed
+                // `ReadFailed` scan is the refusal, exactly like a failed
+                // store read.
+                let Ok(names) = serde_json::from_str::<Vec<String>>(&value) else {
                     tracing::warn!(
                         session = %handle.id(),
-                        "tool activation read failed: {error}"
+                        "tool activation fact is corrupt; treating the read as failed"
                     );
                     return ToolActivationLoad {
                         set: ToolActivationSet::new(),
                         scan: ToolActivationScan::ReadFailed,
                     };
+                };
+                let mut set = ToolActivationSet::new();
+                for name in names {
+                    set.activate(name);
                 }
-            };
-            for (kind, key, value) in &page.facts {
-                if kind == TOOL_ACTIVATION_FACT_KIND && key == TOOL_ACTIVATION_FACT_KEY {
-                    // Authority law: a corrupt durable activation value is an
-                    // UNREADABLE read, never an empty (inactive) set: the
-                    // typed `ReadFailed` scan is the refusal, exactly like a
-                    // failed store read above.
-                    let Ok(names) = serde_json::from_str::<Vec<String>>(value) else {
-                        tracing::warn!(
-                            session = %handle.id(),
-                            "tool activation fact is corrupt; treating the read as failed"
-                        );
-                        return ToolActivationLoad {
-                            set: ToolActivationSet::new(),
-                            scan: ToolActivationScan::ReadFailed,
-                        };
-                    };
-                    let mut set = ToolActivationSet::new();
-                    for name in names {
-                        set.activate(name);
-                    }
-                    return ToolActivationLoad {
-                        set,
-                        scan: ToolActivationScan::Found,
-                    };
+                ToolActivationLoad {
+                    set,
+                    scan: ToolActivationScan::Found,
                 }
             }
-            match page.cursor {
-                Some(next) if page.has_more => cursor = Some(next),
-                // The walk reached the end of the fact table: the absence is
-                // decisive, the session is genuinely fresh (or explicitly
-                // deactivated) and the empty set is the truth.
-                _ => {
-                    return ToolActivationLoad {
-                        set: ToolActivationSet::new(),
-                        scan: ToolActivationScan::Absent,
-                    };
-                }
-            }
-        }
-        // Bound exhausted and the last page still had older rows: the scan
-        // cannot prove the set. Keep the safe inactive default but make the
-        // degradation LOUD (a durable activation older than the window must
-        // never be silently reverted to inactive) and expose the same typed
-        // event to tests.
-        tracing::error!(
-            session = %handle.id(),
-            pages = TOOL_ACTIVATION_MAX_PAGES,
-            page_size = TOOL_ACTIVATION_PAGE,
-            "tool activation scan bound exhausted without a decisive fact; falling back to the \
-             safe inactive default (an activation fact older than the {}x{} newest-first window \
-             is not applied this turn)",
-            TOOL_ACTIVATION_MAX_PAGES,
-            TOOL_ACTIVATION_PAGE,
-        );
-        #[cfg(test)]
-        activation_scan_diagnostics_tests::record(
-            self.deps.session.store().root(),
-            activation_scan_diagnostics_tests::Diagnostic::BoundExhausted {
-                pages: TOOL_ACTIVATION_MAX_PAGES,
-                page_size: TOOL_ACTIVATION_PAGE,
+            Ok(None) => ToolActivationLoad {
+                set: ToolActivationSet::new(),
+                scan: ToolActivationScan::Absent,
             },
-        );
-        ToolActivationLoad {
-            set: ToolActivationSet::new(),
-            scan: ToolActivationScan::BoundExhausted,
+            Err(error) => {
+                tracing::warn!(
+                    session = %handle.id(),
+                    "tool activation read failed: {error}"
+                );
+                ToolActivationLoad {
+                    set: ToolActivationSet::new(),
+                    scan: ToolActivationScan::ReadFailed,
+                }
+            }
         }
     }
 

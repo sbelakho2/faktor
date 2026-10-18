@@ -1597,6 +1597,7 @@ pub(crate) async fn settle_run_converges_after_the_commit_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-commit-seam".into(),
+            task_id: None,
         })
         .await
         .unwrap();
@@ -1689,6 +1690,7 @@ pub(crate) async fn settle_run_converges_after_the_push_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-push-seam".into(),
+            task_id: None,
         })
         .await
         .unwrap();
@@ -1772,6 +1774,7 @@ pub(crate) async fn settle_run_converges_after_the_pr_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-pr-seam".into(),
+            task_id: None,
         })
         .await
         .unwrap();
@@ -1790,6 +1793,7 @@ pub(crate) async fn settle_run_converges_after_the_pr_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-pr-seam".into(),
+            task_id: None,
         })
         .await
         .unwrap();

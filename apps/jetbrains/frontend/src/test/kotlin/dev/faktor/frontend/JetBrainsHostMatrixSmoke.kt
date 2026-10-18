@@ -829,20 +829,31 @@ object JetBrainsHostMatrixSmoke {
         val existing = readJsonFile(path)
         val platformNames = listOf("linux", "macos", "windows")
         if (write) {
+            // Write ONLY this platform's digests from THIS render. The old
+            // writer copied the current platform's digests onto every
+            // platform entry, which is exactly the inherited-macOS-digest
+            // defect the Edition-8 certification forbids. Other platforms
+            // are preserved byte-for-byte.
             val platforms = LinkedHashMap<String, JsonValue>()
+            val existingPlatforms = existing?.view("existing")?.optionalField("platforms")
             for (name in platformNames) {
-                platforms[name] = JsonValue.Obj(
-                    linkedMapOf(
-                        "environment" to JsonValue.Str("${name}-normalized-edition8-digest"),
-                        "reviewed" to JsonValue.Bool(true),
-                        "themes" to JsonValue.Arr(
-                            listOf("light", "dark", "high-contrast").map { JsonValue.Str(it) }
-                        ),
-                        "widths" to JsonValue.Arr(WIDTHS.map { JsonValue.Int64(it.toLong()) }),
-                        "zooms" to JsonValue.Arr(listOf(100, 125, 200).map { JsonValue.Int64(it.toLong()) }),
-                        "digests" to JsonValue.Obj(digests.mapValues { JsonValue.Str(it.value) })
+                if (name == platform) {
+                    platforms[name] = JsonValue.Obj(
+                        linkedMapOf(
+                            "environment" to JsonValue.Str("${name}-normalized-edition8-digest"),
+                            "reviewed" to JsonValue.Bool(true),
+                            "themes" to JsonValue.Arr(
+                                listOf("light", "dark", "high-contrast").map { JsonValue.Str(it) }
+                            ),
+                            "widths" to JsonValue.Arr(WIDTHS.map { JsonValue.Int64(it.toLong()) }),
+                            "zooms" to JsonValue.Arr(listOf(100, 125, 200).map { JsonValue.Int64(it.toLong()) }),
+                            "digests" to JsonValue.Obj(digests.mapValues { JsonValue.Str(it.value) })
+                        )
                     )
-                )
+                } else {
+                    val preserved = existingPlatforms?.optionalField(name)?.value
+                    if (preserved != null) platforms[name] = preserved
+                }
             }
             Files.write(
                 path.toPath(),

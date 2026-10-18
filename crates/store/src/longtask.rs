@@ -374,11 +374,35 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        self.workspace_memory_facts_page_filtered(workspace_id, after, limit, None)
+    }
+
+    /// Newest-first page restricted to typed V2 workspace memory records;
+    /// see `memory_facts_v2_page` for why the filter must ride SQL.
+    pub fn workspace_memory_facts_v2_page(
+        &self,
+        workspace_id: u64,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        self.workspace_memory_facts_page_filtered(workspace_id, after, limit, Some("memory_v2:"))
+    }
+
+    fn workspace_memory_facts_page_filtered(
+        &self,
+        workspace_id: u64,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+        kind_prefix: Option<&str>,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
         let conn = self.read()?;
         let mut sql = String::from(
             "SELECT kind, key, value, updated_ms FROM workspace_memory_fact
              WHERE workspace_id = ?1",
         );
+        if let Some(prefix) = kind_prefix {
+            sql.push_str(&format!(" AND kind LIKE '{prefix}%'"));
+        }
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(5);
         params.push(rusqlite::types::Value::Integer(workspace_id as i64));
         if let Some((ms, kind, key)) = after {

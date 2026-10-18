@@ -369,29 +369,60 @@ pub(crate) async fn native_transcript_search(
         .search_messages(handle.id(), &q.q, limit)
     {
         Ok(rows) => {
-            let matches: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|row| {
-                    let text = row
-                        .data
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let lower = text.to_ascii_lowercase();
-                    let needle = q.q.to_ascii_lowercase();
-                    let offset = lower.find(&needle).unwrap_or(0);
-                    let before = text[..offset].len();
-                    serde_json::json!({
-                        "seq": row.seq,
-                        "messageId": row.id,
-                        "role": row.role,
-                        "createdMs": row.created_ms,
-                        "snippet": text.chars().skip(before.saturating_sub(80)).take(240).collect::<String>(),
-                        "matchOffset": offset,
-                        "textLength": text.len(),
-                    })
-                })
-                .collect();
+            let needle = q.q.to_ascii_lowercase();
+            // A match may live in `message.data` (user prompts) or in a part
+            // row (`text`/`reasoning`/`tool_result`), which is where every
+            // assistant answer is stored. The snippet must quote the row that
+            // actually matched, not an empty assistant envelope. Part reads
+            // are bounded to this page (never the whole transcript) and a
+            // read failure fails the page loudly instead of guessing text.
+            let mut matches: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut text = row
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !text.to_ascii_lowercase().contains(&needle) {
+                    let parts = match state.deps.session.store().parts_of(row.id) {
+                        Ok(parts) => parts,
+                        Err(e) => return api_err(&store_err_to_core(e)),
+                    };
+                    text = parts
+                        .iter()
+                        .filter_map(|part| {
+                            let body = &part.data;
+                            let candidate = body
+                                .get("text")
+                                .or_else(|| body.get("excerpt"))
+                                .or_else(|| body.get("output"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| body.to_string());
+                            candidate
+                                .to_ascii_lowercase()
+                                .contains(&needle)
+                                .then_some(candidate)
+                        })
+                        .next()
+                        .unwrap_or_else(|| row.data.to_string());
+                }
+                let lower = text.to_ascii_lowercase();
+                let offset = lower.find(&needle).unwrap_or(0);
+                // `offset` is a byte index; skip CHARS, not bytes, so a
+                // Unicode prefix cannot split the snippet.
+                let before_chars = text[..offset].chars().count();
+                matches.push(serde_json::json!({
+                    "seq": row.seq,
+                    "messageId": row.id,
+                    "role": row.role,
+                    "createdMs": row.created_ms,
+                    "snippet": text.chars().skip(before_chars.saturating_sub(80)).take(240).collect::<String>(),
+                    "matchOffset": offset,
+                    "textLength": text.len(),
+                }));
+            }
             Json(serde_json::json!({
                 "sessionId": handle.id().to_string(),
                 "query": q.q,
@@ -1424,6 +1455,12 @@ pub(crate) struct NativeSkillQuery {
     q: Option<String>,
     #[serde(default)]
     session: Option<String>,
+    /// Bounded page size for DISCOVERED skills (default 500, max 500).
+    /// Installed records are already bounded at 500. The response declares
+    /// `discoveredTotal`/`hasMore` so a 500-skill workspace is never a
+    /// silent 200-skill lie (the old hardcoded `.take(200)` was).
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 /// `GET /native/skills?q=&session=` — installed trusted records plus
@@ -1449,6 +1486,9 @@ pub(crate) async fn native_skills(
         Err(e) => return foundation_error(e),
     };
     let needle = q.q.as_deref().unwrap_or("").to_ascii_lowercase();
+    let discovered_limit = q.limit.unwrap_or(500).clamp(1, 500) as usize;
+    let mut discovered_total: u64 = 0;
+    let mut discovered_truncated = false;
     let mut installed: Vec<serde_json::Value> = records
         .iter()
         .filter(|r| {
@@ -1481,12 +1521,17 @@ pub(crate) async fn native_skills(
         if let Ok(Some(root)) = state.deps.session.resolve_workspace_root(handle.id()) {
             let registry = SkillRegistry::discover(&root);
             let installed_names: BTreeSet<&str> = records.iter().map(|r| r.name.as_str()).collect();
-            let discovered: Vec<serde_json::Value> = registry
+            let candidates: Vec<&faktor_instructions::SkillMeta> = registry
                 .entries()
                 .iter()
                 .filter(|e| !installed_names.contains(e.name.as_str()))
                 .filter(|e| needle.is_empty() || e.name.to_ascii_lowercase().contains(&needle))
-                .take(200)
+                .collect();
+            discovered_total = candidates.len() as u64;
+            discovered_truncated = candidates.len() > discovered_limit;
+            let discovered: Vec<serde_json::Value> = candidates
+                .into_iter()
+                .take(discovered_limit)
                 .map(|e| {
                     serde_json::json!({
                         "name": e.name,
@@ -1503,7 +1548,12 @@ pub(crate) async fn native_skills(
             }
         }
     }
-    Json(serde_json::json!({ "skills": installed })).into_response()
+    Json(serde_json::json!({
+        "skills": installed,
+        "discoveredTotal": discovered_total,
+        "hasMore": discovered_truncated,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]

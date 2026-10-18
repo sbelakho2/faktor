@@ -17,6 +17,15 @@ const WATCH_REGISTRATION_QUEUE_DEPTH: usize = 2;
 /// recursive watcher backend. Above this the service degrades to fingerprint
 /// reconciliation instead of risking an unbounded recursive walk.
 pub(crate) const DEFAULT_WATCH_PREFLIGHT_ENTRIES: usize = 50_000;
+
+/// Hard bound on CACHED (workspace_id, root) handles. A durable workspace id
+/// legitimately has several roots (its real root plus the live shadow root of
+/// an active drive), but every shadowed turn resolves a NEW shadow root; an
+/// unbounded registry cached one watcher thread per turn forever (the
+/// 1,000-turn probe accumulated >500 FSEvents threads). Eviction only drops
+/// the registry's strong ref: a handle still in use by a turn keeps its
+/// watcher until that clone drops.
+pub(crate) const MAX_CACHED_ROOTS: usize = 64;
 const WATCH_PREFLIGHT_MAX_DEPTH: usize = 64;
 
 /// Bounded, symlink-safe preflight walk through the ANCHORED root (audit
@@ -353,7 +362,17 @@ impl WorkspaceFileService {
             )));
         }
         let handle = self.build_handle(workspace_id, root.clone())?;
-        recover_lock(&self.workspaces).insert((workspace_id, root), handle.clone());
+        let mut workspaces = recover_lock(&self.workspaces);
+        if workspaces.len() >= MAX_CACHED_ROOTS {
+            let evict = workspaces
+                .keys()
+                .find(|(id, cached)| *id != workspace_id || *cached != root)
+                .cloned();
+            if let Some(evict) = evict {
+                workspaces.remove(&evict);
+            }
+        }
+        workspaces.insert((workspace_id, root), handle.clone());
         Ok(handle)
     }
 

@@ -647,7 +647,10 @@ export class Edition8Client implements E8Backend {
       }
     }
     try {
-      const raw = await this.native.edition5Json<Json>(route.method, route.path, body, (value) => value);
+      const raw =
+        route.method === 'GET' && (route.path === '/models' || route.path === '/capabilities')
+          ? await this.native.legacyCatalogJson('GET', route.path, (value) => value)
+          : await this.native.edition5Json<Json>(route.method, route.path, body, (value) => value);
       const ok = booleanOf(raw, 'ok') ?? (booleanOf(raw, 'deleted') === true ? true : booleanOf(raw, 'applied') ?? true);
       return {
         ok,

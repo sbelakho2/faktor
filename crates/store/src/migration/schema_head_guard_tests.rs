@@ -174,15 +174,15 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
         1,
         "an open that migrates nothing must not snapshot"
     );
-    // Rewind one step: the reopen must snapshot the EXACT predecessor
-    // (previous head: no session-deletion tombstone) before applying the
-    // head step.
+    // Rewind to the v38 predecessor: the reopen must snapshot the EXACT
+    // predecessor (no session-deletion tombstone) before applying v38 and
+    // every later step. `SCHEMA_HEAD - 1` moved past v38 when v39 landed.
+    const TOMBSTONE_PREDECESSOR: i64 = 37;
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(&format!(
             "DROP TABLE IF EXISTS session_deletion;
-                 PRAGMA user_version = {};",
-            SCHEMA_HEAD - 1
+                 PRAGMA user_version = {TOMBSTONE_PREDECESSOR};"
         ))
         .unwrap();
     }
@@ -199,10 +199,10 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .contains(&format!(".pre-migration-v{}-", SCHEMA_HEAD - 1))
+                .contains(&format!(".pre-migration-v{TOMBSTONE_PREDECESSOR}-"))
         })
         .expect("the pending migration must write its predecessor restore point");
-    assert_verified_restore_point(&newest, SCHEMA_HEAD - 1);
+    assert_verified_restore_point(&newest, TOMBSTONE_PREDECESSOR);
     let snapshot =
         Connection::open_with_flags(&newest, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let pre_table: i64 = snapshot

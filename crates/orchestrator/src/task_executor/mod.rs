@@ -349,6 +349,12 @@ pub struct TaskRunRow {
     /// runs and legacy rows (field-level serde default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_digest: Option<String>,
+    /// The task identity this run was admitted under. Settlement binds to
+    /// THIS id: a new chat prompt may advance the session's current task
+    /// while an earlier run is still settling, and settling the earlier run
+    /// into the new row would fold its goal/spend/gate across tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u64>,
 }
 
 impl TaskRunRow {
@@ -974,7 +980,14 @@ pub enum RunSettlement {
     /// gate (the exact single-agent ordering, preserved); settlement
     /// executes the accepted contract's requested steps (idempotently) and
     /// then finalizes the run's shadow. `run_id` is carried for reporting.
-    InSession { parent: SessionId, run_id: String },
+    InSession {
+        parent: SessionId,
+        run_id: String,
+        /// Task identity captured when the drive was admitted. Settlement
+        /// binds to it so a still-running tail cannot fold into the NEXT
+        /// task row after a new prompt advances the session identity.
+        task_id: Option<TaskId>,
+    },
     /// A multi-item orchestrated run: settlement folds the run's children
     /// into the ROOT task's aggregate deterministic verification (the
     /// tournament-style derived check set over the parent's criteria, never
@@ -2728,6 +2741,7 @@ impl TaskExecutor {
             budget_max_tokens: req.max_tokens,
             created_ms: now,
             submission_digest: admission_digest,
+            task_id: Some(task_id.raw()),
         };
         put_run_row(handle, &run_id, &row)?;
         // P0 no-op policy: the run's disposition is durable BEFORE the drive
@@ -2771,7 +2785,7 @@ impl TaskExecutor {
                 // here (the runtime gate arms a live runner or this spawns a
                 // fresh one — exactly one drive ever claims the head).
                 exec.kick_pending_queue(parent);
-                exec.after_shadowed_drive(parent).await;
+                exec.after_shadowed_drive(parent, None).await;
             });
             if !spawned {
                 return Err(ExecError::Conflict(format!(
@@ -2827,7 +2841,7 @@ impl TaskExecutor {
                     // runtime gate; a dead one is replaced here. A shut-down
                     // registry leaves the row pending for recovery.
                     exec.kick_pending_queue(parent);
-                    exec.after_shadowed_drive(parent).await;
+                    exec.after_shadowed_drive(parent, Some(task_id)).await;
                 });
                 if !spawned {
                     return Err(ExecError::Conflict(format!(
@@ -2910,6 +2924,7 @@ impl TaskExecutor {
             budget_max_tokens: req.max_tokens,
             created_ms: handle.now_ms(),
             submission_digest: admission_digest,
+            task_id: handle.task_id().ok().map(|t| t.raw()),
         };
         put_run_row(handle, &run_id, &row)?;
         // Acceptance: the refused-isolation run is durably admitted (prompt,
@@ -3356,6 +3371,8 @@ impl TaskExecutor {
 mod integration;
 mod recovery;
 mod settlement;
+#[cfg(test)]
+pub(crate) use settlement::settlement_task_id;
 mod verification;
 pub use recovery::*;
 pub use verification::*;
