@@ -1590,7 +1590,11 @@ impl TerminalService {
         if from_scratch {
             entry.terminals.clear();
         }
-        let after = if from_scratch { None } else { Some(entry.watermark) };
+        let after = if from_scratch {
+            None
+        } else {
+            Some(entry.watermark)
+        };
         let records = handle
             .ledger_terminal_rows(after)
             .map_err(|e| TerminalServiceError::Refused(e.message))?;
