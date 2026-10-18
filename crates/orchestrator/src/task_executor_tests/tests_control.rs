@@ -154,10 +154,14 @@ pub(crate) fn settlement_modules_never_read_the_lazy_current_task_identity() {
             let Some(col) = line.find(".task_id()") else {
                 continue;
             };
-            let annotated = line[..col].contains("allowed-task-id-read:")
-                || index
-                    .checked_sub(1)
-                    .is_some_and(|prev| lines[prev].contains("allowed-task-id-read:"));
+            let mut annotated = line[..col].contains("allowed-task-id-read:");
+            // The justification may span a multi-line comment directly
+            // above the read; scan that contiguous comment block.
+            let mut above = index;
+            while !annotated && above > 0 && lines[above - 1].trim_start().starts_with("//") {
+                above -= 1;
+                annotated = lines[above].contains("allowed-task-id-read:");
+            }
             assert!(
                 annotated,
                 "{name}:{}: lazy `task_id()` read in a settlement module (bind the \

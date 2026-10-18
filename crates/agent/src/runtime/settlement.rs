@@ -443,8 +443,8 @@ impl AgentRuntime {
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-        // allowed-task-id-read: admission-time budget seed; the caller has no
-        // run binding and no settlement is in flight for this session.
+        // The caller has no run binding and no settlement is in flight.
+        // allowed-task-id-read: admission-time budget seed.
         let task_id = handle.task_id()?;
         let now = handle.now_ms();
         let mut seed = match handle.get_task(task_id)? {
