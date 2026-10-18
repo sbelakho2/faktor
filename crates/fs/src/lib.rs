@@ -3642,8 +3642,11 @@ mod tests {
 #[test]
 fn in_use_durable_root_is_never_evicted_by_shadow_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let service =
-        WorkspaceFileService::with_watch_registration_deadline(std::time::Duration::from_millis(1));
+    // No watcher registrations: the preflight cap of zero forces the
+    // deterministic degraded path, so this cache probe cannot occupy the
+    // singleton registration worker (and cannot slow the parallel watcher
+    // tests).
+    let service = WorkspaceFileService::with_watch_preflight_entries(0);
     let id = faktor_core::id::WorkspaceId::new(7);
     let durable_root = dir.path().join("durable");
     std::fs::create_dir_all(&durable_root).unwrap();
@@ -3680,11 +3683,12 @@ fn in_use_durable_root_is_never_evicted_by_shadow_churn() {
 #[test]
 fn cached_workspace_roots_are_hard_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    // A one-millisecond registration deadline forces the deterministic
-    // degraded (no-watcher) path: the test is about the REGISTRY bound, not
-    // the platform watcher backend's latency.
-    let service =
-        WorkspaceFileService::with_watch_registration_deadline(std::time::Duration::from_millis(1));
+    // A zero-entry preflight forces the deterministic degraded (no-watcher)
+    // path WITHOUT enqueueing registrations on the singleton worker: the
+    // test is about the REGISTRY bound, not the platform watcher backend's
+    // latency, and a 192-deep registration flood would starve the parallel
+    // watcher tests.
+    let service = WorkspaceFileService::with_watch_preflight_entries(0);
     let id = faktor_core::id::WorkspaceId::new(7);
     for i in 0..(crate::workspace_service::MAX_CACHED_ROOTS * 3) {
         let root = dir.path().join(format!("shadow-{i}"));
