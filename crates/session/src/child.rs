@@ -608,7 +608,8 @@ impl SessionHandle {
         let mut rows = Vec::new();
         let mut after: Option<(i64, String, String)> = None;
         for _ in 0..MAX_CONTROL_PAGES {
-            let page = self.memory_facts_by_kind_page(ROW_KIND_CONTROL, after.as_ref(), CONTROL_PAGE)?;
+            let page =
+                self.memory_facts_by_kind_page(ROW_KIND_CONTROL, after.as_ref(), CONTROL_PAGE)?;
             for (_, key, value) in &page.facts {
                 let Some(seq) = parse_ctl_key(key) else {
                     return Err(SessionError::Internal(format!(
@@ -799,15 +800,51 @@ mod tests {
             .iter()
             .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
             .collect();
-        _m.store()
-            .upsert_memory_facts(s.id(), &refs)
-            .unwrap();
+        _m.store().upsert_memory_facts(s.id(), &refs).unwrap();
         let rows = s.orchestrator_ctl_all().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].control, ChildControl::Pause);
         assert!(
             s.orchestrator_child_identity_get().unwrap().is_some(),
             "the identity point lookup must survive fact churn"
+        );
+    }
+
+    /// Report row 3: a hostile row space (more control rows than the page
+    /// bound can walk) is refused TYPED — never a silently truncated queue
+    /// that drops the newest controls.
+    #[test]
+    fn hostile_control_row_space_refuses_typed_never_truncates() {
+        let (_d, m, s) = fixture();
+        // 25 pages x 200 rows = 5,000; the 5,001st row is unreachable
+        // under the bound, so the read must refuse instead of returning
+        // the first 5,000 as if they were the whole queue.
+        let total = (CONTROL_PAGE as usize) * MAX_CONTROL_PAGES + 1;
+        let rows: Vec<(String, String, String)> = (1..=total as u64)
+            .map(|seq| {
+                (
+                    ROW_KIND_CONTROL.to_string(),
+                    ctl_key(seq),
+                    serde_json::to_string(&ControlRow {
+                        seq,
+                        control: ChildControl::Pause,
+                        created_ms: 0,
+                        applied_ms: None,
+                    })
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        m.store().upsert_memory_facts(s.id(), &refs).unwrap();
+        let err = s.orchestrator_ctl_all().unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing a partial control read"),
+            "the read must refuse typed: {message}"
         );
     }
 

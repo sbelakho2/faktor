@@ -22,6 +22,22 @@ pub struct MemoryFactRow {
 /// the same window.
 pub type MemoryFactCursor = (i64, String, String);
 
+/// Exclusive upper bound of the half-open byte range that contains exactly
+/// the rows whose `kind` starts with `prefix`.
+///
+/// SQLite's default BINARY collation compares TEXT bytewise, so
+/// `kind >= '<prefix>' AND kind < '<prefix_end>'` is the exact, literal
+/// prefix predicate. The previous `kind LIKE '<prefix>%'` was
+/// case-insensitive for ASCII, treated `_` as a single-character wildcard
+/// and could not use the `(session_id, kind, key)` index. Prefixes are
+/// compile-time constants, never user input.
+pub(crate) fn kind_prefix_end(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    let last = bytes.pop().expect("memory kind prefixes are non-empty");
+    bytes.push(last.saturating_add(1));
+    String::from_utf8(bytes).expect("memory kind prefixes are ASCII")
+}
+
 /// [`Store::journal_session_problems`] depth: `Open` is the bounded projection check
 /// (point reads plus ONE covering-index aggregate); `Deep` adds the adjacent-inversion
 /// timestamp aggregate the doctor sweep runs. Both never materialize the journal.
@@ -1651,8 +1667,11 @@ impl Store {
              WHERE session_id = ?1",
         );
         if let Some(prefix) = kind_prefix {
-            // Trusted, compile-time prefix (never user input).
-            sql.push_str(&format!(" AND kind LIKE '{prefix}%'"));
+            // Trusted, compile-time prefix (never user input). The half-open
+            // byte range is the exact literal prefix and rides the
+            // `(session_id, kind, key)` index (a LIKE pattern did neither).
+            let end = kind_prefix_end(prefix);
+            sql.push_str(&format!(" AND kind >= '{prefix}' AND kind < '{end}'"));
         }
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(5);
         params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));

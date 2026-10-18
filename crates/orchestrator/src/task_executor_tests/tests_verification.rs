@@ -1710,6 +1710,14 @@ pub(crate) async fn remote_completion_settles_a_self_verified_read_only_result()
         updated_ms: now,
     })
     .unwrap();
+    // The placement-time task binding a real remote placement writes (the
+    // no-task-id completion resolves THIS row, never the current identity).
+    h.upsert_memory_fact(
+        crate::runtime::task_executor::RUN_POLICY_ROW_KIND,
+        "job_remote_1",
+        &serde_json::json!({ "task_id": task_id.raw() }).to_string(),
+    )
+    .unwrap();
     let outcome = env
         .executor
         .complete_remote_run(remote_completion(

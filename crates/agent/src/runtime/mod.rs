@@ -176,10 +176,6 @@ mod compaction_tests;
 mod verification_attribution_tests;
 
 #[cfg(test)]
-#[path = "activation_scan_diagnostics_tests.rs"]
-mod activation_scan_diagnostics_tests;
-
-#[cfg(test)]
 #[path = "durable_faults_tests.rs"]
 mod durable_faults_tests;
 

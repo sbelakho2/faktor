@@ -196,6 +196,9 @@ impl<'a> TurnDriveState<'a> {
         // and becomes the planning model of the next one; there is no
         // fallback: every routing failure is typed and terminal.
         let provider = rt.provider_for(handle)?;
+        // allowed-task-id-read: drive-start binding. The identity is captured
+        // ONCE here, before any turn work; the whole settlement tail uses this
+        // captured id and never re-reads the session's current identity.
         let task_id = handle.task_id()?;
         let routed_decision: Option<RouteDecision> = None;
         let override_active = model_override.is_some();
@@ -410,6 +413,7 @@ impl AgentRuntime {
             self.genuine_end_tail(
                 st.handle,
                 st.op_id,
+                st.task_id,
                 &mut st.outcome,
                 &mut st.ledger,
                 &st.turn_summary,
@@ -1254,6 +1258,7 @@ impl AgentRuntime {
         self.genuine_end_tail(
             st.handle,
             st.op_id,
+            st.task_id,
             &mut st.outcome,
             &mut st.ledger,
             &st.turn_summary,

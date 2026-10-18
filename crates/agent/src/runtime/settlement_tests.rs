@@ -1573,3 +1573,186 @@ async fn settlement_is_bound_to_the_admitted_task_id() {
         "the old turn's completion gate must never land on the next task"
     );
 }
+
+/// Settlement must never re-read the session's CURRENT task identity. The
+/// turn settlement tail receives the identity captured at drive start
+/// (`TurnDriveState::task_id`); any new lazy read has to carry an explicit
+/// justification. Doc comments are ignored (they describe the ban itself).
+#[test]
+fn settlement_modules_never_read_the_lazy_current_task_identity() {
+    const FILES: &[(&str, &str)] = &[
+        ("runtime/settlement.rs", include_str!("settlement.rs")),
+        ("runtime/turn/drive.rs", include_str!("turn/drive.rs")),
+    ];
+    for (name, src) in FILES {
+        let lines: Vec<&str> = src.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(col) = line.find(".task_id()") else {
+                continue;
+            };
+            let annotated = line[..col].contains("allowed-task-id-read:")
+                || index
+                    .checked_sub(1)
+                    .is_some_and(|prev| lines[prev].contains("allowed-task-id-read:"));
+            assert!(
+                annotated,
+                "{name}:{}: lazy `task_id()` read in a settlement module (use the \
+                 drive-start binding, or annotate `// allowed-task-id-read: <reason>`): {}",
+                index + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
+/// Report row 1 (deterministic interleaving): a prompt N+1 starts at EVERY
+/// step of turn N's settlement tail (the steps that mutate the durable task
+/// row: content/spend fold, bound read, completion gate, late spend heal).
+/// The N+1 task row must stay byte-identical at every interleaving, never
+/// absorbing N's goal, spend or completion gate.
+#[tokio::test]
+async fn settlement_interleaving_at_every_tail_step_keeps_the_next_task_byte_identical() {
+    const STEPS: usize = 4;
+    for interleave_at in 0..=STEPS {
+        let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let worktree = handle.worktree_id().unwrap();
+        let first = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(Task {
+                task_id: first,
+                session_id: session,
+                goal: "first".into(),
+                acceptance_criteria: Vec::new(),
+                plan: Vec::new(),
+                attachments: Vec::new(),
+                contract: Default::default(),
+                budget: Default::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        let ledger = TaskLedger {
+            goal: "first settled".into(),
+            ..Default::default()
+        };
+
+        // The exact durable mutation a new prompt performs: advance the
+        // session identity, then seed the N+1 task row.
+        let start_next = || {
+            let second = TaskId::new(first.raw() + 1);
+            runtime
+                .deps
+                .session
+                .adopt_identity(session, worktree, second)
+                .unwrap();
+            handle
+                .create_task(Task {
+                    task_id: second,
+                    session_id: session,
+                    goal: "second".into(),
+                    acceptance_criteria: vec!["second criterion".into()],
+                    plan: vec!["second plan".into()],
+                    attachments: Vec::new(),
+                    contract: Default::default(),
+                    budget: faktor_session::TaskBudget {
+                        max_tokens: Some(7),
+                        max_turns: Some(3),
+                        spent_tokens: 0,
+                        spent_turns: 0,
+                    },
+                    state: TaskState::Pending,
+                    created_ms: now + 1,
+                    updated_ms: now + 1,
+                })
+                .unwrap();
+            second
+        };
+
+        if interleave_at == 0 {
+            start_next();
+        }
+        // (1) content + spend fold of turn N
+        runtime
+            .sync_task_row(&handle, first, &ledger, None)
+            .unwrap();
+        if interleave_at == 1 {
+            start_next();
+        }
+        // (2) the bound pre-terminal read of turn N
+        let bound = runtime.session_task_bound(&handle, first).unwrap().unwrap();
+        assert_eq!(bound.task_id, first);
+        if interleave_at == 2 {
+            start_next();
+        }
+        // (3) turn N's completion gate
+        runtime
+            .apply_gate_to_task_row_bound(&handle, first, Some(CompletionGate::Unverified), None)
+            .unwrap();
+        if interleave_at == 3 {
+            start_next();
+        }
+        // (4) the late spend heal of turn N (idempotent, bound)
+        runtime
+            .sync_task_row(&handle, first, &ledger, None)
+            .unwrap();
+        if interleave_at == 4 {
+            start_next();
+        }
+
+        let second = TaskId::new(first.raw() + 1);
+        let next = handle.get_task(second).unwrap().unwrap();
+        // Byte-identical to the row the N+1 admission wrote: goal, criteria,
+        // plan, caps, empty spend and Pending state.
+        assert_eq!(next.goal, "second", "interleave at step {interleave_at}");
+        assert_eq!(
+            next.acceptance_criteria,
+            vec!["second criterion".to_string()],
+            "interleave at step {interleave_at}"
+        );
+        assert_eq!(
+            next.plan,
+            vec!["second plan".to_string()],
+            "interleave at step {interleave_at}"
+        );
+        assert_eq!(next.budget.spent_tokens, 0);
+        assert_eq!(next.budget.spent_turns, 0);
+        assert_eq!(next.state, TaskState::Pending);
+        assert_eq!(
+            serde_json::to_value(&next).unwrap(),
+            serde_json::to_value(Task {
+                task_id: second,
+                session_id: session,
+                goal: "second".into(),
+                acceptance_criteria: vec!["second criterion".into()],
+                plan: vec!["second plan".into()],
+                attachments: Vec::new(),
+                contract: Default::default(),
+                budget: faktor_session::TaskBudget {
+                    max_tokens: Some(7),
+                    max_turns: Some(3),
+                    spent_tokens: 0,
+                    spent_turns: 0,
+                },
+                state: TaskState::Pending,
+                created_ms: now + 1,
+                updated_ms: now + 1,
+            })
+            .unwrap(),
+            "interleave at step {interleave_at}: N+1 must be byte-identical"
+        );
+        // The old turn's state landed on ITS row only.
+        assert_ne!(
+            handle.get_task(first).unwrap().unwrap().state,
+            TaskState::Pending
+        );
+    }
+}

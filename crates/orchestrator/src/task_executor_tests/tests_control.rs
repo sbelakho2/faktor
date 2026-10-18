@@ -124,6 +124,52 @@ pub(crate) fn direct_compat_is_a_strict_decode_error_naming_the_removal() {
     assert!(err.to_string().contains("unknown variant"), "{err}");
 }
 
+/// Settlement must never re-read the session's CURRENT task identity. The
+/// no-task-id paths (queued prompt, recovery, shadow watcher) resolve their
+/// bound identity from the durable run/plan/policy rows instead; any new
+/// lazy read in a settlement module has to carry an explicit justification.
+#[test]
+pub(crate) fn settlement_modules_never_read_the_lazy_current_task_identity() {
+    const FILES: &[(&str, &str)] = &[
+        (
+            "task_executor/settlement.rs",
+            include_str!("../task_executor/settlement.rs"),
+        ),
+        (
+            "task_executor/integration.rs",
+            include_str!("../task_executor/integration.rs"),
+        ),
+        (
+            "task_executor/recovery.rs",
+            include_str!("../task_executor/recovery.rs"),
+        ),
+    ];
+    for (name, src) in FILES {
+        let lines: Vec<&str> = src.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(col) = line.find(".task_id()") else {
+                continue;
+            };
+            let annotated = line[..col].contains("allowed-task-id-read:")
+                || index
+                    .checked_sub(1)
+                    .is_some_and(|prev| lines[prev].contains("allowed-task-id-read:"));
+            assert!(
+                annotated,
+                "{name}:{}: lazy `task_id()` read in a settlement module (bind the \
+                 admitted task from the run/plan/policy row, or annotate \
+                 `// allowed-task-id-read: <reason>`): {}",
+                index + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
 /// P0 isolation at the SOURCE level: `direct_compat` has no variant and no
 /// literal anywhere, the PRODUCTION constructor requires the shadow service
 /// (so no production value can disable isolation), and the ONLY no-shadow
@@ -1597,7 +1643,7 @@ pub(crate) async fn settle_run_converges_after_the_commit_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-commit-seam".into(),
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
         .unwrap();
@@ -1690,7 +1736,7 @@ pub(crate) async fn settle_run_converges_after_the_push_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-push-seam".into(),
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
         .unwrap();
@@ -1774,7 +1820,7 @@ pub(crate) async fn settle_run_converges_after_the_pr_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-pr-seam".into(),
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
         .unwrap();
@@ -1793,7 +1839,7 @@ pub(crate) async fn settle_run_converges_after_the_pr_status_write_seam() {
         .settle_run(RunSettlement::InSession {
             parent: env.parent,
             run_id: "tx-pr-seam".into(),
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
         .unwrap();

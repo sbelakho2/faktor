@@ -56,3 +56,95 @@ fn list_sessions_is_one_statement_newest_first_at_5k_sessions() {
     assert_eq!(reads_after - reads_before, 1);
     assert_eq!(scoped.len(), N as usize);
 }
+
+/// Report row 8: a History walk is a SNAPSHOT. A conversation updated
+/// mid-walk must neither re-surface at page one nor be skipped by a later
+/// page; under the snapshot rule it is absent from the remainder of that
+/// walk and the next walk (fresh snapshot) lists it.
+#[test]
+fn history_walk_snapshot_never_resurfaces_or_skips_mid_walk_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let mut ids = Vec::new();
+    for i in 0..6 {
+        ids.push(
+            store
+                .create_session(ws, &format!("walk {i}"), "fake", "m")
+                .unwrap()
+                .id,
+        );
+    }
+    // Deterministic sort key: 100..=105 (distinct, equal to none of the
+    // wall-clock values a mid-walk rename will use).
+    {
+        let conn = store.raw_conn();
+        for (i, id) in ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE session SET updated_ms = ?2 WHERE id = ?1",
+                params![id.raw() as i64, 100 + i as i64],
+            )
+            .unwrap();
+        }
+    }
+    let snapshot = 105i64;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut before: Option<(i64, i64)> = None;
+    let mut pages = 0;
+    loop {
+        let page = store
+            .list_sessions_page_at(None, before, 2, Some(snapshot))
+            .unwrap();
+        pages += 1;
+        assert!(pages <= 10, "the walk must terminate");
+        let has_more = page.len() > 2;
+        let page = &page[..page.len().min(2)];
+        seen.extend(page.iter().map(|row| row.id.raw()));
+        if pages == 1 {
+            // Mid-walk update: the row that would be served LAST jumps to
+            // the newest position under a live cursor.
+            let last = ids[0];
+            store
+                .update_session_title(last, "updated mid-walk")
+                .unwrap();
+            let bumped: i64 = store
+                .raw_conn()
+                .query_row(
+                    "SELECT updated_ms FROM session WHERE id = ?1",
+                    params![last.raw() as i64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                bumped > snapshot,
+                "the update must move the row above the snapshot"
+            );
+        }
+        if !has_more {
+            break;
+        }
+        let last = page.last().unwrap();
+        before = Some((last.updated_ms, last.id.raw() as i64));
+    }
+    // Sessions 6,5,4,3,2 are served exactly once; the mid-walk-updated
+    // session 1 is absent from THIS snapshot walk (it moved above it).
+    assert_eq!(seen, vec![6, 5, 4, 3, 2], "snapshot walk: {seen:?}");
+    let mut fresh = Vec::new();
+    let mut before = None;
+    loop {
+        let page = store.list_sessions_page(None, before, 2).unwrap();
+        let has_more = page.len() > 2;
+        let page = &page[..page.len().min(2)];
+        fresh.extend(page.iter().map(|row| row.id.raw()));
+        if !has_more {
+            break;
+        }
+        let last = page.last().unwrap();
+        before = Some((last.updated_ms, last.id.raw() as i64));
+    }
+    assert_eq!(
+        fresh,
+        vec![1, 6, 5, 4, 3, 2],
+        "the next walk (fresh snapshot) lists the updated conversation first"
+    );
+}

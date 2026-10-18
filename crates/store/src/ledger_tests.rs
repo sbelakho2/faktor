@@ -781,11 +781,133 @@ fn v2_memory_page_filters_internal_fact_churn_in_sql() {
             .upsert_memory_fact(s.id, "orchestrator_cs", &format!("step-{i}"), "{}")
             .unwrap();
     }
-    let (rows, more) = store
-        .memory_facts_v2_page(s.id, None, 64)
-        .unwrap();
+    let (rows, more) = store.memory_facts_v2_page(s.id, None, 64).unwrap();
     assert!(!more);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "memory_v2:decision");
     assert_eq!(rows[0].key, "framework");
+}
+
+/// Regression (report row 5): the V2 pagers filter with the exact literal
+/// byte-range prefix. `LIKE` folded ASCII case and treated `_` as a
+/// single-character wildcard, so hostile kinds (`MEMORY_V2:x`,
+/// `memoryXv2:y`) leaked into the typed memory listing and the count.
+#[test]
+fn v2_memory_prefix_is_literal_and_case_sensitive_at_every_boundary() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let kinds = [
+        "memory_v2:",
+        "memory_v2:port",
+        "memory_v2:~",
+        "memory_v2;upper-bound-is-exclusive",
+        "memory_v2",
+        "MEMORY_V2:upper",
+        "Memory_V2:mixed",
+        "memoryXv2:wildcard-underscore",
+        "memory_v2x:longer-prefix",
+        "memory_v2:\u{e9}",
+        "taskexec_run",
+    ];
+    for (i, kind) in kinds.iter().enumerate() {
+        store
+            .upsert_memory_fact(s.id, kind, &format!("k{i}"), "{}")
+            .unwrap();
+    }
+    let (rows, more) = store.memory_facts_v2_page(s.id, None, 64).unwrap();
+    assert!(!more);
+    let mut got: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r.kind.as_str(), r.key.as_str()))
+        .collect();
+    got.sort_unstable();
+    let mut expected = vec![
+        ("memory_v2:", "k0"),
+        ("memory_v2:port", "k1"),
+        ("memory_v2:~", "k2"),
+        ("memory_v2:\u{e9}", "k9"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "only the literal `memory_v2:` rows may match (LIKE folded case and `_`)"
+    );
+    assert_eq!(store.memory_fact_count_v2(s.id).unwrap(), 4);
+}
+
+/// Regression (report row 5): at 200,000 churn rows the V2 page is an
+/// indexed range seek naming `(session_id, kind, key)`, not a table scan,
+/// and stays fast. The LIKE predicate could not use the index.
+#[test]
+fn v2_memory_page_plan_and_latency_at_200k_churn_rows() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    for (key, kind) in [
+        ("a", "memory_v2:port"),
+        ("b", "memory_v2:port"),
+        ("c", "memory_v2:port"),
+    ] {
+        store.upsert_memory_fact(s.id, kind, key, "{}").unwrap();
+    }
+    {
+        let conn = store.raw_conn();
+        conn.execute_batch("BEGIN").unwrap();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                     VALUES (?1, 'taskexec_run', ?2, '{}', ?3)",
+                )
+                .unwrap();
+            for i in 0..200_000i64 {
+                stmt.execute(params![s.id.raw() as i64, format!("churn-{i:07}"), i])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    let plan: Vec<String> = {
+        let conn = store.raw_conn();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT kind, key, value, updated_ms FROM memory_fact
+                 WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
+                 ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 65",
+            )
+            .unwrap();
+        stmt.query_map(params![s.id.raw() as i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        plan.iter().any(|detail| detail
+            == "SEARCH memory_fact USING INDEX sqlite_autoindex_memory_fact_1 (session_id=? AND kind>? AND kind<?)"),
+        "the V2 page must name the (session_id, kind, key) index: {plan:?}"
+    );
+    let started = std::time::Instant::now();
+    let (rows, more) = store.memory_facts_v2_page(s.id, None, 64).unwrap();
+    let elapsed = started.elapsed();
+    assert!(!more);
+    assert_eq!(rows.len(), 3, "churn must not leak into the V2 page");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "an indexed page over 200k churn rows took {elapsed:?}"
+    );
+
+    // The workspace pager uses the same literal range over its
+    // `(workspace_id, kind, key)` primary index.
+    let w = store.create_workspace("/w2").unwrap();
+    store
+        .upsert_workspace_memory_fact(w.raw(), "memory_v2:decision", "framework", "rust")
+        .unwrap();
+    let (wrows, wmore) = store
+        .workspace_memory_facts_v2_page(w.raw(), None, 64)
+        .unwrap();
+    assert!(!wmore);
+    assert_eq!(wrows.len(), 1);
+    assert_eq!(wrows[0].kind, "memory_v2:decision");
 }

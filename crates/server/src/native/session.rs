@@ -1496,6 +1496,11 @@ pub(crate) struct NativeSessionListQuery {
     before_ms: Option<i64>,
     #[serde(default, rename = "beforeId")]
     before_id: Option<u64>,
+    /// Snapshot bound of the walk, returned by page 1 and passed back on
+    /// every later page. Conversations updated mid-walk are excluded from
+    /// the rest of that walk instead of jumping to page one / being skipped.
+    #[serde(default, rename = "snapshotMs")]
+    snapshot_ms: Option<i64>,
     #[serde(default)]
     limit: Option<u64>,
 }
@@ -1538,15 +1543,25 @@ pub(crate) async fn native_list_sessions(
         Some(value) => value as usize,
     };
     let page_limit = u64::try_from(limit).unwrap_or(0);
-    let rows: Vec<faktor_store::SessionRow> = match state
-        .deps
-        .session
-        .store()
-        .list_sessions_page(None, cursor, page_limit)
-    {
-        Ok(rows) => rows,
-        Err(e) => return api_err(&store_err_to_core(e)),
+    let store = state.deps.session.store();
+    let snapshot_ms = match (q.snapshot_ms, cursor) {
+        (Some(ms), _) if ms < 0 => return wire_status(malformed_body("snapshotMs must be >= 0")),
+        (Some(ms), _) => Some(ms),
+        (None, None) => match store.session_listing_snapshot_ms() {
+            Ok(ms) => Some(ms),
+            Err(e) => return api_err(&store_err_to_core(e)),
+        },
+        (None, Some(_)) => {
+            return wire_status(malformed_body(
+                "a cursored session page requires snapshotMs from the first page",
+            ))
+        }
     };
+    let rows: Vec<faktor_store::SessionRow> =
+        match store.list_sessions_page_at(None, cursor, page_limit, snapshot_ms) {
+            Ok(rows) => rows,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
     let has_more = rows.len() > limit;
     let rows = &rows[..rows.len().min(limit)];
     let next_before = if has_more {
@@ -1583,6 +1598,7 @@ pub(crate) async fn native_list_sessions(
         "sessions": sessions,
         "hasMore": has_more,
         "nextBefore": next_before,
+        "snapshotMs": snapshot_ms,
     }))
     .into_response()
 }
@@ -2099,6 +2115,7 @@ mod tests {
             Ok(Query(super::NativeSessionListQuery {
                 before_ms: None,
                 before_id: None,
+                snapshot_ms: None,
                 limit: None,
             })),
         )
@@ -2113,8 +2130,8 @@ mod tests {
         );
         assert_eq!(
             reads_after - reads_before,
-            1,
-            "the page must read the session table exactly once (one listing statement)"
+            2,
+            "the page reads one bounded snapshot scalar + ONE listing statement"
         );
         eprintln!(
             "session listing: {} sessions (seed {seed_elapsed:?}, manager list+verify {historical_elapsed:?}): single-read projection {single_projection:?}; handler reads delta 1",
@@ -2136,6 +2153,7 @@ mod tests {
             Ok(Query(super::NativeSessionListQuery {
                 before_ms: None,
                 before_id: None,
+                snapshot_ms: None,
                 limit: None,
             })),
         )
@@ -3075,6 +3093,37 @@ mod tests {
             "a".repeat(faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1);
         assert!(validate_prompt_submission_id(&oversized).is_err());
         assert!(validate_prompt_submission_id(PROMPT_KEY).is_ok());
+    }
+
+    /// Report row 12: a PLAIN prompt carries no billing caps. A cap field
+    /// (even the 1-micro / 1-token values that once bought a paid call) is
+    /// an unknown field and is refused at the wire BEFORE any admission or
+    /// provider call. The zero-cap rule lives on the task-start boundary
+    /// where caps are valid.
+    #[test]
+    fn plain_prompt_refuses_every_billing_cap_before_admission() {
+        for cap in [
+            serde_json::json!({"max_cost_micro": "1"}),
+            serde_json::json!({"max_cost_micro": 1}),
+            serde_json::json!({"max_tokens": 1}),
+            serde_json::json!({"maxCostMicro": "1"}),
+            serde_json::json!({"maxTokens": 1}),
+        ] {
+            let mut body = prompt_body(
+                faktor_core::id::SessionId::new(1),
+                "b0000000-0000-4000-8000-0000000000ff",
+                "hi",
+            );
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in cap.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            let err = match serde_json::from_value::<NativePromptRequestBody>(body) {
+                Ok(_) => panic!("a billing cap on a plain prompt must refuse: {cap}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("unknown field"), "{cap}: {err}");
+        }
     }
 
     /// A lost response is retried with the SAME submission id and the SAME

@@ -401,7 +401,12 @@ impl Store {
              WHERE workspace_id = ?1",
         );
         if let Some(prefix) = kind_prefix {
-            sql.push_str(&format!(" AND kind LIKE '{prefix}%'"));
+            // Trusted, compile-time prefix (never user input). The half-open
+            // byte range is the exact literal prefix and rides the
+            // `(workspace_id, kind, key)` primary index (a LIKE pattern did
+            // neither: it folded ASCII case and treated `_` as a wildcard).
+            let end = kind_prefix_end(prefix);
+            sql.push_str(&format!(" AND kind >= '{prefix}' AND kind < '{end}'"));
         }
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(5);
         params.push(rusqlite::types::Value::Integer(workspace_id as i64));
@@ -503,7 +508,7 @@ impl Store {
         let conn = self.read()?;
         let out = conn.query_row(
             "SELECT COUNT(*) FROM memory_fact
-             WHERE session_id = ?1 AND kind LIKE 'memory_v2:%'",
+             WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
             params![session_id.raw() as i64],
             |r| r.get::<_, i64>(0),
         )?;

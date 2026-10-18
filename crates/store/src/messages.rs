@@ -430,14 +430,19 @@ impl Store {
     }
 
     /// Durable transcript search over one session's stored payloads (D-03):
-    /// a bounded `instr(lower(...))` scan ordered newest-first. The query is
-    /// capped, the page is capped, and the scan never loads more than
-    /// `limit` rows into memory. It searches BOTH the durable message data
-    /// (user prompts) and the durable per-message `part` rows (assistant
-    /// text, reasoning and tool results) — assistant answers live only in
-    /// parts (`message.data` is `{"parts":[]}`), so a data-only scan silently
-    /// missed every model response. The page is newest-first over the message
-    /// sequence, so Find reaches unloaded history, never only rendered rows.
+    /// newest-first over the message sequence, matching the VISIBLE decoded
+    /// text, never the raw JSON envelope.
+    ///
+    /// The historical implementation ran `instr(lower(raw_json), lower(q))`:
+    /// a query for `text`, `parts` or `"` matched every row because those
+    /// characters occur in the JSON keys/punctuation, and SQLite's `lower()`
+    /// folds ASCII only (`É` never found `é`). This implementation walks the
+    /// durable transcript in bounded chunks (memory stays O(chunk)), decodes
+    /// each row, extracts the fields the transcript actually renders —
+    /// message `text`; part `text` for text/reasoning/summary; tool_result
+    /// `excerpt`; tool_call `name` + its input string leaves — and applies
+    /// Unicode `to_lowercase()` folding to both sides. The page bound is
+    /// exact over MATCHES; chunks stop as soon as the page is full.
     pub fn search_messages(
         &self,
         session_id: SessionId,
@@ -449,29 +454,94 @@ impl Store {
                 "transcript search query must be 1..=256 bytes".into(),
             ));
         }
-        let limit = i64::try_from(limit.clamp(1, 200)).map_err(|_| {
-            StoreError::Oversized("transcript search page exceeds SQLite signed range".into())
-        })?;
-        let conn = self.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, seq, role, data, created_ms FROM message m
-             WHERE m.session_id = ?1 AND (
-                 instr(lower(m.data), lower(?2)) > 0 OR
-                 EXISTS (SELECT 1 FROM part p
-                         WHERE p.message_id = m.id
-                           AND instr(lower(p.data), lower(?2)) > 0)
-             )
-             ORDER BY m.seq DESC LIMIT ?3",
-        )?;
-        let mut rows = stmt.query(params![session_id.raw() as i64, query, limit])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(message_map(row)?);
+        let limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(200);
+        let needle = query.to_lowercase();
+        const CHUNK: u64 = 256;
+        let mut out: Vec<MessageRow> = Vec::with_capacity(limit);
+        let mut before: Option<u64> = None;
+        loop {
+            let page =
+                self.messages_window_with_parts(session_id, before, None, CHUNK, u64::MAX)?;
+            if page.is_empty() {
+                break;
+            }
+            let mut last_seq: Option<u64> = None;
+            for (message, parts) in &page {
+                last_seq = Some(message.seq as u64);
+                if out.len() >= limit {
+                    break;
+                }
+                if message_matches(message, parts, &needle) {
+                    out.push(message.clone());
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+            match last_seq {
+                Some(seq) if page.len() as u64 == CHUNK => before = Some(seq),
+                _ => break,
+            }
         }
         Ok(out)
     }
 
     // ---------------------------------------------------------------- task ledger
+}
+
+/// True when any VISIBLE field of one durable message/parts pair contains
+/// the already-folded search needle. String leaves of a tool call's `input`
+/// are visible (rendered as the call's arguments); identifiers/state are
+/// not. `to_lowercase()` gives Unicode-aware folding for both sides.
+fn message_matches(message: &MessageRow, parts: &[PartRow], needle: &str) -> bool {
+    let mut haystacks: Vec<&str> = Vec::new();
+    if let Some(text) = message.data.get("text").and_then(|v| v.as_str()) {
+        haystacks.push(text);
+    }
+    for part in parts {
+        let data = &part.data;
+        match part.kind.as_str() {
+            "text" | "reasoning" | "summary" => {
+                if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                    haystacks.push(text);
+                }
+            }
+            "tool_result" => {
+                if let Some(excerpt) = data.get("excerpt").and_then(|v| v.as_str()) {
+                    haystacks.push(excerpt);
+                }
+            }
+            "tool_call" => {
+                if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
+                    haystacks.push(name);
+                }
+                if let Some(input) = data.get("input") {
+                    collect_visible_strings(input, &mut haystacks);
+                }
+            }
+            _ => {}
+        }
+    }
+    haystacks
+        .into_iter()
+        .any(|text| text.to_lowercase().contains(needle))
+}
+
+fn collect_visible_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_visible_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_visible_strings(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -593,6 +663,120 @@ mod tests {
             store.search_messages(a.id, "needle", 2).unwrap().len(),
             2,
             "the page bound is exact"
+        );
+    }
+
+    /// Report row 9: Find matches the VISIBLE decoded text, never the raw
+    /// JSON envelope, and folds case across Unicode. A reference oracle
+    /// (visible fields only, `to_lowercase`) must agree for every query.
+    #[test]
+    fn transcript_search_matches_visible_text_and_unicode_not_raw_json() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "plain prompt"}))
+            .unwrap();
+        store
+            .put_message(
+                s.id,
+                2,
+                "user",
+                serde_json::json!({"text": "the word text is visible"}),
+            )
+            .unwrap();
+        let answer = store
+            .put_message(s.id, 3, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(
+                answer,
+                "text",
+                serde_json::json!({"text": "say \"hello\" now"}),
+            )
+            .unwrap();
+        let answer2 = store
+            .put_message(s.id, 4, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(
+                answer2,
+                "text",
+                serde_json::json!({"text": "résumé: Élève"}),
+            )
+            .unwrap();
+        let tool = store
+            .put_message(s.id, 5, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(
+                tool,
+                "tool_call",
+                serde_json::json!({
+                    "tool_call_id": "call-1",
+                    "name": "read_file",
+                    "state": "requested",
+                    "input": {"path": "src/main.rs"}
+                }),
+            )
+            .unwrap();
+
+        // Raw JSON keys/punctuation are not searchable.
+        assert!(
+            store
+                .search_messages(s.id, "parts", 200)
+                .unwrap()
+                .is_empty(),
+            "the `parts` KEY must not match every assistant row"
+        );
+        assert!(
+            store
+                .search_messages(s.id, "tool_call_id", 200)
+                .unwrap()
+                .is_empty(),
+            "JSON keys are not visible text"
+        );
+        assert_eq!(
+            store
+                .search_messages(s.id, "text", 200)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "only the row whose VISIBLE text says `text` may match"
+        );
+        assert_eq!(
+            store
+                .search_messages(s.id, "\"", 200)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "a quote matches only visible quotes, never JSON punctuation"
+        );
+        for query in ["É", "é", "ÉLÈVE", "élève", "RÉSUMÉ"] {
+            assert_eq!(
+                store
+                    .search_messages(s.id, query, 200)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.seq)
+                    .collect::<Vec<_>>(),
+                vec![4],
+                "Unicode folding must match {query:?}"
+            );
+        }
+        assert_eq!(
+            store
+                .search_messages(s.id, "SRC/MAIN.RS", 200)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![5],
+            "visible tool-call input strings are searchable"
         );
     }
 

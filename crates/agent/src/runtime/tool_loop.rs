@@ -439,12 +439,6 @@ pub(crate) enum ToolActivationScan {
     /// The walk reached the end of the fact table inside the bound: the
     /// absence is decisive — the session is genuinely fresh.
     Absent,
-    /// The page bound was exhausted while older pages still existed, so the
-    /// scan could NOT prove the session's set. The safe inactive default
-    /// applies and the exhaustion is emitted as a loud typed diagnostic —
-    /// never a silent revert to inactive.
-    #[cfg_attr(not(test), allow(dead_code))]
-    BoundExhausted,
     /// The durable read failed (already warned): the safe inactive default.
     ReadFailed,
 }

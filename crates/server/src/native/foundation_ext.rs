@@ -1461,10 +1461,17 @@ pub(crate) struct NativeSkillQuery {
     /// silent 200-skill lie (the old hardcoded `.take(200)` was).
     #[serde(default)]
     limit: Option<u64>,
+    /// Cursor of the DISCOVERED listing: the last name served on the
+    /// previous page. Names are sorted, so `after` + `limit` reaches every
+    /// discovered skill (the old fixed `.take(500)` made 501+ unreachable).
+    #[serde(default)]
+    after: Option<String>,
 }
 
-/// `GET /native/skills?q=&session=` — installed trusted records plus
-/// discovered-but-not-installed workspace skills (metadata only).
+/// `GET /native/skills?q=&session=&limit=&after=` — installed trusted
+/// records plus discovered-but-not-installed workspace skills (metadata
+/// only). `after` + `limit` page the sorted discovered list; `nextCursor`
+/// is exact and `hasMore` names the remainder.
 pub(crate) async fn native_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1486,9 +1493,13 @@ pub(crate) async fn native_skills(
         Err(e) => return foundation_error(e),
     };
     let needle = q.q.as_deref().unwrap_or("").to_ascii_lowercase();
+    if q.after.as_deref().is_some_and(|after| after.len() > 256) {
+        return wire_status(malformed_body("skills cursor must be <= 256 bytes"));
+    }
     let discovered_limit = q.limit.unwrap_or(500).clamp(1, 500) as usize;
     let mut discovered_total: u64 = 0;
     let mut discovered_truncated = false;
+    let mut discovered_cursor: Option<String> = None;
     let mut installed: Vec<serde_json::Value> = records
         .iter()
         .filter(|r| {
@@ -1521,16 +1532,31 @@ pub(crate) async fn native_skills(
         if let Ok(Some(root)) = state.deps.session.resolve_workspace_root(handle.id()) {
             let registry = SkillRegistry::discover(&root);
             let installed_names: BTreeSet<&str> = records.iter().map(|r| r.name.as_str()).collect();
-            let candidates: Vec<&faktor_instructions::SkillMeta> = registry
+            let mut candidates: Vec<&faktor_instructions::SkillMeta> = registry
                 .entries()
                 .iter()
                 .filter(|e| !installed_names.contains(e.name.as_str()))
                 .filter(|e| needle.is_empty() || e.name.to_ascii_lowercase().contains(&needle))
                 .collect();
-            discovered_total = candidates.len() as u64;
-            discovered_truncated = candidates.len() > discovered_limit;
+            // Deterministic cursor order: the registry walk order is
+            // filesystem-dependent, so the cursor sorts by name.
+            candidates.sort_by(|a, b| a.name.cmp(&b.name));
+            let matching_total: u64 = candidates.len() as u64;
+            discovered_total = matching_total;
+            let start = match q.after.as_deref() {
+                Some(after) => candidates
+                    .iter()
+                    .position(|e| e.name.as_str() > after)
+                    .unwrap_or(candidates.len()),
+                None => 0,
+            };
+            let remaining = candidates.len().saturating_sub(start);
+            discovered_truncated = remaining > discovered_limit;
+            discovered_cursor =
+                discovered_truncated.then(|| candidates[start + discovered_limit - 1].name.clone());
             let discovered: Vec<serde_json::Value> = candidates
                 .into_iter()
+                .skip(start)
                 .take(discovered_limit)
                 .map(|e| {
                     serde_json::json!({
@@ -1552,6 +1578,7 @@ pub(crate) async fn native_skills(
         "skills": installed,
         "discoveredTotal": discovered_total,
         "hasMore": discovered_truncated,
+        "nextCursor": discovered_cursor,
     }))
     .into_response()
 }

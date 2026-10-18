@@ -443,6 +443,8 @@ impl AgentRuntime {
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        // allowed-task-id-read: admission-time budget seed; the caller has no
+        // run binding and no settlement is in flight for this session.
         let task_id = handle.task_id()?;
         let now = handle.now_ms();
         let mut seed = match handle.get_task(task_id)? {
@@ -681,6 +683,7 @@ impl AgentRuntime {
     pub(crate) async fn settle_verification_jobs(
         &self,
         handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
         cancel: &CancellationToken,
     ) -> TurnEndVerdict {
         let row = match handle.row() {
@@ -714,7 +717,6 @@ impl AgentRuntime {
                 );
             }
         };
-        let task_id = row.task_id;
         let task_raw = task_id.raw();
         // Honest restart recovery happens ONCE at daemon startup (the CLI's
         // recovery sweep), never per settlement: with the daemon-level
@@ -1096,6 +1098,8 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> faktor_core::Result<Option<Task>> {
+        // allowed-task-id-read: explicit CURRENT-task projection helper (the
+        // drive and every settlement gate use `session_task_bound` instead).
         let task_id = handle.task_id()?;
         self.session_task_bound(handle, task_id)
     }
@@ -1158,6 +1162,8 @@ impl AgentRuntime {
                 // gate has a row. The budget stays unlimited until a caller
                 // (or the session's durable row from a previous run) sets
                 // caps — an existing row is NEVER re-created here.
+                // allowed-task-id-read: drive-start row healing, before any
+                // settlement tail of this drive can run.
                 let task_id = handle.task_id()?;
                 let now = handle.now_ms();
                 let created = handle.create_task(Task {
@@ -1443,6 +1449,8 @@ impl AgentRuntime {
         gate: Option<CompletionGate>,
         proof: Option<&VerificationProof>,
     ) -> faktor_core::Result<Option<CompletionGate>> {
+        // allowed-task-id-read: cfg(test)-only convenience wrapper; production
+        // settlement calls `apply_gate_to_task_row_bound` with the bound id.
         let task_id = handle.task_id()?;
         self.apply_gate_to_task_row_bound(handle, task_id, gate, proof)
     }

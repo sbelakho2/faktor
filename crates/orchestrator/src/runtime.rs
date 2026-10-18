@@ -688,6 +688,10 @@ struct DurablePlanRow {
     provider: String,
     default_model: String,
     isolated_root: PathBuf,
+    /// The root task identity the run was admitted under. Settlement binds
+    /// to THIS id; the session's current identity may have advanced while the
+    /// run was settling. Legacy rows decode `None` and refuse settlement.
+    task_id: Option<u64>,
 }
 
 /// The orchestrator session + the worktree the plan works on.
@@ -1666,6 +1670,7 @@ impl OrchestratorRuntime {
             provider,
             default_model: durable_model,
             isolated_root: durable_root,
+            task_id: _,
         } = self.plan_row(parent, run_id)?;
         // The durable attachment set is re-validated before any re-drive: a
         // tampered/oversized/hostile stored list refuses the re-attach
@@ -2077,6 +2082,13 @@ impl OrchestratorRuntime {
             "default_model": config.default_model,
             "isolated_root": config.isolated_root.to_string_lossy(),
             "created_ms": handle.now_ms(),
+            // The run's root task identity, bound at admission. Settlement
+            // must never re-read the session's (possibly advanced) current
+            // identity: that folded the previous run's goal/spend/completion
+            // into the next task.
+            "task_id": handle.task_id().map_err(|e| {
+                ExecError::Internal(format!("plan-row task identity read: {e}"))
+            })?.raw(),
         });
         let text = serde_json::to_string(&value)
             .map_err(|e| ExecError::Internal(format!("plan row serialization: {e}")))?;
@@ -2177,6 +2189,7 @@ impl OrchestratorRuntime {
                     .and_then(|x| x.as_str())
                     .map(PathBuf::from)
                     .unwrap_or_default();
+                let task_id = v.get("task_id").and_then(|x| x.as_u64());
                 return Ok(DurablePlanRow {
                     plan,
                     owner,
@@ -2184,6 +2197,7 @@ impl OrchestratorRuntime {
                     provider,
                     default_model,
                     isolated_root,
+                    task_id,
                 });
             }
         }

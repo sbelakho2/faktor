@@ -657,6 +657,7 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
         op_id: OpId,
+        task_id: TaskId,
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
@@ -685,6 +686,7 @@ impl AgentRuntime {
         self.finish_logical_turn(
             handle,
             op_id,
+            task_id,
             outcome,
             ledger,
             turn_summary,
@@ -709,19 +711,20 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
         op_id: OpId,
+        task_id: TaskId,
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
         settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
-        // Settlement is bound to the task identity this run was admitted
-        // under. A new chat prompt can start as soon as the TurnCompleted
+        // Settlement is bound to the task identity this drive captured at
+        // its start. A new chat prompt can start as soon as the TurnCompleted
         // journal event below is visible, while this tail is still folding
         // the row and applying the completion gate; re-reading the session's
         // (now advanced) task id would settle the OLD turn into the NEXT
         // task row.
-        let settlement_task_id = handle.task_id()?;
+        let settlement_task_id = task_id;
         // P0-2 remainder: generic-shell changes are attributed through the
         // durable `shell_change` facts, so a crash-resumed turn (or a live
         // settlement that could not open a workspace) still feeds its ACTUAL
@@ -764,6 +767,7 @@ impl AgentRuntime {
             .run_turn_verification(
                 handle,
                 op_id,
+                settlement_task_id,
                 &turn_summary.files_changed,
                 &ledger.goal,
                 quality,
@@ -1408,10 +1412,15 @@ impl AgentRuntime {
     ///
     /// Infra absence NEVER fails the turn itself: the completion gate carries
     /// the non-completion and `final_state` stays ReadyForNextTurn.
+    // The verification tail needs the bound task identity in addition to
+    // the turn inputs; grouping them in a struct only to satisfy the lint
+    // would obscure the call site.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_turn_verification(
         &self,
         handle: &faktor_session::SessionHandle,
         op_id: OpId,
+        bound_task: TaskId,
         changed: &[String],
         goal: &str,
         quality: VerificationQuality,
@@ -1437,26 +1446,16 @@ impl AgentRuntime {
             // P2-VERIFY (audit): these reads gate settlement. A store failure
             // must not silently skip the whole background path; it blocks the
             // completion typed instead.
-            let task_id = match handle.row() {
-                Ok(row) => row.task_id.raw(),
-                Err(e) => {
-                    tracing::error!(error = %e, "turn-end settlement skipped: session row unreadable");
-                    if changed.is_empty() {
-                        return TurnEndVerdict::default();
-                    }
-                    return self.unverified_verdict(
-                        handle,
-                        changed,
-                        None,
-                        "session row unreadable; verification cannot be settled",
-                    );
-                }
-            };
+            // The run's bound task identity (never the session's current
+            // identity, which may belong to a newer prompt).
+            let task_id = bound_task.raw();
             {
                 match handle.open_verification_jobs(task_id) {
                     Ok(open) if !open.is_empty() => {
                         if changed.is_empty() {
-                            return self.settle_verification_jobs(handle, cancel).await;
+                            return self
+                                .settle_verification_jobs(handle, bound_task, cancel)
+                                .await;
                         }
                         match handle.current_verification_attempt(task_id) {
                             Ok(Some(attempt)) => {
@@ -1496,27 +1495,16 @@ impl AgentRuntime {
                         // exact rows (the executor never settles the task
                         // itself).
                         if changed.is_empty() {
-                            let non_terminal = match handle.task_id() {
-                                Ok(t) => match handle.get_task(t) {
-                                    Ok(Some(task)) => !task.state.is_terminal(),
-                                    Ok(None) => false,
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "task row unreadable; refusing to complete this turn");
-                                        return self.unverified_verdict(
-                                            handle,
-                                            changed,
-                                            None,
-                                            "task row unreadable; completion is blocked",
-                                        );
-                                    }
-                                },
+                            let non_terminal = match handle.get_task(bound_task) {
+                                Ok(Some(task)) => !task.state.is_terminal(),
+                                Ok(None) => false,
                                 Err(e) => {
-                                    tracing::error!(error = %e, "task id unreadable; refusing to complete this turn");
+                                    tracing::error!(error = %e, "task row unreadable; refusing to complete this turn");
                                     return self.unverified_verdict(
                                         handle,
                                         changed,
                                         None,
-                                        "task id unreadable; completion is blocked",
+                                        "task row unreadable; completion is blocked",
                                     );
                                 }
                             };
@@ -1534,7 +1522,9 @@ impl AgentRuntime {
                                 }
                             };
                             if non_terminal && attempt_exists {
-                                return self.settle_verification_jobs(handle, cancel).await;
+                                return self
+                                    .settle_verification_jobs(handle, bound_task, cancel)
+                                    .await;
                             }
                         }
                     }

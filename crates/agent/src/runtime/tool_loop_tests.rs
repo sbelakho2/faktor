@@ -136,7 +136,8 @@ async fn activated_lazy_tool_is_dispatchable_and_executes() {
 /// Scale probe regression: the durable activation fact is a POINT lookup.
 /// Internal fact churn (taskexec/orchestrator rows written every turn) must
 /// never push a valid activation out of a bounded newest-first page and
-/// silently deactivate the tool set.
+/// silently deactivate the tool set. There is no page bound to exhaust any
+/// more: the lookup is O(1).
 #[tokio::test]
 async fn activation_point_lookup_survives_unrelated_fact_churn() {
     let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
@@ -144,8 +145,6 @@ async fn activation_point_lookup_survives_unrelated_fact_churn() {
     let runtime = AgentRuntime::new(deps).unwrap();
     let session = new_session(runtime.deps());
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-    let root = runtime.deps().session.store().root().to_path_buf();
-    activation_scan_diagnostics_tests::clear(&root);
 
     // A decisive activation fact first ...
     handle
@@ -179,10 +178,54 @@ async fn activation_point_lookup_survives_unrelated_fact_churn() {
         load.set.is_active("source_market"),
         "churn must not deactivate a durable activation: {load:?}"
     );
-    assert!(
-        activation_scan_diagnostics_tests::events_for(&root).is_empty(),
-        "no bound-exhaustion diagnostic can fire for a point lookup"
-    );
+}
+
+/// Report row 2 at the exact scale: 1,000,000 unrelated internal facts
+/// (the churn a long task writes) never push the activation fact out of its
+/// point lookup, and a corrupt value reads as `ReadFailed` (never inactive;
+/// covered by `retrieval_tests`). There is no page-exhaustion state left.
+#[tokio::test]
+async fn activation_point_lookup_survives_one_million_churn_rows() {
+    let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    deps.tools = Arc::new(lazy_registry());
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            "[\"source_market\"]",
+        )
+        .unwrap();
+    const CHURN: usize = 1_000_000;
+    const BATCH: usize = 10_000;
+    for batch in 0..CHURN / BATCH {
+        let seeds: Vec<(String, String, String)> = (0..BATCH)
+            .map(|i| {
+                (
+                    "taskexec_run".to_string(),
+                    format!("churn-{:07}", batch * BATCH + i),
+                    "{}".to_string(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = seeds
+            .iter()
+            .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        runtime
+            .deps()
+            .session
+            .store()
+            .upsert_memory_facts(session, &refs)
+            .unwrap();
+    }
+
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(load.scan, ToolActivationScan::Found, "{load:?}");
+    assert!(load.set.is_active("source_market"));
 }
 
 #[tokio::test]

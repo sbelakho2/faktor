@@ -373,6 +373,13 @@ impl TaskRunRow {
 struct RunPolicyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     no_op_disposition: Option<NoOpDisposition>,
+    /// The task identity the run was admitted under. Settlement resolves
+    /// this row (never the session's CURRENT task) so a prompt that starts
+    /// while an earlier run settles can never fold the old run's
+    /// goal/spend/completion into the new task. Additive: legacy rows decode
+    /// with `None` and refuse settlement typed instead of guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<u64>,
 }
 
 /// Record one orchestrated run's durable policy row BEFORE the run is
@@ -382,12 +389,47 @@ fn write_run_policy_row(
     handle: &faktor_session::SessionHandle,
     run_id: &str,
     no_op_disposition: Option<NoOpDisposition>,
+    task_id: Option<u64>,
 ) -> Result<(), ExecError> {
-    let value = serde_json::to_string(&RunPolicyRow { no_op_disposition })
-        .map_err(|e| ExecError::Internal(format!("run policy row encode: {e}")))?;
+    let value = serde_json::to_string(&RunPolicyRow {
+        no_op_disposition,
+        task_id,
+    })
+    .map_err(|e| ExecError::Internal(format!("run policy row encode: {e}")))?;
     handle
         .upsert_memory_fact(RUN_POLICY_ROW_KIND, run_id, &value)
         .map_err(|e| ExecError::Internal(format!("run policy row write: {e}")))
+}
+
+/// The run's bound task identity from its durable policy row. A legacy row
+/// without the binding (or no row at all) is a typed refusal: settlement
+/// must never fall back to the session's current identity (that is the
+/// cross-task fold the scale probe found).
+fn run_policy_task_id(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<TaskId, ExecError> {
+    let Some(value) = handle
+        .memory_fact_get(RUN_POLICY_ROW_KIND, run_id)
+        .map_err(|e| ExecError::Internal(format!("run policy row read of {run_id}: {e}")))?
+    else {
+        return Err(ExecError::Conflict(format!(
+            "run {run_id} has no recorded task identity; refusing to settle it into the session's current task"
+        )));
+    };
+    let row: RunPolicyRow = serde_json::from_str(&value).map_err(|e| {
+        ExecError::from(DurableStateError::CorruptDurableState {
+            what: format!("run policy row of run {run_id}"),
+            detail: e.to_string(),
+        })
+    })?;
+    row.task_id
+        .map(TaskId::new)
+        .ok_or_else(|| {
+            ExecError::Conflict(format!(
+                "run {run_id} predates the task-identity binding; refusing to settle it into the session's current task"
+            ))
+        })
 }
 
 /// The run's effective no-op disposition from its durable policy row; an
@@ -2227,6 +2269,19 @@ impl TaskExecutor {
                     generation,
                     lease_id,
                 } => {
+                    // Bind the remote run to the task identity in force at
+                    // placement. The job may land long after a newer prompt
+                    // advanced the session identity; remote completion then
+                    // resolves THIS row instead of folding into the new task.
+                    // allowed-task-id-read: placement-time binding, before
+                    // any run work starts.
+                    let placed_task = handle.task_id()?;
+                    write_run_policy_row(
+                        &handle,
+                        &job_id,
+                        req.no_op_disposition,
+                        Some(placed_task.raw()),
+                    )?;
                     tracing::info!(
                         session = parent.raw(),
                         job_id = %job_id,
@@ -2747,12 +2802,16 @@ impl TaskExecutor {
         // P0 no-op policy: the run's disposition is durable BEFORE the drive
         // is dispatched. The shadow settlement reads it under the synthetic
         // per-session run id (`tx-session-<session>`), so the row is written
-        // under BOTH the real run id and that id.
-        write_run_policy_row(handle, &run_id, req.no_op_disposition)?;
+        // under BOTH the real run id and that id. Both rows carry the ADMITTED
+        // task id: the no-task-id settlement paths (queued prompt, recovery,
+        // shadow watcher) therefore resolve the run's own task instead of the
+        // session's current (possibly advanced) identity.
+        write_run_policy_row(handle, &run_id, req.no_op_disposition, Some(task_id.raw()))?;
         write_run_policy_row(
             handle,
             &format!("tx-session-{}", parent.raw()),
             req.no_op_disposition,
+            Some(task_id.raw()),
         )?;
         // Acceptance: the prompt is durably recorded and the run's linkage +
         // policy rows exist. The exact receipt is admitted BEFORE the spawn
@@ -2785,7 +2844,7 @@ impl TaskExecutor {
                 // here (the runtime gate arms a live runner or this spawns a
                 // fresh one — exactly one drive ever claims the head).
                 exec.kick_pending_queue(parent);
-                exec.after_shadowed_drive(parent, None).await;
+                exec.after_shadowed_drive(parent, Some(task_id)).await;
             });
             if !spawned {
                 return Err(ExecError::Conflict(format!(
@@ -3124,7 +3183,7 @@ impl TaskExecutor {
         // P0 no-op policy: the run's disposition is durable BEFORE the run is
         // claimed or any child spawns, so the detached settlement applies the
         // exact policy the caller requested.
-        write_run_policy_row(&handle, &run_id, req.no_op_disposition)?;
+        write_run_policy_row(&handle, &run_id, req.no_op_disposition, Some(task_id.raw()))?;
         self.occupy(parent, &run_id)?;
         // The DAEMON allocates the isolated root itself (never an HTTP
         // path): one CandidateWorkspaceService authority per executor. A
@@ -3248,13 +3307,33 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        // allowed-task-id-read: public convenience entry point with no run
+        // binding; settlement always calls the BOUND variant below.
+        let task_id = handle.task_id()?;
+        self.run_completion_steps_bound(parent, task_id, proof)
+            .await
+    }
+
+    /// [`Self::run_completion_steps`] bound to the task identity the run was
+    /// admitted under (settlement must never re-read the current identity).
+    pub async fn run_completion_steps_bound(
+        &self,
+        parent: SessionId,
+        task_id: TaskId,
+        proof: VerificationRecordId,
+    ) -> Result<Option<CompletionStepReport>, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         // The run's integration/candidate root: the LIVE shadow root when
         // the session has one, else its durable owner worktree root.
         let root = match self.session.active_root(parent)? {
             Some(root) => root,
             None => self.owner_root_of(parent, &handle)?,
         };
-        self.run_completion_steps_at(parent, proof, root).await
+        self.run_completion_steps_at(parent, task_id, proof, root)
+            .await
     }
 
     /// The steps of a VERIFIED orchestrated landing: execute the accepted
@@ -3264,6 +3343,7 @@ impl TaskExecutor {
     pub async fn run_completion_steps_against_proof(
         &self,
         parent: SessionId,
+        task_id: TaskId,
         landed: &LandedRunIntegration,
     ) -> Result<Option<CompletionStepReport>, ExecError> {
         let _handle = self
@@ -3280,8 +3360,13 @@ impl TaskExecutor {
                 landed.prepared.candidate_snapshot
             )));
         }
-        self.run_completion_steps_at(parent, landed.record, landed.prepared.owner_root.clone())
-            .await
+        self.run_completion_steps_at(
+            parent,
+            task_id,
+            landed.record,
+            landed.prepared.owner_root.clone(),
+        )
+        .await
     }
 
     /// The shared completion-step body: contract lookup, terminal check and
@@ -3289,6 +3374,7 @@ impl TaskExecutor {
     async fn run_completion_steps_at(
         &self,
         parent: SessionId,
+        task_id: TaskId,
         proof: VerificationRecordId,
         root: PathBuf,
     ) -> Result<Option<CompletionStepReport>, ExecError> {
@@ -3296,7 +3382,6 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle.task_id()?;
         let Some((_revision, contract)) = handle
             .completion_contract(task_id)
             .map_err(|e| ExecError::Internal(format!("completion contract read: {e}")))?
@@ -3371,7 +3456,6 @@ impl TaskExecutor {
 mod integration;
 mod recovery;
 mod settlement;
-#[cfg(test)]
 pub(crate) use settlement::settlement_task_id;
 mod verification;
 pub use recovery::*;

@@ -1754,9 +1754,8 @@ impl AgentRuntime {
 
     /// Load the session's durable activation set with the typed scan verdict
     /// ([`ToolActivationScan`]): `Found` reports the durable flag (missing =
-    /// fresh session, empty set), `Absent` proves it does not exist inside
-    /// the bound, `BoundExhausted` means the bound ran out with older pages
-    /// still present and the safe inactive default applies — LOUDLY.
+    /// fresh session, empty set), `Absent` proves it does not exist, and a
+    /// failed/corrupt read is `ReadFailed` (never a silent inactive set).
     pub(crate) fn load_tool_activation(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -1765,8 +1764,8 @@ impl AgentRuntime {
         // every turn scan the internal fact churn written since the durable
         // activation fact (taskexec/orchestrator rows, ~3 per turn): context
         // prep grew with turn count and, past the page bound, silently lost
-        // a valid activation (`BoundExhausted` -> inactive). The `(kind,
-        // session_id)` index makes this O(1) regardless of churn.
+        // a valid activation. The `(kind, session_id)` index makes this O(1)
+        // regardless of churn, so the dead page-exhaustion state is gone.
         match handle.memory_fact_get(TOOL_ACTIVATION_FACT_KIND, TOOL_ACTIVATION_FACT_KEY) {
             Ok(Some(value)) => {
                 // Authority law: a corrupt durable activation value is an

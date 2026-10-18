@@ -1225,3 +1225,105 @@ pub(crate) fn proof_store_failure(component: &str, detail: &str) -> Response {
 #[cfg(test)]
 #[path = "proof_tests.rs"]
 mod proof_tests;
+
+#[cfg(test)]
+mod totals_tests {
+    use super::*;
+    use faktor_core::id::{TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId};
+    use faktor_core::state::{
+        CheckExecution, CriterionBinding, CriterionVerification, VerificationStatus,
+    };
+
+    fn record(n: usize) -> VerificationRecord {
+        VerificationRecord {
+            record_id: VerificationRecordId::new(1),
+            task_id: TaskId::new(1),
+            revision: TaskRevision::new(1),
+            workspace_id: WorkspaceId::new(1),
+            worktree_id: WorktreeId::new(1),
+            tree_hash: Some("a".repeat(64)),
+            environment_fingerprint: None,
+            candidate_proof_ref: None,
+            criteria: (0..n)
+                .map(|i| CriterionVerification {
+                    criterion_key: format!("criterion-{i}"),
+                    passed: i % 2 == 0,
+                    evidence: None,
+                    binding: Some(CriterionBinding::RequiredCheck {
+                        check_id: format!("check-{i}"),
+                        command_digest: "b".repeat(64),
+                    }),
+                })
+                .collect(),
+            checks: (0..n)
+                .map(|i| CheckExecution {
+                    check: format!("check-{i}"),
+                    program: "true".into(),
+                    args: Vec::new(),
+                    category: "test".into(),
+                    required: i % 3 == 0,
+                    status: if i % 2 == 0 {
+                        VerificationStatus::Passed
+                    } else {
+                        VerificationStatus::Failed
+                    },
+                    started_ms: 0,
+                    finished_ms: Some(1),
+                    exit: Some(if i % 2 == 0 { 0 } else { 1 }),
+                    summary: None,
+                })
+                .collect(),
+            changed_files: Vec::new(),
+            unrelated_changes: Vec::new(),
+            reviewer: None,
+            status: VerificationStatus::Passed,
+            started_ms: 0,
+            completed_ms: Some(1),
+        }
+    }
+
+    /// Report row 10: proof totals are DURABLE counts, not page-local. The
+    /// served counts must equal the record at 0, 1, 499, 500, 501 and 10,000
+    /// rows while `items` stays at the 500-row page bound.
+    #[test]
+    fn proof_totals_are_durable_not_page_local_at_every_boundary() {
+        for n in [0usize, 1, 499, 500, 501, 10_000] {
+            let record = record(n);
+            let criteria = criteria_block(Some(&record), &[], false);
+            assert_eq!(criteria.total, n as u64, "criteria total at {n}");
+            assert_eq!(
+                criteria.passed + criteria.failed + criteria.unavailable,
+                n as u64,
+                "criteria counts at {n}"
+            );
+            assert_eq!(
+                criteria.items.len(),
+                n.min(MAX_NATIVE_LIST),
+                "criteria page at {n}"
+            );
+            assert_eq!(
+                criteria.truncated,
+                n > MAX_NATIVE_LIST,
+                "criteria truncated at {n}"
+            );
+
+            let checks = checks_block(Some(&record));
+            assert_eq!(checks.total, n as u64, "checks total at {n}");
+            assert_eq!(
+                checks.passed + checks.failed + checks.other,
+                n as u64,
+                "checks counts at {n}"
+            );
+            assert_eq!(
+                checks.items.len(),
+                n.min(MAX_NATIVE_LIST),
+                "checks page at {n}"
+            );
+            assert_eq!(
+                checks.truncated,
+                n > MAX_NATIVE_LIST,
+                "checks truncated at {n}"
+            );
+        }
+    }
+}

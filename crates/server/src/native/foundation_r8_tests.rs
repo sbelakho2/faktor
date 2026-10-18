@@ -845,3 +845,72 @@ async fn unauthenticated_requests_are_refused_for_every_r8_surface() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
 }
+
+/// Report row 18: the skills listing is cursor-paged. All 600 discovered
+/// skills are reachable; the old fixed `.take(500)` left 501+ invisible.
+#[tokio::test]
+async fn skills_listing_cursor_reaches_every_discovered_skill() {
+    let rig = Rig::new().await;
+    for i in 0..600 {
+        let dir = rig.dir.path().join(format!(".faktor/skills/skill-{i:04}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("# Skill {i}\n## Keywords: kw-{i}\nbody {i}\n"),
+        )
+        .unwrap();
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 10, "the cursor walk must terminate");
+        let path = match &after {
+            Some(cursor) => format!(
+                "/native/skills?session={}&limit=200&after={}",
+                rig.session,
+                urlencoding(cursor)
+            ),
+            None => format!("/native/skills?session={}&limit=200", rig.session),
+        };
+        let (status, body) = rig.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["discoveredTotal"], 600);
+        for skill in body["skills"].as_array().expect("skills array") {
+            if skill["installed"] == false {
+                names.push(skill["name"].as_str().expect("name").to_string());
+            }
+        }
+        if body["hasMore"] == true {
+            after = Some(
+                body["nextCursor"]
+                    .as_str()
+                    .expect("nextCursor with hasMore")
+                    .to_string(),
+            );
+        } else {
+            break;
+        }
+    }
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 600, "every discovered skill is reachable");
+
+    fn urlencoding(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                    c.to_string()
+                } else {
+                    let mut buf = [0u8; 4];
+                    c.encode_utf8(&mut buf)
+                        .bytes()
+                        .map(|b| format!("%{b:02X}"))
+                        .collect()
+                }
+            })
+            .collect()
+    }
+}

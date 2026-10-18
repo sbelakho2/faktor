@@ -3636,6 +3636,43 @@ mod tests {
     }
 }
 
+/// Report row 6: cache eviction is use-aware. A held (in-use) durable root
+/// is never the eviction victim while unused shadow roots exist, so the hot
+/// root keeps its watcher across 3x the cache bound of shadow churn.
+#[test]
+fn in_use_durable_root_is_never_evicted_by_shadow_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let service =
+        WorkspaceFileService::with_watch_registration_deadline(std::time::Duration::from_millis(1));
+    let id = faktor_core::id::WorkspaceId::new(7);
+    let durable_root = dir.path().join("durable");
+    std::fs::create_dir_all(&durable_root).unwrap();
+    let durable = service.open(id, durable_root.clone()).unwrap();
+    let canonical = durable_root.canonicalize().unwrap();
+    for i in 0..(crate::workspace_service::MAX_CACHED_ROOTS * 3) {
+        let root = dir.path().join(format!("shadow-{i}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = service.open(id, root).unwrap();
+    }
+    let cached = service.cached_roots();
+    assert!(
+        cached
+            .iter()
+            .any(|(cached_id, root)| *cached_id == id && *root == canonical),
+        "the in-use durable root must stay cached: {cached:?}"
+    );
+    assert!(
+        cached.len() <= crate::workspace_service::MAX_CACHED_ROOTS,
+        "unused shadow roots are evicted, not the held durable root: {}",
+        cached.len()
+    );
+    // The held handle is still fully usable.
+    std::fs::write(canonical.join("still-hot.txt"), b"ok").unwrap();
+    assert!(durable
+        .read_default(std::path::Path::new("still-hot.txt"))
+        .is_ok());
+}
+
 /// Scale probe regression: every shadowed turn opens a NEW root under the
 /// session's durable workspace id. The registry must stay bounded (one
 /// watcher thread per cached root), while still allowing the durable root and

@@ -4162,6 +4162,14 @@
 
   /** The outcome tone of one tool from its exit code and durable state. */
   function toolOutcome(tool) {
+    var excerpt = typeof tool.excerpt === 'string' ? tool.excerpt : '';
+    // A denied call is written as a typed tool_result whose excerpt starts
+    // with `tool call denied (<kind>): ...` and which carries NO exit code.
+    // It is a refusal, never a success: without this branch the generic
+    // "completed + non-empty excerpt" path painted it green as "done".
+    if (excerpt.indexOf('tool call denied (') === 0) {
+      return { tone: 'fail', label: 'denied' };
+    }
     var exit = tool.exitCode;
     if (typeof exit === 'number' && isFinite(exit)) {
       return exit === 0 ? { tone: 'pass', label: 'exit 0' } : { tone: 'fail', label: 'exit ' + exit };

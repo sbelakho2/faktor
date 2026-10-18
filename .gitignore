@@ -12,9 +12,12 @@ fuzz/artifacts/
 fuzz/coverage/
 fuzz/Cargo.lock
 
-# OS core dumps (crash artifacts; never source)
+# OS core dumps (crash artifacts; never source). `core` matches the bare
+# name, `core.*` the dot-suffixed form, and `*.core` the qemu/chrome-style
+# `<name>.core` dumps that reached this repo's history (2026-10-18).
 core
 core.*
+*.core
 # The `core` dump rule also matches the workspace's REAL source directory
 # `crates/core/`, and git cannot re-include files under an excluded
 # directory: without this negation every NEW file under crates/core (e.g.

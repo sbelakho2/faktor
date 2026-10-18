@@ -3178,9 +3178,9 @@ async fn settlement_binds_to_the_runs_recorded_task_identity() {
         admitted,
         "settlement must use the run's own task, not the advanced session identity"
     );
-    assert_eq!(
-        settlement_task_id(&handle, "tx-unrecorded").unwrap(),
-        advanced,
-        "legacy/unknown runs keep the historical current-identity fallback"
+    let err = settlement_task_id(&handle, "tx-unrecorded").unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Conflict(message) if message.contains("no recorded task identity")),
+        "an unrecorded run must refuse typed, never fall back to the advanced current identity: {err:?}"
     );
 }

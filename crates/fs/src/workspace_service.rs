@@ -265,9 +265,18 @@ fn register_watch_bounded(
 /// several roots at once: its real root and the live shadow root of an
 /// active shadow-mutation drive (the drive reads the world it mutates).
 /// `open` is idempotent per (id, root); identity stays the id.
+/// One cached root: the handle plus its insertion order (the eviction
+/// tie-break: the OLDEST not-in-use entry goes first, never an arbitrary one
+/// and never a root a live caller still holds).
+#[derive(Debug)]
+pub(crate) struct CachedRoot {
+    handle: WorkspaceHandle,
+    sequence: u64,
+}
+
 #[derive(Debug)]
 pub struct WorkspaceFileService {
-    pub(crate) workspaces: Mutex<HashMap<(WorkspaceId, PathBuf), WorkspaceHandle>>,
+    pub(crate) workspaces: Mutex<HashMap<(WorkspaceId, PathBuf), CachedRoot>>,
     /// Bounded recursive-watcher registration deadline (see
     /// [`DEFAULT_WATCH_REGISTRATION_DEADLINE`]).
     watch_registration_deadline: std::time::Duration,
@@ -278,6 +287,8 @@ pub struct WorkspaceFileService {
     watch_preflight_entries: usize,
     /// Monotonic allocator for [`Self::open_ephemeral`] identities.
     next_ephemeral_id: AtomicU64,
+    /// Monotonic insertion order of cached roots (eviction tie-break).
+    next_cache_sequence: AtomicU64,
 }
 
 impl Default for WorkspaceFileService {
@@ -287,6 +298,7 @@ impl Default for WorkspaceFileService {
             watch_registration_deadline: DEFAULT_WATCH_REGISTRATION_DEADLINE,
             watch_preflight_entries: DEFAULT_WATCH_PREFLIGHT_ENTRIES,
             next_ephemeral_id: AtomicU64::new(EPHEMERAL_WORKSPACE_ID_BASE),
+            next_cache_sequence: AtomicU64::new(1),
         }
     }
 }
@@ -323,8 +335,8 @@ impl WorkspaceFileService {
             .map_err(|e| Error::not_found(format!("workspace root {}: {e}", root.display())))?;
         {
             let map = recover_lock(&self.workspaces);
-            if let Some(h) = map.get(&(workspace_id, root.clone())) {
-                return Ok(h.clone());
+            if let Some(cached) = map.get(&(workspace_id, root.clone())) {
+                return Ok(cached.handle.clone());
             }
         }
         self.build_and_register(workspace_id, root)
@@ -364,15 +376,27 @@ impl WorkspaceFileService {
         let handle = self.build_handle(workspace_id, root.clone())?;
         let mut workspaces = recover_lock(&self.workspaces);
         if workspaces.len() >= MAX_CACHED_ROOTS {
+            // Evict the OLDEST entry no caller still holds. A live handle
+            // (`rooted` strong count > 1) keeps its cache slot: evicting it
+            // would recreate the watcher on the next resolve and could drop
+            // the hot durable root in favour of a freshly opened shadow.
             let evict = workspaces
-                .keys()
-                .find(|(id, cached)| *id != workspace_id || *cached != root)
-                .cloned();
+                .iter()
+                .filter(|(_, cached)| Arc::strong_count(&cached.handle.rooted) == 1)
+                .min_by_key(|(_, cached)| cached.sequence)
+                .map(|(key, _)| key.clone());
             if let Some(evict) = evict {
                 workspaces.remove(&evict);
             }
         }
-        workspaces.insert((workspace_id, root), handle.clone());
+        let sequence = self.next_cache_sequence.fetch_add(1, Ordering::SeqCst);
+        workspaces.insert(
+            (workspace_id, root),
+            CachedRoot {
+                handle: handle.clone(),
+                sequence,
+            },
+        );
         Ok(handle)
     }
 
@@ -501,6 +525,17 @@ impl WorkspaceFileService {
         recover_lock(&self.workspaces).len()
     }
 
+    /// Test probe: the exact cached roots (id, path), insertion-ordered.
+    #[cfg(test)]
+    pub(crate) fn cached_roots(&self) -> Vec<(WorkspaceId, PathBuf)> {
+        let mut roots: Vec<(u64, WorkspaceId, PathBuf)> = recover_lock(&self.workspaces)
+            .iter()
+            .map(|((id, path), cached)| (cached.sequence, *id, path.clone()))
+            .collect();
+        roots.sort_by_key(|(sequence, _, _)| *sequence);
+        roots.into_iter().map(|(_, id, path)| (id, path)).collect()
+    }
+
     /// The handle registered for `workspace_id`, if open (idle unload
     /// removes it). A READ-ONLY registry probe: unlike [`Self::open`] it
     /// never re-registers a workspace or creates a watcher, so callers that
@@ -510,7 +545,7 @@ impl WorkspaceFileService {
         recover_lock(&self.workspaces)
             .iter()
             .find(|((id, _), _)| *id == workspace_id)
-            .map(|(_, handle)| handle.clone())
+            .map(|(_, cached)| cached.handle.clone())
     }
 }
 

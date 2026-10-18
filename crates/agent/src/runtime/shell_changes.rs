@@ -1401,7 +1401,7 @@ impl AgentRuntime {
             return false;
         };
         let mut any = false;
-        let workspace = (|| self.open_effective_workspace(handle))();
+        let workspace = self.open_effective_workspace(handle);
         for row in rows {
             let Some(envelope) = &row.pre_manifest else {
                 continue;

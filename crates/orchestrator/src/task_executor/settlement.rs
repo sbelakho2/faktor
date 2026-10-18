@@ -2,9 +2,15 @@
 
 use super::*;
 
-/// Resolve the task identity a run was admitted under from its durable run
-/// linkage row. Legacy rows (written before the binding existed) fall back to
-/// the session's current identity. Never guesses a different task.
+/// Resolve the task identity a run was admitted under from its durable
+/// linkage row (in-session runs) or its durable policy row (the synthetic
+/// `tx-session-<id>` identity used by queued prompts, recovery and the
+/// shadow watcher). There is deliberately NO fallback to the session's
+/// CURRENT identity: a prompt that starts while an earlier run is still
+/// settling advances that identity, and reading it here would fold the old
+/// run's goal/spend/completion gate into the next task (and could mark it
+/// terminal before its first provider call). An unbound/legacy run is a
+/// typed refusal.
 pub(crate) fn settlement_task_id(
     handle: &faktor_session::SessionHandle,
     run_id: &str,
@@ -16,9 +22,7 @@ pub(crate) fn settlement_task_id(
             }
         }
     }
-    handle
-        .task_id()
-        .map_err(|e| ExecError::Internal(format!("task id read: {e}")))
+    run_policy_task_id(handle, run_id)
 }
 
 impl TaskExecutor {
@@ -62,7 +66,15 @@ impl TaskExecutor {
         // its durable facts, with the router feed atomic in the store's
         // append transaction. A replay of the same settlement is a no-op
         // (an existing record short-circuits and never double-feeds).
-        self.record_terminal_run_outcome(parent, &run_id, bound_task)?;
+        //
+        // A settlement that reached NO terminal/complete state has no
+        // terminal row to record; it also may name a run whose durable
+        // identity rows are absent (the documented missing-plan policy).
+        // Recording there would have to guess an identity, which is exactly
+        // the cross-task fold this settlement forbids.
+        if outcome.complete || outcome.completed || outcome.verified {
+            self.record_terminal_run_outcome(parent, &run_id, bound_task)?;
+        }
         Ok(outcome)
     }
 
@@ -97,7 +109,7 @@ impl TaskExecutor {
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         let task_id = match bound_task {
             Some(task_id) => task_id,
-            None => settlement_task_id(&handle, &run_id)?,
+            None => settlement_task_id(&handle, run_id)?,
         };
         let task = handle
             .get_task(task_id)
@@ -279,9 +291,9 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle
-            .task_id()
-            .map_err(|e| ExecError::Internal(format!("task id read: {e}")))?;
+        // The run's root task identity comes from its OWN durable plan row,
+        // per run. Reading the session's current identity here would let a
+        // newer prompt's task decide whether an OLDER run has open jobs.
         // FIX 2: the verification-fact scan is an explicit durable read — a
         // store failure is an error (never "no runs to settle") and a
         // corrupt fact page refuses typed.
@@ -310,6 +322,16 @@ impl TaskExecutor {
             if active {
                 continue;
             }
+            let task_id = self
+                .orchestrator
+                .plan_row(parent, &run_id)?
+                .task_id
+                .map(TaskId::new)
+                .ok_or_else(|| {
+                    ExecError::Conflict(format!(
+                        "run {run_id} predates the plan-row task binding; refusing to settle it into the session's current task"
+                    ))
+                })?;
             // FIX 2: open verification jobs are read explicitly. A failed
             // read must NEVER collapse to "no open jobs" (which would let
             // the settlement race a still-open verification). A corrupt job
@@ -383,7 +405,10 @@ impl TaskExecutor {
         // only stale-revision proof) runs nothing — the durable fact is
         // reporting state, never authorization.
         let steps = match self.latest_passing_proof(&handle, task_id)? {
-            Some(proof) => match self.run_completion_steps(parent, proof).await {
+            Some(proof) => match self
+                .run_completion_steps_bound(parent, task_id, proof)
+                .await
+            {
                 Ok(report) => report,
                 Err(e) => {
                     eprintln!("completion-step execution failed for session {parent}: {e}");
@@ -419,7 +444,7 @@ impl TaskExecutor {
                 None
             }
         };
-        let finalize = self.finalize_shadow_run(parent)?;
+        let finalize = self.finalize_shadow_run(parent, task_id)?;
         let task_state = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?
@@ -587,7 +612,7 @@ impl TaskExecutor {
         };
         // (4) The accepted contract's steps against the LANDED proof.
         outcome.steps = match self
-            .run_completion_steps_against_proof(parent, &landed)
+            .run_completion_steps_against_proof(parent, task_id, &landed)
             .await
         {
             Ok(report) => report,
@@ -908,7 +933,17 @@ impl TaskExecutor {
             merge_proposals,
             finalize,
         };
-        let task_id = handle.task_id()?;
+        // Settlement binds to the run's ROOT task identity recorded in its
+        // durable plan row at admission. A prompt that starts while this run
+        // settles may advance the session's current identity; re-reading it
+        // here would fold this run's goal/spend/completion into the next
+        // task.
+        let plan_row = self.orchestrator.plan_row(parent, &run_id)?;
+        let task_id = plan_row.task_id.map(TaskId::new).ok_or_else(|| {
+            ExecError::Conflict(format!(
+                "run {run_id} predates the plan-row task binding; refusing to settle it into the session's current task"
+            ))
+        })?;
         // Point 7: the root task row is created unconditionally at start;
         // a legacy run whose row is missing is SEEDED here — the settlement
         // never returns early merely because no row exists.
@@ -918,7 +953,7 @@ impl TaskExecutor {
         {
             Some(t) => t,
             None => {
-                let plan = self.orchestrator.plan_row(parent, &run_id)?.plan;
+                let plan = plan_row.plan;
                 let now = handle.now_ms();
                 handle
                     .create_task(faktor_session::Task {
@@ -989,7 +1024,7 @@ impl TaskExecutor {
         let landed = self.land_verified_integration(&handle, &proof)?;
         // (4) The accepted contract's steps against the landed proof.
         outcome.steps = match self
-            .run_completion_steps_against_proof(parent, &landed)
+            .run_completion_steps_against_proof(parent, task_id, &landed)
             .await
         {
             Ok(report) => report,

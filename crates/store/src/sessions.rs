@@ -564,6 +564,33 @@ impl Store {
         before: Option<(i64, i64)>,
         limit: u64,
     ) -> StoreResult<Vec<SessionRow>> {
+        self.list_sessions_page_at(workspace_id, before, limit, None)
+    }
+
+    /// The snapshot bound of a History walk: the newer of the wall clock and
+    /// the newest durable `updated_ms`. The first page returns it; every
+    /// later page passes it back so an update DURING the walk cannot move a
+    /// conversation above the cursor (re-surface it) or below a later page
+    /// (skip it). Under this rule a row updated after the snapshot is absent
+    /// from the rest of THAT walk and is re-listed by the next walk, which
+    /// starts from a fresh snapshot.
+    pub fn session_listing_snapshot_ms(&self) -> StoreResult<i64> {
+        let conn = self.read()?;
+        let newest: Option<i64> =
+            conn.query_row("SELECT MAX(updated_ms) FROM session", [], |row| row.get(0))?;
+        Ok(newest.unwrap_or(0).max(crate::connection::now_ms()))
+    }
+
+    /// [`Self::list_sessions_page`] bound to a History-walk snapshot. A
+    /// `None` snapshot keeps the legacy live-cursor behavior (used only by
+    /// callers that opt out of a coherent walk).
+    pub fn list_sessions_page_at(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        before: Option<(i64, i64)>,
+        limit: u64,
+        snapshot_ms: Option<i64>,
+    ) -> StoreResult<Vec<SessionRow>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -580,6 +607,10 @@ impl Store {
         if let Some(workspace) = workspace_id {
             clauses.push("workspace_id = ?");
             params.push(rusqlite::types::Value::Integer(workspace.raw() as i64));
+        }
+        if let Some(snapshot_ms) = snapshot_ms {
+            clauses.push("updated_ms <= ?");
+            params.push(rusqlite::types::Value::Integer(snapshot_ms));
         }
         if let Some((updated_ms, id)) = before {
             clauses.push("(updated_ms < ? OR (updated_ms = ? AND id < ?))");

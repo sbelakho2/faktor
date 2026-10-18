@@ -587,7 +587,11 @@ impl TaskExecutor {
         if !row.state.is_live() {
             return Ok(());
         }
-        let task_id = handle.task_id()?;
+        // The live shadow belongs to the run that STARTED it: its synthetic
+        // per-session policy row carries that run's admitted task id. A
+        // legacy shadow without the binding is a typed refusal — never the
+        // session's current identity (which a newer prompt may own).
+        let task_id = run_policy_task_id(handle, &format!("tx-session-{}", parent.raw()))?;
         let state = handle.get_task(task_id)?.map(|t| t.state);
         match state {
             Some(TaskState::Failed) | Some(TaskState::Cancelled) => {
@@ -1014,7 +1018,7 @@ impl TaskExecutor {
         handle: &faktor_session::SessionHandle,
         row: &TaskRunRow,
     ) -> Result<(), ExecError> {
-        let task_id = handle.task_id()?;
+        let task_id = settlement_task_id(handle, &row.run_id)?;
         let task = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
@@ -1043,7 +1047,7 @@ impl TaskExecutor {
                 })?;
         }
         // Cancelled is terminal: the durable finalize discards any shadow.
-        if let Err(e) = self.finalize_shadow_run(parent) {
+        if let Err(e) = self.finalize_shadow_run(parent, task_id) {
             eprintln!("shadow discard after cancel of run {}: {e}", row.run_id);
         }
         // The terminal cancel is the run's ledger boundary: its ONE
@@ -1052,7 +1056,7 @@ impl TaskExecutor {
         self.record_terminal_run_outcome(
             parent,
             &faktor_agent::session_terminal_run_id(parent),
-            None,
+            Some(task_id),
         )?;
         Ok(())
     }
@@ -1093,7 +1097,16 @@ impl TaskExecutor {
                     )),
                 })?;
         }
-        let task_id = handle.task_id()?;
+        let task_id = self
+            .orchestrator
+            .plan_row(handle.id(), run_id)?
+            .task_id
+            .map(TaskId::new)
+            .ok_or_else(|| {
+                ExecError::Conflict(format!(
+                    "run {run_id} predates the plan-row task binding; refusing to cancel the session's current task"
+                ))
+            })?;
         let task = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
@@ -1113,7 +1126,7 @@ impl TaskExecutor {
         }
         // The root task row is terminal: the run's ONE engineering-outcome
         // row is recorded now (a later settlement pass re-uses it verbatim).
-        self.record_terminal_run_outcome(handle.id(), run_id, None)?;
+        self.record_terminal_run_outcome(handle.id(), run_id, Some(task_id))?;
         Ok(())
     }
 
@@ -1137,6 +1150,7 @@ impl TaskExecutor {
     pub fn finalize_shadow_run(
         self: &Arc<Self>,
         parent: SessionId,
+        task_id: TaskId,
     ) -> Result<Option<ShadowFinalize>, ExecError> {
         let Some(shadows) = self.shadows() else {
             return Ok(None);
@@ -1151,7 +1165,6 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle.task_id()?;
         let Some(task) = handle.get_task(task_id)? else {
             return Ok(None);
         };
