@@ -127,6 +127,7 @@ async fn settle(
         .settle_run(RunSettlement::InSession {
             parent,
             run_id: run_id.to_string(),
+            task_id: None,
         })
         .await
         .expect("the production settlement converges")
@@ -447,6 +448,7 @@ async fn dual_producers_converge_for_every_interleaving() {
             .settle_run(RunSettlement::InSession {
                 parent,
                 run_id: settle_run_id,
+                task_id: None,
             })
             .await
             .expect("the concurrent settlement converges")

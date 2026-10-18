@@ -485,6 +485,7 @@ async fn settle(
         .settle_run(RunSettlement::InSession {
             parent,
             run_id: run_id.to_string(),
+            task_id: None,
         })
         .await
         .expect("the production settlement converges")
