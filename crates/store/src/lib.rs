@@ -201,6 +201,7 @@ pub use schema::SCHEMA_HEAD;
 pub(crate) use schema::*;
 mod migration;
 pub use migration::*;
+mod session_listing_page;
 mod sessions;
 pub use sessions::*;
 mod messages;

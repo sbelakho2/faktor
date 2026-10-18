@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// Merge the durable `shell_change` attribution into the turn summary.
+fn shell_change_summary(
+    handle: &faktor_session::SessionHandle,
+    op_id: OpId,
+    turn_summary: &faktor_context::ledger::TurnSummary,
+) -> (faktor_context::ledger::TurnSummary, bool) {
+    let (durable_paths, unresolved) = shell_change_facts(handle, op_id);
+    let mut merged = turn_summary.clone();
+    for path in durable_paths {
+        if !merged.files_changed.contains(&path) {
+            merged.files_changed.push(path);
+        }
+    }
+    (merged, unresolved)
+}
+
 impl AgentRuntime {
     /// Submit a prompt and run the full turn (durable; survives restarts).
     pub async fn run_turn(
@@ -718,12 +734,7 @@ impl AgentRuntime {
         settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
-        // Settlement is bound to the task identity this drive captured at
-        // its start. A new chat prompt can start as soon as the TurnCompleted
-        // journal event below is visible, while this tail is still folding
-        // the row and applying the completion gate; re-reading the session's
-        // (now advanced) task id would settle the OLD turn into the NEXT
-        // task row.
+        // Bound at drive start; never re-read after TurnCompleted is visible.
         let settlement_task_id = task_id;
         // P0-2 remainder: generic-shell changes are attributed through the
         // durable `shell_change` facts, so a crash-resumed turn (or a live
@@ -732,13 +743,7 @@ impl AgentRuntime {
         // unresolved attribution (captured/discovered/unattributed) refuses
         // the completion gate below — the unknown tree is never read as
         // "unchanged".
-        let (durable_shell_paths, unresolved_shell) = shell_change_facts(handle, op_id);
-        let mut merged_summary = turn_summary.clone();
-        for path in durable_shell_paths {
-            if !merged_summary.files_changed.contains(&path) {
-                merged_summary.files_changed.push(path);
-            }
-        }
+        let (merged_summary, unresolved_shell) = shell_change_summary(handle, op_id, turn_summary);
         let turn_summary = &merged_summary;
         ledger.record_turn(turn_summary);
         handle.put_task_ledger(serde_json::to_value(&*ledger)?)?;
