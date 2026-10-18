@@ -1562,10 +1562,37 @@ impl TerminalService {
         handle: &SessionHandle,
         sid: u64,
     ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
+        self.fold_from(handle, sid, false)
+    }
+
+    /// [`Self::fold`] with an optional FULL sweep. The listing read uses the
+    /// full sweep: the per-session index otherwise only decodes rows newer
+    /// than its watermark, so an already-folded row corrupted in place (the
+    /// run-state probe's poison) would stay invisible until a daemon
+    /// restart. A durable decode failure is a typed refusal, never a stale
+    /// cached view.
+    fn fold_verified(
+        &self,
+        handle: &SessionHandle,
+        sid: u64,
+    ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
+        self.fold_from(handle, sid, true)
+    }
+
+    fn fold_from(
+        &self,
+        handle: &SessionHandle,
+        sid: u64,
+        from_scratch: bool,
+    ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
         let mut index = self.lock_index();
         let entry = index.entry(sid).or_default();
+        if from_scratch {
+            entry.terminals.clear();
+        }
+        let after = if from_scratch { None } else { Some(entry.watermark) };
         let records = handle
-            .ledger_terminal_rows(Some(entry.watermark))
+            .ledger_terminal_rows(after)
             .map_err(|e| TerminalServiceError::Refused(e.message))?;
         for record in records {
             entry.apply(record);
@@ -2098,7 +2125,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let live = self.lock_live();
         let mut out: Vec<TerminalView> = terminals
             .values()
@@ -2168,7 +2195,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2239,7 +2266,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2312,7 +2339,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2384,7 +2411,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2436,7 +2463,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold(&handle, sid.raw())?;
+        let terminals = self.fold_verified(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
