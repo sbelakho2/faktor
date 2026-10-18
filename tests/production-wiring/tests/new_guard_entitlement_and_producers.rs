@@ -480,12 +480,22 @@ async fn settle(
     parent: SessionId,
     run_id: &str,
 ) -> SettlementOutcome {
+    // These harnesses seed the run's task row directly (they never admit a
+    // run through the executor), so the bound identity is the session's
+    // current task. Settlement must still be TOLD it explicitly.
+    let task_id = graph
+        .session
+        .get_session(parent)
+        .unwrap()
+        .unwrap()
+        .task_id()
+        .unwrap();
     graph
         .tasks
         .settle_run(RunSettlement::InSession {
             parent,
             run_id: run_id.to_string(),
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
         .expect("the production settlement converges")
