@@ -79,6 +79,14 @@ function summary(values) {
 }
 
 function rssKb(pid) {
+  // Linux (the nightly lane): read the kernel's own counter, no procps.
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+    if (match) return Number(match[1]);
+  } catch {
+    // fall through to ps on hosts without procfs
+  }
   try {
     const out = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' }).stdout;
     const value = Number(String(out).trim().split(/\s+/)[0]);
@@ -133,6 +141,7 @@ function storeBinary() {
 
 function appendBinary() {
   const candidates = [
+    process.env.FAKTOR_E8_APPEND_TURN,
     resolve(ROOT, 'target/release/examples/e8_append_turn'),
     resolve(ROOT, 'target/debug/examples/e8_append_turn'),
   ];
@@ -143,6 +152,7 @@ function appendBinary() {
 
 function seedBinary() {
   const candidates = [
+    process.env.FAKTOR_E8_SCALE_SEED,
     resolve(ROOT, 'target/release/examples/e8_scale_seed'),
     resolve(ROOT, 'target/debug/examples/e8_scale_seed'),
   ];
@@ -1221,10 +1231,9 @@ async function main() {
       },
       metrics: {
         turns: {
-          turn_ms: probes.find((entry) => entry.id === 'turns-compaction')?.turn_ms ?? summary(turnMetrics.turn),
+          turn_ms: probes.find((entry) => entry.id === 'turns-compaction')?.turn_ms ?? null,
           compaction_ms:
-            probes.find((entry) => entry.id === 'turns-compaction')?.compaction_ms ??
-            summary(turnMetrics.compaction),
+            probes.find((entry) => entry.id === 'turns-compaction')?.compaction_ms ?? null,
         },
         rss_kb: {
           start: startedRss,

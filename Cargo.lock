@@ -1928,6 +1928,7 @@ dependencies = [
  "faktor-session",
  "faktor-store",
  "faktor-verify",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

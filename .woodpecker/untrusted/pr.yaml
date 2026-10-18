@@ -123,9 +123,64 @@ steps:
     commands:
       - sh scripts/build-ci-image.sh --verify-runtime
 
+  # ------------------------------------------------- programme selection --
+  # Change-aware selection: maps the PR diff to affected crates/tests/suites,
+  # applies the transitive reverse-dependency closure and emits the exact
+  # command set. The Node half runs the structural suites here; the Rust half
+  # is written to selected-cargo.sh and executed by the linux lane below.
+  # An unmapped path is a typed refusal escalated to the full workspace test.
+  - name: programme-selection
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    commands:
+      - node scripts/programme/build-registry.mjs --check
+      - node scripts/programme/check-registry.mjs --selftest
+      - node scripts/programme/check-registry.mjs --check --no-probe
+      - node scripts/programme/select-tests.mjs selftest
+      - node scripts/programme/run-lane.mjs --selftest
+      - node scripts/programme/check-settlement.mjs --selftest
+      - node scripts/programme/check-settlement.mjs
+      - node tests/programme/generators/hostile.mjs --selftest
+      - node tests/programme/generators/schedules.mjs --selftest
+      - node tests/programme/probes/ordering.mjs
+      - node scripts/programme/check-core-dumps.mjs --selftest
+      - node scripts/check-blob-hygiene.mjs --selftest
+      - node scripts/check-blob-hygiene.mjs
+      - node scripts/programme/release-gate.mjs --selftest
+      - node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
+      - node scripts/programme/run-selection.mjs --selection target/certification/programme/selection.json
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        node scripts/programme/build-registry.mjs --check
+        node scripts/programme/check-registry.mjs --selftest
+        node scripts/programme/check-registry.mjs --check --no-probe
+        node scripts/programme/select-tests.mjs selftest
+        node scripts/programme/run-lane.mjs --selftest
+        node scripts/programme/check-settlement.mjs --selftest
+        node scripts/programme/check-settlement.mjs
+        node tests/programme/generators/hostile.mjs --selftest
+        node tests/programme/generators/schedules.mjs --selftest
+        node tests/programme/probes/ordering.mjs
+        node scripts/programme/check-core-dumps.mjs --selftest
+        node scripts/check-blob-hygiene.mjs --selftest
+        node scripts/check-blob-hygiene.mjs
+        node scripts/programme/release-gate.mjs --selftest
+        node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
+        node scripts/programme/run-selection.mjs --selection target/certification/programme/selection.json
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane programme-selection --status passed \
+          --artifact target/certification/programme/selection.json \
+          --artifact target/certification/programme/selection-run.json \
+          --artifact target/certification/programme/selected-cargo.sh \
+          --out target/certification/lanes/programme-selection.json
+
   # ---------------------------------------------------------------- linux --
   - name: linux
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    depends_on: [programme-selection]
     environment:
       RUST_BACKTRACE: "1"
     commands:
@@ -145,7 +200,15 @@ steps:
       - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - cargo test --workspace --all-features
+      # Change-aware pull lane: only the affected crates/suites run by
+      # default. The selection is conservative (reverse-dependency closure);
+      # an unmapped path is a typed refusal escalated to the full workspace
+      # test and recorded in the selection evidence — never a silent skip.
+      # Trusted/nightly full lanes keep `cargo test --workspace` (see
+      # .woodpecker/trusted/).
+      - cargo build -p faktor-cli
+      # Only the affected Rust command set selected by programme-selection.
+      - sh target/certification/programme/selected-cargo.sh
       - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
@@ -158,7 +221,8 @@ steps:
         sh scripts/check-fault-seams.sh
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo test --workspace --all-features
+        cargo build -p faktor-cli
+        sh target/certification/programme/selected-cargo.sh
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
@@ -172,6 +236,17 @@ steps:
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
+  # Dynamic surface verification after the Rust step built faktor-cli:
+  # every native route is probed with auth/empty/hostile cases against a real
+  # daemon, the event-stream ordering probe runs, and the registry status is
+  # rewritten with the measured evidence.
+  - name: programme-verify
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    depends_on: [linux]
+    commands:
+      - node scripts/programme/check-registry.mjs --check
+      - node tests/programme/probes/ordering.mjs
+      - node scripts/programme/release-gate.mjs --status
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -571,6 +646,8 @@ steps:
       - jetbrains-smoke
       - edition5
       - edition8
+      - programme-selection
+      - programme-verify
     when:
       status: [success, failure]
     commands:

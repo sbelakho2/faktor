@@ -173,6 +173,20 @@ const PLAN_GATES = [
   ['jetbrains-smokes', '§6', 'smokeHostMatrixZip'],
   ['edition5', '§7', 'scripts/edition5/run.mjs'],
   ['edition8', '§7', 'tests/edition8/registry.mjs'],
+  ['programme-registry-build', '§2', 'build-registry.mjs --check'],
+  ['programme-registry-check', '§2', 'check-registry.mjs --check'],
+  ['programme-registry-selftest', '§2', 'check-registry.mjs --selftest'],
+  ['programme-selector-selftest', '§2', 'select-tests.mjs selftest'],
+  ['programme-lane-selftest', '§2', 'run-lane.mjs --selftest'],
+  ['programme-settlement', '§2', 'check-settlement.mjs'],
+  ['programme-hostile-generators', '§2', 'generators/hostile.mjs --selftest'],
+  ['programme-race-schedules', '§2', 'generators/schedules.mjs --selftest'],
+  ['programme-ordering-probe', '§2', 'probes/ordering.mjs'],
+  ['programme-agent-evals', '§2', 'evals.mjs --smoke'],
+  ['programme-core-dumps', '§2', 'check-core-dumps.mjs'],
+  ['blob-hygiene', '§2', 'check-blob-hygiene.mjs'],
+  ['programme-release-selftest', '§2', 'release-gate.mjs --selftest'],
+  ['programme-full-selection', '§2', 'select-tests.mjs --mode trusted'],
   ['dogfood-coverage', '§8', 'dogfood.mjs --coverage'],
 ];
 
@@ -382,6 +396,62 @@ const CI_LANE_MAP = [
     ],
   },
   {
+    id: 'programme-registry-build',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'build-registry.mjs --check']],
+  },
+  {
+    id: 'programme-registry-check',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'check-registry.mjs --check']],
+  },
+  {
+    id: 'programme-registry-selftest',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'check-registry.mjs --selftest']],
+  },
+  {
+    id: 'programme-selector-selftest',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'select-tests.mjs selftest']],
+  },
+  {
+    id: 'programme-lane-selftest',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'run-lane.mjs --selftest']],
+  },
+  {
+    id: 'programme-settlement',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'check-settlement.mjs']],
+  },
+  {
+    id: 'programme-hostile-generators',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'generators/hostile.mjs --selftest']],
+  },
+  {
+    id: 'programme-race-schedules',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'generators/schedules.mjs --selftest']],
+  },
+  {
+    id: 'programme-ordering-probe',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'probes/ordering.mjs']],
+  },
+  {
+    id: 'programme-agent-evals',
+    lanes: [['.woodpecker/trusted/nightly.yaml', 'evals.mjs --smoke']],
+  },
+  {
+    id: 'programme-core-dumps',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'check-core-dumps.mjs']],
+  },
+  {
+    id: 'blob-hygiene',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'check-blob-hygiene.mjs']],
+  },
+  {
+    id: 'programme-release-selftest',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'release-gate.mjs --selftest']],
+  },
+  {
+    id: 'programme-full-selection',
+    lanes: [['.woodpecker/untrusted/pr.yaml', 'select-tests.mjs --mode pull']],
+  },
+  {
     id: 'dogfood-coverage',
     lanes: [
       ['.woodpecker/untrusted/pr.yaml', 'dogfood.mjs --coverage'],
@@ -423,6 +493,16 @@ const SCRIPT_ALLOWLIST = new Map(
       'PowerShell implementation of the Windows visual baseline lane; runs on the self-hosted windows agent and is not executable in the linux dogfood suite.',
     'scripts/woodpecker/activate.sh':
       'operator helper for Woodpecker server/project setup (scripts/woodpecker/setup.md); not part of the repository build or test surface.',
+    'scripts/programme/live-contracts.mjs':
+      'weekly live lane driver: runs recorded provider fixtures offline and refuses typed without operator live keys/driver; it must not run inside the offline dogfood suite.',
+    'scripts/edition8/fake-ollama.mjs':
+      'fake provider used by the nightly scale-probe lane (sandboxed loopback server); the nightly campaign runs it with the probe.',
+    'scripts/edition8/scale-probe.mjs':
+      'nightly scale-probe lane (1,000 turns/100k messages/2k sessions with stored curves); too large for the offline dogfood suite.',
+    'scripts/vscode-e2e/edition8-host-smoke.cjs':
+      'invoked by the Extension Host e2e lane (scripts/vscode-e2e.sh / apps/vscode package scripts), not by the offline dogfood plan.',
+    'scripts/programme/hil.mjs':
+      'hardware-in-the-loop release lane driver: requires FAKTOR_HIL=1 and a rig command, so it is a typed refusal outside the release rig.',
     'scripts/woodpecker/verify-boundary.sh':
       'operator assertion for the trusted/untrusted Woodpecker project boundary; exercised during server setup, not by the dogfood suite.',
     'scripts/certification/fixtures/woodpecker-api/mock_server.py':
@@ -2309,12 +2389,20 @@ function capabilityGraph(root) {
       crates,
     };
   }
+  let programmeRows = new Map();
+  try {
+    const programme = JSON.parse(readIf(join(root, 'tests/programme/registry.json')));
+    programmeRows = new Map((programme.rows ?? []).map((row) => [row.id, row]));
+  } catch {
+    programmeRows = new Map();
+  }
   const world = {
     crates,
     invariants: parseInvariants(readIf(join(root, REGISTRY_FILE))),
     coverage,
     discovered: discover(root),
     specs: loadMutationSpecs(join(root, 'scripts/mutations')),
+    programmeRows,
     root,
   };
   return { problems: coverageProblems(world), discovered: world.discovered, crates };

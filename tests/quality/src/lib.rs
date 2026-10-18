@@ -1366,3 +1366,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "memory_pager_plan_tests.rs"]
+mod memory_pager_plan_tests;

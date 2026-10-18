@@ -48,6 +48,7 @@
 #
 #   fault-scale                          faktor_lane_token_fault_scale
 #   longrun                              faktor_lane_token_longrun
+#   scale                                faktor_lane_token_scale
 #   supply-chain                         faktor_lane_token_supply_chain
 #   ui-smoke-vscode                      faktor_lane_token_ui_smoke_vscode
 #   ui-smoke-jetbrains                   faktor_lane_token_ui_smoke_jetbrains
@@ -109,6 +110,47 @@ steps:
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane longrun --status passed \
           --out target/certification/lanes/longrun.json
+  # ------------------------------------------------------------------ scale
+  # The scale probe added at HEAD found more real defects than any other suite,
+  # yet no lane ran it. It is a nightly gate with stored curves: 1,000 turns
+  # each followed by a forced compaction, 100k messages, 2k history sessions,
+  # 5k memory facts, 500 children/claims, 16 live streams. The build step and
+  # the probe are split because the rust baseline has no Node and the node
+  # baseline has no Rust toolchain; both share the target volume.
+  - name: scale-build
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-scale:/woodpecker-cache/target
+    commands:
+      - cargo build --release -p faktor-cli --bins --examples
+  - name: scale
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23 (same digest-pinned baseline as the nightly certificate)
+    depends_on: [scale-build]
+    environment:
+      # The probe reads these instead of guessing target/<profile> paths.
+      FAKTOR_CLI_BIN: /woodpecker-cache/target/release/faktor-cli
+      FAKTOR_E8_SCALE_SEED: /woodpecker-cache/target/release/examples/e8_scale_seed
+      FAKTOR_E8_APPEND_TURN: /woodpecker-cache/target/release/examples/e8_append_turn
+    volumes:
+      - faktor-nightly-target-scale:/woodpecker-cache/target
+    commands:
+      - node scripts/edition8/scale-probe.mjs --turns 1000
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        node scripts/edition8/scale-probe.mjs --turns 1000
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane scale --status passed \
+          --artifact target/certification/edition8/scale.raw.json \
+          --out target/certification/lanes/scale.json
   - name: supply-chain
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -282,6 +324,7 @@ steps:
       - supply-chain
       - ui-smoke-vscode
       - ui-smoke-jetbrains
+      - scale
     when:
       status: [success, failure]
     # Lane-bound auth verification (opt-in): map every registered lane token
@@ -291,6 +334,7 @@ steps:
     # environment:
     #   faktor_lane_token_fault_scale: { from_secret: faktor_lane_token_fault_scale }
     #   faktor_lane_token_longrun: { from_secret: faktor_lane_token_longrun }
+    #   faktor_lane_token_scale: { from_secret: faktor_lane_token_scale }
     #   faktor_lane_token_supply_chain: { from_secret: faktor_lane_token_supply_chain }
     #   faktor_lane_token_ui_smoke_vscode: { from_secret: faktor_lane_token_ui_smoke_vscode }
     #   faktor_lane_token_ui_smoke_jetbrains: { from_secret: faktor_lane_token_ui_smoke_jetbrains }
@@ -299,5 +343,12 @@ steps:
       # conventionally tagged and assigned to a lane wired in this workflow
       # (or documented as manual) — see scripts/check-ignored-tests.mjs.
       - node scripts/check-ignored-tests.mjs
+      # Test-programme nightly gates: structural registry + full selection,
+      # settlement ban, and the strict tree/history core-dump scan.
+      - node scripts/programme/check-registry.mjs --check --no-probe
+      - node scripts/programme/select-tests.mjs --mode nightly --out target/certification/programme/selection-nightly.json
+      - node scripts/programme/check-settlement.mjs
+      - node scripts/programme/evals.mjs --smoke
+      - node scripts/programme/check-core-dumps.mjs
       - node scripts/certification/evidence.mjs verify-markers --workflow nightly --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_nightly --status passed --from-markers target/certification/lanes --commands "woodpecker nightly campaign certificate"

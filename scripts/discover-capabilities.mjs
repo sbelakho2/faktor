@@ -203,13 +203,15 @@ export function discoverNativeRoutes(root, files = serverRouteFiles(root)) {
       if (body === null) continue;
       const pathMatch = /^\s*"([^"]+)"/.exec(body);
       if (!pathMatch) continue;
-      const path = pathMatch[1].replace(/^\//, '').replace(/[/{}]/g, '.').replace(/\.+/g, '.');
+      const rawPath = pathMatch[1];
+      const path = rawPath.replace(/^\//, '').replace(/[/{}]/g, '.').replace(/\.+/g, '.');
       for (const method of body.matchAll(/\b(get|post|put|patch|delete)\s*\(/g)) {
-        found.set(`native.${method[1]}.${path.replace(/\.$/, '')}`, file);
+        const id = `native.${method[1]}.${path.replace(/\.$/, '')}`;
+        found.set(id, { file, method: method[1], path: rawPath });
       }
     }
   }
-  return [...found.keys()].sort().map((id) => ({ id, file: found.get(id) }));
+  return [...found.keys()].sort().map((id) => ({ id, ...found.get(id) }));
 }
 
 /**

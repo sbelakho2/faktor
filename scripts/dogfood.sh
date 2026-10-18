@@ -175,6 +175,30 @@ run_shell "bash scripts/check-gradle-integrity.sh --selftest"
 run_shell "bash scripts/branding-scan.sh"
 run_cmd cargo test -p faktor-tests-static-authority
 run_cmd "$NODE_BIN" scripts/discover-capabilities.mjs selftest
+# Test programme: the per-surface registry, change-aware selector, lane model
+# and the report's act-now scans. The registry check derives statuses from
+# real probes (route/CLI when a binary exists); the full selection proves the
+# conservative mapping covers every crate.
+run_cmd "$NODE_BIN" scripts/programme/build-registry.mjs --check
+run_cmd "$NODE_BIN" scripts/programme/check-registry.mjs --check
+run_cmd "$NODE_BIN" scripts/programme/check-registry.mjs --selftest
+run_cmd "$NODE_BIN" scripts/programme/select-tests.mjs selftest
+run_cmd "$NODE_BIN" scripts/programme/select-tests.mjs --mode trusted --out target/certification/programme/selection-dogfood.json
+run_cmd "$NODE_BIN" scripts/certification/select-tests.mjs --changed-file crates/store/src/ledger.rs --lane pull --out target/certification/programme/selection-dogfood-alias.json
+run_cmd "$NODE_BIN" scripts/programme/select-tests.mjs --mode pull --changed-file docs/specs/edition8/flows.md --out target/certification/programme/selection-dogfood-scoped.json
+run_cmd "$NODE_BIN" scripts/programme/run-selection.mjs --selection target/certification/programme/selection-dogfood-scoped.json
+run_cmd "$NODE_BIN" scripts/programme/run-lane.mjs --selftest
+run_cmd "$NODE_BIN" scripts/programme/check-settlement.mjs --selftest
+run_cmd "$NODE_BIN" scripts/programme/check-settlement.mjs
+run_cmd "$NODE_BIN" tests/programme/generators/hostile.mjs --selftest
+run_cmd "$NODE_BIN" tests/programme/generators/schedules.mjs --selftest
+run_cmd "$NODE_BIN" tests/programme/probes/ordering.mjs
+run_cmd "$NODE_BIN" scripts/programme/evals.mjs --smoke
+run_cmd "$NODE_BIN" scripts/programme/check-core-dumps.mjs --selftest
+run_cmd "$NODE_BIN" scripts/programme/check-core-dumps.mjs
+run_cmd "$NODE_BIN" scripts/check-blob-hygiene.mjs --selftest
+run_cmd "$NODE_BIN" scripts/check-blob-hygiene.mjs
+run_cmd "$NODE_BIN" scripts/programme/release-gate.mjs --selftest
 run_cmd "$NODE_BIN" scripts/protocol-codegen.mjs --check-clients
 run_cmd "$NODE_BIN" scripts/check-visual-platforms.mjs --selftest
 run_cmd python3 scripts/certification/check-visual-baseline.py selftest

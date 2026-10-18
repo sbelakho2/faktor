@@ -338,10 +338,11 @@ impl MemoryRecordStore {
                     self.store
                         .memory_facts_v2_page(self.session, cursor.as_ref(), page)?
                 }
-                FactOwner::Workspace => {
-                    self.store
-                        .workspace_memory_facts_v2_page(self.workspace, cursor.as_ref(), page)?
-                }
+                FactOwner::Workspace => self.store.workspace_memory_facts_v2_page(
+                    self.workspace,
+                    cursor.as_ref(),
+                    page,
+                )?,
             };
             if rows.is_empty() {
                 break;

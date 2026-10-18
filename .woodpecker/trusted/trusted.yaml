@@ -1010,6 +1010,14 @@ steps:
       # tree barrier, host UI matrices) stay explicit in the
       # report's `not_proven_here` list and are enforced by their own lanes.
       - node scripts/certification/prove-all.mjs
+      # Test-programme gates: per-surface registry (structural: the node-only
+      # certificate has no daemon binary), full-lane selection evidence and
+      # the act-now static scans. Dynamic route/CLI probes run in the PR lane.
+      - node scripts/programme/check-registry.mjs --check --no-probe
+      - node scripts/programme/select-tests.mjs --mode trusted --out target/certification/programme/selection-trusted.json
+      - node scripts/programme/check-settlement.mjs
+      - node scripts/programme/check-core-dumps.mjs --selftest
+      - node scripts/check-blob-hygiene.mjs
       - |
         set -eu
         contracts_digest="$(node scripts/contracts/emit.mjs verify --print-digest)"

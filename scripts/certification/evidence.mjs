@@ -705,6 +705,7 @@ const WORKFLOWS = {
       'jetbrains-build',
       'jetbrains-smoke',
       'edition5',
+      'programme-selection',
     ],
   },
   trusted: {
@@ -733,6 +734,10 @@ const WORKFLOWS = {
       // check; `ui-smoke-jetbrains` proves the built plugin ZIP through the
       // host matrix, recording target/certification/jetbrains-host-matrix.json.
       'ui-smoke-vscode',
+      {
+        lane: 'scale',
+        requiredArtifacts: ['target/certification/edition8/scale.raw.json'],
+      },
       {
         lane: 'ui-smoke-jetbrains',
         requiredArtifacts: ['target/certification/jetbrains-host-matrix.json'],

@@ -33,6 +33,7 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discover } from './discover-capabilities.mjs';
+import { isDelegationOnly } from '../tests/programme/model.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const COVERAGE_FILE = join(ROOT, 'tests/invariant-coverage.json');
@@ -40,6 +41,17 @@ const CRATE_SNAPSHOT_FILE = join(ROOT, 'tests/production-crates.json');
 const REGISTRY_FILE = join(ROOT, 'tests/invariants.toml');
 const MUTATIONS_DIR = join(ROOT, 'scripts/mutations');
 const SURFACES = ['apps/vscode', 'apps/jetbrains'];
+const PROGRAMME_REGISTRY = join(ROOT, 'tests/programme/registry.json');
+
+/** Surface rows owned by the per-surface programme registry, if present. */
+function loadProgrammeRows() {
+  try {
+    const document = JSON.parse(readFileSync(PROGRAMME_REGISTRY, 'utf8'));
+    return new Map((document.rows ?? []).map((row) => [row.id, row]));
+  } catch {
+    return new Map();
+  }
+}
 
 export function productionCrates(metadata) {
   return metadata.packages
@@ -151,6 +163,7 @@ export function coverageProblems({
   coverage,
   discovered = { ids: [] },
   specs = new Map(),
+  programmeRows = new Map(),
   root = ROOT,
 }) {
   const problems = [];
@@ -283,11 +296,16 @@ export function coverageProblems({
   // ---- discovery equality (P0-2) ---------------------------------------
   const known = new Set(capabilities.keys());
   for (const id of discovered.ids ?? []) {
-    if (!known.has(id)) {
-      problems.push(
-        `undiscovered-capability: ${id} exists on a real product surface but has no manifest row (prove it, delegate it, or record an explicit gap)`,
-      );
-    }
+    if (known.has(id)) continue;
+    // The per-surface programme registry supersedes the legacy delegation
+    // manifest for surface rows. A row with its own (non-invariant) test ids
+    // satisfies discovery equality; status/proof debt is judged by the
+    // programme checker and the release gate.
+    const programmeRow = programmeRows.get(id);
+    if (programmeRow && !isDelegationOnly(programmeRow.test_ids ?? [])) continue;
+    problems.push(
+      `undiscovered-capability: ${id} exists on a real product surface but has no manifest row (prove it, delegate it, or record an explicit gap)`,
+    );
   }
 
   // ---- crate classification --------------------------------------------
@@ -390,6 +408,7 @@ function load() {
     coverage: JSON.parse(readFileSync(COVERAGE_FILE, 'utf8')),
     discovered: discover(ROOT),
     specs: loadMutationSpecs(),
+    programmeRows: loadProgrammeRows(),
   };
 }
 

@@ -1,0 +1,146 @@
+{
+  "schema": "faktor-agent-eval-corpus/v1",
+  "note": "Deterministic trajectory oracles. Live-model hidden tasks run in the weekly-live lane; this corpus proves the evaluator and the trajectory invariants on recorded events, never on model prose.",
+  "tasks": [
+    {
+      "id": "settlement-bound",
+      "events": [
+        {
+          "seq": 1,
+          "kind": "turn_started",
+          "op": "op-1",
+          "task": "task-1",
+          "event_id": "settlement-bound-e1"
+        },
+        {
+          "seq": 2,
+          "kind": "provider_call",
+          "op": "op-1",
+          "task": "task-1",
+          "event_id": "settlement-bound-e2"
+        },
+        {
+          "seq": 3,
+          "kind": "turn_completed",
+          "op": "op-1",
+          "task": "task-1",
+          "event_id": "settlement-bound-e3"
+        },
+        {
+          "seq": 4,
+          "kind": "task_row",
+          "op": "op-1",
+          "task": "task-1",
+          "terminal": true,
+          "event_id": "settlement-bound-e4"
+        }
+      ],
+      "assert": [
+        {
+          "type": "ordered",
+          "before": "turn_completed",
+          "after": "task_row"
+        },
+        {
+          "type": "no_duplicate",
+          "field": "event_id"
+        },
+        {
+          "type": "every_event_task",
+          "task": "task-1"
+        }
+      ]
+    },
+    {
+      "id": "budget-refusal-before-call",
+      "events": [
+        {
+          "seq": 1,
+          "kind": "turn_started",
+          "op": "op-2",
+          "task": "task-2",
+          "event_id": "budget-refusal-before-call-e1"
+        },
+        {
+          "seq": 2,
+          "kind": "budget_refused",
+          "op": "op-2",
+          "task": "task-2",
+          "limit": "max_cost_micro",
+          "event_id": "budget-refusal-before-call-e2"
+        },
+        {
+          "seq": 3,
+          "kind": "turn_completed",
+          "op": "op-2",
+          "task": "task-2",
+          "event_id": "budget-refusal-before-call-e3"
+        }
+      ],
+      "assert": [
+        {
+          "type": "no_event_after",
+          "kind": "provider_call",
+          "after": "budget_refused"
+        },
+        {
+          "type": "names_limit",
+          "kind": "budget_refused"
+        },
+        {
+          "type": "no_duplicate",
+          "field": "event_id"
+        }
+      ]
+    },
+    {
+      "id": "tool-call-dedupe",
+      "events": [
+        {
+          "seq": 1,
+          "kind": "turn_started",
+          "op": "op-3",
+          "task": "task-3",
+          "event_id": "tool-call-dedupe-e1"
+        },
+        {
+          "seq": 2,
+          "kind": "tool_call",
+          "id": "call-1",
+          "name": "read_file",
+          "event_id": "tool-call-dedupe-e2"
+        },
+        {
+          "seq": 3,
+          "kind": "tool_call",
+          "id": "call-1",
+          "name": "read_file",
+          "event_id": "tool-call-dedupe-e3"
+        },
+        {
+          "seq": 4,
+          "kind": "tool_result",
+          "id": "call-1",
+          "status": "ok",
+          "event_id": "tool-call-dedupe-e4"
+        },
+        {
+          "seq": 5,
+          "kind": "turn_completed",
+          "op": "op-3",
+          "task": "task-3",
+          "event_id": "tool-call-dedupe-e5"
+        }
+      ],
+      "assert": [
+        {
+          "type": "dedupe_tool_calls"
+        },
+        {
+          "type": "result_after_call",
+          "id": "call-1"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+# Executable lane/layer manifest for the test programme.
+# Source: Report.pdf p.2 (six layers), pp.39-47 (five lanes), act-now p.3.
+# The Node model (tests/programme/model.mjs) is the executable authority; this
+# file is the repository-facing manifest read by tests/programme/lanes.mjs so
+# a lane rename cannot silently diverge from the report.
+
+schema = "faktor-test-lanes/v1"
+
+[[layer]]
+id = "unit-property"
+name = "Unit and property"
+
+[[layer]]
+id = "state-model-crash"
+name = "State model and crash"
+
+[[layer]]
+id = "contracts"
+name = "Contracts"
+
+[[layer]]
+id = "ide-screen-readers"
+name = "IDE and screen readers"
+
+[[layer]]
+id = "agent-evals"
+name = "Agent evals"
+
+[[layer]]
+id = "hardware"
+name = "Hardware"
+
+[[lane]]
+id = "pull"
+full = false
+layers = ["unit-property", "state-model-crash", "contracts"]
+
+[[lane]]
+id = "trusted"
+full = true
+layers = ["unit-property", "state-model-crash", "contracts", "ide-screen-readers"]
+
+[[lane]]
+id = "nightly"
+full = true
+layers = ["unit-property", "state-model-crash", "contracts", "ide-screen-readers", "agent-evals"]
+
+[[lane]]
+id = "weekly-live"
+full = true
+layers = ["contracts", "ide-screen-readers", "agent-evals"]
+
+[[lane]]
+id = "release"
+full = true
+layers = ["unit-property", "state-model-crash", "contracts", "ide-screen-readers", "agent-evals", "hardware"]
+
+[[job]]
+id = "scale"
+lane = "nightly"
+script = "scripts/edition8/scale-probe.mjs"
+artifact = "target/certification/edition8/scale.raw.json"
+marker = "target/certification/lanes/scale.json"
+turns = 1000
+
+[[job]]
+id = "blob-hygiene"
+lane = "pull"
+script = "scripts/programme/check-core-dumps.mjs"
