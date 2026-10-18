@@ -2016,6 +2016,745 @@
           }
         ]
       }
+    },
+    {
+      "name": "ModelBinding",
+      "doc": "One provider/model preference (plus optional reasoning effort).",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "provider",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "reasoning_effort",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "PresetRoleModels",
+      "doc": "The persisted per-role model map (planner/coder/verifier/summarizer).",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "role_models",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "revision",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "PresetFallbackChain",
+      "doc": "The ordered fallback candidates; order is authoritative.",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "fallback_chain",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "revision",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "CatalogProbe",
+      "doc": "Observed reachability/model-list probe plus the served capability of one exact model.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "connection_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "provider",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "stages",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "models",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "capability",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "certification",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "McpAuthState",
+      "doc": "Durable MCP auth binding; token material is never present.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "server_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "transport",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "account",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "scopes",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "has_token",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "revision",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReviewComment",
+      "doc": "A durable line-anchored review comment tied to session/task/change.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "task_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "change_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "path",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "line_start",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "line_end",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "side",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "body",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "author",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "content_hash",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "resolved",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "revision",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "created_ms",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "updated_ms",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChangeAcceptReceipt",
+      "doc": "Idempotent per-file change acceptance: applied/already-current/rejected paths.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "accepted",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "change_set_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "applied",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "already_current",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "rejected",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "integrated",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "idempotent",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RestorePreviewFile",
+      "doc": "One exact would-restore file action with current/expected/restored digests.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "path",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "action",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "current",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "expected",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "restore",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "content_digest",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RestorePreview",
+      "doc": "Dry-run restore plan; writes is always 0.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "dry_run",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "writes",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "checkpoint_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "sequence",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "direction",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "files",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "RestorePreviewFile"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "writable",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "conflict_count",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionExport",
+      "doc": "Bounded exported session bundle with digest and redaction counts.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "digest",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "bytes",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "redacted",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "redacted_fields",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "truncated",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "bundle",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionSettings",
+      "doc": "Per-session selectable compaction model and loop guards.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "compaction_model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "max_turns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "max_consecutive_failures",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionDeleteTombstone",
+      "doc": "Durable session deletion tombstone and the exact purged-row counts.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "deleted",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "idempotent",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "deleted_ms",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "purged",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
     }
   ],
   "constants": {

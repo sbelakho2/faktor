@@ -5331,6 +5331,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "DigiKey OAuth token-endpoint provider response: token_from_response extracts \
              the token into the connector SecretString at the same boundary, never stored.",
         ),
+        (
+            "crates/server/src/native/foundation_ext.rs",
+            "NativeMcpAuthBody",
+            "MCP OAuth callback body: the access token is moved into the secret vault \
+             (SecretVault) in the same handler and never persisted or echoed in plaintext.",
+        ),
     ];
 
     fn is_wire_dto_allowlisted(rel: &str, struct_name: &str) -> bool {

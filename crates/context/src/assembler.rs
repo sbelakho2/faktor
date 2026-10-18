@@ -7,7 +7,12 @@
 
 /// One compacted/wire text turn: role + bounded text (the compactor and the
 /// recent-history loaders both speak this shape).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` exist for the DURABLE context checkpoint: an
+/// accepted compaction persists exactly these turns (plus the source
+/// high-water seq) so a restarted daemon rebuilds the same context instead
+/// of replaying history that was already summarized.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecentTurn {
     pub role: String,
     pub text: String,

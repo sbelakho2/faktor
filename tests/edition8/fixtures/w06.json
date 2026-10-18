@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W06",
+  "title": "Compact and inspect continuity",
+  "screens": [
+    "S10",
+    "S08",
+    "S32"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Open the compaction plan. Inspect retained facts: contract version, candidate identity, policy version, pending operations and evidence refs.",
+    "Inspect the summary model route, egress and cost implications.",
+    "Request a new durable compact operation with an expected context/task revision.",
+    "Preserve pending approvals and unknown external-effect state through compaction.",
+    "After commit, inspect before/after basis, measured reduction and the new summary version.",
+    "Keep required contract, candidate identity and unresolved obligations reachable and active."
+  ],
+  "forbidden_fake_states": [
+    "A compacted transcript view shown as runtime context reduction",
+    "a 1% summary accepted as success",
+    "deletion implied by compaction",
+    "measured reduction fabricated from an estimate"
+  ],
+  "complete_when": "required contract, candidate identity and unresolved obligations remain reachable and active (p.184).",
+  "traceability": "p.184; controls K-01..K-04, C-12, I-11, V-07; acceptance A15.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

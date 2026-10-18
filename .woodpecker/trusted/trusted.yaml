@@ -614,11 +614,13 @@ steps:
         platform: darwin/arm64
     commands:
       - cargo check --workspace
+      - if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped: node unavailable"; fi
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         cargo check --workspace
+        if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped: node unavailable"; fi
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | shasum -a 256 | cut -d' ' -f1)"
@@ -631,6 +633,42 @@ steps:
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-check","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-check.json
+  - name: darwin-edition8
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
+    environment:
+      RUST_TEST_THREADS: "2"
+      CARGO_BUILD_JOBS: "4"
+    when:
+      matrix:
+        platform: darwin/arm64
+    commands:
+      # Isolated real-product dogfood: detached worktree + isolated data dir +
+      # loopback-only fake provider + the real daemon; drives the VS Code host,
+      # then the real Swing JetBrains host (control exercise, A01-A40,
+      # W01-W16 x 5 cells, evidence, host matrix, daemon dogfood). The runner
+      # then executes every Edition 8 gate against the macOS reviewed
+      # baselines and verifies the certificate evidence. No soak lane.
+      - cargo build -q -p faktor-cli
+      - node scripts/edition8/run.mjs --dogfood --allow-dirty
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo build -q -p faktor-cli
+        node scripts/edition8/run.mjs --dogfood --allow-dirty
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | shasum -a 256 | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane darwin-edition8 --status passed \
+          --artifact target/certification/edition8-summary.json \
+          --artifact target/certification/edition8/dogfood.raw.json \
+          --out target/certification/lanes/darwin-edition8.json
   - name: darwin-test
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     environment:
@@ -823,6 +861,54 @@ steps:
           --lane release-artifacts --status passed \
           --artifact target/release/faktor-cli \
           --out target/certification/lanes/release-artifacts.json
+  # ---------------------------- Edition 8 gates (linux, both hosts) ------
+  # Same registry-driven gates as the PR lane; trusted runs on the shared
+  # workspace where the linux lane built target/debug/faktor-cli and the
+  # jetbrains-smoke lane produced the real Swing evidence. A runner without a
+  # checked-in reviewed baseline records an explicit unreviewed platform
+  # boundary; the isolated real-daemon dogfood for both hosts runs in the
+  # darwin-edition8 lane where the host toolchain exists.
+  - name: edition8
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-render/vscode-e2e; chromium runtime included)
+    depends_on: [linux, vscode, vscode-render, jetbrains-build, jetbrains-smoke]
+    commands:
+      - |
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        [ -n "$chrome_bin" ] || { echo "edition8: chromium missing (fail closed)" >&2; exit 1; }
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        export FAKTOR_CHROME="$chrome_wrapper"
+        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        set -eu
+        chrome_bin="$(ls /ms-playwright/chromium-*/chrome-linux/chrome | head -n 1)"
+        [ -n "$chrome_bin" ] || { echo "edition8: chromium missing" >&2; exit 1; }
+        chrome_wrapper="$(mktemp)"
+        printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        chmod +x "$chrome_wrapper"
+        export FAKTOR_CHROME="$chrome_wrapper"
+        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane edition8 --status passed \
+          --artifact target/certification/edition8-summary.json \
+          --artifact target/certification/edition8/registry.json \
+          --artifact target/certification/edition8/control-exercise-vscode.json \
+          --artifact target/certification/edition8/control-exercise-jetbrains.json \
+          --out target/certification/lanes/edition8.json
   - name: certificate
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -833,6 +919,7 @@ steps:
       - vscode-e2e
       - jetbrains-build
       - jetbrains-smoke
+      - edition8
       - release-artifacts
     when:
       matrix:
@@ -869,6 +956,10 @@ steps:
       # calm card headers, no unreviewed internal-identifier labels) hold with
       # file:line evidence. A new surface without a gate fails here.
       - node scripts/dogfood.mjs selftest && node scripts/dogfood.mjs --coverage
+      # Edition 8 evidence is verified on the trusted linux workspace; the
+      # isolated both-host dogfood evidence is produced and verified by the
+      # darwin-edition8 lane.
+      - node tests/edition8/evidence.mjs verify --allow-unreviewed-platform
       # Singular-authority law: the retired raw network matcher must never
       # return; the canonical destination/DNS authority owns egress.
       - node scripts/check-network-authority-singular.mjs
@@ -886,6 +977,22 @@ steps:
       # README/docs capability claims are enforced HERE because this is the
       # node-carrying lane (`check-docs-sync.sh` skips the check without node).
       - node scripts/capabilities-manifest.mjs --selftest && node scripts/capabilities-manifest.mjs --check-claims
+      # Edition 5 dogfood: isolated worktree + isolated data dir + loopback-only
+      # fake provider + the REAL daemon; drives the VS Code host runtime and
+      # the real compaction long-task probes. The JetBrains host flows are
+      # covered by the jetbrains-smoke lane's real-daemon smokes.
+      - |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
+        printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
+        /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
+      - . "$HOME/.cargo/env"
+      - FAKTOR_CLI_BIN="$PWD/target/release/faktor-cli" SKIP_JETBRAINS=1 bash scripts/edition5/dogfood.sh
+      - node scripts/edition5/run.mjs --no-verify
+      - node tests/edition5/evidence.mjs verify --allow-dirty
       # The planted-mutation campaign runs in the jetbrains-smoke lane, which
       # carries cargo, JDK/gradle and Node; this node-only image has none of
       # those toolchains, so running it here would count exit-127 environment

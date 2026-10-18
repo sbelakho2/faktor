@@ -1400,3 +1400,59 @@ fn degenerate_shadow_roots_refuse_typed_and_anchored_relative_roots_are_accepted
     let accepted = ShadowRoots::new(manager.clone(), PathBuf::from("./shadows")).unwrap();
     assert_eq!(accepted.shadows_root(), Path::new("./shadows"));
 }
+
+#[test]
+fn accept_change_set_lands_only_approved_paths_and_retires_the_shadow() {
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    drive_write(&fix, "a.txt", b"alpha v2");
+    let row = shadow_row_of(&fix);
+    fs::remove_file(PathBuf::from(&row.root).join("c.txt")).unwrap();
+    let change_set = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_eq!(change_set.files.len(), 2);
+
+    let outcome = fix
+        .shadows
+        .accept_change_set(
+            fix.session,
+            &[PathBuf::from("a.txt")],
+            &[PathBuf::from("c.txt")],
+        )
+        .unwrap();
+    assert_eq!(outcome.applied, vec![PathBuf::from("a.txt")]);
+    assert_eq!(outcome.rejected, vec![PathBuf::from("c.txt")]);
+    assert!(outcome.integrated);
+    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha v2");
+    // A rejected deletion is NEVER applied.
+    assert!(fix.user.join("c.txt").exists());
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Integrated);
+    // Replaying against a retired shadow is a typed refusal; the server's
+    // durable receipt is what makes the wire replay idempotent.
+    assert!(fix
+        .shadows
+        .accept_change_set(
+            fix.session,
+            &[PathBuf::from("a.txt")],
+            &[PathBuf::from("c.txt")]
+        )
+        .is_err());
+}
+
+#[test]
+fn accept_change_set_refuses_an_incomplete_decision_without_writing() {
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    drive_write(&fix, "a.txt", b"alpha v2");
+    drive_write(&fix, "sub/b.txt", b"beta v2");
+    let err = fix
+        .shadows
+        .accept_change_set(fix.session, &[PathBuf::from("a.txt")], &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::runtime::ExecError::UndecidedPaths(_)),
+        "{err}"
+    );
+    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
+    assert_eq!(user_bytes(&fix, "sub/b.txt"), b"beta");
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Active);
+}

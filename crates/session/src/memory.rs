@@ -8,6 +8,31 @@ const MAX_FACT_VALUE_BYTES: usize = 4096;
 /// Bounded page size for memory-fact paging (paging is fundamental).
 pub const MAX_FACT_PAGE_SIZE: i64 = 200;
 
+/// Reserved legacy fact kind of the DURABLE CONTEXT CHECKPOINT. It is not a
+/// V2 memory row (no `memory_v2:` prefix), so the typed memory render never
+/// surfaces it as project memory; it is the durable replacement history of
+/// the last accepted compaction.
+pub const CONTEXT_CHECKPOINT_KIND: &str = "context_checkpoint";
+/// Hard byte bound of one checkpoint payload (kept-history turns JSON).
+/// The durable context window is budget-bounded far below this; exceeding
+/// it is a typed refusal, never a silent truncation of the replacement
+/// context (which would lose facts).
+pub const MAX_CONTEXT_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
+/// One fact value must stay under [`MAX_FACT_VALUE_BYTES`]; chunks leave
+/// room for the JSON head/chunk-key envelope.
+const CONTEXT_CHECKPOINT_CHUNK_BYTES: usize = 3000;
+
+/// One durable context checkpoint: the exact compacted turns plus the source
+/// message high-water seq they replace. `payload` is the serialized turn
+/// list (opaque to the session layer); `digest` is the caller's canonical
+/// history digest, used by restart/probe equality checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCheckpoint {
+    pub through_seq: u64,
+    pub digest: String,
+    pub payload: Vec<u8>,
+}
+
 /// One deterministic page of memory facts with explicit paging metadata:
 /// `{size, cursor, has_more, total_estimate}`. Facts are ordered
 /// newest-first by `(updated_ms DESC, kind DESC, key DESC)`; the cursor is
@@ -25,6 +50,60 @@ pub struct MemoryFactsPage {
     pub has_more: bool,
     /// Exact fact count for the session (cheap; the facts table is small).
     pub total_estimate: i64,
+}
+
+/// Build the chunked `(key, value)` facts of one durable context checkpoint.
+/// Validation, the UTF-8 bound and the payload hash are the SAME for the
+/// standalone checkpoint write and the atomic compaction commit, so the two
+/// paths can never encode different replacement contexts.
+pub(crate) fn context_checkpoint_facts(
+    through_seq: u64,
+    digest: &str,
+    payload: &[u8],
+) -> faktor_core::Result<Vec<(String, String)>> {
+    if payload.len() > MAX_CONTEXT_CHECKPOINT_BYTES {
+        return Err(SessionError::Oversized(format!(
+            "context checkpoint of {} bytes exceeds MAX_CONTEXT_CHECKPOINT_BYTES",
+            payload.len()
+        ))
+        .into());
+    }
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(SessionError::Malformed(
+            "context checkpoint digest must be 64 hex characters".into(),
+        )
+        .into());
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| SessionError::Malformed("context checkpoint is not UTF-8".into()))?;
+    let mut chunks: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + CONTEXT_CHECKPOINT_CHUNK_BYTES).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    let payload_hash = blake3::hash(payload).to_hex().to_string();
+    let head = serde_json::json!({
+        "version": 1,
+        "through_seq": through_seq,
+        "digest": digest,
+        "payload_hash": payload_hash,
+        "chunks": chunks.len(),
+    })
+    .to_string();
+    let mut facts: Vec<(String, String)> = Vec::with_capacity(chunks.len() + 1);
+    facts.push(("head".to_string(), head));
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        facts.push((format!("c/{index:06}"), chunk));
+    }
+    Ok(facts)
 }
 
 impl SessionHandle {
@@ -64,6 +143,156 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// ONE exact fact value (indexed `(session, kind, key)` lookup). Hot
+    /// paths that used to full-scan the fact table use this instead.
+    pub fn memory_fact_get(&self, kind: &str, key: &str) -> faktor_core::Result<Option<String>> {
+        self.manager
+            .store()
+            .memory_fact_get(self.id, kind, key)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// One deterministic newest-first page of ONE fact kind.
+    pub fn memory_facts_by_kind_page(
+        &self,
+        kind: &str,
+        after: Option<&(i64, String, String)>,
+        limit: i64,
+    ) -> faktor_core::Result<MemoryFactsPage> {
+        let limit = limit.clamp(1, MAX_FACT_PAGE_SIZE);
+        let page_limit = u64::try_from(limit).map_err(|_| {
+            SessionError::Malformed(format!("memory fact page limit {limit} is negative"))
+        })?;
+        let (rows, has_more) = self
+            .manager
+            .store()
+            .memory_facts_by_kind_page(self.id, kind, after, page_limit)
+            .map_err(crate::map_store_err)?;
+        let cursor = if has_more {
+            rows.last()
+                .map(|r| (r.updated_ms, r.kind.clone(), r.key.clone()))
+        } else {
+            None
+        };
+        Ok(MemoryFactsPage {
+            facts: rows.into_iter().map(|r| (r.kind, r.key, r.value)).collect(),
+            size: limit,
+            cursor,
+            has_more,
+            total_estimate: 0,
+        })
+    }
+
+    /// Keep only the newest `keep` rows of one fact kind (bounded retention
+    /// for append-only per-turn facts).
+    pub fn prune_memory_facts_kind_keep_newest(
+        &self,
+        kind: &str,
+        keep: usize,
+    ) -> faktor_core::Result<usize> {
+        self.manager
+            .store()
+            .prune_memory_facts_kind_keep_newest(self.id, kind, keep)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Atomically replace the durable context checkpoint (all chunks in one
+    /// transaction): a crash exposes the OLD checkpoint or the NEW one,
+    /// never a half-written replacement context.
+    pub fn put_context_checkpoint(
+        &self,
+        through_seq: u64,
+        digest: &str,
+        payload: &[u8],
+    ) -> faktor_core::Result<()> {
+        let facts = context_checkpoint_facts(through_seq, digest, payload)?;
+        self.manager
+            .store()
+            .replace_memory_facts_kind(self.id, CONTEXT_CHECKPOINT_KIND, &facts)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// The durable context checkpoint, if the session has one. A malformed
+    /// or truncated checkpoint is a LOUD typed error (the caller may fall
+    /// back to the full transcript, but it must never mistake corruption for
+    /// "no checkpoint" and silently change context).
+    pub fn context_checkpoint(&self) -> faktor_core::Result<Option<ContextCheckpoint>> {
+        let Some(head_raw) = self
+            .manager
+            .store()
+            .memory_fact_get(self.id, CONTEXT_CHECKPOINT_KIND, "head")
+            .map_err(crate::map_store_err)?
+        else {
+            return Ok(None);
+        };
+        let head: serde_json::Value = serde_json::from_str(&head_raw)
+            .map_err(|e| SessionError::Malformed(format!("context checkpoint head: {e}")))?;
+        let version = head.get("version").and_then(|v| v.as_u64());
+        if version != Some(1) {
+            return Err(
+                SessionError::Malformed("unsupported context checkpoint version".into()).into(),
+            );
+        }
+        let through_seq = head
+            .get("through_seq")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| SessionError::Malformed("checkpoint through_seq missing".into()))?;
+        let digest = head
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SessionError::Malformed("checkpoint digest missing".into()))?
+            .to_string();
+        let payload_hash = head
+            .get("payload_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SessionError::Malformed("checkpoint payload_hash missing".into()))?
+            .to_string();
+        let chunks = head
+            .get("chunks")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| SessionError::Malformed("checkpoint chunk count missing".into()))?;
+        if chunks == 0 || chunks > (MAX_CONTEXT_CHECKPOINT_BYTES as u64) {
+            return Err(SessionError::Malformed(
+                "context checkpoint chunk count is out of bounds".into(),
+            )
+            .into());
+        }
+        let mut payload: Vec<u8> = Vec::new();
+        for index in 0..chunks {
+            let key = format!("c/{index:06}");
+            let Some(chunk) = self
+                .manager
+                .store()
+                .memory_fact_get(self.id, CONTEXT_CHECKPOINT_KIND, &key)
+                .map_err(crate::map_store_err)?
+            else {
+                return Err(SessionError::Malformed(format!(
+                    "context checkpoint chunk {key} is missing"
+                ))
+                .into());
+            };
+            payload.extend_from_slice(chunk.as_bytes());
+            if payload.len() > MAX_CONTEXT_CHECKPOINT_BYTES {
+                return Err(SessionError::Oversized(
+                    "context checkpoint reassembly exceeds the bound".into(),
+                )
+                .into());
+            }
+        }
+        let actual = blake3::hash(&payload).to_hex().to_string();
+        if actual != payload_hash {
+            return Err(SessionError::Malformed(
+                "context checkpoint payload hash mismatch (truncated or corrupt)".into(),
+            )
+            .into());
+        }
+        Ok(Some(ContextCheckpoint {
+            through_seq,
+            digest,
+            payload,
+        }))
+    }
+
     /// One deterministic page of memory facts (see [`MemoryFactsPage`]).
     /// Bounded: never loads more than one page + one probe row, and the
     /// probe runs inside the same query.
@@ -101,6 +330,49 @@ impl SessionHandle {
         })
     }
 
+    /// Durable UX marker of a THRESHOLD-TRIGGERED compaction in flight
+    /// (S10). It is written only while the summarizer/pruner runs and cleared
+    /// at the end, so a standalone session can render "compacting" instead of
+    /// inferring progress. A crash leaves a stale marker with its start time;
+    /// readers must treat an old marker as stale, never as live progress.
+    pub fn set_runtime_compaction(
+        &self,
+        active: bool,
+        trigger: &str,
+        now_ms: i64,
+    ) -> faktor_core::Result<()> {
+        const KIND: &str = "runtime_compaction";
+        const KEY: &str = "active";
+        if active {
+            let value = serde_json::json!({
+                "version": 1,
+                "trigger": trigger,
+                "started_ms": now_ms,
+            })
+            .to_string();
+            self.upsert_memory_fact(KIND, KEY, &value)
+        } else {
+            self.manager
+                .store()
+                .delete_memory_fact(self.id, KIND, KEY)
+                .map(|_| ())
+                .map_err(|e| crate::map_store_err(e).into())
+        }
+    }
+
+    /// The stale-tolerant in-flight compaction marker, if any.
+    pub fn runtime_compaction(&self) -> faktor_core::Result<Option<serde_json::Value>> {
+        const KIND: &str = "runtime_compaction";
+        const KEY: &str = "active";
+        let Some(raw) = self.memory_fact_get(KIND, KEY)? else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            SessionError::Malformed(format!("runtime compaction marker is malformed: {e}"))
+        })?;
+        Ok(Some(value))
+    }
+
     /// The durable task ledger (goal, completed/open steps, decisions, ...).
     /// The journal is the source of truth for *what happened*; the ledger is
     /// the compact structured projection that survives compaction.
@@ -130,6 +402,7 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
+    use crate::SessionManager;
 
     #[test]
     fn memory_facts_upsert_and_bounds() {
@@ -365,5 +638,97 @@ mod tests {
             let again = s.memory_facts_page(probe.as_ref(), 6).unwrap();
             assert_eq!(replay, again, "cursor replay is deterministic");
         }
+    }
+
+    #[test]
+    fn context_checkpoint_roundtrips_atomically_and_rejects_corruption() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let payload = "TURN-".repeat(2_000).into_bytes(); // 10 KiB -> multiple bounded chunks
+        let digest = blake3::hash(b"digest").to_hex().to_string();
+        let sid = s.id();
+        s.put_context_checkpoint(42, &digest, &payload).unwrap();
+        let stored = s
+            .context_checkpoint()
+            .unwrap()
+            .expect("checkpoint must roundtrip");
+        assert_eq!(stored.through_seq, 42);
+        assert_eq!(stored.digest, digest);
+        assert_eq!(stored.payload, payload);
+
+        // Reopening the store (daemon restart) reproduces the same bytes.
+        drop(s);
+        let reopened =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let handle = reopened.get_session(sid).unwrap().unwrap();
+        let after = handle.context_checkpoint().unwrap().unwrap();
+        assert_eq!(after, stored, "restart must reproduce the checkpoint");
+
+        // A shorter replacement deletes stale chunks atomically.
+        handle
+            .put_context_checkpoint(43, &digest, b"short")
+            .unwrap();
+        let replaced = handle.context_checkpoint().unwrap().unwrap();
+        assert_eq!(replaced.payload, b"short");
+        let chunks = handle
+            .memory_facts_by_kind_page(CONTEXT_CHECKPOINT_KIND, None, MAX_FACT_PAGE_SIZE)
+            .unwrap();
+        assert_eq!(
+            chunks.facts.len(),
+            2,
+            "head + exactly one chunk, no stale chunk rows"
+        );
+
+        // Corrupt one chunk: the payload hash must fail loudly, never be
+        // mistaken for an absent checkpoint.
+        m.store()
+            .upsert_memory_fact(sid, CONTEXT_CHECKPOINT_KIND, "c/000000", "garbage")
+            .unwrap();
+        assert!(
+            handle.context_checkpoint().is_err(),
+            "truncated/corrupt checkpoint must be a typed error"
+        );
+    }
+
+    #[test]
+    fn identical_fact_rewrites_are_true_noops_and_changes_are_stamped() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        s.upsert_memory_fact("task", "goal", "same").unwrap();
+        let before = s
+            .memory_facts_by_kind_page("task", None, MAX_FACT_PAGE_SIZE)
+            .unwrap()
+            .facts;
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        s.upsert_memory_fact("task", "goal", "same").unwrap();
+        let again = s
+            .memory_facts_by_kind_page("task", None, MAX_FACT_PAGE_SIZE)
+            .unwrap()
+            .facts;
+        assert_eq!(before, again, "an unchanged value must not rewrite the row");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        s.upsert_memory_fact("task", "goal", "changed").unwrap();
+        let changed = s
+            .memory_facts_by_kind_page("task", None, MAX_FACT_PAGE_SIZE)
+            .unwrap()
+            .facts;
+        assert_eq!(changed[0].2, "changed");
+    }
+
+    #[test]
+    fn per_turn_fact_retention_is_bounded_and_keeps_the_newest() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        for i in 0..200 {
+            s.upsert_memory_fact("turn", &format!("{i:04}"), "x")
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let deleted = s.prune_memory_facts_kind_keep_newest("turn", 64).unwrap();
+        assert_eq!(deleted, 136);
+        let facts = s.memory_facts().unwrap();
+        assert_eq!(facts.len(), 64);
+        assert!(facts.iter().any(|(_, k, _)| k == "0199"));
+        assert!(!facts.iter().any(|(_, k, _)| k == "0000"));
     }
 }

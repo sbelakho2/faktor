@@ -1415,7 +1415,16 @@ pub(crate) fn build_daemon_core(
     let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(cas.clone(), store));
     let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(sandbox_policy, None));
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
-    let hooks = env_hook_registry(&supervisor);
+    // Always wire ONE hook registry over the daemon supervisor, even with
+    // zero configured specs: the Edition 5 hook lifecycle endpoints register
+    // managed hooks into this SAME registry, so a hook created at runtime
+    // actually fires for its event.
+    let hooks = Some(env_hook_registry(&supervisor).unwrap_or_else(|| {
+        Arc::new(faktor_hooks::HookRegistry::with_supervisor(
+            supervisor.clone(),
+            DAEMON_HOOK_ENVELOPE,
+        ))
+    }));
     // Step 13 — the AgentRuntime over every authority above: the routing
     // policy, the budget ledger, the evidence provider, the instruction
     // resolver, the verification service and the ONE supervisor all enter

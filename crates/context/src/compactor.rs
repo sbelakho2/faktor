@@ -53,7 +53,6 @@ use faktor_evidence::types::{
 const ARCHIVE_CHUNK_BYTES: usize = 512 * 1024;
 const DIGEST_MAX_CHARS: usize = 600;
 const DIGEST_MAX_LINES: usize = 8;
-const DIGEST_TEMPLATE: &str = "[Earlier context archived: …<artifact://hash>]";
 const ARTIFACT_PLACEHOLDER: &str = "<artifact://hash>";
 
 /// A `tool`-role turn larger than this many bytes is "huge historical tool
@@ -97,8 +96,22 @@ fn turn_chars(turn: &RecentTurn) -> usize {
 
 /// Exact estimator value of one rendered turn (same formula as
 /// `Estimator::estimate_tokens(&format!("{role}: {text}"))`, no allocation).
-fn estimate_turn_tokens(turn: &RecentTurn) -> usize {
+/// This is also the EXACT wire cost of one post-compaction message: the
+/// compacted history is carried as one text message per turn, and the
+/// estimator's +1 structural adder is the message envelope.
+pub fn estimate_turn_tokens(turn: &RecentTurn) -> usize {
     Estimator.estimate_chars(turn_chars(turn))
+}
+
+/// Exact wire cost of a list of compacted turns (the number the hard
+/// invariant must compare against the cap). This is the SAME metric the
+/// compactor charges while it decides what to keep, so `after_tokens` can
+/// never under-report the bytes the next request will actually carry.
+pub fn estimate_wire_turns(turns: &[RecentTurn]) -> usize {
+    turns
+        .iter()
+        .map(estimate_turn_tokens)
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Exact estimator value of the concatenated rendering of `turns` (same
@@ -108,6 +121,58 @@ fn estimate_rendered_tokens<'a>(turns: impl Iterator<Item = &'a RecentTurn>) -> 
         .map(|turn| turn_chars(turn).saturating_add(1))
         .fold(0usize, |total, chars| total.saturating_add(chars));
     Estimator.estimate_chars(chars)
+}
+
+/// The runtime's compaction trigger and the session's hard-invariant record
+/// must speak the SAME token unit. The compactor measures a history by its
+/// rendered wire shape (`role: text`), so the runtime calls this instead of
+/// approximating with `bytes / 4` (which under-counted the estimator by
+/// about 25% and made the recorded reduction ratio meaningless).
+pub fn estimate_history_tokens(turns: &[RecentTurn]) -> usize {
+    estimate_rendered_tokens(turns.iter())
+}
+
+/// Deterministic digest of the EXACT compacted context (role + text pairs,
+/// length-prefixed). A restart must reproduce this value byte-for-byte from
+/// the durable checkpoint; probes and recovery compare it instead of
+/// trusting an in-memory plan object.
+pub fn history_digest(turns: &[RecentTurn]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(turns.len() as u64).to_le_bytes());
+    for turn in turns {
+        for part in [turn.role.as_bytes(), turn.text.as_bytes()] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+// Test-only work counter for the deterministic keep scan: proves the
+// per-compaction work is a constant number of passes over the loaded
+// window (never a rescan of the whole conversation per kept turn).
+#[cfg(test)]
+thread_local! {
+    static TURN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_turn_visit() {
+    TURN_VISITS.with(|v| v.set(v.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(crate) fn take_turn_visits() -> usize {
+    TURN_VISITS.with(|v| v.replace(0))
+}
+
+/// The exact wire text of the eviction digest marker.
+fn digest_marker(digest_text: &str) -> String {
+    format!(
+        "[Earlier context archived: {}…{}]",
+        truncate(digest_text, DIGEST_MAX_CHARS),
+        ARTIFACT_PLACEHOLDER
+    )
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -133,6 +198,54 @@ fn dedupe_exact_rows(turns: &[RecentTurn]) -> Vec<RecentTurn> {
         }
     }
     out
+}
+
+/// Split prior compaction summaries out of the conversational residue:
+/// `(residue_without_summaries, newest_summary, older_summaries)`.
+///
+/// A summary is model-authored compression, not a new fact. Feeding it back
+/// into a summarizer lets repeated compactions re-summarize their own output
+/// and drift; the newest summary is therefore carried VERBATIM (or archived
+/// whole when it cannot fit) and never enters the summarizer input. Older
+/// summaries are superseded and archived.
+fn partition_prior_metadata(
+    turns: &[RecentTurn],
+) -> (
+    Vec<RecentTurn>,
+    Option<RecentTurn>,
+    Vec<RecentTurn>,
+    Option<RecentTurn>,
+) {
+    let mut residue = Vec::with_capacity(turns.len());
+    let mut summaries: Vec<RecentTurn> = Vec::new();
+    let mut digest: Option<RecentTurn> = None;
+    for turn in turns {
+        if turn.role == "summary" {
+            summaries.push(turn.clone());
+        } else if turn.role == "assistant" && is_digest_marker(turn) {
+            // Only the NEWEST archive pointer matters; older ones are
+            // superseded by it (they describe the same durable archive).
+            digest = Some(turn.clone());
+        } else {
+            residue.push(turn.clone());
+        }
+    }
+    let carried = summaries.pop();
+    (residue, carried, summaries, digest)
+}
+
+/// One deterministic keep pass's result (the retry loop can revisit the
+/// keep budget when the optional digest marker does not fit).
+struct KeptPlan {
+    wire: Vec<RecentTurn>,
+    archived: Vec<ArtifactRef>,
+    chunks: Vec<String>,
+    after: usize,
+    accepted: bool,
+}
+
+fn is_digest_marker(turn: &RecentTurn) -> bool {
+    turn.text.starts_with("[Earlier context archived:")
 }
 
 /// Only a TOOL-role turn is evidence-eligible. Tool output has no
@@ -646,61 +759,96 @@ impl Compactor {
     ) -> CompactionPlan {
         // Stages (a)+(b): move huge historical tool output to evidence refs
         // and collapse exact duplicate rows BEFORE any model sees anything.
-        let (residue, evidence_refs) = self.prepare_history(history);
+        let (prepared, evidence_refs) = self.prepare_history(history);
+        // Prior compaction summaries are NOT conversational residue: feeding
+        // a summary back into a summarizer is how repeated compactions drift.
+        // The newest summary is carried VERBATIM; older ones are archived.
+        let (residue, carried_summary, older_summaries, prior_digest) =
+            partition_prior_metadata(&prepared);
         // (c): the user's ask, verbatim, and the durable facts, both kept
         // OUT of the summarizer input.
         let identity = projection.identity_render();
         let durable_facts = projection.summarizable_render();
-        let identity_tokens = Estimator.estimate_tokens(&identity);
-        let facts_tokens = Estimator.estimate_tokens(&durable_facts);
+        // The synthesized turns are reserved by their EXACT wire cost (role
+        // + ": " + text), never by estimating the bare render: the old code
+        // omitted the "TASK IDENTITY (verbatim):\n" / "DURABLE TASK
+        // PROJECTION:\n" prefixes and could accept an over-cap plan.
+        let synthesized = synthesized_turns(&identity, &durable_facts);
         let residue_tokens = estimate_rendered_tokens(residue.iter());
 
         // (f): the LLM is invoked only above the residue budget.
         if let Some(summarizer) = &self.summarizer {
             if residue_tokens > req.summarizer_residue_budget_tokens {
                 let summary = summarizer.summarize(&residue, &durable_facts).await;
-                let after = identity_tokens
-                    .saturating_add(facts_tokens)
-                    .saturating_add(Estimator.estimate_tokens(&summary));
-                if after <= req.hard_cap() {
-                    // Accepted summary: it REPLACES the conversational
-                    // residue on the wire. Identity (verbatim) and durable
-                    // facts ride alongside; every evicted residue turn is
-                    // archived for the CAS, chunked, never truncated.
-                    let archived = residue
-                        .iter()
-                        .map(|t| ArtifactRef {
-                            inline: None,
-                            artifact: None,
-                            summary: format!("archived turn ({} chars)", t.text.len()),
-                            size: t.text.len(),
-                        })
-                        .collect();
-                    let mut kept_recent = synthesized_turns(&identity, &durable_facts);
+                // An EMPTY/whitespace summary would pass the token cap and
+                // wipe the conversation: reject it exactly like a liar
+                // summary and let deterministic pruning carry the facts.
+                if !summary.trim().is_empty() {
+                    // The accepted summary REPLACES the conversational
+                    // residue (and every prior summary, which it supersedes).
+                    let mut kept_recent = synthesized.clone();
+                    // The prior archive pointer describes history that is
+                    // still archived even though this new summary replaces
+                    // the residue; carry it when it fits.
+                    if let Some(digest) = prior_digest.as_ref() {
+                        kept_recent.push(digest.clone());
+                    }
                     kept_recent.push(RecentTurn {
-                        role: "assistant".into(),
+                        role: "summary".into(),
                         text: summary,
                     });
-                    return CompactionPlan {
-                        accepted: true,
-                        before_tokens: req.before_tokens,
-                        after_tokens: after,
-                        target_tokens: req.target_tokens,
-                        strategy: CompactionStrategy::LlmSummary,
-                        ledger: working_ledger.clone(),
-                        kept_recent,
-                        archived,
-                        archive_chunks: fill_chunks(residue.iter(), ARCHIVE_CHUNK_BYTES),
-                        evidence_refs,
-                    };
+                    // The ACTIVE instruction rides verbatim even when the
+                    // summary omits it: a summary is model-authored and may
+                    // paraphrase, but the user's current ask is not
+                    // negotiable context. If it cannot fit, the summary is
+                    // rejected and deterministic pruning must prove the
+                    // prompt fits instead.
+                    if let Some(active) = residue.iter().rev().find(|t| t.role == "user") {
+                        kept_recent.push(active.clone());
+                    }
+                    let after = estimate_wire_turns(&kept_recent);
+                    if after <= req.hard_cap() {
+                        let archived = residue
+                            .iter()
+                            .chain(older_summaries.iter())
+                            .chain(carried_summary.iter())
+                            .map(|t| ArtifactRef {
+                                inline: None,
+                                artifact: None,
+                                summary: format!("archived turn ({} chars)", t.text.len()),
+                                size: t.text.len(),
+                            })
+                            .collect();
+                        let archive_chunks = fill_chunks(
+                            older_summaries
+                                .iter()
+                                .chain(carried_summary.iter())
+                                .chain(residue.iter()),
+                            ARCHIVE_CHUNK_BYTES,
+                        );
+                        return CompactionPlan {
+                            accepted: true,
+                            before_tokens: req.before_tokens,
+                            after_tokens: after,
+                            target_tokens: req.target_tokens,
+                            strategy: CompactionStrategy::LlmSummary,
+                            ledger: working_ledger.clone(),
+                            kept_recent,
+                            archived,
+                            archive_chunks,
+                            evidence_refs,
+                        };
+                    }
                 }
-                // REJECT the liar summary; fall through to deterministic.
+                // REJECT the liar/empty summary; fall through to
+                // deterministic pruning. The strategy stays `Rejected` so
+                // the runtime journals why no LLM summary was used.
                 let mut plan = self.deterministic_core(
                     &residue,
-                    &identity,
-                    &durable_facts,
-                    identity_tokens,
-                    facts_tokens,
+                    carried_summary.as_ref(),
+                    &older_summaries,
+                    prior_digest.as_ref(),
+                    &synthesized,
                     working_ledger,
                     req,
                     evidence_refs,
@@ -711,10 +859,10 @@ impl Compactor {
         }
         self.deterministic_core(
             &residue,
-            &identity,
-            &durable_facts,
-            identity_tokens,
-            facts_tokens,
+            carried_summary.as_ref(),
+            &older_summaries,
+            prior_digest.as_ref(),
+            &synthesized,
             working_ledger,
             req,
             evidence_refs,
@@ -722,91 +870,181 @@ impl Compactor {
     }
 
     /// Deterministic pruning: keep the durable projection in full, keep the
-    /// newest residue turns that fit under the cap, archive the rest as
-    /// references. `identity` and `durable_facts` are reserved up front.
+    /// NEWEST CONTIGUOUS SUFFIX of residue turns that fits under the cap,
+    /// archive the rest as references. `synthesized` (identity + durable
+    /// facts) and the carried prior summary are reserved up front at their
+    /// EXACT wire cost, and `after_tokens` is measured from the actual wire
+    /// turns returned — so an "accepted" plan can never exceed the cap.
     #[allow(clippy::too_many_arguments)]
     fn deterministic_core(
         &self,
         residue: &[RecentTurn],
-        identity: &str,
-        durable_facts: &str,
-        identity_tokens: usize,
-        facts_tokens: usize,
+        carried_summary: Option<&RecentTurn>,
+        older_summaries: &[RecentTurn],
+        prior_digest: Option<&RecentTurn>,
+        synthesized: &[RecentTurn],
         working_ledger: &TaskLedger,
         req: &CompactionRequest,
         evidence_refs: Vec<EvidenceRef>,
     ) -> CompactionPlan {
         let cap = req.hard_cap();
-        // The eviction digest rides the wire in kept_recent[0]; reserve its
-        // budget up front so the after_tokens figure stays honest.
-        let digest_tokens = Estimator.estimate_tokens(DIGEST_TEMPLATE);
-        let mut kept_recent = Vec::new();
-        let mut archived = Vec::new();
-        // Evicted turns as collected (newest first — the scan runs newest to
-        // oldest); reversed into chronological order for the chunk fill.
-        let mut evicted: Vec<&RecentTurn> = Vec::new();
-        let reserved = identity_tokens
-            .saturating_add(facts_tokens)
-            .saturating_add(32)
-            .saturating_add(digest_tokens);
-        let mut used = reserved;
-        if cap > reserved {
-            // Newest first; each turn's cost = role + text.
+        let synthesized_tokens = estimate_wire_turns(synthesized);
+        let mut archived_summaries: Vec<RecentTurn> = older_summaries.to_vec();
+        let mut carried = carried_summary.cloned();
+        let carried_tokens = carried
+            .as_ref()
+            .map(estimate_turn_tokens)
+            .unwrap_or_default();
+        let mut reserved = synthesized_tokens.saturating_add(carried_tokens);
+        if cap <= synthesized_tokens && carried.is_some() {
+            // Even the summary cannot ride the wire under this cap: archive
+            // it instead of pretending it was carried.
+            if let Some(summary) = carried.take() {
+                archived_summaries.push(summary);
+            }
+            reserved = synthesized_tokens;
+        }
+        // Keep the newest contiguous suffix under a keep budget. The digest
+        // marker is METADATA: when it would overflow the hard cap we shrink
+        // the keep budget by the overage and rerun (bounded passes), so the
+        // marker is preserved whenever any space can be traded for it and
+        // the final `after_tokens` is always the exact wire cost of the
+        // returned turns.
+        let mut keep_cap = cap;
+        let mut result: Option<KeptPlan> = None;
+        for attempt in 0..4 {
+            let mut kept_recent = Vec::new();
+            let mut evicted: Vec<&RecentTurn> = Vec::new();
+            let mut used = reserved;
+            let mut keep_going = keep_cap > reserved;
+            // The kept window is a CONTIGUOUS newest suffix: the first turn
+            // that does not fit evicts itself and every older turn, so an
+            // older turn can never appear before a newer archived one and a
+            // tool call can never survive across its result.
             for turn in residue.iter().rev() {
+                #[cfg(test)]
+                note_turn_visit();
                 let t = estimate_turn_tokens(turn);
-                if used + t > cap {
-                    archived.push(ArtifactRef {
-                        inline: None,
-                        artifact: None,
-                        summary: format!("archived turn ({} chars)", turn.text.len()),
-                        size: turn.text.len(),
-                    });
+                if !keep_going || used.saturating_add(t) > keep_cap {
+                    keep_going = false;
                     evicted.push(turn);
                     continue;
                 }
-                used += t;
+                used = used.saturating_add(t);
                 kept_recent.push(turn.clone());
             }
             kept_recent.reverse();
-        }
-        // Every evicted turn is archived, chunked, oldest first — nothing
-        // beyond the kept window is ever omitted (the old 1 MiB cap silently
-        // dropped cold history).
-        let archive_chunks = fill_chunks(evicted.iter().rev().copied(), ARCHIVE_CHUNK_BYTES);
-        let after = used;
-        let accepted = after <= cap;
-        // Digest of what was archived: the newest evicted lines (tail of the
-        // last chunk), bounded — the marker tells the model history was
-        // dropped and where the durable material lives. The digest stays
-        // FIRST: the runtime rewrites its placeholder with the CAS manifest.
-        let digest_text = archive_digest(&archive_chunks);
-        let mut wire_recent = Vec::new();
-        if !digest_text.is_empty() && accepted {
-            wire_recent.push(RecentTurn {
-                role: "assistant".into(),
-                text: format!(
-                    "[Earlier context archived: {}…{}]",
-                    truncate(&digest_text, DIGEST_MAX_CHARS),
-                    ARTIFACT_PLACEHOLDER
-                ),
+            let mut archived: Vec<ArtifactRef> = evicted
+                .iter()
+                .map(|turn| ArtifactRef {
+                    inline: None,
+                    artifact: None,
+                    summary: format!("archived turn ({} chars)", turn.text.len()),
+                    size: turn.text.len(),
+                })
+                .collect();
+            for summary in &archived_summaries {
+                archived.push(ArtifactRef {
+                    inline: None,
+                    artifact: None,
+                    summary: format!("archived summary ({} chars)", summary.text.len()),
+                    size: summary.text.len(),
+                });
+            }
+            // Every evicted turn is archived, chunked, oldest first —
+            // nothing beyond the kept window is ever omitted (the old 1 MiB
+            // cap silently dropped cold history).
+            let archive_chunks = fill_chunks(
+                archived_summaries
+                    .iter()
+                    .rev()
+                    .chain(evicted.iter().rev().copied()),
+                ARCHIVE_CHUNK_BYTES,
+            );
+            let digest_text = archive_digest(&archive_chunks);
+            // Prefer the NEW digest; when this compaction evicted nothing
+            // (already-compacted context), carry the PREVIOUS archive
+            // pointer forward verbatim so repeated compactions never orphan
+            // the durable archive behind already-summarized history. The
+            // marker is regenerated, never re-summarized.
+            let carried_digest: Option<RecentTurn> = if !digest_text.is_empty() {
+                Some(RecentTurn {
+                    role: "assistant".into(),
+                    text: digest_marker(&digest_text),
+                })
+            } else {
+                prior_digest.cloned()
+            };
+            let mut wire_recent = Vec::new();
+            wire_recent.extend(synthesized.iter().cloned());
+            if let Some(summary) = carried.clone() {
+                wire_recent.push(summary);
+            }
+            wire_recent.extend(kept_recent.iter().cloned());
+            let mut after = estimate_wire_turns(&wire_recent);
+            let mut over = after.saturating_sub(cap);
+            let mut digest_included = false;
+            if let Some(digest_turn) = carried_digest.as_ref() {
+                let mut with_digest = Vec::with_capacity(wire_recent.len() + 1);
+                with_digest.push(digest_turn.clone());
+                with_digest.extend(wire_recent.iter().cloned());
+                let with_digest_tokens = estimate_wire_turns(&with_digest);
+                over = over.max(with_digest_tokens.saturating_sub(cap));
+                if with_digest_tokens <= cap {
+                    wire_recent = with_digest;
+                    after = with_digest_tokens;
+                    digest_included = true;
+                }
+            }
+            // The ACTIVE instruction must never disappear: if the newest
+            // user turn did not fit the kept suffix, this is a typed
+            // rejection, not a "successful" compaction that silently drops
+            // the prompt (the caller then reports CompactRejected).
+            let newest_user = residue.iter().rev().find(|t| t.role == "user");
+            let newest_user_present = newest_user.is_none_or(|user| {
+                wire_recent
+                    .iter()
+                    .any(|w| w.role == "user" && w.text == user.text)
             });
+            let accepted = after <= cap && newest_user_present;
+            result = Some(KeptPlan {
+                wire: wire_recent,
+                archived,
+                chunks: archive_chunks,
+                after,
+                accepted,
+            });
+            let digest_done = digest_included || carried_digest.is_none();
+            if (accepted && digest_done) || kept_recent.is_empty() || attempt == 3 {
+                break;
+            }
+            // Trade the overage out of the keep window and try again; the
+            // next pass evicts older turns, which can only shrink `after`.
+            // If the trade would consume the whole keep window (the digest
+            // metadata alone is over budget), keep the accepted plan WITHOUT
+            // the optional marker: dropping real turns — including the
+            // active instruction — to make room for metadata is never right.
+            let next_keep_cap = keep_cap.saturating_sub(over.max(1));
+            if next_keep_cap <= reserved {
+                break;
+            }
+            keep_cap = next_keep_cap;
         }
-        wire_recent.extend(synthesized_turns(identity, durable_facts));
-        wire_recent.extend(kept_recent);
+        let kept = result.expect("the bounded keep loop always produces a plan");
         CompactionPlan {
-            accepted,
+            accepted: kept.accepted,
             before_tokens: req.before_tokens,
-            after_tokens: after,
+            after_tokens: kept.after,
             target_tokens: req.target_tokens,
-            strategy: if accepted {
+            strategy: if kept.accepted {
                 CompactionStrategy::DeterministicPruning
             } else {
                 CompactionStrategy::Rejected
             },
             ledger: working_ledger.clone(),
-            kept_recent: wire_recent,
-            archived,
-            archive_chunks,
+            kept_recent: kept.wire,
+            archived: kept.archived,
+            archive_chunks: kept.chunks,
             evidence_refs,
         }
     }
@@ -820,17 +1058,18 @@ impl Compactor {
         req: &CompactionRequest,
     ) -> CompactionPlan {
         let projection = TaskContextProjection::from_task_ledger(ledger);
-        let (residue, evidence_refs) = self.prepare_history(history);
+        let (prepared, evidence_refs) = self.prepare_history(history);
+        let (residue, carried_summary, older_summaries, prior_digest) =
+            partition_prior_metadata(&prepared);
         let identity = projection.identity_render();
         let durable_facts = projection.summarizable_render();
-        let identity_tokens = Estimator.estimate_tokens(&identity);
-        let facts_tokens = Estimator.estimate_tokens(&durable_facts);
+        let synthesized = synthesized_turns(&identity, &durable_facts);
         self.deterministic_core(
             &residue,
-            &identity,
-            &durable_facts,
-            identity_tokens,
-            facts_tokens,
+            carried_summary.as_ref(),
+            &older_summaries,
+            prior_digest.as_ref(),
+            &synthesized,
             ledger,
             req,
             evidence_refs,

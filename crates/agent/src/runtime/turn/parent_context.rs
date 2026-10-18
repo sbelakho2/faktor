@@ -52,25 +52,55 @@ fn ack_internal_context_entry(handle: &faktor_session::SessionHandle, key: &str)
 /// Empty when the session carries none; a fact read failure yields empty
 /// and logs (the following drive re-reads the durable rows).
 pub(crate) fn take_pending_internal_context(handle: &faktor_session::SessionHandle) -> String {
-    let facts = match handle.memory_facts() {
-        Ok(facts) => facts,
-        Err(error) => {
-            tracing::warn!(
-                session = %handle.id(),
-                "pending internal-context read failed: {error}"
-            );
-            return String::new();
+    // Bounded per-kind walk: the previous full fact-table scan got slower
+    // with every turn's facts (O(n²) over a long task). 16 x 200 handoff
+    // rows is far beyond the bounded child-control cap; exhausting the walk
+    // is logged and leaves the untouched rows pending for the next drive.
+    const PAGE: i64 = 200;
+    const MAX_PAGES: usize = 16;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut cursor: Option<(i64, String, String)> = None;
+    for _ in 0..MAX_PAGES {
+        let page = match handle.memory_facts_by_kind_page(
+            PENDING_INTERNAL_CONTEXT_KIND,
+            cursor.as_ref(),
+            PAGE,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    session = %handle.id(),
+                    "pending internal-context read failed: {error}"
+                );
+                return String::new();
+            }
+        };
+        pending.extend(
+            page.facts
+                .into_iter()
+                .filter(|(kind, key, value)| {
+                    kind == PENDING_INTERNAL_CONTEXT_KIND
+                        && key.starts_with(PENDING_INTERNAL_CONTEXT_KEY_PREFIX)
+                        && !value.is_empty()
+                })
+                .map(|(_, key, value)| (key, value)),
+        );
+        match page.cursor {
+            Some(next) if page.has_more => cursor = Some(next),
+            _ => {
+                cursor = None;
+                break;
+            }
         }
-    };
-    let mut pending: Vec<(String, String)> = facts
-        .into_iter()
-        .filter(|(kind, key, value)| {
-            kind == PENDING_INTERNAL_CONTEXT_KIND
-                && key.starts_with(PENDING_INTERNAL_CONTEXT_KEY_PREFIX)
-                && !value.is_empty()
-        })
-        .map(|(_, key, value)| (key, value))
-        .collect();
+    }
+    if cursor.is_some() {
+        tracing::error!(
+            session = %handle.id(),
+            pages = MAX_PAGES,
+            page_size = PAGE,
+            "pending internal-context scan bound exhausted; older handoffs stay pending"
+        );
+    }
     pending.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::new();
     for (key, value) in pending {

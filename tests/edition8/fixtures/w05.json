@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W05",
+  "title": "Assemble context and resolve overflow",
+  "screens": [
+    "S09",
+    "S08",
+    "S10"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Mention exact sources (files, selections, diagnostics, terminal excerpts, diffs, URLs, prior chats).",
+    "Inspect URI, range, version, byte size and inclusion reason for each source.",
+    "Attach supported files; review automatic chips and remove anything not intended.",
+    "Pin required facts; compare estimated input and reserves against capacity.",
+    "Remove, compact or choose a capable model before capture.",
+    "Admission captures a versioned source manifest and the capacity calculation."
+  ],
+  "forbidden_fake_states": [
+    "A filename or tab title shown as attached content",
+    "a composed context number labelled measured",
+    "silent omission of a failed attachment",
+    "hidden truncation of criteria"
+  ],
+  "complete_when": "the admitted request has a versioned source manifest and valid capacity calculation (p.184).",
+  "traceability": "p.184; controls C-01..C-14; acceptance A11, A12, A13, A14.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

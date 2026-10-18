@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W09",
+  "title": "Install and invoke a skill safely",
+  "screens": [
+    "S17",
+    "S11",
+    "S13"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Inspect the manifest, files, source, version and required capabilities.",
+    "Preview a version diff.",
+    "Choose manual or agent-selectable invocation scope.",
+    "Install a validated version into the trusted store.",
+    "Resolve template variables and preview the draft and permission envelope.",
+    "Invoke deliberately; execution still uses effective grants."
+  ],
+  "forbidden_fake_states": [
+    "Viewing a package executing setup",
+    "installation shown as authorization",
+    "hidden skill still invocable",
+    "instruction text widening grants"
+  ],
+  "complete_when": "versioned instructions are attributed and execution still uses effective grants (p.185).",
+  "traceability": "p.185; controls S-01..S-06, S-14, I-06; acceptance A10, A23.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

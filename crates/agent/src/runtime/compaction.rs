@@ -425,7 +425,22 @@ impl AgentRuntime {
         Ok((provider, model))
     }
 
+    /// Compatibility entry point for callers/tests that do not own a
+    /// durable history head (no checkpoint is persisted).
+    #[allow(dead_code)] // test/compatibility entry; production uses the head-carrying twin
     pub(crate) async fn try_compact(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        recent: &[RecentTurn],
+        ledger: &TaskLedger,
+        budget: &ContextBudget,
+        cancel: &CancellationToken,
+    ) -> faktor_core::Result<Option<CompactionPlan>> {
+        self.try_compact_with_head(handle, recent, ledger, budget, cancel, None)
+            .await
+    }
+
+    pub(crate) async fn try_compact_with_head(
         &self,
         handle: &faktor_session::SessionHandle,
         recent: &[RecentTurn],
@@ -436,8 +451,29 @@ impl AgentRuntime {
         // round 11 — the summary request used to mint an orphan token and
         // ran up to the full 90s after the turn was cancelled).
         cancel: &CancellationToken,
+        // Durable message-seq high-water mark of the window `recent` was
+        // loaded from. An accepted plan persists its replacement context
+        // against this seq (restart resumes from the checkpoint).
+        head_seq: Option<u64>,
     ) -> faktor_core::Result<Option<CompactionPlan>> {
-        let before = recent.iter().map(|t| t.text.len()).sum::<usize>() / 4;
+        // Strip the PREVIOUS compaction's synthesized blocks before the
+        // next compaction: the identity/durable-facts turns are regenerated
+        // from the durable projection below, and carrying the old copies
+        // would duplicate them on every cycle. The prior eviction digest is
+        // KEPT: the compactor carries it forward verbatim when this cycle
+        // evicts nothing, so repeated compactions never orphan the durable
+        // archive. Prior `summary` turns stay too: the newest is carried
+        // verbatim and never re-summarized.
+        let input: Vec<RecentTurn> = recent
+            .iter()
+            .filter(|t| t.role != "system")
+            .cloned()
+            .collect();
+        let recent = input.as_slice();
+        // SAME token unit as the compactor's `after_tokens`: the previous
+        // `bytes / 4` underestimated the estimator by ~25%, so the recorded
+        // reduction ratio could pass while the exact wire shrank by less.
+        let before = faktor_context::estimate_history_tokens(recent);
         if before == 0 {
             return Ok(None);
         }
@@ -745,6 +781,18 @@ impl AgentRuntime {
                 }
             }
         }
+        // A cancellation that landed while the summary stream ran discards
+        // the produced plan: no compaction is applied after the turn was
+        // stopped (the reservation above already reached its honest
+        // terminal state, so no money move is guessed). The summarizer's
+        // child token is bounded, so no compaction task outlives the turn.
+        if cancel.is_cancelled() {
+            tracing::warn!(
+                session = %handle.id(),
+                "turn cancelled during compaction; the plan is discarded (no checkpoint, no event)"
+            );
+            return Ok(None);
+        }
         let accepted = plan.accepted;
         if plan.after_tokens > plan.before_tokens {
             // A grow is NOT a recordable compaction (`record_compaction`
@@ -758,6 +806,83 @@ impl AgentRuntime {
                 "compaction summary would grow the context; skipping compaction"
             );
             return Ok(None);
+        }
+        // Durable archiving (P0: no more 1 MiB cap losing history): evicted
+        // turns arrive as ORDERED chunks (oldest first, each bounded) — each
+        // chunk is written to the CAS, then a small JSON manifest
+        // {version:1, chunks:[{index,size,hash}], total_bytes} is written
+        // and its content address replaces the digest placeholder — the
+        // digest rides the wire with the archive behind ONE artifact ref.
+        // Best-effort: an unwritable CAS leaves the digest text without a
+        // hash (never breaks the turn).
+        //
+        // Runs BEFORE the durable checkpoint is written: the checkpoint must
+        // persist the SAME final marker text the in-memory history carries,
+        // or a restart would reproduce a different context digest.
+        if !plan.archive_chunks.is_empty() {
+            if let Some(cas) = &self.deps.cas {
+                let mut chunk_entries: Vec<serde_json::Value> = Vec::new();
+                let mut total_bytes = 0usize;
+                for (index, chunk) in plan.archive_chunks.iter().enumerate() {
+                    // Each chunk is stored whole (chunks are already bounded
+                    // by the compactor; a pathological single-turn chunk may
+                    // exceed the bound and still stores — never truncated).
+                    let Ok(hash) = cas.put_bounded(chunk.as_bytes(), chunk.len()) else {
+                        chunk_entries.clear();
+                        break;
+                    };
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    chunk_entries.push(serde_json::json!({
+                        "index": index,
+                        "size": chunk.len(),
+                        "hash": hash.to_string(),
+                    }));
+                }
+                let manifest = serde_json::json!({
+                    "version": 1,
+                    "chunks": chunk_entries,
+                    "total_bytes": total_bytes,
+                });
+                if !chunk_entries.is_empty() {
+                    if let Ok(bytes) = serde_json::to_vec(&manifest) {
+                        if let Ok(hash) = cas.put(&bytes) {
+                            let marker = format!("artifact://{hash}");
+                            if let Some(first) = plan.kept_recent.first_mut() {
+                                first.text = first.text.replace("<artifact://hash>", &marker);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Durable replacement context (restart parity): the accepted plan's
+        // EXACT wire turns are persisted against the source high-water seq in
+        // ONE atomic chunk-group. A crash can expose the old checkpoint or
+        // the new one, never a half-written summary replacing context; a
+        // failed checkpoint write is logged and leaves the full durable
+        // transcript to be re-compacted on the next drive.
+        if accepted {
+            match (head_seq, serde_json::to_vec(&plan.kept_recent)) {
+                (Some(seq), Ok(payload)) => {
+                    let digest = faktor_context::history_digest(&plan.kept_recent);
+                    if let Err(error) = handle.put_context_checkpoint(seq, &digest, &payload) {
+                        tracing::error!(
+                            session = %handle.id(),
+                            error = %error,
+                            "durable context checkpoint write failed; the next drive re-compacts"
+                        );
+                    }
+                }
+                (None, _) => tracing::warn!(
+                    session = %handle.id(),
+                    "compaction had no source high-water seq; durable checkpoint skipped"
+                ),
+                (_, Err(error)) => tracing::error!(
+                    session = %handle.id(),
+                    error = %error,
+                    "context checkpoint serialization failed; the next drive re-compacts"
+                ),
+            }
         }
         handle.record_compaction_defaults(
             plan.before_tokens as i64,
@@ -809,6 +934,17 @@ impl AgentRuntime {
                 );
             }
         }
+        self.persist_compaction_ledger(handle, &plan)?;
+        Ok(Some(plan))
+    }
+
+    /// Persist the accepted plan's typed ledger and prune the typed entry
+    /// stream below the never-FIFO watermark in one durable step.
+    fn persist_compaction_ledger(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        plan: &CompactionPlan,
+    ) -> faktor_core::Result<()> {
         handle.put_task_ledger(serde_json::to_value(&plan.ledger)?)?;
         // Typed ledger watermark compaction (audit 27): an accepted
         // compaction also prunes the typed entry stream below the
@@ -826,53 +962,8 @@ impl AgentRuntime {
                 "typed ledger compaction below the durability watermark"
             );
         }
-        // Durable archiving (P0: no more 1 MiB cap losing history): evicted
-        // turns arrive as ORDERED chunks (oldest first, each bounded) — each
-        // chunk is written to the CAS, then a small JSON manifest
-        // {version:1, chunks:[{index,size,hash}], total_bytes} is written
-        // and its content address replaces the digest placeholder — the
-        // digest rides the wire with the archive behind ONE artifact ref.
-        // Best-effort: an unwritable CAS leaves the digest text without a
-        // hash (never breaks the turn).
-        if !plan.archive_chunks.is_empty() {
-            if let Some(cas) = &self.deps.cas {
-                let mut chunk_entries: Vec<serde_json::Value> = Vec::new();
-                let mut total_bytes = 0usize;
-                for (index, chunk) in plan.archive_chunks.iter().enumerate() {
-                    // Each chunk is stored whole (chunks are already bounded
-                    // by the compactor; a pathological single-turn chunk may
-                    // exceed the bound and still stores — never truncated).
-                    let Ok(hash) = cas.put_bounded(chunk.as_bytes(), chunk.len()) else {
-                        chunk_entries.clear();
-                        break;
-                    };
-                    total_bytes = total_bytes.saturating_add(chunk.len());
-                    chunk_entries.push(serde_json::json!({
-                        "index": index,
-                        "size": chunk.len(),
-                        "hash": hash.to_string(),
-                    }));
-                }
-                let manifest = serde_json::json!({
-                    "version": 1,
-                    "chunks": chunk_entries,
-                    "total_bytes": total_bytes,
-                });
-                if !chunk_entries.is_empty() {
-                    if let Ok(bytes) = serde_json::to_vec(&manifest) {
-                        if let Ok(hash) = cas.put(&bytes) {
-                            let marker = format!("artifact://{hash}");
-                            if let Some(first) = plan.kept_recent.first_mut() {
-                                first.text = first.text.replace("<artifact://hash>", &marker);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Some(plan))
+        Ok(())
     }
-
     /// Build the READ-ONLY durable projection a compaction summarizes against
     /// (audits 70/71): goal/criteria/plan/state from the typed Task row,
     /// decisions + child progress from the typed session ledger, checks from

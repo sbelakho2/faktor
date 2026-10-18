@@ -3292,12 +3292,8 @@ impl AgentRuntime {
             // upsert below is idempotent, so healing on unknown is safe and
             // the read failure can never suppress the durable criteria row.
             let seeded = handle
-                .memory_facts()
-                .map(|facts| {
-                    facts
-                        .iter()
-                        .any(|(kind, key, _)| kind == "criteria" && key == "0")
-                })
+                .memory_fact_get("criteria", "0")
+                .map(|fact| fact.is_some())
                 .unwrap_or(false);
             if !seeded {
                 self.dw_note_upsert_memory_fact(
@@ -3589,11 +3585,7 @@ impl AgentRuntime {
         let _ = ledger;
         // P2-VERIFY: both reads gate a completion claim; a store failure is
         // a typed refusal, never "the row was not seeded yet".
-        let fact = handle
-            .memory_facts()?
-            .into_iter()
-            .find(|(k, key, _)| k == "criteria" && key == "0")
-            .map(|(_, _, v)| v);
+        let fact = handle.memory_fact_get("criteria", "0")?;
         let row = self.session_task(handle)?;
         let row_criteria = row.map(|t| t.acceptance_criteria).unwrap_or_default();
         let (Some(fact), false) = (fact, row_criteria.is_empty()) else {

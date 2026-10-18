@@ -58,6 +58,7 @@ faktor-router.workspace = true
 faktor-security.workspace = true
 faktor-semantic.workspace = true
 faktor-cloud.workspace = true
+faktor-foundation.workspace = true
 faktor-worker.workspace = true
 faktor-updater.workspace = true
 faktor-scm.workspace = true

@@ -2122,6 +2122,18 @@ impl TaskExecutor {
         parent: SessionId,
         req: TaskRunRequest,
     ) -> Result<TaskRunReceipt, ExecError> {
+        self.start_task_with_turn_cap(parent, req, None)
+    }
+
+    /// Start with an explicit session-selected turn bound (B-09). The cap is
+    /// written into the durable task budget at admission, so it is enforced
+    /// by the SAME agent gate as every other budget field.
+    pub fn start_task_with_turn_cap(
+        self: &Arc<Self>,
+        parent: SessionId,
+        req: TaskRunRequest,
+        max_turns: Option<u32>,
+    ) -> Result<TaskRunReceipt, ExecError> {
         req.validate()?;
         let handle = self
             .session
@@ -2230,7 +2242,7 @@ impl TaskExecutor {
             self.settle_existing_shadow(parent, &handle)?;
         }
         if req.work_items.len() == 1 {
-            self.start_in_session(parent, &handle, req)
+            self.start_in_session(parent, &handle, req, max_turns)
         } else {
             self.start_orchestrated(parent, req)
         }
@@ -2488,6 +2500,7 @@ impl TaskExecutor {
         parent: SessionId,
         handle: &faktor_session::SessionHandle,
         req: TaskRunRequest,
+        max_turns: Option<u32>,
     ) -> Result<TaskRunReceipt, ExecError> {
         let admission = match begin_start_admission(
             &self.session,
@@ -2500,8 +2513,14 @@ impl TaskExecutor {
             StartAdmission::Fresh(admission) => admission,
         };
         let mut accepted = false;
-        let result =
-            self.start_in_session_admitted(parent, handle, req, admission.as_ref(), &mut accepted);
+        let result = self.start_in_session_admitted(
+            parent,
+            handle,
+            req,
+            admission.as_ref(),
+            &mut accepted,
+            max_turns,
+        );
         if result.is_err() && !accepted {
             release_start_admission(&self.session, parent, admission.as_ref());
         }
@@ -2518,6 +2537,7 @@ impl TaskExecutor {
         req: TaskRunRequest,
         admission: Option<&TaskStartAdmission>,
         accepted: &mut bool,
+        max_turns: Option<u32>,
     ) -> Result<TaskRunReceipt, ExecError> {
         let item = &req.work_items[0];
         // P0 isolation: a MUTATING single-item run ALWAYS works in a
@@ -2629,7 +2649,7 @@ impl TaskExecutor {
                         contract: Default::default(),
                         budget: TaskBudget {
                             max_tokens: req.max_tokens,
-                            max_turns: None,
+                            max_turns,
                             spent_tokens: 0,
                             spent_turns: 0,
                         },
@@ -2669,7 +2689,7 @@ impl TaskExecutor {
                     parent,
                     &TaskBudget {
                         max_tokens: Some(mt),
-                        max_turns: None,
+                        max_turns,
                         spent_tokens: 0,
                         spent_turns: 0,
                     },

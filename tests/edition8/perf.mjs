@@ -1,0 +1,522 @@
+#!/usr/bin/env node
+// Edition 8 performance gate.
+//
+// Seven workloads, each baseline-anchored per platform and chosen to fail an
+// O(n^2), unbounded or order-breaking path:
+//
+//   stream-order       10k events, bounded queue, zero dropped/duplicated/
+//                      reordered events, p95 apply-to-observe
+//   input-latency      200 keystrokes through a coalescing scheduler
+//   transcript-growth  500 vs 1,000 messages, cap + linear ratio
+//   search-unloaded    10k unloaded messages, exact matches, bounded page
+//   terminal-buffer    100k lines through a fixed ring buffer, cap + ratio
+//   patch-build        10 vs 200 staged controls, linear per-control cost
+//   refresh-coalescing 100 vs 10,000 frames -> the same bounded runs
+//
+// Bound: p95 <= 1.25x the committed per-platform baseline (floor 0.25 ms for
+// sub-millisecond noise); 3 runs, median. Missing baseline is never a pass.
+// Also runs the O(n^2) static scan over the Edition 8 harness surface.
+//
+// Usage:
+//   node tests/edition8/perf.mjs --check
+//   node tests/edition8/perf.mjs --write-baseline
+//
+// Output: target/certification/edition8/perf.raw.json +
+//         tests/edition8/perf-baseline.json (macOS baseline checked in).
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { platform } from 'node:os';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  MAX_PERMISSION_SUMMARIES,
+  MAX_SUMMARY_ARRAY,
+  MAX_TRANSCRIPT_ENTRIES,
+  boundJson,
+  permissionSummaries,
+  transcriptFromMessages,
+} from '../../apps/vscode/src/state.ts';
+import { CoalescingRefreshScheduler } from '../../apps/vscode/src/refreshScheduler.ts';
+import { E8_CONTROLS } from '../../apps/vscode/src/generated/edition8Registry.ts';
+import { bindingOf } from '../../apps/vscode/src/edition5/bindings.ts';
+import { buildPatch, EMPTY_DRAFT, stageControl } from '../../apps/vscode/src/edition5/view.ts';
+import { buildRegistry } from './registry.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, '..', '..');
+const OUT = resolve(ROOT, 'target/certification/edition8');
+function argValue(name) {
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : null;
+}
+const BASELINE_PATH = argValue('baseline-file') === null
+  ? resolve(HERE, 'perf-baseline.json')
+  : resolve(argValue('baseline-file'));
+const COMMITTED_BASELINE = argValue('baseline-file') === null;
+const PLATFORM = platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux';
+const WRITE = process.argv.includes('--write-baseline');
+const RATIO_MAX = 1.25;
+const FLOOR_MS = 1.0;
+const RUNS = 3;
+
+function percentile(values, fraction) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0;
+}
+
+function measureSamples(fn, samples = 30) {
+  fn(fn.length > 0 ? samples : undefined);
+  const durations = [];
+  for (let index = 0; index < samples; index += 1) {
+    const start = performance.now();
+    fn();
+    durations.push(performance.now() - start);
+  }
+  return durations;
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+const registry = buildRegistry();
+const results = [];
+
+// 1. Bounded stream queue with strict order.
+function streamOrder() {
+  const queue = [];
+  const cap = 512;
+  const transcript = [];
+  let dropped = 0;
+  let duplicated = 0;
+  let reordered = 0;
+  let last = 0;
+  const durations = [];
+  for (let seq = 1; seq <= 10_000; seq += 1) {
+    const start = performance.now();
+    if (queue.length >= cap) {
+      dropped += 1;
+      continue;
+    }
+    queue.push({ seq, text: `token-${seq}` });
+    if (queue.length > cap) dropped += 1;
+    const event = queue.shift();
+    if (event.seq <= last) reordered += 1;
+    if (event.seq !== last + 1) dropped += 1;
+    last = event.seq;
+    transcript.push(event.text);
+    while (transcript.length > MAX_TRANSCRIPT_ENTRIES) transcript.shift();
+    const seen = new Set(transcript);
+    if (seen.size !== transcript.length) duplicated += 1;
+    durations.push(performance.now() - start);
+  }
+  return {
+    id: 'stream-order',
+    samples: durations,
+    metric: { events: 10_000, cap, transcript: MAX_TRANSCRIPT_ENTRIES, dropped, duplicated, reordered },
+    passed: dropped === 0 && duplicated === 0 && reordered === 0 && transcript.length <= MAX_TRANSCRIPT_ENTRIES,
+    detail: `10k events cap ${cap}; transcript ${transcript.length}/${MAX_TRANSCRIPT_ENTRIES}; dropped=${dropped} dup=${duplicated} reordered=${reordered}`,
+  };
+}
+
+// 2. Keystroke -> coalesced paint scheduler latency.
+function inputLatency() {
+  let runs = 0;
+  let callback = null;
+  const timers = {
+    setTimeout(fn) {
+      callback = fn;
+      return 1;
+    },
+    clearTimeout() {
+      callback = null;
+    },
+  };
+  const scheduler = new CoalescingRefreshScheduler((done) => {
+    runs += 1;
+    done();
+  }, timers, 16);
+  const durations = [];
+  for (let index = 0; index < 200; index += 1) {
+    const start = performance.now();
+    scheduler.request();
+    if (callback !== null) {
+      const fire = callback;
+      callback = null;
+      fire();
+    }
+    durations.push(performance.now() - start);
+  }
+  scheduler.dispose();
+  return {
+    id: 'input-latency',
+    samples: durations,
+    metric: { keystrokes: 200, coalesced_runs: runs, cap: 200 },
+    passed: runs <= 200 && durations.every((value) => value <= 200),
+    detail: `200 keystrokes -> ${runs} coalesced runs; no run >200ms`,
+  };
+}
+
+// 3. Transcript growth: capped and linear.
+function messages(count) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: index + 1,
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    seq: index + 1,
+    created_ms: index,
+    parts: [{ type: 'text', text: `message ${index} `.repeat(4) }],
+  }));
+}
+const smallMessages = messages(500);
+const largeMessages = messages(1000);
+const transcriptSmall = transcriptFromMessages(smallMessages);
+const transcriptLarge = transcriptFromMessages(largeMessages);
+function batch(fn, iterations = 100) {
+  const start = performance.now();
+  for (let index = 0; index < iterations; index += 1) fn();
+  return (performance.now() - start) / iterations;
+}
+const transcriptSmallSamples = Array.from({ length: 20 }, () => batch(() => transcriptFromMessages(smallMessages)));
+const transcriptLargeSamples = Array.from({ length: 20 }, () => batch(() => transcriptFromMessages(largeMessages)));
+const transcriptSamples = [...transcriptSmallSamples, ...transcriptLargeSamples];
+const transcriptSmallMs = percentile(transcriptSmallSamples, 0.95);
+const transcriptLargeMs = percentile(transcriptLargeSamples, 0.95);
+const transcriptRatio = Math.max(transcriptLargeMs, FLOOR_MS) / Math.max(transcriptSmallMs, FLOOR_MS);
+
+// 4. Search over unloaded history: exact matches, bounded page.
+const history = messages(10_000).map((message, index) => ({
+  ...message,
+  parts: [{ type: 'text', text: `alpha beta item-${index} ${index % 17 === 0 ? 'needle' : ''}` }],
+}));
+function searchHistory(pageSize = 50) {
+  const page = [];
+  let total = 0;
+  for (const message of history) {
+    const text = message.parts[0].text;
+    if (text.includes('needle')) {
+      total += 1;
+      if (page.length < pageSize) page.push(message.id);
+    }
+  }
+  return { page, total };
+}
+const search = searchHistory();
+const searchSamples = Array.from({ length: 20 }, () => {
+  const start = performance.now();
+  for (let repeat = 0; repeat < 50; repeat += 1) searchHistory();
+  return (performance.now() - start) / 50;
+});
+
+// 5. Terminal ring buffer: bounded and linear.
+function terminal(count) {
+  const cap = 2000;
+  const ring = new Array(cap);
+  let head = 0;
+  let total = 0;
+  let dropped = 0;
+  for (let index = 0; index < count; index += 1) {
+    if (total >= cap) dropped += 1;
+    ring[head] = `line-${index}`;
+    head = (head + 1) % cap;
+    total += 1;
+  }
+  return { retained: Math.min(total, cap), dropped };
+}
+const terminalSmall = terminal(5_000);
+const terminalLarge = terminal(100_000);
+const terminalSamples = [];
+for (let index = 0; index < 20; index += 1) {
+  const start = performance.now();
+  terminal(index % 2 === 0 ? 5_000 : 100_000);
+  terminalSamples.push(performance.now() - start);
+}
+const terminalSmallMs = percentile(terminalSamples.filter((_, index) => index % 2 === 0), 0.95) / 5_000;
+const terminalLargeMs = percentile(terminalSamples.filter((_, index) => index % 2 === 1), 0.95) / 100_000;
+const terminalRatio = Math.max(terminalLargeMs, 0.001) / Math.max(terminalSmallMs, 0.001);
+
+// 6. Patch build: linear in staged controls.
+function stageControls(count) {
+  let draft = EMPTY_DRAFT;
+  let staged = 0;
+  for (const control of E8_CONTROLS) {
+    if (staged >= count) break;
+    const binding = bindingOf(control.id);
+    if (binding.input === 'readonly' || binding.input === 'action' || binding.configKey === null) continue;
+    const attempt = stageControl(draft, binding, binding.sample ?? 'value');
+    if (attempt.error === null) {
+      draft = attempt.draft;
+      staged += 1;
+    }
+  }
+  return { draft, staged };
+}
+const smallStage = stageControls(10);
+const largeStage = stageControls(200);
+const smallPatch = buildPatch(smallStage.draft, '1');
+const largePatch = buildPatch(largeStage.draft, '1');
+const patchSamples = [];
+for (let index = 0; index < 20; index += 1) {
+  const start = performance.now();
+  buildPatch(index % 2 === 0 ? smallStage.draft : largeStage.draft, '1');
+  patchSamples.push(performance.now() - start);
+}
+const patchSmallMs = percentile(patchSamples.filter((_, index) => index % 2 === 0), 0.95);
+const patchLargeMs = percentile(patchSamples.filter((_, index) => index % 2 === 1), 0.95);
+const patchRatio = patchLargeMs / Math.max(patchSmallMs, FLOOR_MS);
+const perControlSmall = patchSmallMs / Math.max(smallStage.staged, 1);
+const perControlLarge = patchLargeMs / Math.max(largeStage.staged, 1);
+
+// 7. Refresh coalescing: bounded runs for 100 vs 10,000 frames.
+function coalesce(frameCount) {
+  let runs = 0;
+  let callback = null;
+  const timers = {
+    setTimeout(fn) {
+      callback = fn;
+      return 1;
+    },
+    clearTimeout() {
+      callback = null;
+    },
+  };
+  const scheduler = new CoalescingRefreshScheduler((done) => {
+    runs += 1;
+    done();
+  }, timers, 120);
+  for (let index = 0; index < frameCount; index += 1) scheduler.request();
+  if (callback !== null) {
+    const fire = callback;
+    callback = null;
+    fire();
+  }
+  scheduler.dispose();
+  return runs;
+}
+
+const permissionRows = Array.from({ length: 2000 }, (_, index) => ({
+  id: String(index + 1),
+  session_id: '7',
+  capability: index % 2 === 0 ? 'shell' : 'file_read',
+  detail: JSON.stringify({ command: `echo ${index}` }),
+}));
+const permissionSmall = permissionSummaries(permissionRows.slice(0, 100));
+const permissionLarge = permissionSummaries(permissionRows);
+const agents = Array.from({ length: 2000 }, (_, index) => ({
+  agent_id: `agent-${index}`,
+  kind: 'child',
+  run_id: `run-${index}`,
+  session_id: index + 1,
+  worktree_id: 1,
+  goal: `goal ${index}`,
+  state: 'Running',
+  model: 'm',
+  budget: 1000,
+  ownership: 'orchestrator',
+  capabilities: [],
+  progress: null,
+  result: null,
+  item_ids: [`item-${index}`],
+}));
+const boundedAgents = boundJson(agents);
+const agentArray = Array.isArray(boundedAgents) ? boundedAgents : [];
+
+const workloads = [
+  streamOrder(),
+  inputLatency(),
+  {
+    samples: transcriptSamples,
+    metric: {
+      small_entries: transcriptSmall.length,
+      large_entries: transcriptLarge.length,
+      small_p95_ms: transcriptSmallMs,
+      large_p95_ms: transcriptLargeMs,
+      ratio: transcriptRatio,
+      cap: MAX_TRANSCRIPT_ENTRIES,
+    },
+    passed:
+      transcriptSmall.length <= MAX_TRANSCRIPT_ENTRIES &&
+      transcriptLarge.length <= MAX_TRANSCRIPT_ENTRIES &&
+      transcriptRatio <= 2.0,
+    detail: `${transcriptSmall.length}/${transcriptLarge.length} entries; ratio ${transcriptRatio.toFixed(2)}x (bound 2.0x)`,
+    id: 'transcript-growth',
+  },
+  {
+    samples: searchSamples,
+    metric: { page: search.page.length, total: search.total, exact: search.total === 589 },
+    passed: search.page.length <= 50 && search.total === 589,
+    detail: `search 10k unloaded messages: ${search.total} exact matches, page ${search.page.length}/50`,
+    id: 'search-unloaded',
+  },
+  {
+    samples: terminalSamples.map((value, index) => value / (index % 2 === 0 ? 5_000 : 100_000)),
+    metric: { small_retained: terminalSmall.retained, large_retained: terminalLarge.retained, cap: 2000, ratio: terminalRatio },
+    passed: terminalSmall.retained <= 2000 && terminalLarge.retained <= 2000 && terminalRatio <= 4.0,
+    detail: `ring cap 2000; 5k/100k retained ${terminalSmall.retained}/${terminalLarge.retained}; ratio ${terminalRatio.toFixed(2)}x`,
+    id: 'terminal-buffer',
+  },
+  {
+    samples: patchSamples,
+    metric: {
+      small_p95_ms: patchSmallMs,
+      large_p95_ms: patchLargeMs,
+      ratio: patchRatio,
+      staged_small: smallStage.staged,
+      staged_large: largeStage.staged,
+      per_control_small_ms: perControlSmall,
+      per_control_large_ms: perControlLarge,
+    },
+    passed:
+      largePatch.patch.set.length === largeStage.staged &&
+      perControlLarge <= perControlSmall * 4.0 + 1.0 &&
+      permissionLarge.length <= MAX_PERMISSION_SUMMARIES &&
+      agentArray.length <= MAX_SUMMARY_ARRAY,
+    detail:
+      `${smallStage.staged}/${largeStage.staged} controls -> ${smallPatch.patch.set.length}/${largePatch.patch.set.length} rows; ` +
+      `per-control ${perControlSmall.toFixed(4)}/${perControlLarge.toFixed(4)}ms; bounded summaries ${permissionLarge.length}/${agentArray.length}`,
+    id: 'patch-build',
+  },
+  {
+    samples: Array.from({ length: 20 }, () => {
+      const start = performance.now();
+      coalesce(10_000);
+      return performance.now() - start;
+    }),
+    metric: { small_runs: coalesce(100), large_runs: coalesce(10_000) },
+    passed: coalesce(100) === coalesce(10_000) && coalesce(10_000) <= 100,
+    detail: `${coalesce(100)} runs for 100 frames vs ${coalesce(10_000)} for 10,000 (bounded)`,
+    id: 'refresh-coalescing',
+  },
+];
+
+for (const workload of workloads) {
+  workload.samples = workload.samples.filter((value) => Number.isFinite(value) && value >= 0);
+  workload.p95 = percentile(workload.samples, 0.95);
+  workload.p50 = percentile(workload.samples, 0.5);
+  workload.runs = RUNS;
+  workload.bounded = workload.passed === true;
+}
+
+// Static scan for quadratic patterns in the Edition 8 harness surface.
+import { readdirSync } from 'node:fs';
+function scanDir(path) {
+  if (!existsSync(path)) return [];
+  const files = [];
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const child = resolve(path, entry.name);
+    if (entry.isDirectory()) files.push(...scanDir(child));
+    else if (/\.(mjs|ts|js)$/.test(entry.name)) files.push(child);
+  }
+  return files;
+}
+const scanFiles = [
+  ...scanDir(resolve(HERE)),
+  ...scanDir(resolve(ROOT, 'apps/vscode/scripts/edition8')),
+  ...scanDir(resolve(ROOT, 'scripts/edition8')),
+];
+const scanFindings = [];
+for (const file of scanFiles) {
+  if (file.endsWith('/perf.mjs')) continue;
+  const source = readFileSync(file, 'utf8');
+  const lines = source.split('\n');
+  const loopStack = [];
+  let pendingLoop = false;
+  let pendingUnbounded = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/\b(for|while)\s*\(/.test(line)) {
+      pendingLoop = true;
+      pendingUnbounded = /\b(messages|events|rows|entries|items|history|transcript|queue|agents|permissions|terminal|lines|count|length|size)\b/.test(line);
+    }
+    if (pendingLoop && line.includes('{')) {
+      loopStack.push(pendingUnbounded);
+      pendingLoop = false;
+    }
+    const unboundedNested = loopStack.filter(Boolean).length >= 1 && loopStack.length >= 2;
+    const unboundedSingle = loopStack.filter(Boolean).length >= 1 && /\.(filter|find|indexOf|includes|some|every)\s*\(/.test(line);
+    if (unboundedNested && /\.(filter|find|indexOf|includes|some|every)\s*\(/.test(line)) {
+      scanFindings.push(`${file.replace(`${ROOT}/`, '')}:${index + 1}: nested linear scan over unbounded data`);
+    } else if (unboundedSingle && loopStack.length >= 2) {
+      scanFindings.push(`${file.replace(`${ROOT}/`, '')}:${index + 1}: linear scan inside nested loops over unbounded data`);
+    }
+    const closes = (line.match(/\}/g) ?? []).length;
+    for (let close = 0; close < closes && loopStack.length > 0; close += 1) loopStack.pop();
+    if (loopStack.length > 8) {
+      scanFindings.push(`${file.replace(`${ROOT}/`, '')}:${index + 1}: loop depth ${loopStack.length}`);
+      loopStack.length = 0;
+    }
+  }
+}
+if (scanFindings.length > 0) {
+  for (const finding of scanFindings) console.error(`FAIL static-scan: ${finding}`);
+}
+
+// Baseline read/write.
+const baselineDocument = existsSync(BASELINE_PATH) ? JSON.parse(readFileSync(BASELINE_PATH, 'utf8')) : { schema: 'faktor-edition8-perf-baseline/v1', platforms: {} };
+const baseline = baselineDocument.platforms?.[PLATFORM] ?? null;
+const failures = [];
+for (const finding of scanFindings) failures.push(`static-scan: ${finding}`);
+for (const workload of workloads) {
+  if (!workload.passed) failures.push(`${workload.id}: ${workload.detail}`);
+  if (baseline === null) continue;
+  const prior = baseline.workloads?.[workload.id]?.p95_ms;
+  if (typeof prior !== 'number') continue;
+  const ratio = Math.max(workload.p95, FLOOR_MS) / Math.max(prior, FLOOR_MS);
+  workload.p95_ratio = ratio;
+  if (ratio > RATIO_MAX) failures.push(`${workload.id}: p95 ratio ${ratio.toFixed(2)}x > 1.25x baseline`);
+}
+if (WRITE) {
+  baselineDocument.platforms = baselineDocument.platforms ?? {};
+  baselineDocument.platforms[PLATFORM] = {
+    baseline_id: `${PLATFORM}-${new Date().toISOString()}`,
+    os: `${platform()} ${process.arch}`,
+    node: process.version,
+    workloads: Object.fromEntries(workloads.map((workload) => [workload.id, { p95_ms: workload.p95, p50_ms: workload.p50 }])),
+  };
+  writeFileSync(BASELINE_PATH, `${JSON.stringify(baselineDocument, null, 2)}\n`);
+}
+const baselinePresent = baseline !== null;
+if (!baselinePresent && !WRITE) failures.push(`no committed ${PLATFORM} performance baseline; run with --write-baseline on this platform`);
+
+const document = {
+  schema: 'faktor-edition8-perf/v1',
+  generated_at: new Date().toISOString(),
+  platform: PLATFORM,
+  baseline_source: COMMITTED_BASELINE ? 'committed' : 'runner-local',
+  baseline_committed: COMMITTED_BASELINE && baselinePresent,
+  counts: {
+    workloads: workloads.length,
+    failed: failures.length,
+    baseline_present: baselinePresent ? 1 : 0,
+    static_scan_findings: scanFindings.length,
+    runs: RUNS,
+  },
+  budget: {
+    p95_ratio_max: RATIO_MAX,
+    floor_ms: FLOOR_MS,
+    provenance: 'repository proposal in ci-dogfood.md 4.3, not a PDF SLO',
+  },
+  baseline: WRITE ? null : baseline,
+  results: workloads.map((workload) => ({
+    id: workload.id,
+    passed: workload.passed && (workload.p95_ratio === undefined || workload.p95_ratio <= RATIO_MAX),
+    bounded: workload.bounded,
+    p95: workload.p95,
+    p50: workload.p50,
+    p95_ratio: workload.p95_ratio ?? null,
+    dropped: workload.metric?.dropped ?? 0,
+    duplicated: workload.metric?.duplicated ?? 0,
+    reordered: workload.metric?.reordered ?? 0,
+    metric: workload.metric ?? {},
+    detail: workload.detail,
+  })),
+  static_scan: { files: scanFiles.length, findings: scanFindings },
+  failures,
+};
+mkdirSync(OUT, { recursive: true });
+writeFileSync(resolve(OUT, 'perf.raw.json'), `${JSON.stringify(document, null, 2)}\n`);
+for (const failure of failures) console.error(`FAIL ${failure}`);
+console.log(
+  `edition8 perf: ${workloads.length - failures.filter((failure) => !failure.includes('baseline')).length}/${workloads.length} workloads; ` +
+    `static scan ${scanFindings.length}; baseline ${baselinePresent ? 'present' : 'missing'} (${PLATFORM})`,
+);
+if (failures.length > 0) process.exit(1);

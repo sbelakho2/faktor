@@ -34,6 +34,21 @@ pub(crate) mod control_plane;
 /// retention runtime through it.
 pub mod enterprise;
 pub(crate) mod evidence;
+/// Edition 5 foundation surfaces (config/providers/models/context/policy/diagnostics).
+pub(crate) mod foundation;
+/// Edition 5 lifecycle surfaces (MCP/skills/hooks/memory/session ops).
+pub(crate) mod foundation_ext;
+/// Revision 8 daemon contract routes (instructions/presets/trust/browser/
+/// context pins/export/efficiency/budget/provenance).
+pub(crate) mod foundation_r8;
+#[cfg(test)]
+#[path = "foundation_rev8_contracts_tests.rs"]
+mod foundation_rev8_contracts_tests;
+pub(crate) use foundation_r8 as r8;
+/// Rev8 long-task surfaces (durable compaction operations, memory records,
+/// instruction precedence/editing) layered beside the foundation routes.
+pub(crate) mod instructions;
+pub(crate) mod longtask;
 pub(crate) mod models;
 /// The Engineering Outcome Ledger read surface (economic audit item 7,
 /// additive): `GET /native/outcomes` — durable completed-run metrics and a

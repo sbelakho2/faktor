@@ -225,12 +225,18 @@ impl PromptExecutionService {
     /// Start ONE explicit task run (the native task-start surface). The
     /// executor allocates the isolated root for multi-item mutating plans
     /// itself.
+    /// Start ONE task with the session-selected turn bound (B-09) written
+    /// into the durable budget at admission. This is the ONLY executor
+    /// entry the server uses.
     pub fn start_task(
         &self,
         session: SessionId,
         request: TaskRunRequest,
+        max_turns: Option<u32>,
     ) -> Result<TaskRunReceipt, ExecError> {
-        let receipt = self.tasks.start_task(session, request)?;
+        let receipt = self
+            .tasks
+            .start_task_with_turn_cap(session, request, max_turns)?;
         observe(self, PromptCallKind::StartTask, session);
         Ok(receipt)
     }

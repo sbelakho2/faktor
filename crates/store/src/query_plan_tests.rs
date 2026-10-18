@@ -484,7 +484,7 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
 /// the head indexes, then drop the v36 additions and recreate the pre-audit
 /// duplicate indexes to report the actual write-path delta. Best of three.
 #[test]
-#[ignore = "manual audit benchmark"]
+#[ignore = "[fault] manual audit benchmark"]
 fn write_path_before_after() {
     static BASE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100_000);
     fn run(conn: &rusqlite::Connection, label: &str) {
@@ -558,7 +558,7 @@ fn write_path_before_after() {
 /// duplicates) and measure again. This is the before/after pair quoted by
 /// the query-plan audit; it is not a CI timing gate.
 #[test]
-#[ignore = "manual audit benchmark"]
+#[ignore = "[fault] manual audit benchmark"]
 fn read_path_before_after() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), true).unwrap();

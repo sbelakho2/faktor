@@ -1,0 +1,511 @@
+{
+  "schema": "faktor-edition5-screenshots/v1",
+  "platform": "darwin",
+  "chrome": "Google Chrome 155.0.8059.84",
+  "fixture": "d16bd8e4d4057f1d79364794cc81826d0b78edcc040bc077585299ebc1c44add",
+  "generated_at_ms": 1792258517716,
+  "widths": [
+    480
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "screens": {
+    "S01": 13,
+    "S02": 14,
+    "S03": 10,
+    "S04": 7,
+    "S05": 14,
+    "S06": 12,
+    "S07": 9,
+    "S08": 12,
+    "S09": 9,
+    "S10": 7,
+    "S11": 11,
+    "S12": 5,
+    "S13": 13,
+    "S14": 7,
+    "S15": 13,
+    "S16": 8,
+    "S17": 8,
+    "S18": 8,
+    "S19": 8,
+    "S20": 8,
+    "S21": 12,
+    "S22": 10,
+    "S23": 10,
+    "S24": 8,
+    "S25": 6,
+    "S26": 8,
+    "S27": 6,
+    "S28": 12,
+    "S29": 11,
+    "S30": 9,
+    "S31": 8,
+    "S32": 8
+  },
+  "records": [
+    {
+      "name": "S01-480",
+      "width": 480,
+      "height": 900,
+      "hash": "4d34aa0e74edea48ea2921401369b1d482bb947e68ee0ab88fea0af69473e3e4",
+      "format": "png"
+    },
+    {
+      "name": "S02-480",
+      "width": 480,
+      "height": 900,
+      "hash": "dc56521d17e9e0906cc62df0f6809c8be63461a33087c8b3d9d9ae09b227644e",
+      "format": "png"
+    },
+    {
+      "name": "S03-480",
+      "width": 480,
+      "height": 900,
+      "hash": "c98f698245f8d8ab47435c3b36f679b45497e2d4fa0ea6cd52a550bc63d817e7",
+      "format": "png"
+    },
+    {
+      "name": "S04-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ab66d0077d78fdd700f455a9e4cf9c724aec248a1cbbf72ee76a9b8b13700b79",
+      "format": "png"
+    },
+    {
+      "name": "S05-480",
+      "width": 480,
+      "height": 900,
+      "hash": "e1a322f06b45897403c0c0a576fa47d9add5e8bb552b27db0272cf143ecac8aa",
+      "format": "png"
+    },
+    {
+      "name": "S06-480",
+      "width": 480,
+      "height": 900,
+      "hash": "02e4fce6f9c817e1ec62bb1e944cd60a92a72b410eea50f15805eb0f56efa339",
+      "format": "png"
+    },
+    {
+      "name": "S07-480",
+      "width": 480,
+      "height": 900,
+      "hash": "0184fe84ef09d160a61874db78fe13a113dcb349d2e726741a2f58d7a1f6f81d",
+      "format": "png"
+    },
+    {
+      "name": "S08-480",
+      "width": 480,
+      "height": 900,
+      "hash": "c5ef893e932ed3c565ccf5a45cc526f0e0d717e0fdd2104a24595f0943b6026e",
+      "format": "png"
+    },
+    {
+      "name": "S09-480",
+      "width": 480,
+      "height": 900,
+      "hash": "08f34da9f37934387900cfc926b10f802ceeb3c41f23884664b76879d28fc117",
+      "format": "png"
+    },
+    {
+      "name": "S10-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ebd422b0e478c45e0cfaa859a3682cd5cfd69bae8cc08a0fb96c6fce229fccdd",
+      "format": "png"
+    },
+    {
+      "name": "S11-480",
+      "width": 480,
+      "height": 900,
+      "hash": "1b11bba8b15d5eba533c5ca20b1f67109a8c26f0dd608eb87f3e1300336ac737",
+      "format": "png"
+    },
+    {
+      "name": "S12-480",
+      "width": 480,
+      "height": 900,
+      "hash": "06e574cea8a8e053380185b6d918d31441968ac77d9fba185a1a1cc02c84dbe9",
+      "format": "png"
+    },
+    {
+      "name": "S13-480",
+      "width": 480,
+      "height": 900,
+      "hash": "db86413aa564f561cd3b6f461df5bf68c149ef0fd8dea06faa93d980b5cf122d",
+      "format": "png"
+    },
+    {
+      "name": "S14-480",
+      "width": 480,
+      "height": 900,
+      "hash": "a9842281dfef4a6c6f9e92ef044c0be117ad61499a2ac98599e9bffc9461d35f",
+      "format": "png"
+    },
+    {
+      "name": "S15-480",
+      "width": 480,
+      "height": 900,
+      "hash": "2c9d3d6d5b6247ce697a4244dd780da1c0e5014c115a28a552b684b1fdfeb5bf",
+      "format": "png"
+    },
+    {
+      "name": "S16-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ea0577d85902751e482501be907b2ebb5f8c1238fb087bfb7f901cebe075047a",
+      "format": "png"
+    },
+    {
+      "name": "S17-480",
+      "width": 480,
+      "height": 900,
+      "hash": "f0d67125e7a63650c2ef4a9099e4e68c4e75889a270271a23b4c9e9d76e4624b",
+      "format": "png"
+    },
+    {
+      "name": "S18-480",
+      "width": 480,
+      "height": 900,
+      "hash": "c961ab683369ed6b6ded1df7462de290ed7658877c1031d13a14c739e3220e22",
+      "format": "png"
+    },
+    {
+      "name": "S19-480",
+      "width": 480,
+      "height": 900,
+      "hash": "1bb3fa7f6262827527d532693fc5b1f68353fc5ab9d364a47d9ccec63aac17fb",
+      "format": "png"
+    },
+    {
+      "name": "S20-480",
+      "width": 480,
+      "height": 900,
+      "hash": "2fe3126508060fd191eeb01dcde5c4dba954d63c99ccd62f2687e8c3fe5deffe",
+      "format": "png"
+    },
+    {
+      "name": "S21-480",
+      "width": 480,
+      "height": 900,
+      "hash": "83dbe6e814484ea5471670797bb901655b846bbacd76bbbf077a7c370761483d",
+      "format": "png"
+    },
+    {
+      "name": "S22-480",
+      "width": 480,
+      "height": 900,
+      "hash": "aded45739a8f9f1dd91ee9e3d3bc5d389058cf3912c343214ef013ce98320eb0",
+      "format": "png"
+    },
+    {
+      "name": "S23-480",
+      "width": 480,
+      "height": 900,
+      "hash": "28536df52c73b42710efef6dbf19e9213ea411fd259dd58123e4b5489268f57a",
+      "format": "png"
+    },
+    {
+      "name": "S24-480",
+      "width": 480,
+      "height": 900,
+      "hash": "21e2af2c55db1e5c28d3a77bd9302a61df5aa8184c5f5b45802805f38dc05ced",
+      "format": "png"
+    },
+    {
+      "name": "S25-480",
+      "width": 480,
+      "height": 900,
+      "hash": "5d0f25c1182098050d97c4b5071d18126eaf892d518c672d9d409f80ee94cf16",
+      "format": "png"
+    },
+    {
+      "name": "S26-480",
+      "width": 480,
+      "height": 900,
+      "hash": "24e91f1644c4a06425caff8514f635c3638e17dd12c1bc75cdd88a3ae1de1b2d",
+      "format": "png"
+    },
+    {
+      "name": "S27-480",
+      "width": 480,
+      "height": 900,
+      "hash": "c99109b84d048afab32928a54ae12f502de292a363af17f8ee8128d45663c808",
+      "format": "png"
+    },
+    {
+      "name": "S28-480",
+      "width": 480,
+      "height": 900,
+      "hash": "3b154a324ff96605e3caf4a496ff0aae155cf183d12f1a5febc76b6c7ff5843a",
+      "format": "png"
+    },
+    {
+      "name": "S29-480",
+      "width": 480,
+      "height": 900,
+      "hash": "a130d1dc1beb4407a624fbaffa22149a723d9fce940cabba7695ce3f164eabf4",
+      "format": "png"
+    },
+    {
+      "name": "S30-480",
+      "width": 480,
+      "height": 900,
+      "hash": "7288237eff37ce3e7cadf472fcb31dd520088e98a27af878b8c6fe00755f4802",
+      "format": "png"
+    },
+    {
+      "name": "S31-480",
+      "width": 480,
+      "height": 900,
+      "hash": "38e45c5a4001b1a9b2b2ea1646982056a0ac4be1e771e0362b8686519138193c",
+      "format": "png"
+    },
+    {
+      "name": "S32-480",
+      "width": 480,
+      "height": 900,
+      "hash": "f85f8d66bab1f5ae8d7971d4e19ac98093a4994e685de0d4fbcca7c0d771454b",
+      "format": "png"
+    },
+    {
+      "name": "S01-480",
+      "width": 480,
+      "height": 900,
+      "hash": "9fd6fa2f49d4a8d2e2d9836b299169110c2c414d9d23a902a9c32d976312154d",
+      "format": "png"
+    },
+    {
+      "name": "S02-480",
+      "width": 480,
+      "height": 900,
+      "hash": "9c2608006231232e3143038ac3f64a0358be181ddf9892139f28af098d793673",
+      "format": "png"
+    },
+    {
+      "name": "S03-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ff78fa3d4ac578f0190209686ac11767d606fb232f6b42113b30d3e948d4cbc3",
+      "format": "png"
+    },
+    {
+      "name": "S04-480",
+      "width": 480,
+      "height": 900,
+      "hash": "e298083b335c7749cdc03b8291bda2225a150bba77bbe5028c41bc4d2e4434d1",
+      "format": "png"
+    },
+    {
+      "name": "S05-480",
+      "width": 480,
+      "height": 900,
+      "hash": "be1e9a983180911bccc310d04e488ed93b88fe11e6332bb5e77881f8710c6120",
+      "format": "png"
+    },
+    {
+      "name": "S06-480",
+      "width": 480,
+      "height": 900,
+      "hash": "e75c97823441cdb802e59c1cad7d889764603a1dee9800c332bf9a4f90704b61",
+      "format": "png"
+    },
+    {
+      "name": "S07-480",
+      "width": 480,
+      "height": 900,
+      "hash": "f0282d274a5d5227c6fff2eb5ef5b137df0479f6e0acb6a7c2d8fc17c83d8840",
+      "format": "png"
+    },
+    {
+      "name": "S08-480",
+      "width": 480,
+      "height": 900,
+      "hash": "8e078600faafa35f14120113d708a7098cdb7ea52030d7e00cac83e2860cf14b",
+      "format": "png"
+    },
+    {
+      "name": "S09-480",
+      "width": 480,
+      "height": 900,
+      "hash": "abeb1c6218b4ce5a40b401d5e3ade9a38a1ff62f7c6144279abb9cb10d7ab502",
+      "format": "png"
+    },
+    {
+      "name": "S10-480",
+      "width": 480,
+      "height": 900,
+      "hash": "a8f950f0e9172ca14e563173ae9b4e41d0168f54c6c8c1d7d71dde6bbb1df585",
+      "format": "png"
+    },
+    {
+      "name": "S11-480",
+      "width": 480,
+      "height": 900,
+      "hash": "fd777cd17046d22be61c01f0814257e5616fea97606ebcb04743029bac961c8e",
+      "format": "png"
+    },
+    {
+      "name": "S12-480",
+      "width": 480,
+      "height": 900,
+      "hash": "f1174e01e2cbac0108e3f69d1504b77774cfcc8667551e705d35d800164eeb57",
+      "format": "png"
+    },
+    {
+      "name": "S13-480",
+      "width": 480,
+      "height": 900,
+      "hash": "f2acbe5031186447c2fffafd2a42143c677f584145654747d23d7def730eee81",
+      "format": "png"
+    },
+    {
+      "name": "S14-480",
+      "width": 480,
+      "height": 900,
+      "hash": "75f8f2106fe803f97d56e4f0ac628872ddd98e3b7b16d741156f5012ab297216",
+      "format": "png"
+    },
+    {
+      "name": "S15-480",
+      "width": 480,
+      "height": 900,
+      "hash": "87b45d812b9d8ab769159c8c75722f7912502022705c0a8ce4d9bde6cfcb2af7",
+      "format": "png"
+    },
+    {
+      "name": "S16-480",
+      "width": 480,
+      "height": 900,
+      "hash": "516ad23a3ffc6e5bdc98ed7859b39b6ebf48b5a0ab866d90ec375ba8f642e90f",
+      "format": "png"
+    },
+    {
+      "name": "S17-480",
+      "width": 480,
+      "height": 900,
+      "hash": "3838b8511c28359a74672564ffd156807e5fcdc66a410d5086afdbff14ed17eb",
+      "format": "png"
+    },
+    {
+      "name": "S18-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ce6788e7e9f136a46f8b0282fd4db4836cee7799a1c5ff9e3f89edd47871d212",
+      "format": "png"
+    },
+    {
+      "name": "S19-480",
+      "width": 480,
+      "height": 900,
+      "hash": "990e57e59ecf5927da2af8a21bba8b042c14382ab40c90bc193b9c11a21bc126",
+      "format": "png"
+    },
+    {
+      "name": "S20-480",
+      "width": 480,
+      "height": 900,
+      "hash": "410086ec44a84b8589d5a92cd8ce3812bcb70c101f319ce1b9826a61d1033876",
+      "format": "png"
+    },
+    {
+      "name": "S21-480",
+      "width": 480,
+      "height": 900,
+      "hash": "81e1758dd1bf0a3feb7f59a56415af0146f5dbf0b54ff1863db2637f39c74bd1",
+      "format": "png"
+    },
+    {
+      "name": "S22-480",
+      "width": 480,
+      "height": 900,
+      "hash": "46a46a629eb19e882a22b33e160fe391897347b098801c1db7446bd36e14c807",
+      "format": "png"
+    },
+    {
+      "name": "S23-480",
+      "width": 480,
+      "height": 900,
+      "hash": "671bd9f148e7dec746212cf039725f9f991b1e525b0d7a42a093c468a426ae9c",
+      "format": "png"
+    },
+    {
+      "name": "S24-480",
+      "width": 480,
+      "height": 900,
+      "hash": "ef5443b81c6c8e96ce7d6f6729fb56df5c678253bd21af67fe4c9886a208c816",
+      "format": "png"
+    },
+    {
+      "name": "S25-480",
+      "width": 480,
+      "height": 900,
+      "hash": "1d3024a3432d58c9864869d0df2a4e54ccd065d067773d2a2d014876d0a66054",
+      "format": "png"
+    },
+    {
+      "name": "S26-480",
+      "width": 480,
+      "height": 900,
+      "hash": "c57781e710528b85551c04f3dc3377fe2941861f133f1c48b7f8259942e91409",
+      "format": "png"
+    },
+    {
+      "name": "S27-480",
+      "width": 480,
+      "height": 900,
+      "hash": "a7fe5cd75422886361615ca0551bfc98cd890f315d1c84fd8e58e17dbfceeead",
+      "format": "png"
+    },
+    {
+      "name": "S28-480",
+      "width": 480,
+      "height": 900,
+      "hash": "bb0d7c11ea49c400ae42e310c101aa18162d4694ab646ca8b0a55bc8abf077bb",
+      "format": "png"
+    },
+    {
+      "name": "S29-480",
+      "width": 480,
+      "height": 900,
+      "hash": "8ef3f986d8da38c68909ae716497af79a81f74db9249a330c04ee2bd31dee9ab",
+      "format": "png"
+    },
+    {
+      "name": "S30-480",
+      "width": 480,
+      "height": 900,
+      "hash": "96979f03dec7fc629d628284cad2c2ac027248326bec365fe4fedcdb2438378d",
+      "format": "png"
+    },
+    {
+      "name": "S31-480",
+      "width": 480,
+      "height": 900,
+      "hash": "db8000d4b1c2f9a982fa6ca8c209285c021af4cc9a4d67477bb45b8de7a2e0ef",
+      "format": "png"
+    },
+    {
+      "name": "S32-480",
+      "width": 480,
+      "height": 900,
+      "hash": "d2fbb515732b6b71524e535c8f26f45527d5da581f8a3d4aac22b2cdad454197",
+      "format": "png"
+    }
+  ],
+  "absent_platforms": [
+    {
+      "platform": "linux",
+      "status": "not_certified",
+      "reason": "No record generated on this host; the policy never certifies one platform from another."
+    },
+    {
+      "platform": "win32",
+      "status": "not_certified",
+      "reason": "No record generated on this host; the policy never certifies one platform from another."
+    }
+  ],
+  "reviewed": true
+}

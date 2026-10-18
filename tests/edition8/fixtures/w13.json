@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W13",
+  "title": "Handle rate limit, cap and unknown spend",
+  "screens": [
+    "S21",
+    "S22",
+    "S27"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Inspect the typed 429/quota/local-saturation cause.",
+    "Show known retry delay and total attempts; keep Stop available.",
+    "Inspect the ledger: open, settled and uncertain.",
+    "Request a supported allowance revision or end the task.",
+    "Reconcile any unknown admission before any replay.",
+    "Keep every eligible attempted charge, including failed/cancelled work."
+  ],
+  "forbidden_fake_states": [
+    "Guessed reset time",
+    "zero for unknown price",
+    "cap decrease shown as deleting spend",
+    "cancelled work omitted from the eligible numerator"
+  ],
+  "complete_when": "the final ledger retains every eligible attempted charge, including failed/cancelled work (p.186).",
+  "traceability": "p.186; controls B-01..B-12, O-06, M-13, K-12; acceptance A30, A31, A32.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

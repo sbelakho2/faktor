@@ -76,6 +76,16 @@ class HistoryPanel : JPanel(BorderLayout()) {
         fun onOpenSession(sessionId: String)
 
         fun onRefresh()
+
+        fun onRename(sessionId: String, title: String) {}
+
+        fun onPin(sessionId: String, pinned: Boolean) {}
+
+        fun onArchive(sessionId: String) {}
+
+        fun onFork(sessionId: String) {}
+
+        fun onExport(sessionId: String) {}
     }
 
     private val all = ArrayList<NativeSessionSummary>()
@@ -87,6 +97,26 @@ class HistoryPanel : JPanel(BorderLayout()) {
     private val status = WrappedLabel("prior work: -")
 
     private val searchField = javax.swing.JTextField("", 14)
+
+    private val findField = javax.swing.JTextField("", 14)
+
+    private val findButton = secondaryButton("Find in transcript")
+
+    private val findStatus = wrappedMutedLabel(
+        "Find searches durable pages, not only the rendered rows."
+    )
+
+    private var transcriptSearchListener: ((String) -> Unit)? = null
+
+    private val renameButton = secondaryButton("Rename")
+
+    private val pinButton = secondaryButton("Pin")
+
+    private val archiveButton = secondaryButton("Archive")
+
+    private val forkButton = secondaryButton("Fork")
+
+    private val exportButton = secondaryButton("Export")
 
     private val openButton = primaryButton("Open")
 
@@ -124,6 +154,29 @@ class HistoryPanel : JPanel(BorderLayout()) {
         list.a11y("Prior work", "Durable conversations. Press Enter to open the selection.")
         installActivateKey(list, "faktor.openHistorySession") { submitOpen() }
         openButton.addActionListener { submitOpen() }
+        findField.a11y("Find in transcript", "Search all durable message pages, including unloaded history.")
+        findField.addActionListener { runTranscriptSearch() }
+        findButton.addActionListener { runTranscriptSearch() }
+        renameButton.addActionListener {
+            val selected = list.selectedValue?.id ?: return@addActionListener
+            listener?.onRename(selected, searchField.text.trim())
+        }
+        pinButton.addActionListener {
+            val selected = list.selectedValue?.id ?: return@addActionListener
+            listener?.onPin(selected, true)
+        }
+        archiveButton.addActionListener {
+            val selected = list.selectedValue?.id ?: return@addActionListener
+            listener?.onArchive(selected)
+        }
+        forkButton.addActionListener {
+            val selected = list.selectedValue?.id ?: return@addActionListener
+            listener?.onFork(selected)
+        }
+        exportButton.addActionListener {
+            val selected = list.selectedValue?.id ?: return@addActionListener
+            listener?.onExport(selected)
+        }
         openButton.a11y("Open conversation", "Opens the selected durable conversation.")
         refreshButton.addActionListener { listener?.onRefresh() }
         refreshHistoryButton.addActionListener { listener?.onRefresh() }
@@ -139,13 +192,19 @@ class HistoryPanel : JPanel(BorderLayout()) {
         // Narrow-host fix: the label sits ABOVE the field (no fixed key
         // column that could squeeze the input at 240px).
         val searchRow = pageColumn(gap = Spacing.XS, padding = 0)
-        searchRow.add(mutedLabel("Search"))
+        searchRow.add(mutedLabel("Filter by title"))
         searchRow.add(searchField)
+        searchRow.add(mutedLabel("Find in transcript (all pages)"))
+        searchRow.add(findField)
+        searchRow.add(findButton)
+        searchRow.add(findStatus)
         val listContent = JPanel(BorderLayout(0, Spacing.S))
         listContent.isOpaque = false
         listContent.add(searchRow, BorderLayout.NORTH)
         listContent.add(insetScroll(list), BorderLayout.CENTER)
-        val listActions = actionRow(openButton, refreshButton)
+        val listActions = wrapRow(
+            openButton, refreshButton, renameButton, pinButton, archiveButton, forkButton, exportButton
+        )
         listContent.add(listActions, BorderLayout.SOUTH)
         val unavailableBody = pageColumn(gap = Spacing.XS, padding = 0)
         unavailableBody.add(unavailableHeadline)
@@ -168,6 +227,30 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     fun setListener(value: Listener?) {
         listener = value
+    }
+
+    /** D-03: transcript Find is a separate operation from title filtering. */
+    fun setTranscriptSearchListener(value: ((String) -> Unit)?) {
+        transcriptSearchListener = value
+    }
+
+    fun findQueryForTest(): String = findField.text
+
+    fun submitFindForTest(query: String) {
+        findField.text = query
+        runTranscriptSearch()
+    }
+
+    private fun runTranscriptSearch() {
+        val query = findField.text.trim()
+        if (query.isEmpty()) {
+            findStatus.text = "Find needs a query; nothing was searched."
+            findStatus.foreground = semanticForeground(SemanticState.WARNING)
+            return
+        }
+        transcriptSearchListener?.invoke(query)
+        findStatus.text = "Find requested across durable pages: $query"
+        findStatus.foreground = mutedForeground()
     }
 
     /** Replaces the durable listing; a still-served selection is preserved. */

@@ -134,6 +134,19 @@ pub struct ServerDeps {
     /// native health payload reports an explicit `disabled` worker-plane
     /// state and no second socket exists.
     pub worker_plane_listener: Option<WorkerPlaneListener>,
+    /// Edition 5 daemon foundation: the durable configuration authority,
+    /// credential vault, provider lifecycle, model descriptors/receipts,
+    /// context manifests, permission policy, customization metadata and
+    /// diagnostics. `None` = the embedded host wired no foundation (the
+    /// `/native/config|providers/connections|...` routes answer a typed 503
+    /// `foundation_disabled`); the daemon's serve path always wires it.
+    pub foundation: Option<Arc<faktor_foundation::Foundation>>,
+    /// Live stdio MCP children owned by this daemon surface (explicit start/
+    /// stop; one process group per server under the daemon supervisor).
+    pub mcp_runtime: Arc<crate::native::foundation_ext::McpRuntime>,
+    /// Process start time (epoch ms) for diagnostics. Set once when the
+    /// dependency envelope is assembled; never synthesized per request.
+    pub started_ms: i64,
     /// The terminal execution-authority policy: the ONE admission gate every
     /// session-owned terminal spawn passes through. The host CONSTRUCTS it
     /// from its configured `[sandbox]` shell contract
@@ -204,6 +217,9 @@ impl ServerDeps {
         tasks: Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
         budgets: Arc<faktor_session::DurableBudgetLedger>,
     ) -> Self {
+        let mcp_runtime = Arc::new(crate::native::foundation_ext::McpRuntime::new(
+            agent.deps().supervisor.clone(),
+        ));
         Self {
             session,
             agent,
@@ -236,6 +252,12 @@ impl ServerDeps {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            foundation: None,
+            mcp_runtime,
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
             terminal_policy: TerminalAuthorityPolicy::default(),
         }
     }
@@ -246,6 +268,14 @@ impl ServerDeps {
     /// fail-closed `os_isolated` default governs.
     pub fn with_terminal_policy(mut self, policy: TerminalAuthorityPolicy) -> Self {
         self.terminal_policy = policy;
+        self
+    }
+
+    /// Wire the Edition 5 foundation (configuration/vault/providers/models/
+    /// context/policy/customization/diagnostics). The daemon serve path
+    /// always wires it; embedded hosts may leave it `None`.
+    pub fn with_foundation(mut self, foundation: Arc<faktor_foundation::Foundation>) -> Self {
+        self.foundation = Some(foundation);
         self
     }
 

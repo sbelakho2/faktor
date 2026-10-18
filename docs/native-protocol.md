@@ -135,11 +135,13 @@ generated into both IDE clients (`ProtocolAttachmentId`,
   else `null`. `verification` = pending tool runs whose effects are
   `unknown` (recovery `mark_unknown`), capped. `progress` is the session's
   live bounded progress record (null before the runtime tracked one);
-  `contextUsage` stays `null` in this revision (no durable context-usage
-  read API yet); `prefixStability` is populated from the durable per-call
+  `contextUsage` is the newest authoritative context manifest's checked
+  usage or `null` (see "Long-task context, compaction, memory and
+  instructions" below; null is the S62 `Unavailable` state, never 0); `prefixStability` is populated from the durable per-call
   prefix observations once a turn has settled one (null before). The
   machine state, activeTool and provider-call journal are the source of
-  phase information.
+  phase information. Rev8 adds the `compaction` and `longTask` fields
+  documented in that section.
 - `GET /models` — the flat daemon model catalog:
   `[{provider, model, context, maxOutput, tools, parallelTools,
   reasoning, thinking, vision, structuredOutput, embeddings, streaming,
@@ -507,6 +509,145 @@ serves these daemon-level forms only — there are no exact
   parallelTools, reasoning, thinking, vision, structuredOutput,
   embeddings, streaming, source}], runtimeContextLimitSupported, health}]`.
   Auth/endpoint metadata stays in the provider layer and is never emitted.
+
+### Long-task context, compaction, memory and instructions (Rev8)
+
+These additive fields/routes back S08/S10/S11/S12/S62/S66/S69. Field names
+are exactly as served (the embedded `faktor-foundation` shapes are
+snake_case; the long-task wrappers are camelCase).
+
+**Projection overlay** — `GET /session/{id}/projection` adds:
+
+- `contextUsage`: `null` or the newest captured manifest's
+  `{revision, call_id, model, capacity, input, output_reserve,
+  safety_reserve, headroom, basis: {kind: "estimated"|"observed"|
+  "unavailable", method?, version?, receipt?, reason?}, estimated,
+  measured, categories: [{category, tokens}], sources: [...],
+  overflow, overflow_reason, created_ms}`. `input`/`headroom` are `null`
+  when the arithmetic cannot be trusted. `null` contextUsage is S62:
+  render `Unavailable`, never a percentage. Draft estimates come only
+  from `POST /native/session/{id}/context/preview` (a separate basis).
+- `compaction`: newest durable compaction operation (same DTO as the
+  status route) or `null`.
+- `longTask`: `{executionPhase, autoCompaction: {trigger, startedMs,
+  ageMs, stale}|null, compacting}`. `compacting` is true for a live manual
+  operation or an un-stale threshold marker; a stale crash marker is
+  never live progress.
+
+**Compaction operations (S10/K-03/K-04)**
+
+- `POST /native/session/{id}/context/compaction` — body
+  `{operationId?, targetTokens?, minReductionRatio?, expectedRevision?,
+  maxHistoryMessages?}` (strict; unknown fields 400). The POST is the
+  executor: it returns the terminal state. To render `planning|reducing|
+  committing` progress, issue it without awaiting the response and poll
+  the status route (or projection) from another request; cancellation is
+  a concurrent request against the same operation id.
+- `GET /native/session/{id}/context/compaction` — newest operation.
+- `GET /native/session/{id}/context/compaction/{operation}` — exact state.
+- `POST /native/session/{id}/context/compaction/{operation}/cancel` —
+  `{cancelRequested, signaled, operation}`; the durable state is the
+  authority and a late cancel never rewrites a terminal outcome.
+
+Operation DTO: `{operationId, state, phase, terminal, progress (0..1),
+expectedRevision, manifestRevision, before, after, target,
+minimumReduction, strategy, result, error: {code, message}|null,
+createdMs, updatedMs, basis: {kind, method, version}}`.
+`state` is one of `prepared | planning | reducing | committing |
+cancelling | applied | refused | cancelled | failed | effect_unknown`.
+`effect_unknown` is terminal and means the daemon stopped during the
+atomic commit; it is never reported as applied/failed. A non-terminal
+operation from a previous daemon is reconciled on read: pre-commit phases
+become `cancelled` (prior basis remains), `committing` becomes
+`effect_unknown`. `progress` is durable, not a fabricated animation.
+
+`result` on a terminal operation carries
+`{accepted, before, after, target, reduction, minimumReduction, strategy,
+summaryRevision, summaryVersion, summaryDigest, checkpointThroughSeq,
+rejectedReason, retainedFacts: {goal, constraints, openSteps, decisions,
+knownFailures, changedFiles}, keptRecentTurns, removed: {archivedChunks,
+archivedRefs, evidenceRefs, originalHistory: {kind, sessionId,
+throughSeq, note}}, basis}`. `before`/`after` are exact history-estimator
+wire tokens (the same unit the next request carries); an accepted
+operation must meet `after <= target`, `reduction >= minimumReduction`,
+and keep the newest user instruction plus the verbatim task identity.
+Refusal/cancellation writes NO checkpoint. Duplicate `operationId` with
+the same inputs replays the same durable row; different inputs are 409.
+A stale `expectedRevision` is 409 `context_revision_conflict`.
+
+**Memory records (S12/S66/K-10/K-11)**
+
+- `GET /native/memory/records?session=&scope=session|workspace|project|all&
+  includeDeleted=&afterMs=&afterKind=&afterKey=&limit=` — bounded page
+  (`limit` 1..=200) of `{id, scope, scopeId, subject, predicate, value,
+  provenance: {origin, recordedMs, assertedBy, sourceRef}, confidencePpm,
+  version, createdMs, updatedMs, deleted: {deletedMs, reason,
+  atRevision}|null, previous: {version, value, updatedMs}|null}`.
+  `scope=all` merges this session's session+workspace scopes only.
+  Workspace/project scope is SHARED by every session of that workspace
+  (separate durable table); session scope is private to the owning
+  session. Both are structurally isolated across workspaces.
+- `POST /native/memory/records` — `{session, scope, subject, predicate,
+  value: {type: "text"|"bool"|"number"|"path_list"|"json", value},
+  provenance?, confidencePpm?, evidence?, sourceRevision?}`. Identity is
+  `(scope, subject, predicate)`: an identical live value is a no-op
+  (`deduped: true`, no version bump), a different live value is a typed
+  409 conflict requiring an explicit update.
+- `PUT /native/memory/records/{id}` — `{session, expectedVersion, value}`;
+  stale versions are 409 `memory_version_conflict`.
+- `DELETE /native/memory/records/{id}?session=&expectedVersion=&reason=`
+  — tombstone + S66 receipt `{id, scope, scopeId,
+  futureUseStoppedAtRevision, deletedValueHash, retainedPriorCopies:
+  true, retainedPriorArtifactRefs, retentionNote, record}`. Future
+  retrieval stops; earlier prompts/artifacts/logs are NOT claimed erased.
+- `POST /native/memory/records/{id}/restore` — `{session,
+  expectedVersion}` (live records are `memory_not_deleted`).
+- `GET|PUT /native/memory/policy` — workspace memory policy with an
+  explicit `revision` CAS (`auto_capture`, `retention_days`,
+  `max_records`, `allow_session_scope`, `allow_workspace_scope`);
+  `max_records` is enforced on new records (dedupe/update/restore still
+  pass); failure learning is a separate authority and never
+  reinterpreted.
+- `POST /native/memory/records/retention` — `{session, scope?,
+  olderThanDays?, dryRun?, limit?}`; a dry run lists exactly the
+  tombstone rows a real bounded pass deletes (live records are never
+  selected).
+
+Typed errors: `memory_not_found` (404), `memory_conflict`,
+`memory_version_conflict`, `memory_deleted`, `memory_not_deleted`,
+`memory_policy_limit` (409),
+`memory_scope_invalid`, `memory_malformed` (400), `memory_oversized`
+(413), `memory_store_unavailable` (500). Provenance origin is one of
+`user | tool | verification | model | import | recovery`. Scopes resolve
+from the session row, so a project cannot read another workspace's
+records.
+
+**Instructions and precedence (S11/S69/I-11)**
+
+- `GET /native/instructions?session=&prompt=&touched=` — loaded sources
+  grouped by origin/scope with `{source, path, scope, priority, hash,
+  bytes, active, reasonLoaded, contentPreview}`, `activeCount`,
+  `skips`, `precedence`, `conflicts: [{scope, winner, loser, reason}]`,
+  `managedAuthority`, `epoch`, `bundleHash`, and `binding`.
+- `GET /native/instructions/preview?session=&prompt=&touched=` — bounded
+  merged bundle (`text`, `bytes`, `truncated`, `sources`, `binding`).
+- `PUT /native/instructions/source` — `{session, path, content, mode:
+  "create"|"update", expectedHash?}`; one atomic bounded edit. Update
+  requires the exact content hash read; create requires an absent path.
+  An edit never rewrites a running turn's captured bundle.
+- `GET|POST /native/instructions/records`, `GET|DELETE
+  /native/instructions/records/{id}`, `POST
+  /native/instructions/records/preview`, `POST
+  /native/instructions/import`, `GET|POST
+  /native/instructions/bindings` — the durable rule records, previews,
+  import migration report and captured-bundle bindings.
+
+`binding` is `{capturedEpoch, capturedBundleHash, capturedAtMs,
+capturedTurnOpId, currentEpoch, currentBundleHash, matches, activeRun,
+applyTiming: "next_task"|"restart_required", restartRequired}`.
+Precedence is served highest-first; a managed lock is never relaxed by
+project text, and repository instructions remain DATA, not executable
+authority.
 
 ### Control-plane surface (disabled by default)
 

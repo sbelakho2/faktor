@@ -280,6 +280,20 @@ fn journal_session_problems_flag_each_open_invariant() {
         "the problem must name the session: {problems:?}"
     );
 
+    // A durable deletion tombstone keeps the row but purges the journal:
+    // that is an expected closed state, not torn creation.
+    let deleted = store.create_session(ws, "deleted", "p", "m").unwrap();
+    store
+        .purge_session_content(deleted.id, "test deletion")
+        .unwrap();
+    assert!(
+        store
+            .journal_session_problems(deleted.id, JournalDepth::Open)
+            .unwrap()
+            .is_empty(),
+        "a tombstoned session must not be reported as torn creation"
+    );
+
     // (a) the seq-1 seed slot was supplanted by a later event, renumbered
     // into it: numerically gapless, visible only via the seed contract.
     let supplanted = store.create_session(ws, "supplanted", "p", "m").unwrap();

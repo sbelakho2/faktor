@@ -811,7 +811,10 @@ async fn history_reconstruction_splits_tool_results_into_user_role() {
         .history_messages(&handle, &ContextBudget::default())
         .await
         .unwrap();
-    assert_eq!(msgs.len(), 3);
+    // 3) pending call and 4) a result for a call that is nowhere in the
+    // retained history are NOT wire messages: the result is an orphan and
+    // is dropped (the durable transcript still holds it).
+    assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].role, Role::Assistant);
     assert!(matches!(
         &msgs[0].content[0].kind,
@@ -837,20 +840,19 @@ async fn history_reconstruction_splits_tool_results_into_user_role() {
         ContentKind::ToolResult { content, is_error }
             if content == "echo: {\"x\":1}" && !is_error
     ));
-    assert_eq!(msgs[2].role, Role::User);
-    assert!(
-        matches!(
-            &msgs[2].content[0].kind,
-            ContentKind::ToolResult { is_error, .. } if *is_error
-        ),
-        "a non-zero exit code is an error result"
-    );
     assert!(
         !msgs.iter().any(|m| m.content.iter().any(|c| matches!(
             &c.kind,
             ContentKind::ToolCall { id, .. } if id == "call_2"
         ))),
         "pending tool calls never reach the wire"
+    );
+    assert!(
+        !msgs.iter().any(|m| m
+            .content
+            .iter()
+            .any(|c| c.tool_call_id.as_deref() == Some("call_3"))),
+        "a tool result with no matching call is never sent (no orphans)"
     );
 }
 

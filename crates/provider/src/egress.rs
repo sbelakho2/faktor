@@ -593,6 +593,24 @@ impl PolicyCheckedHttpTransport {
         })
     }
 
+    /// Production transport with explicit validated options (see
+    /// [`EgressClientOptions`]).
+    pub fn try_with_policy_scan_addresses_and_options(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+        addresses: EgressAddressPolicy,
+        options: EgressClientOptions,
+    ) -> Result<Self, EgressError> {
+        Ok(Self {
+            inner: CheckedHttpClient::try_with_policy_scan_addresses_and_options(
+                policy,
+                outbound_scan,
+                addresses,
+                options,
+            )?,
+        })
+    }
+
     /// The installed outbound secret scan (`None` = no secret scanning).
     pub fn outbound_scan(&self) -> Option<&OutboundScanConfig> {
         self.inner.outbound_scan()
@@ -627,6 +645,24 @@ impl HttpTransport for CheckedHttpClient {
     }
 }
 
+/// Explicit production client options. Every option is validated by the
+/// constructor and there is deliberately NO "disable TLS verification"
+/// switch: TLS roots may be ADDED (a pinned CA), never removed.
+#[derive(Clone, Default)]
+pub struct EgressClientOptions {
+    /// Connect deadline (absent = the adapter-standard 10 s).
+    pub connect_timeout: Option<Duration>,
+    /// One explicitly configured proxy. It is validated against the SAME
+    /// parsed destination policy as request URLs before the client exists,
+    /// and reqwest's automatic environment-proxy inheritance stays disabled.
+    pub proxy: Option<Url>,
+    /// Additional PEM trust roots (a managed/pinned CA bundle). Certificate
+    /// verification is never disabled.
+    pub extra_root_pem: Option<Vec<u8>>,
+    /// TCP keep-alive idle used by the underlying hyper connector.
+    pub tcp_keep_alive: Option<Duration>,
+}
+
 /// The adapter-standard client: connect-timeout only (the streaming hang
 /// controls live in the adapter transport guards, never here), the central
 /// egress resolver pinned as the DNS seam (one resolution per host, every
@@ -645,8 +681,24 @@ impl HttpTransport for CheckedHttpClient {
 /// every failure now surfaces as the typed
 /// [`EgressError::ClientBuild`] and the daemon refuses to run without a
 /// correctly-gated client instead of running with a degraded one.
+#[cfg(any(test, feature = "test-utils"))]
 fn try_default_timeout_client(resolver: EgressResolver) -> Result<reqwest::Client, EgressError> {
-    reqwest::Client::builder()
+    try_default_timeout_client_with_options(resolver, EgressClientOptions::default())
+}
+
+/// The ONE checked-client builder, optionally carrying validated transport
+/// options. `.no_proxy()` runs FIRST (killing every environment proxy), then
+/// an explicitly configured Faktor proxy is installed deliberately after it;
+/// a proxy therefore never bypasses the parsed-destination gate. Additional
+/// trust roots are APPENDED, and there is no insecure-verification option.
+fn try_default_timeout_client_with_options(
+    resolver: EgressResolver,
+    options: EgressClientOptions,
+) -> Result<reqwest::Client, EgressError> {
+    let connect_timeout = options
+        .connect_timeout
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder()
         .dns_resolver(Arc::new(ReqwestDnsResolver::new(resolver)))
         .redirect(reqwest::redirect::Policy::none())
         // Environment proxy inheritance is DISABLED: reqwest's default
@@ -662,13 +714,27 @@ fn try_default_timeout_client(resolver: EgressResolver) -> Result<reqwest::Clien
         // installed deliberately here — never inherited from the
         // environment.
         .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| EgressError::ClientBuild {
-            // `without_url` keeps even the build error URL-free; the
-            // message carries only the builder's typed reason.
-            detail: e.without_url().to_string(),
-        })
+        .connect_timeout(connect_timeout);
+    if let Some(proxy) = options.proxy {
+        let proxy = reqwest::Proxy::all(proxy).map_err(|e| EgressError::ClientBuild {
+            detail: format!("proxy: {e}"),
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    if let Some(pem) = options.extra_root_pem {
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| EgressError::ClientBuild {
+            detail: format!("extra root certificate: {e}"),
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
+    if let Some(idle) = options.tcp_keep_alive {
+        builder = builder.tcp_keepalive(idle);
+    }
+    builder.build().map_err(|e| EgressError::ClientBuild {
+        // `without_url` keeps even the build error URL-free; the message
+        // carries only the builder's typed reason.
+        detail: e.without_url().to_string(),
+    })
 }
 
 /// Execute a GET through a transport. Request building and the raw
@@ -1935,8 +2001,33 @@ impl CheckedHttpClient {
         outbound_scan: Option<OutboundScanConfig>,
         addresses: EgressAddressPolicy,
     ) -> Result<CheckedHttpClient, EgressError> {
+        Self::try_with_policy_scan_addresses_and_options(
+            policy,
+            outbound_scan,
+            addresses,
+            EgressClientOptions::default(),
+        )
+    }
+
+    /// Production constructor with explicit, validated transport options
+    /// (connect deadline, one deliberately installed proxy, added trust
+    /// roots, TCP keep-alive). The proxy destination itself must pass the
+    /// same installed policy and address-class rule: a proxy that is not an
+    /// allowlisted destination is refused BEFORE any client exists.
+    pub fn try_with_policy_scan_addresses_and_options(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+        addresses: EgressAddressPolicy,
+        mut options: EgressClientOptions,
+    ) -> Result<CheckedHttpClient, EgressError> {
+        if let Some(proxy) = options.proxy.as_ref() {
+            check_url_with(Some(&policy), proxy)?;
+        }
+        if options.connect_timeout.is_none() {
+            options.connect_timeout = Some(std::time::Duration::from_secs(10));
+        }
         let resolver = EgressResolver::system(addresses);
-        let inner = try_default_timeout_client(resolver.clone())?;
+        let inner = try_default_timeout_client_with_options(resolver.clone(), options)?;
         Ok(CheckedHttpClient {
             inner,
             policy: Some(policy),

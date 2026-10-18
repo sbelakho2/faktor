@@ -1099,7 +1099,8 @@ pub(crate) fn exec_error_response(e: &faktor_orchestrator::runtime::ExecError) -
         faktor_orchestrator::runtime::ExecError::Oversized(_)
         | faktor_orchestrator::runtime::ExecError::Malformed(_)
         | faktor_orchestrator::runtime::ExecError::InvalidPlan(_)
-        | faktor_orchestrator::runtime::ExecError::InvalidApproval(_) => ("malformed", 400, false),
+        | faktor_orchestrator::runtime::ExecError::InvalidApproval(_)
+        | faktor_orchestrator::runtime::ExecError::UndecidedPaths(_) => ("malformed", 400, false),
         // An authoritative durable write / control ack failed. The control
         // was NOT claimed applied and the same call may be safely retried:
         // surface that as a typed RETRIABLE service failure, never a silent

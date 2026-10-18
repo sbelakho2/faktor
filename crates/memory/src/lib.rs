@@ -273,6 +273,10 @@ pub struct Provenance {
     pub recorded_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asserted_by: Option<String>,
+    /// The durable source identity (session/task/message/artifact) this fact
+    /// was learned from, when one exists. Bounded by validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
 }
 
 impl Provenance {
@@ -281,6 +285,7 @@ impl Provenance {
             origin: ProvenanceOrigin::User,
             recorded_ms: now_ms,
             asserted_by: None,
+            source_ref: None,
         }
     }
 }
@@ -334,6 +339,31 @@ pub fn invalidation_reason(
     }
 }
 
+/// One prior value retained for edit/restore display. Exactly ONE prior
+/// revision is kept (bounded by MAX_V2_FACT_BYTES); the current version is
+/// the fact itself.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryRevision {
+    pub version: u32,
+    pub value: TypedMemoryValue,
+    pub updated_ms: i64,
+}
+
+/// Tombstone of a deleted memory record. The fact row survives so the
+/// deletion is durable, attributable and restorable; retrieval excludes it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryDeletion {
+    pub deleted_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Durable session event revision at which future use stopped.
+    pub at_revision: u64,
+}
+
+fn default_memory_version() -> u32 {
+    1
+}
+
 /// A typed durable fact (Memory V2). Serialized as JSON under the row kind
 /// `memory_v2:<predicate>`; legacy rows are mapped into this shape by the
 /// compat path.
@@ -355,6 +385,24 @@ pub struct MemoryFactV2 {
     pub invalidation: InvalidationRule,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// Monotonic edit version (1 on creation). Every edit/delete/restore
+    /// increments it; clients compare it for optimistic concurrency.
+    #[serde(default = "default_memory_version")]
+    pub version: u32,
+    /// Present exactly while the record is deleted from FUTURE retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<MemoryDeletion>,
+    /// The immediately prior value, retained for display/audit. Never used
+    /// for retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Box<MemoryRevision>>,
+}
+
+impl MemoryFactV2 {
+    /// True while the record participates in retrieval.
+    pub fn is_live(&self) -> bool {
+        self.deleted.is_none()
+    }
 }
 
 impl MemoryFactV2 {
@@ -385,6 +433,9 @@ impl MemoryFactV2 {
             invalidation: InvalidationRule::Never,
             created_ms: now_ms,
             updated_ms: now_ms,
+            version: 1,
+            deleted: None,
+            previous: None,
         }
     }
 
@@ -481,8 +532,34 @@ impl MemoryFactV2 {
                 "created_ms is after updated_ms".into(),
             ));
         }
+        if self.version == 0 {
+            return Err(MemoryError::Malformed("memory version must be >= 1".into()));
+        }
+        if let Some(previous) = &self.previous {
+            if previous.version >= self.version {
+                return Err(MemoryError::Malformed(
+                    "previous memory revision must precede the current version".into(),
+                ));
+            }
+            previous.value.validate()?;
+        }
+        if let Some(deleted) = &self.deleted {
+            if deleted.deleted_ms > self.updated_ms {
+                return Err(MemoryError::Malformed(
+                    "deletion timestamp is after the record update".into(),
+                ));
+            }
+            if deleted.deleted_ms <= 0 {
+                return Err(MemoryError::Malformed(
+                    "deletion timestamp must be positive".into(),
+                ));
+            }
+        }
         if let Some(asserted_by) = &self.provenance.asserted_by {
             check_bounded("asserted_by", asserted_by, 1, 128)?;
+        }
+        if let Some(source_ref) = &self.provenance.source_ref {
+            check_bounded("source_ref", source_ref, 1, 256)?;
         }
         self.validate_provenance()?;
         let serialized = self.serialized_bytes();
@@ -621,6 +698,10 @@ impl MemoryError {
 pub struct MemoryQuery {
     pub scope: MemoryScope,
     pub include_legacy: bool,
+    /// Include tombstoned records (management screens only). Retrieval
+    /// always uses the default `false`, so a deleted memory can never be
+    /// rendered into a model prompt.
+    pub include_deleted: bool,
 }
 
 impl MemoryQuery {
@@ -628,6 +709,7 @@ impl MemoryQuery {
         Self {
             scope,
             include_legacy: true,
+            include_deleted: false,
         }
     }
 
@@ -636,6 +718,7 @@ impl MemoryQuery {
         Self {
             scope,
             include_legacy: false,
+            include_deleted: false,
         }
     }
 
@@ -645,6 +728,13 @@ impl MemoryQuery {
 
     pub fn typed_for_session(session: SessionId) -> Self {
         Self::typed(MemoryScope::session_scope(session))
+    }
+
+    /// Management read: include tombstones so S12/S66 can show the deleted
+    /// record, its scope and its delete date. Never used for prompt assembly.
+    pub fn with_deleted(mut self) -> Self {
+        self.include_deleted = true;
+        self
     }
 }
 
@@ -772,6 +862,9 @@ trait PagedSource {
 
 fn matches_query(row: &DecodedRow, query: &MemoryQuery) -> bool {
     if row.legacy && !query.include_legacy {
+        return false;
+    }
+    if !query.include_deleted && !row.fact.is_live() {
         return false;
     }
     row.fact.scope == query.scope
@@ -958,11 +1051,15 @@ fn legacy_fact(
             origin: ProvenanceOrigin::Recovery,
             recorded_ms: updated_ms,
             asserted_by: None,
+            source_ref: None,
         },
         confidence_ppm: 1_000_000,
         invalidation: InvalidationRule::Never,
         created_ms: updated_ms,
         updated_ms,
+        version: 1,
+        deleted: None,
+        previous: None,
     }
 }
 
@@ -1109,6 +1206,111 @@ impl MemoryWriter for StoreRepository {
         }
         self.store
             .upsert_memory_fact(self.session, &kind, &fact.id, &value)
+            .map_err(MemoryError::Store)
+    }
+}
+
+/// Bounded read seam over ONE workspace's shared V2 memory rows (Rev8
+/// S12/K-10/K-11). Workspace memory lives in its own durable table, so every
+/// session of the workspace sees it and no other workspace can.
+pub struct WorkspaceRepository {
+    store: Arc<Store>,
+    workspace: u64,
+}
+
+impl WorkspaceRepository {
+    pub fn new(store: Arc<Store>, workspace: u64) -> Self {
+        Self { store, workspace }
+    }
+
+    /// Coherence fallback used by context assembly when the pooled reader
+    /// returns an empty page: the SAME indexed newest-first read executed on
+    /// the writer connection, then decoded with the workspace legacy scope.
+    /// Still bounded (`limit` <= MAX_V2_PAGE_SIZE); never used on the hot
+    /// path when a normal read returns rows.
+    pub fn latest_fresh(&self, limit: usize) -> Result<Vec<MemoryFactV2>, MemoryError> {
+        let rows = self
+            .store
+            .workspace_memory_facts_fresh(self.workspace, u64::try_from(limit).unwrap_or(u64::MAX))
+            .map_err(MemoryError::Store)?;
+        let legacy_scope = self.legacy_scope();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| decode_store_row(row, &legacy_scope))
+            .map(|decoded| decoded.fact)
+            .collect())
+    }
+}
+
+impl PagedSource for WorkspaceRepository {
+    fn legacy_scope(&self) -> MemoryScope {
+        MemoryScope::Workspace(self.workspace.to_string())
+    }
+
+    fn fetch(
+        &self,
+        after: Option<&MemoryFactCursor>,
+        limit: usize,
+    ) -> Result<(Vec<DecodedRow>, bool), MemoryError> {
+        let limit = limit.clamp(1, MAX_V2_PAGE_SIZE) as u64;
+        let (rows, has_more) = self
+            .store
+            .workspace_memory_facts_page(self.workspace, after, limit)
+            .map_err(MemoryError::Store)?;
+        let legacy_scope = self.legacy_scope();
+        Ok((
+            rows.into_iter()
+                .filter_map(|row| decode_store_row(row, &legacy_scope))
+                .collect(),
+            has_more,
+        ))
+    }
+}
+
+impl MemoryReader for WorkspaceRepository {
+    fn facts_bounded(
+        &self,
+        query: &MemoryQuery,
+        max_facts: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedFacts, MemoryError> {
+        facts_bounded_impl(self, query, max_facts, max_bytes)
+    }
+
+    fn latest_by_key(
+        &self,
+        query: &MemoryQuery,
+        subject: &str,
+        predicate: &str,
+    ) -> Result<Option<MemoryFactV2>, MemoryError> {
+        latest_by_key_impl(self, query, subject, predicate)
+    }
+
+    fn by_kind_page(
+        &self,
+        query: &MemoryQuery,
+        predicate: &str,
+        after: Option<&MemoryFactCursor>,
+        limit: usize,
+    ) -> Result<FactsPageV2, MemoryError> {
+        by_kind_page_impl(self, query, predicate, after, limit)
+    }
+}
+
+impl MemoryWriter for WorkspaceRepository {
+    fn put(&self, fact: &MemoryFactV2) -> Result<(), MemoryError> {
+        fact.validate()?;
+        let kind = fact.row_kind();
+        let value = serde_json::to_string(fact)
+            .map_err(|err| MemoryError::Malformed(format!("V2 serialization failed: {err}")))?;
+        if value.len() > MAX_V2_FACT_BYTES {
+            return Err(MemoryError::Oversized(format!(
+                "fact of {} bytes exceeds MAX_V2_FACT_BYTES",
+                value.len()
+            )));
+        }
+        self.store
+            .upsert_workspace_memory_fact(self.workspace, &kind, &fact.id, &value)
             .map_err(MemoryError::Store)
     }
 }
@@ -1445,6 +1647,33 @@ pub fn render_for_context<R: MemoryReader + ?Sized>(
     )
 }
 
+/// Render an ALREADY-READ, bounded set of facts into the same DATA block
+/// format as [`render_for_context`]. Used by the context assembler when the
+/// authoritative read is a management page (workspace scope) rather than a
+/// paged reader. Tombstones and default-invalidated facts are withheld.
+pub fn render_context_facts(facts: &[MemoryFactV2], budget_bytes: usize) -> String {
+    let header = format!("\n{MEMORY_HEADER}\n");
+    if budget_bytes == 0 || header.len() > budget_bytes {
+        return String::new();
+    }
+    let context = InvalidationContext::default();
+    let mut text = header;
+    for fact in facts {
+        if !fact.is_live() || invalidation_reason(&fact.invalidation, &context).is_some() {
+            continue;
+        }
+        let line = render_line(fact, None);
+        if text.len() + line.len() > budget_bytes {
+            break;
+        }
+        text.push_str(&line);
+    }
+    if text.trim() == MEMORY_HEADER.trim() {
+        return String::new();
+    }
+    text
+}
+
 /// Structured long-term memory for one session, backed by the store.
 #[derive(Debug, Clone)]
 pub struct SessionMemory {
@@ -1562,6 +1791,9 @@ impl SessionMemory {
         .map_err(MemoryError::into_store_error)
     }
 }
+
+mod management;
+pub use management::*;
 
 #[cfg(test)]
 mod tests {
@@ -1853,6 +2085,7 @@ mod tests {
             origin: ProvenanceOrigin::Verification,
             recorded_ms: 1_000,
             asserted_by: Some("checker".into()),
+            source_ref: None,
         })
         .with_confidence(900_000)
         .with_invalidation(InvalidationRule::SourceHashChanged {
@@ -2541,6 +2774,7 @@ mod tests {
                 origin: ProvenanceOrigin::Model,
                 recorded_ms: 1,
                 asserted_by: None,
+                source_ref: None,
             })
             .with_source_revision("rev");
         assert!(repo.put(&model).is_err(), "model cannot claim certainty");
@@ -2549,6 +2783,7 @@ mod tests {
                 origin: ProvenanceOrigin::Verification,
                 recorded_ms: 1,
                 asserted_by: None,
+                source_ref: None,
             });
         assert!(repo.put(&unbacked_verification).is_err());
         let unbacked_import = make_fact(&scope, "s", "p", TypedMemoryValue::Bool(true), 1)
@@ -2556,6 +2791,7 @@ mod tests {
                 origin: ProvenanceOrigin::Import,
                 recorded_ms: 1,
                 asserted_by: None,
+                source_ref: None,
             });
         assert!(repo.put(&unbacked_import).is_err());
         let too_much_evidence = make_fact(&scope, "s", "p", TypedMemoryValue::Bool(true), 1)

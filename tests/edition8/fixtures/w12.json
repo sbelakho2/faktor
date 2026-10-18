@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W12",
+  "title": "Queue, background and interrupt work",
+  "screens": [
+    "S22",
+    "S19",
+    "S26"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "While a task runs, choose Queue next rather than implicit interrupt.",
+    "Edit or remove the queued item before admission.",
+    "Inspect the owned background process and bounded output.",
+    "Deliberately stop the correct process/task/session; these are separate scopes.",
+    "Switch sessions with per-session drafts intact.",
+    "Lost stream marks the projection stale; reconnect from the durable cursor before enabling duplicate effects."
+  ],
+  "forbidden_fake_states": [
+    "Closed tab shown as cancellation",
+    "lost stream shown as idle",
+    "stop shown as confirmed remote rollback",
+    "queue item silently discarded"
+  ],
+  "complete_when": "each queue item/process/control retains owner, generation and durable result (p.185).",
+  "traceability": "p.185; controls D-05, D-07, D-08, D-12, D-13, X-01..X-05, B-10; acceptance A27, A28, A38.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

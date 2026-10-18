@@ -137,6 +137,9 @@ pub use manager::{
     AdmissionClock, MonotonicAdmissionClock, SessionManager, ShadowRow, ShadowRowState,
     SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES, SHADOW_ROW_KEY, SHADOW_ROW_KIND,
 };
+pub use memory::{
+    ContextCheckpoint, CONTEXT_CHECKPOINT_KIND, MAX_CONTEXT_CHECKPOINT_BYTES, MAX_FACT_PAGE_SIZE,
+};
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
 pub use payload::{decode_payload, validate_payload, PAYLOAD_SCHEMA_V};
 pub use process::OwnedProcess;

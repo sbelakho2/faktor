@@ -47,12 +47,9 @@
 //! a git root (a tree with a `.git` entry) is detected and its `.git` is
 //! skipped so no plumbing is ever materialized into a shadow.
 
-#[cfg(test)]
-use std::sync::Mutex;
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use faktor_core::id::SessionId;
 use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
@@ -60,10 +57,23 @@ use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
 use faktor_fs::entry_state::EntryState;
 
 use crate::runtime::merge::{
-    base_id_of, base_map_digest, compute_change_entries, parent_handle, put_base_map,
-    put_change_set, read_base_state_map, read_change_set_versioned, ChangeSet, MAX_BASE_ENTRIES,
+    apply_manifest_entry, base_id_of, base_map_digest, compute_change_entries,
+    delete_manifest_entry, parent_handle, put_base_map, put_change_set, read_base_state_map,
+    read_change_set_versioned, validate_decision, ChangeSet, MAX_BASE_ENTRIES,
 };
 use crate::runtime::ExecError;
+
+/// The result of per-file change acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeAcceptOutcome {
+    pub change_set_id: String,
+    pub applied: Vec<PathBuf>,
+    pub already_current: Vec<PathBuf>,
+    pub rejected: Vec<PathBuf>,
+    /// Every decided file was landed (or was already current) and the shadow
+    /// was retired. Conflicts return an error and leave the shadow live.
+    pub integrated: bool,
+}
 
 /// Default entry cap of one shadow base copy (matches the wave-13 base-map
 /// cap; trees beyond it are typed Oversized refusals).
@@ -187,6 +197,10 @@ pub struct ShadowRoots {
     manager: Arc<SessionManager>,
     shadows_root: PathBuf,
     limits: ShadowCopyLimits,
+    /// Serializes per-file acceptance for this daemon generation: two
+    /// concurrent replays must observe the same decision, never interleave
+    /// a partial landing with a retirement.
+    accept_lock: Mutex<()>,
     #[cfg(test)]
     copy_seam: Arc<Mutex<Option<ShadowCopyDrift>>>,
     #[cfg(test)]
@@ -256,6 +270,7 @@ impl ShadowRoots {
             manager,
             shadows_root,
             limits,
+            accept_lock: Mutex::new(()),
             #[cfg(test)]
             copy_seam: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -555,6 +570,74 @@ impl ShadowRoots {
             Err(ExecError::NotFound(_)) => self.stage_change_set(session),
             Err(e) => Err(e),
         }
+    }
+
+    /// Per-file/selected-change acceptance (V-03): land exactly the approved
+    /// paths of the session's staged shadow change set into the owner root
+    /// through the SAME full-state CAS primitive the integration uses. Every
+    /// changed file must be decided (validate_decision); rejected paths are
+    /// never written. A path already at the candidate digest is an idempotent
+    /// no-op. Once every file is decided the shadow is retired; an apply
+    /// conflict leaves the shadow LIVE and reports the per-path conflict.
+    pub fn accept_change_set(
+        &self,
+        session: SessionId,
+        approved: &[PathBuf],
+        rejected: &[PathBuf],
+    ) -> Result<ChangeAcceptOutcome, ExecError> {
+        let _guard = self
+            .accept_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let row = self.live_row(session)?;
+        let change_set = self.present_change_set(session)?;
+        let (approved, rejected) = validate_decision(&change_set, approved, rejected)?;
+        let base_root = PathBuf::from(&row.base_root);
+        let child_root = PathBuf::from(&row.root);
+        let mut applied = Vec::new();
+        let mut already_current = Vec::new();
+        for path in &approved {
+            let Some(entry) = change_set.files.iter().find(|entry| &entry.path == path) else {
+                return Err(ExecError::InvalidApproval(format!(
+                    "path {} is not part of the change set",
+                    path.display()
+                )));
+            };
+            let outcome = match entry.child_state() {
+                Some(child) => apply_manifest_entry(
+                    &base_root,
+                    path,
+                    &child_root,
+                    path,
+                    &child,
+                    entry.base_state().as_ref(),
+                ),
+                None => match entry.base_state() {
+                    Some(base) => delete_manifest_entry(&base_root, path, &base),
+                    None => {
+                        return Err(ExecError::Internal(format!(
+                            "staged deletion {:?} has no base anchor",
+                            path.display()
+                        )))
+                    }
+                },
+            }
+            .map_err(|e| {
+                ExecError::from_fs(&format!("accept {:?}", path.display()), &base_root, e)
+            })?;
+            match outcome {
+                faktor_fs::CasMergeResult::Applied => applied.push(path.clone()),
+                faktor_fs::CasMergeResult::AlreadyCurrent => already_current.push(path.clone()),
+            }
+        }
+        self.mark_integrated(session)?;
+        Ok(ChangeAcceptOutcome {
+            change_set_id: format!("{}-cs", base_id_of(&row.shadow_id)),
+            applied,
+            already_current,
+            rejected,
+            integrated: true,
+        })
     }
 
     // -------------------------------------------------------- integration

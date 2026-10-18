@@ -248,6 +248,11 @@ pub enum ExecutionPhase {
     Planning,
     /// Context/evidence preparation.
     Context,
+    /// A compaction (summarize/prune) is running inside the context phase.
+    /// Reachable/observable through the child drive-state projection while
+    /// the summarizer stream runs; the durable end state is the
+    /// `context_compacted` / `compact_rejected` journal event.
+    Compacting,
     /// Provider reasoning (model call).
     Reasoning,
     /// Mutating tool/edit work.
@@ -263,9 +268,10 @@ pub enum ExecutionPhase {
 }
 
 impl ExecutionPhase {
-    pub const ALL: [ExecutionPhase; 8] = [
+    pub const ALL: [ExecutionPhase; 9] = [
         ExecutionPhase::Planning,
         ExecutionPhase::Context,
+        ExecutionPhase::Compacting,
         ExecutionPhase::Reasoning,
         ExecutionPhase::Coding,
         ExecutionPhase::Tool,
@@ -278,6 +284,7 @@ impl ExecutionPhase {
         match self {
             ExecutionPhase::Planning => "planning",
             ExecutionPhase::Context => "context",
+            ExecutionPhase::Compacting => "compacting",
             ExecutionPhase::Reasoning => "reasoning",
             ExecutionPhase::Coding => "coding",
             ExecutionPhase::Tool => "tool",

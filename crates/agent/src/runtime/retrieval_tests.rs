@@ -1041,6 +1041,80 @@ async fn typed_memory_v2_block_reaches_the_wire_as_data() {
     );
 }
 
+/// I-11: the FIRST hop of a turn captures the instruction bundle and every
+/// later hop is pinned to it. A rule edit that happens while the turn is
+/// running changes the NEXT task's bundle, never the running turn's — and
+/// the pinned resolve is a cache hit, not another tree scan.
+#[tokio::test]
+async fn running_turn_is_pinned_to_its_captured_instruction_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = dir.path().join(".faktor/rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(rules.join("style.md"), "OLD-RULE-keep-me\n").unwrap();
+    let (deps, _provider_dir) = deps(scripted_provider(vec![]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let ws = runtime
+        .deps()
+        .session
+        .create_workspace(dir.path().to_str().unwrap())
+        .unwrap();
+    let handle = runtime
+        .deps()
+        .session
+        .create_session(ws, "pinned", "fake", "m")
+        .unwrap();
+    let op = OpId::new(7);
+    let (first, _) = runtime.repo_knowledge(&handle, op);
+    assert!(first.contains("OLD-RULE-keep-me"), "{first}");
+    let captured = runtime
+        .deps()
+        .session
+        .store()
+        .instruction_binding_get(handle.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured.turn_op_id, Some(7));
+    assert!(
+        captured.bundle_hash.len() == 64,
+        "the captured bundle hash is a real digest: {captured:?}"
+    );
+
+    // A mid-turn edit must NOT leak into the running turn's next hop.
+    std::fs::write(rules.join("style.md"), "NEW-RULE-next-task\n").unwrap();
+    let (pinned, _) = runtime.repo_knowledge(&handle, op);
+    assert!(
+        pinned.contains("OLD-RULE-keep-me") && !pinned.contains("NEW-RULE-next-task"),
+        "the running turn must stay pinned to its captured bundle: {pinned}"
+    );
+    let unchanged = runtime
+        .deps()
+        .session
+        .store()
+        .instruction_binding_get(handle.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.instruction_epoch, captured.instruction_epoch,
+        "a mid-turn edit never rewrites the captured binding"
+    );
+    assert_eq!(unchanged.turn_op_id, Some(7));
+
+    // The NEXT task sees the edited tree and captures its own epoch.
+    let next_op = OpId::new(8);
+    let (next, _) = runtime.repo_knowledge(&handle, next_op);
+    assert!(next.contains("NEW-RULE-next-task"), "{next}");
+    assert!(!next.contains("OLD-RULE-keep-me"), "{next}");
+    let rebound = runtime
+        .deps()
+        .session
+        .store()
+        .instruction_binding_get(handle.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebound.turn_op_id, Some(8));
+    assert_ne!(rebound.instruction_epoch, captured.instruction_epoch);
+}
+
 #[tokio::test]
 async fn agents_md_with_instruction_override_is_dropped_from_repo_knowledge() {
     // Poisoned-mix rule at the READ boundary: repository AGENTS.md is

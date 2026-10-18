@@ -1,0 +1,35 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W08",
+  "title": "Add MCP with trust and recover auth",
+  "screens": [
+    "S16",
+    "S15",
+    "S13"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Choose a supported transport. Current config is stdio; remote transport is offered only after capability negotiation.",
+    "Enter a bounded spec: name, command, args, environment references.",
+    "Review executable source, host, working directory and environment references; review trust.",
+    "Save; explicitly start the trusted server. A config file alone never starts an executable.",
+    "Observe health: stopped, connecting, ready, authentication required, failed or stale. Ready requires an observed handshake.",
+    "Inspect tool namespaces/schemas and set narrow permissions per server/tool."
+  ],
+  "forbidden_fake_states": [
+    "Config save shown as Connected",
+    "Ready without handshake",
+    "remote/OAuth shown from stdio config",
+    "repository content starting a server",
+    "disconnect treated as Cancelled"
+  ],
+  "complete_when": "only discovered, healthy, enabled and authorized tools are offered to the correct task (p.184).",
+  "traceability": "p.184; controls T-01..T-15; acceptance A21, A22, A23.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

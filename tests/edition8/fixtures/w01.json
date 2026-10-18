@@ -1,0 +1,35 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W01",
+  "title": "Connect and validate a custom provider",
+  "screens": [
+    "S03",
+    "S02",
+    "S05"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Open the provider connection editor (S03). Choose the supported API family and execution host.",
+    "Enter the endpoint and an environment/vault reference. Never type a secret value into shared config.",
+    "Test reachability, authentication, model catalog and the exact model capability separately. Each stage has a bounded deadline and its own result (p.028).",
+    "Inspect the capability sheet: context, output, tools, parallel tools, reasoning, thinking, vision, documents, streaming, structured output, authority and cost/limit provenance.",
+    "Save the staged draft only after the secure binding is acknowledged. The save is one validated patch; a failure writes nothing.",
+    "Pick the model in S02 and tune only adapter-offered parameters in S05. Unsupported parameters must be rejected before dispatch."
+  ],
+  "forbidden_fake_states": [
+    "Fake \"Connected\" from config save",
+    "fake probe success",
+    "fake capability authority from a model marketing name",
+    "fake effective state from a green toast",
+    "secret values in project files"
+  ],
+  "complete_when": "provider/model pair and supported normalized tuning are captured only after acknowledgement (p.183).",
+  "traceability": "p.183; controls P-01..P-06, P-10..P-14, M-01..M-09, G-01..G-14; acceptance A01, A02, A03, A06.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

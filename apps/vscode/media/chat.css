@@ -116,6 +116,37 @@ header button {
   padding: 0 8px;
 }
 
+/* The Control Center is a full label on wide surfaces and a single gear
+   glyph below 560px so the sticky header never overflows 240-480px. The
+   accessible name stays on the button (aria-label), and the target remains
+   >= 24px in the compact host. */
+.control-center-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.control-center-glyph {
+  display: none;
+  font-size: 1.05em;
+  line-height: 1;
+}
+
+@media (max-width: 559px) {
+  .control-center-toggle {
+    min-width: 28px;
+    padding: 0 6px;
+    justify-content: center;
+  }
+  .control-center-label {
+    display: none;
+  }
+  .control-center-glyph {
+    display: inline;
+  }
+}
+
+
 /* ------------------------------------------------ Work/Inspect/History shell
    ONE compact switcher: three tab controls, the selected one carried by the
    theme accent (text + border), never color alone (aria-selected is set). */

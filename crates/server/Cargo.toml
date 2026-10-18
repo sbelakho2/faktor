@@ -12,6 +12,13 @@ streaming-harness = []
 
 [dependencies]
 faktor-core.workspace = true
+faktor-foundation.workspace = true
+faktor-context.workspace = true
+faktor-memory.workspace = true
+faktor-hooks.workspace = true
+faktor-mcp.workspace = true
+zeroize.workspace = true
+url = "2"
 faktor-protocol.workspace = true
 faktor-session.workspace = true
 faktor-agent.workspace = true
@@ -63,8 +70,6 @@ faktor-provider = { workspace = true, features = ["test-utils"] }
 # execution seam vocabulary and the store's crash-arm boundaries.
 faktor-orchestrator = { workspace = true, features = ["fault-injection"] }
 faktor-store = { workspace = true, features = ["fault-injection"] }
-# Lifecycle-hook registries for the session-start wiring tests.
-faktor-hooks.workspace = true
 # The updater route tests sign manifests with a real ed25519 key and
 # implement the async artifact-fetcher seam.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

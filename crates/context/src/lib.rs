@@ -29,6 +29,7 @@ pub use artifact::{ArtifactRef, ArtifactWriter};
 pub use assembler::{Evidence, RecentTurn};
 pub use budget::ContextBudget;
 pub use compactor::{
+    estimate_history_tokens, estimate_turn_tokens, estimate_wire_turns, history_digest,
     CompactionPlan, CompactionRequest, CompactionStrategy, Compactor, EvidenceArchive, EvidenceRef,
     Summarizer, DEFAULT_SUMMARIZER_RESIDUE_BUDGET_TOKENS, EVIDENCE_BACKING_CAP_BYTES,
     EVIDENCE_COMPACT_BODY_MAX_BYTES, TOOL_OUTPUT_EVIDENCE_THRESHOLD_BYTES,
@@ -881,3 +882,6 @@ mod token_cache_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod longtask_probes;

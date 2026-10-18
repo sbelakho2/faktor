@@ -881,37 +881,52 @@ pub(crate) fn shell_change_facts(
     handle: &faktor_session::SessionHandle,
     turn_op: OpId,
 ) -> (Vec<String>, bool) {
-    let Ok(facts) = handle.memory_facts() else {
-        // An unreadable fact table is never read as "no shell changes": the
-        // caller refuses certification (conservative).
-        return (Vec::new(), true);
-    };
+    // Bounded per-kind walk (16 x 200): the previous full-table scan grew
+    // with every fact the session had ever written, so one turn's shell
+    // attribution got slower as the task got longer. Exhausting the bound is
+    // NOT "no changes": it degrades to unresolved (conservative refusal).
+    const PAGE: i64 = 200;
+    const MAX_PAGES: usize = 16;
     let mut paths = Vec::new();
     let mut unresolved = false;
-    for (kind, _key, value) in facts {
-        if kind != SHELL_CHANGE_FACT_KIND {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&value) else {
-            unresolved = true;
-            continue;
-        };
-        if value.get("turn_op").and_then(|v| v.as_u64()) != Some(turn_op.raw()) {
-            continue;
-        }
-        match value.get("state").and_then(|v| v.as_str()) {
-            Some("reconciled") => {}
-            Some(_) => unresolved = true,
-            None => unresolved = true,
-        }
-        if let Some(list) = value.get("paths").and_then(|v| v.as_array()) {
-            for path in list {
-                if let Some(path) = path.as_str() {
-                    paths.push(path.to_string());
+    let mut cursor: Option<(i64, String, String)> = None;
+    for _page_index in 0..MAX_PAGES {
+        let page =
+            match handle.memory_facts_by_kind_page(SHELL_CHANGE_FACT_KIND, cursor.as_ref(), PAGE) {
+                Ok(page) => page,
+                Err(_) => return (Vec::new(), true),
+            };
+        for (kind, _key, value) in &page.facts {
+            if kind != SHELL_CHANGE_FACT_KIND {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(value) else {
+                unresolved = true;
+                continue;
+            };
+            if value.get("turn_op").and_then(|v| v.as_u64()) != Some(turn_op.raw()) {
+                continue;
+            }
+            match value.get("state").and_then(|v| v.as_str()) {
+                Some("reconciled") => {}
+                Some(_) | None => unresolved = true,
+            }
+            if let Some(list) = value.get("paths").and_then(|v| v.as_array()) {
+                for path in list {
+                    if let Some(path) = path.as_str() {
+                        paths.push(path.to_string());
+                    }
                 }
             }
         }
+        match page.cursor {
+            Some(next) if page.has_more => cursor = Some(next),
+            _ => return (paths, unresolved),
+        }
     }
+    // The bound ran out with older facts still present: the scan cannot
+    // prove the turn's set, so the caller must refuse certification.
+    unresolved = true;
     (paths, unresolved)
 }
 

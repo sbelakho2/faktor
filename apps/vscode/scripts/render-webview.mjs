@@ -57,6 +57,7 @@ const WIDTHS = [240, 320, 480, 800];
 const THEME_CSS = `:root {
   --vscode-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   --vscode-font-size: 13px;
+  --vscode-editor-background: #1e1e1e;
   --vscode-editor-font-family: "SF Mono", Menlo, Consolas, monospace;
   --vscode-foreground: #cccccc;
   --vscode-descriptionForeground: #9d9d9d;
@@ -100,6 +101,7 @@ const THEME_CSS = `:root {
 const LIGHT_THEME_CSS = `:root {
   --vscode-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   --vscode-font-size: 13px;
+  --vscode-editor-background: #ffffff;
   --vscode-editor-font-family: "SF Mono", Menlo, Consolas, monospace;
   --vscode-foreground: #3b3b3b;
   --vscode-descriptionForeground: #3b3b3b;
@@ -150,6 +152,15 @@ function chromeCandidates() {
   if (process.env.FAKTOR_CHROME) {
     found.push(process.env.FAKTOR_CHROME);
   }
+  // Installed browser apps are not on PATH in the VS Code/macOS/Windows
+  // environments this harness runs in; probe the platform app locations.
+  found.push(
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    join(process.env.HOME || '', 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  );
   for (const dir of (process.env.PATH || '').split(':')) {
     if (!dir) {
       continue;

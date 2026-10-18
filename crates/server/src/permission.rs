@@ -124,6 +124,12 @@ pub struct ChannelPermissionRequester {
     /// Upper bound of one live wait. The durable `expires_ms` can only cut it
     /// shorter, never extend it — the durable clock is the outer authority.
     timeout: Duration,
+    /// Optional persistent-policy gate. When wired, EVERY dispatch evaluates
+    /// the SAME canonical action the preview endpoint evaluates: `allow`
+    /// returns without prompting, `deny` refuses without prompting, and
+    /// `ask` falls through to the live waiter. A gate/storage failure falls
+    /// through to the waiter (never an implicit allow).
+    gate: Arc<std::sync::RwLock<Option<Arc<faktor_foundation::policy::PolicyService>>>>,
 }
 
 impl ChannelPermissionRequester {
@@ -132,7 +138,22 @@ impl ChannelPermissionRequester {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             timeout,
+            gate: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    /// Attach the persistent permission policy (the foundation service) to
+    /// this requester. Called once by the daemon serve path.
+    pub fn set_policy_gate(
+        &self,
+        policy: Arc<faktor_foundation::policy::PolicyService>,
+    ) -> Result<(), String> {
+        let mut gate = self
+            .gate
+            .write()
+            .map_err(|_| "permission policy gate lock is poisoned".to_string())?;
+        *gate = Some(policy);
+        Ok(())
     }
 
     /// The authority map with classified recovery: every entry is owned by a
@@ -224,6 +245,29 @@ impl PermissionRequester for ChannelPermissionRequester {
                     "permission {id} expired (durable deadline passed)"
                 )))
             });
+        }
+        // Persistent policy gate BEFORE any waiter is registered. The exact
+        // same evaluator the preview endpoint uses; a storage error is NOT an
+        // allow (the live waiter still decides).
+        if let Ok(gate) = self.gate.read() {
+            if let Some(policy) = gate.as_ref() {
+                let action =
+                    faktor_foundation::policy::action_for_capability(&permission.capability);
+                match policy.evaluate_recorded(&action, "dispatch") {
+                    Ok(verdict) if verdict.decision == faktor_foundation::Decision::Allow => {
+                        return Box::pin(async move { Ok(PermissionDecision::Allow) });
+                    }
+                    Ok(verdict) if verdict.decision == faktor_foundation::Decision::Deny => {
+                        return Box::pin(async move { Ok(PermissionDecision::Deny) });
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "permission policy evaluation failed for {id}: {e}; asking the live window"
+                        );
+                    }
+                }
+            }
         }
         let detail =
             serde_json::to_value(&permission.capability).unwrap_or(serde_json::Value::Null);

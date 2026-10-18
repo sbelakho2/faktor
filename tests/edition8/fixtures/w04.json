@@ -1,0 +1,32 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W04",
+  "title": "Move from Ask to Plan to Code",
+  "screens": [
+    "S06",
+    "S07",
+    "S01"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Choose enforced Ask. Explore read-only; the offered tools must be filtered and effectful writes denied at dispatch.",
+    "Create a Plan task with a named artifact scope. The plan file and review comments are the artifact.",
+    "Review the frozen plan and comments. Approval does not broaden tool policy.",
+    "Start a new Code task with an explicit contract, permissions, model and finish level.",
+    "The Code admission binds the approved plan version and execution envelope."
+  ],
+  "forbidden_fake_states": [
+    "Calling a plain prompt \"read-only\"",
+    "approving a plan and silently broadening authority",
+    "treating a preset label as a permission grant"
+  ],
+  "complete_when": "a new Code admission binds the approved plan version and execution envelope (p.183).",
+  "traceability": "p.183; controls A-01..A-12; acceptance A09, A10.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

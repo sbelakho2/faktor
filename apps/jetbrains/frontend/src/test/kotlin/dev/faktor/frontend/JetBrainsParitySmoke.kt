@@ -104,6 +104,21 @@ object JetBrainsParitySmoke {
             historyCanned()
         }
 
+        if (System.getProperty("faktor.parity.visualOnly") == "true") {
+            // Visual-only mode: render the pinned panels and compare/repin the
+            // per-platform record. Used to pin a platform lane (Linux CI
+            // container) without a daemon binary of that platform.
+            ParityMatrix.run()
+            println(
+                if (failures == 0) {
+                    "JETBRAINS PARITY SMOKE PASS (visual-only: ${ParityMatrix.visuals().size} panels)"
+                } else {
+                    "JETBRAINS PARITY SMOKE FAIL ($failures)"
+                }
+            )
+            kotlin.system.exitProcess(if (failures == 0) 0 else 1)
+        }
+
         if (args.isEmpty()) {
             println(
                 if (failures == 0) {

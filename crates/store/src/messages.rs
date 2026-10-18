@@ -170,6 +170,126 @@ impl Store {
         Ok(out)
     }
 
+    /// Newest-first bounded window that charges BOTH the message payload and
+    /// its part payloads against `max_bytes`, and returns each message with
+    /// its parts in one batch (no per-message N+1 query).
+    ///
+    /// The older [`Self::messages_backwards_bounded`] only charged the
+    /// `message.data` column, which is `{"parts":[]}` for assistant/tool
+    /// messages: a budget-sized window could therefore load hundreds of
+    /// messages whose TEXT parts were many megabytes. This is the turn-path
+    /// loader's bound: paging/windowing must account for the bytes the
+    /// runtime actually materializes.
+    ///
+    /// `after_seq` is a strictly-greater lower bound (the durable context
+    /// checkpoint's high-water mark), so a compacted session never rescans
+    /// rows older than its checkpoint.
+    pub fn messages_window_with_parts(
+        &self,
+        session_id: SessionId,
+        before_seq: Option<u64>,
+        after_seq: Option<u64>,
+        max_messages: u64,
+        max_bytes: u64,
+    ) -> StoreResult<Vec<(MessageRow, Vec<PartRow>)>> {
+        if max_messages == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.read()?;
+        let before = before_seq.map(|b| i64::try_from(b).unwrap_or(i64::MAX));
+        let after = after_seq.map(|a| i64::try_from(a).unwrap_or(i64::MAX));
+        let mut sql = String::from(
+            "SELECT m.id, m.session_id, m.seq, m.role, m.data, m.created_ms,
+                    COALESCE((SELECT SUM(length(p.data)) FROM part p
+                              WHERE p.message_id = m.id), 0)
+             FROM message m
+             WHERE m.session_id = ?1",
+        );
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Integer(session_id.raw() as i64)];
+        if let Some(b) = before {
+            sql.push_str(" AND m.seq < ?");
+            params.push(rusqlite::types::Value::Integer(b));
+        }
+        if let Some(a) = after {
+            sql.push_str(" AND m.seq > ?");
+            params.push(rusqlite::types::Value::Integer(a));
+        }
+        sql.push_str(" ORDER BY m.seq DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut messages: Vec<MessageRow> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        while let Some(row) = rows.next()? {
+            if messages.len() as u64 >= max_messages {
+                break;
+            }
+            let raw: String = row.get(4)?;
+            let part_bytes: i64 = row.get(6)?;
+            let row_bytes = (raw.len() as u64).saturating_add(part_bytes.max(0) as u64);
+            // Message granularity is absolute. A row that does not fit the
+            // running bound stops the walk (older rows are never preferred
+            // over newer ones), EXCEPT a single row that can never fit by
+            // itself: such an oversized row is taken WHOLE and then the
+            // walk stops (the docs' lone-oversized-message rule). Skipping
+            // it and continuing to older rows was how one large assistant/
+            // tool message right before the newest prompt made the loader
+            // drop the entire preceding conversation.
+            let oversized = row_bytes > max_bytes;
+            if !messages.is_empty()
+                && !oversized
+                && total_bytes.saturating_add(row_bytes) > max_bytes
+            {
+                break;
+            }
+            messages.push(message_map_data(row, &raw)?);
+            total_bytes = total_bytes.saturating_add(row_bytes);
+            if oversized {
+                break;
+            }
+        }
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One bounded batch read for every collected message id. Ids are
+        // chunked so a hostile page bound can never build an unbounded IN
+        // list.
+        const ID_CHUNK: usize = 500;
+        let mut parts_by_message: std::collections::HashMap<i64, Vec<PartRow>> =
+            std::collections::HashMap::with_capacity(messages.len());
+        for chunk in messages.chunks(ID_CHUNK) {
+            let mut placeholders = String::new();
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len());
+            for (i, m) in chunk.iter().enumerate() {
+                if i > 0 {
+                    placeholders.push(',');
+                }
+                placeholders.push('?');
+                params.push(rusqlite::types::Value::Integer(m.id));
+            }
+            let sql = format!(
+                "SELECT id, message_id, kind, data, created_ms FROM part
+                 WHERE message_id IN ({placeholders}) ORDER BY message_id, id"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            while let Some(row) = rows.next()? {
+                let part = part_map(row)?;
+                parts_by_message
+                    .entry(part.message_id)
+                    .or_default()
+                    .push(part);
+            }
+        }
+        Ok(messages
+            .into_iter()
+            .map(|m| {
+                let parts = parts_by_message.remove(&m.id).unwrap_or_default();
+                (m, parts)
+            })
+            .collect())
+    }
+
     pub fn put_message(
         &self,
         session_id: SessionId,
@@ -307,6 +427,39 @@ impl Store {
             tx.commit()?;
             Ok(true)
         })
+    }
+
+    /// Durable transcript search over one session's stored message payloads
+    /// (D-03): a bounded `instr(lower(...))` scan ordered newest-first. The
+    /// query is capped, the page is capped, and the scan never loads more
+    /// than `limit` rows into memory. It searches the durable message data
+    /// (which includes unloaded history), not only rendered parts.
+    pub fn search_messages(
+        &self,
+        session_id: SessionId,
+        query: &str,
+        limit: u64,
+    ) -> StoreResult<Vec<MessageRow>> {
+        if query.is_empty() || query.len() > 256 {
+            return Err(StoreError::Malformed(
+                "transcript search query must be 1..=256 bytes".into(),
+            ));
+        }
+        let limit = i64::try_from(limit.clamp(1, 200)).map_err(|_| {
+            StoreError::Oversized("transcript search page exceeds SQLite signed range".into())
+        })?;
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, seq, role, data, created_ms FROM message
+             WHERE session_id = ?1 AND instr(lower(data), lower(?2)) > 0
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, query, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(message_map(row)?);
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------- task ledger
@@ -835,5 +988,55 @@ mod perf_tests {
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].seq, N + 1);
         assert_eq!(next[0].data["text"].as_str().unwrap().len(), 64 * 1024);
+    }
+
+    /// NEW long-task probe: the turn-path window charges PART bytes, returns
+    /// parts in the same call, never skips a newer oversized row in favour
+    /// of older smaller rows, and honors the checkpoint lower bound.
+    #[test]
+    fn window_with_parts_charges_part_bytes_and_never_skips_the_newest_big_row() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let ancient = store
+            .put_message(sid, 1, "assistant", serde_json::json!({"parts":[]}))
+            .unwrap();
+        store
+            .put_part(ancient, "text", serde_json::json!({"text": "ANCIENT"}))
+            .unwrap();
+        let older = store
+            .put_message(sid, 2, "assistant", serde_json::json!({"parts":[]}))
+            .unwrap();
+        store
+            .put_part(
+                older,
+                "text",
+                serde_json::json!({"text": "y".repeat(50_000)}),
+            )
+            .unwrap();
+        store
+            .put_message(sid, 3, "user", serde_json::json!({"text": "the prompt"}))
+            .unwrap();
+        // Bound 64 bytes: the newest prompt fits, the 50 KiB part does not —
+        // it is still taken WHOLE (one over-bound row) and the window stops.
+        let window = store
+            .messages_window_with_parts(sid, None, None, 10, 64)
+            .unwrap();
+        assert_eq!(window.len(), 2, "newest + one over-bound row, then STOP");
+        assert_eq!(window[0].0.seq, 3);
+        assert_eq!(window[1].0.seq, 2);
+        assert_eq!(window[1].1.len(), 1, "parts are batched, not N+1");
+        assert!(window[1].1[0].data["text"].as_str().unwrap().len() == 50_000);
+        assert!(
+            window.iter().all(|(m, _)| m.seq != 1),
+            "older rows must never be read past the over-bound row"
+        );
+        // Checkpoint lower bound: seq > 1 excludes the summarized row.
+        let after = store
+            .messages_window_with_parts(sid, None, Some(1), 10, 64)
+            .unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].0.seq, 3);
+        assert_eq!(after[1].0.seq, 2);
     }
 }

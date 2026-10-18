@@ -296,6 +296,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="nav-history" class="nav-tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-panel">History</button>
     </nav>
     <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="true" title="Diagnostics and service controls" aria-label="Diagnostics and service controls">⋯</button>
+    <button id="btn-control-center" class="toggle control-center-toggle" type="button" title="Open the Faktor Control Center (models, providers, context, authority, routines, diagnostics)" aria-label="Open Faktor Control Center"><span class="control-center-label">Control Center</span><span class="control-center-glyph" aria-hidden="true">⚙</span></button>
   </header>
   <section id="diagnostics" class="card diagnostics" hidden>
     <h2>Diagnostics</h2>

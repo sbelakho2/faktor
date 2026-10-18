@@ -1515,6 +1515,7 @@ impl AgentRuntime {
     pub(crate) fn repo_knowledge(
         &self,
         handle: &faktor_session::SessionHandle,
+        op_id: faktor_core::id::OpId,
     ) -> (String, String) {
         const MAX_ENTRIES: usize = 500;
         const MAX_DEPTH: usize = 6;
@@ -1564,12 +1565,50 @@ impl AgentRuntime {
         // (oversized authority rules) is a surfaced warn — repository rules
         // are never silently truncated into the prompt.
         let prompt_hint = handle.title().unwrap_or_default();
+        // I-11: the FIRST hop of this turn captures the instruction bundle
+        // (epoch + real bundle digest); every later hop with the SAME op is
+        // pinned to that epoch. A mid-turn rule edit therefore changes the
+        // NEXT task's bundle, never the running turn's.
+        let shadow_active = self
+            .deps
+            .session
+            .active_root(handle.id())
+            .ok()
+            .flatten()
+            .is_some();
+        let captured = self
+            .deps
+            .session
+            .store()
+            .instruction_binding_get(handle.id())
+            .ok()
+            .flatten();
+        // A live shadow is the world the drive mutates: its rule tree is
+        // re-read every hop (the shadow test's mid-flight AGENTS.md rewrite).
+        // Pinning applies to ordinary durable-root turns (I-11).
+        let pinned = (!shadow_active)
+            .then_some(captured.as_ref())
+            .flatten()
+            .and_then(|binding| {
+                (binding.turn_op_id == Some(op_id.raw() as i64))
+                    .then(|| {
+                        serde_json::from_value::<faktor_instructions::InstructionEpoch>(
+                            serde_json::Value::String(binding.instruction_epoch.clone()),
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            });
+        let mut captured_epoch = None;
         match self
             .deps
             .instructions_resolver
-            .resolve(row.workspace_id.raw(), None)
+            .resolve(row.workspace_id.raw(), pinned)
         {
             Ok(loaded) => {
+                if pinned.is_none() {
+                    captured_epoch = loaded.epoch().map(|epoch| epoch.to_string());
+                }
                 for instr in loaded.active_for(&prompt_hint, &[]).iter().take(16) {
                     // Same provenance guard per appended rule: a repository-
                     // sourced rule that overrides is data, never appended.
@@ -1596,6 +1635,35 @@ impl AgentRuntime {
                     "workspace instructions resolve failed; repository rules skipped this turn"
                 );
             }
+        }
+        if let Some(epoch) = captured_epoch {
+            // The SAME material hash the instruction inspector exposes:
+            // ordered (path, file hash) pairs, each NUL-terminated.
+            let mut material = Vec::new();
+            if let Ok(loaded) = self
+                .deps
+                .instructions_resolver
+                .resolve(row.workspace_id.raw(), None)
+            {
+                if let Some(instructions) = loaded.instructions() {
+                    for instruction in instructions.all() {
+                        material.extend_from_slice(instruction.path.as_bytes());
+                        material.push(0);
+                        material.extend_from_slice(instruction.hash.to_string().as_bytes());
+                        material.push(0);
+                    }
+                }
+            }
+            let bundle_hash = blake3::hash(&material).to_hex().to_string();
+            let _ = self.deps.session.store().put_instruction_binding(
+                faktor_store::InstructionBindingRow {
+                    session_id: handle.id(),
+                    instruction_epoch: epoch,
+                    bundle_hash,
+                    turn_op_id: Some(op_id.raw() as i64),
+                    captured_ms: self.deps.clock.now_ms(),
+                },
+            );
         }
         rules.truncate(MAX_RULES_BYTES);
         // Deterministic bounded walk (sorted per dir, depth-capped).
@@ -1650,12 +1718,42 @@ impl AgentRuntime {
     /// Best-effort — a read failure yields no block, never a failed turn.
     pub(crate) fn memory_data_block(&self, handle: &faktor_session::SessionHandle) -> String {
         const MEMORY_RENDER_BUDGET_BYTES: usize = 4096;
-        let repository =
-            faktor_memory::StoreRepository::new(self.deps.session.store(), handle.id());
-        let query = faktor_memory::MemoryQuery::typed_for_session(handle.id());
-        faktor_memory::render_for_context(&repository, &query, MEMORY_RENDER_BUDGET_BYTES)
-            .map(|render| render.text)
-            .unwrap_or_default()
+        const PAGE_ROWS: usize = 64;
+        // ONE newest-first merge of the two retrieval scopes. Session rows
+        // come from the management page; workspace rows are read on the
+        // writer connection (a pooled reader can still hold a pre-write WAL
+        // snapshot). Sorting the bounded pages by `updated_ms` guarantees the
+        // newest facts of BOTH scopes precede older churn under the 4096-byte
+        // budget; tombstones are filtered by the renderer.
+        let records = faktor_memory::MemoryRecordStore::new(self.deps.session.store(), handle.id());
+        let mut facts = records
+            .list(
+                &faktor_memory::MemoryScope::session_scope(handle.id()),
+                false,
+                None,
+                PAGE_ROWS,
+            )
+            .map(|page| page.records)
+            .unwrap_or_default();
+        if let Ok(row) = handle.row() {
+            facts.extend(
+                faktor_memory::WorkspaceRepository::new(
+                    self.deps.session.store(),
+                    row.workspace_id.raw(),
+                )
+                .latest_fresh(PAGE_ROWS)
+                .unwrap_or_default(),
+            );
+        }
+        facts.sort_by(|a, b| {
+            b.updated_ms
+                .cmp(&a.updated_ms)
+                .then_with(|| b.version.cmp(&a.version))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut out = faktor_memory::render_context_facts(&facts, MEMORY_RENDER_BUDGET_BYTES);
+        out.truncate(MEMORY_RENDER_BUDGET_BYTES);
+        out
     }
 
     /// Load the session's durable activation set with the typed scan verdict

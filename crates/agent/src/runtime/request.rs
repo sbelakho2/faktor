@@ -37,31 +37,85 @@ pub trait PermissionRequester: Send + Sync {
     >;
 }
 
-/// Lightweight row view used by history loading (parts are fetched per row
-/// by the callers).
+/// Lightweight row view used by history loading. Parts are loaded in ONE
+/// bounded batch by the store query, so the caller never runs an N+1
+/// `parts_of` walk over the window.
 pub(crate) struct MessageRowLike {
     pub(crate) id: i64,
-    #[allow(dead_code)]
     pub(crate) seq: i64,
     pub(crate) role: String,
     pub(crate) data: serde_json::Value,
+    pub(crate) parts: Vec<faktor_store::PartRow>,
 }
 
 /// Convert the compactor's kept text turns back into provider messages: the
-/// compacted history that rides the next wire request. Text-only by
-/// construction (compaction works on `RecentTurn`, which carries text).
+/// compacted history that rides the next wire request. Roles are preserved:
+/// synthesized identity/facts turns stay SYSTEM (never demoted to
+/// assistant), prior summaries stay assistant, and tool-role residue is a
+/// user-side observation.
 pub(crate) fn recent_turns_to_messages(turns: &[RecentTurn]) -> Vec<RequestMessage> {
     turns
         .iter()
         .map(|t| RequestMessage {
-            role: if t.role == "user" {
-                Role::User
-            } else {
-                Role::Assistant
+            role: match t.role.as_str() {
+                "user" | "tool" => Role::User,
+                "system" => Role::System,
+                _ => Role::Assistant,
             },
             content: vec![ContentPart::text(&t.text)],
         })
         .collect()
+}
+
+/// Nothing may ride a provider request as a DANGLING tool pairing: a tool
+/// result whose call is not in the retained history (a crash between the
+/// call append and the result append, or a checkpoint that summarized the
+/// call) is dropped, and a call whose result never arrived is dropped too.
+/// The durable transcript still holds both; only the WIRE is repaired. The
+/// wire planner's boundary trim handles windows that start on a result;
+/// this pass covers mid-history orphans the boundary rule cannot see.
+pub(crate) fn sanitize_tool_pairing(messages: Vec<RequestMessage>) -> Vec<RequestMessage> {
+    let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for message in &messages {
+        for part in &message.content {
+            match &part.kind {
+                ContentKind::ToolCall { id, .. } => {
+                    call_ids.insert(id.clone());
+                }
+                ContentKind::ToolResult { .. } => {
+                    if let Some(id) = part.tool_call_id.as_deref() {
+                        result_ids.insert(id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    messages
+        .into_iter()
+        .filter_map(|mut message| {
+            message.content.retain(|part| match &part.kind {
+                ContentKind::ToolCall { id, .. } => result_ids.contains(id),
+                ContentKind::ToolResult { .. } => part
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| call_ids.contains(id)),
+                _ => true,
+            });
+            (!message.content.is_empty()).then_some(message)
+        })
+        .collect()
+}
+
+/// Decode the durable context checkpoint's opaque payload into the exact
+/// compacted turns. A malformed payload is loud; the caller logs and falls
+/// back to the full transcript rather than silently changing context.
+pub(crate) fn decode_checkpoint_turns(
+    checkpoint: &faktor_session::ContextCheckpoint,
+) -> faktor_core::Result<Vec<RecentTurn>> {
+    serde_json::from_slice(&checkpoint.payload)
+        .map_err(|e| Error::malformed(format!("context checkpoint turns: {e}")))
 }
 
 impl AgentRuntime {
@@ -72,6 +126,13 @@ impl AgentRuntime {
     /// `messages_backwards_bounded`, which reads exactly the newest window
     /// and never materializes older rows.
     pub(crate) fn history_window_bounds(budget: &ContextBudget) -> (u64, u64) {
+        // The history class budget — NOT the whole context — is the load
+        // bound. The planner can spend `context_max`, so loading to the brim
+        // would make every turn sit at ~100% usage and re-trigger proactive
+        // compaction forever; keeping the nominal recent-class headroom is
+        // what makes the 65% trigger meaningful. The bound is in BYTES and
+        // charges parts too ([`Store::messages_window_with_parts`]), so it is
+        // the real materialized history, not just the message envelopes.
         let token_budget = budget.recent.max(HISTORY_TOKEN_FLOOR) as u64;
         (
             MAX_HISTORY_MESSAGES as u64,
@@ -79,56 +140,139 @@ impl AgentRuntime {
         )
     }
 
-    /// Load the durable history rows (oldest first) for one logical turn.
-    /// The window is chosen by the budget-aware planner BEFORE any load
-    /// (audit 29): `messages_backwards_bounded` walks the store's backward
-    /// index newest-first and stops at the message cap or the byte bound —
-    /// rows the planner would trim are never read at all. The 40-message
-    /// hard limit is long gone (audit round 6); the WirePlan still does the
-    /// exact token-based trimming over the bounded window. The read itself
-    /// runs on the session manager's bounded read pool (audit 13): the
-    /// SQLite I/O + JSON decode never block a Tokio worker.
+    /// The durable context checkpoint, decoded. A corrupt checkpoint is
+    /// logged and treated as ABSENT (the full durable transcript is then
+    /// replayed): the session must open, but corruption is never silently
+    /// mistaken for an honest compacted history.
+    pub(crate) fn context_checkpoint_turns(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> (Vec<RecentTurn>, Option<u64>) {
+        match handle.context_checkpoint() {
+            Ok(Some(checkpoint)) => match decode_checkpoint_turns(&checkpoint) {
+                Ok(turns) => (turns, Some(checkpoint.through_seq)),
+                Err(error) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        %error,
+                        "durable context checkpoint is malformed; falling back to the full transcript"
+                    );
+                    (Vec::new(), None)
+                }
+            },
+            Ok(None) => (Vec::new(), None),
+            Err(error) => {
+                tracing::error!(
+                    session = %handle.id(),
+                    %error,
+                    "durable context checkpoint is unreadable; falling back to the full transcript"
+                );
+                (Vec::new(), None)
+            }
+        }
+    }
+
+    /// Load the durable history rows (oldest first) for one logical turn,
+    /// starting STRICTLY after the durable context checkpoint's high-water
+    /// seq. The window is chosen BEFORE any load: the store walks its
+    /// backward index newest-first and stops at the byte/message bound, so
+    /// rows the planner would trim are never read. The bound charges message
+    /// AND part bytes and returns parts in one batch, so neither a long
+    /// session nor a table of huge tool text can make one turn load more
+    /// than its budget (or run N+1 queries). The read runs on the session
+    /// manager's bounded pool, never a Tokio worker.
     pub(crate) async fn load_history_rows(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
+        after_seq: Option<u64>,
     ) -> faktor_core::Result<Vec<MessageRowLike>> {
         let (max_messages, max_bytes) = Self::history_window_bounds(budget);
         let mut collected: Vec<MessageRowLike> = self
             .deps
             .session
-            .messages_backwards_bounded(handle.id(), None, max_messages, max_bytes)
+            .messages_window_with_parts(handle.id(), None, after_seq, max_messages, max_bytes)
             .await?
             .into_iter()
-            .map(|row| MessageRowLike {
+            .map(|(row, parts)| MessageRowLike {
                 id: row.id,
                 seq: row.seq,
                 role: row.role.clone(),
                 data: row.data.clone(),
+                parts,
             })
             .collect();
         collected.reverse(); // oldest first
         Ok(collected)
     }
 
-    pub(crate) async fn recent_turns(
+    /// The compaction/history view PLUS the source high-water seq the loaded
+    /// window covers. The runtime records the accepted plan's replacement
+    /// context against this seq, so a restart resumes from the checkpoint
+    /// instead of replaying summarized rows.
+    pub(crate) async fn recent_turns_with_head(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
-    ) -> faktor_core::Result<Vec<RecentTurn>> {
-        let rows = self.load_history_rows(handle, budget).await?; // oldest-first
-        let mut turns = Vec::new();
+    ) -> faktor_core::Result<(Vec<RecentTurn>, Option<u64>)> {
+        let (mut turns, checkpoint_seq) = self.context_checkpoint_turns(handle);
+        let rows = self
+            .load_history_rows(handle, budget, checkpoint_seq)
+            .await?; // oldest-first
+        let head = rows
+            .last()
+            .map(|row| u64::try_from(row.seq).unwrap_or(0))
+            .or(checkpoint_seq)
+            .filter(|seq| *seq > 0);
         for row in rows {
             let mut pushed_text = false;
-            for part in handle.parts_of(row.id)? {
-                if part.kind == "text" {
-                    if let Some(text) = part.data.get("text").and_then(|v| v.as_str()) {
-                        turns.push(RecentTurn {
-                            role: row.role.clone(),
-                            text: text.to_string(),
-                        });
-                        pushed_text = true;
+            for part in &row.parts {
+                match part.kind.as_str() {
+                    "text" => {
+                        if let Some(text) = part.data.get("text").and_then(|v| v.as_str()) {
+                            turns.push(RecentTurn {
+                                role: row.role.clone(),
+                                text: text.to_string(),
+                            });
+                            pushed_text = true;
+                        }
                     }
+                    // Tool activity is part of the conversation the
+                    // summarizer must see. The durable excerpt is already
+                    // bounded (2 KiB); the call rendering is bounded here.
+                    // These are TEXT turns, never provider tool parts, so
+                    // compaction can never orphan a tool result.
+                    "tool_result" => {
+                        if let Some(excerpt) = part.data.get("excerpt").and_then(|v| v.as_str()) {
+                            let exit = part
+                                .data
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|c| format!(" (exit {c})"))
+                                .unwrap_or_default();
+                            turns.push(RecentTurn {
+                                role: "tool".into(),
+                                text: format!("{excerpt}{exit}"),
+                            });
+                        }
+                    }
+                    "tool_call" => {
+                        let name = part
+                            .data
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
+                        let input = part
+                            .data
+                            .get("input")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        turns.push(RecentTurn {
+                            role: "tool_call".into(),
+                            text: truncate(&format!("{name}({input})"), 2_000),
+                        });
+                    }
+                    _ => {}
                 }
             }
             // The durable user prompt lives in the message payload
@@ -145,30 +289,49 @@ impl AgentRuntime {
                 }
             }
         }
-        Ok(turns)
+        Ok((turns, head))
     }
 
-    /// Reconstruct the full provider message list from the durable state,
-    /// oldest first. The persisted part order is the source of truth:
+    #[allow(dead_code)] // test/compatibility view; production uses the head-carrying twin
+    pub(crate) async fn recent_turns(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        budget: &ContextBudget,
+    ) -> faktor_core::Result<Vec<RecentTurn>> {
+        Ok(self.recent_turns_with_head(handle, budget).await?.0)
+    }
+
+    /// Reconstruct the provider message list from the durable state, oldest
+    /// first: the durable context checkpoint (the exact replacement history
+    /// of the last accepted compaction) followed by rows newer than its
+    /// high-water seq. The persisted part order is the source of truth:
     /// text/reasoning/tool calls keep the assistant role, tool results move
     /// to the user role (provider APIs require tool results to come from the
     /// user), and a message carrying only tool results yields one user-role
     /// request message. The durable user prompt (message payload `{"text":
     /// ...}`, no part rows) is synthesized as a user text part — without it
     /// the model would never see the prompt.
-    pub(crate) async fn history_messages(
+    pub(crate) async fn history_messages_with_head(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
-    ) -> faktor_core::Result<Vec<RequestMessage>> {
-        let rows = self.load_history_rows(handle, budget).await?; // oldest-first
-        let mut out = Vec::new();
+    ) -> faktor_core::Result<(Vec<RequestMessage>, Option<u64>)> {
+        let (checkpoint_turns, checkpoint_seq) = self.context_checkpoint_turns(handle);
+        let rows = self
+            .load_history_rows(handle, budget, checkpoint_seq)
+            .await?; // oldest-first
+        let head = rows
+            .last()
+            .map(|row| u64::try_from(row.seq).unwrap_or(0))
+            .or(checkpoint_seq)
+            .filter(|seq| *seq > 0);
+        let mut out = recent_turns_to_messages(&checkpoint_turns);
         for row in rows {
             let role_is_user = row.role == "user";
             let mut user_parts: Vec<ContentPart> = Vec::new();
             let mut assistant_parts: Vec<ContentPart> = Vec::new();
             let mut had_text_part = false;
-            for part in handle.parts_of(row.id)? {
+            for part in &row.parts {
                 match part.kind.as_str() {
                     "text" => {
                         had_text_part = true;
@@ -251,7 +414,16 @@ impl AgentRuntime {
                 }
             }
         }
-        Ok(out)
+        Ok((sanitize_tool_pairing(out), head))
+    }
+
+    #[allow(dead_code)] // test/compatibility view; production uses the head-carrying twin
+    pub(crate) async fn history_messages(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        budget: &ContextBudget,
+    ) -> faktor_core::Result<Vec<RequestMessage>> {
+        Ok(self.history_messages_with_head(handle, budget).await?.0)
     }
 
     /// Thin adapter: the wire request IS the budgeted plan — `system`,

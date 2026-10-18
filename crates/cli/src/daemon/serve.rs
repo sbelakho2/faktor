@@ -1104,6 +1104,22 @@ pub(crate) async fn serve_impl(
         graph.tasks.clone(),
         graph.budgets.clone(),
     );
+    // Edition 5 foundation: ONE durable SQLite authority under the daemon
+    // data directory for configuration revisions, the credential vault,
+    // provider lifecycle, receipts, context manifests, permission policy,
+    // customization metadata and diagnostics. The SAME policy service gates
+    // dispatch through the daemon's permission channel.
+    let foundation = Arc::new(faktor_foundation::Foundation::open(&data_dir).map_err(|e| {
+        format!(
+            "opening the Edition 5 foundation under {}: {e}",
+            data_dir.display()
+        )
+    })?);
+    deps = deps.with_foundation(foundation.clone());
+    graph
+        .permissions
+        .set_policy_gate(foundation.policy.clone())
+        .map_err(|e| format!("wiring the persistent permission policy: {e}"))?;
     // Explicit dependency injection: the daemon's terminal authority is
     // constructed under the configured shell contract resolved above (the
     // same source doctor reads), never under a hardcoded grant.

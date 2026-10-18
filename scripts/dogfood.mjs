@@ -136,6 +136,7 @@ const VSCODE_TEST_CORPUS = [
   VSCODE_SELFTEST,
   'apps/vscode/scripts/verify-vsix.mjs',
   'apps/vscode/scripts/render-webview.mjs',
+  'apps/vscode/scripts/edition5-control-exercise.mjs',
 ];
 
 // ---------------------------------------------------------------------------
@@ -170,7 +171,9 @@ const PLAN_GATES = [
   ['vscode-vsix', '§5', 'verify-vsix.mjs'],
   ['vscode-e2e', '§5', 'vscode-e2e.sh'],
   ['jetbrains-smokes', '§6', 'smokeHostMatrixZip'],
-  ['dogfood-coverage', '§7', 'dogfood.mjs --coverage'],
+  ['edition5', '§7', 'scripts/edition5/run.mjs'],
+  ['edition8', '§7', 'tests/edition8/registry.mjs'],
+  ['dogfood-coverage', '§8', 'dogfood.mjs --coverage'],
 ];
 
 // ---------------------------------------------------------------------------
@@ -357,6 +360,28 @@ const CI_LANE_MAP = [
     ],
   },
   {
+    // Edition 5 gates: the PR lane consumes the JetBrains host raw evidence
+    // produced by jetbrains-smoke and writes the gate summary; the trusted
+    // certificate lane runs the same gates plus the isolated real-daemon
+    // dogfood before verifying the evidence.
+    id: 'edition5',
+    lanes: [
+      ['.woodpecker/untrusted/pr.yaml', 'node scripts/edition5/run.mjs'],
+      ['.woodpecker/trusted/trusted.yaml', 'node scripts/edition5/run.mjs'],
+    ],
+  },
+  {
+    // Edition 8 gates: every host/visual/perf gate is verified by the PR lane
+    // (linux, both hosts) and the trusted lane; the darwin-edition8 lane runs
+    // the isolated both-host dogfood and the same verifier.
+    id: 'edition8',
+    lanes: [
+      ['.woodpecker/untrusted/pr.yaml', 'node scripts/edition8/run.mjs'],
+      ['.woodpecker/trusted/trusted.yaml', 'node scripts/edition8/run.mjs'],
+      ['.woodpecker/trusted/trusted.yaml', 'node scripts/edition8/run.mjs --dogfood'],
+    ],
+  },
+  {
     id: 'dogfood-coverage',
     lanes: [
       ['.woodpecker/untrusted/pr.yaml', 'dogfood.mjs --coverage'],
@@ -416,6 +441,14 @@ const SCRIPT_ALLOWLIST = new Map(
       'planted-mutation runner; tests/invariants.toml mutation_command invokes it per invariant and check-invariants --mutations (dogfood §3) executes that registry.',
     'scripts/generate-iana-network-table':
       'extensionless python generator for the frozen IANA table in crates/security/src/network.rs; invoked by scripts/update-iana-special-registry.sh (operator refresh) and the generated table is exercised by the security crate tests under §1 cargo test --workspace.',
+    'scripts/edition5/dogfood.sh':
+      'isolated real-daemon Edition 5 dogfood (git worktree + data dir + loopback fake provider); runs in the trusted certificate lane and locally because it needs the full daemon/JetBrains toolchains, not the node-only dogfood plan.',
+    'scripts/edition5/fake-openai.mjs':
+      'loopback-only fake OpenAI-compatible provider spawned by scripts/edition5/dogfood.sh; never network-reachable and never a production provider.',
+    'scripts/edition5/acceptance-jetbrains.mjs':
+      'converts the real JetBrains host observation overlays into the shared A01-A40 result document; invoked transitively by scripts/edition5/run.mjs.',
+    'scripts/edition8/codegen.mjs':
+      'generates the 72-screen/144-host-contract registries from docs/specs/edition8/registry.json for both hosts; generation is a source-authoring step and the generated files are committed and gated, so it is not run by CI.',
     'scripts/dogfood.sh':
       'executor root of the DOGFOOD program: it IS the run plan every other script is classified against, so it cannot invoke itself; it is run explicitly by operators and its registered gates run in the certificate/PR lanes through scripts/dogfood.mjs.',
   }),
@@ -428,6 +461,8 @@ const DOCS_ALLOWLIST = new Map(
       'normative commerce acquisition contract; cited from crates/cli (acquire_certification, tools_market) and tests/static-authority, not part of the architecture index.',
     'docs/ci-enforcement.md':
       'operator CI enforcement runbook; linked from scripts/woodpecker/setup.md rather than the architecture index.',
+    'docs/query-plan-audit.md':
+      'query-planner audit notes owned by the storage/query workstream; the normative contract lives in docs/architecture.md and the audit is intentionally not part of the product index.',
     'docs/ui-terminology.md':
       'normative Work/Inspect/History vocabulary law; enforced by the dogfood internal-identifier label rule below and by the panel wording; not yet linked from the architecture index.',
   }),
@@ -497,6 +532,18 @@ const PANEL_SUPPORT_COLOR_FUNCTIONS = new Set([
 // `reason` why this is a legitimate diagnostics/detail site.
 const INTERNAL_LABEL_ALLOWLIST = [
   {
+    file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition5CatalogData.kt',
+    token: 'worktree',
+    count: 3,
+    reason: 'frozen control-catalog copy names the per-instance scope term "worktree" in advanced control descriptions; it is spec text, not a visible raw id label.',
+  },
+  {
+    file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition5Panels.kt',
+    token: 'session_id',
+    count: 2,
+    reason: 'diagnostics detail rows in the Edition 5 context/checkpoint panels surface the native session_id field as an inspect key; primary actions stay human-labeled.',
+  },
+  {
     file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BlockersPanel.kt',
     token: 'capability=',
     count: 1,
@@ -549,6 +596,24 @@ const INTERNAL_LABEL_ALLOWLIST = [
     token: '#<id>',
     count: 2,
     reason: 'verification-record number in the candidate detail pane and the winner chip ("#3 pass/fail") — the number is the visible verification ordinal.',
+  },
+  {
+    file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Daemon.kt',
+    token: 'session_id',
+    count: 2,
+    reason: 'native path-template resolver and permission reply-handle detail: session_id is a wire placeholder/handle inside diagnostics, never a primary label; the visible permission card names the action and scope.',
+  },
+  {
+    file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Panels.kt',
+    token: 'session_id',
+    count: 1,
+    reason: 'permission inspect detail body reads the daemon session_id reply handle; primary actions keep human labels and the id is never shown as task identity.',
+  },
+  {
+    file: 'apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition8ScreenRegistry.kt',
+    token: 'worktree',
+    count: 7,
+    reason: 'generated Rev8 screen/control contract descriptions (screens.md/controls.json) surface worktree as an inspect/detail noun in help copy; no primary action is labeled with an internal id.',
   },
 ];
 

@@ -175,12 +175,12 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
         "an open that migrates nothing must not snapshot"
     );
     // Rewind one step: the reopen must snapshot the EXACT predecessor
-    // (previous head: no hot-path query-plan indexes) before applying the
+    // (previous head: no session-deletion tombstone) before applying the
     // head step.
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(&format!(
-            "DROP INDEX IF EXISTS idx_part_message;
+            "DROP TABLE IF EXISTS session_deletion;
                  PRAGMA user_version = {};",
             SCHEMA_HEAD - 1
         ))
@@ -205,16 +205,16 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
     assert_verified_restore_point(&newest, SCHEMA_HEAD - 1);
     let snapshot =
         Connection::open_with_flags(&newest, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let pre_index: i64 = snapshot
+    let pre_table: i64 = snapshot
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_part_message'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_deletion'",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
-        pre_index, 0,
-        "the restore point is PRE-migration: the head index must not exist in it"
+        pre_table, 0,
+        "the restore point is PRE-migration: the pending step's table must not exist in it"
     );
     // The predecessor already carries the v33 settlement objects.
     let pre_settlement: i64 = snapshot
@@ -226,14 +226,14 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
         .unwrap();
     assert_eq!(pre_settlement, 1);
     let live = Connection::open(&db).unwrap();
-    let post_index: i64 = live
+    let post_table: i64 = live
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_part_message'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_deletion'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(post_index, 1, "the live database finished the chain");
+    assert_eq!(post_table, 1, "the live database finished the chain");
     for table in [
         "engineering_outcome",
         "economic_settlement",

@@ -294,7 +294,24 @@ fi
 end_section
 
 # ===========================================================================
-# §7 dogfood coverage LAST so the manifest reflects every section above.
+# §7 Edition 5 registry-driven gates (hosts, acceptance, contracts, visuals).
+# ===========================================================================
+begin_section edition5 "Edition 5 gates (controls, A01-A40, visual/settings/perf/dead controls)"
+run_cmd "$NODE_BIN" scripts/edition5/run.mjs --skip-jetbrains --no-verify
+end_section
+
+# ===========================================================================
+# §7b Edition 8 gates. The fast registry invariant runs in this local plan;
+# the full both-host matrix/visual/perf/dogfood runner is
+# scripts/edition8/run.mjs and executes in the PR/trusted/darwin lanes.
+# ===========================================================================
+begin_section edition8 "Edition 8 registry (full runner: scripts/edition8/run.mjs)"
+printf '  full gate runner: node scripts/edition8/run.mjs (PR/trusted/darwin lanes)\n'
+run_cmd "$NODE_BIN" tests/edition8/registry.mjs
+end_section
+
+# ===========================================================================
+# §8 dogfood coverage LAST so the manifest reflects every section above.
 # ===========================================================================
 begin_section coverage "dogfood surface coverage"
 run_cmd "$NODE_BIN" scripts/dogfood.mjs --coverage

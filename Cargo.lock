@@ -962,6 +962,7 @@ dependencies = [
  "faktor-deepseek",
  "faktor-edit",
  "faktor-evidence",
+ "faktor-foundation",
  "faktor-fs",
  "faktor-gateway",
  "faktor-git",
@@ -1174,6 +1175,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-foundation"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-provider",
+ "faktor-security",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "faktor-fs"
 version = "0.1.0"
 dependencies = [
@@ -1354,6 +1375,7 @@ dependencies = [
 name = "faktor-memory"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-core",
  "faktor-store",
  "serde",
@@ -1590,11 +1612,15 @@ dependencies = [
  "faktor-agent",
  "faktor-cas",
  "faktor-cloud",
+ "faktor-context",
  "faktor-core",
  "faktor-evidence",
+ "faktor-foundation",
  "faktor-fs",
  "faktor-hooks",
  "faktor-instructions",
+ "faktor-mcp",
+ "faktor-memory",
  "faktor-openai",
  "faktor-orchestrator",
  "faktor-protocol",
@@ -1623,6 +1649,8 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1834,6 +1862,7 @@ dependencies = [
  "faktor-deepseek",
  "faktor-edit",
  "faktor-evidence",
+ "faktor-foundation",
  "faktor-fs",
  "faktor-gateway",
  "faktor-git",

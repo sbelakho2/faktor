@@ -20,6 +20,7 @@ import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.options.ConfigurationException
+import com.intellij.openapi.progress.ProgressManager
 import dev.faktor.backend.DaemonBinary
 import java.awt.BorderLayout
 import java.nio.file.Files
@@ -59,7 +60,9 @@ class FaktorConfigurable : Configurable {
 
     private val controller = FaktorSettingsController(IntelliJApplicationSettingsStore())
 
-    private val credentialStore = ControlPlaneCredentialStore(IntelliJPasswordSafeVault())
+    private val secretVault: SecretVault = IntelliJPasswordSafeVault()
+
+    private val credentialStore = ControlPlaneCredentialStore(secretVault)
 
     private val sessionStore = IntelliJControlPlaneSessionStore()
 
@@ -82,6 +85,12 @@ class FaktorConfigurable : Configurable {
     private var signedInLabel: JLabel? = null
 
     private var applied: FaktorSettingsSnapshot = FaktorSettingsSnapshot.DEFAULTS
+
+    /** The Edition 5 configuration center embedded under the Faktor node. */
+    private var edition5Panel: Edition5SettingsPanel? = null
+
+    /** The shared staging/validation controller (one per Configurable). */
+    private var edition5Controller: Edition5SettingsController? = null
 
     override fun getDisplayName(): String = "Faktor"
 
@@ -189,20 +198,72 @@ class FaktorConfigurable : Configurable {
                 )
             )
         }
+        val screensButton = secondaryButton("Open Revision 8 screens…")
+        screensButton.toolTipText = "Open the 72 Revision 8 Work, Inspect and History screens"
+        screensButton.a11y(
+            "Open Revision 8 screens",
+            "Opens the registry-driven screen browser for providers, context, tools, usage and setup."
+        )
+        screensButton.addActionListener {
+            Edition8ScreenBrowser(edition8Host()).show(component)
+        }
+        val screensBody = pageColumn(gap = Spacing.XS, padding = 0).apply {
+            add(actionRow(screensButton))
+            add(
+                wrappedMutedLabel(
+                    "The screens are the host presentation of the same native contracts used by the " +
+                        "tool window. Secrets stay in PasswordSafe; no screen fabricates a Saved, " +
+                        "Connected or Verified state."
+                )
+            )
+        }
         val body = pageColumn().apply {
             add(card("Service", serviceBody))
             add(vSpace(Spacing.M))
             add(card("Run defaults", runBody))
             add(vSpace(Spacing.M))
             add(card("Optional control plane", controlPlaneBody))
+            add(vSpace(Spacing.M))
+            add(card("Revision 8 screens", screensBody))
         }
-        val panel = JPanel(BorderLayout())
-        panel.isOpaque = false
-        panel.add(body, BorderLayout.NORTH)
-        component = panel
+        // The Edition 5 settings tree: General (the host-local application
+        // settings above) plus every daemon-backed category. The same panel
+        // renders in the tool window Config utility and the offscreen matrix.
+        val source: Edition5ConfigSource =
+            FaktorConnectionRegistry.client()?.let { NativeEdition5ConfigSource(it) }
+                ?: Edition5ConfigUnavailable(
+                    "contract-required: daemon not connected; start the Faktor service to read " +
+                        "GET ${Edition5Routes.CONFIG_EFFECTIVE} (revision + per-field effective snapshot)"
+                )
+        val controller = Edition5SettingsController(source, endpointLabel = FaktorConnectionRegistry.endpointLabel())
+        edition5Controller = controller
+        val general = object : Edition5SettingsPanel.GeneralSettingsSurface {
+            override val component: JComponent get() = body
+            override fun generalState(): String =
+                "Application scope only. Run defaults apply to the next session; the binary path " +
+                    "and optional control-plane coordinates never enter a project."
+            override fun applyGeneral(): String? = null
+        }
+        val center = Edition5SettingsPanel(controller, general)
+        edition5Panel = center
+        component = center.component()
         reset()
-        return panel
+        return center.component()
     }
+
+    private fun edition8Host(): Edition8Host = Edition8Host(
+        client = { FaktorConnectionRegistry.client() },
+        sessionId = { null },
+        taskId = { null },
+        vault = secretVault,
+        settings = controller,
+        navigate = { screenId ->
+            javax.swing.SwingUtilities.invokeLater {
+                Edition8ScreenBrowser(edition8Host()).show(component, screenId)
+            }
+        },
+        credentials = credentialStore
+    )
 
     private fun formRow(label: String, field: JComponent): JPanel {
         val row = JPanel(BorderLayout(Spacing.S, 0))
@@ -220,7 +281,8 @@ class FaktorConfigurable : Configurable {
     }
 
     /** True when any edited field differs from the applied configuration. */
-    override fun isModified(): Boolean = editedSnapshot() != applied
+    override fun isModified(): Boolean =
+        editedSnapshot() != applied || (edition5Panel?.changedCount() ?: 0) > 0
 
     /** Validate first, then persist in ONE batch; invalid writes nothing. */
     override fun apply() {
@@ -229,6 +291,29 @@ class FaktorConfigurable : Configurable {
             controller.apply(snapshot)
         } catch (e: FaktorSettingsValidationException) {
             throw ConfigurationException(e.message ?: "invalid Faktor configuration")
+        }
+        // Daemon-backed staged changes are applied as ONE atomic patch. The
+        // IntelliJ progress runner executes the I/O on a background thread;
+        // the EDT only receives the typed acknowledgement or refusal.
+        val center = edition5Panel
+        if (center != null && center.changedCount() > 0) {
+            var decision: Edition5ConfigDecision? = null
+            ProgressManager.getInstance().runProcessWithProgressSynchronously(
+                { decision = center.applyBlocking() },
+                "Applying Faktor configuration",
+                false,
+                null
+            )
+            val result = decision
+                ?: throw ConfigurationException("Faktor configuration apply produced no decision")
+            if (!result.ok) {
+                throw ConfigurationException(
+                    result.contractGap
+                        ?: result.errors.joinToString("; ") { error ->
+                            (error.key?.plus(": ") ?: "") + error.message
+                        }.ifBlank { "the daemon refused the configuration patch" }
+                )
+            }
         }
         applied = controller.read()
         render(applied)
@@ -244,6 +329,7 @@ class FaktorConfigurable : Configurable {
     override fun reset() {
         applied = controller.read()
         render(applied)
+        edition5Panel?.reset()
     }
 
     /**
@@ -256,6 +342,9 @@ class FaktorConfigurable : Configurable {
     }
 
     override fun disposeUIResources() {
+        edition5Panel?.shutdown()
+        edition5Panel = null
+        edition5Controller = null
         component = null
         binaryField = null
         providerField = null

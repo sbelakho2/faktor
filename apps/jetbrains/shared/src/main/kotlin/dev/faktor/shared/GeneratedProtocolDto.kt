@@ -337,6 +337,129 @@ data class ProtocolValueEntitlementsReport(
     val nowMs: Long
 )
 
+/** One provider/model preference (plus optional reasoning effort). (unknown_fields: reject) */
+data class ProtocolModelBinding(
+    val provider: String,
+    val model: String,
+    val reasoningEffort: String?
+)
+
+/** The persisted per-role model map (planner/coder/verifier/summarizer). (unknown_fields: reject) */
+data class ProtocolPresetRoleModels(
+    val roleModels: JsonValue,
+    val revision: Long
+)
+
+/** The ordered fallback candidates; order is authoritative. (unknown_fields: reject) */
+data class ProtocolPresetFallbackChain(
+    val fallbackChain: JsonValue,
+    val revision: Long
+)
+
+/** Observed reachability/model-list probe plus the served capability of one exact model. (unknown_fields: ignore) */
+data class ProtocolCatalogProbe(
+    val connectionId: String,
+    val provider: String,
+    val state: String,
+    val stages: JsonValue,
+    val models: List<String>,
+    val model: String?,
+    val capability: JsonValue?,
+    val certification: String
+)
+
+/** Durable MCP auth binding; token material is never present. (unknown_fields: ignore) */
+data class ProtocolMcpAuthState(
+    val serverId: String,
+    val transport: String,
+    val state: String,
+    val account: String?,
+    val scopes: List<String>,
+    val hasToken: Boolean,
+    val revision: Long
+)
+
+/** A durable line-anchored review comment tied to session/task/change. (unknown_fields: ignore) */
+data class ProtocolReviewComment(
+    val id: String,
+    val sessionId: Long,
+    val taskId: String?,
+    val changeId: String?,
+    val path: String,
+    val lineStart: Long,
+    val lineEnd: Long,
+    val side: String,
+    val body: String,
+    val author: String,
+    val contentHash: String?,
+    val resolved: Boolean,
+    val revision: Long,
+    val createdMs: Long,
+    val updatedMs: Long
+)
+
+/** Idempotent per-file change acceptance: applied/already-current/rejected paths. (unknown_fields: ignore) */
+data class ProtocolChangeAcceptReceipt(
+    val accepted: Boolean,
+    val changeSetId: String,
+    val applied: List<String>,
+    val alreadyCurrent: List<String>,
+    val rejected: List<String>,
+    val integrated: Boolean,
+    val idempotent: Boolean
+)
+
+/** One exact would-restore file action with current/expected/restored digests. (unknown_fields: ignore) */
+data class ProtocolRestorePreviewFile(
+    val path: String,
+    val action: String,
+    val current: JsonValue,
+    val expected: JsonValue,
+    val restore: JsonValue,
+    val contentDigest: String?
+)
+
+/** Dry-run restore plan; writes is always 0. (unknown_fields: ignore) */
+data class ProtocolRestorePreview(
+    val dryRun: Boolean,
+    val writes: Long,
+    val sessionId: Long,
+    val checkpointId: Long,
+    val sequence: Long,
+    val direction: String,
+    val files: List<ProtocolRestorePreviewFile>,
+    val writable: Boolean,
+    val conflictCount: Long
+)
+
+/** Bounded exported session bundle with digest and redaction counts. (unknown_fields: ignore) */
+data class ProtocolSessionExport(
+    val sessionId: String,
+    val digest: String,
+    val bytes: Long,
+    val redacted: Boolean,
+    val redactedFields: Long,
+    val truncated: Boolean,
+    val bundle: JsonValue
+)
+
+/** Per-session selectable compaction model and loop guards. (unknown_fields: ignore) */
+data class ProtocolSessionSettings(
+    val sessionId: String,
+    val compactionModel: String?,
+    val maxTurns: Long?,
+    val maxConsecutiveFailures: Long?
+)
+
+/** Durable session deletion tombstone and the exact purged-row counts. (unknown_fields: ignore) */
+data class ProtocolSessionDeleteTombstone(
+    val deleted: Boolean,
+    val idempotent: Boolean,
+    val sessionId: String,
+    val deletedMs: Long,
+    val purged: JsonValue
+)
+
 // -------------------------------------------------------- parse functions
 
 fun parseProtocolMessage(v: JsonView): ProtocolMessage {
@@ -760,6 +883,159 @@ fun parseProtocolValueEntitlementsReport(v: JsonView): ProtocolValueEntitlements
         governance = parseProtocolValueGovernanceCapabilities(v.field("governance")),
         decisions = v.field("decisions").array().map { parseProtocolValueEntitlementDecision(it) },
         nowMs = v.field("now_ms").long()
+    )
+}
+
+fun parseProtocolModelBinding(v: JsonView): ProtocolModelBinding {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("provider", "model", "reasoning_effort")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolModelBinding(
+        provider = v.field("provider").string(),
+        model = v.field("model").string(),
+        reasoningEffort = v.optionalField("reasoning_effort")?.string()
+    )
+}
+
+fun parseProtocolPresetRoleModels(v: JsonView): ProtocolPresetRoleModels {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("role_models", "revision")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolPresetRoleModels(
+        roleModels = v.field("role_models").value,
+        revision = v.field("revision").long()
+    )
+}
+
+fun parseProtocolPresetFallbackChain(v: JsonView): ProtocolPresetFallbackChain {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("fallback_chain", "revision")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolPresetFallbackChain(
+        fallbackChain = v.field("fallback_chain").value,
+        revision = v.field("revision").long()
+    )
+}
+
+fun parseProtocolCatalogProbe(v: JsonView): ProtocolCatalogProbe {
+    return ProtocolCatalogProbe(
+        connectionId = v.field("connection_id").string(),
+        provider = v.field("provider").string(),
+        state = v.field("state").string(),
+        stages = v.field("stages").value,
+        models = v.field("models").array().map { it.string() },
+        model = v.optionalField("model")?.string(),
+        capability = v.optionalField("capability")?.value,
+        certification = v.field("certification").string()
+    )
+}
+
+fun parseProtocolMcpAuthState(v: JsonView): ProtocolMcpAuthState {
+    return ProtocolMcpAuthState(
+        serverId = v.field("server_id").string(),
+        transport = v.field("transport").string(),
+        state = v.field("state").string(),
+        account = v.optionalField("account")?.string(),
+        scopes = v.field("scopes").array().map { it.string() },
+        hasToken = v.field("has_token").bool(),
+        revision = v.field("revision").long()
+    )
+}
+
+fun parseProtocolReviewComment(v: JsonView): ProtocolReviewComment {
+    return ProtocolReviewComment(
+        id = v.field("id").string(),
+        sessionId = v.field("session_id").long(),
+        taskId = v.optionalField("task_id")?.string(),
+        changeId = v.optionalField("change_id")?.string(),
+        path = v.field("path").string(),
+        lineStart = v.field("line_start").long(),
+        lineEnd = v.field("line_end").long(),
+        side = v.field("side").string(),
+        body = v.field("body").string(),
+        author = v.field("author").string(),
+        contentHash = v.optionalField("content_hash")?.string(),
+        resolved = v.field("resolved").bool(),
+        revision = v.field("revision").long(),
+        createdMs = v.field("created_ms").long(),
+        updatedMs = v.field("updated_ms").long()
+    )
+}
+
+fun parseProtocolChangeAcceptReceipt(v: JsonView): ProtocolChangeAcceptReceipt {
+    return ProtocolChangeAcceptReceipt(
+        accepted = v.field("accepted").bool(),
+        changeSetId = v.field("change_set_id").string(),
+        applied = v.field("applied").array().map { it.string() },
+        alreadyCurrent = v.field("already_current").array().map { it.string() },
+        rejected = v.field("rejected").array().map { it.string() },
+        integrated = v.field("integrated").bool(),
+        idempotent = v.field("idempotent").bool()
+    )
+}
+
+fun parseProtocolRestorePreviewFile(v: JsonView): ProtocolRestorePreviewFile {
+    return ProtocolRestorePreviewFile(
+        path = v.field("path").string(),
+        action = v.field("action").string(),
+        current = v.field("current").value,
+        expected = v.field("expected").value,
+        restore = v.field("restore").value,
+        contentDigest = v.optionalField("content_digest")?.string()
+    )
+}
+
+fun parseProtocolRestorePreview(v: JsonView): ProtocolRestorePreview {
+    return ProtocolRestorePreview(
+        dryRun = v.field("dry_run").bool(),
+        writes = v.field("writes").long(),
+        sessionId = v.field("session_id").long(),
+        checkpointId = v.field("checkpoint_id").long(),
+        sequence = v.field("sequence").long(),
+        direction = v.field("direction").string(),
+        files = v.field("files").array().map { parseProtocolRestorePreviewFile(it) },
+        writable = v.field("writable").bool(),
+        conflictCount = v.field("conflict_count").long()
+    )
+}
+
+fun parseProtocolSessionExport(v: JsonView): ProtocolSessionExport {
+    return ProtocolSessionExport(
+        sessionId = v.field("session_id").string(),
+        digest = v.field("digest").string(),
+        bytes = v.field("bytes").long(),
+        redacted = v.field("redacted").bool(),
+        redactedFields = v.field("redacted_fields").long(),
+        truncated = v.field("truncated").bool(),
+        bundle = v.field("bundle").value
+    )
+}
+
+fun parseProtocolSessionSettings(v: JsonView): ProtocolSessionSettings {
+    return ProtocolSessionSettings(
+        sessionId = v.field("session_id").string(),
+        compactionModel = v.optionalField("compaction_model")?.string(),
+        maxTurns = v.optionalField("max_turns")?.long(),
+        maxConsecutiveFailures = v.optionalField("max_consecutive_failures")?.long()
+    )
+}
+
+fun parseProtocolSessionDeleteTombstone(v: JsonView): ProtocolSessionDeleteTombstone {
+    return ProtocolSessionDeleteTombstone(
+        deleted = v.field("deleted").bool(),
+        idempotent = v.field("idempotent").bool(),
+        sessionId = v.field("session_id").string(),
+        deletedMs = v.field("deleted_ms").long(),
+        purged = v.field("purged").value
     )
 }
 

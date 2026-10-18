@@ -215,6 +215,8 @@ class TerminalPanel : JPanel(BorderLayout()) {
         body.add(vSpace(Spacing.XS))
         body.add(advancedBody)
         val bodyScroll = JScrollPane(body)
+        bodyScroll.horizontalScrollBarPolicy =
+            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         bodyScroll.verticalScrollBar.unitIncrement = 16
         add(panelHeader(header), BorderLayout.NORTH)
         add(bodyScroll, BorderLayout.CENTER)

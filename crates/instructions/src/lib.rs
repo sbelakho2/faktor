@@ -712,6 +712,12 @@ impl Instructions {
     /// Surfaced whole-file skips (P0-34): optional rule files that were
     /// never read (oversized or unreadable) are listed here with their size
     /// and reason — they are never half-loaded.
+    /// Every loaded rule in deterministic discovery order. Inspection
+    /// surfaces read the SAME tree the resolver serves; this is a pure view.
+    pub fn all(&self) -> &[Instruction] {
+        &self.rules
+    }
+
     pub fn skipped(&self) -> &[RuleSkip] {
         &self.skipped
     }
@@ -1746,6 +1752,12 @@ impl SkillRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The discovered skill metadata in deterministic order (inspection
+    /// read; bodies still load on demand through the rooted authority).
+    pub fn entries(&self) -> &[SkillMeta] {
+        &self.entries
     }
 
     /// Whole-entry refusals of the last discovery (unsafe links/special

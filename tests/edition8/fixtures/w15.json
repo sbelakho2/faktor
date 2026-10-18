@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W15",
+  "title": "Finish a change with complete proof",
+  "screens": [
+    "S01",
+    "S24",
+    "S32"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Capture required criteria and the requested finish level: Local / Commit / Push / PR.",
+    "Implement in the isolated candidate.",
+    "Inspect claim artifacts.",
+    "Run required checks; match proof to the exact candidate identity.",
+    "Integrate with matching identity.",
+    "Perform the authorized finish; inspect receipts and outcome."
+  ],
+  "forbidden_fake_states": [
+    "Green finish from chat completion",
+    "proof reused across candidate identities",
+    "PR created without SCM",
+    "empty required set treated as success"
+  ],
+  "complete_when": "required acceptance, claims, landing equality and requested finish all have explicit matching facts (p.186).",
+  "traceability": "p.186; controls V-07..V-12, O-06, B-04; acceptance A35, A36.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

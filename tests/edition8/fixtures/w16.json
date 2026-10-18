@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W16",
+  "title": "Recover a remote host or runtime change",
+  "screens": [
+    "S31",
+    "S30",
+    "S26"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Detect the new daemon/workspace generation; mark old handles stale.",
+    "Preserve local drafts and the prior coherent projection.",
+    "Show the execution/model/vault map and the data boundary.",
+    "Verify runtime path, readiness and protocol compatibility.",
+    "Rebind the session and reconcile operations.",
+    "Resume only supported work; unknown effects stay visible."
+  ],
+  "forbidden_fake_states": [
+    "Old handle controlling a new host",
+    "local URL shown as daemon loopback",
+    "copied credentials",
+    "replaying an old effectful request on a new host"
+  ],
+  "complete_when": "all callbacks and controls are fenced to the new binding; unknown effects stay visible (p.186).",
+  "traceability": "p.186; controls X-13, P-13, O-02, O-07, O-11, D-01, D-15, A-11; acceptance A08, A28, A38.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

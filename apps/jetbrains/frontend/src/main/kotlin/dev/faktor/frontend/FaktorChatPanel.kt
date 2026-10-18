@@ -431,6 +431,26 @@ class FaktorChatPanel(
 
     private val historyPanel = HistoryPanel()
 
+    /** Edition 5 context inspector and compaction review (session-scoped). */
+    private val edition5ContextPanel = Edition5ContextPanel(null) { service.currentSessionId() }
+
+    private val edition5CompactionPanel = Edition5CompactionPanel(null) { service.currentSessionId() }
+
+    /** Edition 5 checkpoint timeline / restore / fork (session-scoped). */
+    private val edition5CheckpointPanel = Edition5CheckpointPanel(null) { service.currentSessionId() }
+
+    private val edition5ModelLabel = mutedLabel("Model: defaults from Settings")
+
+    private val edition5ModelButton = secondaryButton("Model…")
+
+    private val edition5ContextLabel = mutedLabel("Context: Unavailable (contextUsage = null)")
+
+    private val edition5ContextButton = secondaryButton("Context")
+
+    private val edition5Attention = statusChip("No pending attention", SemanticState.DIM)
+
+    private var edition5AttachedFor: String? = null
+
     /** The I07 Outcomes surface (lazy-read on first open), beside the list. */
     private val outcomesPanel = OutcomesPanel()
 
@@ -563,6 +583,77 @@ class FaktorChatPanel(
 
     // ------------------------------------------------------------------ UI
 
+    /**
+     * The real host adapter for the Revision 8 screens. Its callbacks reuse
+     * the panel's live service, session and task scope; absent scope is a
+     * typed refusal in the screen, never an invented value.
+     */
+    internal fun edition8Host(): Edition8Host = Edition8Host(
+        client = { FaktorConnectionRegistry.client() },
+        sessionId = { service.currentSessionId() },
+        taskId = {
+            runCatching { service.taskRuns().firstOrNull()?.taskId?.toString() }.getOrNull()
+        },
+        vault = null,
+        settings = settingsController,
+        startService = {
+            val health = service.start()
+            "started ok=${health.ok} version=${health.version}"
+        },
+        restartService = {
+            val health = service.restart()
+            "restarted ok=${health.ok} version=${health.version}"
+        },
+        confirmTrust = { path ->
+            SwingUtilities.invokeLater { startButton.doClick() }
+            "start requested for $path — awaiting daemon readiness"
+        },
+        startTask = { goal, options ->
+            val criteria = options["V-07"]?.takeIf { it.isNotBlank() }
+                ?.split('\n')?.filter { it.isNotBlank() }
+            val model = options["M-01"]?.takeIf { it.isNotBlank() }
+            val started = service.startTaskRun(goal, criteria = criteria, model = model)
+            "task-run ${started.runId} task ${started.taskId} state ${started.state}"
+        },
+        stopScope = { scope ->
+            when (scope) {
+                "run" -> {
+                    val run = service.taskRuns().firstOrNull()
+                    if (run == null) "no owned run to stop — nothing was cancelled"
+                    else {
+                        val ack = service.cancelTaskRun(run.runId)
+                        "cancel ${if (ack.cancelled) "acknowledged" else "refused"} for ${ack.runId}"
+                    }
+                }
+                else -> "scope $scope is separate: no implicit stop was issued"
+            }
+        },
+        replyApproval = { id, session, decision ->
+            val ack = service.replyPermission(session, id, decision)
+            "permission $id $decision acknowledged=${ack.ok}"
+        },
+        openDiff = {
+            SwingUtilities.invokeLater {
+                selectCluster("Inspect")
+                inspectTabs.selectedIndex = 3
+            }
+            "opened native diff destination (Inspect › Changes)"
+        },
+        openTerminal = {
+            SwingUtilities.invokeLater {
+                selectCluster("Inspect")
+                inspectTabs.selectedIndex = 0
+                selectInspectDetail("Overview", "Terminal")
+            }
+            "opened the owned console surface"
+        },
+        navigate = { screenId ->
+            SwingUtilities.invokeLater { Edition8ScreenBrowser(edition8Host()).show(this, screenId) }
+        },
+        credentials = controlPlaneCredentials
+    )
+
+
     private fun buildLayout() {
         transcript.isEditable = false
         transcript.lineWrap = true
@@ -593,6 +684,21 @@ class FaktorChatPanel(
                 startTaskFromControls()
             }
         })
+        // macOS hosts expect the platform menu shortcut (Cmd+Enter). Bind it
+        // beside Ctrl+Enter; on non-macOS the mask equals Ctrl and the entry
+        // is already present.
+        val menuMask = if (java.awt.GraphicsEnvironment.isHeadless()) {
+            java.awt.event.InputEvent.CTRL_DOWN_MASK
+        } else {
+            runCatching { java.awt.Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx }
+                .getOrDefault(java.awt.event.InputEvent.CTRL_DOWN_MASK)
+        }
+        if (menuMask != java.awt.event.InputEvent.CTRL_DOWN_MASK) {
+            input.inputMap.put(
+                javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ENTER, menuMask),
+                "faktor.runTask"
+            )
+        }
         // Escape closes the Task options sheet (returning focus to the exact
         // trigger); it NEVER cancels a run.
         input.inputMap.put(
@@ -626,7 +732,14 @@ class FaktorChatPanel(
         // scrollbar: at 240px every primary control (New session, Refresh,
         // the session chooser) stays visible, and the secondary utilities
         // live under More. No horizontal-scroll fallback exists.
-        val toolbar = wrapRow(FaktorMark(), newSessionButton, refreshButton)
+        val screensButton = secondaryButton("Screens…")
+        screensButton.toolTipText = "Open the Revision 8 screen registry (72 screens)"
+        screensButton.a11y(
+            "Faktor screens",
+            "Opens the Revision 8 Work, Inspect and History screen registry."
+        )
+        screensButton.addActionListener { Edition8ScreenBrowser(edition8Host()).show(this) }
+        val toolbar = wrapRow(FaktorMark(), newSessionButton, refreshButton, screensButton)
         toolbar.isOpaque = true
         toolbar.background = panelSurface()
         toolbar.border = BorderFactory.createCompoundBorder(
@@ -662,6 +775,9 @@ class FaktorChatPanel(
         val diagnosticsItem = JMenuItem("Diagnostics")
         diagnosticsItem.addActionListener { showUtility("Diagnostics", diagnosticsPanel) }
         moreMenu.add(diagnosticsItem)
+        val screensItem = JMenuItem("Revision 8 screens…")
+        screensItem.addActionListener { Edition8ScreenBrowser(edition8Host()).show(this) }
+        moreMenu.add(screensItem)
         moreMenu.addSeparator()
         serviceStartItem.addActionListener { startButton.doClick() }
         serviceStopItem.addActionListener { stopButton.doClick() }
@@ -694,6 +810,16 @@ class FaktorChatPanel(
                 )
             )
         )
+        inspectTabs.addTab(
+            "Context",
+            selectorTab(
+                "Context",
+                listOf(
+                    inspectDetail("Manifest", edition5ContextPanel),
+                    inspectDetail("Compaction", edition5CompactionPanel)
+                )
+            )
+        )
         inspectTabs.addTab("Changes", changesPanel)
         inspectTabs.addTab(
             "Verification",
@@ -720,8 +846,14 @@ class FaktorChatPanel(
         // open) and failure-isolated from the conversation listing.
         historyTabs.removeAll()
         historyTabs.addTab("Conversations", historyPanel)
+        historyTabs.addTab("Checkpoints", edition5CheckpointPanel)
         historyTabs.addTab("Outcomes", outcomesPanel)
-        historyTabs.addChangeListener { ensureOutcomesLoaded() }
+        historyTabs.addChangeListener {
+            ensureOutcomesLoaded()
+            ensureEdition5SessionPanelsLoaded()
+        }
+        inspectTabs.addChangeListener { ensureEdition5SessionPanelsLoaded() }
+        tabs.addChangeListener { ensureEdition5SessionPanelsLoaded() }
         tabs.addTab("History", historyTabs)
 
         add(toolbar, BorderLayout.NORTH)
@@ -738,6 +870,25 @@ class FaktorChatPanel(
      * budget and the attachments.
      */
     private fun buildWorkPlane() {
+        // S01 cockpit identity: the selected run default, the context
+        // authority and the attention rail. These are real served/local
+        // values; context usage stays Unavailable until a durable read.
+        edition5ModelButton.a11y("Choose model", "Opens the native model picker over the served catalog.")
+        edition5ModelButton.addActionListener { openEdition5ModelPicker() }
+        edition5ContextButton.a11y("Open context inspector", "Shows capacity, sources and compaction.")
+        edition5ContextButton.addActionListener {
+            selectCluster("Inspect")
+            selectInspectDetail("Context", "Manifest")
+        }
+        val cockpit = wrapRow(
+            edition5ModelLabel, edition5ModelButton,
+            edition5ContextLabel, edition5ContextButton,
+            edition5Attention
+        )
+        cockpit.background = panelSurface()
+        cockpit.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
+        workPlane.add(cockpit, BorderLayout.NORTH)
+
         val transcriptBody = JPanel(BorderLayout())
         transcriptBody.isOpaque = false
         transcriptBody.add(transcriptScroll, BorderLayout.CENTER)
@@ -2313,7 +2464,45 @@ class FaktorChatPanel(
             override fun onRefresh() {
                 runAsync("refresh history") { refreshHistoryBlocking() }
             }
+
+            override fun onRename(sessionId: String, title: String) {
+                appendSystem(
+                    "contract-required: POST /native/session/$sessionId/rename " +
+                        "({title}) — the rename route is not currently served; no title was changed"
+                )
+            }
+
+            override fun onPin(sessionId: String, pinned: Boolean) {
+                appendSystem(
+                    "contract-required: POST /native/session/$sessionId/pin ({pinned}) — " +
+                        "the pin route is not currently served; no pin state was changed"
+                )
+            }
+
+            override fun onArchive(sessionId: String) {
+                appendSystem(
+                    "contract-required: POST /native/session/$sessionId/archive — " +
+                        "the archive route is not currently served; nothing was hidden"
+                )
+            }
+
+            override fun onFork(sessionId: String) {
+                appendSystem(
+                    "contract-required: POST /native/session/$sessionId/fork — " +
+                        "the fork route is not currently served; no branch was created"
+                )
+            }
+
+            override fun onExport(sessionId: String) {
+                appendSystem(
+                    "contract-required: GET /native/session/$sessionId/export — " +
+                        "the export route is not currently served; no file was written"
+                )
+            }
         })
+        historyPanel.setTranscriptSearchListener { query ->
+            runAsync("find in transcript") { searchTranscriptBlocking(query) }
+        }
         outcomesPanel.setListener(object : OutcomesPanel.Listener {
             override fun onRefresh() {
                 outcomesCursor = null
@@ -2410,6 +2599,7 @@ class FaktorChatPanel(
                     setControlsEnabled(true)
                     diagnosticsPanel.setReadiness("ready", "version ${health.version}")
                     appendSystem("daemon ready: version ${health.version}")
+                    ensureEdition5SessionPanelsLoaded()
                 }
                 newSessionFromControls(provider, model)
             } catch (e: Throwable) {
@@ -3352,6 +3542,16 @@ class FaktorChatPanel(
             emptyList<NativePermissionEntry>()
         }
         pendingPermissions = permissions
+        edition5Attention.text = if (permissions.isEmpty()) {
+            "No pending attention"
+        } else {
+            "${permissions.size} pending approval" + (if (permissions.size == 1) "" else "s")
+        }
+        edition5Attention.foreground = if (permissions.isEmpty()) {
+            mutedForeground()
+        } else {
+            semanticForeground(SemanticState.WARNING)
+        }
         val model = TaskTree.build(
             projection = projection,
             task = task,
@@ -4218,6 +4418,103 @@ class FaktorChatPanel(
      */
     private fun isTransportFailure(e: NativeApiException): Boolean =
         e.status == 0 && (e.code == "transport" || e.code == "timeout")
+
+    /** S02: the picker is a bounded modal over the served catalog. */
+    private fun openEdition5ModelPicker() {
+        runAsync("load model catalog") {
+            val models = try {
+                service.modelCatalog()
+            } catch (e: Exception) {
+                onEdt {
+                    appendSystem(
+                        "model catalog unavailable: ${e.message ?: e.javaClass.simpleName}; " +
+                            "the picker refuses to invent a model"
+                    )
+                }
+                return@runAsync
+            }
+            onEdt {
+                val chosen = ModelPickerDialog.choose(this@FaktorChatPanel, models)
+                if (chosen != null) {
+                    val applied = settingsPanel.selectRunModel(chosen.provider, chosen.model)
+                    if (applied) {
+                        edition5ModelLabel.text = "Model: ${chosen.provider}/${chosen.model}"
+                        appendSystem(
+                            "run model set to ${chosen.provider}/${chosen.model} for the next task; " +
+                                "running calls keep their recorded model"
+                        )
+                    } else {
+                        appendSystem("the selected model is no longer served; no default was changed")
+                    }
+                }
+            }
+        }
+    }
+
+    /** Attach the session-scoped Edition 5 panels exactly once per session. */
+    private fun ensureEdition5SessionPanelsLoaded() {
+        val session = service.currentSessionId() ?: return
+        if (edition5AttachedFor == session) return
+        val client = FaktorConnectionRegistry.client() ?: return
+        edition5AttachedFor = session
+        edition5ContextPanel.attachClient(client)
+        edition5CompactionPanel.attachClient(client)
+        edition5CheckpointPanel.attachClient(client)
+    }
+
+    /**
+     * D-03 Find: pages durable messages backwards (bounded), not just the
+     * rendered rows. Reports the exact searched/capped scope.
+     */
+    private fun searchTranscriptBlocking(query: String) {
+        val needle = query.trim()
+        if (needle.isEmpty()) return
+        val session = service.currentSessionId()
+        if (session == null) {
+            onEdt { appendSystem("find: no session is open") }
+            return
+        }
+        var before: Long? = null
+        var pages = 0
+        var scanned = 0
+        var hits = 0
+        val first = ArrayList<Long>()
+        var more = true
+        while (more && pages < 50 && scanned < 10_000) {
+            val page = try {
+                service.messagesBefore(session, before, 200)
+            } catch (e: Exception) {
+                onEdt {
+                    appendSystem("find stopped after $pages page(s): ${e.message ?: e.javaClass.simpleName}")
+                }
+                return
+            }
+            pages++
+            for (message in page.messages) {
+                scanned++
+                if (message.text.contains(needle, ignoreCase = true)) {
+                    hits++
+                    if (first.size < 5) first.add(message.seq)
+                }
+            }
+            more = page.hasMore && page.nextBefore != null && page.nextBefore != before
+            before = page.nextBefore
+        }
+        val scope = if (more) {
+            "latest $pages page(s) / $scanned message(s); older pages remain unsearched"
+        } else {
+            "all $pages durable page(s) / $scanned message(s)"
+        }
+        onEdt {
+            appendSystem(
+                if (hits == 0) {
+                    "find '$needle': no matches in $scope"
+                } else {
+                    "find '$needle': $hits match(es) in $scope; first seqs ${first.joinToString(", ")}"
+                }
+            )
+        }
+    }
 
     private fun runAsync(label: String, work: () -> Unit) {
         worker.execute {

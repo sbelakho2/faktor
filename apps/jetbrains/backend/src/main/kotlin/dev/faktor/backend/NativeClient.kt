@@ -215,6 +215,16 @@ class NativeClient(
 
     // ------------------------------------------------------------ liveness
 
+    /**
+     * One bounded Edition 5 contract call. New control families are
+     * version-negotiated under `/native/`; the client refuses any other
+     * prefix so this seam can never become an arbitrary HTTP escape hatch.
+     */
+    fun nativeContractJson(method: String, path: String, body: String? = null): String {
+        require(path.startsWith("/native/")) { "native contract path must start with /native/: $path" }
+        return request(method, path, null, body)
+    }
+
     fun health(): NativeHealth = parseNativeHealth(request("GET", "/native/health"))
 
     fun ready(): NativeReady = parseNativeReady(request("GET", "/native/ready"))

@@ -186,3 +186,11 @@ mod durable_faults_tests;
 #[cfg(test)]
 #[path = "scheduler_faults_tests.rs"]
 mod scheduler_faults_tests;
+
+#[cfg(test)]
+#[path = "longtask_probes.rs"]
+mod longtask_probes;
+
+#[cfg(test)]
+#[path = "longtask_e2e_probes.rs"]
+mod longtask_e2e_probes;

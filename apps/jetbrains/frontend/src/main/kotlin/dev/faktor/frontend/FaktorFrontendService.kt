@@ -284,6 +284,7 @@ class FaktorFrontendService(
                     manager = mgr
                     connection = backendConnection
                     client = cl
+                    FaktorConnectionRegistry.register(backendConnection, controlToken)
                 }
             }
             if (aborted) {
@@ -327,6 +328,7 @@ class FaktorFrontendService(
             manager = null
             connection = null
             client = null
+            FaktorConnectionRegistry.register(null, null)
             if (mgr != null && conn != null) {
                 toStop = Pair(mgr, conn)
             } else {
@@ -379,6 +381,7 @@ class FaktorFrontendService(
                 client = cl
                 manager = null
                 externalStop = stopAction
+                FaktorConnectionRegistry.register(backendConnection, controlToken)
             }
         }
         if (aborted) {
@@ -472,6 +475,14 @@ class FaktorFrontendService(
     /** The durable message page of ANY session id (child transcript slices). */
     fun messagesFor(sessionId: String, limit: Long = 50): dev.faktor.shared.NativeMessagePage =
         clientOrThrow().messages(sessionId, null, limit)
+
+    /** Backwards paging for transcript Find (unloaded durable pages). */
+    fun messagesBefore(
+        sessionId: String,
+        before: Long?,
+        limit: Long = 200
+    ): dev.faktor.shared.NativeMessagePage =
+        clientOrThrow().messages(sessionId, before, limit)
 
     fun events(after: Long, limit: Long = 256): dev.faktor.shared.NativeEventPage =
         clientOrThrow().events(requireSession(), after, limit)

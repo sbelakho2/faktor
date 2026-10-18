@@ -195,7 +195,12 @@ async fn runtime_context_limit_shrinks_the_budget_below_the_model_maximum() {
         !all_text.contains("turn seed0"),
         "the oldest seed must be trimmed under the runtime-limited budget"
     );
-    assert!(total > 25_000, "real history must survive: {total}");
+    // The history loader is bounded by the BUDGET's recent class (parts
+    // included), not by the whole transcript: with a 40K cap and the
+    // conservative 32K-profile recent=10K, a multi-hundred-KiB seed set
+    // must still leave real history on the wire. (The old 25K threshold
+    // was only reachable by the part-blind over-read the loader fixed.)
+    assert!(total > 5_000, "real history must survive: {total}");
 }
 
 /// Boundary race (audit): the active turn ends exactly as the runner's

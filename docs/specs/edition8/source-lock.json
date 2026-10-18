@@ -1,0 +1,27 @@
+{
+  "schema": "faktor-edition8-source-lock/v1",
+  "pdf": "Faktor_IDE_UI_UX_3.pdf",
+  "revision": 8,
+  "revision_date": "2026-10-17",
+  "extraction": "pdftotext -layout",
+  "extracted_text_sha256": "sha256:bef802a6d53744ce30023be7a12fe5859e5c3b0802efe6c78b3b804a155604a8",
+  "pages": {
+    "screens": "pp.20-180",
+    "workflows": "pp.183-186",
+    "visual": "pp.8-19, 188-196, 359-382",
+    "acceptance": "pp.343-345",
+    "controls": "pp.257-294",
+    "readiness": "pp.224-237",
+    "restored": "p.332",
+    "evidence": "p.346"
+  },
+  "artifacts": {
+    "controls": "sha256:df80a280b8423d30106132e342333e5a85bad644b2f65845bc58a38bb01ea084",
+    "screens": "sha256:c2b9655666e47c23d1ab65aa77164851d25b9bdc187afecef52dc9a50e29fb87",
+    "flows": "sha256:a22fa1582ec98d65bab168e6df499ea8604248519ffdf4fe8a522445aaaf8c8d",
+    "acceptance": "sha256:ae28d8067593e6a5baef8cf7ab891e01b4ae980c1c71b66a3e8c1ee1ebcb4908",
+    "expectations": "sha256:8be92336ebc8553a3f76cf9f8808cd60a5b697f0c8a2c473270c63d7e8b60ac1",
+    "registry": "sha256:2c309632f274ac46ffd7456df6753b130f16463c528f8154347fff61dcf1160f"
+  },
+  "note": "The PDF text extraction is a build-time input, not a release artifact."
+}

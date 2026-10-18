@@ -25,7 +25,30 @@
     "onCommand:faktor.reconnectStream",
     "onCommand:faktor.switchSession",
     "onCommand:faktor.locateDaemon",
-    "onView:faktor.chat"
+    "onView:faktor.chat",
+    "onCommand:faktor.openControlCenter",
+    "onCommand:faktor.openModelPicker",
+    "onCommand:faktor.openSettings",
+    "onView:faktor.edition8",
+    "onCommand:faktor.openEdition8",
+    "onCommand:faktor.openInspect8",
+    "onCommand:faktor.openHistory8",
+    "onCommand:faktor.openUsage8",
+    "onCommand:faktor.openSettings8",
+    "onCommand:faktor.openModelPicker8",
+    "onCommand:faktor.openAgentPicker8",
+    "onCommand:faktor.addContext8",
+    "onCommand:faktor.stopScoped8",
+    "onCommand:faktor.trustExecutable8",
+    "onCommand:faktor.deleteMemory8",
+    "onCommand:faktor.testHook8",
+    "onCommand:faktor.captureBrowser8",
+    "onCommand:faktor.switchConversationSafe8",
+    "onCommand:faktor.openControl8",
+    "onCommand:faktor.openProviders8",
+    "onCommand:faktor.openTools8",
+    "onCommand:faktor.openContext8",
+    "onCommand:faktor.openDiagnostics8"
   ],
   "main": "out/extension.js",
   "contributes": {
@@ -90,6 +113,117 @@
         "command": "faktor.locateDaemon",
         "title": "Locate daemon…",
         "category": "Faktor"
+      },
+      {
+        "command": "faktor.openControlCenter",
+        "title": "Open Control Center",
+        "icon": "$(settings-gear)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openModelPicker",
+        "title": "Models and Capabilities",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openSettings",
+        "title": "Settings: Edition 5",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openEdition8",
+        "title": "Faktor: Open Work",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openInspect8",
+        "title": "Faktor: Open Inspect",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openHistory8",
+        "title": "Faktor: Open History",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openUsage8",
+        "title": "Faktor: Open Usage & Outcomes",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openSettings8",
+        "title": "Faktor: Open Revision 8 Settings",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openProviders8",
+        "title": "Faktor: Open Providers",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openTools8",
+        "title": "Faktor: Open Tools & MCP",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openContext8",
+        "title": "Faktor: Open Context",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openDiagnostics8",
+        "title": "Faktor: Open Diagnostics",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openModelPicker8",
+        "title": "Faktor: Choose Model (Revision 8)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openAgentPicker8",
+        "title": "Faktor: Agents (Revision 8)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.addContext8",
+        "title": "Faktor: Add Context (Revision 8)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.stopScoped8",
+        "title": "Faktor: Stop… (Revision 8)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.trustExecutable8",
+        "title": "Faktor: Review Executable Trust",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.deleteMemory8",
+        "title": "Faktor: Review and Delete Memory",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.testHook8",
+        "title": "Faktor: Test Hook",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.captureBrowser8",
+        "title": "Faktor: Capture Browser Artifact",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.switchConversationSafe8",
+        "title": "Faktor: Switch Conversation (safe)",
+        "category": "Faktor"
+      },
+      {
+        "command": "faktor.openControl8",
+        "title": "Faktor: Open Settings Screen",
+        "category": "Faktor"
       }
     ],
     "viewsContainers": {
@@ -106,6 +240,11 @@
         {
           "id": "faktor.chat",
           "name": "Chat",
+          "type": "webview"
+        },
+        {
+          "id": "faktor.edition8",
+          "name": "Work · Inspect · History",
           "type": "webview"
         }
       ]
@@ -252,14 +391,33 @@
           }
         ]
       }
-    ]
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "faktor.openControl8",
+          "when": "false"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "tsc -p .",
     "selftest": "node scripts/selftest.mjs",
-    "render:check": "node scripts/render-webview.mjs --check",
+    "render:check": "node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
     "render:screenshots": "node scripts/render-webview.mjs --screenshots --prefix render",
-    "package:vsix": "npx --no-install vsce package"
+    "package:vsix": "npx --no-install vsce package",
+    "render:edition5": "node scripts/render-edition5.mjs --write",
+    "exercise:edition5": "node scripts/exercise-edition5.mjs",
+    "acceptance:edition5": "node scripts/acceptance-edition5.mjs",
+    "render:edition8": "node scripts/edition8-visual.mjs",
+    "exercise:edition8": "node scripts/edition8-control-exercise.mjs",
+    "acceptance:edition8": "node scripts/edition8-acceptance.mjs",
+    "workflows:edition8": "node scripts/edition8-workflows.mjs",
+    "contrast:edition8": "node scripts/edition8-contrast.mjs",
+    "optical:edition8": "node scripts/edition8-optical.mjs",
+    "e2e:edition8": "node scripts/stream-probe.mjs && bash ../../scripts/edition8/dogfood.sh",
+    "perf:edition8": "node ../../tests/edition8/perf.mjs --check"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

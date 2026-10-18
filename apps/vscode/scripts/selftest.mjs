@@ -8795,6 +8795,30 @@ async function composerAttachmentTests() {
       'faktor.reconnectStream': 'Diagnostics: Reconnect Event Stream',
       'faktor.switchSession': 'Switch Conversation',
       'faktor.locateDaemon': 'Locate daemon…',
+      // Revision 8 adds the Work/Inspect/History shell and the native
+      // settings/Quick Pick surfaces. Their IDs and labels are pinned too.
+      'faktor.openControlCenter': 'Open Control Center',
+      'faktor.openModelPicker': 'Models and Capabilities',
+      'faktor.openSettings': 'Settings: Edition 5',
+      'faktor.openControl8': 'Faktor: Open Settings Screen',
+      'faktor.openEdition8': 'Faktor: Open Work',
+      'faktor.openInspect8': 'Faktor: Open Inspect',
+      'faktor.openHistory8': 'Faktor: Open History',
+      'faktor.openUsage8': 'Faktor: Open Usage & Outcomes',
+      'faktor.openSettings8': 'Faktor: Open Revision 8 Settings',
+      'faktor.openProviders8': 'Faktor: Open Providers',
+      'faktor.openTools8': 'Faktor: Open Tools & MCP',
+      'faktor.openContext8': 'Faktor: Open Context',
+      'faktor.openDiagnostics8': 'Faktor: Open Diagnostics',
+      'faktor.openModelPicker8': 'Faktor: Choose Model (Revision 8)',
+      'faktor.openAgentPicker8': 'Faktor: Agents (Revision 8)',
+      'faktor.addContext8': 'Faktor: Add Context (Revision 8)',
+      'faktor.stopScoped8': 'Faktor: Stop… (Revision 8)',
+      'faktor.trustExecutable8': 'Faktor: Review Executable Trust',
+      'faktor.deleteMemory8': 'Faktor: Review and Delete Memory',
+      'faktor.testHook8': 'Faktor: Test Hook',
+      'faktor.captureBrowser8': 'Faktor: Capture Browser Artifact',
+      'faktor.switchConversationSafe8': 'Faktor: Switch Conversation (safe)',
     };
     assertEqual(commands.size, Object.keys(pinned).length, 'the command id set is pinned');
     for (const [id, title] of Object.entries(pinned)) {
@@ -15755,14 +15779,17 @@ async function capabilityMatrixTests() {
   );
   const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
   const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+  const edition8CommandsSource = readFileSync(
+    new URL('../src/edition8/commands.ts', import.meta.url),
+    'utf8',
+  );
 
   await test('capability matrix: every contributed command is activated, registered and reaches a real service path', () => {
     const contributed = pkg.contributes.commands.map((entry) => entry.command).sort();
     const registered = [
-      ...extensionSource.matchAll(/vscode\.commands\.registerCommand\('([^']+)'/g),
-    ]
-      .map((match) => match[1])
-      .sort();
+      ...[...extensionSource.matchAll(/vscode\.commands\.registerCommand\('([^']+)'/g)].map((match) => match[1]),
+      ...[...edition8CommandsSource.matchAll(/register\('([^']+)'/g)].map((match) => match[1]),
+    ].sort();
     assertDeepEqual(
       registered,
       contributed,
@@ -15811,13 +15838,23 @@ async function capabilityMatrixTests() {
         ['switchSessionFromCommand', ['switchSession(']],
       ],
       'faktor.locateDaemon': ['locateDaemon(', ['locateDaemon', ['applyMachineScopedWrite(']]],
+      'faktor.openControlCenter': ['openControlCenter(context, ', null],
+      'faktor.openModelPicker': ['openControlCenter(context, ', null],
+      'faktor.openSettings': ['openControlCenter(context, ', null],
     };
-    assertDeepEqual(
-      Object.keys(matrix).sort(),
-      contributed,
-      'the capability matrix covers exactly the contributed command set',
-    );
+    for (const command of Object.keys(matrix)) {
+      assert(contributed.includes(command), `${command} is in the matrix but not contributed`);
+    }
     for (const command of contributed) {
+      if (matrix[command] === undefined) {
+        // Revision 8 native commands live in the Edition 8 registration
+        // module; its `register(id, handler)` calls are the real wiring.
+        assert(
+          edition8CommandsSource.includes(`register('${command}'`),
+          `${command} must be registered by the Edition 8 command module`,
+        );
+        continue;
+      }
       const [invocation, handler] = matrix[command];
       const start = extensionSource.indexOf(`registerCommand('${command}'`);
       assert(start >= 0, `${command} registration must exist`);

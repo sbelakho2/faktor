@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W11",
+  "title": "Delegate and steer a bounded child",
+  "screens": [
+    "S07",
+    "S23",
+    "S14"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Admit a role within the parent envelope; show concurrency and budget reservation.",
+    "Bind candidate ownership (worktree/edit ownership) explicitly.",
+    "Inspect the child's actual model, role and status.",
+    "Send a ≤500-character steer or use a supported model control.",
+    "Resolve a child-scoped approval in the approval dock.",
+    "Inspect the typed handoff. Child output is evidence, not automatic parent success."
+  ],
+  "forbidden_fake_states": [
+    "Child \"done\" shown as parent verified",
+    "unbounded child wallets",
+    "stale controls acting on a new generation",
+    "steer silently truncated"
+  ],
+  "complete_when": "shared budget and ownership hold; a child saying done does not establish parent verification (p.185).",
+  "traceability": "p.185; controls A-06..A-12, M-11, B-04, Q-06; acceptance A25, A26.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

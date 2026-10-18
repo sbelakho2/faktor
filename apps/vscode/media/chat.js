@@ -5837,6 +5837,9 @@
   // stream metadata, the raw service URL, Refresh/Start/Stop and the raw
   // stream position. Nothing in it is product copy, so it stays collapsed
   // until asked for (Escape closes it and returns focus here).
+  byId('btn-control-center').addEventListener('click', function () {
+    vscode.postMessage({ type: 'openControlCenter', screen: 'S01' });
+  });
   byId('btn-overflow').addEventListener('click', function () {
     setDiagnosticsOpen(!diagnosticsOpen);
   });

@@ -294,6 +294,22 @@ class SettingsPanel(
         modelCombo.selectedItem = name
     }
 
+    /**
+     * Select one exact provider/model pair and persist the run defaults
+     * through the shared controller. A pair the served registry does not
+     * know is refused (the picker only offers served pairs).
+     */
+    fun selectRunModel(provider: String, model: String): Boolean {
+        if (!modelsByProvider[provider].orEmpty().contains(model)) return false
+        suppressEvents = true
+        providerCombo.selectedItem = provider
+        refreshModelCombo()
+        modelCombo.selectedItem = model
+        suppressEvents = false
+        emitSelection()
+        return true
+    }
+
     /** Select one offered mode; an unknown/removed mode is refused (no-op). */
     fun selectMutationMode(mode: String) {
         val index = (0 until mutationModel.size)

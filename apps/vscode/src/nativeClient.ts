@@ -3936,6 +3936,30 @@ export class NativeClient {
     }
   }
 
+  /**
+   * One Edition 5 native call through the same authenticated, bounded
+   * transport as every other route. The path must stay under /native/; the
+   * Edition 5 client owns the typed endpoint/DTO map and validates the body.
+   * Kept public so the Edition 5 panel shares auth, deadline and byte caps
+   * without duplicating transport policy.
+   */
+  edition5Json<T>(
+    method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+    path: string,
+    body: Json | null,
+    validate: (json: Json, path: string) => T,
+    maxBytes?: number,
+  ): Promise<T> {
+    if (!path.startsWith('/native/')) {
+      return Promise.reject(new NativeProtocolError('edition5', `refused non-native path ${path}`));
+    }
+    return this.request(method, path, {
+      body: body === null ? undefined : body,
+      validate,
+      ...(maxBytes !== undefined ? { maxBytes } : {}),
+    });
+  }
+
   health(): Promise<NativeHealth> {
     return this.request('GET', '/native/health', { validate: validateHealth });
   }

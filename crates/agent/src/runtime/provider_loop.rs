@@ -400,6 +400,18 @@ impl AgentRuntime {
         if !empty {
             let rendered = serde_json::to_string(summary).unwrap_or_default();
             handle.upsert_memory_fact("turn", &op_id.to_string(), &truncate(&rendered, 3500))?;
+            // Per-turn summaries are append-only long-term memory: keep a
+            // bounded newest window so a 300+ turn task cannot make the fact
+            // table (and every fact read) grow without limit. A prune failure
+            // is logged, never a failed turn — the next turn retries.
+            const MAX_TURN_FACTS: usize = 64;
+            if let Err(error) = handle.prune_memory_facts_kind_keep_newest("turn", MAX_TURN_FACTS) {
+                tracing::warn!(
+                    session = %handle.id(),
+                    %error,
+                    "per-turn memory fact pruning failed; the next turn retries"
+                );
+            }
         }
         Ok(())
     }

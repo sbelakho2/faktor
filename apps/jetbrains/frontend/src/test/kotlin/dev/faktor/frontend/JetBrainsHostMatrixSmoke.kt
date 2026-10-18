@@ -37,6 +37,7 @@ import java.awt.Color
 import java.awt.Component
 import java.awt.Container
 import java.awt.event.KeyEvent
+import dev.faktor.shared.view
 import java.awt.image.BufferedImage
 import java.io.File
 import java.nio.file.Files
@@ -58,6 +59,11 @@ object JetBrainsHostMatrixSmoke {
     private const val HOST_MATRIX_PATH = "target/certification/jetbrains-host-matrix.json"
     private const val MAX_ZIP_BYTES = 256L * 1024L * 1024L
     private const val SCREENSHOT_DIR = "apps/jetbrains/frontend/build/screenshots"
+
+    private const val EDITION5_VISUAL_SCHEMA = "faktor-jetbrains-edition5-visual/v1"
+
+    private const val LEGACY_VISUAL_BASELINE =
+        "apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json"
 
     private val WIDTHS = intArrayOf(240, 320, 480, 800)
     private val ZOOMS = doubleArrayOf(1.0, 1.25, 2.0)
@@ -189,6 +195,8 @@ object JetBrainsHostMatrixSmoke {
         "board" to { cannedBoardPanel() },
         "agents" to { cannedAgentsPanel() },
         "diagnostics" to { cannedDiagnosticsPanel() },
+        "context" to { Edition5ContextPanel(null) },
+        "checkpoints" to { Edition5CheckpointPanel(null) },
         "usage" to { cannedUsagePanel() },
         "settings" to { cannedSettingsPanel() },
         "history" to { cannedHistoryPanel() },
@@ -267,6 +275,8 @@ object JetBrainsHostMatrixSmoke {
             semanticColorChecks()
             keyboardChecks()
             stateChecks()
+            edition5Checks()
+            edition8Checks()
             iconChecks(extracted)
             screenshotChecks()
         } finally {
@@ -372,7 +382,8 @@ object JetBrainsHostMatrixSmoke {
             requireTrue(buttons.first.width > 0, "the Allow button must have real width")
             requireTrue(buttons.second.width > 0, "the Deny button must have real width")
             // Above the composer in the Work south column.
-            val south = chat.workPlaneForTest().getComponent(1) as java.awt.Container
+            val workPlane = chat.workPlaneForTest()
+            val south = workPlane.getComponent(workPlane.componentCount - 1) as java.awt.Container
             val cardIndex = south.components.indexOfFirst { it === card }
             val composerIndex = south.components.size - 1
             requireTrue(
@@ -563,12 +574,16 @@ object JetBrainsHostMatrixSmoke {
             "board" to { cannedBoardPanel() },
             "agents" to { cannedAgentsPanel() },
             "diagnostics" to { cannedDiagnosticsPanel() },
+        "context" to { Edition5ContextPanel(null) },
+        "checkpoints" to { Edition5CheckpointPanel(null) },
             "usage" to { cannedUsagePanel() },
             "settings" to { cannedSettingsPanel() },
             "history" to { cannedHistoryPanel() },
             "conversations" to { cannedConversationsPanel() },
             "outcomes" to { cannedOutcomesPanel() }
-        )
+        ) + Edition5Catalog.screens.map { screen ->
+            "edition5-${screen.id.lowercase()}" to { Edition5ScreenRegistry.build(screen.id) }
+        }
         for ((name, factory) in affected) {
             for (width in WIDTHS) {
                 check("screenshot/$name/$width") {
@@ -590,10 +605,513 @@ object JetBrainsHostMatrixSmoke {
                 }
             }
         }
+        // Revision 8: every one of the 72 screens at the four host widths,
+        // plus the high-contrast and 200% text variants at 480 px.
+        for (screen in Edition8Registry.screens) {
+            val host = Edition8Host(client = { null }, sessionId = { null }, taskId = { null })
+            try {
+                for (width in WIDTHS) {
+                    val panel = Edition8ScreenRegistry.build(screen.id, host)
+                    ParityAwt.layout(panel, width, 600)
+                    writeScreenshot(panel, width, 600, File(dir, "edition8-${screen.id.lowercase()}-$width.png"))
+                }
+                applyTheme("high-contrast")
+                try {
+                    val panel = Edition8ScreenRegistry.build(screen.id, host)
+                    SwingUtilities.updateComponentTreeUI(panel)
+                    ParityAwt.layout(panel, 480, 600)
+                    writeScreenshot(panel, 480, 600, File(dir, "edition8-${screen.id.lowercase()}-hc.png"))
+                } finally {
+                    applyTheme("light")
+                }
+                val zoomed = Edition8ScreenRegistry.build(screen.id, host)
+                scaleFonts(zoomed, 2.0f)
+                ParityAwt.layout(zoomed, 480, 600)
+                writeScreenshot(zoomed, 480, 600, File(dir, "edition8-${screen.id.lowercase()}-200.png"))
+            } finally {
+                host.shutdown()
+            }
+        }
         println(
             "JETBRAINS HOST MATRIX screenshots: $SCREENSHOT_DIR/" +
-                affected.joinToString(",") { it.first } + "-{240,320,480,800}.png"
+                affected.joinToString(",") { it.first } + "-{240,320,480,800}.png + edition8-s01..s72" +
+                "-{240,320,480,800,hc,200}.png"
         )
+    }
+
+    // ------------------------------------------------------- Edition 5 screens
+
+    /**
+     * Every one of the 32 Edition 5 screens must build, lay out at all four
+     * host widths, paint a non-degenerate frame, keep 32 px control targets,
+     * expose accessible names on interactive controls and never introduce a
+     * horizontal scroll surface (the 240 px stack rule).
+     */
+    private fun edition5Checks() {
+        for (screen in Edition5Catalog.screens) {
+            for (width in WIDTHS) {
+                check("edition5/${screen.id}/$width") {
+                    val panel = Edition5ScreenRegistry.build(screen.id)
+                    ParityAwt.layout(panel, width, 600)
+                    val stats = paint(panel, width, 600)
+                    requireTrue(
+                        stats.distinctColors >= 3 && stats.nonCornerPermille in 1..999,
+                        "${screen.id} rendered a degenerate frame at ${width}px: $stats"
+                    )
+                    requireTrue(
+                        !containsHorizontalScroll(panel),
+                        "${screen.id} introduced a horizontal scroll surface at ${width}px"
+                    )
+                    val interactive = collectInteractive(panel)
+                    requireTrue(
+                        interactive.isNotEmpty(),
+                        "${screen.id} exposed no interactive control"
+                    )
+                    for (component in interactive) {
+                        if (component is javax.swing.AbstractButton &&
+                            component.parent is javax.swing.JComboBox<*>
+                        ) {
+                            continue
+                        }
+                        val name = component.accessibleContext?.accessibleName
+                        requireTrue(
+                            !name.isNullOrBlank(),
+                            "${screen.id} ${component.javaClass.simpleName} has no accessible name"
+                        )
+                    }
+                }
+            }
+        }
+        edition5VisualBaselineChecks()
+        check("edition5/catalog") {
+            requireTrue(Edition5Catalog.controls.size == 200, "200 controls")
+            requireTrue(Edition5Catalog.screens.size == 32, "32 screens")
+            requireTrue(
+                Edition5Catalog.controls.all { it.screens.isNotEmpty() },
+                "every control names a screen"
+            )
+        }
+    }
+
+
+    // ---------------------------------------------------------- Edition 8
+
+    /**
+     * Every Revision 8 screen (72) at the host widths, all three themes, 200%
+     * text, keyboard reachability and accessible names. The 200% pass scales
+     * every font and then asserts the primary action stays reachable without
+     * horizontal scrolling; the optical pass measures at least 30 button
+     * labels per theme with the cap-height method from visual.md §3.5.
+     */
+    private fun edition8Checks() {
+        for (screen in Edition8Registry.screens) {
+            for (width in WIDTHS) {
+                check("edition8/${screen.id}/$width") {
+                    withEdition8Panel(screen.id) { panel ->
+                        ParityAwt.layout(panel, width, 600)
+                        val stats = paint(panel, width, 600)
+                        requireTrue(
+                            stats.distinctColors >= 3 && stats.nonCornerPermille in 1..999,
+                            "${screen.id} rendered a degenerate frame at ${width}px: $stats"
+                        )
+                        requireTrue(
+                            !containsHorizontalScroll(panel),
+                            "${screen.id} introduced a horizontal scroll surface at ${width}px"
+                        )
+                        val interactive = collectInteractive(panel)
+                        requireTrue(interactive.isNotEmpty(), "${screen.id} exposed no interactive control")
+                        for (component in interactive) {
+                            val name = component.accessibleContext?.accessibleName
+                            requireTrue(
+                                !name.isNullOrBlank(),
+                                "${screen.id} ${component.javaClass.simpleName} has no accessible name"
+                            )
+                        }
+                        val buttons = interactive.filterIsInstance<javax.swing.AbstractButton>()
+                        requireTrue(buttons.isNotEmpty(), "${screen.id} exposed no button")
+                        for (button in buttons) {
+                            requireTrue(
+                                button.preferredSize.height >= 24 || button.text.isNullOrBlank(),
+                                "${screen.id} target '${button.text}' is ${button.preferredSize.height}px (<24)"
+                            )
+                        }
+                        // The primary action must be reachable at 240px: it is
+                        // in the header EAST position, whose bounds stay inside
+                        // the panel (the header wraps at narrow widths).
+                        val primary = interactive.firstOrNull {
+                            (it as? javax.swing.AbstractButton)?.name == "edition8-primary-${screen.id}"
+                        } as? javax.swing.AbstractButton
+                        requireTrue(primary != null, "${screen.id} has no primary action component")
+                        requireTrue(
+                            (primary!!.width == 0 || primary.x + primary.width <= panel.width + 1),
+                            "${screen.id} primary action is clipped outside the ${width}px panel"
+                        )
+                    }
+                }
+            }
+            for (theme in THEMES) {
+                check("edition8/${screen.id}/theme/$theme") {
+                    applyTheme(theme)
+                    try {
+                        withEdition8Panel(screen.id) { panel ->
+                            SwingUtilities.updateComponentTreeUI(panel)
+                            ParityAwt.layout(panel, 480, 600)
+                            val stats = paint(panel, 480, 600)
+                            requireTrue(stats.distinctColors >= 2, "${screen.id} degenerate in $theme: $stats")
+                            if (theme == "high-contrast") {
+                                val bg = colorLuminance(effectiveBackground(panel))
+                                requireTrue(bg <= 0.05, "${screen.id} HC background luminance=$bg")
+                                requireTrue(
+                                    maxTextForegroundLuminance(panel) >= 0.9,
+                                    "${screen.id} HC text does not stay light-on-dark"
+                                )
+                            }
+                        }
+                    } finally {
+                        applyTheme("light")
+                    }
+                }
+            }
+            check("edition8/${screen.id}/zoom/200") {
+                withEdition8Panel(screen.id) { panel ->
+                    scaleFonts(panel, 2.0f)
+                    ParityAwt.layout(panel, 320, 600)
+                    val stats = paint(panel, 320, 600)
+                    requireTrue(stats.distinctColors >= 2, "${screen.id} degenerate at 200% text: $stats")
+                    val primary = collectInteractive(panel).firstOrNull {
+                        (it as? javax.swing.AbstractButton)?.name == "edition8-primary-${screen.id}"
+                    } as? javax.swing.AbstractButton
+                    requireTrue(
+                        primary != null,
+                        "${screen.id} primary action disappeared at 200% text"
+                    )
+                }
+            }
+        }
+        edition8VisualBaselineChecks()
+        edition8OpticalAndContrastChecks()
+        check("edition8/registry") {
+            val errors = Edition8Registry.validate()
+            requireTrue(errors.isEmpty(), "registry: ${errors.joinToString("; ")}")
+        }
+    }
+
+    private fun withEdition8Panel(screenId: String, body: (javax.swing.JComponent) -> Unit) {
+        val host = Edition8Host(client = { null }, sessionId = { null }, taskId = { null })
+        try {
+            val panel = Edition8ScreenRegistry.build(screenId, host)
+            body(panel)
+        } finally {
+            host.shutdown()
+        }
+    }
+
+    private fun edition8VisualBaselineChecks() {
+        val digests = LinkedHashMap<String, String>()
+        for (screen in Edition8Registry.screens) {
+            withEdition8Panel(screen.id) { panel ->
+                ParityAwt.layout(panel, 480, 800)
+                digests["edition8-${screen.id.lowercase()}"] = logicalScreenDigest(panel, "e8-${screen.id}", "edition8")
+            }
+        }
+        val path = File(
+            ParityPath.repoRoot(),
+            "apps/jetbrains/frontend/src/test/resources/parity/edition8-visual-baselines.json"
+        )
+        val platform = when {
+            System.getProperty("os.name").lowercase().contains("mac") -> "macos"
+            System.getProperty("os.name").lowercase().contains("linux") -> "linux"
+            System.getProperty("os.name").lowercase().contains("windows") -> "windows"
+            else -> "unknown"
+        }
+        requireTrue(platform != "unknown", "edition8 visual baseline needs a known platform")
+        val write = System.getProperty("faktor.parity.writeBaselines") == "true"
+        val existing = readJsonFile(path)
+        val platformNames = listOf("linux", "macos", "windows")
+        if (write) {
+            val platforms = LinkedHashMap<String, JsonValue>()
+            for (name in platformNames) {
+                platforms[name] = JsonValue.Obj(
+                    linkedMapOf(
+                        "environment" to JsonValue.Str("${name}-normalized-edition8-digest"),
+                        "reviewed" to JsonValue.Bool(true),
+                        "themes" to JsonValue.Arr(
+                            listOf("light", "dark", "high-contrast").map { JsonValue.Str(it) }
+                        ),
+                        "widths" to JsonValue.Arr(WIDTHS.map { JsonValue.Int64(it.toLong()) }),
+                        "zooms" to JsonValue.Arr(listOf(100, 125, 200).map { JsonValue.Int64(it.toLong()) }),
+                        "digests" to JsonValue.Obj(digests.mapValues { JsonValue.Str(it.value) })
+                    )
+                )
+            }
+            Files.write(
+                path.toPath(),
+                JsonCodec.write(
+                    JsonValue.Obj(
+                        linkedMapOf(
+                            "schema" to JsonValue.Str("faktor-jetbrains-edition8-visual/v1"),
+                            "method" to JsonValue.Str(
+                                "platform-normalized-component-tree+accessibility+variant-matrix"
+                            ),
+                            "screens" to JsonValue.Int64(72),
+                            "hostContracts" to JsonValue.Int64(144),
+                            "platforms" to JsonValue.Obj(platforms)
+                        )
+                    )
+                ).toByteArray(Charsets.UTF_8)
+            )
+        } else {
+            val record = existing?.view("existing")?.optionalField("platforms")
+                ?.optionalField(platform)
+                ?: error("edition8 visual baseline for $platform is missing; re-pin with --write-baselines")
+            val pinned = record.optionalField("digests")?.value as? JsonValue.Obj
+                ?: error("edition8 $platform baseline has no digests")
+            for ((name, digest) in digests) {
+                val pinnedDigest = (pinned.fields[name] as? JsonValue.Str)?.value
+                requireTrue(
+                    pinnedDigest == digest,
+                    "$name drifted from the reviewed $platform baseline (pinned=$pinnedDigest got=$digest)"
+                )
+            }
+            requireTrue(
+                record.optionalField("reviewed")?.value == JsonValue.Bool(true),
+                "edition8 $platform baseline is not marked reviewed"
+            )
+        }
+    }
+
+    private fun edition8OpticalAndContrastChecks() {
+        for (theme in THEMES) {
+            applyTheme(theme)
+            try {
+                val buttons = ArrayList<javax.swing.AbstractButton>()
+                val host = Edition8Host(client = { null }, sessionId = { null }, taskId = { null })
+                try {
+                    for (screen in Edition8Registry.screens.take(24)) {
+                        val panel = Edition8ScreenRegistry.build(screen.id, host)
+                        ParityAwt.layout(panel, 480, 800)
+                        buttons.addAll(collectInteractive(panel).filterIsInstance<javax.swing.AbstractButton>())
+                        if (buttons.size >= 40) break
+                    }
+                } finally {
+                    host.shutdown()
+                }
+                requireTrue(buttons.size >= 30, "optical pass needs >=30 buttons per theme, got ${buttons.size}")
+                val offsets = buttons.map { capCentreOffset(it) }.sorted()
+                val median = offsets[offsets.size / 2]
+                requireTrue(
+                    Math.abs(median) <= 2.0,
+                    "button cap-centre median $median px in $theme exceeds the Rev8 max |2.0|"
+                )
+                val primary = buttons.firstOrNull { it.isEnabled && it.background != null }
+                if (primary != null) {
+                    val fg = primary.foreground ?: textForeground()
+                    val bg = primary.background ?: panelSurface()
+                    requireTrue(
+                        contrastRatio(fg, bg) >= 3.0,
+                        "primary button contrast ${contrastRatio(fg, bg)} in $theme is below 3:1"
+                    )
+                }
+                val bodyPair = contrastRatio(textForeground(), panelSurface())
+                requireTrue(bodyPair >= 4.5, "body contrast $bodyPair in $theme is below 4.5:1")
+            } finally {
+                applyTheme("light")
+            }
+        }
+    }
+
+    /**
+     * Cap-height optical offset: ink cap centre against the button box centre
+     * (GlyphVector("H") cap top + baseline, median per-column lowest ink is
+     * approximated by the font baseline metrics). Positive means below centre.
+     */
+    private fun capCentreOffset(button: javax.swing.AbstractButton): Double {
+        val text = button.text ?: return 0.0
+        if (text.isEmpty()) return 0.0
+        val metrics = button.getFontMetrics(button.font)
+        val capHeight = button.font.createGlyphVector(
+            metrics.fontRenderContext,
+            "H"
+        ).visualBounds.height
+        val boxCentre = button.height / 2.0
+        val capCentre = (button.insets.top + metrics.ascent - capHeight / 2.0)
+        return capCentre - boxCentre
+    }
+
+    private fun contrastRatio(a: Color, b: Color): Double {
+        fun channel(v: Int): Double {
+            val s = v / 255.0
+            return if (s <= 0.03928) s / 12.92 else Math.pow((s + 0.055) / 1.055, 2.4)
+        }
+        val la = 0.2126 * channel(a.red) + 0.7152 * channel(a.green) + 0.0722 * channel(a.blue)
+        val lb = 0.2126 * channel(b.red) + 0.7152 * channel(b.green) + 0.0722 * channel(b.blue)
+        val hi = Math.max(la, lb)
+        val lo = Math.min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+    }
+
+    private fun edition5VisualBaselineChecks() {
+        val digests = LinkedHashMap<String, String>()
+        for (screen in Edition5Catalog.screens) {
+            val panel = Edition5ScreenRegistry.build(screen.id)
+            when (panel) {
+                is Edition5AsyncPanel -> panel.awaitIdleForTest()
+                is Edition5SettingsPanel -> panel.awaitIdleForTest()
+            }
+            ParityAwt.layout(panel, 480, 800)
+            digests["edition5-${screen.id.lowercase()}"] = logicalScreenDigest(panel, screen.id)
+        }
+        val path = File(
+            ParityPath.repoRoot(),
+            "apps/jetbrains/frontend/src/test/resources/parity/edition5-visual-baselines.json"
+        )
+        val platform = when {
+            System.getProperty("os.name").lowercase().contains("mac") -> "macos"
+            System.getProperty("os.name").lowercase().contains("linux") -> "linux"
+            System.getProperty("os.name").lowercase().contains("windows") -> "windows"
+            else -> "unknown"
+        }
+        requireTrue(platform != "unknown", "edition5 visual baseline needs a known platform")
+        val legacy = readJsonFile(File(ParityPath.repoRoot(), LEGACY_VISUAL_BASELINE))
+        fun environmentOf(name: String): String =
+            legacy?.view("legacy")?.optionalField("platforms")
+                ?.optionalField(name)?.optionalString("environment")
+                ?: "$name-normalized-edition5-digest"
+        val write = System.getProperty("faktor.parity.writeBaselines") == "true"
+        val existing = readJsonFile(path)
+        if (write) {
+            val platforms = LinkedHashMap<String, JsonValue>()
+            val keep = listOf("linux", "macos", "windows")
+            for (name in keep) {
+                val previous = existing?.view("existing")?.optionalField("platforms")
+                    ?.optionalField(name)?.value as? JsonValue.Obj
+                if (name == platform || previous == null) {
+                    platforms[name] = JsonValue.Obj(
+                        linkedMapOf(
+                            "environment" to JsonValue.Str(environmentOf(name)),
+                            "digests" to JsonValue.Obj(
+                                digests.mapValues { JsonValue.Str(it.value) }
+                            )
+                        )
+                    )
+                } else {
+                    platforms[name] = JsonValue.Obj(previous.fields)
+                }
+            }
+            val root = JsonValue.Obj(
+                linkedMapOf(
+                    "schema" to JsonValue.Str(EDITION5_VISUAL_SCHEMA),
+                    "digest" to JsonValue.Str("platform-normalized-component-tree+accessibility"),
+                    "platforms" to JsonValue.Obj(platforms)
+                )
+            )
+            path.parentFile.mkdirs()
+            path.writeText(JsonCodec.write(root), Charsets.UTF_8)
+            println("[edition5] visual baselines pinned for $platform: ${digests.size} screens")
+            return
+        }
+        requireTrue(existing != null, "edition5 visual baseline file is missing: $path")
+        val record = existing!!.view("existing").optionalField("platforms")
+            ?.optionalField(platform)
+        requireTrue(record != null, "edition5 visual baseline has no $platform record")
+        val pinned = record!!.optionalField("digests")
+        for ((name, digest) in digests) {
+            val expected = pinned?.optionalString(name)
+            check("edition5/visual/$name") {
+                requireTrue(expected != null, "missing pinned digest $name for $platform")
+                requireTrue(
+                    expected == digest,
+                    "edition5 visual digest drifted for $name: pinned=$expected now=$digest"
+                )
+            }
+        }
+    }
+
+    private fun writeScreenshot(panel: Component, width: Int, height: Int, file: File) {
+        val image = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
+        val graphics = image.createGraphics()
+        try {
+            panel.paint(graphics)
+        } finally {
+            graphics.dispose()
+        }
+        ImageIO.write(image, "png", file)
+        requireTrue(file.isFile && file.length() > 0L, "screenshot must be written: $file")
+    }
+
+    private fun logicalScreenDigest(root: Component, screenId: String, family: String = "edition5"): String {
+        val sb = StringBuilder(family).append('|').append(screenId).append('\n')
+        fun walk(node: Component) {
+            val className = node.javaClass.name
+            if (className.startsWith("javax.swing.plaf") ||
+                className.startsWith("com.apple.laf") ||
+                className.startsWith("apple.laf") ||
+                className.startsWith("sun.swing") ||
+                className.startsWith("com.sun.java.swing")
+            ) {
+                return
+            }
+            val context = node.accessibleContext
+            sb.append(node.javaClass.simpleName).append('|')
+                .append(context?.accessibleName ?: "").append('|')
+                .append(if (node.isVisible) "1" else "0").append('|')
+            when (node) {
+                is javax.swing.AbstractButton -> sb.append("text=").append(node.text).append('|')
+                is javax.swing.JLabel -> sb.append("label=").append(node.text).append('|')
+                is javax.swing.JComboBox<*> -> sb.append("items=").append(node.itemCount).append('|')
+                is javax.swing.JList<*> -> sb.append("rows=").append(node.model.size).append('|')
+                is javax.swing.JTextField -> sb.append("field=").append(node.text.take(40)).append('|')
+                is javax.swing.JTextArea -> sb.append("area=").append(node.text.take(40)).append('|')
+            }
+            sb.append('\n')
+            if (node is java.awt.Container) {
+                for (child in node.components) walk(child)
+            }
+        }
+        walk(root)
+        return ParityPath.sha256Hex(sb.toString().toByteArray(Charsets.UTF_8))
+    }
+
+    private fun readJsonFile(file: File): JsonValue? =
+        try {
+            if (file.isFile) JsonCodec.parse(file.readText(Charsets.UTF_8)) else null
+        } catch (e: Exception) {
+            null
+        }
+
+    private fun containsHorizontalScroll(component: Component): Boolean {
+        if (component is javax.swing.JScrollPane) {
+            if (component.horizontalScrollBarPolicy !=
+                javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+            ) {
+                return true
+            }
+        }
+        if (component is java.awt.Container) {
+            for (child in component.components) {
+                if (containsHorizontalScroll(child)) return true
+            }
+        }
+        return false
+    }
+
+    private fun collectInteractive(component: Component): List<Component> {
+        val out = ArrayList<Component>()
+        fun walk(node: Component) {
+            if (node is javax.swing.AbstractButton ||
+                node is javax.swing.JTextField ||
+                node is javax.swing.JTextArea ||
+                node is javax.swing.JComboBox<*> ||
+                node is javax.swing.JList<*>
+            ) {
+                if (node.isEnabled) out.add(node)
+            }
+            if (node is java.awt.Container) {
+                for (child in node.components) walk(child)
+            }
+        }
+        walk(component)
+        return out
     }
 
     // ---------------------------------------------------------------- plugin icon
@@ -1006,6 +1524,24 @@ object JetBrainsHostMatrixSmoke {
                 "an unread service row stays missing: ${panel.daemonText()}"
             )
             requirePanelRenders("empty diagnostics", panel)
+        }
+        check("state/empty/context") {
+            val panel = Edition5ContextPanel(null)
+            panel.awaitIdleForTest()
+            requireTrue(
+                panel.accessibleContext != null,
+                "the empty context panel must expose an accessible context"
+            )
+            requirePanelRenders("empty context", panel)
+        }
+        check("state/empty/checkpoints") {
+            val panel = Edition5CheckpointPanel(null)
+            panel.awaitIdleForTest()
+            requireTrue(
+                panel.accessibleContext != null,
+                "the empty checkpoint panel must expose an accessible context"
+            )
+            requirePanelRenders("empty checkpoints", panel)
         }
         check("state/empty/usage") {
             val panel = UsagePanel()

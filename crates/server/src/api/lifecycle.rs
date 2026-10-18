@@ -1,6 +1,7 @@
 //! `api::lifecycle`: cohesive slice of the api module.
 
 use super::*;
+use axum::routing::put;
 
 /// The startup line the daemon prints after binding (frozen stdout
 /// contract; nothing else may be printed on stdout).
@@ -546,22 +547,8 @@ where
     Ok(())
 }
 
-pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<ServerHandle> {
-    // Bind first, then compute the line (needs the bound address) and
-    // finally move the deps into the router.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let addr = listener.local_addr()?;
-    let startup_line = deps.startup_line(addr);
-    // Readiness (audit 55): the flag starts false and flips true ONLY when
-    // setup completes. Recovery runs before serve in the caller (the CLI
-    // opens the store and runs `agent.recover()` first), migrations applied
-    // at store open are implicit, and the required runtime components are
-    // non-optional `Arc`s in `ServerDeps` — so the flip at the end of setup
-    // is exactly the ready moment. `simulate_not_ready` (tests) keeps it
-    // false forever: /native/ready answers 503 {ready:false}.
-    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let set_ready = !deps.simulate_not_ready;
-    let app = Router::new()
+fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         // Faktor Native Protocol v1 (docs/native-protocol.md): the daemon's
         // OWN surface, optimized around this runtime. These handlers speak
         // native JSON.
@@ -693,6 +680,459 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         .route("/native/messages", get(native_messages))
         .route("/native/events", get(native_events))
         .route("/native/providers", get(native_providers))
+}
+
+fn native_foundation_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        // ---- Edition 5 foundation (settings/runtime contract) ----
+        .route(
+            "/native/config/descriptors",
+            get(foundation::native_config_descriptors),
+        )
+        .route(
+            "/native/config/snapshot",
+            get(foundation::native_config_snapshot),
+        )
+        .route(
+            "/native/config/preview",
+            post(foundation::native_config_preview),
+        )
+        .route(
+            "/native/config/commit",
+            post(foundation::native_config_commit),
+        )
+        .route(
+            "/native/config/rollback",
+            post(foundation::native_config_rollback),
+        )
+        .route(
+            "/native/config/runtime-ack",
+            post(foundation::native_config_runtime_ack),
+        )
+        .route(
+            "/native/config/search",
+            get(foundation::native_config_search),
+        )
+        .route(
+            "/native/config/export",
+            get(foundation::native_config_export),
+        )
+        .route(
+            "/native/config/import",
+            post(foundation::native_config_import),
+        )
+        .route(
+            "/native/providers/connections",
+            get(foundation::native_provider_connections)
+                .post(foundation::native_provider_connection_save),
+        )
+        .route(
+            "/native/providers/connections/{id}",
+            delete(foundation::native_provider_connection_delete),
+        )
+        .route(
+            "/native/providers/connections/{id}/test",
+            post(foundation::native_provider_connection_test),
+        )
+        .route(
+            "/native/providers/connections/{id}/health",
+            get(foundation::native_provider_connection_health),
+        )
+        .route(
+            "/native/providers/credentials",
+            get(foundation::native_provider_credentials)
+                .post(foundation::native_provider_credential_store),
+        )
+        .route(
+            "/native/providers/credentials/rotate",
+            post(foundation::native_provider_credential_rotate),
+        )
+        .route(
+            "/native/providers/credentials/{handle}",
+            delete(foundation::native_provider_credential_delete),
+        )
+        .route(
+            "/native/model-parameters",
+            get(foundation::native_model_parameters),
+        )
+        .route(
+            "/native/model-parameters/compile",
+            post(foundation::native_model_compile),
+        )
+        .route(
+            "/native/call-receipts",
+            get(foundation::native_call_receipts),
+        )
+        .route(
+            "/native/session/{id}/context/preview",
+            post(foundation::native_context_preview),
+        )
+        .route(
+            "/native/session/{id}/context/manifests",
+            post(foundation::native_context_capture),
+        )
+        .route(
+            "/native/context/manifest",
+            get(foundation::native_context_manifest),
+        )
+        .route(
+            "/native/context/manifests",
+            get(foundation::native_context_manifests),
+        )
+        .route(
+            "/native/session/{id}/context/compact",
+            post(foundation::native_context_compact),
+        )
+        // Rev8 durable compaction operations (S10/K-03/K-04): explicit op id,
+        // durable progress/cancel and atomic checkpoint+event commit.
+        .route(
+            "/native/session/{id}/context/compaction",
+            post(longtask::native_compaction_start).get(longtask::native_compaction_latest),
+        )
+        .route(
+            "/native/session/{id}/context/compaction/{operation}",
+            get(longtask::native_compaction_status),
+        )
+        .route(
+            "/native/session/{id}/context/compaction/{operation}/cancel",
+            post(longtask::native_compaction_cancel),
+        )
+        .route(
+            "/native/permissions/policy",
+            get(foundation::native_permissions_policy),
+        )
+        .route(
+            "/native/permissions/rules",
+            post(foundation::native_permission_rule_save),
+        )
+        .route(
+            "/native/permissions/rules/{id}",
+            delete(foundation::native_permission_rule_delete),
+        )
+        .route(
+            "/native/permissions/preview",
+            post(foundation::native_permission_preview),
+        )
+        .route(
+            "/native/permissions/audit",
+            get(foundation::native_permission_audit),
+        )
+        .route(
+            "/native/diagnostics/preview",
+            get(foundation::native_diagnostics_preview),
+        )
+        .route(
+            "/native/diagnostics/export",
+            post(foundation::native_diagnostics_export),
+        )
+        // ---- Edition 5 lifecycle surfaces ----
+        .route(
+            "/native/sessions/parallel",
+            get(foundation_ext::native_sessions_parallel),
+        )
+        .route(
+            "/native/sessions/{id}/meta",
+            get(foundation_ext::native_session_meta)
+                .post(foundation_ext::native_session_meta_update),
+        )
+        .route(
+            "/native/transcript/search",
+            get(foundation_ext::native_transcript_search),
+        )
+        .route(
+            "/native/memory",
+            get(foundation_ext::native_memory_list).post(foundation_ext::native_memory_write),
+        )
+        // Rev8 memory V2 management (S12/S66/K-10/K-11): provenance,
+        // optimistic versions, tombstone/restore, dedupe, bounded retention.
+        .route(
+            "/native/memory/records",
+            get(longtask::native_memory_records_list).post(longtask::native_memory_records_create),
+        )
+        .route(
+            "/native/memory/records/retention",
+            post(longtask::native_memory_records_retention),
+        )
+        .route(
+            "/native/memory/records/{id}",
+            put(longtask::native_memory_records_update)
+                .delete(longtask::native_memory_records_delete),
+        )
+        .route(
+            "/native/memory/records/{id}/restore",
+            post(longtask::native_memory_records_restore),
+        )
+        .route(
+            "/native/memory/policy",
+            get(longtask::native_memory_policy_get).put(longtask::native_memory_policy_put),
+        )
+        // Rev8 instruction inspection/editing (S11/S69/I-11).
+        .route(
+            "/native/instructions",
+            get(instructions::native_instructions_list),
+        )
+        .route(
+            "/native/instructions/preview",
+            get(instructions::native_instructions_preview),
+        )
+        .route(
+            "/native/instructions/source",
+            put(instructions::native_instructions_source_put),
+        )
+        .route(
+            "/native/memory/retention",
+            post(foundation_ext::native_memory_retention),
+        )
+        .route(
+            "/native/memory/{kind}/{key}",
+            delete(foundation_ext::native_memory_delete),
+        )
+        .route(
+            "/native/mcp/servers",
+            get(foundation_ext::native_mcp_servers).post(foundation_ext::native_mcp_server_save),
+        )
+        .route(
+            "/native/mcp/servers/{id}",
+            delete(foundation_ext::native_mcp_server_delete),
+        )
+        .route(
+            "/native/mcp/servers/{id}/start",
+            post(foundation_ext::native_mcp_server_start),
+        )
+        .route(
+            "/native/mcp/servers/{id}/stop",
+            post(foundation_ext::native_mcp_server_stop),
+        )
+        .route(
+            "/native/mcp/servers/{id}/tools",
+            get(foundation_ext::native_mcp_server_tools),
+        )
+        .route(
+            "/native/mcp/servers/{id}/connect",
+            post(foundation_ext::native_mcp_server_connect),
+        )
+        .route(
+            "/native/mcp/servers/{id}/resources",
+            get(foundation_ext::native_mcp_server_resources),
+        )
+        .route(
+            "/native/mcp/servers/{id}/auth",
+            get(foundation_ext::native_mcp_server_auth_get)
+                .post(foundation_ext::native_mcp_server_auth),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/revoke",
+            post(foundation_ext::native_mcp_server_oauth_revoke),
+        )
+        .route("/native/skills", get(foundation_ext::native_skills))
+        .route(
+            "/native/skills/install",
+            post(foundation_ext::native_skill_install),
+        )
+        .route(
+            "/native/skills/{id}",
+            get(foundation_ext::native_skill_get).delete(foundation_ext::native_skill_delete),
+        )
+        .route(
+            "/native/skills/{id}/trust",
+            post(foundation_ext::native_skill_trust),
+        )
+        .route(
+            "/native/skills/{id}/invocation",
+            post(foundation_ext::native_skill_invocation),
+        )
+        .route(
+            "/native/skills/{id}/invoke",
+            post(foundation_ext::native_skill_invoke),
+        )
+        .route(
+            "/native/hooks",
+            get(foundation_ext::native_hooks).post(foundation_ext::native_hook_save),
+        )
+        .route(
+            "/native/hooks/audit",
+            get(foundation_ext::native_hook_audit),
+        )
+        .route(
+            "/native/hooks/{id}",
+            delete(foundation_ext::native_hook_delete),
+        )
+        .route(
+            "/native/hooks/{id}/test",
+            post(foundation_ext::native_hook_test),
+        )
+        .route("/native/tools", get(foundation_ext::native_tools))
+        .route(
+            "/native/browser/status",
+            get(foundation_ext::native_browser_status),
+        )
+        .route(
+            "/native/browser/validate-url",
+            post(foundation_ext::native_browser_validate_url),
+        )
+}
+
+fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        // ---- Revision 8 daemon contract layer (additive) ----
+        // Config provenance/conflicts (S60/S64) and single-scope reset.
+        .route(
+            "/native/config/provenance",
+            get(r8::native_config_provenance),
+        )
+        .route("/native/config/reset", post(r8::native_config_reset))
+        // Durable instruction/rule records, previews, imports and captured
+        // bundles (S11/S69/I-01..I-11). Distinct from the file-tree
+        // inspection routes at /native/instructions above.
+        .route(
+            "/native/instructions/records",
+            get(r8::native_instruction_records).post(r8::native_instruction_upsert),
+        )
+        .route(
+            "/native/instructions/records/preview",
+            post(r8::native_instruction_preview),
+        )
+        .route(
+            "/native/instructions/records/{id}",
+            get(r8::native_instruction_get).delete(r8::native_instruction_delete),
+        )
+        .route(
+            "/native/instructions/import",
+            post(r8::native_instruction_import),
+        )
+        .route(
+            "/native/instructions/bindings",
+            get(r8::native_instruction_bindings).post(r8::native_instruction_bind),
+        )
+        // Versioned agent presets (S06/S07/S33/A-01..A-12).
+        .route("/native/presets/binding", get(r8::native_preset_binding))
+        .route(
+            "/native/presets",
+            get(r8::native_presets).post(r8::native_preset_upsert),
+        )
+        .route(
+            "/native/presets/{id}",
+            get(r8::native_preset_get).delete(r8::native_preset_delete),
+        )
+        .route(
+            "/native/presets/{id}/envelope",
+            get(r8::native_preset_envelope),
+        )
+        .route(
+            "/native/presets/{id}/roles",
+            get(r8::native_preset_roles_get).post(r8::native_preset_roles_set),
+        )
+        .route(
+            "/native/presets/{id}/fallback",
+            get(r8::native_preset_fallback_get).post(r8::native_preset_fallback_set),
+        )
+        // Bounded live catalog probe (M-08).
+        .route(
+            "/native/catalog/probe",
+            post(foundation::native_catalog_probe),
+        )
+        // Runtime executable trust (S34/S35/S56, O-04/O-05) and status.
+        .route(
+            "/native/runtime/trust",
+            get(r8::native_runtime_trust_get).post(r8::native_runtime_trust_confirm),
+        )
+        .route(
+            "/native/runtime/trust/check",
+            post(r8::native_runtime_trust_check),
+        )
+        .route("/native/runtime/status", get(r8::native_runtime_status))
+        // Browser adapter/session lifecycle, bounded observations and
+        // content-addressed captures (S20/X-06..X-09). There is deliberately
+        // no route that marks a session connected or fabricates an event.
+        .route("/native/browser/adapters", get(r8::native_browser_adapters))
+        .route(
+            "/native/browser/sessions",
+            get(r8::native_browser_sessions).post(r8::native_browser_session_request),
+        )
+        .route(
+            "/native/browser/sessions/{id}/observations",
+            get(r8::native_browser_observations),
+        )
+        .route(
+            "/native/browser/sessions/{id}/screenshot",
+            post(r8::native_browser_screenshot),
+        )
+        .route(
+            "/native/browser/artifacts/{id}",
+            get(r8::native_browser_artifact),
+        )
+        .route(
+            "/native/browser/artifacts/{id}/bytes",
+            get(r8::native_browser_artifact_bytes),
+        )
+        // Context pin/exclude decisions and explicit export (S08/S62/C-07/C-14).
+        .route(
+            "/native/session/{id}/context/pins",
+            get(r8::native_context_pins)
+                .post(r8::native_context_pin_set)
+                .delete(r8::native_context_pin_delete),
+        )
+        .route("/native/context/export", get(r8::native_context_export))
+        // Measured efficiency effects (S27/S65/K-12) and budget revision
+        // (S41/B-05).
+        .route(
+            "/native/session/{id}/efficiency",
+            get(r8::native_session_efficiency),
+        )
+        .route(
+            "/native/session/{id}/budget",
+            get(r8::native_task_budget_get).put(r8::native_task_budget_put),
+        )
+        .route(
+            "/native/session/{id}/fork",
+            post(foundation_ext::native_session_fork),
+        )
+        .route(
+            "/native/session/{id}/checkpoints/{sequence}/restore",
+            post(foundation_ext::native_checkpoint_restore),
+        )
+        .route(
+            "/native/session/{id}/checkpoints/{sequence}/restore/preview",
+            post(foundation_ext::native_checkpoint_restore_preview),
+        )
+        // Review comments (V-02) and per-file change acceptance (V-03).
+        .route(
+            "/native/session/{id}/review/comments",
+            get(foundation_ext::native_review_comments_list)
+                .post(foundation_ext::native_review_comment_create),
+        )
+        .route(
+            "/native/session/{id}/review/comments/{comment}",
+            axum::routing::patch(foundation_ext::native_review_comment_update)
+                .delete(foundation_ext::native_review_comment_delete),
+        )
+        .route(
+            "/native/session/{id}/changes/accept",
+            post(foundation_ext::native_change_accept),
+        )
+        // Session delete/export (D-06) and selectable session settings
+        // (K-02/B-09).
+        .route(
+            "/native/session/{id}",
+            axum::routing::delete(foundation_ext::native_session_delete),
+        )
+        .route(
+            "/native/session/{id}/export",
+            post(foundation_ext::native_session_export),
+        )
+        .route(
+            "/native/session/{id}/settings",
+            get(foundation_ext::native_session_settings_get)
+                .put(foundation_ext::native_session_settings_put),
+        )
+        .route(
+            "/native/agents/{child_id}/stage",
+            post(foundation_ext::native_agent_stage),
+        )
+        .route(
+            "/native/agents/{child_id}/merge",
+            post(foundation_ext::native_agent_merge),
+        )
         .route("/native/session/{id}/usage", get(native_session_usage))
         .route(
             "/native/session/{id}/tasks/{task_id}/verification",
@@ -800,6 +1240,10 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         // Index coverage diagnostics (audits 5/6, additive): durable
         // per-workspace coverage/fingerprint coverage/freshness; pure read.
         .route("/native/index/coverage", get(native_index_coverage))
+}
+
+fn native_control_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         // Control-plane surface (additive; disabled by default): identity,
         // organizations, members, synced repositories and approvals. Strict
         // DTOs, cursor pagination, idempotency keys and tenant isolation are
@@ -919,6 +1363,28 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
             "/native/enterprise/effective-config",
             post(native_enterprise_effective_config),
         )
+}
+
+pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<ServerHandle> {
+    // Bind first, then compute the line (needs the bound address) and
+    // finally move the deps into the router.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let addr = listener.local_addr()?;
+    let startup_line = deps.startup_line(addr);
+    // Readiness (audit 55): the flag starts false and flips true ONLY when
+    // setup completes. Recovery runs before serve in the caller (the CLI
+    // opens the store and runs `agent.recover()` first), migrations applied
+    // at store open are implicit, and the required runtime components are
+    // non-optional `Arc`s in `ServerDeps` — so the flip at the end of setup
+    // is exactly the ready moment. `simulate_not_ready` (tests) keeps it
+    // false forever: /native/ready answers 503 {ready:false}.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let set_ready = !deps.simulate_not_ready;
+    let app = native_core_routes(Router::new());
+    let app = native_foundation_routes(app);
+    let app = native_r8_routes(app);
+    let app = native_control_routes(app);
+    let app = app
         // Every rejection is the frozen typed envelope, never an empty body.
         .method_not_allowed_fallback(native_method_not_allowed)
         .fallback(native_not_found)

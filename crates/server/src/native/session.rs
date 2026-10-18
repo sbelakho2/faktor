@@ -175,7 +175,10 @@ pub(crate) async fn native_session_projection(
         Err(e) => return api_err(&e),
     };
     match build_native_projection(&state.deps, &handle) {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            super::longtask::augment_projection(&state, &handle, &mut v);
+            Json(v).into_response()
+        }
         Err(e) => api_err(&e),
     }
 }
@@ -1327,20 +1330,50 @@ pub(crate) async fn native_create_session(
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid native create-session body")),
     };
-    if req.provider.trim().is_empty() || req.model.trim().is_empty() {
-        return wire_status(malformed_body("provider and model must not be empty"));
+    // Default provider/model settings apply at "new conversation" timing.
+    // A host may send empty strings when the user has not made a per-session
+    // choice; resolve the durable daemon defaults before validating, so the
+    // settings screen is not a write-only decoration. An unset default still
+    // refuses typed, exactly as before.
+    let mut provider = req.provider.trim().to_string();
+    let mut model = req.model.trim().to_string();
+    if provider.is_empty() || model.is_empty() {
+        if let Some(foundation) = state.deps.foundation.as_deref() {
+            if let Ok(snapshot) = foundation.config.snapshot() {
+                let value = |key: &str| {
+                    snapshot
+                        .values
+                        .get(key)
+                        .and_then(|entry| entry.value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                };
+                if provider.is_empty() {
+                    provider = value("faktor.defaultProvider").unwrap_or_default();
+                }
+                if model.is_empty() {
+                    model = value("faktor.defaultModel").unwrap_or_default();
+                }
+            }
+        }
+    }
+    if provider.is_empty() || model.is_empty() {
+        return wire_status(malformed_body(
+            "provider and model must not be empty (no durable default is set)",
+        ));
     }
     // The registry is the authority: an unregistered provider refuses HERE,
     // before any workspace/session effect (the CLI's `run` preflight mirrors
     // this rule). Without it an unknown id created a durable workspace and a
     // permanently failed session.
     let registered = state.deps.agent.deps().providers.ids();
-    if !registered.iter().any(|id| id == &req.provider) {
+    if !registered.iter().any(|id| id == &provider) {
         return api_err(&faktor_core::Error::new(
             faktor_core::error::ErrorKind::NotFound,
             format!(
                 "provider '{}' is not registered; registered: {:?}",
-                req.provider, registered
+                provider, registered
             ),
         ));
     }
@@ -1356,12 +1389,12 @@ pub(crate) async fn native_create_session(
         .routing
         .served_models()
         .into_iter()
-        .filter(|(provider, _)| provider == &req.provider)
+        .filter(|(registered_provider, _)| registered_provider == &provider)
         .map(|(_, model)| model)
         .collect();
     // Permissive when the policy exposes no candidate set (fixed/passthrough
     // test policies); production Economy validates against its priced set.
-    if !served.is_empty() && !served.iter().any(|m| m == &req.model) {
+    if !served.is_empty() && !served.iter().any(|m| m == &model) {
         let mut listed = served.clone();
         listed.sort();
         listed.dedup();
@@ -1369,7 +1402,7 @@ pub(crate) async fn native_create_session(
             faktor_core::error::ErrorKind::NotFound,
             format!(
                 "session model '{}' is not served by provider '{}'; served: {:?}",
-                req.model, req.provider, listed
+                model, provider, listed
             ),
         ));
     }
@@ -1401,7 +1434,7 @@ pub(crate) async fn native_create_session(
     match state
         .deps
         .session
-        .create_session(ws, &title, &req.provider, &req.model)
+        .create_session(ws, &title, &provider, &model)
     {
         Ok(handle) => {
             // SessionStart lifecycle hook (audit): the durable row exists

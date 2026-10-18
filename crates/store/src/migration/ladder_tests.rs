@@ -1274,7 +1274,9 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
             }
             // The v1 duplicates are recreated so the replay also has to drop
             // them again (the migration must be idempotent, not just additive).
-            let prev_head = SCHEMA_HEAD - 1;
+            // v35 is the hot-path index migration; start four steps back so
+            // later additive migrations (v36, v37, v38) do not skip it.
+            let prev_head = SCHEMA_HEAD - 4;
             conn.execute_batch(&format!(
                 "CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event(session_id, seq);
                  CREATE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);

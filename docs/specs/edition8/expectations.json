@@ -1,0 +1,80 @@
+{
+  "schema": "faktor-edition8-expectations/v1",
+  "source": "docs/specs/edition8/acceptance.md §6 and ci-dogfood.md §4.3",
+  "notes": [
+    "Numeric values are the document's printed fixtures, not universal defaults.",
+    "Performance bounds are repository proposals (ci-dogfood.md §4.3), explicitly not PDF SLOs."
+  ],
+  "counts": {
+    "screens": 72,
+    "host_contracts": 144,
+    "controls": 200,
+    "control_categories": 15,
+    "acceptance": 40,
+    "workflows": 16,
+    "workflow_cells_per_host": 5,
+    "workflow_cells_total": 160,
+    "reference_vectors": 288,
+    "base_host_renderings": 288,
+    "high_contrast_renderings": 144,
+    "maximal_alternate_renderings": 576,
+    "platform_records": 6,
+    "fixture_classes_per_screen": 8
+  },
+  "widths": [240, 320, 420, 480, 720],
+  "required_widths": [240, 320, 480],
+  "text_scale": [1.0, 1.5, 2.0],
+  "required_text_scale": 2.0,
+  "text_expansion": 0.5,
+  "themes": {
+    "vscode": ["dark-modern", "light-modern", "high-contrast-dark", "high-contrast-light"],
+    "jetbrains": ["light", "dark", "high-contrast"]
+  },
+  "platforms": ["linux", "macos", "windows"],
+  "hosts": ["vscode", "jetbrains"],
+  "fixtures": {
+    "usd": "5.00",
+    "micro_usd": 5000000,
+    "tokens": 120000,
+    "tokens_display": "120,000",
+    "context": {
+      "input": 18400,
+      "output_reserve": 4096,
+      "safety_reserve": 2048,
+      "headroom": 8224,
+      "capacity": 32768
+    },
+    "retry": {
+      "total_attempts": 3,
+      "base_delay_ms": 250,
+      "max_delay_ms": 5000,
+      "jitter": 0.2
+    },
+    "steer_max_chars": 500,
+    "mcp": {
+      "max_servers": 8,
+      "max_name_bytes": 128,
+      "max_argument_bytes": 512,
+      "max_arguments_bytes": 16384,
+      "arguments": 32
+    },
+    "optical": {
+      "min_buttons_per_host_theme": 30,
+      "labels": 1036,
+      "contrast_pairs": 80
+    },
+    "verification": {
+      "quick_check_seconds": 60,
+      "unit_seconds": 600
+    }
+  },
+  "performance": {
+    "p95_ratio_max": 1.25,
+    "max_long_task_ms": 200,
+    "transcript_growth_ratio_max": 2.0,
+    "settings_patch_ratio_max": 6.0,
+    "rss_growth_after_warmup_max": 0.05,
+    "runs": 3,
+    "budget_provenance": "repository proposal, not a PDF SLO"
+  }
+}

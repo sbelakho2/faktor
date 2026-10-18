@@ -184,6 +184,12 @@ pub(crate) struct StartTaskRunRequest {
     /// boundary, never consulted by the runtime.
     ownership: Option<faktor_orchestrator::OwnershipModel>,
     model: Option<String>,
+    /// Optional saved preset bound to this submission BEFORE dispatch. The
+    /// captured envelope is immutable per submission and applied to the run
+    /// (coder role model / declared model); a read-only preset refuses a
+    /// mutating plan typed.
+    #[serde(default)]
+    preset_id: Option<String>,
     max_tokens: Option<u64>,
     /// Money input: decimal string or legacy JSON integer (see
     /// `faktor_cloud::money`).
@@ -511,6 +517,70 @@ pub(crate) async fn native_task_run_start(
         Err(r) => return *r,
     };
     let sid = handle.id();
+    // Saved-preset binding (M-05/M-06 runtime application): the envelope is
+    // captured durably BEFORE any plan validation, so even a refused start
+    // leaves a replay-proof binding. A read-only preset refuses mutating
+    // plans; a plan-less mutating admission is refused explicitly.
+    if let Some(preset_id) = req.preset_id.as_deref() {
+        let foundation = match state.deps.foundation.as_deref() {
+            Some(foundation) => foundation,
+            None => {
+                return wire_status(ApiError {
+                    code: "unavailable",
+                    message: "the foundation authority is not wired in this host".into(),
+                    http_status: 503,
+                    retryable: false,
+                })
+            }
+        };
+        let envelope = match foundation.presets.envelope_with(preset_id, &[]) {
+            Ok(envelope) => envelope,
+            Err(e) => return crate::native::foundation::foundation_error(e),
+        };
+        if let Err(e) = foundation
+            .presets
+            .bind(sid.raw(), &req.submission_id, &envelope)
+        {
+            return crate::native::foundation::foundation_error(e);
+        }
+        if !envelope.admission_mutation_allowed {
+            let has_plan = req
+                .work_items
+                .as_ref()
+                .is_some_and(|items| !items.is_empty());
+            if !has_plan {
+                return wire_status(ApiError {
+                    code: "read_only_preset_needs_plan",
+                    message:
+                        "the bound preset is read-only; a mutating start requires an explicit plan"
+                            .into(),
+                    http_status: 400,
+                    retryable: false,
+                });
+            }
+            if req
+                .work_items
+                .as_ref()
+                .is_some_and(|items| items.iter().any(|item| item.kind.is_mutating()))
+            {
+                return wire_status(ApiError {
+                    code: "read_only_preset",
+                    message: "the bound preset forbids mutating work at admission".into(),
+                    http_status: 409,
+                    retryable: false,
+                });
+            }
+        }
+        if req.model.is_none() {
+            if let Some(binding) = envelope.role_models.get("coder") {
+                req.model = Some(format!("{}/{}", binding.provider, binding.model));
+            } else if let (Some(provider), Some(model)) =
+                (envelope.model_provider.as_ref(), envelope.model_id.as_ref())
+            {
+                req.model = Some(format!("{provider}/{model}"));
+            }
+        }
+    }
     // Per-run routing overrides are refused until the daemon's routing
     // policy — the single routing authority — can honor them: a parsed-but-
     // ignored policy field would silently claim a mode the run never used.
@@ -563,7 +633,7 @@ pub(crate) async fn native_task_run_start(
     // contract seam; a non-default contract is refused loudly here, never
     // silently dropped. The default all-false contract is accepted and
     // changes nothing.
-    if completion_contract_needs_work_items(req.work_items.is_none(), req.completion_contract) {
+    if completion_contract_needs_work_items(req.work_items.is_some(), req.completion_contract) {
         return wire_status(ApiError {
             code: "unsupported",
             message: "completion_contract requires explicit work_items; the plain-prompt path carries no contract seam"
@@ -610,7 +680,8 @@ pub(crate) async fn native_task_run_start(
                 completion_contract: req.completion_contract,
                 ..Default::default()
             };
-            match prompts.start_task(sid, request) {
+            let max_turns = session_turn_cap(&state, sid);
+            match prompts.start_task(sid, request, max_turns) {
                 Ok(r) => r,
                 Err(e) => return exec_error_response(&e),
             }
@@ -1390,6 +1461,44 @@ mod completion_contract_dto_tests {
         }));
         assert!(err.contains("unknown field"), "{err}");
     }
+
+    #[test]
+    fn explicit_work_items_parse_and_are_not_silently_dropped() {
+        let req = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+            "work_items": [{
+                "id": "w1",
+                "kind": "Implementation",
+                "summary": "s",
+                "ownership": "isolated_worktree",
+            }],
+            "completion_contract": {
+                "include_commit": true,
+                "include_push": false,
+                "include_pr": false,
+            },
+        }))
+        .expect("explicit work_items must parse");
+        assert!(
+            req.work_items.is_some(),
+            "explicit work_items must reach the handler, not become None"
+        );
+        assert!(
+            !completion_contract_needs_work_items(
+                req.work_items.is_some(),
+                req.completion_contract
+            ),
+            "explicit work_items plus a non-default contract must be accepted"
+        );
+        assert!(
+            completion_contract_needs_work_items(
+                None::<Vec<super::NativeTaskRunWorkItem>>.is_some(),
+                req.completion_contract
+            ),
+            "the plain-prompt path with a non-default contract must be refused"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1812,4 +1921,24 @@ mod engineering_contract_dto_tests {
             assert!(!err.is_empty(), "{hostile}");
         }
     }
+}
+
+/// The resolved B-09 turn bound: the per-session setting wins, else the
+/// served workspace descriptor; an absent value leaves the daemon default.
+fn session_turn_cap(state: &AppState, session: faktor_core::id::SessionId) -> Option<u32> {
+    let foundation = state.deps.foundation.as_deref()?;
+    if let Ok(Some(value)) = foundation.session_settings.get(
+        session.raw(),
+        faktor_foundation::session_settings::MAX_TURNS_KEY,
+    ) {
+        if let Some(turns) = value.as_u64() {
+            return u32::try_from(turns).ok();
+        }
+    }
+    foundation
+        .config
+        .u64_value("faktor.agent.maxTurns")
+        .ok()
+        .flatten()
+        .and_then(|turns| u32::try_from(turns).ok())
 }

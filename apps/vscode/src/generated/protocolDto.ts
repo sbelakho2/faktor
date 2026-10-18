@@ -501,6 +501,129 @@ export interface ProtocolValueEntitlementsReport {
   readonly now_ms: number;
 }
 
+/** One provider/model preference (plus optional reasoning effort). (unknown_fields: reject) */
+export interface ProtocolModelBinding {
+  readonly provider: string;
+  readonly model: string;
+  readonly reasoning_effort: string | null;
+}
+
+/** The persisted per-role model map (planner/coder/verifier/summarizer). (unknown_fields: reject) */
+export interface ProtocolPresetRoleModels {
+  readonly role_models: ProtocolJson;
+  readonly revision: number;
+}
+
+/** The ordered fallback candidates; order is authoritative. (unknown_fields: reject) */
+export interface ProtocolPresetFallbackChain {
+  readonly fallback_chain: ProtocolJson;
+  readonly revision: number;
+}
+
+/** Observed reachability/model-list probe plus the served capability of one exact model. (unknown_fields: ignore) */
+export interface ProtocolCatalogProbe {
+  readonly connection_id: string;
+  readonly provider: string;
+  readonly state: string;
+  readonly stages: ProtocolJson;
+  readonly models: readonly string[];
+  readonly model: string | null;
+  readonly capability: ProtocolJson | null;
+  readonly certification: string;
+}
+
+/** Durable MCP auth binding; token material is never present. (unknown_fields: ignore) */
+export interface ProtocolMcpAuthState {
+  readonly server_id: string;
+  readonly transport: string;
+  readonly state: string;
+  readonly account: string | null;
+  readonly scopes: readonly string[];
+  readonly has_token: boolean;
+  readonly revision: number;
+}
+
+/** A durable line-anchored review comment tied to session/task/change. (unknown_fields: ignore) */
+export interface ProtocolReviewComment {
+  readonly id: string;
+  readonly session_id: number;
+  readonly task_id: string | null;
+  readonly change_id: string | null;
+  readonly path: string;
+  readonly line_start: number;
+  readonly line_end: number;
+  readonly side: string;
+  readonly body: string;
+  readonly author: string;
+  readonly content_hash: string | null;
+  readonly resolved: boolean;
+  readonly revision: number;
+  readonly created_ms: number;
+  readonly updated_ms: number;
+}
+
+/** Idempotent per-file change acceptance: applied/already-current/rejected paths. (unknown_fields: ignore) */
+export interface ProtocolChangeAcceptReceipt {
+  readonly accepted: boolean;
+  readonly change_set_id: string;
+  readonly applied: readonly string[];
+  readonly already_current: readonly string[];
+  readonly rejected: readonly string[];
+  readonly integrated: boolean;
+  readonly idempotent: boolean;
+}
+
+/** One exact would-restore file action with current/expected/restored digests. (unknown_fields: ignore) */
+export interface ProtocolRestorePreviewFile {
+  readonly path: string;
+  readonly action: string;
+  readonly current: ProtocolJson;
+  readonly expected: ProtocolJson;
+  readonly restore: ProtocolJson;
+  readonly content_digest: string | null;
+}
+
+/** Dry-run restore plan; writes is always 0. (unknown_fields: ignore) */
+export interface ProtocolRestorePreview {
+  readonly dry_run: boolean;
+  readonly writes: number;
+  readonly session_id: number;
+  readonly checkpoint_id: number;
+  readonly sequence: number;
+  readonly direction: string;
+  readonly files: readonly ProtocolRestorePreviewFile[];
+  readonly writable: boolean;
+  readonly conflict_count: number;
+}
+
+/** Bounded exported session bundle with digest and redaction counts. (unknown_fields: ignore) */
+export interface ProtocolSessionExport {
+  readonly session_id: string;
+  readonly digest: string;
+  readonly bytes: number;
+  readonly redacted: boolean;
+  readonly redacted_fields: number;
+  readonly truncated: boolean;
+  readonly bundle: ProtocolJson;
+}
+
+/** Per-session selectable compaction model and loop guards. (unknown_fields: ignore) */
+export interface ProtocolSessionSettings {
+  readonly session_id: string;
+  readonly compaction_model: string | null;
+  readonly max_turns: number | null;
+  readonly max_consecutive_failures: number | null;
+}
+
+/** Durable session deletion tombstone and the exact purged-row counts. (unknown_fields: ignore) */
+export interface ProtocolSessionDeleteTombstone {
+  readonly deleted: boolean;
+  readonly idempotent: boolean;
+  readonly session_id: string;
+  readonly deleted_ms: number;
+  readonly purged: ProtocolJson;
+}
+
 // ------------------------------------------------------------ defaults
 
 function dtoDefaultProtocolPageMeta(): ProtocolPageMeta {
@@ -1027,6 +1150,204 @@ export function validateProtocolValueEntitlementsReport(value: ProtocolJson, pat
     governance: validateProtocolValueGovernanceCapabilities(dtoRequired(object, "governance", path), path + ".governance"),
     decisions: dtoList(object, "decisions", path).map((item, index) => validateProtocolValueEntitlementDecision(item, path + ".decisions[" + index + "]")),
     now_ms: dtoI64(object, "now_ms", path),
+  };
+}
+
+export function validateProtocolModelBinding(value: ProtocolJson, path = "ProtocolModelBinding"): ProtocolModelBinding {
+  const object = dtoObject(value, path);
+  const required = ["provider","model","reasoning_effort"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["provider","model","reasoning_effort"]);
+  return {
+    provider: dtoString(object, "provider", path),
+    model: dtoString(object, "model", path),
+    reasoning_effort: dtoNullableString(object, "reasoning_effort", path),
+  };
+}
+
+export function validateProtocolPresetRoleModels(value: ProtocolJson, path = "ProtocolPresetRoleModels"): ProtocolPresetRoleModels {
+  const object = dtoObject(value, path);
+  const required = ["role_models","revision"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["role_models","revision"]);
+  return {
+    role_models: dtoRequired(object, "role_models", path),
+    revision: dtoI64(object, "revision", path),
+  };
+}
+
+export function validateProtocolPresetFallbackChain(value: ProtocolJson, path = "ProtocolPresetFallbackChain"): ProtocolPresetFallbackChain {
+  const object = dtoObject(value, path);
+  const required = ["fallback_chain","revision"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["fallback_chain","revision"]);
+  return {
+    fallback_chain: dtoRequired(object, "fallback_chain", path),
+    revision: dtoI64(object, "revision", path),
+  };
+}
+
+export function validateProtocolCatalogProbe(value: ProtocolJson, path = "ProtocolCatalogProbe"): ProtocolCatalogProbe {
+  const object = dtoObject(value, path);
+  const required = ["connection_id","provider","state","stages","models","model","capability","certification"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    connection_id: dtoString(object, "connection_id", path),
+    provider: dtoString(object, "provider", path),
+    state: dtoString(object, "state", path),
+    stages: dtoRequired(object, "stages", path),
+    models: dtoList(object, "models", path).map((item, index) => dtoStringElement(item, path + ".models[" + index + "]")),
+    model: dtoNullableString(object, "model", path),
+    capability: dtoRequired(object, "capability", path),
+    certification: dtoString(object, "certification", path),
+  };
+}
+
+export function validateProtocolMcpAuthState(value: ProtocolJson, path = "ProtocolMcpAuthState"): ProtocolMcpAuthState {
+  const object = dtoObject(value, path);
+  const required = ["server_id","transport","state","account","scopes","has_token","revision"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    server_id: dtoString(object, "server_id", path),
+    transport: dtoString(object, "transport", path),
+    state: dtoString(object, "state", path),
+    account: dtoNullableString(object, "account", path),
+    scopes: dtoList(object, "scopes", path).map((item, index) => dtoStringElement(item, path + ".scopes[" + index + "]")),
+    has_token: dtoBool(object, "has_token", path),
+    revision: dtoI64(object, "revision", path),
+  };
+}
+
+export function validateProtocolReviewComment(value: ProtocolJson, path = "ProtocolReviewComment"): ProtocolReviewComment {
+  const object = dtoObject(value, path);
+  const required = ["id","session_id","task_id","change_id","path","line_start","line_end","side","body","author","content_hash","resolved","revision","created_ms","updated_ms"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    id: dtoString(object, "id", path),
+    session_id: dtoI64(object, "session_id", path),
+    task_id: dtoNullableString(object, "task_id", path),
+    change_id: dtoNullableString(object, "change_id", path),
+    path: dtoString(object, "path", path),
+    line_start: dtoI64(object, "line_start", path),
+    line_end: dtoI64(object, "line_end", path),
+    side: dtoString(object, "side", path),
+    body: dtoString(object, "body", path),
+    author: dtoString(object, "author", path),
+    content_hash: dtoNullableString(object, "content_hash", path),
+    resolved: dtoBool(object, "resolved", path),
+    revision: dtoI64(object, "revision", path),
+    created_ms: dtoI64(object, "created_ms", path),
+    updated_ms: dtoI64(object, "updated_ms", path),
+  };
+}
+
+export function validateProtocolChangeAcceptReceipt(value: ProtocolJson, path = "ProtocolChangeAcceptReceipt"): ProtocolChangeAcceptReceipt {
+  const object = dtoObject(value, path);
+  const required = ["accepted","change_set_id","applied","already_current","rejected","integrated","idempotent"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    accepted: dtoBool(object, "accepted", path),
+    change_set_id: dtoString(object, "change_set_id", path),
+    applied: dtoList(object, "applied", path).map((item, index) => dtoStringElement(item, path + ".applied[" + index + "]")),
+    already_current: dtoList(object, "already_current", path).map((item, index) => dtoStringElement(item, path + ".already_current[" + index + "]")),
+    rejected: dtoList(object, "rejected", path).map((item, index) => dtoStringElement(item, path + ".rejected[" + index + "]")),
+    integrated: dtoBool(object, "integrated", path),
+    idempotent: dtoBool(object, "idempotent", path),
+  };
+}
+
+export function validateProtocolRestorePreviewFile(value: ProtocolJson, path = "ProtocolRestorePreviewFile"): ProtocolRestorePreviewFile {
+  const object = dtoObject(value, path);
+  const required = ["path","action","current","expected","restore","content_digest"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    path: dtoString(object, "path", path),
+    action: dtoString(object, "action", path),
+    current: dtoRequired(object, "current", path),
+    expected: dtoRequired(object, "expected", path),
+    restore: dtoRequired(object, "restore", path),
+    content_digest: dtoNullableString(object, "content_digest", path),
+  };
+}
+
+export function validateProtocolRestorePreview(value: ProtocolJson, path = "ProtocolRestorePreview"): ProtocolRestorePreview {
+  const object = dtoObject(value, path);
+  const required = ["dry_run","writes","session_id","checkpoint_id","sequence","direction","files","writable","conflict_count"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    dry_run: dtoBool(object, "dry_run", path),
+    writes: dtoI64(object, "writes", path),
+    session_id: dtoI64(object, "session_id", path),
+    checkpoint_id: dtoI64(object, "checkpoint_id", path),
+    sequence: dtoI64(object, "sequence", path),
+    direction: dtoString(object, "direction", path),
+    files: dtoList(object, "files", path).map((item, index) => validateProtocolRestorePreviewFile(item, path + ".files[" + index + "]")),
+    writable: dtoBool(object, "writable", path),
+    conflict_count: dtoI64(object, "conflict_count", path),
+  };
+}
+
+export function validateProtocolSessionExport(value: ProtocolJson, path = "ProtocolSessionExport"): ProtocolSessionExport {
+  const object = dtoObject(value, path);
+  const required = ["session_id","digest","bytes","redacted","redacted_fields","truncated","bundle"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    session_id: dtoString(object, "session_id", path),
+    digest: dtoString(object, "digest", path),
+    bytes: dtoI64(object, "bytes", path),
+    redacted: dtoBool(object, "redacted", path),
+    redacted_fields: dtoI64(object, "redacted_fields", path),
+    truncated: dtoBool(object, "truncated", path),
+    bundle: dtoRequired(object, "bundle", path),
+  };
+}
+
+export function validateProtocolSessionSettings(value: ProtocolJson, path = "ProtocolSessionSettings"): ProtocolSessionSettings {
+  const object = dtoObject(value, path);
+  const required = ["session_id","compaction_model","max_turns","max_consecutive_failures"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    session_id: dtoString(object, "session_id", path),
+    compaction_model: dtoNullableString(object, "compaction_model", path),
+    max_turns: dtoNullableI64(object, "max_turns", path),
+    max_consecutive_failures: dtoNullableI64(object, "max_consecutive_failures", path),
+  };
+}
+
+export function validateProtocolSessionDeleteTombstone(value: ProtocolJson, path = "ProtocolSessionDeleteTombstone"): ProtocolSessionDeleteTombstone {
+  const object = dtoObject(value, path);
+  const required = ["deleted","idempotent","session_id","deleted_ms","purged"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    deleted: dtoBool(object, "deleted", path),
+    idempotent: dtoBool(object, "idempotent", path),
+    session_id: dtoString(object, "session_id", path),
+    deleted_ms: dtoI64(object, "deleted_ms", path),
+    purged: dtoRequired(object, "purged", path),
   };
 }
 

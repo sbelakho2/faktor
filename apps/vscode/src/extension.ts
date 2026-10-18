@@ -105,6 +105,12 @@ import {
   unavailableBoardState,
 } from './state';
 import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf, usagePanelSections } from './cockpit';
+import { Edition5Client } from './edition5/client.ts';
+import { Edition5Panel } from './edition5/panel.ts';
+import { Edition8Client } from './edition8/client.ts';
+import { Edition8Panel, Edition8ViewProvider, type Edition8PanelDeps } from './edition8/panel.ts';
+import { registerEdition8 } from './edition8/commands.ts';
+import { addContextDraft, toggleFavorite } from './edition8/hostDraft.ts';
 import type { PixelPresence } from './pixelAgents';
 import {
   microBalance,
@@ -3722,6 +3728,9 @@ async function handleWebviewMessage(
     // `Return to run`: the chat command focuses the panel and the webview's
     // own Work subview switch happens locally (one surface, no round trip
     // needed for the view move).
+    case 'openControlCenter':
+      openControlCenter(context, typeof message.screen === 'string' ? message.screen : 'S01');
+      return;
     case 'openWork':
       await vscode.commands.executeCommand('faktor.openChat');
       return;
@@ -3744,6 +3753,139 @@ async function handleWebviewMessage(
     default:
       return;
   }
+}
+
+// ------------------------------------------------------- Edition 5 control center
+
+let controlCenterOutput: vscode.OutputChannel | null = null;
+
+/**
+ * One Faktor-owned editor tab over the Edition 5 native contract. The panel
+ * shares the live client/session; native host actions (sign-in, keymap help,
+ * setup guidance, accessibility audit, worktree switch) stay host-native.
+ */
+function openControlCenter(context: vscode.ExtensionContext, screen = 'S01'): void {
+  if (controlCenterOutput === null) {
+    controlCenterOutput = vscode.window.createOutputChannel('Faktor Control Center');
+    context.subscriptions.push(controlCenterOutput);
+  }
+  const output = controlCenterOutput;
+  Edition5Panel.createOrShow(
+    context,
+    {
+      backend: () => (active.client === null ? null : new Edition5Client(active.client)),
+      session: () => active.sessionId,
+      hostAction: async (controlId: string) => {
+        switch (controlId) {
+          case 'O-07':
+            await controlPlaneSignIn(context);
+            return 'The native control-plane sign-in flow finished; the secret store holds any credential.';
+          case 'D-11':
+            await vscode.commands.executeCommand('workbench.action.showCommands');
+            return 'The native command palette is open; Faktor commands are registered under Faktor.';
+          case 'D-14':
+            await vscode.commands.executeCommand('workbench.action.showCommands');
+            return 'Native accessibility settings are reachable through Preferences: Open Accessibility Settings.';
+          case 'D-15':
+            await switchSessionFromCommand(context);
+            return 'The native conversation switcher finished; per-session drafts are preserved.';
+          case 'Q-11':
+            await vscode.commands.executeCommand('faktor.openChat');
+            return 'The native shell-isolation setup guidance is shown in the Faktor view diagnostics.';
+          default:
+            return 'Native VS Code action completed.';
+        }
+      },
+      output,
+    },
+    screen,
+  );
+}
+
+// ------------------------------------------------------- Edition 8 surfaces
+
+let edition8Output: vscode.OutputChannel | null = null;
+
+function edition8Deps(context: vscode.ExtensionContext): Edition8PanelDeps {
+  if (edition8Output === null) {
+    edition8Output = vscode.window.createOutputChannel('Faktor Revision 8');
+    context.subscriptions.push(edition8Output);
+  }
+  const output = edition8Output;
+  return {
+    backend: () => (active.client === null ? null : new Edition8Client(active.client)),
+    session: () => active.sessionId,
+    workspace: () => ({
+      workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+      worktree: null,
+      daemon: active.daemon?.baseUrl ?? null,
+      generation: null,
+    }),
+    hostAction: async (controlId: string) => {
+      switch (controlId) {
+        case 'M-03': {
+          const model = vscode.workspace.getConfiguration('faktor').get<string>('defaultModel') ?? 'unselected';
+          const added = toggleFavorite(model);
+          return `${model} ${added ? 'added to' : 'removed from'} local favorites. This is host MRU state; no daemon write is claimed.`;
+        }
+        case 'C-04': {
+          const editor = vscode.window.activeTextEditor;
+          if (editor === undefined) return 'No active editor selection exists; nothing was attached.';
+          const selection = editor.selection;
+          addContextDraft({
+            kind: 'selection',
+            uri: editor.document.uri.toString(),
+            range: `${selection.start.line}:${selection.start.character}-${selection.end.line}:${selection.end.character}`,
+            version: String(editor.document.version),
+            reason: 'Current editor selection',
+            text: editor.document.getText(selection).slice(0, 32 * 1024),
+          });
+          return `Captured ${editor.document.uri.fsPath}:${selection.start.line + 1}-${selection.end.line + 1} at version ${editor.document.version}.`;
+        }
+        case 'X-10': {
+          const editor = vscode.window.activeTextEditor;
+          if (editor === undefined) return 'No active editor exists; no diagnostics were added.';
+          const diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+          addContextDraft({
+            kind: 'diagnostic',
+            uri: editor.document.uri.toString(),
+            range: null,
+            version: String(editor.document.version),
+            reason: `${diagnostics.length} host diagnostics`,
+            text: diagnostics.slice(0, 50).map((entry) => entry.message).join('\n').slice(0, 16 * 1024),
+          });
+          return `Captured ${diagnostics.length} host diagnostics for the active file.`;
+        }
+        case 'X-11':
+          await vscode.commands.executeCommand('editor.action.quickFix');
+          return 'The native code-action list is open; no action is selected automatically.';
+        case 'S-05':
+          await vscode.commands.executeCommand('workbench.action.showCommands');
+          return 'The native command palette is open.';
+        case 'D-08':
+          return 'Display focus is host-local; choose Compact, Balanced or Verbose in the Conversation settings.';
+        case 'D-09':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'window.zoomLevel');
+          return 'Theme, zoom and density are host-owned; Faktor never overrides them.';
+        case 'D-10':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'faktor.send');
+          return 'Send behavior is a host keybinding; Ctrl/Cmd+Enter remains the default.';
+        case 'D-11':
+          await vscode.commands.executeCommand('workbench.action.showCommands');
+          return 'Faktor commands are registered under Faktor in the native palette.';
+        case 'D-14':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'accessibility');
+          return 'Native accessibility settings are open; reduced motion is honored automatically.';
+        case 'D-15':
+          await switchSessionFromCommand(context);
+          return 'The native conversation switcher finished; each draft stays with its conversation.';
+        default:
+          return 'Native VS Code action completed.';
+      }
+    },
+    switchSession: (sessionId: string) => switchSession(sessionId, context),
+    output,
+  };
 }
 
 // ------------------------------------------------------------------- lifecycle
@@ -3795,6 +3937,22 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    (() => {
+      const deps = edition8Deps(context);
+      const view = new Edition8ViewProvider(context, deps);
+      return vscode.Disposable.from(
+        vscode.window.registerWebviewViewProvider(Edition8ViewProvider.viewType, view, {
+          webviewOptions: { retainContextWhenHidden: true },
+        }),
+        registerEdition8(context, {
+          deps,
+          view,
+          openSettings: (screen: string) => Edition8Panel.createOrShow(context, deps, screen),
+          cancelRun: () => cancelActiveRun(),
+          switchConversation: () => switchSessionFromCommand(context),
+        }),
+      );
+    })(),
     vscode.commands.registerCommand('faktor.startServer', async () => {
       try {
         await startServer(context);
@@ -3812,6 +3970,15 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('faktor.openChat', () => {
       chatProvider?.focus();
+    }),
+    vscode.commands.registerCommand('faktor.openControlCenter', () => {
+      openControlCenter(context, 'S01');
+    }),
+    vscode.commands.registerCommand('faktor.openModelPicker', () => {
+      openControlCenter(context, 'S02');
+    }),
+    vscode.commands.registerCommand('faktor.openSettings', () => {
+      openControlCenter(context, 'S29');
     }),
     vscode.commands.registerCommand('faktor.newTask', async () => {
       await newTaskFromCommand(context);

@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W03",
+  "title": "Tune a model and change it mid-session",
+  "screens": [
+    "S02",
+    "S05",
+    "S01"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Open the model picker; inspect capability authority, availability and limits.",
+    "Choose the exact provider/model pair.",
+    "Review reasoning and generation compatibility; remove invalid overrides.",
+    "Read the apply timing: Next task or New conversation. Preserve the current draft.",
+    "Submit a new captured request. The executed call records its actual route and effective parameters.",
+    "If the change requires a new session, offer Create new conversation with the draft preserved."
+  ],
+  "forbidden_fake_states": [
+    "Showing the picker's model as the executed model",
+    "rewriting an in-flight call",
+    "treating a reasoning enum as a writable API",
+    "silently dropping an unsupported parameter"
+  ],
+  "complete_when": "each executed call records actual route and effective parameters, separately from current draft preference (p.183).",
+  "traceability": "p.183; controls M-01, M-02, M-05..M-12, G-01..G-14; acceptance A02, A03, A05.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

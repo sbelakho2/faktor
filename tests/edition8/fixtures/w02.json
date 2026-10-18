@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W02",
+  "title": "Set up a local model without false locality",
+  "screens": [
+    "S04",
+    "S31",
+    "S08"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Inspect the daemon host and the meaning of loopback (local to the daemon, not necessarily the laptop).",
+    "Choose the configured local adapter (for example Ollama-compatible) and test the exact endpoint from the daemon host.",
+    "Compare declared and observed context allocation; show the runtime observation source, never infer from the model name.",
+    "Review the data boundary before configuring an embedder. An absent embedder keeps lexical/symbol retrieval.",
+    "Choose the retrieval fallback and capture a context preview in S08.",
+    "Offer allocation/keep-alive/unload controls only where the adapter owns and can acknowledge them."
+  ],
+  "forbidden_fake_states": [
+    "\"Local\" inferred from a URL on the laptop",
+    "observed allocation fabricated from the model name",
+    "a private-LAN route shown as enabled",
+    "semantic index claimed without an embedder"
+  ],
+  "complete_when": "a ready local route is explicit and observed usage remains unavailable until a durable read exists (p.183).",
+  "traceability": "p.183; controls P-07..P-09, P-13, P-15, C-09..C-11, M-09; acceptance A07, A08, A11.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

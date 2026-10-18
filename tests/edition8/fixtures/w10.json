@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W10",
+  "title": "Author and test a lifecycle hook",
+  "screens": [
+    "S18",
+    "S30",
+    "S22"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Choose a native event from the 17-value HookEvent set. Do not copy foreign event names.",
+    "Configure executable/argv, allowlisted environment, deadline, stdout/stderr caps and failure policy.",
+    "Preview the normalized input.",
+    "Admit a bounded test under the real capability/deadline envelope; no production event is emitted merely to preview input.",
+    "Inspect verdict, exit state and bounded output.",
+    "Save only a validated version for future events; cite the exact spec version, event, envelope and audit artifact."
+  ],
+  "forbidden_fake_states": [
+    "Partial output after timeout shown as Allow",
+    "test run emitting a real production lifecycle event",
+    "malformed verdict treated as pass",
+    "fail-open hidden"
+  ],
+  "complete_when": "a hook run cites exact spec version, event, envelope and bounded audit artifact (p.185).",
+  "traceability": "p.185; controls S-07..S-14; acceptance A24.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

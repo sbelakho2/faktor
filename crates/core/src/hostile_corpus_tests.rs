@@ -1611,7 +1611,7 @@ fn core_blocker_and_phase_vocabulary() {
             .is_ok(),
         "child case #{case}: a bounded blocker validates"
     );
-    assert_eq!(case, 47, "COUNT");
+    assert_eq!(case, 48, "COUNT");
 }
 
 #[test]

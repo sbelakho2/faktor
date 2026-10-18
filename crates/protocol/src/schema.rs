@@ -136,7 +136,203 @@ fn type_defs() -> Vec<TypeDef> {
     out.extend(type_defs_task_runs());
     out.extend(type_defs_outcomes());
     out.extend(type_defs_value_entitlements());
+    out.extend(type_defs_rev8_contracts());
     out
+}
+
+/// Rev8 field-level contracts (M-05/M-06/M-08, P-11/P-12/P-15, C-08,
+/// K-02/T-06/T-10/B-09, V-02/V-03/V-05, D-06). These are the wire shapes
+/// the IDE clients generate against; the daemon handlers emit exactly these
+/// fields (ad-hoc JSON in the handler modules, pinned here).
+fn type_defs_rev8_contracts() -> Vec<TypeDef> {
+    vec![
+        TypeDef {
+            name: "ModelBinding",
+            doc: "One provider/model preference (plus optional reasoning effort).",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("provider"),
+                    text_field("model"),
+                    nullable("reasoning_effort", Ty::String),
+                ],
+            },
+        },
+        TypeDef {
+            name: "PresetRoleModels",
+            doc: "The persisted per-role model map (planner/coder/verifier/summarizer).",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    req(
+                        "role_models",
+                        Ty::Json,
+                    ),
+                    req("revision", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "PresetFallbackChain",
+            doc: "The ordered fallback candidates; order is authoritative.",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("fallback_chain", Ty::Json),
+                    req("revision", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "CatalogProbe",
+            doc: "Observed reachability/model-list probe plus the served capability of one exact model.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("connection_id"),
+                    text_field("provider"),
+                    text_field("state"),
+                    req("stages", Ty::Json),
+                    req("models", Ty::List { of: Box::new(Ty::String) }),
+                    nullable("model", Ty::String),
+                    nullable("capability", Ty::Json),
+                    text_field("certification"),
+                ],
+            },
+        },
+        TypeDef {
+            name: "McpAuthState",
+            doc: "Durable MCP auth binding; token material is never present.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("server_id"),
+                    text_field("transport"),
+                    text_field("state"),
+                    nullable("account", Ty::String),
+                    req("scopes", Ty::List { of: Box::new(Ty::String) }),
+                    req("has_token", Ty::Bool),
+                    req("revision", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "ReviewComment",
+            doc: "A durable line-anchored review comment tied to session/task/change.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("id"),
+                    req("session_id", Ty::I64),
+                    nullable("task_id", Ty::String),
+                    nullable("change_id", Ty::String),
+                    text_field("path"),
+                    req("line_start", Ty::I64),
+                    req("line_end", Ty::I64),
+                    text_field("side"),
+                    text_field("body"),
+                    text_field("author"),
+                    nullable("content_hash", Ty::String),
+                    req("resolved", Ty::Bool),
+                    req("revision", Ty::I64),
+                    req("created_ms", Ty::I64),
+                    req("updated_ms", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "ChangeAcceptReceipt",
+            doc: "Idempotent per-file change acceptance: applied/already-current/rejected paths.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("accepted", Ty::Bool),
+                    text_field("change_set_id"),
+                    req("applied", Ty::List { of: Box::new(Ty::String) }),
+                    req("already_current", Ty::List { of: Box::new(Ty::String) }),
+                    req("rejected", Ty::List { of: Box::new(Ty::String) }),
+                    req("integrated", Ty::Bool),
+                    req("idempotent", Ty::Bool),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RestorePreviewFile",
+            doc: "One exact would-restore file action with current/expected/restored digests.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("path"),
+                    text_field("action"),
+                    req("current", Ty::Json),
+                    req("expected", Ty::Json),
+                    req("restore", Ty::Json),
+                    nullable("content_digest", Ty::String),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RestorePreview",
+            doc: "Dry-run restore plan; writes is always 0.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("dry_run", Ty::Bool),
+                    req("writes", Ty::I64),
+                    req("session_id", Ty::I64),
+                    req("checkpoint_id", Ty::I64),
+                    req("sequence", Ty::I64),
+                    text_field("direction"),
+                    req("files", Ty::List { of: Box::new(Ty::Named { name: "RestorePreviewFile" }) }),
+                    req("writable", Ty::Bool),
+                    req("conflict_count", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "SessionExport",
+            doc: "Bounded exported session bundle with digest and redaction counts.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("session_id"),
+                    text_field("digest"),
+                    req("bytes", Ty::I64),
+                    req("redacted", Ty::Bool),
+                    req("redacted_fields", Ty::I64),
+                    req("truncated", Ty::Bool),
+                    req("bundle", Ty::Json),
+                ],
+            },
+        },
+        TypeDef {
+            name: "SessionSettings",
+            doc: "Per-session selectable compaction model and loop guards.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("session_id"),
+                    nullable("compaction_model", Ty::String),
+                    nullable("max_turns", Ty::I64),
+                    nullable("max_consecutive_failures", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "SessionDeleteTombstone",
+            doc: "Durable session deletion tombstone and the exact purged-row counts.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("deleted", Ty::Bool),
+                    req("idempotent", Ty::Bool),
+                    text_field("session_id"),
+                    req("deleted_ms", Ty::I64),
+                    req("purged", Ty::Json),
+                ],
+            },
+        },
+    ]
 }
 
 fn type_defs_conversation() -> Vec<TypeDef> {

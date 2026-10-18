@@ -1202,11 +1202,10 @@ impl AgentRuntime {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "pending".into());
-        let facts = handle.memory_facts().unwrap_or_default();
-        let goal_fact = facts
-            .iter()
-            .find(|(k, key, _)| k == "task" && key == "goal")
-            .map(|(_, _, v)| v.clone());
+        // Exact indexed reads: this drive-start heal used to full-scan every
+        // memory fact of the session, so its cost grew with every turn the
+        // task had ever completed (O(n²) over a long task).
+        let goal_fact = handle.memory_fact_get("task", "goal").unwrap_or_default();
         if !healed.goal.is_empty()
             && goal_fact.as_deref() != Some(truncate(&healed.goal, 200).as_str())
         {
@@ -1221,10 +1220,9 @@ impl AgentRuntime {
                 DW_SITE_RESTORE_GOAL_FACT,
             )?;
         }
-        let state_fact = facts
-            .iter()
-            .find(|(k, key, _)| k == "task_state" && key == "state")
-            .map(|(_, _, v)| v.clone());
+        let state_fact = handle
+            .memory_fact_get("task_state", "state")
+            .unwrap_or_default();
         if state_fact.as_deref() != Some(&state_str) {
             self.guarded_upsert_memory_fact(
                 handle,
@@ -1237,10 +1235,7 @@ impl AgentRuntime {
         }
         if !healed.acceptance_criteria.is_empty() {
             let canonical = criteria_canonical_text(&healed.acceptance_criteria);
-            let criteria_fact = facts
-                .iter()
-                .find(|(k, key, _)| k == "criteria" && key == "0")
-                .map(|(_, _, v)| v.clone());
+            let criteria_fact = handle.memory_fact_get("criteria", "0").unwrap_or_default();
             if criteria_fact.as_deref() != Some(canonical.as_str()) {
                 self.guarded_upsert_memory_fact(
                     handle,

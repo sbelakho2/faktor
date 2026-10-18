@@ -1,0 +1,34 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W14",
+  "title": "Review, restore or fork without overwriting edits",
+  "screens": [
+    "S24",
+    "S25",
+    "S26"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Open the exact native candidate diff; review mapped criteria.",
+    "Choose a recorded checkpoint from the timeline.",
+    "Inspect content coverage and file preconditions.",
+    "Choose a supported restore or fork scope.",
+    "Preview unrelated edits and uncovered effects.",
+    "Perform a separate transaction if valid; recheck CAS preconditions inside the restore transaction."
+  ],
+  "forbidden_fake_states": [
+    "Universal undo claimed from hashes",
+    "restore silently overwriting user edits",
+    "fork shown as file rollback",
+    "old proof reused for a new tree"
+  ],
+  "complete_when": "a changed candidate invalidates stale proof; historical verified artifacts remain historical (p.186).",
+  "traceability": "p.186; controls V-01..V-06, V-12, D-06, Q-09; acceptance A33, A34.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

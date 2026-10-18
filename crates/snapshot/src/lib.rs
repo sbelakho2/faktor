@@ -244,6 +244,49 @@ pub enum RollbackOutcome {
     },
 }
 
+/// The exact action a restore would take for one file, computed without
+/// writes. `AlreadyCurrent` is the idempotent no-op; `Conflict` means the
+/// current bytes no longer match the side the transaction must consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewAction {
+    Write,
+    Delete,
+    AlreadyCurrent,
+    Conflict,
+}
+
+impl PreviewAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewAction::Write => "write",
+            PreviewAction::Delete => "delete",
+            PreviewAction::AlreadyCurrent => "already_current",
+            PreviewAction::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePreviewFile {
+    pub path: String,
+    pub action: PreviewAction,
+    pub current: FileState,
+    pub expected: FileState,
+    pub restore: FileState,
+    /// The content digest the restore would install (absent for a delete).
+    pub content_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePreview {
+    pub session_id: SessionId,
+    pub checkpoint_id: i64,
+    pub sequence: i64,
+    pub direction: String,
+    pub files: Vec<RestorePreviewFile>,
+    pub writable: bool,
+}
+
 /// One side of a line diff: a context line (' '), a removed line ('-') or an
 /// added line ('+'). Deterministic, LCS-free, bounded by [`DIFF_MAX_LINES`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,6 +667,60 @@ impl CheckpointStore {
             .clear_checkpoint_restored(checkpoint_id)
             .map_err(map_store)?;
         Ok(outcome)
+    }
+
+    /// Dry-run restore preview (V-05): computes the EXACT would-restore plan
+    /// for one checkpoint without writing anything. The plan names the
+    /// recorded before/after digests, the current disk digest, the action
+    /// (`write`, `delete`, `already_current`, `conflict`) and any stale
+    /// conflict. A caller may then execute `rollback`/`redo` under the exact
+    /// same preconditions; preview never changes durable or filesystem state.
+    pub fn preview_restore(
+        &self,
+        workspace: &WorkspaceHandle,
+        identity: &WorkspaceIdentity,
+        session: SessionId,
+        checkpoint_id: i64,
+        direction: &str,
+    ) -> Result<RestorePreview, Error> {
+        workspace.verify_identity(identity)?;
+        if direction != "undo" && direction != "redo" {
+            return Err(Error::malformed("direction must be `undo` or `redo`"));
+        }
+        let row = self.checkpoint_row(session, checkpoint_id)?;
+        let before = side_state(&row, Side::Before)?;
+        let after = side_state(&row, Side::After)?;
+        let rel = std::path::Path::new(&row.path);
+        let current = FileState::probe(workspace, rel)?;
+        let (expected, target) = if direction == "undo" {
+            (after, before)
+        } else {
+            (before, after)
+        };
+        let action = if current != expected {
+            PreviewAction::Conflict
+        } else if current == target {
+            PreviewAction::AlreadyCurrent
+        } else if target.exists {
+            PreviewAction::Write
+        } else {
+            PreviewAction::Delete
+        };
+        Ok(RestorePreview {
+            session_id: session,
+            checkpoint_id: row.id,
+            sequence: row.sequence,
+            direction: direction.to_string(),
+            files: vec![RestorePreviewFile {
+                path: row.path,
+                action,
+                current,
+                expected,
+                restore: target,
+                content_digest: target.hash.map(|h| h.to_hex()),
+            }],
+            writable: action != PreviewAction::Conflict,
+        })
     }
 
     /// Unified line diff of the latest checkpoint's before/after states, with
@@ -1574,6 +1671,50 @@ mod tests {
             err.kind == ErrorKind::Conflict && err.message.contains("after-content unavailable"),
             "pre-v3 rows must be refused honestly: {err:?}"
         );
+    }
+
+    #[test]
+    fn restore_preview_is_a_side_effect_free_exact_plan_with_conflict_detection() {
+        let (_d, cps, h, id, session) = fixture();
+        let before = b"original\n";
+        let after = b"changed\n";
+        let before_hash = CheckpointStore::hash_of(before);
+        let after_hash = CheckpointStore::hash_of(after);
+        let cid2 = cps
+            .record_change(
+                session,
+                "preview.txt",
+                FileState::existing(before_hash),
+                Some(before),
+                FileState::existing(after_hash),
+                Some(after),
+            )
+            .unwrap();
+        fs::write(h.root().join("preview.txt"), after).unwrap();
+        let preview = cps.preview_restore(&h, &id, session, cid2, "undo").unwrap();
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].action, PreviewAction::Write);
+        assert_eq!(
+            preview.files[0].content_digest.as_deref(),
+            Some(before_hash.to_hex().as_str())
+        );
+        assert!(preview.writable);
+        assert_eq!(fs::read(h.root().join("preview.txt")).unwrap(), after);
+        assert!(cps.checkpoints(session).unwrap()[0].restored_ms.is_none());
+
+        // Drift after the preview: the exact plan becomes a conflict and
+        // STILL writes nothing.
+        fs::write(h.root().join("preview.txt"), b"drifted\n").unwrap();
+        let conflict = cps.preview_restore(&h, &id, session, cid2, "undo").unwrap();
+        assert_eq!(conflict.files[0].action, PreviewAction::Conflict);
+        assert!(!conflict.writable);
+        assert_eq!(
+            fs::read(h.root().join("preview.txt")).unwrap(),
+            b"drifted\n"
+        );
+        assert!(cps
+            .preview_restore(&h, &id, session, cid2, "sideways")
+            .is_err());
     }
 
     #[test]

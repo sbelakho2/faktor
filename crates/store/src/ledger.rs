@@ -805,7 +805,7 @@ impl Store {
         strategy: &str,
         expected_state: AgentState,
         event: CommandEvent,
-    ) -> StoreResult<EventSeq> {
+    ) -> StoreResult<(EventSeq, i64)> {
         let seam = Arc::clone(&self.seam);
         let strategy = strategy.to_owned();
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
@@ -839,6 +839,7 @@ impl Store {
                 "record_compaction: expected exactly one inserted row".into(),
             ));
         }
+        let compaction_id = txn.conn().last_insert_rowid();
         txn.side_row_applied();
         let seq = Self::insert_event_locked(
             txn.conn(),
@@ -853,8 +854,96 @@ impl Store {
         )?;
         txn.precommit();
         txn.commit()?;
-        Ok(seq)
+        Ok((seq, compaction_id))
         })
+    }
+
+    /// Rev8 atomic compaction commit: the compaction row, the durable
+    /// replacement checkpoint facts and the accepted/rejected journal event
+    /// land in ONE SQLite transaction. A crash can therefore never expose a
+    /// checkpoint whose compaction event is missing (or an accepted event
+    /// whose replacement context was never written). Returns the event seq
+    /// and the durable compaction row id (the S10 summary revision).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_compaction_with_checkpoint_and_event(
+        &self,
+        session_id: SessionId,
+        before_tokens: i64,
+        after_tokens: i64,
+        target_tokens: i64,
+        accepted: bool,
+        strategy: &str,
+        expected_state: AgentState,
+        event: CommandEvent,
+        checkpoint_kind: &str,
+        checkpoint_facts: &[(String, String)],
+    ) -> StoreResult<(EventSeq, i64)> {
+        let seam = Arc::clone(&self.seam);
+        let strategy = strategy.to_owned();
+        let checkpoint_kind = checkpoint_kind.to_owned();
+        let checkpoint_facts: Vec<(String, String)> = checkpoint_facts.to_vec();
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let seq_messages = EventSeqMessages::for_session(session_id);
+        let now = now_ms();
+        self.writer
+            .execute("record_compaction_with_checkpoint", move |conn| {
+                let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
+                let changed = txn.tx.execute(
+                    "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        session_id.raw() as i64,
+                        before_tokens,
+                        after_tokens,
+                        target_tokens,
+                        accepted as i64,
+                        strategy,
+                        now
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Migration(
+                        "record_compaction: expected exactly one inserted row".into(),
+                    ));
+                }
+                let compaction_id = txn.conn().last_insert_rowid();
+                if accepted {
+                    txn.conn().execute(
+                        "DELETE FROM memory_fact WHERE session_id = ?1 AND kind = ?2",
+                        params![session_id.raw() as i64, &checkpoint_kind],
+                    )?;
+                    for (key, value) in &checkpoint_facts {
+                        txn.conn().execute(
+                            "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                session_id.raw() as i64,
+                                &checkpoint_kind,
+                                key,
+                                value,
+                                now
+                            ],
+                        )?;
+                    }
+                }
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    event.op_id,
+                    event.kind,
+                    &event_state_json,
+                    event.ts_ms,
+                    event_payload_json,
+                    event.payload_ver,
+                    &seq_messages,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok((seq, compaction_id))
+            })
     }
 
     // -------------------------------------------------- actor batch surface
@@ -1347,9 +1436,15 @@ impl Store {
         let key = key.to_owned();
         let value = value.to_owned();
         self.writer.execute("upsert_memory_fact", move |conn| {
+        // IDEMPOTENCE: rewriting the SAME value must be a true no-op. The
+        // old unconditional update bumped `updated_ms` on every drive, which
+        // moved the row to the newest end of every paged walk and made
+        // replay/heal paths indistinguishable from real fact changes (fact
+        // churn in a long task). A changed value still updates normally.
         conn.execute(
             "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(session_id, kind, key) DO UPDATE SET value = ?4, updated_ms = ?5",
+             ON CONFLICT(session_id, kind, key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms
+             WHERE memory_fact.value IS NOT excluded.value",
             params![session_id.raw() as i64, kind, key, value, fact_stamp],
         )?;
         Ok(())
@@ -1381,7 +1476,8 @@ impl Store {
         for (kind, key, value) in facts {
             tx.execute(
                 "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(session_id, kind, key) DO UPDATE SET value = ?4, updated_ms = ?5",
+                 ON CONFLICT(session_id, kind, key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms
+                 WHERE memory_fact.value IS NOT excluded.value",
                 params![
                     session_id.raw() as i64,
                     kind,
@@ -1396,6 +1492,113 @@ impl Store {
         })
     }
 
+    /// Read ONE memory fact with its CAS timestamp (`updated_ms`). `None`
+    /// means the fact does not exist.
+    pub fn get_memory_fact(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+    ) -> StoreResult<Option<MemoryFactRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, kind, key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(MemoryFactRow {
+                kind: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                updated_ms: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete ONE memory fact durably. Returns the deleted row (`None` when
+    /// it was already absent). A caller that needs optimistic concurrency
+    /// reads [`Store::get_memory_fact`] first and compares `updated_ms`.
+    pub fn delete_memory_fact(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+    ) -> StoreResult<Option<MemoryFactRow>> {
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        self.writer.execute("delete_memory_fact", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let row: Option<MemoryFactRow> = tx
+                .query_row(
+                    "SELECT kind, key, value, updated_ms FROM memory_fact
+                     WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                    params![session_id.raw() as i64, &kind, &key],
+                    |r| {
+                        Ok(MemoryFactRow {
+                            kind: r.get(0)?,
+                            key: r.get(1)?,
+                            value: r.get(2)?,
+                            updated_ms: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            tx.execute(
+                "DELETE FROM memory_fact WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                params![session_id.raw() as i64, &kind, &key],
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+    }
+
+    /// Retention deletion: remove every fact older than `cutoff_ms` for one
+    /// session in ONE transaction, bounded by `limit`. Returns the deleted
+    /// rows (headers only) so the caller can report a dry-run/true count.
+    pub fn delete_memory_facts_before(
+        &self,
+        session_id: SessionId,
+        cutoff_ms: i64,
+        limit: u64,
+    ) -> StoreResult<Vec<MemoryFactRow>> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).map_err(|_| {
+            StoreError::Oversized("memory retention page exceeds SQLite signed range".into())
+        })?;
+        self.writer
+            .execute("delete_memory_facts_before", move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let mut stmt = tx.prepare(
+                    "SELECT kind, key, value, updated_ms FROM memory_fact
+                     WHERE session_id = ?1 AND updated_ms < ?2
+                     ORDER BY updated_ms ASC, kind ASC, key ASC LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(params![session_id.raw() as i64, cutoff_ms, limit], |r| {
+                        Ok(MemoryFactRow {
+                            kind: r.get(0)?,
+                            key: r.get(1)?,
+                            value: r.get(2)?,
+                            updated_ms: r.get(3)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for row in &rows {
+                    tx.execute(
+                        "DELETE FROM memory_fact WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                        params![session_id.raw() as i64, &row.kind, &row.key],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(rows)
+            })
+    }
+
     /// Deterministic newest-first page over memory facts (paging is
     /// fundamental). Rows follow the total order
     /// `(updated_ms DESC, kind DESC, key DESC)` — the same order the
@@ -1404,10 +1607,12 @@ impl Store {
     /// order). Returns `(rows, has_more)` with at most `limit` rows; pass
     /// the last row's `(updated_ms, kind, key)` as the next `after` cursor.
     ///
-    /// Cursor semantics under concurrent writes: an upsert only moves a row
-    /// toward the NEWEST end of the order (its `updated_ms` is rewritten to
-    /// now), so a backward walk can never see the same `(kind, key)` twice,
-    /// and rows that existed at the walk's start and are never rewritten
+    /// Cursor semantics under concurrent writes: an upsert that CHANGES a
+    /// value moves the row toward the NEWEST end of the order (its
+    /// `updated_ms` is rewritten to now; an identical-value upsert is a
+    /// true no-op and does not move), so a backward walk can never see the
+    /// same `(kind, key)` twice, and rows that existed at the walk's start
+    /// and are never rewritten
     /// appear exactly once — deterministic, no duplicate, no gap.
     pub fn memory_facts_page(
         &self,
@@ -1452,6 +1657,113 @@ impl Store {
             out.truncate(limit as usize);
         }
         Ok((out, has_more))
+    }
+
+    /// Newest-first page of ONE fact kind (the `(kind, session_id)` index
+    /// makes this independent of unrelated fact volume). Used by hot paths
+    /// that used to walk the ENTIRE per-session fact table on every turn
+    /// (shell-change attribution, pending child handoffs): a long task's
+    /// per-turn work must not grow with every fact ever written.
+    pub fn memory_facts_by_kind_page(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        let conn = self.read()?;
+        let mut sql = String::from(
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1 AND kind = ?2",
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(6);
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
+        params.push(rusqlite::types::Value::Text(kind.to_string()));
+        if let Some((ms, kind, key)) = after {
+            sql.push_str(
+                " AND (updated_ms < ?3 OR (updated_ms = ?3 AND (kind < ?4 OR (kind = ?4 AND key < ?5))))",
+            );
+            params.push(rusqlite::types::Value::Integer(*ms));
+            params.push(rusqlite::types::Value::Text(kind.clone()));
+            params.push(rusqlite::types::Value::Text(key.clone()));
+        }
+        sql.push_str(" ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?");
+        let probe = (limit.min(i64::MAX as u64) as i64).saturating_add(1);
+        params.push(rusqlite::types::Value::Integer(probe));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out: Vec<MemoryFactRow> = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(MemoryFactRow {
+                kind: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                updated_ms: row.get(3)?,
+            });
+        }
+        let has_more = out.len() as u64 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
+    }
+
+    /// Atomically REPLACE every row of one fact kind for a session (delete +
+    /// insert in ONE transaction). The durable context checkpoint uses this
+    /// so a crash can only expose the OLD checkpoint or the NEW one, never a
+    /// half-written summary/replacement context.
+    pub fn replace_memory_facts_kind(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        facts: &[(String, String)],
+    ) -> StoreResult<()> {
+        let kind = kind.to_owned();
+        let facts: Vec<(String, String)> = facts.to_vec();
+        let fact_stamp = self.fact_timestamp();
+        self.writer
+            .execute("replace_memory_facts_kind", move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "DELETE FROM memory_fact WHERE session_id = ?1 AND kind = ?2",
+                    params![session_id.raw() as i64, kind],
+                )?;
+                for (key, value) in facts {
+                    tx.execute(
+                        "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![session_id.raw() as i64, kind, key, value, fact_stamp],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+    }
+
+    /// Keep only the NEWEST `keep` rows of one fact kind (oldest evicted).
+    /// Bounded retention for append-only per-turn facts: the per-turn
+    /// summaries are write-only long-term memory, and an unbounded kind made
+    /// every full fact scan (and the table itself) grow with the task.
+    pub fn prune_memory_facts_kind_keep_newest(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        keep: usize,
+    ) -> StoreResult<usize> {
+        let kind = kind.to_owned();
+        let keep = keep as i64;
+        self.writer.execute("prune_memory_facts_kind", move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM memory_fact
+                 WHERE session_id = ?1 AND kind = ?2 AND key NOT IN (
+                    SELECT key FROM memory_fact
+                    WHERE session_id = ?1 AND kind = ?2
+                    ORDER BY updated_ms DESC, key DESC LIMIT ?3
+                 )",
+                params![session_id.raw() as i64, kind, keep],
+            )?;
+            Ok(deleted)
+        })
     }
 
     pub fn memory_facts(
@@ -2287,7 +2599,19 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         if count == 0 {
-            if row_state.is_some() {
+            // A durable D-06 tombstone intentionally keeps the session row
+            // while the purge removes its journal. That is a deleted
+            // session, not a torn creation, and it must not make the usage
+            // aggregator or the doctor fail on an otherwise healthy store.
+            let deleted: bool = conn
+                .query_row(
+                    "SELECT 1 FROM session_deletion WHERE session_id = ?1",
+                    params![sid],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if row_state.is_some() && !deleted {
                 problems.push(format!(
                     "session {session_id}: session row exists but its journal has no events (torn creation)"
                 ));

@@ -704,6 +704,7 @@ const WORKFLOWS = {
       'vscode-render',
       'jetbrains-build',
       'jetbrains-smoke',
+      'edition5',
     ],
   },
   trusted: {

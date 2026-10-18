@@ -1,0 +1,1481 @@
+{
+  "schema": "faktor-edition8-copy-retention/v1",
+  "printed": {
+    "segments": 1497,
+    "strings": 5973,
+    "changes": 838
+  },
+  "destinations": {
+    "Edition 5 screens (S01–S32) Source: , screen interaction contracts pp.101–108, native visual plates pp.109–172, product IA pp.007–008, responsive rules p.023 and spacing rules p.035.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "All 32 screens are rendered for both hosts; the PDF states \"These contracts apply to both host variants\" on each contract page (pp.101–108).": {
+      "destination": "S12",
+      "basis": "fuzzy token overlap 0.46",
+      "reviewed": false
+    },
+    "Global visual contract (applies to every screen) Base unit 4 logical px; inline gaps 4/8; control gap 8; helper gap 4; form row gap 12; group gap 24; panel padding 12 compact / 16 standard / 24 wide (p.035).": {
+      "destination": "S05",
+      "basis": "fuzzy token overlap 0.45",
+      "reviewed": false
+    },
+    "Controls target 32 logical px (compact 28 where host convention allows); primary composer action 32–44; body line height 1.4–1.5; labels 1.25–1.35; never clip text to a fixed single line box (p.035).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Settings use a bounded label column plus a flexible value column only when there is room; stack below the measured breakpoint; and for paths/IDs (pp.035, 050).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Breakpoints: 240–319 px labelled vertical stack with Send/Stop and attention visible; 320–479 px two compact wrapped rows; ≥480 px full configuration summary (p.023).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Inherit host font family/size/zoom, semantic colors/focus/high contrast tokens; no brand font in IDE reading surfaces; no blinking/decorative motion; reduced motion removes nonessential transitions (pp.023, 035, 050).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "VS Code host tokens: , , , ; JetBrains uses JBUI/UIManager metrics (p.050).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Every screen must cover empty, loading, stale and error states; loading is bounded/cancellable; stale keeps the last coherent data with age; errors name the typed cause, affected scope and safe recovery and preserve edits (p.013).": {
+      "destination": "S44",
+      "basis": "fuzzy token overlap 0.69",
+      "reviewed": false
+    },
+    "Optimistic actions are limited to expansion/filter/favorite/draft editing; Saved, Connected, Allowed, Cancelled, Restored, Verified and PR created require their own acknowledgements (p.013).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Host variants VS Code: Faktor activity view with Work / Inspect / History; editor sized settings tab with left configuration nav and / staged footer; native QuickPick for one dimensional choices; native diff editor for review; wide details open in editor tabs (pp.022, 101–108, 109–172).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "JetBrains: movable/dockable Faktor tool window with the same Work / Inspect / History destinations; Configurable with left settings tree and ; ActionSystem toolbar, native lists/dialogs and native editor diff (pp.022, 101–108, 109–172).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "S01 — Work: a complete agent cockpit Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Compact cockpit exposes intent, model, effort, authority, context, caps and pending attention beside the draft; Send captures an immutable configuration summary and task contract.": {
+      "destination": "S01",
+      "basis": "fuzzy token overlap 0.70",
+      "reviewed": false
+    },
+    "Open Task options without losing the draft; Send captures an immutable configuration summary and task contract.": {
+      "destination": "S36",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "While disconnected, retain the draft and last coherent transcript; mark observations stale and disable admission until the session is reconciled.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Identity/header (task, model, effort, authority, context, caps), transcript/body, attention rail, composer, status row.": {
+      "destination": "S01",
+      "basis": "fuzzy token overlap 0.71",
+      "reviewed": false
+    },
+    "Faktor activity view; wide diff/context/call detail opens in a native editor tab; Back restores the prior selection.": {
+      "destination": "S08",
+      "basis": "fuzzy token overlap 0.47",
+      "reviewed": false
+    },
+    "Faktor tool window; wide detail opens in the native editor/diff; tool window selection and text caret survive snapshots.": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "12/16 px panel inset; 8 px control gap; 4/8 px inline gaps; 32 px composer; attention rail remains visible at 240 px.": {
+      "destination": "S58",
+      "basis": "fuzzy token overlap 0.70",
+      "reviewed": false
+    },
+    "Empty: name the add/discover/refresh action and show no placeholder values.": {
+      "destination": "S57",
+      "basis": "fuzzy token overlap 0.75",
+      "reviewed": false
+    },
+    "Loading: bounded/cancellable, keep the last coherent state.": {
+      "destination": "S57",
+      "basis": "fuzzy token overlap 0.86",
+      "reviewed": false
+    },
+    "Stale: show age and disable admission/apply until reconciled.": {
+      "destination": "S21",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "Error: typed cause, affected scope and safe recovery; preserve the draft.": {
+      "destination": "S44",
+      "basis": "fuzzy token overlap 0.78",
+      "reviewed": false
+    },
+    "Disabled: show the missing capability/policy/ownership prerequisite; never render an inert toggle (p.013).": {
+      "destination": "S57",
+      "basis": "fuzzy token overlap 0.45",
+      "reviewed": false
+    },
+    "Screen specific recovery: While disconnected, retain the draft and last coherent transcript; mark observations stale and disable admission until the session is reconciled.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W03, W04, W15.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Back or Escape restores the invoking selection; session/worktree switches preserve per session drafts and never merge late callbacks (pp.007–008, 013).": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.101; plates pp.109–110; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S02 — Model picker and capability details Purpose.": {
+      "destination": "S02",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Search by exact ID, provider or capability; expose authority, limits and availability before selection; favorites/recent are user local; show New conversation when the current session cannot change safely.": {
+      "destination": "S02",
+      "basis": "fuzzy token overlap 0.55",
+      "reviewed": false
+    },
+    "Choose a served model and commit its provider/model pair; show New conversation when this session cannot change safely.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "An unknown or unavailable model remains visible with a reason; do not silently substitute it; a blocked tool capability prevents tool using admission.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Search field, pinned/favorites/recent groups, served model list with authority/limits/availability, selected model detail, select/cancel row.": {
+      "destination": "S02",
+      "basis": "fuzzy token overlap 0.82",
+      "reviewed": false
+    },
+    "QuickPick style host picker over Work; Enter selects, arrows navigate, Esc cancels and preserves the previous pair/draft; Tab keeps normal focus.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Native dialog/list picker over the tool window; Enter selects, Esc cancels; the same requested vs actual and unavailable labels.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "32 px rows, 8 px item gap, full width search, selected detail pane; 240 px vertical stack; Enter/Esc/Tab use host focus rules.": {
+      "destination": "S02",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "Screen specific recovery: An unknown or unavailable model remains visible with a reason; do not silently substitute it; a blocked tool capability prevents tool using admission.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W01, W03.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.101; plates pp.111–112; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S03 — Provider connection editor Purpose.": {
+      "destination": "S03",
+      "basis": "fuzzy token overlap 0.75",
+      "reviewed": false
+    },
+    "Connections have a stable instance ID, API family, endpoint and credential reference; test auth, model discovery and capability support as separate stages; save only after secure binding.": {
+      "destination": "S03",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Validate a staged draft, preview the diff and save only after secure binding succeeds; keep the last valid connection when validation fails.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A 401 offers Rotate credential; blocked destination shows endpoint policy; discovery failure keeps manually declared model IDs intact.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Connection list, identity/API family, endpoint and credential reference, staged test stages (reachability/auth/catalog/capability), diff/apply footer.": {
+      "destination": "S03",
+      "basis": "fuzzy token overlap 0.53",
+      "reviewed": false
+    },
+    "Editor tab in the Faktor Settings group; per field effective source; staged changes footer; / .": {
+      "destination": "S29",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    ", category tree, one shared application scoped validation/persistence controller; / / ; project scope is proposed.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Two column form at ≥480 px (label 10–15rem, flexible value); 12 px row gap; 24 px groups; 32 px controls; pinned staged footer; 240/320 px stack with no clipped labels.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: A 401 offers Rotate credential; blocked destination shows endpoint policy; discovery failure keeps manually declared model IDs intact.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W01.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.101; plates pp.113–114; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S04 — Local model setup and runtime allocation Purpose.": {
+      "destination": "S04",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Locality is relative to the daemon; explain loopback, allocation, model readiness and resource ownership before offering local runtime controls.": {
+      "destination": "S04",
+      "basis": "fuzzy token overlap 1.00",
+      "reviewed": false
+    },
+    "Test the exact endpoint from the daemon host, then show configured and observed allocation side by side.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A private LAN endpoint receives a typed refusal; allow loopback cannot authorize it; unsupported unload/allocation controls stay unavailable.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Execution location, local adapter, endpoint/test, declared vs observed allocation, embedding boundary, context preview.": {
+      "destination": "S04",
+      "basis": "fuzzy token overlap 0.54",
+      "reviewed": false
+    },
+    "Screen specific recovery: A private LAN endpoint receives a typed refusal; allow loopback cannot authorize it; unsupported unload/allocation controls stay unavailable.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W02.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.101; plates pp.115–116; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S05 — Model tuning: reasoning and generation Purpose.": {
+      "destination": "S05",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Capability driven form exposes standard generation controls without pretending every provider supports every field; Unset is distinct from zero; Preview shows the normalized request and apply timing.": {
+      "destination": "S05",
+      "basis": "fuzzy token overlap 0.78",
+      "reviewed": false
+    },
+    "Reset removes an override; Preview shows the normalized request and apply timing; changes apply only after a supported acknowledgement.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Unsupported values fail locally before admission; changing the model revalidates the complete tuning bundle and retains incompatible edits for review.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Model identity, reasoning, thinking budget, sampling, output limit, advanced fields, reset/preview/apply bar.": {
+      "destination": "S05",
+      "basis": "fuzzy token overlap 0.62",
+      "reviewed": false
+    },
+    "Screen specific recovery: Unsupported values fail locally before admission; changing the model revalidates the complete tuning bundle and retains incompatible edits for review.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.102; plates pp.117–118; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S06 — Agent presets and execution envelopes Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Code, Ask, Plan, Debug and Review are proposed task envelopes with visible instructions, models, tool limits and delegation policy; a preset cannot override managed denies.": {
+      "destination": "S06",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Select or duplicate a preset, then inspect resolved permissions before applying it to a new task.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A prompt only Ask route is labelled accordingly until read only dispatch is enforced; a preset cannot override managed denies.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Preset library, preset editor, resolved permissions/envelope, duplicate/apply actions.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: A prompt only Ask route is labelled accordingly until read only dispatch is enforced; a preset cannot override managed denies.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W04.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.102; plates pp.119–120; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S07 — Custom agent and delegation settings Purpose.": {
+      "destination": "S07",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Build a role from bounded instructions, model settings, tools and parent owned budget; preview the resulting envelope before saving; active children retain their admitted version.": {
+      "destination": "S07",
+      "basis": "fuzzy token overlap 0.68",
+      "reviewed": false
+    },
+    "Save a validated version for the next task; an active child retains its admitted version until a supported control changes it.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Duplicate names do not collide with stable IDs; invalid capability/model combinations stay in the draft and cannot be applied.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Role/instructions, model/reasoning, tool allowlist, delegation limits, parent budget, envelope preview.": {
+      "destination": "S07",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Screen specific recovery: Duplicate names do not collide with stable IDs; invalid capability/model combinations stay in the draft and cannot be applied.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W04, W11.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.102; plates pp.121–122; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S08 — Context inspector and capacity accounting Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Inspect what enters a call, its estimated/observed token cost and provenance; capacity and input usage have different bases; overflow must be resolved before sending.": {
+      "destination": "S08",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Pin, exclude or open an attributed source; resolve overflow before sending; show the preview version admission will capture.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "With current contextUsage=null, measured usage reads Unavailable; estimates remain useful but never masquerade as a durable runtime meter.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Capacity totals, category accounting, source manifest, overflow actions, preview/capture bar.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: With current contextUsage=null, measured usage reads Unavailable; estimates remain useful but never masquerade as a durable runtime meter.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W02, W05, W06.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.102; plates pp.123–124; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S09 — Mentions, attachments and explicit context Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "One discoverable picker adds exact files, ranges, diagnostics, terminal excerpts, diffs, URLs and prior chat references to a draft; failed items stay visible and removable.": {
+      "destination": "S09",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Select a source to preview resolved URI, range, version, bytes and inclusion state; Escape closes the picker without clearing text.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Oversize, stale or unsupported attachments stay visible with a reason and Remove/Retry; do not silently omit a failed item on Send.": {
+      "destination": "S37",
+      "basis": "fuzzy token overlap 0.53",
+      "reviewed": false
+    },
+    "Search/mention field, grouped sources (files, symbols, diagnostics, terminal, diffs, URLs, prior chats), source preview, selected attachment chips.": {
+      "destination": "S09",
+      "basis": "fuzzy token overlap 0.56",
+      "reviewed": false
+    },
+    "Screen specific recovery: Oversize, stale or unsupported attachments stay visible with a reason and Remove/Retry; do not silently omit a failed item on Send.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W05.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.103; plates pp.125–126; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S10 — Compaction and continuity review Purpose.": {
+      "destination": "S10",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Compaction preserves task obligations and operation identity while reducing eligible history; show a plan before dispatch and a measured result afterwards.": {
+      "destination": "S10",
+      "basis": "fuzzy token overlap 0.82",
+      "reviewed": false
+    },
+    "Review retained facts and model/egress/cost implications, then Compact using a new durable operation contract.": {
+      "destination": "S10",
+      "basis": "fuzzy token overlap 0.54",
+      "reviewed": false
+    },
+    "Failure or insufficient reduction keeps the prior valid basis; pending approvals and unknown external effects cannot be erased by summarization.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Freshness/basis, retained facts manifest, summary model/egress/cost, before/after reduction, compact/cancel actions.": {
+      "destination": "S10",
+      "basis": "fuzzy token overlap 0.53",
+      "reviewed": false
+    },
+    "Screen specific recovery: Failure or insufficient reduction keeps the prior valid basis; pending approvals and unknown external effects cannot be erased by summarization.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W05, W06.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.103; plates pp.127–128; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S11 — Rules, instructions and effective prompt Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Inspect instructions by origin and activation scope, edit allowed sources and preview the merged bundle the next task will capture; a policy lock is not overridable by text.": {
+      "destination": "S11",
+      "basis": "fuzzy token overlap 0.79",
+      "reviewed": false
+    },
+    "Test a scoped rule against sample files, review conflicts and save a version; show a policy lock rather than pretending text can override it.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "An invalid glob or unresolved template variable blocks Apply; unsaved edits survive navigation and are never mistaken for applied runtime state.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Source tree, instruction editor, activation/match preview, merged effective prompt, conflict/lock inspector.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: An invalid glob or unresolved template variable blocks Apply; unsaved edits survive navigation and are never mistaken for applied runtime state.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W09.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.103; plates pp.129–130; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S12 — Memory, learned facts and retention Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Separate learned failure priors, user instructions and proposed personal/project memory; each record has scope, source, date and deletion semantics.": {
+      "destination": "S12",
+      "basis": "fuzzy token overlap 1.00",
+      "reviewed": false
+    },
+    "Review a proposed memory diff before saving; open the originating evidence or delete the exact record after scope review.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Deleting a memory affects future use after acknowledgement, not copies in prior calls; a project cannot redirect global memory storage.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Scope selector, memory records, provenance/evidence, retention/delete detail, learned failure section.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: Deleting a memory affects future use after acknowledgement, not copies in prior calls; a project cannot redirect global memory storage.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: no dedicated W01–W16 path; reached from Settings/editor.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.103; plates pp.131–132; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S13 — Permissions and sandbox policy editor Purpose.": {
+      "destination": "S13",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Explain effective permissions by tool, action, target and scope; show persistent rules separately from pending approvals and actual containment.": {
+      "destination": "S13",
+      "basis": "fuzzy token overlap 0.94",
+      "reviewed": false
+    },
+    "Preview a rule match against a sample operation, then apply a versioned policy to future dispatch after daemon acknowledgement.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "No policy store means no Remember rule; revocation reports future denial and already issued effects separately; sandbox failure remains visible.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Permission preset, filesystem/shell/network sections, matcher/rule editor, effective policy preview, audit/revocation.": {
+      "destination": "S13",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "Screen specific recovery: No policy store means no Remember rule; revocation reports future denial and already issued effects separately; sandbox failure remains visible.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W07, W08, W09.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.104; plates pp.133–134; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S14 — Approval: exact operation and safe response Purpose.": {
+      "destination": "S14",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Approval dock shows requesting session/child, operation, target, reason and effect boundary without losing the transcript; Allow once/Deny address one exact waiter generation.": {
+      "destination": "S14",
+      "basis": "fuzzy token overlap 0.86",
+      "reviewed": false
+    },
+    "Allow once or Deny to one exact waiter generation; Remember opens a separate persistent policy draft only when supported.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Expired, already replied or wrong session requests disable response and offer Refresh; a timeout preserves unknown state until reconciled.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Requesting owner/child/generation, exact operation/arguments/cwd/target, effect boundary, Allow once/Deny, Remember draft, expiry.": {
+      "destination": "S14",
+      "basis": "fuzzy token overlap 0.63",
+      "reviewed": false
+    },
+    "Screen specific recovery: Expired, already replied or wrong session requests disable response and offer Refresh; a timeout preserves unknown state until reconciled.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W07, W11.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.104; plates pp.135–136; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S15 — Tools and MCP connection health Purpose.": {
+      "destination": "S03",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Group built in tools and MCP servers by origin, availability and active permissions; discovered, enabled, healthy and authorized are independently visible.": {
+      "destination": "S15",
+      "basis": "fuzzy token overlap 0.79",
+      "reviewed": false
+    },
+    "Open a server to inspect tool schemas, permission defaults, output bounds and logs; reconnect only through owned lifecycle control.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Authentication required, failed discovery and stopped process are different states; unknown remote effects never become Cancelled merely on disconnect.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Built in tools, MCP server list, tool catalog, permission/default badges, health/auth/logs, reconnect/remove.": {
+      "destination": "S15",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "Screen specific recovery: Authentication required, failed discovery and stopped process are different states; unknown remote effects never become Cancelled merely on disconnect.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W08.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.104; plates pp.137–138; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S16 — Add MCP server with trust and bounded config Purpose.": {
+      "destination": "S16",
+      "basis": "fuzzy token overlap 0.83",
+      "reviewed": false
+    },
+    "Configure a supervised stdio server with exact command/args and explicit trust; remote transport is offered only after capability negotiation; repository content never auto starts a server.": {
+      "destination": "S16",
+      "basis": "fuzzy token overlap 0.77",
+      "reviewed": false
+    },
+    "Validate size/count bounds, review executable host and source, then save and explicitly start the trusted server.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A repository supplied executable never starts merely because a config file exists; invalid args or a failed start preserve the previous valid server.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Transport selector, identity/command/args, environment references, trust/source review, bounds, test/start actions.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: A repository supplied executable never starts merely because a config file exists; invalid args or a failed start preserve the previous valid server.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.104; plates pp.139–140; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S17 — Skills and command discovery Purpose.": {
+      "destination": "S17",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Discover reusable workflows without confusing installation with permission grants; commands say whether they insert text, start a task or execute a bounded action.": {
+      "destination": "S17",
+      "basis": "fuzzy token overlap 0.89",
+      "reviewed": false
+    },
+    "Open a skill manifest and version diff before enabling; insert a command into a draft without unexpectedly sending it.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Unavailable dependencies or a failed update keep the previous known good version; disabling a skill removes both discovery and agent invocation.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Skill library, manifest/version, source/trust, invocation policy, arguments/template preview, install/update/remove.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: Unavailable dependencies or a failed update keep the previous known good version; disabling a skill removes both discovery and agent invocation.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.105; plates pp.141–142; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S18 — Hooks: lifecycle automation and testing Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Edit exact native lifecycle events, executable arguments, environment, bounds and failure policy; test under the same capability envelope; partial output cannot authorize after timeout.": {
+      "destination": "S18",
+      "basis": "fuzzy token overlap 0.77",
+      "reviewed": false
+    },
+    "Select an event, inspect matching inputs and run an explicitly admitted test; save only a validated version for future events.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Deadline, nonzero exit and malformed verdict remain distinct; partial output cannot become an Allow verdict after timeout.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Native event list, hook spec form (executable/args/env/deadline/caps/failure), match preview, bounded test result, audit artifact.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: Deadline, nonzero exit and malformed verdict remain distinct; partial output cannot become an Allow verdict after timeout.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W10.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.105; plates pp.143–144; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S19 — Terminal ownership and background work Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "An owned process table and bounded output coexist with the transcript; terminal kill, run stop and session abort are separate actions; stale PIDs cannot authorize kill.": {
+      "destination": "S19",
+      "basis": "fuzzy token overlap 0.79",
+      "reviewed": false
+    },
+    "Select a live process, inspect cwd/sandbox/output, then use only controls supported by its current owned handle.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A stale PID cannot authorize kill; timeout or disconnect retains Unknown effect until reconciliation, with no blind replay.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Owned process table, cwd/sandbox profile, bounded output, process/task/session controls, artifact links.": {
+      "destination": "S19",
+      "basis": "fuzzy token overlap 0.75",
+      "reviewed": false
+    },
+    "Faktor editor tab for wide detail; terminal/output remains bounded and anchored.": {
+      "destination": "S05",
+      "basis": "fuzzy token overlap 0.56",
+      "reviewed": false
+    },
+    "Tool window detail with selector/one visible surface; native editor/output tabs for long artifacts.": {
+      "destination": "S19",
+      "basis": "fuzzy token overlap 0.62",
+      "reviewed": false
+    },
+    "12/16 px panel inset; 32 px control rows; bounded output with artifact link; 240 px stacks controls, never hides Stop/attention.": {
+      "destination": "S19",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Screen specific recovery: A stale PID cannot authorize kill; timeout or disconnect retains Unknown effect until reconciliation, with no blind replay.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W12.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.105; plates pp.145–146; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S20 — Browser, diagnostics and editor actions Purpose.": {
+      "destination": "S20",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Integrate host diagnostics and explicit code actions; browser controls require an actual advertised adapter with account, machine and network scope.": {
+      "destination": "S20",
+      "basis": "fuzzy token overlap 1.00",
+      "reviewed": false
+    },
+    "Capture versioned selection or diagnostics into a draft; connect a browser only through an implemented adapter and scoped permission decision.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A screenshot or clean console does not prove functional correctness; unavailable browser support is labelled rather than shown as an idle tab.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Browser adapter/connection, URL/account/machine scope, screenshot/console/network observations, diagnostics and editor actions.": {
+      "destination": "S20",
+      "basis": "fuzzy token overlap 0.85",
+      "reviewed": false
+    },
+    "Screen specific recovery: A screenshot or clean console does not prove functional correctness; unavailable browser support is labelled rather than shown as an idle tab.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.105; plates pp.147–148; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S21 — Budgets, retry policy and loop guards Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Show exact run limits and current accounting beside reliability controls; a soft warning is different from enforced admission refusal; a cap decrease cannot erase obligations.": {
+      "destination": "S21",
+      "basis": "fuzzy token overlap 0.74",
+      "reviewed": false
+    },
+    "Stage a new default or request a supported active task allowance revision; clearly label which captured task is affected.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Unknown price is not zero; a cap decrease cannot erase settled or reserved spend; retry only after classifying admission and external effect state.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Token cap, money cap, threshold/warning, retry policy, loop guards, current ledger/reservation summary.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: Unknown price is not zero; a cap decrease cannot erase settled or reserved spend; retry only after classifying admission and external effect state.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W13.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.106; plates pp.149–150; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S22 — Live run: tools, queue and attention Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A live timeline explains what is active, waiting, queued, failed or uncertain; critical attention remains visible when details are collapsed.": {
+      "destination": "S22",
+      "basis": "fuzzy token overlap 1.00",
+      "reviewed": false
+    },
+    "Inspect a tool call, edit the owned next message queue or stop the current run; a steer action states its delivery point.": {
+      "destination": "S01",
+      "basis": "fuzzy token overlap 0.47",
+      "reviewed": false
+    },
+    "Lost stream marks the projection stale without turning the task idle; reconnect from durable cursor and reconcile before enabling duplicate effects.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Run header, live timeline, tool call detail, prompt queue, attention/approval dock, composer/status.": {
+      "destination": "S01",
+      "basis": "fuzzy token overlap 0.54",
+      "reviewed": false
+    },
+    "Screen specific recovery: Lost stream marks the projection stale without turning the task idle; reconnect from durable cursor and reconcile before enabling duplicate effects.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W07, W10, W12, W13.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.106; plates pp.151–152; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S23 — Agents: delegation, ownership and handoff Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Inspect parent and child work as a tree with bounded concurrency, shared spend and candidate ownership; child output is evidence, not automatic parent success.": {
+      "destination": "S23",
+      "basis": "fuzzy token overlap 0.81",
+      "reviewed": false
+    },
+    "Select a child to view its admitted role/model/tools and use supported Steer, Model or Stop controls.": {
+      "destination": "S23",
+      "basis": "fuzzy token overlap 0.55",
+      "reviewed": false
+    },
+    "Stale child controls are fenced by session and generation; child failure preserves artifacts and the parent remaining obligations.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Agent tree, child role/model/status, parent budget/ownership, child controls, typed handoff/result.": {
+      "destination": "S23",
+      "basis": "fuzzy token overlap 0.77",
+      "reviewed": false
+    },
+    "Screen specific recovery: Stale child controls are fenced by session and generation; child failure preserves artifacts and the parent remaining obligations.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W11.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.106; plates pp.153–154; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S24 — Native changes and review obligations Purpose.": {
+      "destination": "S24",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Use each host native diff editor; keep base/candidate identity, acceptance criteria and remaining verification adjacent to code review; review marks do not integrate or publish.": {
+      "destination": "S24",
+      "basis": "fuzzy token overlap 0.84",
+      "reviewed": false
+    },
+    "Open a file/hunk, attach a versioned comment or prepare a new bounded task; review marks alone do not integrate or publish.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Manual owner edits trigger compare and swap refusal; a changed or partially selected candidate needs matching new evidence.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "File tree, native diff, versioned comments, acceptance criteria, verification/proof status, review/finish actions.": {
+      "destination": "S24",
+      "basis": "fuzzy token overlap 0.71",
+      "reviewed": false
+    },
+    "Native VS Code diff editor/tab; review marks never land a change.": {
+      "destination": "S43",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Native IntelliJ diff editor; review marks never land a change.": {
+      "destination": "S43",
+      "basis": "fuzzy token overlap 0.56",
+      "reviewed": false
+    },
+    "Native diff editor chrome; review/details inset 12–24 px; version badges and 32 px actions; no overlap of verification status with code.": {
+      "destination": "S24",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Screen specific recovery: Manual owner edits trigger compare and swap refusal; a changed or partially selected candidate needs matching new evidence.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W14, W15.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.106; plates pp.155–156; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S25 — Checkpoints, restore and fork preview Purpose.": {
+      "destination": "S25",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Show recorded checkpoint identity, content coverage and branching separately; preview exact files and conversation range before any supported restore.": {
+      "destination": "S25",
+      "basis": "fuzzy token overlap 0.88",
+      "reviewed": false
+    },
+    "Choose a stored checkpoint, inspect coverage and compare content preconditions before requesting a separate restore transaction.": {
+      "destination": "S25",
+      "basis": "fuzzy token overlap 0.46",
+      "reviewed": false
+    },
+    "Hash only entries may not support redo/diff; unrelated edits or missing content refuse restore; shell/network/SCM effects are disclosed as uncovered.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Checkpoint timeline, coverage/preconditions, diff preview, restore/fork scope, uncovered effects warning.": {
+      "destination": "S25",
+      "basis": "fuzzy token overlap 0.75",
+      "reviewed": false
+    },
+    "Screen specific recovery: Hash only entries may not support redo/diff; unrelated edits or missing content refuse restore; shell/network/SCM effects are disclosed as uncovered.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W14.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.107; plates pp.157–158; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S26 — History, search and parallel workspaces Purpose.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "History shows durable conversation identity, worktree, status and engineering outcome; label title search separately from transcript find and indexed recall.": {
+      "destination": "S26",
+      "basis": "fuzzy token overlap 0.83",
+      "reviewed": false
+    },
+    "Switch deliberately while retaining per session drafts, scroll and pending attention; open supported session actions with precise retention scope.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Late callbacks cannot populate the wrong conversation; an unavailable history service is not an empty list; archived is not deleted.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Filters (title, status, worktree, outcome), paged session list, selected session summary, actions, parallel worktree tabs.": {
+      "destination": "S26",
+      "basis": "fuzzy token overlap 0.46",
+      "reviewed": false
+    },
+    "Screen specific recovery: Late callbacks cannot populate the wrong conversation; an unavailable history service is not an empty list; archived is not deleted.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W12, W13, W14, W16.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.107; plates pp.159–160; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S27 — Usage, context and engineering outcomes Purpose.": {
+      "destination": "S27",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Separate token accounting, provider/cache prices, quota, local estimates and verification based engineering cost; explain every denominator.": {
+      "destination": "S27",
+      "basis": "fuzzy token overlap 0.94",
+      "reviewed": false
+    },
+    "Filter by workspace, model, cohort and time basis, then inspect the underlying attempted runs and verified landed changes.": {
+      "destination": "S53",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "No verified changes means VCSC unavailable, not zero; cancelled/failed attempts remain in the eligible spend numerator.": {
+      "destination": "S53",
+      "basis": "fuzzy token overlap 0.62",
+      "reviewed": false
+    },
+    "Period/cohort filters, token/cost categories, provider/cache/quota, engineering outcomes, VCSC and denominators.": {
+      "destination": "S27",
+      "basis": "fuzzy token overlap 0.54",
+      "reviewed": false
+    },
+    "Screen specific recovery: No verified changes means VCSC unavailable, not zero; cancelled/failed attempts remain in the eligible spend numerator.": {
+      "destination": "S53",
+      "basis": "fuzzy token overlap 0.50",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W13, W15.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.107; plates pp.161–162; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S28 — Routing, efficiency and retrieval controls Purpose.": {
+      "destination": "S28",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Expose current production efficiency flags and off switches with honest measurement, fallback and apply timing; duplicate semantic context/information gain aliases fail validation.": {
+      "destination": "S28",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Preview a config diff, validate aliases and save through supported operator/native pathways; keep provenance for each effective value.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Missing embedding support falls back to lexical/symbol retrieval; duplicate semantic context/information gain aliases fail validation.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Routing policy, efficiency flags (failure learning, CCR, typed handoff, semantic context, rework), retrieval strategy, measured effects.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Screen specific recovery: Missing embedding support falls back to lexical/symbol retrieval; duplicate semantic context/information gain aliases fail validation.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.107; plates pp.163–164; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S29 — Settings: scope, provenance and atomic apply Purpose.": {
+      "destination": "S29",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Search settings across allowed scopes and inspect each effective value, source, lock and timing; distinguish staged, saved and runtime applied state; apply one validated atomic patch.": {
+      "destination": "S29",
+      "basis": "fuzzy token overlap 0.82",
+      "reviewed": false
+    },
+    "Apply a validated atomic patch against a known config revision, or Reset to applied values; Restore defaults edits the form until Apply.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A revision conflict opens a compare/rebase view; machine executable paths never inherit from untrusted project settings.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Scope/search, category navigation, form rows with effective source/lock, staged changes, Reset/Apply/Restore defaults.": {
+      "destination": "S29",
+      "basis": "fuzzy token overlap 0.56",
+      "reviewed": false
+    },
+    "Screen specific recovery: A revision conflict opens a compare/rebase view; machine executable paths never inherit from untrusted project settings.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.108; plates pp.165–166; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S30 — Diagnostics, runtime trust and recovery Purpose.": {
+      "destination": "S29",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Show readiness, version compatibility, runtime identity and bounded diagnostics with an actionable typed cause; checksum mismatch refuses start; checksum match is not signature verification.": {
+      "destination": "S30",
+      "basis": "fuzzy token overlap 0.74",
+      "reviewed": false
+    },
+    "Review a redacted diagnostic preview before export; explicit Start is separate from opening the tool window.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Checksum mismatch refuses start; an unrecorded exact path needs deliberate trust; a checksum match does not claim publisher signature verification.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Readiness/version, runtime path/checksum/trust, protocol compatibility, bounded diagnostics, logs, start/export/recovery actions.": {
+      "destination": "S30",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Screen specific recovery: Checksum mismatch refuses start; an unrecorded exact path needs deliberate trust; a checksum match does not claim publisher signature verification.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W10, W16.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.108; plates pp.167–168; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S31 — Remote workspaces and execution boundary Purpose.": {
+      "destination": "S31",
+      "basis": "fuzzy token overlap 0.60",
+      "reviewed": false
+    },
+    "Display editor, execution, model, vault and candidate locations together; remote workspaces must not blur local/hosted boundaries or path ownership.": {
+      "destination": "S31",
+      "basis": "fuzzy token overlap 0.82",
+      "reviewed": false
+    },
+    "Bind a conversation to one workspace/worktree/daemon generation; revalidate after container, SSH or execution host changes.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "A host change invalidates process and permission handles until rebound; preserve drafts without replaying a captured effectful request elsewhere.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Binding identity (workspace/worktree/daemon), editor/execution/model/vault/worker locations, data boundary, revalidation/rebind.": {
+      "destination": "S31",
+      "basis": "fuzzy token overlap 0.47",
+      "reviewed": false
+    },
+    "Screen specific recovery: A host change invalidates process and permission handles until rebound; preserve drafts without replaying a captured effectful request elsewhere.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W02, W16.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.108; plates pp.169–170; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "S32 — Task outcome and finish proof Purpose.": {
+      "destination": "S32",
+      "basis": "fuzzy token overlap 0.80",
+      "reviewed": false
+    },
+    "Finish with explicit engineering status: required acceptance, claim evidence, matching integration and requested finish; conversation completion alone proves none of them.": {
+      "destination": "S32",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "Open each evidence receipt, inspect matching candidate identity and resolve any missing required fact before the requested finish can be fulfilled.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Missing unit evidence, failed integration or absent SCM configuration remains a named blocker; a successful chat response cannot turn it green.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Engineering outcome, required criteria, claim evidence, candidate/proof identity, landing/integration, finish level/receipt.": {
+      "destination": "S41",
+      "basis": "fuzzy token overlap 0.57",
+      "reviewed": false
+    },
+    "Screen specific recovery: Missing unit evidence, failed integration or absent SCM configuration remains a named blocker; a successful chat response cannot turn it green.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Reached from the Faktor view/settings entry and the native command/keymap; flows: W06, W15.": {
+      "destination": "flows.md",
+      "basis": "no strong screen match; retained destination is the flow/acceptance copy set",
+      "reviewed": false
+    },
+    "Contract p.108; plates pp.171–172; controls .": {
+      "destination": "S34",
+      "basis": "fuzzy token overlap 0.67",
+      "reviewed": false
+    },
+    "string:Faktor_IDE_UI_UX_2.pdf": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:minmax(10rem, 15rem)": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:min-width:0": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:overflow-wrap:anywhere": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:--s1:4px --s2:8px --s3:12px --s4:16px --s6:24px --s8:32px": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:--control-min:32px": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:--field-gap:12px": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:--panel-inset:12px": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:Faktor: <Category>": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    },
+    "string:Cancel / Apply / OK": {
+      "destination": "registry",
+      "basis": "control/field literal retained in the registry",
+      "reviewed": false
+    }
+  },
+  "segments": 283,
+  "strings": 47,
+  "changed_segments": 283,
+  "unaccounted": 0,
+  "unreviewed_destinations": 293,
+  "generated_at": "2026-10-18T00:16:55.867Z"
+}

@@ -300,6 +300,37 @@ impl HookRegistry {
         Ok(())
     }
 
+    /// The registered specs (bounded policy projection).
+    pub fn specs(&self) -> Vec<HookSpec> {
+        self.inner
+            .specs
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.inner.specs.clear_poison();
+                poisoned.into_inner()
+            })
+            .clone()
+    }
+
+    /// Remove one spec by id. Returns whether it was registered. The audit
+    /// ring is untouched (history is never rewritten).
+    pub fn unregister(&self, id: &str) -> Result<bool, String> {
+        let mut specs = self.inner.specs.lock().map_err(|_| {
+            "hook registry poisoned: refusing to mutate the hook policy set".to_string()
+        })?;
+        let before = specs.len();
+        specs.retain(|s| s.id != id);
+        Ok(specs.len() != before)
+    }
+
+    pub fn is_registered(&self, id: &str) -> bool {
+        self.inner
+            .specs
+            .lock()
+            .map(|specs| specs.iter().any(|s| s.id == id))
+            .unwrap_or(false)
+    }
+
     pub fn matching(&self, event: HookEvent) -> Vec<HookSpec> {
         self.inner
             .specs

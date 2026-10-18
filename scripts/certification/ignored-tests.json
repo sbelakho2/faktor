@@ -85,6 +85,18 @@
       "fn": "fault_acquire_restart_recovers_pending_jobs",
       "tag": "fault",
       "reason": "opt-in acquire restart storm; the source file marks it 'never run in CI' \u2014 operator-run only"
+    },
+    {
+      "file": "crates/store/src/query_plan_tests.rs",
+      "fn": "write_path_before_after",
+      "tag": "fault",
+      "reason": "operator-run query-planner audit benchmark; excluded from CI by design and executed manually when the plan shape changes (the source marks it \"manual audit benchmark\")"
+    },
+    {
+      "file": "crates/store/src/query_plan_tests.rs",
+      "fn": "read_path_before_after",
+      "tag": "fault",
+      "reason": "operator-run query-planner audit benchmark; excluded from CI by design and executed manually when the plan shape changes (the source marks it \"manual audit benchmark\")"
     }
   ],
   "non_test": [

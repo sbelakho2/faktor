@@ -84,6 +84,11 @@ pub(crate) struct TurnDriveState<'a> {
     /// [`TurnDriveState::new`].
     pub(crate) internal_context: String,
     pub(crate) recent: Vec<RecentTurn>,
+    /// Durable message-seq high-water mark of the loaded context window.
+    /// An accepted compaction records this in the context checkpoint, so a
+    /// restart replays the checkpoint + newer rows instead of the summarized
+    /// transcript.
+    pub(crate) recent_head_seq: Option<u64>,
     pub(crate) evidence: Vec<Evidence>,
     pub(crate) project_rules: String,
     pub(crate) repo_map: String,
@@ -270,6 +275,7 @@ impl<'a> TurnDriveState<'a> {
             system_extra: String::new(),
             internal_context,
             recent: Vec::new(),
+            recent_head_seq: None,
             evidence: Vec::new(),
             project_rules: String::new(),
             repo_map: String::new(),
@@ -438,7 +444,7 @@ impl AgentRuntime {
     ) -> faktor_core::Result<PhaseFlow> {
         // Phase boundary: the drive is preparing context.
         self.note_execution_phase(st.handle, ExecutionPhase::Context);
-        let recent = self.recent_turns(st.handle, &st.budget).await?;
+        let (recent, recent_head_seq) = self.recent_turns_with_head(st.handle, &st.budget).await?;
         // Retrieval signals (spec §20): the CURRENT prompt (the last
         // user turn), the files the task changed, and known failures —
         // never just the session title.
@@ -653,7 +659,9 @@ impl AgentRuntime {
         // Repository knowledge (spec §8 class 3): bounded file map +
         // AGENTS.md rules ride the cacheable prefix. Re-resolved every
         // iteration so edits made by tools appear on the next hop.
-        let (project_rules, repo_map) = self.repo_knowledge(st.handle);
+        // I-11: the first hop captures this turn's instruction bundle and
+        // every later hop is pinned to it (repo_knowledge owns the capture).
+        let (project_rules, repo_map) = self.repo_knowledge(st.handle, st.op_id);
         // Audit 61-64: the bounded typed-memory DATA block (V2 rows,
         // newest-first, hard byte budget) rides the semi-stable head
         // right after the repository rules.
@@ -665,7 +673,9 @@ impl AgentRuntime {
         } else {
             format!("{project_rules}\n{memory_data}")
         };
-        let mut history = self.history_messages(st.handle, &st.budget).await?;
+        let (mut history, _history_head_seq) = self
+            .history_messages_with_head(st.handle, &st.budget)
+            .await?;
         // Request construction (media): resolve the task's durable image
         // attachments from the CAS into bounded in-memory parts BEFORE
         // the plan is measured, so their token cost is budgeted and a
@@ -718,6 +728,7 @@ impl AgentRuntime {
             self.turn_context_prior(),
         )?;
         st.recent = recent;
+        st.recent_head_seq = recent_head_seq;
         st.evidence = evidence;
         st.project_rules = project_rules;
         st.repo_map = repo_map;
@@ -744,10 +755,29 @@ impl AgentRuntime {
         // ---- proactive compaction (spec §9)
         let usage = st.budget.effective_usage(wire_plan.total_tokens);
         if usage >= self.deps.compact_at_usage.clamp(0.0, 1.0) {
-            if let Some(plan) = self
-                .try_compact(st.handle, &st.recent, &st.ledger, &st.budget, &st.cancel)
-                .await?
-            {
+            // UX-observable in-progress state: child drives expose
+            // `execution_phase=compacting` through the durable drive-state
+            // projection while the summarizer runs; the end state is the
+            // durable ContextCompacted/CompactRejected journal event.
+            self.note_execution_phase(st.handle, ExecutionPhase::Compacting);
+            let _ = st
+                .handle
+                .set_runtime_compaction(true, "threshold", self.deps.clock.now_ms());
+            let compaction = self
+                .try_compact_with_head(
+                    st.handle,
+                    &st.recent,
+                    &st.ledger,
+                    &st.budget,
+                    &st.cancel,
+                    st.recent_head_seq,
+                )
+                .await;
+            let _ = st
+                .handle
+                .set_runtime_compaction(false, "threshold", self.deps.clock.now_ms());
+            self.note_execution_phase(st.handle, ExecutionPhase::Context);
+            if let Some(plan) = compaction? {
                 st.outcome.compacted = true;
                 st.ledger = plan.ledger.clone();
                 st.history = recent_turns_to_messages(&plan.kept_recent);

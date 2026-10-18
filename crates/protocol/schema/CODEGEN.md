@@ -157,6 +157,114 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/workers/register` | handwritten-grandfathered |  |
 | `POST /native/workers/tokens` | handwritten-grandfathered |  |
 | `GET /session/{id}/projection` | handwritten-grandfathered |  |
+| `POST /native/agents/{child_id}/merge` | handwritten-grandfathered |  |
+| `POST /native/agents/{child_id}/stage` | handwritten-grandfathered |  |
+| `GET /native/browser/adapters` | handwritten-grandfathered |  |
+| `GET /native/browser/artifacts/{id}` | handwritten-grandfathered |  |
+| `GET /native/browser/artifacts/{id}/bytes` | streaming-special-case |  |
+| `GET,POST /native/browser/sessions` | handwritten-grandfathered |  |
+| `GET /native/browser/sessions/{id}/observations` | handwritten-grandfathered |  |
+| `POST /native/browser/sessions/{id}/screenshot` | handwritten-grandfathered |  |
+| `GET /native/browser/status` | handwritten-grandfathered |  |
+| `POST /native/browser/validate-url` | handwritten-grandfathered |  |
+| `GET /native/call-receipts` | handwritten-grandfathered |  |
+| `POST /native/config/commit` | handwritten-grandfathered |  |
+| `GET /native/config/descriptors` | handwritten-grandfathered |  |
+| `GET /native/config/export` | handwritten-grandfathered |  |
+| `POST /native/config/import` | handwritten-grandfathered |  |
+| `POST /native/config/preview` | handwritten-grandfathered |  |
+| `GET /native/config/provenance` | handwritten-grandfathered |  |
+| `POST /native/config/reset` | handwritten-grandfathered |  |
+| `POST /native/config/rollback` | handwritten-grandfathered |  |
+| `POST /native/config/runtime-ack` | handwritten-grandfathered |  |
+| `GET /native/config/search` | handwritten-grandfathered |  |
+| `GET /native/config/snapshot` | handwritten-grandfathered |  |
+| `GET /native/context/export` | handwritten-grandfathered |  |
+| `GET /native/context/manifest` | handwritten-grandfathered |  |
+| `GET /native/context/manifests` | handwritten-grandfathered |  |
+| `POST /native/diagnostics/export` | handwritten-grandfathered |  |
+| `GET /native/diagnostics/preview` | handwritten-grandfathered |  |
+| `GET,POST /native/hooks` | handwritten-grandfathered |  |
+| `GET /native/hooks/audit` | handwritten-grandfathered |  |
+| `DELETE /native/hooks/{id}` | handwritten-grandfathered |  |
+| `POST /native/hooks/{id}/test` | handwritten-grandfathered |  |
+| `GET /native/instructions` | handwritten-grandfathered |  |
+| `GET,POST /native/instructions/bindings` | handwritten-grandfathered |  |
+| `POST /native/instructions/import` | handwritten-grandfathered |  |
+| `GET /native/instructions/preview` | handwritten-grandfathered |  |
+| `GET,POST /native/instructions/records` | handwritten-grandfathered |  |
+| `POST /native/instructions/records/preview` | handwritten-grandfathered |  |
+| `DELETE,GET /native/instructions/records/{id}` | handwritten-grandfathered |  |
+| `PUT /native/instructions/source` | handwritten-grandfathered |  |
+| `GET,POST /native/mcp/servers` | handwritten-grandfathered |  |
+| `DELETE /native/mcp/servers/{id}` | handwritten-grandfathered |  |
+| `POST /native/mcp/servers/{id}/start` | handwritten-grandfathered |  |
+| `POST /native/mcp/servers/{id}/stop` | handwritten-grandfathered |  |
+| `GET /native/mcp/servers/{id}/tools` | handwritten-grandfathered |  |
+| `POST /native/mcp/servers/{id}/connect` | no-body |  |
+| `GET /native/mcp/servers/{id}/resources` | no-body |  |
+| `POST /native/mcp/servers/{id}/oauth/revoke` | no-body |  |
+| `GET,POST /native/memory` | handwritten-grandfathered |  |
+| `GET,PUT /native/memory/policy` | handwritten-grandfathered |  |
+| `GET,POST /native/memory/records` | handwritten-grandfathered |  |
+| `POST /native/memory/records/retention` | handwritten-grandfathered |  |
+| `DELETE,PUT /native/memory/records/{id}` | handwritten-grandfathered |  |
+| `POST /native/memory/records/{id}/restore` | handwritten-grandfathered |  |
+| `POST /native/memory/retention` | handwritten-grandfathered |  |
+| `DELETE /native/memory/{kind}/{key}` | handwritten-grandfathered |  |
+| `GET /native/model-parameters` | handwritten-grandfathered |  |
+| `POST /native/model-parameters/compile` | handwritten-grandfathered |  |
+| `GET /native/permissions/audit` | handwritten-grandfathered |  |
+| `GET /native/permissions/policy` | handwritten-grandfathered |  |
+| `POST /native/permissions/preview` | handwritten-grandfathered |  |
+| `POST /native/permissions/rules` | handwritten-grandfathered |  |
+| `DELETE /native/permissions/rules/{id}` | handwritten-grandfathered |  |
+| `GET,POST /native/presets` | handwritten-grandfathered |  |
+| `GET /native/presets/binding` | handwritten-grandfathered |  |
+| `DELETE,GET /native/presets/{id}` | handwritten-grandfathered |  |
+| `GET /native/presets/{id}/envelope` | handwritten-grandfathered |  |
+| `GET,POST /native/providers/connections` | handwritten-grandfathered |  |
+| `DELETE /native/providers/connections/{id}` | handwritten-grandfathered |  |
+| `GET /native/providers/connections/{id}/health` | handwritten-grandfathered |  |
+| `POST /native/providers/connections/{id}/test` | handwritten-grandfathered |  |
+| `GET,POST /native/providers/credentials` | handwritten-grandfathered |  |
+| `POST /native/providers/credentials/rotate` | handwritten-grandfathered |  |
+| `DELETE /native/providers/credentials/{handle}` | handwritten-grandfathered |  |
+| `GET /native/runtime/status` | handwritten-grandfathered |  |
+| `GET,POST /native/runtime/trust` | handwritten-grandfathered |  |
+| `POST /native/runtime/trust/check` | handwritten-grandfathered |  |
+| `GET,POST /native/mcp/servers/{id}/auth` | generated | `McpAuthState` |
+| `GET,POST /native/presets/{id}/roles` | generated | `PresetRoleModels` |
+| `GET,POST /native/presets/{id}/fallback` | generated | `PresetFallbackChain` |
+| `POST /native/catalog/probe` | generated | `CatalogProbe` |
+| `POST /native/session/{id}/checkpoints/{sequence}/restore/preview` | generated | `RestorePreview` |
+| `GET,POST /native/session/{id}/review/comments` | generated | `ReviewComment` |
+| `DELETE,PATCH /native/session/{id}/review/comments/{comment}` | generated | `ReviewComment` |
+| `POST /native/session/{id}/changes/accept` | generated | `ChangeAcceptReceipt` |
+| `DELETE /native/session/{id}` | generated | `SessionDeleteTombstone` |
+| `POST /native/session/{id}/export` | generated | `SessionExport` |
+| `GET,PUT /native/session/{id}/settings` | generated | `SessionSettings` |
+| `GET,PUT /native/session/{id}/budget` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/checkpoints/{sequence}/restore` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/context/compact` | handwritten-grandfathered |  |
+| `GET,POST /native/session/{id}/context/compaction` | handwritten-grandfathered |  |
+| `GET /native/session/{id}/context/compaction/{operation}` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/context/compaction/{operation}/cancel` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/context/manifests` | handwritten-grandfathered |  |
+| `DELETE,GET,POST /native/session/{id}/context/pins` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/context/preview` | handwritten-grandfathered |  |
+| `GET /native/session/{id}/efficiency` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/fork` | handwritten-grandfathered |  |
+| `GET /native/sessions/parallel` | handwritten-grandfathered |  |
+| `GET,POST /native/sessions/{id}/meta` | handwritten-grandfathered |  |
+| `GET /native/skills` | handwritten-grandfathered |  |
+| `POST /native/skills/install` | handwritten-grandfathered |  |
+| `DELETE,GET /native/skills/{id}` | handwritten-grandfathered |  |
+| `POST /native/skills/{id}/invocation` | handwritten-grandfathered |  |
+| `POST /native/skills/{id}/invoke` | handwritten-grandfathered |  |
+| `POST /native/skills/{id}/trust` | handwritten-grandfathered |  |
+| `GET /native/tools` | handwritten-grandfathered |  |
+| `GET /native/transcript/search` | handwritten-grandfathered |  |
 
 ## Handwritten (deliberately NOT generated)
 

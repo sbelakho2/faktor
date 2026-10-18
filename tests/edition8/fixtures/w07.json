@@ -1,0 +1,33 @@
+{
+  "schema": "faktor-edition8-workflow-fixture/v1",
+  "workflow": "W07",
+  "title": "Approve once or create a narrow rule",
+  "screens": [
+    "S14",
+    "S13",
+    "S22"
+  ],
+  "source": "docs/specs/edition8/flows.md (PDF pp.183-186)",
+  "steps": [
+    "Open the approval dock. Inspect owner/session/child, generation, normalized tool arguments, cwd, target and effect boundary.",
+    "Choose Allow once or Deny. The reply addresses one exact waiter generation.",
+    "Await the exact reply acknowledgement; the card disables duplicate replies.",
+    "Optionally open a separate persistent-rule draft in S13. Test the match against a sample operation.",
+    "Apply future policy only after daemon acknowledgement; the rule gets a named scope, version and expiry."
+  ],
+  "forbidden_fake_states": [
+    "Persisting Allow once automatically",
+    "a green \"Allowed\" toast without dispatch",
+    "a rule shown active without a policy store",
+    "duplicate reply generating a second effect"
+  ],
+  "complete_when": "one exact approval resolves once; a persisted rule has named scope, version and expiry (p.184).",
+  "traceability": "p.184; controls Q-01..Q-09, Q-13, Q-14, X-12, B-12, D-12; acceptance A17, A18, A19.",
+  "cells": [
+    "pointer",
+    "keyboard",
+    "screen_reader",
+    "compact_zoom",
+    "recovery"
+  ]
+}

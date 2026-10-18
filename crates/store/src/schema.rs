@@ -1110,6 +1110,94 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON provider_call(session_id, id);
      CREATE INDEX IF NOT EXISTS idx_turn_record_active
         ON turn_record(started_at, id) WHERE status = 'active';",
+    // v36 — Rev8 long-task surfaces (schema target 37; array index 36).
+    //
+    // `compaction_operation` is the durable state machine behind S10/K-03:
+    // an explicit operation id, phase, progress and typed terminal outcome.
+    // It is written BEFORE work starts so a client can always re-read a
+    // truthful state after a restart or disconnect; terminal rows are the
+    // post-compaction inspection anchor (K-04).
+    //
+    // `memory_policy` stores the S12 new-memory/retention policy per
+    // workspace scope with an explicit revision for compare-and-swap.
+    //
+    // `instruction_binding` records the instruction epoch/bundle captured at
+    // admission (I-11) so a later edit can truthfully say next task vs
+    // restart required instead of rewriting an active run's instructions.
+    //
+    // `idx_memory_fact_session_key` makes the V2 memory management read ONE
+    // indexed row by id instead of scanning a long task's fact space.
+    "CREATE TABLE IF NOT EXISTS compaction_operation (
+        session_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        progress_ppm INTEGER NOT NULL DEFAULT 0,
+        expected_revision INTEGER,
+        manifest_revision INTEGER,
+        before_tokens INTEGER,
+        after_tokens INTEGER,
+        target_tokens INTEGER NOT NULL DEFAULT 0,
+        min_reduction_ppm INTEGER NOT NULL,
+        strategy TEXT,
+        result_json TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, operation_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_compaction_operation_session_created
+        ON compaction_operation(session_id, created_ms DESC);
+     CREATE TABLE IF NOT EXISTS memory_policy (
+        scope TEXT NOT NULL,
+        scope_id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        policy_json TEXT NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (scope, scope_id)
+     );
+     CREATE TABLE IF NOT EXISTS instruction_binding (
+        session_id INTEGER PRIMARY KEY,
+        instruction_epoch TEXT NOT NULL,
+        bundle_hash TEXT NOT NULL,
+        turn_op_id INTEGER,
+        captured_ms INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_memory_fact_session_key
+        ON memory_fact(session_id, key);",
+    // v37 — workspace-scoped memory (Rev8 S12/K-10/K-11). Project memory is
+    // visible to EVERY session of one workspace and to no other. It lives
+    // in its own table (not `memory_fact`) so a session delete can never
+    // silently delete project memory and a cross-project read is
+    // structurally impossible. `(workspace_id, updated_ms, kind, key)` is
+    // the same total order the per-session pager uses.
+    "CREATE TABLE IF NOT EXISTS workspace_memory_fact (
+        workspace_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, kind, key)
+     );
+     CREATE INDEX IF NOT EXISTS idx_workspace_memory_fact_workspace_updated
+        ON workspace_memory_fact(workspace_id, updated_ms DESC, kind DESC, key DESC);",
+    // v38 — durable session deletion tombstones (Rev8 D-06). The session row
+    // itself stays (the existing Closed marker); this table is the audited
+    // tombstone naming exactly what the cascade purged. Attachment CAS blobs
+    // are reference-counted elsewhere and are deliberately NOT removed here.
+    "CREATE TABLE IF NOT EXISTS session_deletion (
+        session_id INTEGER PRIMARY KEY REFERENCES session(id),
+        title_digest TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        deleted_ms INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS session_deletion_purge (
+        session_id INTEGER NOT NULL,
+        table_name TEXT NOT NULL,
+        rows INTEGER NOT NULL,
+        PRIMARY KEY (session_id, table_name)
+     );",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

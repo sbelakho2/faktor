@@ -193,6 +193,9 @@ pub(crate) fn test_deps_with_hooks(
         retention: None,
         sso: None,
         worker_plane_listener: None,
+        foundation: None,
+        mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
 }
@@ -602,6 +605,9 @@ pub(crate) fn paced_test_deps(
         retention: None,
         sso: None,
         worker_plane_listener: None,
+        foundation: None,
+        mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
 }
@@ -932,6 +938,9 @@ pub(crate) fn test_deps_full(
         retention: None,
         sso: None,
         worker_plane_listener: None,
+        foundation: None,
+        mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
 }
@@ -1245,6 +1254,9 @@ pub(crate) fn native_task_rig_with_provider_and_verification(
         retention: None,
         sso: None,
         worker_plane_listener: None,
+        foundation: None,
+        mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     };
     NativeTaskRig {

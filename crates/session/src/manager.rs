@@ -517,6 +517,26 @@ impl SessionManager {
             .await?
     }
 
+    /// Bounded newest-first window charging message AND part bytes, with
+    /// parts batched per message (the turn-path history loader).
+    pub async fn messages_window_with_parts(
+        &self,
+        session: SessionId,
+        before: Option<u64>,
+        after: Option<u64>,
+        max_messages: u64,
+        max_bytes: u64,
+    ) -> faktor_core::Result<Vec<(faktor_store::MessageRow, Vec<faktor_store::PartRow>)>> {
+        self.reads
+            .submit_tagged(DbReadKind::History, move |store| {
+                store
+                    .messages_window_with_parts(session, before, after, max_messages, max_bytes)
+                    .map_err(crate::map_store_err)
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
     /// One durable task row of `session` (`SessionHandle::get_task`
     /// semantics), read off the pool.
     pub async fn task(

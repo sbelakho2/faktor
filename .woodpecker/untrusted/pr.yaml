@@ -476,6 +476,87 @@ steps:
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","clean":true,"runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
+  # ------------------------------- Edition 5 gates (both hosts, linux) --
+  # The registry-driven control exercise, A01-A40 acceptance suite, 32-screen
+  # visual contracts, settings/runtime contract, bounded delta performance and
+  # dead-control scan. JetBrains raw evidence is produced by the
+  # `jetbrains-smoke` lane above (the full smoke suite includes the
+  # Edition5ControlExercise and Edition5AcceptanceSmoke mains); this lane
+  # consumes it and writes the machine-readable summary. The trusted
+  # dogfood lane adds the isolated real-daemon run.
+  - name: edition5
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    depends_on: [jetbrains-smoke]
+    commands:
+      - node scripts/edition5/run.mjs --no-verify
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        node scripts/edition5/run.mjs --no-verify
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane edition5 --status passed \
+          --artifact target/certification/edition5-summary.json \
+          --out target/certification/lanes/edition5.json
+  # ---------------------------- Edition 8 gates (both hosts, linux) -----
+  # Registry-driven control exercise (200 controls), executable A01-A40 and
+  # W01-W16 (five cells per host), 72-screen visual contracts and the real
+  # headless-Chromium width/theme/200%/HC matrix, per-platform records,
+  # optical/contrast/copy-retention/assistive gates, the baseline-anchored
+  # performance gate and the daemon production-wiring probes. JetBrains raw
+  # evidence comes from the jetbrains-smoke lane (its full smoke suite runs
+  # Edition8ControlExercise/Acceptance/Workflow/Evidence and the ZIP host
+  # matrix); this lane converts it and verifies every gate. A Linux runner
+  # with no checked-in reviewed baseline records an explicit unreviewed
+  # platform boundary, never a cross-platform inheritance. The isolated
+  # real-daemon dogfood runs in the trusted darwin lane (both hosts).
+  - name: edition8
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-render/vscode-e2e; chromium runtime included)
+    depends_on: [linux, vscode, vscode-render, jetbrains-smoke, edition5]
+    commands:
+      - |
+        set -eu
+        chrome_bin=""
+        for candidate in /ms-playwright/chromium-*/chrome-linux/chrome; do
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then chrome_bin="$candidate"; break; fi
+        done
+        if [ -z "$chrome_bin" ]; then
+          echo "edition8: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
+          exit 1
+        fi
+        chrome_wrapper="$(mktemp)"
+        if [ "$(id -u)" -eq 0 ]; then
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        else
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
+        fi
+        chmod +x "$chrome_wrapper"
+        export FAKTOR_CHROME="$chrome_wrapper"
+        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        set -eu
+        chrome_wrapper="$(mktemp)"
+        chrome_bin="$(ls /ms-playwright/chromium-*/chrome-linux/chrome | head -n 1)"
+        if [ -z "$chrome_bin" ]; then echo "edition8: chromium missing" >&2; exit 1; fi
+        id -u | grep -qx 0 && no_sandbox=--no-sandbox || no_sandbox=
+        printf '#!/bin/sh\nexec "%s" %s "$@"\n' "$chrome_bin" "$no_sandbox" > "$chrome_wrapper"
+        chmod +x "$chrome_wrapper"
+        export FAKTOR_CHROME="$chrome_wrapper"
+        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        CMDS
+        )"
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane edition8 --status passed \
+          --artifact target/certification/edition8-summary.json \
+          --artifact target/certification/edition8/registry.json \
+          --artifact target/certification/edition8/control-exercise-vscode.json \
+          --artifact target/certification/edition8/control-exercise-jetbrains.json \
+          --out target/certification/lanes/edition8.json
   - name: certificate
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -488,6 +569,8 @@ steps:
       - vscode-render
       - jetbrains-build
       - jetbrains-smoke
+      - edition5
+      - edition8
     when:
       status: [success, failure]
     commands:
@@ -508,6 +591,9 @@ steps:
       # calm card headers, no unreviewed internal-identifier labels) hold with
       # file:line evidence. A new surface without a gate fails here.
       - node scripts/dogfood.mjs selftest && node scripts/dogfood.mjs --coverage
+      # Edition 8 evidence is verified HERE in the PR, not only in trusted:
+      # every gate document must be current for this commit/tree and counted.
+      - node tests/edition8/evidence.mjs verify --allow-unreviewed-platform
       # Singular-authority law: the retired raw network matcher must never
       # return; the canonical destination/DNS authority owns egress.
       - node scripts/check-network-authority-singular.mjs

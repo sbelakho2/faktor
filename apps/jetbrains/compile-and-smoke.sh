@@ -75,7 +75,7 @@ fi
 # `--offline` there).
 EXTRA_JVM_ARGS=""
 SMOKE_SELECTION=()
-KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork"
+KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork ControlExercise Acceptance Edition8ControlExercise Edition8Acceptance Edition8Workflow Edition8Evidence Edition8DaemonDogfood Edition8LiveAcceptance Visual"
 while [ $# -gt 0 ]; do
   case "$1" in
     --write-baselines)
@@ -164,8 +164,26 @@ $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/ControlPlaneCredentialSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsHostMatrixSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt
-$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/EdtWorkHarness.kt"
-FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/EdtWorkHarness.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition5ControlExercise.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition5AcceptanceSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8ControlExercise.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8AcceptanceSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8WorkflowSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8Evidence.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8DaemonDogfood.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8LiveAcceptance.kt"
+FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5CatalogData.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5Catalog.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5ConfigSource.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5Settings.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5Panels.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5ScreenRegistry.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8ScreenRegistry.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Daemon.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Panels.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ModelPickerDialog.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PanelSupport.kt
@@ -392,7 +410,47 @@ if smoke_selected EdtWork; then
   run_smoke EdtWorkHarness dev.faktor.frontend.EdtWorkHarness || exit $?
 fi
 
-if smoke_selected HostMatrix; then
+if smoke_selected ControlExercise; then
+  echo "[compile-and-smoke] running Edition5ControlExercise (all 200 controls through the real Swing panels)"
+  run_smoke ControlExercise dev.faktor.frontend.Edition5ControlExercise || exit $?
+fi
+
+if smoke_selected Acceptance; then
+  echo "[compile-and-smoke] running Edition5AcceptanceSmoke (A01-A40 host observations)"
+  run_smoke Acceptance dev.faktor.frontend.Edition5AcceptanceSmoke || exit $?
+fi
+
+if smoke_selected Edition8ControlExercise; then
+  echo "[compile-and-smoke] running Edition8ControlExercise (all 200 controls / 72 screens)"
+  run_smoke Edition8ControlExercise dev.faktor.frontend.Edition8ControlExercise || exit $?
+fi
+
+if smoke_selected Edition8Acceptance; then
+  echo "[compile-and-smoke] running Edition8AcceptanceSmoke (A01-A40 host overlays)"
+  run_smoke Edition8Acceptance dev.faktor.frontend.Edition8AcceptanceSmoke || exit $?
+fi
+
+if smoke_selected Edition8Workflow; then
+  echo "[compile-and-smoke] running Edition8WorkflowSmoke (W01-W16 x 5 cells)"
+  run_smoke Edition8Workflow dev.faktor.frontend.Edition8WorkflowSmoke || exit $?
+fi
+
+if smoke_selected Edition8DaemonDogfood; then
+  echo "[compile-and-smoke] running Edition8DaemonDogfood (real daemon)"
+  run_smoke Edition8DaemonDogfood dev.faktor.frontend.Edition8DaemonDogfood || exit $?
+fi
+
+if smoke_selected Edition8LiveAcceptance; then
+  echo "[compile-and-smoke] running Edition8LiveAcceptance (A01-A40 against the real daemon)"
+  run_smoke Edition8LiveAcceptance dev.faktor.frontend.Edition8LiveAcceptance || exit $?
+fi
+
+if smoke_selected Edition8Evidence; then
+  echo "[compile-and-smoke] running Edition8Evidence (optical/contrast/a11y evidence)"
+  run_smoke Edition8Evidence dev.faktor.frontend.Edition8Evidence || exit $?
+fi
+
+if smoke_selected HostMatrix || smoke_selected Visual; then
 # ---- 6. host matrix: the BUILT plugin ZIP ----------------------------------
 # Extracts the built plugin ZIP and runs the host matrix with the ZIP's
 # `faktor/lib/*.jar` FIRST on the classpath, so the panel classes under test
@@ -428,11 +486,11 @@ else
 fi
 mkdir -p "$WORK/home"
 echo "[compile-and-smoke] running JetBrainsHostMatrixSmoke (width/zoom/theme/keyboard-only/states)"
-java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $HOST_MATRIX_ARGS -cp "$HOST_MATRIX_CP" dev.faktor.frontend.JetBrainsHostMatrixSmoke 2>"$WORK/HostMatrix.stderr"
+java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $EXTRA_JVM_ARGS $HOST_MATRIX_ARGS -cp "$HOST_MATRIX_CP" dev.faktor.frontend.JetBrainsHostMatrixSmoke 2>"$WORK/HostMatrix.stderr"
 HOST_RC=$?
 if [ $HOST_RC -ne 0 ]; then
   report_toolchain_failure "JetBrainsHostMatrixSmoke" "$WORK/HostMatrix.stderr" "$HOST_RC"
   exit $HOST_RC
 fi
-fi  # smoke_selected HostMatrix
+fi  # smoke_selected HostMatrix/Visual
 exit 0
