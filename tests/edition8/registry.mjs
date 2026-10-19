@@ -399,7 +399,19 @@ function main() {
     process.exit(1);
   } else {
     const checkedIn = JSON.parse(read(REGISTRY_PATH));
-    if (JSON.stringify(checkedIn) !== JSON.stringify(registry)) {
+    // `/tmp/faktor-ui3.txt` is a local extraction aid, not a release artifact
+    // (see docs/specs/edition8/acceptance.md). Its sha256 is provenance only:
+    // CI checks out no /tmp file, so comparing it would make the drift gate
+    // depend on the runner's temporary directory. The committed specification
+    // inputs (controls/screens/flows/acceptance/expectations) remain the truth.
+    const withoutLocalExtract = (doc) => {
+      const copy = JSON.parse(JSON.stringify(doc));
+      if (copy.source && typeof copy.source === 'object') {
+        delete copy.source.extracted_text_sha256;
+      }
+      return copy;
+    };
+    if (JSON.stringify(withoutLocalExtract(checkedIn)) !== JSON.stringify(withoutLocalExtract(registry))) {
       console.error('edition8 registry: checked-in registry.json drifted from the specification inputs; run node tests/edition8/registry.mjs --write');
       process.exit(1);
     }

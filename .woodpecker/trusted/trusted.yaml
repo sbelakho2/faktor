@@ -219,6 +219,7 @@ steps:
   # doctor. Protocol/stream tests ride the --workspace all-features run.
   # Long lanes stay #[ignore]-gated.
   - name: linux
+    depends_on: [static]
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     # The workspace test run includes crates/browser's BrokerOnly confinement
     # tests, whose spawn layer needs unshare(CLONE_NEWNET); Docker's default
@@ -240,7 +241,9 @@ steps:
       # workers keeps each actor's timing loop live. `CARGO_BUILD_JOBS` caps
       # rustc fan-out for the same reason (shared host with the darwin lane).
       RUST_TEST_THREADS: "2"
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -302,6 +305,9 @@ steps:
           --flake-file target/certification/flakes/linux.json \
           --out target/certification/lanes/linux.json
   - name: static
+    # The supply-chain fast-path test runs `cargo metadata`; serialize it
+    # after the docs cargo-doc step so the package-cache lock is free.
+    depends_on: [docs]
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
       matrix:
@@ -313,7 +319,9 @@ steps:
       # host while these containers build, so cap rustc fan-out and keep the
       # fixture children schedulable (bounded, documented resource setting —
       # no test is excluded).
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -362,7 +370,9 @@ steps:
       # host while these containers build, so cap rustc fan-out and keep the
       # fixture children schedulable (bounded, documented resource setting —
       # no test is excluded).
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -461,7 +471,9 @@ steps:
   # into the diagnostics, and a failed cell is never retried or downgraded.
   - name: vscode-e2e
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (lane requires genuine x86_64; Rosetta runs it on arm64 hosts)
-    depends_on: [vscode]
+    # Serialize after the full Rust lane: both are heavy under the local
+    # amd64 emulation and concurrent runs starve the browser/CDP startup.
+    depends_on: [vscode, linux]
     when:
       matrix:
         platform: linux/amd64
@@ -493,7 +505,9 @@ steps:
     # that the pinned Gradle wrapper (9.7.1) requires.
     image: ghcr.io/sbelakho2/faktor-ci@sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
-    depends_on: [ci-image]
+    # Serialize the QEMU-heavy lanes: Gradle/Kotlin beside the full Rust
+    # workspace caused a linker SIGSEGV in the sibling smoke compilation.
+    depends_on: [ci-image, linux, vscode-e2e]
     when:
       matrix:
         platform: linux/amd64
@@ -544,11 +558,12 @@ steps:
     # a hard dependency and FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 makes a
     # missing ZIP a typed failure, never a silent source-only downgrade.
     depends_on: [ci-image, jetbrains-build]
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "1"
     when:
       matrix:
         platform: linux/amd64
-    environment:
-      RUST_BACKTRACE: "1"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -614,7 +629,8 @@ steps:
         platform: darwin/arm64
     commands:
       - cargo check --workspace
-      - if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped: node unavailable"; fi
+      - >-
+        if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped:node unavailable"; fi
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -869,8 +885,8 @@ steps:
   # boundary; the isolated real-daemon dogfood for both hosts runs in the
   # darwin-edition8 lane where the host toolchain exists.
   - name: edition8
-    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-render/vscode-e2e; chromium runtime included)
-    depends_on: [linux, vscode, vscode-render, jetbrains-build, jetbrains-smoke]
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-e2e; chromium runtime included)
+    depends_on: [linux, vscode, jetbrains-build, jetbrains-smoke]
     commands:
       - |
         set -eu
