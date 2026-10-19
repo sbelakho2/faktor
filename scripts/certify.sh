@@ -645,7 +645,9 @@ if [ "$GATE_PARITY" -eq 1 ]; then
         parity_files+=("$f")
     done
     if [ "${#parity_files[@]}" -eq 0 ]; then
-        parity_files=(.woodpecker/trusted/trusted.yaml .woodpecker/untrusted/pr.yaml)
+        # The untrusted PR lane is a change-aware fast subset (it cannot run
+        # privileged/full-suite steps); the TRUSTED lane is the canonical gate.
+        parity_files=(.woodpecker/trusted/trusted.yaml)
     fi
     if check_gate_parity "$parity_canonical" "${parity_files[@]}"; then
         [ -n "$parity_tmp" ] && rm -f "$parity_tmp"
@@ -3322,7 +3324,7 @@ STUB
     check_parity ci-diverge 1 "$parity_fixtures/canonical.txt" "$parity_fixtures/ci-diverge.yaml"
     check_parity canonical-diverge 1 "$parity_fixtures/canonical-diverge.txt" "$parity_fixtures/ci-match.yaml"
     canonical_gate_commands >"$tmp/canonical-gates.txt"
-    check_parity real-workflows 0 "$tmp/canonical-gates.txt" "$ROOT/.woodpecker/trusted/trusted.yaml" "$ROOT/.woodpecker/untrusted/pr.yaml"
+    check_parity real-trusted-workflow 0 "$tmp/canonical-gates.txt" "$ROOT/.woodpecker/trusted/trusted.yaml"
 
     # --- Audit 19 CI status contract: a trusted workflow whose top-level
     # `when` drops the push event never creates the main-push pipeline, and a
