@@ -1001,3 +1001,81 @@ async fn foreign_tenant_gets_an_unentitled_snapshot_not_the_configured_default_p
     assert_eq!(body["entitlements"]["plan_found"], true);
     assert_eq!(body["entitlements"]["limits"][LIMIT_MAX_ACTIVE_TASKS], 3);
 }
+
+/// Tenant isolation is decided BEFORE plan/billing availability: with the
+/// control plane wired but `[billing]` disabled, a foreign `?org=` is the
+/// same typed 404 a missing organization answers, never the
+/// `billing_disabled` oracle that would reveal the caller's own tenancy.
+#[tokio::test]
+async fn outcomes_foreign_organization_is_404_before_billing_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
+        Arc::new(faktor_cloud::MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let deps = test_deps(dir.path()).with_control_plane(control_plane);
+    let token = deps.auth_token.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    let bootstrap = |name: &'static str, email: &'static str, key: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.as_str().to_string();
+        async move {
+            let response = client
+                .post(format!("{base}/native/orgs"))
+                .bearer_auth(&token)
+                .header("idempotency-key", key)
+                .json(&serde_json::json!({
+                    "name": name,
+                    "owner_email": email,
+                    "display_name": name,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{name} bootstrap");
+            let body: serde_json::Value = response.json().await.unwrap();
+            (
+                body["organization"]["id"].as_str().unwrap().to_string(),
+                body["token"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+    let (org_a, token_a) = bootstrap("Outcome A", "a@outcome.test", "outcome-a").await;
+    let (org_b, _token_b) = bootstrap("Outcome B", "b@outcome.test", "outcome-b").await;
+
+    let foreign = client
+        .get(format!("{base}/native/outcomes?org={org_b}"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.status(),
+        404,
+        "a foreign organization must not reveal billing availability"
+    );
+    let body: serde_json::Value = foreign.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "not_found");
+    assert!(!body.to_string().contains(&org_b));
+
+    let own = client
+        .get(format!("{base}/native/outcomes?org={org_a}"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own.status(),
+        409,
+        "the caller's own organization may learn that billing is disabled"
+    );
+    let body: serde_json::Value = own.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "billing_disabled");
+    let _ = handle.request_shutdown();
+}

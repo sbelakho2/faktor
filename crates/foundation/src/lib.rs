@@ -134,6 +134,15 @@ pub(crate) fn page_limit_i64(limit: usize, what: &str) -> Result<i64, Foundation
         .map_err(|_| FoundationError::Oversized(format!("{what} page exceeds SQLite signed range")))
 }
 
+/// True when `text` carries a recognizable secret from the daemon's default
+/// secret-pattern set (`sk-…`, `ghp_…`, AWS/Slack/Google keys, PEM private
+/// keys). Credential-adjacent metadata (labels, provider endpoints/proxies)
+/// is REFUSED when this returns true: metadata is served, exported and
+/// logged, so a secret pasted there would otherwise live outside the vault.
+pub(crate) fn contains_secret_material(text: &str) -> bool {
+    !faktor_security::scan_secrets(text, &faktor_security::SecretPolicy::default()).is_empty()
+}
+
 /// Lowercase hex blake3 digest.
 pub fn hash_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()

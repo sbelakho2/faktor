@@ -452,6 +452,21 @@ impl BrowserService {
     ) -> Result<Vec<BrowserObservation>, FoundationError> {
         let limit = page_limit_i64(limit.clamp(1, 500), "browser observations")?;
         self.db.read("browser observations", |conn| {
+            // An unknown browser session is a typed not-found, never an empty
+            // 200 page (observation ids are owner-scoped beneath it).
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM browser_session WHERE id = ?1",
+                    params![browser_session_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| FoundationError::Store(e.to_string()))?;
+            if exists.is_none() {
+                return Err(FoundationError::NotFound(format!(
+                    "browser session {browser_session_id}"
+                )));
+            }
             let mut stmt = conn
                 .prepare(
                     "SELECT id, browser_session_id, kind, severity, payload_json, captured_ms
@@ -779,6 +794,10 @@ mod tests {
             .observations(&session.id, Some("info"), None, 10)
             .unwrap()
             .is_empty());
+        assert!(matches!(
+            svc.observations("browser-session-absent", None, None, 10),
+            Err(FoundationError::NotFound(_))
+        ));
         let big = serde_json::json!({"x": "a".repeat(MAX_OBSERVATION_BYTES + 1)});
         assert!(svc
             .append_observation(&session.id, "network", None, &big)

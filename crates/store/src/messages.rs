@@ -1698,3 +1698,75 @@ mod search_corruption_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod messages_perf_probe {
+    use super::*;
+
+    /// ([perf]) 400-message page with 4 parts each: the historical handler
+    /// ran `messages_before` plus ONE `parts_of` query per message (401
+    /// SQLite round trips); the batched window is 2. Measured here on the
+    /// same rows so the improvement is attributable, not inferred.
+    ///
+    /// `cargo test -p faktor-store --release messages_page_parts_batch -- --ignored --nocapture`
+    #[test]
+    #[ignore = "[perf] measured probe; run explicitly with --ignored --nocapture"]
+    fn messages_page_parts_batch_is_much_cheaper_than_per_row_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let session = store.create_session(ws, "t", "p", "m").unwrap().id;
+        const ROWS: i64 = 400;
+        for seq in 1..=ROWS {
+            let id = store
+                .put_message(session, seq, "user", serde_json::json!({"text": "turn"}))
+                .unwrap();
+            for part in 0..4 {
+                store
+                    .put_part(id, "text", serde_json::json!({"i": part}))
+                    .unwrap();
+            }
+        }
+        let legacy = || {
+            let started = std::time::Instant::now();
+            let rows = store.messages_before(session, None, ROWS as u64).unwrap();
+            let mut parts = 0usize;
+            for row in &rows {
+                parts += store.parts_of(row.id).unwrap().len();
+            }
+            (started.elapsed(), rows.len(), parts)
+        };
+        let batched = || {
+            let started = std::time::Instant::now();
+            let rows = store
+                .messages_window_with_parts(session, None, None, ROWS as u64, u64::MAX)
+                .unwrap();
+            (
+                started.elapsed(),
+                rows.len(),
+                rows.iter().map(|(_, p)| p.len()).sum(),
+            )
+        };
+        // Warm the page cache, then take the best of three each.
+        let _ = legacy();
+        let _ = batched();
+        let mut legacy_best = std::time::Duration::MAX;
+        let mut batch_best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let (t, rows, parts) = legacy();
+            assert_eq!((rows, parts), (ROWS as usize, ROWS as usize * 4));
+            legacy_best = legacy_best.min(t);
+            let (t, rows, parts) = batched();
+            assert_eq!((rows, parts), (ROWS as usize, ROWS as usize * 4));
+            batch_best = batch_best.min(t);
+        }
+        println!(
+            "[perf] 400 rows x 4 parts: per-row parts_of {legacy_best:?} vs batched {batch_best:?} \
+             (queries 401 -> 2)"
+        );
+        assert!(
+            batch_best <= legacy_best,
+            "batching regressed: legacy {legacy_best:?} batched {batch_best:?}"
+        );
+    }
+}

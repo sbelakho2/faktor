@@ -283,3 +283,187 @@ async fn restore_preview_is_wired_even_without_a_snapshot_authority() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "unavailable");
 }
+
+#[tokio::test]
+async fn browser_validate_url_classifies_ipv6_aliases_and_never_echoes_secrets() {
+    let rig = Rig::new().await;
+    let validate = |url: &str| json!({ "url": url });
+
+    // IPv6 literals (bracketed in the URL) are classified by the shared
+    // authority, not skipped as "unresolved" by a v4-only parse.
+    let (status, body) = rig
+        .post(
+            "/native/browser/validate-url",
+            validate("http://[::1]:8080/x"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["class"], "loopback", "{body}");
+    assert_eq!(body["decision"], "deny", "{body}");
+    assert_eq!(body["url"], "http://[::1]:8080", "{body}");
+    for alias in [
+        "http://[::ffff:169.254.169.254]/latest/meta-data",
+        "http://[64:ff9b::a9fe:a9fe]/x",
+        "http://[2002:a9fe:a9fe::1]/x",
+    ] {
+        let (status, body) = rig
+            .post("/native/browser/validate-url", validate(alias))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decision"], "deny", "{alias}: {body}");
+        assert_ne!(body["class"], "unresolved", "{alias}: {body}");
+    }
+    // Userinfo and secret-bearing path/query/fragment bytes never come back
+    // in the preview payload.
+    let (status, body) = rig
+        .post(
+            "/native/browser/validate-url",
+            validate(
+                "https://aliceUSER:p@ssPASSWORD@example.com/token/raw-secretPATH?api_key=supersecretQUERY#fragFRAGMENT",
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let encoded = body.to_string();
+    for leaked in [
+        "aliceUSER",
+        "p@ssPASSWORD",
+        "raw-secretPATH",
+        "supersecretQUERY",
+        "fragFRAGMENT",
+    ] {
+        assert!(!encoded.contains(leaked), "{leaked} leaked: {encoded}");
+    }
+    let (status, body) = rig
+        .post(
+            "/native/browser/validate-url",
+            validate(
+                "https://example.com/token/raw-secretPATH?api_key=supersecretQUERY#fragFRAGMENT",
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["url"], "https://example.com", "{body}");
+    assert_eq!(body["queryPresent"], true, "{body}");
+    assert_eq!(body["fragmentPresent"], true, "{body}");
+    let encoded = body.to_string();
+    for leaked in ["raw-secretPATH", "supersecretQUERY", "fragFRAGMENT"] {
+        assert!(!encoded.contains(leaked), "{leaked} leaked: {encoded}");
+    }
+}
+
+#[tokio::test]
+async fn session_export_redacts_secret_patterns_in_titles_and_message_content() {
+    let rig = Rig::new().await;
+    // A recognizable planted credential in a user-controlled TITLE, a
+    // message body and a message PART body: default redaction must remove
+    // every occurrence, not only credential-shaped object keys.
+    let secret = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    let ws = rig
+        .deps
+        .session
+        .create_workspace("/tmp/export-redaction")
+        .unwrap();
+    let session = rig
+        .deps
+        .session
+        .create_session(ws, &format!("title {secret}"), "fake", "m")
+        .unwrap();
+    let message = rig
+        .deps
+        .session
+        .store()
+        .put_message(
+            session.id(),
+            1,
+            "user",
+            json!({"text": format!("body {secret}")}),
+        )
+        .unwrap();
+    rig.deps
+        .session
+        .store()
+        .put_part(message, "text", json!({"text": format!("part {secret}")}))
+        .unwrap();
+    // A secret hidden in an object KEY (not just a value) must be redacted
+    // by the recursive walk too.
+    rig.deps
+        .session
+        .store()
+        .put_part(message, "tool_result", json!({ secret: "value" }))
+        .unwrap();
+
+    let path = format!("/native/session/{}/export", session.id().raw());
+    let (status, bundle) = rig.post(&path, json!({"redact": true})).await;
+    assert_eq!(status, StatusCode::OK, "{bundle}");
+    let encoded = bundle.to_string();
+    assert!(
+        !encoded.contains(secret),
+        "default export redaction leaked a planted secret: {encoded}"
+    );
+    assert!(
+        encoded.contains("<redacted:"),
+        "the export must name what it redacted: {encoded}"
+    );
+    assert!(
+        bundle["redactedFields"].as_u64().unwrap_or(0) >= 4,
+        "title + message + part value + part key redactions are counted: {bundle}"
+    );
+
+    // `redact:false` is not an exfiltration switch: structured credential
+    // keys that do not match a token pattern, and PEM private-key BODIES
+    // (the pattern scan only names the header), are still scrubbed.
+    let opaque_key = "opaque-custom-credential-value";
+    let pem_body = "BODYBODYBODYBODYBODYBODYBODYBODY";
+    rig.deps
+        .session
+        .store()
+        .put_part(
+            message,
+            "tool",
+            json!({
+                "headers": {"ANTHROPIC_API_KEY": opaque_key},
+                "pem": format!(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\n{pem_body}\n-----END OPENSSH PRIVATE KEY-----"
+                ),
+            }),
+        )
+        .unwrap();
+    let (status, bundle) = rig.post(&path, json!({"redact": false})).await;
+    assert_eq!(status, StatusCode::OK, "{bundle}");
+    let encoded = bundle.to_string();
+    assert!(
+        !encoded.contains(opaque_key),
+        "credential key leaked: {encoded}"
+    );
+    assert!(
+        !encoded.contains(pem_body),
+        "private-key body leaked: {encoded}"
+    );
+    assert!(encoded.contains("<redacted:pem_private_key>"), "{encoded}");
+    assert_eq!(bundle["redacted"], true, "{bundle}");
+    assert_eq!(bundle["redactRequested"], false, "{bundle}");
+}
+
+#[test]
+fn decision_paths_refuse_traversal_on_both_separators() {
+    for hostile in [
+        "",
+        "../escape",
+        "a/../../b",
+        "a\\..\\b",
+        "/absolute",
+        "C:\\absolute",
+        "\\\\server\\share",
+        "a\0b",
+    ] {
+        assert!(
+            crate::native::foundation_ext::agent_paths(&[hostile.to_string()]).is_err(),
+            "decision path {hostile:?} must be refused"
+        );
+    }
+    assert!(
+        crate::native::foundation_ext::agent_paths(&["src/lib.rs".into()]).is_ok(),
+        "workspace-relative paths stay accepted"
+    );
+}

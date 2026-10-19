@@ -487,6 +487,19 @@ pub struct Store {
     /// row can tie the cursor's millisecond and sort BELOW an ongoing walk
     /// (kind/key tie-breaks can put it on the already-consumed side).
     pub(crate) fact_seq: AtomicU64,
+    /// Monotonic epoch of DIRECT-SQL / purge mutations (the test/forensic
+    /// escape hatches that bypass the typed writers). Session-open
+    /// verification is cached per session; a direct mutation can invalidate
+    /// any journal/ledger invariant, so it bumps this epoch and the next
+    /// session open re-verifies from scratch. Typed writes (journal append,
+    /// ledger append, checkpoint, message) maintain the invariants by
+    /// construction and never bump it, so the cache survives steady-state
+    /// concurrency.
+    pub(crate) corruption_epoch: AtomicU64,
+    /// Monotonic revision of the Engineering Outcome Ledger (engineering
+    /// rows + settlement events). Read-side metric folds cache by this
+    /// value; it advances only when a writer commits a row/event.
+    pub(crate) outcome_revision: AtomicU64,
 }
 
 impl Drop for Store {
@@ -2019,8 +2032,22 @@ impl Store {
             seam: Arc::new(CrashSeam::default()),
             generation: mint_boot_generation(),
             fact_seq,
+            corruption_epoch: AtomicU64::new(0),
+            outcome_revision: AtomicU64::new(0),
             maintenance: Arc::new(MaintenanceRegistry::new()),
         }
+    }
+
+    /// Monotonic epoch of direct-SQL/purge mutations (see the field docs).
+    /// Session-open verification caches key on this value.
+    pub fn corruption_epoch(&self) -> u64 {
+        self.corruption_epoch.load(Ordering::Acquire)
+    }
+
+    /// Monotonic revision of the Engineering Outcome Ledger (engineering
+    /// rows + settlement events). Read-side metric folds cache by this.
+    pub fn outcome_revision(&self) -> u64 {
+        self.outcome_revision.load(Ordering::Acquire)
     }
 
     /// This store instance's boot-instance identity (audit P1). A `pending`
@@ -2555,10 +2582,15 @@ impl Store {
     #[doc(hidden)]
     pub fn sql_execute(&self, sql: &str) -> StoreResult<()> {
         let sql = sql.to_owned();
-        self.writer.execute("sql_execute", move |conn| {
+        let result = self.writer.execute("sql_execute", move |conn| {
             conn.execute_batch(&sql)?;
             Ok(())
-        })
+        });
+        // Direct SQL can break any journal/ledger invariant. Bump even on a
+        // partial batch failure: the typed writers are the only mutations
+        // allowed to leave the open-verification cache intact.
+        self.corruption_epoch.fetch_add(1, Ordering::Release);
+        result
     }
 
     // ------------------------------------------------------- typed session ledger

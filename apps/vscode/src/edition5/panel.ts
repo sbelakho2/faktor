@@ -19,6 +19,7 @@ import {
   type E5ViewCache,
 } from './host.ts';
 import { E5_SCREENS } from '../generated/edition5Registry.ts';
+import { E5_BINDINGS } from './bindings.ts';
 import { validateMcpPayload, validateSteerText, type E5Payload } from './commands.ts';
 import type { Json } from './contract.ts';
 
@@ -48,13 +49,35 @@ function text(value: unknown, max = 256): string | null {
   return typeof value === 'string' && value.length > 0 && value.length <= max ? value : null;
 }
 
+const MAX_PANEL_MESSAGE_BYTES = 4 * 1024 * 1024;
+const MAX_STAGED_CHANGES = 512;
+const MAX_STAGED_STRING = 256 * 1024;
+const MAX_PAYLOAD_KEYS = 64;
+const MAX_PAYLOAD_ARRAY = 256;
+
+function messageWithinBound(message: unknown): boolean {
+  try {
+    const encoded = JSON.stringify(message);
+    return typeof encoded === 'string' && encoded.length <= MAX_PANEL_MESSAGE_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 function payloadOf(value: unknown): E5Payload {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
   const out: Record<string, Json> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_PAYLOAD_KEYS);
+  for (const [key, entry] of entries) {
+    if (key.length === 0 || key.length > 128) continue;
     if (entry === null || ['string', 'number', 'boolean'].includes(typeof entry)) {
+      if (typeof entry === 'string' && entry.length > MAX_STAGED_STRING) continue;
       out[key] = entry as Json;
-    } else if (Array.isArray(entry) && entry.every((item) => typeof item === 'string')) {
+    } else if (
+      Array.isArray(entry) &&
+      entry.length <= MAX_PAYLOAD_ARRAY &&
+      entry.every((item) => typeof item === 'string' && item.length <= MAX_STAGED_STRING)
+    ) {
       out[key] = entry as string[];
     }
   }
@@ -196,6 +219,7 @@ export class Edition5Panel {
   }
 
   private async handle(message: PanelMessage): Promise<void> {
+    if (!messageWithinBound(message)) return;
     const type = text(message.type, 64);
     if (type === null) return;
     switch (type) {
@@ -216,11 +240,15 @@ export class Edition5Panel {
       }
       case 'e5Stage': {
         const controlId = text(message.controlId, 16);
-        if (controlId === null) return;
+        if (controlId === null || !E5_BINDINGS.has(controlId)) return;
         const raw =
-          typeof message.raw === 'string' || typeof message.raw === 'boolean' || typeof message.raw === 'number'
+          typeof message.raw === 'string' && message.raw.length <= MAX_STAGED_STRING
             ? message.raw
-            : null;
+            : typeof message.raw === 'boolean'
+              ? message.raw
+              : typeof message.raw === 'number' && Number.isFinite(message.raw)
+                ? message.raw
+                : null;
         const staged = stageRaw(this.state, controlId, raw, message.useSample === true);
         if (staged.error !== null) {
           this.postDraft(staged.error);
@@ -232,7 +260,7 @@ export class Edition5Panel {
       }
       case 'e5Unstage': {
         const controlId = text(message.controlId, 16);
-        if (controlId === null) return;
+        if (controlId === null || !E5_BINDINGS.has(controlId)) return;
         this.state = unstage(this.state, controlId);
         this.postDraft();
         return;
@@ -252,10 +280,15 @@ export class Edition5Panel {
           return;
         }
         const set = Array.isArray(message.set)
-          ? (message.set as unknown[]).filter(isStagedChange)
+          ? (message.set as unknown[]).slice(0, MAX_STAGED_CHANGES).filter(isStagedChange)
           : [...this.state.draft.set.values()];
         const unset = Array.isArray(message.unset)
-          ? (message.unset as unknown[]).filter((entry): entry is string => typeof entry === 'string')
+          ? (message.unset as unknown[])
+              .slice(0, MAX_STAGED_CHANGES)
+              .filter(
+                (entry): entry is string =>
+                  typeof entry === 'string' && entry.length <= 64 && E5_BINDINGS.has(entry),
+              )
           : [...this.state.draft.unset];
         const outcome = await applyDraft(backend, this.state, set, unset);
         this.state = outcome.state;
@@ -275,7 +308,7 @@ export class Edition5Panel {
       case 'e5Activate': {
         const backend = this.deps.backend();
         const controlId = text(message.controlId, 16);
-        if (backend === null || controlId === null) {
+        if (backend === null || controlId === null || !E5_BINDINGS.has(controlId)) {
           this.post({ type: 'e5Error', message: 'The Faktor service is not running; no control was dispatched.' });
           return;
         }
@@ -358,5 +391,23 @@ export class Edition5Panel {
 function isStagedChange(value: unknown): value is { controlId: string; key: string; value: Json } {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return typeof record.controlId === 'string' && typeof record.key === 'string';
+  if (
+    typeof record.controlId !== 'string' ||
+    record.controlId.length === 0 ||
+    record.controlId.length > 16 ||
+    typeof record.key !== 'string' ||
+    record.key.length === 0 ||
+    record.key.length > 128
+  ) {
+    return false;
+  }
+  const binding = E5_BINDINGS.get(record.controlId);
+  if (binding === undefined || binding.configKey !== record.key) return false;
+  const staged = record.value;
+  return (
+    staged === null ||
+    typeof staged === 'boolean' ||
+    (typeof staged === 'number' && Number.isFinite(staged)) ||
+    (typeof staged === 'string' && staged.length <= MAX_STAGED_STRING)
+  );
 }

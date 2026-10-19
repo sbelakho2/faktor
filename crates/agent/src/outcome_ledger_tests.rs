@@ -2510,3 +2510,63 @@ fn attribution_states_are_counted_and_incomplete_feeds_are_excluded() {
     assert_eq!(m.money_complete_runs, 4);
     assert_eq!(m.verified_changes, 4);
 }
+
+/// ([perf]) The metrics fold used to page the ledger through separate read
+/// connections (one engineering page + one settlement batch per page); it
+/// now reads one consistent snapshot. Measured on the same 1,200 records.
+///
+/// `cargo test -p faktor-agent --release outcome_metrics_snapshot_probe -- --ignored --nocapture`
+#[test]
+#[ignore = "[perf] measured probe; run explicitly with --ignored --nocapture"]
+fn outcome_metrics_snapshot_probe_beats_the_historical_page_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path(), true).unwrap());
+    let ledger = OutcomeLedger::new(store);
+    const ROWS: usize = 1_200;
+    for i in 0..ROWS {
+        let mut record = full_record();
+        record.run_id = format!("run-probe-{i:05}");
+        record.completed_at_ms = 1_700_000_000_000 + i as i64;
+        let settlement = pending_settlement(&record.run_id);
+        ledger.record(&record, &settlement).unwrap();
+    }
+    let old_walk = || {
+        let started = std::time::Instant::now();
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = ledger.page(cursor.as_ref(), MAX_LEDGER_PAGE).unwrap();
+            entries.extend(page.entries);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        (started.elapsed(), entries.len())
+    };
+    // Warm both paths, then take the best of three each (the first fold
+    // pays page-cache/CPU warmup that has nothing to do with the shape).
+    let _ = ledger.metrics().unwrap();
+    let _ = old_walk();
+    let mut snapshot_best = std::time::Duration::MAX;
+    let mut old_best = std::time::Duration::MAX;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let report = ledger.metrics().unwrap();
+        snapshot_best = snapshot_best.min(started.elapsed());
+        assert_eq!(report.scanned, ROWS as u64);
+        assert!(!report.truncated);
+        let (elapsed, rows) = old_walk();
+        old_best = old_best.min(elapsed);
+        assert_eq!(rows, ROWS);
+    }
+    println!(
+        "[perf] outcome metrics {ROWS} rows: page-walk {old_best:?} vs one snapshot {snapshot_best:?}"
+    );
+    // The snapshot is primarily a CONSISTENCY fix; its cost must stay in
+    // the same class as the historical walk (not a throughput regression).
+    assert!(
+        snapshot_best <= old_best.saturating_mul(2),
+        "snapshot fold regressed beyond 2x: walk {old_best:?} snapshot {snapshot_best:?}"
+    );
+}

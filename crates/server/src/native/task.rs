@@ -18,26 +18,11 @@ use crate::api::AppState;
 pub(crate) const TASK_RUN_ROW_KIND: &str =
     faktor_orchestrator::runtime::task_executor::TASK_RUN_ROW_KIND;
 
-/// The state tag of ONE in-session task run: the session's durable typed
-/// task row wins when it is TERMINAL (VerifiedComplete -> "Done", Failed,
-/// Cancelled) — a cancelled or verified run must not read as merely
-/// "parked"; otherwise the session's live AgentState tag applies. A durable
-/// read failure is LOUD (never silently "no task row").
-pub(crate) fn in_session_run_state_tag(
-    handle: &faktor_session::SessionHandle,
-    session_row: &faktor_store::SessionRow,
-) -> Result<&'static str, ApiError> {
-    let task = handle
-        .get_task(session_row.task_id)
-        .map_err(|e| faktor_protocol::error::from_core(&e))?;
-    Ok(run_state_tag_for(task.map(|t| t.state), session_row.state))
-}
-
 /// Map the durable task phase to the run tag. A non-terminal task is NOT
 /// "Done" merely because the turn-level session machine settled into
 /// `ready_for_next_turn`; a waiting approval, budget stop or pending
 /// verification must stay visible as its own phase.
-fn run_state_tag_for(
+pub(crate) fn run_state_tag_for(
     task: Option<TaskState>,
     session: faktor_core::state::AgentState,
 ) -> &'static str {

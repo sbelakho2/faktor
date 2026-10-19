@@ -195,6 +195,7 @@ pub(crate) fn test_deps_with_hooks(
         worker_plane_listener: None,
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
@@ -607,6 +608,7 @@ pub(crate) fn paced_test_deps(
         worker_plane_listener: None,
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
@@ -940,6 +942,7 @@ pub(crate) fn test_deps_full(
         worker_plane_listener: None,
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     }
@@ -1256,6 +1259,7 @@ pub(crate) fn native_task_rig_with_provider_and_verification(
         worker_plane_listener: None,
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
+        outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
     };

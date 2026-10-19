@@ -963,3 +963,140 @@ fn memory_fact_key_prefix_probe_is_literal_not_a_like_pattern() {
         .memory_fact_key_prefix_exists(s.id, "absent-kind", "")
         .unwrap());
 }
+
+/// Concurrent memory CAS: two writers holding the SAME expected stamp can
+/// no longer both apply (the historical read-then-upsert pair lost one
+/// update). Exactly one writer wins; the loser gets `Conflict`, and the
+/// surviving value is the winner's.
+#[test]
+fn concurrent_memory_cas_upsert_has_exactly_one_winner() {
+    let (_d, store) = tmp_store();
+    let store = std::sync::Arc::new(store);
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    store
+        .upsert_memory_fact(s.id, "user", "note", "base")
+        .unwrap();
+    let base = store
+        .get_memory_fact(s.id, "user", "note")
+        .unwrap()
+        .unwrap()
+        .updated_ms;
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut threads = Vec::new();
+    for i in 0..8 {
+        let store = std::sync::Arc::clone(&store);
+        let barrier = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let outcome = store
+                .upsert_memory_fact_cas(s.id, "user", "note", &format!("writer-{i}"), Some(base))
+                .unwrap();
+            (i, outcome)
+        }));
+    }
+    let mut winners = Vec::new();
+    let mut conflicts = 0;
+    for t in threads {
+        let (i, outcome) = t.join().unwrap();
+        match outcome {
+            MemoryFactCas::Applied(row) => {
+                assert_eq!(row.value, format!("writer-{i}"));
+                winners.push(row.value);
+            }
+            MemoryFactCas::Conflict => conflicts += 1,
+            MemoryFactCas::Missing => panic!("the row exists"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one CAS writer may apply");
+    assert_eq!(conflicts, 7);
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, "user", "note")
+            .unwrap()
+            .unwrap()
+            .value,
+        winners[0]
+    );
+
+    // A stale expected stamp is refused after the winner landed.
+    assert_eq!(
+        store
+            .upsert_memory_fact_cas(s.id, "user", "note", "late", Some(base))
+            .unwrap(),
+        MemoryFactCas::Conflict
+    );
+}
+
+/// Concurrent memory CAS delete: a delete holding the OLD stamp must not
+/// remove a row a concurrent CAS update moved forward.
+#[test]
+fn concurrent_memory_cas_delete_refuses_a_replaced_row() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    store
+        .upsert_memory_fact(s.id, "user", "note", "base")
+        .unwrap();
+    let base = store
+        .get_memory_fact(s.id, "user", "note")
+        .unwrap()
+        .unwrap()
+        .updated_ms;
+    assert!(matches!(
+        store
+            .upsert_memory_fact_cas(s.id, "user", "note", "next", Some(base))
+            .unwrap(),
+        MemoryFactCas::Applied(_)
+    ));
+    assert_eq!(
+        store
+            .delete_memory_fact_cas(s.id, "user", "note", Some(base))
+            .unwrap(),
+        MemoryFactDeleteCas::Conflict,
+        "the stale delete must not remove the newer row"
+    );
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, "user", "note")
+            .unwrap()
+            .unwrap()
+            .value,
+        "next"
+    );
+}
+
+/// The KIND-set read returns only the requested rows in the durable total
+/// order and reports the bound honestly (no silent truncation).
+#[test]
+fn memory_facts_of_kinds_is_indexed_and_bounded() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    for i in 0..50 {
+        store
+            .upsert_memory_fact(s.id, "user", &format!("k{i:02}"), "v")
+            .unwrap();
+    }
+    store
+        .upsert_memory_fact(s.id, "orchestrator_registry", "run/child-0", "{}")
+        .unwrap();
+    store
+        .upsert_memory_fact(s.id, "orchestrator_registry", "run/child-1", "{}")
+        .unwrap();
+    let (rows, has_more) = store
+        .memory_facts_of_kinds(s.id, &["orchestrator_registry"], 10)
+        .unwrap();
+    assert!(!has_more);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.kind == "orchestrator_registry"));
+    let (rows, has_more) = store
+        .memory_facts_of_kinds(s.id, &["user", "orchestrator_registry"], 10)
+        .unwrap();
+    assert!(has_more);
+    assert_eq!(rows.len(), 10);
+    // A zero/absent kind set never widens into a full scan.
+    let (rows, has_more) = store.memory_facts_of_kinds(s.id, &["absent"], 10).unwrap();
+    assert!(rows.is_empty() && !has_more);
+}

@@ -84,6 +84,19 @@ pub enum FailurePolicy {
     Warn,
 }
 
+/// Hard ceiling on either captured stream head. A persisted hook spec is
+/// authored by an API client; without this bound a hostile/typo'd
+/// `usize::MAX` cap would make `run_sync` retain an unbounded child stream
+/// in daemon RAM for the whole deadline.
+pub const MAX_HOOK_OUTPUT_CAP: usize = 4 * 1024 * 1024;
+/// Structural bounds on one persisted hook spec (the spec body itself is
+/// already byte-capped at the API boundary).
+pub const MAX_HOOK_ARGS: usize = 64;
+pub const MAX_HOOK_ARG_BYTES: usize = 4096;
+pub const MAX_HOOK_ENV: usize = 32;
+pub const MAX_HOOK_ENV_NAME_BYTES: usize = 128;
+pub const MAX_HOOK_ENV_VALUE_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HookSpec {
     pub id: String,
@@ -285,8 +298,56 @@ impl HookRegistry {
         if spec.command.is_empty() || spec.command.len() > 4096 {
             return Err("hook command must be 1..=4096 bytes".into());
         }
+        if spec.command.contains('\0') {
+            return Err("hook command must not contain NUL".into());
+        }
+        if spec.events.len() > HookEvent::ALL.len() {
+            return Err(format!(
+                "a hook may subscribe to at most {} event kinds",
+                HookEvent::ALL.len()
+            ));
+        }
+        if spec.args.len() > MAX_HOOK_ARGS {
+            return Err(format!("a hook may carry at most {MAX_HOOK_ARGS} args"));
+        }
+        if spec
+            .args
+            .iter()
+            .any(|arg| arg.len() > MAX_HOOK_ARG_BYTES || arg.contains('\0'))
+        {
+            return Err(format!(
+                "hook args must be at most {MAX_HOOK_ARG_BYTES} bytes without NUL"
+            ));
+        }
+        if spec.env.len() > MAX_HOOK_ENV {
+            return Err(format!(
+                "a hook may carry at most {MAX_HOOK_ENV} env entries"
+            ));
+        }
+        for (name, value) in &spec.env {
+            if name.is_empty()
+                || name.len() > MAX_HOOK_ENV_NAME_BYTES
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || value.len() > MAX_HOOK_ENV_VALUE_BYTES
+                || value.contains('\0')
+            {
+                return Err(format!(
+                    "hook env entries must be NAME=VALUE with a 1..={MAX_HOOK_ENV_NAME_BYTES} \
+                     ASCII name and a value of at most {MAX_HOOK_ENV_VALUE_BYTES} bytes without NUL"
+                ));
+            }
+        }
         if spec.deadline_ms == 0 || spec.deadline_ms > 300_000 {
             return Err("hook deadline must be in (0, 300000] ms".into());
+        }
+        if spec.stdout_cap == 0
+            || spec.stdout_cap > MAX_HOOK_OUTPUT_CAP
+            || spec.stderr_cap == 0
+            || spec.stderr_cap > MAX_HOOK_OUTPUT_CAP
+        {
+            return Err(format!(
+                "hook output caps must be in 1..={MAX_HOOK_OUTPUT_CAP} bytes"
+            ));
         }
         // Classified AUTHORITY/POLICY state: a poisoned spec registry
         // refuses the mutation typed — it never half-applies a policy change.
@@ -531,8 +592,8 @@ impl HookRegistry {
         let out = match self.inner.supervisor.run_sync(
             cfg,
             std::time::Duration::from_millis(spec.deadline_ms),
-            spec.stdout_cap,
-            spec.stderr_cap,
+            spec.stdout_cap.min(MAX_HOOK_OUTPUT_CAP),
+            spec.stderr_cap.min(MAX_HOOK_OUTPUT_CAP),
         ) {
             Ok(out) => out,
             Err(e) => {
@@ -1123,6 +1184,71 @@ mod tests {
         };
         r.register(ok.clone()).unwrap();
         assert!(r.register(ok).is_err(), "duplicate id rejected");
+    }
+
+    #[test]
+    fn hostile_hook_caps_args_and_env_are_refused_before_registration() {
+        let r = HookRegistry::try_new().unwrap();
+        let base = HookSpec {
+            id: "h".into(),
+            command: "true".into(),
+            ..Default::default()
+        };
+        for hostile in [
+            HookSpec {
+                stdout_cap: usize::MAX,
+                ..base.clone()
+            },
+            HookSpec {
+                stderr_cap: usize::MAX,
+                ..base.clone()
+            },
+            HookSpec {
+                stdout_cap: 0,
+                ..base.clone()
+            },
+            HookSpec {
+                args: vec!["a".into(); MAX_HOOK_ARGS + 1],
+                ..base.clone()
+            },
+            HookSpec {
+                args: vec!["a".repeat(MAX_HOOK_ARG_BYTES + 1)],
+                ..base.clone()
+            },
+            HookSpec {
+                args: vec!["a\0b".into()],
+                ..base.clone()
+            },
+            HookSpec {
+                env: vec![("PATH".into(), "x".into()); MAX_HOOK_ENV + 1],
+                ..base.clone()
+            },
+            HookSpec {
+                env: vec![("BAD=NAME".into(), "x".into())],
+                ..base.clone()
+            },
+            HookSpec {
+                env: vec![("GOOD".into(), "x\0y".into())],
+                ..base.clone()
+            },
+            HookSpec {
+                env: vec![("GOOD".into(), "v".repeat(MAX_HOOK_ENV_VALUE_BYTES + 1))],
+                ..base.clone()
+            },
+            HookSpec {
+                command: "tr\0ue".into(),
+                ..base.clone()
+            },
+            HookSpec {
+                events: vec![HookEvent::PreTool; HookEvent::ALL.len() + 1],
+                ..base
+            },
+        ] {
+            assert!(
+                r.register(hostile).is_err(),
+                "hostile hook spec must be refused"
+            );
+        }
     }
 
     // ------------------------------------------- audit P0-40 adversarial

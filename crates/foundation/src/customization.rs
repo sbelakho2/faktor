@@ -197,9 +197,14 @@ impl CustomizationService {
     ) -> Result<McpServerRecord, FoundationError> {
         validate_mcp(draft)?;
         let id = draft.id.clone().unwrap_or_else(|| slug_id(&draft.name));
-        if id.is_empty() || id.len() > MAX_MCP_NAME_BYTES {
+        if id.is_empty()
+            || id.len() > MAX_MCP_NAME_BYTES
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
             return Err(FoundationError::Malformed(
-                "mcp id must be 1..=128 bytes".into(),
+                "mcp id must be 1..=128 bytes of ASCII letters, digits, '_', '-' or '.'".into(),
             ));
         }
         let transport = draft.transport.as_deref().unwrap_or("stdio");
@@ -214,19 +219,7 @@ impl CustomizationService {
             ));
         }
         let endpoint = match (transport, draft.endpoint.as_deref()) {
-            ("streamable_http", Some(endpoint)) => {
-                let parsed = url::Url::parse(endpoint).map_err(|_| {
-                    FoundationError::Malformed(
-                        "MCP endpoint must be an absolute http(s) URL".into(),
-                    )
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(FoundationError::Malformed(
-                        "MCP endpoint must be an absolute http(s) URL".into(),
-                    ));
-                }
-                Some(parsed.to_string())
-            }
+            ("streamable_http", Some(endpoint)) => Some(validate_mcp_endpoint(endpoint)?),
             ("streamable_http", None) => {
                 return Err(FoundationError::Malformed(
                     "streamable_http MCP servers require an endpoint".into(),
@@ -1019,6 +1012,71 @@ fn map_hook(row: &rusqlite::Row<'_>) -> rusqlite::Result<HookRecord> {
     })
 }
 
+/// Validate a persisted MCP HTTP endpoint before it can be named by any
+/// future transport adapter.
+///
+/// Remote MCP is typed unsupported today, but the endpoint is durable and is
+/// surfaced by the tools view. It must therefore already obey the boundary a
+/// transport would need: absolute http(s), no embedded userinfo, no
+/// query/fragment (credentials belong in the vault reference), and no
+/// special-purpose literal destination (loopback, private, link-local,
+/// IPv4-mapped/NAT64/6to4/Teredo aliases). Classification is the ONE shared
+/// [`faktor_security::network::classify_ip`] authority, never a local table.
+fn validate_mcp_endpoint(endpoint: &str) -> Result<String, FoundationError> {
+    let parsed = url::Url::parse(endpoint).map_err(|_| {
+        FoundationError::Malformed("MCP endpoint must be an absolute http(s) URL".into())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(FoundationError::Malformed(
+            "MCP endpoint must be an absolute http(s) URL".into(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FoundationError::Malformed(
+            "MCP endpoint must not embed userinfo credentials".into(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(FoundationError::Malformed(
+            "MCP endpoint must not carry a query or fragment; credentials belong in the vault reference".into(),
+        ));
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                return Err(FoundationError::Malformed(
+                    "MCP endpoint must not target loopback".into(),
+                ));
+            }
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            if faktor_security::network::classify_ip(std::net::IpAddr::V4(ip))
+                != faktor_security::network::AddressClass::Global
+            {
+                return Err(FoundationError::Malformed(
+                    "MCP endpoint must not target a special-purpose address".into(),
+                ));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if faktor_security::network::classify_ip(std::net::IpAddr::V6(ip))
+                != faktor_security::network::AddressClass::Global
+            {
+                return Err(FoundationError::Malformed(
+                    "MCP endpoint must not target a special-purpose address".into(),
+                ));
+            }
+        }
+        None => {
+            return Err(FoundationError::Malformed(
+                "MCP endpoint must be an absolute http(s) URL".into(),
+            ))
+        }
+    }
+    Ok(parsed.to_string())
+}
+
 fn slug_id(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -1102,6 +1160,50 @@ mod tests {
         let mut unicode = mcp("é".repeat(64).as_str());
         unicode.command = "x".repeat(MAX_MCP_COMMAND_BYTES + 1);
         assert!(svc.save_mcp_server(&unicode, None).is_err());
+    }
+
+    #[test]
+    fn mcp_remote_endpoint_and_id_are_hostile_input_safe() {
+        let (_dir, svc) = service();
+        let remote = |endpoint: &str| {
+            let mut draft = mcp("remote");
+            draft.command = String::new();
+            draft.args = vec![];
+            draft.transport = Some("streamable_http".into());
+            draft.endpoint = Some(endpoint.into());
+            draft
+        };
+        assert!(svc
+            .save_mcp_server(&remote("https://mcp.example.com/rpc"), None)
+            .is_ok());
+        for hostile in [
+            "https://user:pw@mcp.example.com/rpc",
+            "https://mcp.example.com/rpc?api_key=sk-secret",
+            "https://mcp.example.com/rpc#token",
+            "https://127.0.0.1/rpc",
+            "https://169.254.169.254/rpc",
+            "https://[::1]/rpc",
+            "https://[::ffff:169.254.169.254]/rpc",
+            "https://[64:ff9b::a9fe:a9fe]/rpc",
+            "https://[2002:a9fe:a9fe::1]/rpc",
+            "https://localhost/rpc",
+            "https://mcp.localhost/rpc",
+            "ftp://mcp.example.com/rpc",
+        ] {
+            assert!(
+                svc.save_mcp_server(&remote(hostile), None).is_err(),
+                "{hostile} must be refused"
+            );
+        }
+        // The id is a served key: traversal/control bytes cannot cross it.
+        for id in ["../evil", "a/b", "a\\b", "a b", "a\nb", "é"] {
+            let mut draft = mcp("id");
+            draft.id = Some(id.into());
+            assert!(
+                svc.save_mcp_server(&draft, None).is_err(),
+                "id {id:?} must be refused"
+            );
+        }
     }
 
     #[test]

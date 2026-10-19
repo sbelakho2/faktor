@@ -1214,7 +1214,10 @@ impl OutcomeLedger {
         limit: u64,
     ) -> Result<OutcomeLedgerPage, OutcomeLedgerError> {
         let limit = limit.clamp(1, MAX_LEDGER_PAGE);
-        let rows = self.store.engineering_outcome_page(
+        // One transaction for the rows AND their latest settlements: a
+        // concurrent settlement correction can no longer land between the
+        // two reads and tear the page's money projection.
+        let (rows, settlements) = self.store.engineering_outcome_page_with_settlements(
             cursor.map(|c| (c.completed_at_ms, c.run_id.as_str())),
             limit,
         )?;
@@ -1223,13 +1226,10 @@ impl OutcomeLedger {
             .iter()
             .map(decode_record_row)
             .collect::<Result<_, _>>()?;
-        let run_ids: Vec<String> = rows.iter().map(|row| row.run_id.clone()).collect();
         let mut latest: BTreeMap<String, EconomicSettlement> = BTreeMap::new();
-        for chunk in run_ids.chunks(faktor_store::MAX_ECONOMIC_SETTLEMENT_BATCH) {
-            for row in self.store.economic_settlement_latest_for_runs(chunk)? {
-                let settlement = EconomicSettlement::from_row(&row)?;
-                latest.insert(settlement.run_id.clone(), settlement);
-            }
+        for row in settlements {
+            let settlement = EconomicSettlement::from_row(&row)?;
+            latest.insert(settlement.run_id.clone(), settlement);
         }
         let mut entries = Vec::with_capacity(stored.len());
         for stored in &stored {
@@ -1262,26 +1262,33 @@ impl OutcomeLedger {
     /// [`OutcomeLedgerMetrics::compute`] for the metric definitions; a
     /// ledger larger than [`MAX_METRICS_RECORDS`] reports `truncated`.
     pub fn metrics(&self) -> Result<OutcomeLedgerMetricsReport, OutcomeLedgerError> {
-        let mut entries: Vec<OutcomeLedgerEntry> = Vec::new();
-        let mut cursor: Option<OutcomeCursor> = None;
-        let mut truncated = false;
-        loop {
-            let page = self.page(cursor.as_ref(), MAX_LEDGER_PAGE)?;
-            entries.extend(page.entries);
-            if entries.len() as u64 >= MAX_METRICS_RECORDS {
-                truncated |= page.next.is_some();
-                entries.truncate(MAX_METRICS_RECORDS as usize);
-                break;
-            }
-            match page.next {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        // ONE read transaction for the engineering rows AND their latest
+        // settlements: a concurrent settlement correction can no longer land
+        // between pages and tear the aggregate (some runs folded from one
+        // committed state, others from another).
+        let snapshot = self
+            .store
+            .engineering_outcome_metrics_snapshot(MAX_METRICS_RECORDS)?;
+        let mut latest: BTreeMap<String, EconomicSettlementRow> = BTreeMap::new();
+        for settlement in snapshot.settlements {
+            latest.insert(settlement.run_id.clone(), settlement);
+        }
+        let mut entries: Vec<OutcomeLedgerEntry> = Vec::with_capacity(snapshot.outcomes.len());
+        for row in &snapshot.outcomes {
+            let stored = decode_record_row(row)?;
+            let settlement = match latest.remove(&stored.outcome.run_id) {
+                Some(settlement) => EconomicSettlement::from_row(&settlement)?,
+                None => settlement_for_stored(&stored, None)?,
+            };
+            entries.push(OutcomeLedgerEntry {
+                outcome: stored.outcome,
+                settlement,
+            });
         }
         Ok(OutcomeLedgerMetricsReport {
             scanned: entries.len() as u64,
             metrics: OutcomeLedgerMetrics::compute(&entries),
-            truncated,
+            truncated: snapshot.truncated,
         })
     }
 

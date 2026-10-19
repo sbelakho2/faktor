@@ -172,6 +172,11 @@ impl Store {
                 Ok(deleted_ms)
             },
         )?;
+        // A purge removes journal/ledger rows: any cached session-open
+        // verification is stale. Bump the epoch even on an idempotent
+        // replay (harmless, and never leaves a pre-purge cache alive).
+        self.corruption_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(SessionDeletion {
             session_id,
             deleted_ms,

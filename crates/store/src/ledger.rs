@@ -17,6 +17,26 @@ pub struct MemoryFactRow {
     pub updated_ms: i64,
 }
 
+/// Outcome of one atomic memory-fact CAS upsert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryFactCas {
+    /// The upsert landed; the row carries the post-write value/stamp.
+    Applied(MemoryFactRow),
+    /// A row exists but its `updated_ms` differs from the expected stamp:
+    /// nothing was written.
+    Conflict,
+    /// `expected_updated_ms = Some(_)` but the row does not exist.
+    Missing,
+}
+
+/// Outcome of one atomic memory-fact CAS delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryFactDeleteCas {
+    Deleted(MemoryFactRow),
+    Conflict,
+    Missing,
+}
+
 /// Cursor over the memory-fact total order `(updated_ms DESC, kind DESC, key DESC)`: the
 /// position of the last row of a page. Identifies a stable position — replaying it returns
 /// the same window.
@@ -24,7 +44,6 @@ pub type MemoryFactCursor = (i64, String, String);
 
 /// Exclusive upper bound of the half-open byte range that contains exactly
 /// the rows whose `kind` starts with `prefix`.
-///
 /// SQLite's default BINARY collation compares TEXT bytewise, so
 /// `kind >= '<prefix>' AND kind < '<prefix_end>'` is the exact, literal
 /// prefix predicate. The previous `kind LIKE '<prefix>%'` was
@@ -187,7 +206,6 @@ pub(crate) fn evidence_row_map(r: &rusqlite::Row<'_>) -> StoreResult<EvidenceRow
 
 /// The seed of a freshly migrated op-id sequence: `(now_ms << 20)` rounded
 /// UP to the 1024-id reservation quantum.
-///
 /// The 20-bit shift keeps every pre-migration id (`now_ms + counter`, where
 /// the counter only ever grew from 1) far below the seed — by a factor of
 /// ~2^20 in wall-clock terms, i.e. even a clock that had run ~56 million
@@ -1246,7 +1264,6 @@ impl Store {
     /// that scanned the whole stream paid O(history) per listing. The
     /// `(session_id, entry_type, seq)` index restricts the search to the
     /// named types and serves the `seq` bound/order per type.
-    ///
     /// `entry_types` is a trusted, compile-time tag list (the session layer's
     /// terminal tags); values are bound as parameters, never interpolated.
     /// An empty list is the empty page. Same typed limit rules as
@@ -1540,6 +1557,119 @@ impl Store {
         })
     }
 
+    /// Compare-and-set upsert of ONE memory fact in ONE writer
+    /// transaction. `expected_updated_ms = Some(ms)` requires the row to
+    /// exist with exactly that stamp; `None` is an unconditional upsert.
+    /// The HTTP memory write used to read the row, compare the stamp and
+    /// then call [`Store::upsert_memory_fact`] in a SEPARATE command: two
+    /// concurrent writers holding the same expected stamp both passed the
+    /// check and the second silently overwrote the first (a lost update
+    /// despite the CAS contract). The read + conditional write now execute
+    /// inside the single writer job.
+    pub fn upsert_memory_fact_cas(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+        value: &str,
+        expected_updated_ms: Option<i64>,
+    ) -> StoreResult<MemoryFactCas> {
+        let fact_stamp = self.fact_timestamp();
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.writer.execute("upsert_memory_fact_cas", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let select = "SELECT kind, key, value, updated_ms FROM memory_fact
+                          WHERE session_id = ?1 AND kind = ?2 AND key = ?3";
+            let current: Option<MemoryFactRow> = tx
+                .query_row(select, params![session_id.raw() as i64, &kind, &key], |r| {
+                    Ok(MemoryFactRow {
+                        kind: r.get(0)?,
+                        key: r.get(1)?,
+                        value: r.get(2)?,
+                        updated_ms: r.get(3)?,
+                    })
+                })
+                .optional()?;
+            if let Some(expected) = expected_updated_ms {
+                match &current {
+                    None => return Ok(MemoryFactCas::Missing),
+                    Some(row) if row.updated_ms != expected => return Ok(MemoryFactCas::Conflict),
+                    Some(_) => {}
+                }
+            }
+            // Same-value rewrites stay a true no-op (idempotence), so a
+            // successful CAS on an unchanged value does not move the row.
+            tx.execute(
+                "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, kind, key) DO UPDATE SET
+                   value = excluded.value, updated_ms = excluded.updated_ms
+                 WHERE memory_fact.value IS NOT excluded.value",
+                params![session_id.raw() as i64, &kind, &key, &value, fact_stamp],
+            )?;
+            let saved: MemoryFactRow =
+                tx.query_row(select, params![session_id.raw() as i64, &kind, &key], |r| {
+                    Ok(MemoryFactRow {
+                        kind: r.get(0)?,
+                        key: r.get(1)?,
+                        value: r.get(2)?,
+                        updated_ms: r.get(3)?,
+                    })
+                })?;
+            tx.commit()?;
+            Ok(MemoryFactCas::Applied(saved))
+        })
+    }
+
+    /// Atomic compare-and-set delete of ONE memory fact. Same authority as
+    /// [`Store::upsert_memory_fact_cas`]: the read, stamp check and delete
+    /// are one writer transaction, so a concurrent update can never be
+    /// deleted by a writer that observed the older stamp.
+    pub fn delete_memory_fact_cas(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+        expected_updated_ms: Option<i64>,
+    ) -> StoreResult<MemoryFactDeleteCas> {
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        self.writer.execute("delete_memory_fact_cas", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let row: Option<MemoryFactRow> = tx
+                .query_row(
+                    "SELECT kind, key, value, updated_ms FROM memory_fact
+                     WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                    params![session_id.raw() as i64, &kind, &key],
+                    |r| {
+                        Ok(MemoryFactRow {
+                            kind: r.get(0)?,
+                            key: r.get(1)?,
+                            value: r.get(2)?,
+                            updated_ms: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Ok(MemoryFactDeleteCas::Missing);
+            };
+            if let Some(expected) = expected_updated_ms {
+                if row.updated_ms != expected {
+                    return Ok(MemoryFactDeleteCas::Conflict);
+                }
+            }
+            tx.execute(
+                "DELETE FROM memory_fact WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                params![session_id.raw() as i64, &kind, &key],
+            )?;
+            tx.commit()?;
+            Ok(MemoryFactDeleteCas::Deleted(row))
+        })
+    }
+
     /// Atomically upsert MANY memory facts of ONE session in ONE SQLite
     /// transaction (one commit + fsync): the row group either lands fully
     /// or not at all — a crash between the writes can never expose a
@@ -1695,7 +1825,6 @@ impl Store {
     /// only rows strictly AFTER the `after` cursor position (older in the
     /// order). Returns `(rows, has_more)` with at most `limit` rows; pass
     /// the last row's `(updated_ms, kind, key)` as the next `after` cursor.
-    ///
     /// Cursor semantics under concurrent writes: an upsert that CHANGES a
     /// value moves the row toward the NEWEST end of the order (its
     /// `updated_ms` is rewritten to now; an identical-value upsert is a
@@ -1929,6 +2058,60 @@ impl Store {
         Ok(out)
     }
 
+    /// Bounded page of the session's facts restricted to an explicit KIND
+    /// set, in the SAME deterministic total order as
+    /// [`Store::memory_facts_page`] (`updated_ms DESC, kind DESC, key
+    /// DESC`). The set rides `idx_memory_fact_kind_session(kind,
+    /// session_id)`, so the orchestrator graph/verification projections read
+    /// only their own rows instead of paging through every ordinary memory
+    /// fact (the historical scans walked up to 51,200 unrelated rows per
+    /// request). Returns `has_more` when the bound cut the set; callers
+    /// either page or refuse loudly — never silently truncate a graph.
+    pub fn memory_facts_of_kinds(
+        &self,
+        session_id: SessionId,
+        kinds: &[&str],
+        limit: u64,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        if kinds.is_empty() || kinds.len() > 16 {
+            return Err(StoreError::Oversized(format!(
+                "memory kind set must hold 1..=16 kinds, got {}",
+                kinds.len()
+            )));
+        }
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let placeholders = vec!["?"; kinds.len()].join(", ");
+        let sql = format!(
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1 AND kind IN ({placeholders})
+             ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?"
+        );
+        let conn = self.read()?;
+        let mut params: Vec<rusqlite::types::Value> =
+            Vec::with_capacity(kinds.len().saturating_add(2));
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
+        for kind in kinds {
+            params.push(rusqlite::types::Value::Text((*kind).to_string()));
+        }
+        params.push(rusqlite::types::Value::Integer(limit.saturating_add(1)));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out: Vec<MemoryFactRow> = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(MemoryFactRow {
+                kind: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                updated_ms: row.get(3)?,
+            });
+        }
+        let has_more = out.len() as i64 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
+    }
+
     /// Total count of memory facts for one session (cheap; facts are small
     /// per session).
     pub fn memory_fact_count(&self, session_id: SessionId) -> StoreResult<i64> {
@@ -2120,7 +2303,6 @@ impl Store {
     }
 
     /// Oldest row that is not terminal (pending/claimed/running) — FIFO head.
-    ///
     /// The persisted `files` JSON is decoded fallibly: a corrupt row is a
     /// typed [`StoreError::Corrupt`] naming the session/seq, never silently an
     /// empty file list (nor a swallowed `None`).

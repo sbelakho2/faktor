@@ -19,6 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { discoverNativeRoutes, serverRouteFiles } from '../../../scripts/discover-capabilities.mjs';
+import { scan as scanRouteAuthority } from '../checks/route-authority.mjs';
 import { hostileBodies, hostileHeaders, hostileQueries } from '../generators/hostile.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -145,6 +146,20 @@ function transientStatus(status) {
  * `status` is proven only when every route passed both cases.
  */
 export async function probeRoutes({ report = false } = {}) {
+  // A new route is never invisible: every discovered route must declare its
+  // principal/scope and its handler must enforce it before any request runs.
+  const authority = scanRouteAuthority({ root: ROOT });
+  if (!authority.passed) {
+    return {
+      status: 'failed',
+      reason: 'route authority declarations are incomplete or unenforced',
+      results: [],
+      failures: authority.observed.errors.map((error) => ({
+        id: 'static.route-authority',
+        observed: { error },
+      })),
+    };
+  }
   const binary = cliBinary();
   if (binary === null) {
     return { status: 'deferred', reason: 'no faktor-cli binary; trusted lane builds it', results: [] };

@@ -1,0 +1,2015 @@
+{
+  "schema": "faktor-route-authority/v1",
+  "entries": [
+    {
+      "id": "native.delete.native.hooks.id",
+      "method": "delete",
+      "path": "/native/hooks/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.instructions.records.id",
+      "method": "delete",
+      "path": "/native/instructions/records/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.mcp.servers.id",
+      "method": "delete",
+      "path": "/native/mcp/servers/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.memory.kind.key",
+      "method": "delete",
+      "path": "/native/memory/{kind}/{key}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.memory.records.id",
+      "method": "delete",
+      "path": "/native/memory/records/{id}",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.permissions.rules.id",
+      "method": "delete",
+      "path": "/native/permissions/rules/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.presets.id",
+      "method": "delete",
+      "path": "/native/presets/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.providers.connections.id",
+      "method": "delete",
+      "path": "/native/providers/connections/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.providers.credentials.handle",
+      "method": "delete",
+      "path": "/native/providers/credentials/{handle}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.session.id",
+      "method": "delete",
+      "path": "/native/session/{id}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.session.id.context.pins",
+      "method": "delete",
+      "path": "/native/session/{id}/context/pins",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.session.id.review.comments.comment",
+      "method": "delete",
+      "path": "/native/session/{id}/review/comments/{comment}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.skills.id",
+      "method": "delete",
+      "path": "/native/skills/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.capabilities",
+      "method": "get",
+      "path": "/capabilities",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.models",
+      "method": "get",
+      "path": "/models",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.agents",
+      "method": "get",
+      "path": "/native/agents",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.approvals",
+      "method": "get",
+      "path": "/native/approvals",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.adapters",
+      "method": "get",
+      "path": "/native/browser/adapters",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.artifacts.id",
+      "method": "get",
+      "path": "/native/browser/artifacts/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.artifacts.id.bytes",
+      "method": "get",
+      "path": "/native/browser/artifacts/{id}/bytes",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.sessions",
+      "method": "get",
+      "path": "/native/browser/sessions",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.sessions.id.observations",
+      "method": "get",
+      "path": "/native/browser/sessions/{id}/observations",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.browser.status",
+      "method": "get",
+      "path": "/native/browser/status",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.call-receipts",
+      "method": "get",
+      "path": "/native/call-receipts",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.config.descriptors",
+      "method": "get",
+      "path": "/native/config/descriptors",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.config.export",
+      "method": "get",
+      "path": "/native/config/export",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.config.provenance",
+      "method": "get",
+      "path": "/native/config/provenance",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.config.search",
+      "method": "get",
+      "path": "/native/config/search",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.config.snapshot",
+      "method": "get",
+      "path": "/native/config/snapshot",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.context.export",
+      "method": "get",
+      "path": "/native/context/export",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.context.manifest",
+      "method": "get",
+      "path": "/native/context/manifest",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.context.manifests",
+      "method": "get",
+      "path": "/native/context/manifests",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.diagnostics.preview",
+      "method": "get",
+      "path": "/native/diagnostics/preview",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.artifacts",
+      "method": "get",
+      "path": "/native/enterprise/artifacts",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.audit",
+      "method": "get",
+      "path": "/native/enterprise/audit",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.deletion-jobs",
+      "method": "get",
+      "path": "/native/enterprise/deletion-jobs",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "owner",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.deletion-jobs.id",
+      "method": "get",
+      "path": "/native/enterprise/deletion-jobs/{id}",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "owner",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.settings",
+      "method": "get",
+      "path": "/native/enterprise/settings",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.status",
+      "method": "get",
+      "path": "/native/enterprise/status",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.enterprise.tombstones.scope-key",
+      "method": "get",
+      "path": "/native/enterprise/tombstones/{scope_key}",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.entitlements",
+      "method": "get",
+      "path": "/native/entitlements",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.events",
+      "method": "get",
+      "path": "/native/events",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.evidence.id",
+      "method": "get",
+      "path": "/native/evidence/{id}",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.health",
+      "method": "get",
+      "path": "/native/health",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.hooks",
+      "method": "get",
+      "path": "/native/hooks",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.hooks.audit",
+      "method": "get",
+      "path": "/native/hooks/audit",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.identity",
+      "method": "get",
+      "path": "/native/identity",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.index.coverage",
+      "method": "get",
+      "path": "/native/index/coverage",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.instructions",
+      "method": "get",
+      "path": "/native/instructions",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.instructions.bindings",
+      "method": "get",
+      "path": "/native/instructions/bindings",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.instructions.preview",
+      "method": "get",
+      "path": "/native/instructions/preview",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.instructions.records",
+      "method": "get",
+      "path": "/native/instructions/records",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.instructions.records.id",
+      "method": "get",
+      "path": "/native/instructions/records/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.jobs.id",
+      "method": "get",
+      "path": "/native/jobs/{id}",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.mcp.servers",
+      "method": "get",
+      "path": "/native/mcp/servers",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.mcp.servers.id.auth",
+      "method": "get",
+      "path": "/native/mcp/servers/{id}/auth",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.mcp.servers.id.resources",
+      "method": "get",
+      "path": "/native/mcp/servers/{id}/resources",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.mcp.servers.id.tools",
+      "method": "get",
+      "path": "/native/mcp/servers/{id}/tools",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.memory",
+      "method": "get",
+      "path": "/native/memory",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.memory.policy",
+      "method": "get",
+      "path": "/native/memory/policy",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.memory.records",
+      "method": "get",
+      "path": "/native/memory/records",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.messages",
+      "method": "get",
+      "path": "/native/messages",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.model-parameters",
+      "method": "get",
+      "path": "/native/model-parameters",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.orchestrator.graph",
+      "method": "get",
+      "path": "/native/orchestrator/graph",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.orgs",
+      "method": "get",
+      "path": "/native/orgs",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.orgs.id.members",
+      "method": "get",
+      "path": "/native/orgs/{id}/members",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.outcomes",
+      "method": "get",
+      "path": "/native/outcomes",
+      "principal": "daemon_or_control_org",
+      "scope": "mixed_org",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.permissions",
+      "method": "get",
+      "path": "/native/permissions",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.permissions.audit",
+      "method": "get",
+      "path": "/native/permissions/audit",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.permissions.policy",
+      "method": "get",
+      "path": "/native/permissions/policy",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets",
+      "method": "get",
+      "path": "/native/presets",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets.binding",
+      "method": "get",
+      "path": "/native/presets/binding",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets.id",
+      "method": "get",
+      "path": "/native/presets/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets.id.envelope",
+      "method": "get",
+      "path": "/native/presets/{id}/envelope",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets.id.fallback",
+      "method": "get",
+      "path": "/native/presets/{id}/fallback",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.presets.id.roles",
+      "method": "get",
+      "path": "/native/presets/{id}/roles",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.providers",
+      "method": "get",
+      "path": "/native/providers",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.providers.connections",
+      "method": "get",
+      "path": "/native/providers/connections",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.providers.connections.id.health",
+      "method": "get",
+      "path": "/native/providers/connections/{id}/health",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.providers.credentials",
+      "method": "get",
+      "path": "/native/providers/credentials",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.ready",
+      "method": "get",
+      "path": "/native/ready",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.repositories",
+      "method": "get",
+      "path": "/native/repositories",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.runtime.status",
+      "method": "get",
+      "path": "/native/runtime/status",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.runtime.trust",
+      "method": "get",
+      "path": "/native/runtime/trust",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.semantic.capabilities",
+      "method": "get",
+      "path": "/native/semantic/capabilities",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.semantic.status",
+      "method": "get",
+      "path": "/native/semantic/status",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.agents",
+      "method": "get",
+      "path": "/native/session/{id}/agents",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.attachments.blob.digest",
+      "method": "get",
+      "path": "/native/session/{id}/attachments/blob/{digest}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.attachments.blob.digest.bytes",
+      "method": "get",
+      "path": "/native/session/{id}/attachments/blob/{digest}/bytes",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.attachments.ref.ref-id",
+      "method": "get",
+      "path": "/native/session/{id}/attachments/ref/{ref_id}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.attachments.ref.ref-id.bytes",
+      "method": "get",
+      "path": "/native/session/{id}/attachments/ref/{ref_id}/bytes",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.board",
+      "method": "get",
+      "path": "/native/session/{id}/board",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.budget",
+      "method": "get",
+      "path": "/native/session/{id}/budget",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.checkpoints",
+      "method": "get",
+      "path": "/native/session/{id}/checkpoints",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.context.compaction",
+      "method": "get",
+      "path": "/native/session/{id}/context/compaction",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.context.compaction.operation",
+      "method": "get",
+      "path": "/native/session/{id}/context/compaction/{operation}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.context.pins",
+      "method": "get",
+      "path": "/native/session/{id}/context/pins",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.efficiency",
+      "method": "get",
+      "path": "/native/session/{id}/efficiency",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.events",
+      "method": "get",
+      "path": "/native/session/{id}/events",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.review.comments",
+      "method": "get",
+      "path": "/native/session/{id}/review/comments",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.settings",
+      "method": "get",
+      "path": "/native/session/{id}/settings",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.task-runs",
+      "method": "get",
+      "path": "/native/session/{id}/task-runs",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.task-runs.run-id",
+      "method": "get",
+      "path": "/native/session/{id}/task-runs/{run_id}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.tasks",
+      "method": "get",
+      "path": "/native/session/{id}/tasks",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.tasks.task-id.verification",
+      "method": "get",
+      "path": "/native/session/{id}/tasks/{task_id}/verification",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.terminal",
+      "method": "get",
+      "path": "/native/session/{id}/terminal",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.terminal.events",
+      "method": "get",
+      "path": "/native/session/{id}/terminal/events",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.terminals.terminal-id.output",
+      "method": "get",
+      "path": "/native/session/{id}/terminals/{terminal_id}/output",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.tournament.tournament-id",
+      "method": "get",
+      "path": "/native/session/{id}/tournament/{tournament_id}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.tournaments",
+      "method": "get",
+      "path": "/native/session/{id}/tournaments",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.turns",
+      "method": "get",
+      "path": "/native/session/{id}/turns",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.usage",
+      "method": "get",
+      "path": "/native/session/{id}/usage",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.verification",
+      "method": "get",
+      "path": "/native/session/{id}/verification",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.sessions",
+      "method": "get",
+      "path": "/native/sessions",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.sessions.id.meta",
+      "method": "get",
+      "path": "/native/sessions/{id}/meta",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.sessions.parallel",
+      "method": "get",
+      "path": "/native/sessions/parallel",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.skills",
+      "method": "get",
+      "path": "/native/skills",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.skills.id",
+      "method": "get",
+      "path": "/native/skills/{id}",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.tasks.id.completion-steps",
+      "method": "get",
+      "path": "/native/tasks/{id}/completion-steps",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.tasks.id.proof",
+      "method": "get",
+      "path": "/native/tasks/{id}/proof",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.terminals",
+      "method": "get",
+      "path": "/native/terminals",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.tools",
+      "method": "get",
+      "path": "/native/tools",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.transcript.search",
+      "method": "get",
+      "path": "/native/transcript/search",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.updater.status",
+      "method": "get",
+      "path": "/native/updater/status",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.usage",
+      "method": "get",
+      "path": "/native/usage",
+      "principal": "daemon_or_control_org",
+      "scope": "mixed_org",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.value-entitlements",
+      "method": "get",
+      "path": "/native/value-entitlements",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.workers",
+      "method": "get",
+      "path": "/native/workers",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.session.id.projection",
+      "method": "get",
+      "path": "/session/{id}/projection",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.patch.native.session.id.review.comments.comment",
+      "method": "patch",
+      "path": "/native/session/{id}/review/comments/{comment}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.budget",
+      "method": "post",
+      "path": "/native/agents/{child_id}/budget",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.cancel",
+      "method": "post",
+      "path": "/native/agents/{child_id}/cancel",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.merge",
+      "method": "post",
+      "path": "/native/agents/{child_id}/merge",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.model",
+      "method": "post",
+      "path": "/native/agents/{child_id}/model",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.pause",
+      "method": "post",
+      "path": "/native/agents/{child_id}/pause",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.resume",
+      "method": "post",
+      "path": "/native/agents/{child_id}/resume",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.retry",
+      "method": "post",
+      "path": "/native/agents/{child_id}/retry",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.stage",
+      "method": "post",
+      "path": "/native/agents/{child_id}/stage",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.agents.child-id.steer",
+      "method": "post",
+      "path": "/native/agents/{child_id}/steer",
+      "principal": "daemon",
+      "scope": "session_child",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.approvals",
+      "method": "post",
+      "path": "/native/approvals",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.approvals.id.decide",
+      "method": "post",
+      "path": "/native/approvals/{id}/decide",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.browser.sessions",
+      "method": "post",
+      "path": "/native/browser/sessions",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.browser.sessions.id.screenshot",
+      "method": "post",
+      "path": "/native/browser/sessions/{id}/screenshot",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.browser.validate-url",
+      "method": "post",
+      "path": "/native/browser/validate-url",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.catalog.probe",
+      "method": "post",
+      "path": "/native/catalog/probe",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.commit",
+      "method": "post",
+      "path": "/native/config/commit",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.import",
+      "method": "post",
+      "path": "/native/config/import",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.preview",
+      "method": "post",
+      "path": "/native/config/preview",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.reset",
+      "method": "post",
+      "path": "/native/config/reset",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.rollback",
+      "method": "post",
+      "path": "/native/config/rollback",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.config.runtime-ack",
+      "method": "post",
+      "path": "/native/config/runtime-ack",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.credits.grant",
+      "method": "post",
+      "path": "/native/credits/grant",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.diagnostics.export",
+      "method": "post",
+      "path": "/native/diagnostics/export",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.artifacts",
+      "method": "post",
+      "path": "/native/enterprise/artifacts",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.artifacts.id.eligible",
+      "method": "post",
+      "path": "/native/enterprise/artifacts/{id}/eligible",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.deletion-jobs",
+      "method": "post",
+      "path": "/native/enterprise/deletion-jobs",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "owner",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.deletion-jobs.id.advance",
+      "method": "post",
+      "path": "/native/enterprise/deletion-jobs/{id}/advance",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "owner",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.effective-config",
+      "method": "post",
+      "path": "/native/enterprise/effective-config",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.enterprise.retention.gc",
+      "method": "post",
+      "path": "/native/enterprise/retention/gc",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.evidence.id.retrieve",
+      "method": "post",
+      "path": "/native/evidence/{id}/retrieve",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.hooks",
+      "method": "post",
+      "path": "/native/hooks",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.hooks.id.test",
+      "method": "post",
+      "path": "/native/hooks/{id}/test",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.instructions.bindings",
+      "method": "post",
+      "path": "/native/instructions/bindings",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.instructions.import",
+      "method": "post",
+      "path": "/native/instructions/import",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.instructions.records",
+      "method": "post",
+      "path": "/native/instructions/records",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.instructions.records.preview",
+      "method": "post",
+      "path": "/native/instructions/records/preview",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.invitations.accept",
+      "method": "post",
+      "path": "/native/invitations/accept",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.jobs.claim",
+      "method": "post",
+      "path": "/native/jobs/claim",
+      "principal": "worker_token",
+      "scope": "worker",
+      "source": "crates/server/src/worker_plane.rs"
+    },
+    {
+      "id": "native.post.native.jobs.id.result",
+      "method": "post",
+      "path": "/native/jobs/{id}/result",
+      "principal": "worker_token",
+      "scope": "worker",
+      "source": "crates/server/src/worker_plane.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers",
+      "method": "post",
+      "path": "/native/mcp/servers",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.auth",
+      "method": "post",
+      "path": "/native/mcp/servers/{id}/auth",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.connect",
+      "method": "post",
+      "path": "/native/mcp/servers/{id}/connect",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.oauth.revoke",
+      "method": "post",
+      "path": "/native/mcp/servers/{id}/oauth/revoke",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.start",
+      "method": "post",
+      "path": "/native/mcp/servers/{id}/start",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.stop",
+      "method": "post",
+      "path": "/native/mcp/servers/{id}/stop",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.memory",
+      "method": "post",
+      "path": "/native/memory",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.memory.records",
+      "method": "post",
+      "path": "/native/memory/records",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.memory.records.id.restore",
+      "method": "post",
+      "path": "/native/memory/records/{id}/restore",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.memory.records.retention",
+      "method": "post",
+      "path": "/native/memory/records/retention",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.memory.retention",
+      "method": "post",
+      "path": "/native/memory/retention",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.model-parameters.compile",
+      "method": "post",
+      "path": "/native/model-parameters/compile",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.orgs",
+      "method": "post",
+      "path": "/native/orgs",
+      "principal": "daemon_bootstrap",
+      "scope": "organization",
+      "min_role": "bootstrap",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.orgs.id.members",
+      "method": "post",
+      "path": "/native/orgs/{id}/members",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.permission.reply",
+      "method": "post",
+      "path": "/native/permission/reply",
+      "principal": "daemon",
+      "scope": "session_resolver",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.permissions.preview",
+      "method": "post",
+      "path": "/native/permissions/preview",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.permissions.rules",
+      "method": "post",
+      "path": "/native/permissions/rules",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.presets",
+      "method": "post",
+      "path": "/native/presets",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.presets.id.fallback",
+      "method": "post",
+      "path": "/native/presets/{id}/fallback",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.presets.id.roles",
+      "method": "post",
+      "path": "/native/presets/{id}/roles",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.providers.connections",
+      "method": "post",
+      "path": "/native/providers/connections",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.providers.connections.id.test",
+      "method": "post",
+      "path": "/native/providers/connections/{id}/test",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.providers.credentials",
+      "method": "post",
+      "path": "/native/providers/credentials",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.providers.credentials.rotate",
+      "method": "post",
+      "path": "/native/providers/credentials/rotate",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.runtime.trust",
+      "method": "post",
+      "path": "/native/runtime/trust",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.runtime.trust.check",
+      "method": "post",
+      "path": "/native/runtime/trust/check",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.scm.webhook",
+      "method": "post",
+      "path": "/native/scm/webhook",
+      "principal": "webhook",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session",
+      "method": "post",
+      "path": "/native/session",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.abort",
+      "method": "post",
+      "path": "/native/session/{id}/abort",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.agents.child.presentation",
+      "method": "post",
+      "path": "/native/session/{id}/agents/{child}/presentation",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.attachments",
+      "method": "post",
+      "path": "/native/session/{id}/attachments",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.board",
+      "method": "post",
+      "path": "/native/session/{id}/board",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.changes.accept",
+      "method": "post",
+      "path": "/native/session/{id}/changes/accept",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.checkpoints.sequence.restore",
+      "method": "post",
+      "path": "/native/session/{id}/checkpoints/{sequence}/restore",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.checkpoints.sequence.restore.preview",
+      "method": "post",
+      "path": "/native/session/{id}/checkpoints/{sequence}/restore/preview",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.compact",
+      "method": "post",
+      "path": "/native/session/{id}/context/compact",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.compaction",
+      "method": "post",
+      "path": "/native/session/{id}/context/compaction",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.compaction.operation.cancel",
+      "method": "post",
+      "path": "/native/session/{id}/context/compaction/{operation}/cancel",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.manifests",
+      "method": "post",
+      "path": "/native/session/{id}/context/manifests",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.pins",
+      "method": "post",
+      "path": "/native/session/{id}/context/pins",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.context.preview",
+      "method": "post",
+      "path": "/native/session/{id}/context/preview",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.export",
+      "method": "post",
+      "path": "/native/session/{id}/export",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.fork",
+      "method": "post",
+      "path": "/native/session/{id}/fork",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.prompt",
+      "method": "post",
+      "path": "/native/session/{id}/prompt",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.review.comments",
+      "method": "post",
+      "path": "/native/session/{id}/review/comments",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.task-runs",
+      "method": "post",
+      "path": "/native/session/{id}/task-runs",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.task-runs.run-id.cancel",
+      "method": "post",
+      "path": "/native/session/{id}/task-runs/{run_id}/cancel",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.terminal",
+      "method": "post",
+      "path": "/native/session/{id}/terminal",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.terminals.terminal-id.input",
+      "method": "post",
+      "path": "/native/session/{id}/terminals/{terminal_id}/input",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.terminals.terminal-id.kill",
+      "method": "post",
+      "path": "/native/session/{id}/terminals/{terminal_id}/kill",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.terminals.terminal-id.reconcile",
+      "method": "post",
+      "path": "/native/session/{id}/terminals/{terminal_id}/reconcile",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.terminals.terminal-id.resize",
+      "method": "post",
+      "path": "/native/session/{id}/terminals/{terminal_id}/resize",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.tournament",
+      "method": "post",
+      "path": "/native/session/{id}/tournament",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.tournaments.tournament-id.abort",
+      "method": "post",
+      "path": "/native/session/{id}/tournaments/{tournament_id}/abort",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.tournaments.tournament-id.decide",
+      "method": "post",
+      "path": "/native/session/{id}/tournaments/{tournament_id}/decide",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.sessions.id.meta",
+      "method": "post",
+      "path": "/native/sessions/{id}/meta",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.skills.id.invocation",
+      "method": "post",
+      "path": "/native/skills/{id}/invocation",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.skills.id.invoke",
+      "method": "post",
+      "path": "/native/skills/{id}/invoke",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.skills.id.trust",
+      "method": "post",
+      "path": "/native/skills/{id}/trust",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.skills.install",
+      "method": "post",
+      "path": "/native/skills/install",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.sso.callback",
+      "method": "post",
+      "path": "/native/sso/callback",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.sso.logout",
+      "method": "post",
+      "path": "/native/sso/logout",
+      "principal": "daemon_control_token",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.sso.start",
+      "method": "post",
+      "path": "/native/sso/start",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.updater.apply",
+      "method": "post",
+      "path": "/native/updater/apply",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.updater.check",
+      "method": "post",
+      "path": "/native/updater/check",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "viewer",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.updater.downgrade",
+      "method": "post",
+      "path": "/native/updater/downgrade",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.updater.rollback",
+      "method": "post",
+      "path": "/native/updater/rollback",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.updater.stage",
+      "method": "post",
+      "path": "/native/updater/stage",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "member",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.workers.id.heartbeat",
+      "method": "post",
+      "path": "/native/workers/{id}/heartbeat",
+      "principal": "worker_token",
+      "scope": "worker",
+      "source": "crates/server/src/worker_plane.rs"
+    },
+    {
+      "id": "native.post.native.workers.id.revoke",
+      "method": "post",
+      "path": "/native/workers/{id}/revoke",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.workers.register",
+      "method": "post",
+      "path": "/native/workers/register",
+      "principal": "worker_token",
+      "scope": "worker",
+      "source": "crates/server/src/worker_plane.rs"
+    },
+    {
+      "id": "native.post.native.workers.tokens",
+      "method": "post",
+      "path": "/native/workers/tokens",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.enterprise.settings",
+      "method": "put",
+      "path": "/native/enterprise/settings",
+      "principal": "daemon_control",
+      "scope": "organization",
+      "min_role": "admin",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.instructions.source",
+      "method": "put",
+      "path": "/native/instructions/source",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.memory.policy",
+      "method": "put",
+      "path": "/native/memory/policy",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.memory.records.id",
+      "method": "put",
+      "path": "/native/memory/records/{id}",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.session.id.budget",
+      "method": "put",
+      "path": "/native/session/{id}/budget",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.put.native.session.id.settings",
+      "method": "put",
+      "path": "/native/session/{id}/settings",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    }
+  ]
+}

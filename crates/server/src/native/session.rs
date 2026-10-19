@@ -665,33 +665,36 @@ pub(crate) async fn native_messages(
         Err(r) => return *r,
     };
     let store = state.deps.session.store();
-    let rows = match store.messages_before(handle.id(), q.before, read_bound) {
-        Ok(r) => r,
-        Err(e) => return api_err(&store_err_to_core(e)),
-    };
+    // `before` is validated `>= 1` above, so the cast is lossless.
+    let before = q.before.map(|seq| seq as u64);
+    // ONE page read + ONE bounded batch parts read for the whole page (the
+    // historical handler ran one `parts_of` query per message: 200 SQLite
+    // round trips for a full page).
+    let rows =
+        match store.messages_window_with_parts(handle.id(), before, None, read_bound, u64::MAX) {
+            Ok(r) => r,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
     let has_more = rows.len() as i64 > limit;
     let mut page_rows = rows;
     page_rows.truncate(limit as usize);
     let next_before = if has_more {
-        page_rows.last().map(|r| r.seq)
+        page_rows.last().map(|(r, _)| r.seq)
     } else {
         None
     };
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    for row in page_rows {
-        let parts: Vec<serde_json::Value> = match store.parts_of(row.id) {
-            Ok(ps) => ps
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "kind": p.kind,
-                        "createdMs": p.created_ms,
-                        "data": p.data,
-                    })
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(page_rows.len());
+    for (row, parts) in page_rows {
+        let parts: Vec<serde_json::Value> = parts
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "kind": p.kind,
+                    "createdMs": p.created_ms,
+                    "data": p.data,
                 })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+            })
+            .collect();
         messages.push(serde_json::json!({
             "seq": row.seq,
             "id": row.id,
@@ -752,7 +755,11 @@ pub(crate) async fn native_events(
         Err(r) => return *r,
     };
     let after = q.after.unwrap_or(0);
-    let events = match handle.events_range(after.saturating_add(1), Some(read_bound)) {
+    // Bounded read pool: a page read never blocks a Tokio worker.
+    let events = match handle
+        .events_range_async(after.saturating_add(1), Some(read_bound))
+        .await
+    {
         Ok(e) => e,
         Err(e) => return api_err(&e),
     };
@@ -1068,10 +1075,13 @@ fn native_journal_stream(
                     // wake re-enters this loop with pending events that are not
                     // yet emitted, and re-reading them would duplicate frames.
                     let read_after = pending.back().map(|e| e.seq.raw() as i64).unwrap_or(cursor);
-                    let events = match handle.events_range(
-                        read_after.saturating_add(1) as u64,
-                        Some(MAX_NATIVE_EVENT_PAGE as u64),
-                    ) {
+                    let events = match handle
+                        .events_range_async(
+                            read_after.saturating_add(1) as u64,
+                            Some(MAX_NATIVE_EVENT_PAGE as u64),
+                        )
+                        .await
+                    {
                         Ok(events) => events,
                         Err(e) => {
                             tracing::error!(
@@ -1234,10 +1244,18 @@ pub(crate) async fn native_permissions(
         Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let filter = match q.session.as_deref() {
-        Some(raw) => match parse_session_id(raw) {
-            Ok(id) => Some(id),
-            Err(e) => return wire_status(e),
-        },
+        Some(raw) => {
+            let id = match parse_session_id(raw) {
+                Ok(id) => id,
+                Err(e) => return wire_status(e),
+            };
+            match state.deps.session.get_session(id) {
+                Ok(Some(_)) => {}
+                Ok(None) => return wire_status(not_found(&format!("session {id}"))),
+                Err(e) => return api_err(&e),
+            }
+            Some(id)
+        }
         None => None,
     };
     let permissions: Vec<serde_json::Value> = state

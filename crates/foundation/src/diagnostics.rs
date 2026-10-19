@@ -107,6 +107,22 @@ pub const OMITTED_CATEGORIES: [&str; 5] = [
     "environment",
 ];
 
+/// Reduce a configured endpoint to its origin before it enters the bundle.
+///
+/// A provider base URL is config, but its path/query/fragment can carry
+/// credentials (`?api_key=…`, `/token/<secret>`, embedded userinfo). The
+/// diagnostics bundle never needs those bytes: it names the destination
+/// origin (scheme/host/port) only, so no URL-derived secret can leak through
+/// this allowlisted category. An unparseable row is omitted rather than
+/// echoed.
+pub fn diagnostic_endpoint(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.username() != "" || parsed.password().is_some() {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
 pub fn export(
     facts: &DiagnosticsFacts,
     max_bytes: usize,
@@ -139,7 +155,11 @@ pub fn export(
             .map(|p| ProviderSummary {
                 id: redact(&p.id, &policy),
                 family: redact(&p.family, &policy),
-                endpoint: p.endpoint.as_deref().map(|e| redact(e, &policy)),
+                endpoint: p
+                    .endpoint
+                    .as_deref()
+                    .and_then(diagnostic_endpoint)
+                    .map(|e| redact(&e, &policy)),
                 credential_kind: redact(&p.credential_kind, &policy),
                 health: redact(&p.health, &policy),
                 model_count: p.model_count,
@@ -279,6 +299,24 @@ mod tests {
             .content
             .omitted_categories
             .contains(&"secret_material".to_string()));
+    }
+
+    #[test]
+    fn provider_endpoint_is_reduced_to_origin_without_secret_bearing_parts() {
+        let mut hostile = facts();
+        hostile.providers[0].endpoint =
+            Some("https://api.example.com/token/raw-secret/v1?api_key=supersecret#frag".into());
+        let bundle = export(&hostile, 8 * 1024).unwrap();
+        let raw = serde_json::to_string(&bundle).unwrap();
+        assert!(!raw.contains("raw-secret"));
+        assert!(!raw.contains("supersecret"));
+        assert!(!raw.contains("frag"));
+        let endpoint = bundle.content.providers[0].endpoint.as_deref().unwrap();
+        assert_eq!(endpoint, "https://api.example.com");
+        // Embedded userinfo is refused outright rather than partially echoed.
+        hostile.providers[0].endpoint = Some("https://user:pass@api.example.com/v1".into());
+        let bundle = export(&hostile, 8 * 1024).unwrap();
+        assert!(bundle.content.providers[0].endpoint.is_none());
     }
 
     #[test]

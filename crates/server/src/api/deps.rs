@@ -144,6 +144,10 @@ pub struct ServerDeps {
     /// Live stdio MCP children owned by this daemon surface (explicit start/
     /// stop; one process group per server under the daemon supervisor).
     pub mcp_runtime: Arc<crate::native::foundation_ext::McpRuntime>,
+    /// Single-flight cache of the Engineering Outcome Ledger metrics fold
+    /// (`/native/outcomes`). Keyed by the store's monotonic outcome
+    /// revision; a new terminal run or settlement correction invalidates it.
+    pub outcomes_cache: Arc<crate::native::outcomes::OutcomesMetricsCache>,
     /// Process start time (epoch ms) for diagnostics. Set once when the
     /// dependency envelope is assembled; never synthesized per request.
     pub started_ms: i64,
@@ -254,6 +258,7 @@ impl ServerDeps {
             worker_plane_listener: None,
             foundation: None,
             mcp_runtime,
+            outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)

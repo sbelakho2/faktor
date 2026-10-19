@@ -910,6 +910,17 @@ pub const BUNDLE_SCHEMA: &str = "faktor-config-bundle/v1";
 pub struct ConfigService {
     db: FoundationDb,
     descriptors: BTreeMap<String, Descriptor>,
+    /// Last computed effective snapshot. Every read path (`/native/config/
+    /// snapshot`, descriptors, search, export, runtime `value()` reads)
+    /// used to re-read every `config_value` row and re-parse each JSON
+    /// value; configuration changes are rare, so one cached snapshot keyed
+    /// by the service's own write generation is exact. Every mutator below
+    /// invalidates it after a successful write.
+    snapshot_cache: std::sync::Mutex<Option<(u64, Snapshot)>>,
+    /// Generation fence for the snapshot cache: a read that started before
+    /// a concurrent commit must not publish its (pre-commit) snapshot into
+    /// the fresh generation.
+    snapshot_generation: std::sync::atomic::AtomicU64,
 }
 
 impl ConfigService {
@@ -917,12 +928,19 @@ impl ConfigService {
         Self {
             db,
             descriptors: default_descriptors(),
+            snapshot_cache: std::sync::Mutex::new(None),
+            snapshot_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Test/benchmark constructor with an explicit descriptor table.
     pub fn with_descriptors(db: FoundationDb, descriptors: BTreeMap<String, Descriptor>) -> Self {
-        Self { db, descriptors }
+        Self {
+            db,
+            descriptors,
+            snapshot_cache: std::sync::Mutex::new(None),
+            snapshot_generation: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     pub fn descriptors(&self) -> &BTreeMap<String, Descriptor> {
@@ -933,9 +951,44 @@ impl ConfigService {
     /// are declared by the lifecycle service through this seam).
     pub fn upsert_descriptor(&mut self, descriptor: Descriptor) {
         self.descriptors.insert(descriptor.key.clone(), descriptor);
+        self.invalidate_snapshot();
+    }
+
+    fn invalidate_snapshot(&self) {
+        self.snapshot_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        *self
+            .snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, FoundationError> {
+        use std::sync::atomic::Ordering;
+        let generation = self.snapshot_generation.load(Ordering::Acquire);
+        if let Some((cached_generation, cached)) = self
+            .snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            if *cached_generation == generation {
+                return Ok(cached.clone());
+            }
+        }
+        let snapshot = self.snapshot_uncached()?;
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only publish when no writer invalidated while this read ran.
+        if self.snapshot_generation.load(Ordering::Acquire) == generation {
+            *cache = Some((generation, snapshot.clone()));
+        }
+        Ok(snapshot)
+    }
+
+    fn snapshot_uncached(&self) -> Result<Snapshot, FoundationError> {
         let (revision, runtime_revision, rows) = self.db.read("config snapshot", |conn| {
             let (revision, runtime_revision): (i64, i64) = conn
                 .query_row(
@@ -1247,7 +1300,7 @@ impl ConfigService {
         if let Err(errors) = self.validate_against(patch, &snapshot) {
             return Err(FoundationError::Validation(errors));
         }
-        self.db.write("config commit", |conn| {
+        let result = self.db.write("config commit", |conn| {
             let tx = conn
                 .transaction()
                 .map_err(|e| FoundationError::Store(format!("begin commit: {e}")))?;
@@ -1358,13 +1411,17 @@ impl ConfigService {
                 changed: patch.changes.len(),
                 field_states: states,
             })
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_snapshot();
+        }
+        result
     }
 
     /// Advance the runtime revision after the daemon observed the saved
     /// values (explicit acknowledgement; never implied by a save).
     pub fn acknowledge_runtime(&self, expected_revision: u64) -> Result<u64, FoundationError> {
-        self.db.write("config acknowledge", |conn| {
+        let result = self.db.write("config acknowledge", |conn| {
             let current: i64 = conn
                 .query_row(
                     "SELECT revision FROM config_meta WHERE id = 1",
@@ -1383,7 +1440,11 @@ impl ConfigService {
             )
             .map_err(|e| FoundationError::Store(e.to_string()))?;
             Ok(expected_revision)
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_snapshot();
+        }
+        result
     }
 
     /// Roll a linear history back to `target_revision`, writing a NEW
@@ -1399,7 +1460,7 @@ impl ConfigService {
                 "cannot roll forward: target revision is newer than the current revision".into(),
             ));
         }
-        self.db.write("config rollback", |conn| {
+        let result = self.db.write("config rollback", |conn| {
             let tx = conn
                 .transaction()
                 .map_err(|e| FoundationError::Store(format!("begin rollback: {e}")))?;
@@ -1509,7 +1570,11 @@ impl ConfigService {
                 rolled_back_to: target_revision,
                 changed,
             })
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_snapshot();
+        }
+        result
     }
 
     /// Bounded effective-settings search with provenance. One pass over the
@@ -2191,5 +2256,59 @@ mod tests {
         assert!(load < std::time::Duration::from_secs(2));
         assert!(commit < std::time::Duration::from_secs(2));
         assert!(search < std::time::Duration::from_secs(1));
+    }
+
+    /// The snapshot cache is exact: repeat reads are identical until a
+    /// successful commit invalidates, and a reader racing commits never
+    /// regresses to an older revision (the generation fence keeps a
+    /// pre-commit read from publishing into the fresh generation).
+    #[test]
+    fn snapshot_cache_is_fenced_against_concurrent_commits() {
+        let (_dir, svc) = service();
+        let key = "faktor.retry.maxAttempts";
+        let first = svc.snapshot().unwrap();
+        assert_eq!(svc.snapshot().unwrap(), first, "cached read is exact");
+        svc.commit(&patch(
+            first.revision,
+            vec![Change {
+                key: key.into(),
+                scope: Scope::User,
+                value: Some(Value::from(7)),
+            }],
+        ))
+        .unwrap();
+        let after = svc.snapshot().unwrap();
+        assert!(after.revision > first.revision);
+        assert_eq!(after.values[key].value, Value::from(7));
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let mut last = svc.snapshot().unwrap().revision;
+                    for _ in 0..200 {
+                        let now = svc.snapshot().unwrap().revision;
+                        assert!(
+                            now >= last,
+                            "a snapshot revision regressed {last} -> {now} (stale cache published)"
+                        );
+                        last = now;
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for i in 0..40u64 {
+                    let rev = svc.snapshot().unwrap().revision;
+                    svc.commit(&patch(
+                        rev,
+                        vec![Change {
+                            key: key.into(),
+                            scope: Scope::User,
+                            value: Some(Value::from(2 + (i % 3))),
+                        }],
+                    ))
+                    .unwrap();
+                }
+            });
+        });
     }
 }

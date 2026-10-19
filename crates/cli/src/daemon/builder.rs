@@ -275,8 +275,9 @@ pub(crate) async fn build_daemon_with_mcp_inner(
                     Ok(tools) => {
                         let n = tools.len();
                         for t in tools {
-                            let tool = mcp_bridge::mcp_tool(server.clone(), &t);
-                            mcp_tools.push(tool);
+                            if let Some(tool) = mcp_bridge::mcp_tool(server.clone(), &t) {
+                                mcp_tools.push(tool);
+                            }
                         }
                         tracing::info!("mcp server {name}: {n} tool(s) wired");
                     }

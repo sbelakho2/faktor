@@ -5,6 +5,8 @@ use crate::{json_bytes, SessionError, MAX_LEDGER_BYTES};
 
 const MAX_FACT_KEY_BYTES: usize = 512;
 const MAX_FACT_VALUE_BYTES: usize = 4096;
+/// `(kind, key, value)` projection of one memory fact.
+type FactTriple = (String, String, String);
 /// Bounded page size for memory-fact paging (paging is fundamental).
 pub const MAX_FACT_PAGE_SIZE: i64 = 200;
 
@@ -136,11 +138,78 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn memory_facts(&self) -> faktor_core::Result<Vec<(String, String, String)>> {
+    /// [`Self::upsert_memory_fact`] with an atomic expected-stamp CAS. The
+    /// read/check/write is ONE writer transaction, so two concurrent
+    /// writers holding the same expected stamp can no longer both apply
+    /// (the historical read-then-upsert pair lost one update silently).
+    pub fn upsert_memory_fact_cas(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        expected_updated_ms: Option<i64>,
+    ) -> faktor_core::Result<faktor_store::MemoryFactCas> {
+        if kind.is_empty() || key.is_empty() {
+            return Err(
+                SessionError::Malformed("fact kind and key must be non-empty".into()).into(),
+            );
+        }
+        if kind.len() > 64 || key.len() > MAX_FACT_KEY_BYTES {
+            return Err(SessionError::Oversized("fact kind/key too long".into()).into());
+        }
+        if value.len() > MAX_FACT_VALUE_BYTES {
+            return Err(SessionError::Oversized(format!(
+                "fact value of {} bytes exceeds MAX_FACT_VALUE_BYTES",
+                value.len()
+            ))
+            .into());
+        }
+        self.manager
+            .store()
+            .upsert_memory_fact_cas(self.id, kind, key, value, expected_updated_ms)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Atomic CAS delete; see [`Self::upsert_memory_fact_cas`].
+    pub fn delete_memory_fact_cas(
+        &self,
+        kind: &str,
+        key: &str,
+        expected_updated_ms: Option<i64>,
+    ) -> faktor_core::Result<faktor_store::MemoryFactDeleteCas> {
+        self.manager
+            .store()
+            .delete_memory_fact_cas(self.id, kind, key, expected_updated_ms)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    pub fn memory_facts(&self) -> faktor_core::Result<Vec<FactTriple>> {
         self.manager
             .store()
             .memory_facts(self.id)
             .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Bounded newest-first facts restricted to an explicit KIND set (the
+    /// indexed projection read behind the orchestrator graph and the
+    /// verification surface). `has_more` is explicit: callers page or refuse
+    /// loudly, never treat a bounded read as complete.
+    pub fn memory_facts_of_kinds(
+        &self,
+        kinds: &[&str],
+        limit: u64,
+    ) -> faktor_core::Result<(Vec<FactTriple>, bool)> {
+        let (rows, has_more) = self
+            .manager
+            .store()
+            .memory_facts_of_kinds(self.id, kinds, limit)
+            .map_err(crate::map_store_err)?;
+        Ok((
+            rows.into_iter()
+                .map(|row| (row.kind, row.key, row.value))
+                .collect(),
+            has_more,
+        ))
     }
 
     /// ONE exact fact value (indexed `(session, kind, key)` lookup). Hot

@@ -1935,3 +1935,99 @@ async fn native_budget_ack_failure_is_typed_retriable_and_never_claimed_applied(
     assert_eq!(ack["applied"], true);
     let _ = handle.request_shutdown();
 }
+
+/// Session-scoped reads must resolve the PATH/QUERY session BEFORE any
+/// foundation/context read. An unknown id is the same typed 404 a missing
+/// session answers (never a 200 empty namespace or a 503 authority probe),
+/// and a real session still reaches its own durable namespace.
+#[tokio::test]
+async fn session_scoped_reads_reject_unknown_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = test_deps(dir.path());
+    let token = deps.auth_token.clone();
+    let manager = deps.session.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let ws = manager.create_workspace("/tmp").unwrap();
+    let real = manager
+        .create_session(ws, "t-session-scope", "fake", "m")
+        .unwrap();
+    let real_id = real.id().to_string();
+
+    for path in [
+        "/native/sessions/999999/meta".to_string(),
+        "/native/session/999999/context/pins".to_string(),
+        "/native/context/export?session=999999".to_string(),
+        "/native/context/manifest?session=999999".to_string(),
+        "/native/context/manifests?session=999999".to_string(),
+        "/native/permissions?session=999999".to_string(),
+    ] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "{path} must reject an unknown session before any authority read"
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "not_found", "{path}: {body}");
+    }
+
+    // Mutation-shaped reads/writes with a VALID body/query must also hit the
+    // session boundary (not the foundation) first.
+    let preview = client
+        .post(format!("{base}/native/session/999999/context/preview"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"operationId": "probe"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 404, "unknown preview session");
+    let pin = client
+        .post(format!("{base}/native/session/999999/context/pins"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"sourceId": "s1", "action": "pin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin.status(), 404, "unknown pin session");
+    let unpin = client
+        .delete(format!(
+            "{base}/native/session/999999/context/pins?sourceId=s1"
+        ))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpin.status(), 404, "unknown unpin session");
+
+    // The same routes still resolve the REAL session (foundation not wired
+    // in this fixture => a typed 503, never a 404 or an empty 200).
+    for path in [
+        format!("/native/sessions/{real_id}/meta"),
+        format!("/native/session/{real_id}/context/pins"),
+        format!("/native/context/export?session={real_id}"),
+        format!("/native/context/manifest?session={real_id}"),
+        format!("/native/context/manifests?session={real_id}"),
+        format!("/native/permissions?session={real_id}"),
+    ] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            404,
+            "{path} must resolve the real session (typed refusal, not not-found)"
+        );
+        assert_ne!(response.status(), 401, "{path}");
+    }
+    let _ = handle.request_shutdown();
+}

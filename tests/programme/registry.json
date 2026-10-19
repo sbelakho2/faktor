@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-19T00:00:55.231Z",
-  "commit": "b3ec030530b5156344f6f54b35839d778eeacfb8",
-  "tree": "26fc4d35d799b921ba0a2216862bd891fa843654",
+  "generated_at": "2026-10-19T10:55:42.253Z",
+  "commit": "8dddc1acd0c7b08c0169adda3be098ef9df734f6",
+  "tree": "5e77638ecb1864f0878c6caf57c7398ef1dfbd5b",
   "layers": [
     "structural",
     "unit",
@@ -18097,8 +18097,8 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 200,
-          "error_code": null,
+          "authenticated": 404,
+          "error_code": "not_found",
           "hostile": {
             "case": "query:limit=18446744073709551616",
             "status": 400,
@@ -26106,7 +26106,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/dd489aef853fdacdc0de476849ab56d4"
+              "handle": "vault://provider_key/d7ee83181cac4d25b171e8207a7b46e9"
             }
           },
           {

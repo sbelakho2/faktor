@@ -34,25 +34,42 @@ pub(crate) struct NativeOrchestratorGraphQuery {
     session: String,
 }
 
-/// Bounded page walk of one session's durable rows: 200 facts per page,
-/// at most 256 pages — beyond that the projection REFUSES loudly (a
-/// hostile row space is never silently truncated into a partial graph).
+/// Bound on the orchestrator fact set read by one graph projection (the
+/// historical page walk could touch 51,200 rows). Beyond it the projection
+/// REFUSES loudly: a hostile row space is never silently truncated into a
+/// partial graph.
+pub(crate) const MAX_ORCHESTRATOR_FACTS: u64 = 50_000;
+
+/// The durable orchestrator rows of one session, read ONCE through the
+/// `(kind, session_id)` index. The historical walk paged through every
+/// ordinary memory fact (200 rows x up to 256 pages) and filtered in Rust,
+/// so a session with large user memory paid tens of thousands of irrelevant
+/// rows per graph/agents/task-run read.
 pub(crate) fn orchestrator_graph_facts(
     handle: &faktor_session::SessionHandle,
 ) -> Result<Vec<(String, String, String)>, String> {
-    let mut out = Vec::new();
-    let mut after: Option<(i64, String, String)> = None;
-    for _ in 0..256 {
-        let page = handle
-            .memory_facts_page(after.as_ref(), 200)
-            .map_err(|e| format!("fact page scan: {}", e.message))?;
-        out.extend(page.facts);
-        match page.cursor {
-            Some(c) => after = Some(c),
-            None => return Ok(out),
-        }
+    let (facts, has_more) = handle
+        .memory_facts_of_kinds(
+            &[
+                // In-session task runs are orchestration rows too: omitting
+                // this kind made `/native/agents`, `/task-runs` and the
+                // start receipt projection 404 a run that had just landed.
+                TASK_RUN_ROW_KIND,
+                ORCH_PLAN_KIND,
+                ORCH_REGISTRY_KIND,
+                ORCH_MERGE_KIND,
+                ORCH_MERGE_PART_KIND,
+            ],
+            MAX_ORCHESTRATOR_FACTS,
+        )
+        .map_err(|e| format!("orchestrator fact read: {}", e.message))?;
+    if has_more {
+        return Err(format!(
+            "orchestrator fact set exceeds the {MAX_ORCHESTRATOR_FACTS}-row graph bound; \
+             refusing a partial graph"
+        ));
     }
-    Err("memory-fact scan exceeded 256 pages; refusing a partial graph".to_string())
+    Ok(facts)
 }
 
 /// Rejoin one chunked row set (header + `key/cNNN` chunks) into its chunk
@@ -933,7 +950,22 @@ pub(crate) fn native_agents_body(
         }
     };
 
-    // (a) In-session task runs: the parent's own single-item runs.
+    // (a) In-session task runs: the parent's own single-item runs. Every
+    // run of the parent shares ONE session row, ONE task row and ONE
+    // progress view; the historical loop re-read all three per run (so a
+    // 2,000-run session issued ~6,000 point queries per listing).
+    let session_row = handle
+        .row()
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
+    let task = handle
+        .get_task(session_row.task_id)
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
+    let budget = task.as_ref().and_then(|t| t.budget.max_tokens);
+    let progress = state.deps.agent.progress_view(parent);
+    // State: the durable typed task row wins when terminal (wave-24) —
+    // a cancelled/verified/failed run reads as such even though the
+    // session itself is parked. Constant for every run of this session.
+    let run_state = run_state_tag_for(task.as_ref().map(|t| t.state), session_row.state);
     for key in &in_session {
         let value = match index.row_value(&facts, TASK_RUN_ROW_KIND, key) {
             Ok(Some(v)) => v,
@@ -948,18 +980,6 @@ pub(crate) fn native_agents_body(
                 )));
             }
         };
-        let session_row = handle
-            .row()
-            .map_err(|e| faktor_protocol::error::from_core(&e))?;
-        let budget = handle
-            .get_task(session_row.task_id)
-            .map_err(|e| faktor_protocol::error::from_core(&e))?
-            .and_then(|t| t.budget.max_tokens);
-        let progress = state.deps.agent.progress_view(parent);
-        // State: the durable typed task row wins when terminal (wave-24) —
-        // a cancelled/verified/failed run reads as such even though the
-        // session itself is parked.
-        let run_state = in_session_run_state_tag(handle, &session_row)?;
         push(serde_json::json!({
             "agent_id": key,
             "kind": "self",
@@ -969,11 +989,11 @@ pub(crate) fn native_agents_body(
             "goal": row.goal,
             "item_ids": row.item_ids,
             "state": run_state,
-            "model": session_row.model,
+            "model": session_row.model.clone(),
             "budget": budget,
             "ownership": "self",
             "capabilities": [],
-            "progress": progress,
+            "progress": progress.clone(),
             "result": serde_json::Value::Null,
         }));
     }

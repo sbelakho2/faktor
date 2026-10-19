@@ -1832,6 +1832,56 @@ impl Store {
         Ok(out)
     }
 
+    /// The FIRST `per_task` verification records (creation order, `id
+    /// ASC`) of each named task, in ONE read transaction. The session
+    /// export used to run one `verification_record_list_by_task` query per
+    /// task (up to 50 sequential round trips per export).
+    ///
+    /// `record, revision, status` triples are returned task-ascending, so
+    /// the caller's original grouping/ordering is reproducible.
+    pub fn verification_record_head_by_tasks(
+        &self,
+        task_ids: &[TaskId],
+        per_task: u64,
+    ) -> StoreResult<Vec<(i64, i64, String)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if task_ids.len() > 500 {
+            return Err(StoreError::Oversized(format!(
+                "verification-record batch read of {} tasks exceeds the 500-task bound",
+                task_ids.len()
+            )));
+        }
+        let per_task = i64::try_from(per_task.max(1)).unwrap_or(i64::MAX);
+        let placeholders = vec!["?"; task_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT task_id, revision, status FROM (
+                SELECT task_id, revision, status,
+                       ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id ASC) AS rn
+                FROM verification_record WHERE task_id IN ({placeholders})
+             ) WHERE rn <= ? ORDER BY task_id ASC, rn ASC"
+        );
+        let mut params: Vec<rusqlite::types::Value> =
+            Vec::with_capacity(task_ids.len().saturating_add(1));
+        for id in task_ids {
+            params.push(rusqlite::types::Value::Integer(id.raw() as i64));
+        }
+        params.push(rusqlite::types::Value::Integer(per_task));
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ));
+        }
+        Ok(out)
+    }
+
     /// The record's single allowed status write: a CAS from `Running` to
     /// `Passed` or `Failed`. Exactly one finalize wins; a second attempt on
     /// an already-final record is refused with its current status, and the

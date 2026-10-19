@@ -22,10 +22,12 @@ pub(crate) const MAX_NATIVE_VERIFICATION: usize = 32;
 pub(crate) fn native_verification_facts(
     handle: &faktor_session::SessionHandle,
 ) -> faktor_core::Result<Vec<serde_json::Value>> {
-    let facts = handle.memory_facts()?;
+    // Indexed `(kind, session_id)` read: the historical body loaded EVERY
+    // memory fact of the session (unbounded) and filtered in Rust.
+    let (facts, _has_more) =
+        handle.memory_facts_of_kinds(&["verification"], MAX_NATIVE_LIST as u64)?;
     Ok(facts
         .iter()
-        .filter(|(kind, _, _)| kind == "verification")
         .take(MAX_NATIVE_LIST)
         .map(|(_, key, value)| {
             // Project the FACT's own status instead of a constant: a

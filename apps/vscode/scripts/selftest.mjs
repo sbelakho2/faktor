@@ -36,6 +36,7 @@ import * as pf from '../src/preflight.ts';
 import * as rd from '../src/readiness.ts';
 import * as cr from '../src/changeReview.ts';
 import * as oc from '../src/outcomes.ts';
+import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
 import historyPolicy from '../media/history-state.js';
@@ -15935,6 +15936,29 @@ async function capabilityMatrixTests() {
   });
 }
 
+async function edition8HtmlSafetyTests() {
+  await test('edition8: inline state serialization cannot terminate the script element', () => {
+    const hostile = '</script><img src=x onerror=alert(1)>';
+    const encoded = scriptJson({ error: hostile, nested: { text: '\u2028&<>' } });
+    assert(!encoded.includes(hostile), 'hostile served text was embedded raw');
+    assert(encoded.includes('\\u003c/script'), 'inline JSON must escape <');
+    assert(!encoded.includes('</script'), 'no literal closing tag may survive');
+    assert(encoded.includes('\\u2028'), 'U+2028 must be escaped for inline JS');
+    // The renderer ships only the validated registry screen id in the inline
+    // boot value, but any future state embed must use this serializer.
+    const html = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: null, loading: false, error: hostile, focusControl: null },
+      initialScreen: 'S29',
+      host: 'vscode',
+    });
+    assert(!html.includes(hostile), 'hostile served text was embedded raw');
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -15980,6 +16004,7 @@ async function main() {
   await reducedMotionTests();
   await verdictContrastTests();
   await capabilityMatrixTests();
+  await edition8HtmlSafetyTests();
   if (packagedDir !== null && packagedDir !== undefined) {
     await packagedLayoutTests(packagedDir);
   }

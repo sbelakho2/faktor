@@ -529,3 +529,42 @@ async fn outcomes_wire_shape_matches_the_canonical_schema() {
     assert_shape(&schema.types, "OutcomesPage", &body, "GET /native/outcomes");
     handle.request_shutdown();
 }
+
+/// The metrics fold cache is keyed by the ledger's monotonic revision: a
+/// poll between writes is free, a new terminal run/correction invalidates
+/// it, and the returned report reflects the post-write ledger.
+#[tokio::test]
+async fn outcomes_metrics_cache_invalidates_on_ledger_writes() {
+    use super::OutcomesMetricsCache;
+    let dir = tempfile::tempdir().unwrap();
+    let deps = test_deps(dir.path());
+    let store = deps.session.store();
+    let ledger = OutcomeLedger::new(store.clone());
+    let cache = OutcomesMetricsCache::default();
+
+    let empty = cache.report(&store, &ledger).await.unwrap();
+    assert_eq!(empty.metrics.runs, 0);
+    assert_eq!(empty.scanned, 0);
+
+    let (outcome, settlement) = record("run-cache", 1_000, false);
+    ledger.record(&outcome, &settlement).unwrap();
+
+    let after = cache.report(&store, &ledger).await.unwrap();
+    assert_eq!(after.metrics.runs, 1);
+    assert_eq!(after.scanned, 1);
+    let again = cache.report(&store, &ledger).await.unwrap();
+    assert_eq!(again, after, "a cache hit returns the same fold");
+
+    // Polling ceiling: 200 reads between writes do no ledger work.
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let hit = cache.report(&store, &ledger).await.unwrap();
+        assert_eq!(hit, after);
+    }
+    let hits = started.elapsed();
+    println!("[perf] 200 cached outcomes reads: {hits:?}");
+    assert!(
+        hits < std::time::Duration::from_millis(100),
+        "cached outcomes reads took {hits:?} for 200 polls"
+    );
+}

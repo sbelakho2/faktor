@@ -229,6 +229,18 @@ pub enum EngineeringOutcomeAppend {
     Duplicate,
 }
 
+/// One consistent metrics-read snapshot of the Engineering Outcome Ledger
+/// (see [`Store::engineering_outcome_metrics_snapshot`]): the newest
+/// engineering rows plus the latest settlement event of each, all read in
+/// one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineeringOutcomeMetricsSnapshot {
+    pub outcomes: Vec<EngineeringOutcomeRow>,
+    pub settlements: Vec<EconomicSettlementRow>,
+    /// More engineering rows exist than the requested bound.
+    pub truncated: bool,
+}
+
 /// ONE settlement-lifecycle event exactly as stored. The `state` is the
 /// typed `money_state`; amounts are present ONLY on `complete` (NULL means
 /// unmeasured, never zero). `avoided_hosted_micro` is the counterfactual
@@ -851,7 +863,11 @@ impl Store {
                 Ok(RawAppendOutcome::Appended)
             })?;
         match outcome {
-            RawAppendOutcome::Appended => Ok(EngineeringOutcomeAppend::Appended),
+            RawAppendOutcome::Appended => {
+                self.outcome_revision
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                Ok(EngineeringOutcomeAppend::Appended)
+            }
             RawAppendOutcome::Existing(raw) => {
                 let existing = engineering_outcome_from_raw(*raw)?;
                 if existing == submitted {
@@ -965,7 +981,11 @@ impl Store {
                 Ok(RawSettlementAppend::Appended(seq))
             })?;
         match outcome {
-            RawSettlementAppend::Appended(seq) => Ok(EconomicSettlementAppend::Appended(seq)),
+            RawSettlementAppend::Appended(seq) => {
+                self.outcome_revision
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                Ok(EconomicSettlementAppend::Appended(seq))
+            }
             RawSettlementAppend::Existing => Ok(EconomicSettlementAppend::Duplicate),
         }
     }
@@ -1075,6 +1095,121 @@ impl Store {
             }
         }?;
         raws.into_iter().map(engineering_outcome_from_raw).collect()
+    }
+
+    /// One CONSISTENT snapshot of the ledger for a metrics fold: the newest
+    /// `max_records` engineering rows AND the latest settlement event of
+    /// every one of them, read inside ONE deferred read transaction.
+    ///
+    /// The historical fold paged the ledger through separate read
+    /// connections and folded each page's settlement immediately; a
+    /// concurrent settlement correction could land between pages, so one
+    /// run was counted with a projection from a different snapshot than its
+    /// peers (a torn aggregate under concurrency). One transaction makes
+    /// the whole fold see a single committed state. `truncated` is explicit
+    /// when more rows exist than the requested bound.
+    pub fn engineering_outcome_metrics_snapshot(
+        &self,
+        max_records: u64,
+    ) -> StoreResult<EngineeringOutcomeMetricsSnapshot> {
+        let bound = max_records.max(1).saturating_add(1);
+        let limit = i64::try_from(bound).unwrap_or(i64::MAX);
+        let conn = self.read()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {OUTCOME_ROW_COLUMNS} FROM engineering_outcome \
+             ORDER BY completed_at_ms DESC, run_id DESC LIMIT ?1"
+        ))?;
+        let raws: Vec<RawEngineeringOutcomeRow> = stmt
+            .query_map(params![limit], raw_engineering_outcome_row)
+            .and_then(|rows| rows.collect())?;
+        drop(stmt);
+        let truncated = raws.len() as u64 > max_records;
+        let mut outcomes = Vec::with_capacity(raws.len().min(max_records as usize));
+        for raw in raws.into_iter().take(max_records as usize) {
+            outcomes.push(engineering_outcome_from_raw(raw)?);
+        }
+        // Latest settlement of every selected run, batched inside the SAME
+        // transaction (so the money projection and the engineering rows are
+        // one snapshot).
+        let run_ids: Vec<String> = outcomes.iter().map(|row| row.run_id.clone()).collect();
+        let mut settlements = Vec::with_capacity(run_ids.len());
+        for chunk in run_ids.chunks(MAX_ECONOMIC_SETTLEMENT_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT {SETTLEMENT_ROW_COLUMNS} FROM economic_settlement s \
+                 WHERE s.seq = (SELECT MAX(seq) FROM economic_settlement s2 WHERE s2.run_id = s.run_id) \
+                 AND s.run_id IN ({placeholders})"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let raws: Vec<RawSettlementRow> = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), raw_settlement_row)
+                .and_then(|rows| rows.collect())?;
+            for raw in raws {
+                settlements.push(economic_settlement_from_raw(raw)?);
+            }
+        }
+        Ok(EngineeringOutcomeMetricsSnapshot {
+            outcomes,
+            settlements,
+            truncated,
+        })
+    }
+
+    /// One page of engineering rows plus the LATEST settlement of each,
+    /// read inside ONE transaction. The read surface previously paged the
+    /// rows and then batched settlements on a second connection, so a
+    /// concurrent correction could land between them and the page showed a
+    /// money projection from a different committed state than its runs.
+    pub fn engineering_outcome_page_with_settlements(
+        &self,
+        before: Option<(i64, &str)>,
+        limit: u64,
+    ) -> StoreResult<(Vec<EngineeringOutcomeRow>, Vec<EconomicSettlementRow>)> {
+        let limit = limit.clamp(1, MAX_ENGINEERING_OUTCOME_PAGE) as i64;
+        let conn = self.read()?;
+        let tx = conn.unchecked_transaction()?;
+        let raws: Vec<RawEngineeringOutcomeRow> = match before {
+            None => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {OUTCOME_ROW_COLUMNS} FROM engineering_outcome \
+                     ORDER BY completed_at_ms DESC, run_id DESC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![limit], raw_engineering_outcome_row)
+                    .and_then(|rows| rows.collect())
+            }
+            Some((at_ms, run_id)) => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {OUTCOME_ROW_COLUMNS} FROM engineering_outcome \
+                     WHERE completed_at_ms < ?1 OR (completed_at_ms = ?1 AND run_id < ?2) \
+                     ORDER BY completed_at_ms DESC, run_id DESC LIMIT ?3"
+                ))?;
+                stmt.query_map(params![at_ms, run_id, limit], raw_engineering_outcome_row)
+                    .and_then(|rows| rows.collect())
+            }
+        }?;
+        let outcomes = raws
+            .into_iter()
+            .map(engineering_outcome_from_raw)
+            .collect::<StoreResult<Vec<_>>>()?;
+        let run_ids: Vec<String> = outcomes.iter().map(|row| row.run_id.clone()).collect();
+        let mut settlements = Vec::with_capacity(run_ids.len());
+        for chunk in run_ids.chunks(MAX_ECONOMIC_SETTLEMENT_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT {SETTLEMENT_ROW_COLUMNS} FROM economic_settlement s \
+                 WHERE s.seq = (SELECT MAX(seq) FROM economic_settlement s2 WHERE s2.run_id = s.run_id) \
+                 AND s.run_id IN ({placeholders})"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let raws: Vec<RawSettlementRow> = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), raw_settlement_row)
+                .and_then(|rows| rows.collect())?;
+            for raw in raws {
+                settlements.push(economic_settlement_from_raw(raw)?);
+            }
+        }
+        Ok((outcomes, settlements))
     }
 
     /// Exact number of durable ledger rows (doctor/analytics surfaces).
@@ -2295,5 +2430,53 @@ mod tests {
             ),
             (1, 1, 2_400_000, 3)
         );
+    }
+
+    /// The metrics snapshot is ONE consistent transaction: every selected
+    /// engineering row carries its LATEST settlement event, the bound is
+    /// explicit, and the outcome revision advances exactly on writes.
+    #[test]
+    fn metrics_snapshot_is_one_consistent_bounded_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.outcome_revision(), 0);
+        for (i, run) in ["run-a", "run-b", "run-c"].iter().enumerate() {
+            store
+                .engineering_outcome_append(
+                    &row(run, 1_000 + i as i64),
+                    &[],
+                    &settlement(run, 0, "pending"),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.outcome_revision(), 3);
+
+        // A correction lands on run-b; the snapshot must carry seq 1.
+        store
+            .economic_settlement_append(&settlement("run-b", 0, "complete"))
+            .unwrap();
+        assert_eq!(store.outcome_revision(), 4);
+
+        let snap = store.engineering_outcome_metrics_snapshot(10).unwrap();
+        assert!(!snap.truncated);
+        assert_eq!(snap.outcomes.len(), 3);
+        assert_eq!(snap.settlements.len(), 3);
+        let mut by_run: std::collections::BTreeMap<&str, &EconomicSettlementRow> = snap
+            .settlements
+            .iter()
+            .map(|s| (s.run_id.as_str(), s))
+            .collect();
+        assert_eq!(by_run.remove("run-b").unwrap().state, "complete");
+        assert_eq!(by_run.remove("run-c").unwrap().state, "pending");
+        assert_eq!(
+            snap.outcomes.first().map(|r| r.run_id.as_str()),
+            Some("run-c"),
+            "newest completed_at_ms first"
+        );
+
+        let bounded = store.engineering_outcome_metrics_snapshot(2).unwrap();
+        assert!(bounded.truncated, "the bound is named, never silent");
+        assert_eq!(bounded.outcomes.len(), 2);
+        assert_eq!(bounded.settlements.len(), 2);
     }
 }

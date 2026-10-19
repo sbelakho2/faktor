@@ -1502,8 +1502,9 @@ mod scans {
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            let consumer =
-                rel.starts_with("crates/browser/") || rel.starts_with("crates/provider/");
+            let consumer = rel.starts_with("crates/browser/")
+                || rel.starts_with("crates/provider/")
+                || rel.starts_with("crates/foundation/");
             if !consumer || is_test_file(&rel) {
                 continue;
             }
@@ -1514,7 +1515,7 @@ mod scans {
             offenders.extend(egress_authority_redefinition_offenders(&f));
         }
         assert_no_offenders(
-            "egress address authority scan: browser/provider must consume \
+            "egress address authority scan: browser/provider/foundation must consume \
              faktor_security::network (no local classify_v4/classify_v6/AddressClass/\
              IpClass/vet_resolved_answers definitions)",
             &offenders,
@@ -1538,6 +1539,238 @@ mod scans {
         assert!(
             egress_authority_redefinition_offenders(&planted).is_empty(),
             "re-exporting the authority is the sanctioned shape"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 2c: webview HTML sinks and inline JSON embedding
+    // ------------------------------------------------------------------
+
+    /// Runtime-owned webview sources (VS Code TS/JS and the JetBrains
+    /// Kotlin frontend/backend). Render harnesses, fixtures, generated
+    /// baselines and build output are not runtime sources.
+    fn walk_webview_sources() -> Vec<String> {
+        const ROOTS: &[&str] = &[
+            "apps/vscode/src",
+            "apps/vscode/media",
+            "apps/jetbrains/frontend/src",
+            "apps/jetbrains/backend/src",
+            "apps/jetbrains/shared/src",
+        ];
+        fn collect(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if matches!(
+                        name.as_str(),
+                        "node_modules" | "out" | "build" | "target" | ".gradle" | "test" | "tests"
+                    ) {
+                        continue;
+                    }
+                    collect(&path, out);
+                } else if ft.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    if matches!(ext, Some("ts" | "js" | "kt")) {
+                        let rel = path
+                            .strip_prefix(repo_root())
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string();
+                        out.push(normalize_rel(&rel));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for root in ROOTS {
+            collect(&repo_root().join(root), &mut out);
+        }
+        out
+    }
+
+    const WEBVIEW_HTML_SINKS: &[&str] = &[
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write(",
+        "new Function(",
+        "eval(",
+    ];
+
+    /// `eval(` also matches `retrieval(`/`retrieve(`; require an identifier
+    /// boundary so the scan flags a real dynamic-eval call site.
+    fn contains_eval_call(line: &str) -> bool {
+        let mut rest = line;
+        let mut offset = 0usize;
+        while let Some(found) = rest.find("eval(") {
+            let index = offset + found;
+            let before = line.as_bytes().get(index.wrapping_sub(1)).copied();
+            let boundary = before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+            if boundary {
+                return true;
+            }
+            offset = index + 5;
+            rest = &line[offset..];
+        }
+        false
+    }
+
+    fn webview_html_sink_offenders(rel: &str, source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            for marker in WEBVIEW_HTML_SINKS {
+                let hit = if *marker == "eval(" {
+                    contains_eval_call(line)
+                } else {
+                    line.contains(marker)
+                };
+                if hit {
+                    out.push(format!(
+                        "{rel}:{}: {marker}  [untrusted provider/MCP/diagnostics text must be \
+                         rendered as text; no HTML/eval sinks in a webview]",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn inline_json_offenders(rel: &str, source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            if line.contains("<script") && line.contains("JSON.stringify(") {
+                out.push(format!(
+                    "{rel}:{}: inline <script> embeds JSON.stringify directly  [escape <,>,&, \
+                     U+2028/U+2029 or a served string can close the script element]",
+                    index + 1
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn webview_sources_have_no_html_sinks_and_escape_inline_json() {
+        let mut sinks = Vec::new();
+        let mut inline = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_webview_sources() {
+            let Ok(source) = std::fs::read_to_string(repo_root().join(&rel)) else {
+                continue;
+            };
+            scanned += 1;
+            sinks.extend(webview_html_sink_offenders(&rel, &source));
+            inline.extend(inline_json_offenders(&rel, &source));
+        }
+        assert!(scanned >= 40, "webview scan found only {scanned} files");
+        assert_no_offenders(
+            "webview HTML sink scan: runtime webview sources must render served text as text \
+             (no innerHTML/outerHTML/insertAdjacentHTML/document.write/eval/new Function)",
+            &sinks,
+            scanned,
+            40,
+        );
+        assert_no_offenders(
+            "webview inline JSON scan: <script> bodies must use an escaping serializer",
+            &inline,
+            scanned,
+            40,
+        );
+        // Negative proofs: each planted shape fires, and the sanctioned
+        // escaped form does not.
+        assert!(
+            !webview_html_sink_offenders(
+                "apps/vscode/src/evil.ts",
+                "element.innerHTML = served.provider;\n"
+            )
+            .is_empty(),
+            "a planted innerHTML sink must fire"
+        );
+        assert!(
+            !inline_json_offenders(
+                "apps/vscode/src/evil.ts",
+                "<script>window.x = ${JSON.stringify(state)};</script>"
+            )
+            .is_empty(),
+            "a planted raw inline JSON embed must fire"
+        );
+        assert!(
+            inline_json_offenders(
+                "apps/vscode/src/ok.ts",
+                "<script>window.x = ${scriptJson(state)};</script>"
+            )
+            .is_empty(),
+            "the escaping serializer is the sanctioned shape"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 2d: export/artifact secret hygiene is not opt-out
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn session_export_always_scans_secrets_and_diagnostics_never_echo_endpoint_parts() {
+        let export =
+            std::fs::read_to_string(repo_root().join("crates/server/src/native/foundation_ext.rs"))
+                .expect("foundation_ext.rs");
+        let start = export
+            .find("pub(crate) async fn native_session_export")
+            .expect("the session export handler must exist");
+        let body = &export[start..];
+        let end = body
+            .find("\n/// `POST")
+            .map(|end| &body[..end])
+            .unwrap_or(body);
+        assert!(
+            end.contains("redact_export(&mut bundle"),
+            "the export bundle must always run the secret scanner"
+        );
+        assert!(
+            !end.contains("if redact {"),
+            "the secret scanner must not be gated on a caller-controlled `redact` flag"
+        );
+        assert!(
+            end.contains("\"redacted\": true"),
+            "the export response must state that redaction always ran"
+        );
+        let diagnostics =
+            std::fs::read_to_string(repo_root().join("crates/foundation/src/diagnostics.rs"))
+                .expect("diagnostics.rs");
+        assert!(
+            diagnostics.contains(".and_then(diagnostic_endpoint)"),
+            "diagnostics must reduce provider endpoints to an origin before export"
+        );
+        assert!(
+            diagnostics.contains("parsed.origin().ascii_serialization()"),
+            "the origin reducer must not echo path/query/fragment/userinfo"
+        );
+        let providers =
+            std::fs::read_to_string(repo_root().join("crates/foundation/src/providers.rs"))
+                .expect("providers.rs");
+        assert!(
+            providers.contains("faktor_security::network::classify_ip"),
+            "provider endpoint validation must consume the ONE address authority"
+        );
+        assert!(
+            !providers.contains("fn classify_ip("),
+            "provider endpoint validation must not re-derive address classes"
+        );
+        let customization =
+            std::fs::read_to_string(repo_root().join("crates/foundation/src/customization.rs"))
+                .expect("customization.rs");
+        assert!(
+            customization.contains("faktor_security::network::classify_ip"),
+            "MCP endpoints must be vetted by the ONE address authority"
         );
     }
 

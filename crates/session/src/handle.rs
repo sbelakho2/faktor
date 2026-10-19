@@ -179,7 +179,7 @@ impl SessionHandle {
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
             .map_err(crate::map_store_err)?;
-        self.manager.note_journal_append();
+        self.manager.note_journal_append(&self.resources);
         Ok(seq)
     }
 
@@ -260,7 +260,7 @@ impl SessionHandle {
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
             .map_err(crate::map_store_err)?;
-        self.manager.note_journal_append();
+        self.manager.note_journal_append(&self.resources);
         Ok(seq)
     }
 
@@ -294,7 +294,7 @@ impl SessionHandle {
             .append_journal_event(self.id, op_id, kind, to_state, self.now_ms(), payload)
             .await
             .map_err(crate::map_store_err)?;
-        self.manager.note_journal_append();
+        self.manager.note_journal_append(&self.resources);
         Ok(seq)
     }
 
@@ -310,10 +310,11 @@ impl SessionHandle {
         self.manager.journal_generation()
     }
 
-    /// Subscribe to journal-append wake signals (best-effort; a missed wake
-    /// falls back to polling the durable cursor).
+    /// Subscribe to THIS session's journal-append wake signals (best-effort;
+    /// a missed wake falls back to polling the durable cursor). The watch is
+    /// per session, so an append in another session never wakes this reader.
     pub fn subscribe_journal(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.manager.subscribe_journal()
+        self.resources.journal_gen.subscribe()
     }
 
     pub fn events_range(
@@ -325,6 +326,19 @@ impl SessionHandle {
             .store()
             .events_range(self.id, from_seq, limit)
             .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Async twin of [`SessionHandle::events_range`] on the bounded read
+    /// pool (journal catch-up streams and pages never block a Tokio worker
+    /// on SQLite I/O).
+    pub async fn events_range_async(
+        &self,
+        from_seq: u64,
+        limit: Option<u64>,
+    ) -> faktor_core::Result<Vec<Event>> {
+        self.manager
+            .events_range_async(self.id, from_seq, limit)
+            .await
     }
 
     pub fn last_event_seq(&self) -> faktor_core::Result<Option<EventSeq>> {

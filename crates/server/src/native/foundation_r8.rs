@@ -725,15 +725,15 @@ pub(crate) async fn native_browser_sessions(
         Ok(q) => q,
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
-    let sid = match session_from(&q.session) {
-        Ok(sid) => sid,
-        Err(r) => return r,
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.browser.sessions(sid.raw()) {
+    match foundation.browser.sessions(handle.id().raw()) {
         Ok(sessions) => Json(serde_json::json!({ "sessions": sessions })).into_response(),
         Err(e) => foundation_error(e),
     }
@@ -913,15 +913,15 @@ pub(crate) async fn native_context_pins(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let sid = match parse_session_id(&id) {
-        Ok(sid) => sid,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.context.pins(sid.raw()) {
+    match foundation.context.pins(handle.id().raw()) {
         Ok(pins) => Json(serde_json::json!({ "pins": pins })).into_response(),
         Err(e) => foundation_error(e),
     }
@@ -947,9 +947,9 @@ pub(crate) async fn native_context_pin_set(
         Ok(b) => b,
         Err(_) => return malformed("invalid context pin body"),
     };
-    let sid = match parse_session_id(&id) {
-        Ok(sid) => sid,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let Some(action) = PinAction::parse(&req.action) else {
         return malformed("action must be pin or exclude");
@@ -960,7 +960,7 @@ pub(crate) async fn native_context_pin_set(
     };
     match foundation
         .context
-        .set_pin(sid.raw(), &req.source_id, action)
+        .set_pin(handle.id().raw(), &req.source_id, action)
     {
         Ok(pin) => Json(pin).into_response(),
         Err(e) => foundation_error(e),
@@ -986,15 +986,18 @@ pub(crate) async fn native_context_pin_delete(
         Ok(q) => q,
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
-    let sid = match parse_session_id(&id) {
-        Ok(sid) => sid,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.context.remove_pin(sid.raw(), &q.source_id) {
+    match foundation
+        .context
+        .remove_pin(handle.id().raw(), &q.source_id)
+    {
         Ok(removed) => Json(serde_json::json!({ "removed": removed })).into_response(),
         Err(e) => foundation_error(e),
     }
@@ -1018,15 +1021,15 @@ pub(crate) async fn native_context_export(
         Ok(q) => q,
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
-    let sid = match parse_session_id(&q.session) {
-        Ok(sid) => sid,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.context.export(sid.raw()) {
+    match foundation.context.export(handle.id().raw()) {
         Ok(export) => Json(export).into_response(),
         Err(e) => foundation_error(e),
     }

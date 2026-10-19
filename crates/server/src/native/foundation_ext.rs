@@ -23,6 +23,7 @@ use faktor_hooks::{HookEvent, HookInput, HookRegistry, HookSpec};
 use faktor_instructions::SkillRegistry;
 use faktor_mcp::{McpConfig, McpServer};
 use faktor_protocol::error::ApiError;
+use faktor_security::{redact, CompiledSecretPolicy, SecretPolicy};
 use faktor_terminal::ProcessSupervisor;
 
 use super::foundation::foundation_error;
@@ -254,15 +255,15 @@ pub(crate) async fn native_session_meta(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let sid = match parse_session_id(&id) {
-        Ok(s) => s,
-        Err(e) => return wire_status(e),
+    let handle = match resolve_handle(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.session_meta.get(session_u64(sid)) {
+    match foundation.session_meta.get(session_u64(handle.id())) {
         Ok(meta) => Json(meta).into_response(),
         Err(e) => foundation_error(e),
     }
@@ -362,13 +363,17 @@ pub(crate) async fn native_transcript_search(
         Err(r) => return r,
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    match state
-        .deps
-        .session
-        .store()
-        .search_messages(handle.id(), &q.q, limit)
-    {
-        Ok(rows) => {
+    // A miss walks the whole session window in SQLite (50k rows measured
+    // ~65 ms single-request). Run the synchronous scan on the blocking pool
+    // so the scan can never pin a Tokio worker for its whole duration; the
+    // scan itself stays linear in rows (no O(n^2) curve).
+    let store = state.deps.session.store();
+    let session_id = handle.id();
+    let query = q.q.clone();
+    let scanned =
+        tokio::task::spawn_blocking(move || store.search_messages(session_id, &query, limit)).await;
+    match scanned {
+        Ok(Ok(rows)) => {
             let needle = q.q.to_ascii_lowercase();
             // A match may live in `message.data` (user prompts) or in a part
             // row (`text`/`reasoning`/`tool_result`), which is where every
@@ -431,7 +436,13 @@ pub(crate) async fn native_transcript_search(
             }))
             .into_response()
         }
-        Err(e) => api_err(&store_err_to_core(e)),
+        Ok(Err(e)) => api_err(&store_err_to_core(e)),
+        Err(e) => wire_status(ApiError {
+            code: "internal",
+            message: format!("transcript search task failed: {e}"),
+            http_status: 500,
+            retryable: true,
+        }),
     }
 }
 
@@ -532,50 +543,26 @@ pub(crate) async fn native_memory_write(
         Ok(h) => h,
         Err(r) => return r,
     };
-    if let Some(expected) = req.expected_updated_ms {
-        let live =
-            match state
-                .deps
-                .session
-                .store()
-                .get_memory_fact(handle.id(), &req.kind, &req.key)
-            {
-                Ok(row) => row,
-                Err(e) => return api_err(&store_err_to_core(e)),
-            };
-        match live {
-            Some(row) if row.updated_ms == expected => {}
-            Some(_) => {
-                return conflict(
-                    "revision_conflict",
-                    "the memory fact changed since it was read; re-read and merge",
-                )
-            }
-            None => {
-                return conflict(
-                    "revision_conflict",
-                    "the memory fact no longer exists; re-read",
-                )
-            }
-        }
-    }
-    match handle.upsert_memory_fact(&req.kind, &req.key, &req.value) {
-        Ok(()) => {
-            let row = state
-                .deps
-                .session
-                .store()
-                .get_memory_fact(handle.id(), &req.kind, &req.key)
-                .ok()
-                .flatten();
-            Json(serde_json::json!({
-                "saved": true,
-                "fact": row.map(|r| serde_json::json!({
-                    "kind": r.kind, "key": r.key, "value": r.value, "updatedMs": r.updated_ms,
-                })),
-            }))
-            .into_response()
-        }
+    // ONE atomic writer transaction: the expected-stamp check and the
+    // upsert can no longer interleave with another writer (the historical
+    // read-then-write pair let two same-stamp writers both apply).
+    match handle.upsert_memory_fact_cas(&req.kind, &req.key, &req.value, req.expected_updated_ms) {
+        Ok(faktor_store::MemoryFactCas::Applied(row)) => Json(serde_json::json!({
+            "saved": true,
+            "fact": serde_json::json!({
+                "kind": row.kind, "key": row.key, "value": row.value,
+                "updatedMs": row.updated_ms,
+            }),
+        }))
+        .into_response(),
+        Ok(faktor_store::MemoryFactCas::Conflict) => conflict(
+            "revision_conflict",
+            "the memory fact changed since it was read; re-read and merge",
+        ),
+        Ok(faktor_store::MemoryFactCas::Missing) => conflict(
+            "revision_conflict",
+            "the memory fact no longer exists; re-read",
+        ),
         Err(e) => api_err(&e),
     }
 }
@@ -601,39 +588,16 @@ pub(crate) async fn native_memory_delete(
         Ok(h) => h,
         Err(r) => return r,
     };
-    let live = match state
-        .deps
-        .session
-        .store()
-        .get_memory_fact(handle.id(), &kind, &key)
-    {
-        Ok(row) => row,
-        Err(e) => return api_err(&store_err_to_core(e)),
-    };
-    let Some(live) = live else {
-        return wire_status(not_found("memory fact"));
-    };
-    if let Some(expected) = q.expected_updated_ms {
-        if live.updated_ms != expected {
-            return conflict(
-                "revision_conflict",
-                "the memory fact changed since it was read; re-read and merge",
-            );
-        }
-    }
     let revision = handle
         .last_event_seq()
         .ok()
         .flatten()
         .map(|s| s.raw())
         .unwrap_or(0);
-    match state
-        .deps
-        .session
-        .store()
-        .delete_memory_fact(handle.id(), &kind, &key)
-    {
-        Ok(Some(deleted)) => Json(serde_json::json!({
+    // Atomic CAS delete: a concurrent update that lands between a separate
+    // read and delete can no longer be removed under an older stamp.
+    match handle.delete_memory_fact_cas(&kind, &key, q.expected_updated_ms) {
+        Ok(faktor_store::MemoryFactDeleteCas::Deleted(deleted)) => Json(serde_json::json!({
             "deleted": true,
             "receipt": {
                 "kind": deleted.kind,
@@ -647,8 +611,14 @@ pub(crate) async fn native_memory_delete(
             },
         }))
         .into_response(),
-        Ok(None) => wire_status(not_found("memory fact")),
-        Err(e) => api_err(&store_err_to_core(e)),
+        Ok(faktor_store::MemoryFactDeleteCas::Missing) => {
+            wire_status(not_found("memory fact"))
+        }
+        Ok(faktor_store::MemoryFactDeleteCas::Conflict) => conflict(
+            "revision_conflict",
+            "the memory fact changed since it was read; re-read and merge",
+        ),
+        Err(e) => api_err(&e),
     }
 }
 
@@ -1991,14 +1961,55 @@ fn hook_registry(state: &AppState) -> Result<&Arc<HookRegistry>, Response> {
 fn parse_hook_spec(value: &serde_json::Value) -> Result<HookSpec, Response> {
     let spec: HookSpec = serde_json::from_value(value.clone())
         .map_err(|e| wire_status(malformed_body(&format!("invalid hook spec: {e}"))))?;
-    if spec.command.is_empty() || spec.command.len() > 4096 {
+    if spec.command.is_empty() || spec.command.len() > 4096 || spec.command.contains('\0') {
         return Err(wire_status(malformed_body(
-            "hook command must be 1..=4096 bytes",
+            "hook command must be 1..=4096 bytes without NUL",
         )));
     }
     if spec.deadline_ms == 0 || spec.deadline_ms > 300_000 {
         return Err(wire_status(malformed_body(
             "hook deadline must be in (0, 300000] ms",
+        )));
+    }
+    // The spec is authored by the API client. Cap the structural surface
+    // here as well as in `HookRegistry::register` so a hostile persisted
+    // spec cannot make `run_sync` retain an unbounded stream head.
+    if spec.stdout_cap == 0
+        || spec.stdout_cap > faktor_hooks::MAX_HOOK_OUTPUT_CAP
+        || spec.stderr_cap == 0
+        || spec.stderr_cap > faktor_hooks::MAX_HOOK_OUTPUT_CAP
+    {
+        return Err(wire_status(malformed_body(&format!(
+            "hook output caps must be in 1..={} bytes",
+            faktor_hooks::MAX_HOOK_OUTPUT_CAP
+        ))));
+    }
+    if spec.args.len() > faktor_hooks::MAX_HOOK_ARGS
+        || spec
+            .args
+            .iter()
+            .any(|a| a.len() > faktor_hooks::MAX_HOOK_ARG_BYTES || a.contains('\0'))
+    {
+        return Err(wire_status(malformed_body(
+            "hook args exceed the served structural bound",
+        )));
+    }
+    if spec.events.len() > HookEvent::ALL.len() {
+        return Err(wire_status(malformed_body(
+            "a hook may subscribe to at most 17 event kinds",
+        )));
+    }
+    if spec.env.len() > faktor_hooks::MAX_HOOK_ENV
+        || spec.env.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.len() > faktor_hooks::MAX_HOOK_ENV_NAME_BYTES
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || value.len() > faktor_hooks::MAX_HOOK_ENV_VALUE_BYTES
+                || value.contains('\0')
+        })
+    {
+        return Err(wire_status(malformed_body(
+            "hook env entries exceed the served structural bound",
         )));
     }
     Ok(spec)
@@ -2443,6 +2454,12 @@ pub(crate) struct NativeUrlBody {
 /// `POST /native/browser/validate-url` — scheme/host boundary preview. A
 /// hostname is left `unresolved` (no DNS here); a literal address is
 /// classified by the one egress authority.
+///
+/// The response never echoes the submitted URL: a URL can carry credentials
+/// in userinfo, the path, the query or the fragment, and this payload is
+/// rendered in a panel/log. Userinfo is refused outright and the echoed
+/// destination is the canonical ORIGIN only (scheme/host/port), with
+/// path-segment and query/fragment presence reported as counts/flags.
 pub(crate) async fn native_browser_validate_url(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2455,12 +2472,20 @@ pub(crate) async fn native_browser_validate_url(
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid URL body")),
     };
+    if req.url.len() > 4096 {
+        return wire_status(malformed_body("url must be at most 4096 bytes"));
+    }
     let url = match url::Url::parse(&req.url) {
         Ok(url) => url,
         Err(e) => return wire_status(malformed_body(&format!("invalid URL: {e}"))),
     };
+    if !url.username().is_empty() || url.password().is_some() {
+        return wire_status(malformed_body(
+            "URLs must not embed userinfo credentials; pass auth as a vault reference",
+        ));
+    }
     let scheme_ok = matches!(url.scheme(), "http" | "https");
-    let host = url.host_str().unwrap_or_default().to_string();
+    let host = url.host().map(|h| h.to_string()).unwrap_or_default();
     let looback_allowed = state
         .deps
         .foundation
@@ -2473,51 +2498,79 @@ pub(crate) async fn native_browser_validate_url(
         })
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let class_of = |ip: std::net::IpAddr| faktor_security::network::classify_ip(ip);
     let (class, decision, reason) = if !scheme_ok {
         (
             "unsupported".to_string(),
             "deny",
             "only http/https destinations are supported".to_string(),
         )
-    } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let class = faktor_security::network::classify_ip(ip);
-        let (decision, reason) = match class {
-            faktor_security::network::AddressClass::Global => {
-                ("allow", "globally routable destination")
-            }
-            faktor_security::network::AddressClass::Loopback => {
-                if looback_allowed {
-                    ("allow", "loopback explicitly enabled")
+    } else if let Some(host) = url.host() {
+        let literal = match host {
+            url::Host::Ipv4(ip) => Some(class_of(std::net::IpAddr::V4(ip))),
+            url::Host::Ipv6(ip) => Some(class_of(std::net::IpAddr::V6(ip))),
+            url::Host::Domain(domain) => {
+                let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+                if lower == "localhost" || lower.ends_with(".localhost") {
+                    Some(faktor_security::network::AddressClass::Loopback)
                 } else {
-                    ("deny", "loopback requires an explicit opt-in")
+                    None
                 }
             }
-            _ => (
-                "deny",
-                "the destination class is not permitted by the network boundary",
-            ),
         };
-        (
-            format!("{class:?}").to_ascii_lowercase(),
-            decision,
-            reason.to_string(),
-        )
+        match literal {
+            Some(class) => {
+                let (decision, reason) = match class {
+                    faktor_security::network::AddressClass::Global => {
+                        ("allow", "globally routable destination")
+                    }
+                    faktor_security::network::AddressClass::Loopback => {
+                        if looback_allowed {
+                            ("allow", "loopback explicitly enabled")
+                        } else {
+                            ("deny", "loopback requires an explicit opt-in")
+                        }
+                    }
+                    _ => (
+                        "deny",
+                        "the destination class is not permitted by the network boundary",
+                    ),
+                };
+                (
+                    class.as_str().to_string(),
+                    decision,
+                    reason.to_string(),
+                )
+            }
+            None => (
+                "unresolved".to_string(),
+                "resolve",
+                "hostname not resolved here; the egress broker resolves and classifies every answer at connect time"
+                    .to_string(),
+            ),
+        }
     } else {
         (
             "unresolved".to_string(),
-            "resolve",
-            "hostname not resolved here; the egress broker resolves and classifies every answer at connect time"
-                .to_string(),
+            "deny",
+            "the URL has no host".to_string(),
         )
     };
+    let path_segments = url
+        .path_segments()
+        .map(|segments| segments.count())
+        .unwrap_or(0);
     Json(serde_json::json!({
-        "url": req.url,
+        "url": url.origin().ascii_serialization(),
         "scheme": url.scheme(),
         "host": host,
         "class": class,
         "decision": decision,
         "reason": reason,
         "port": url.port_or_known_default(),
+        "pathSegments": path_segments,
+        "queryPresent": url.query().is_some(),
+        "fragmentPresent": url.fragment().is_some(),
     }))
     .into_response()
 }
@@ -2701,7 +2754,7 @@ pub(crate) struct NativeMergeBody {
     rejected: Vec<String>,
 }
 
-fn agent_paths(paths: &[String]) -> Result<Vec<std::path::PathBuf>, Response> {
+pub(crate) fn agent_paths(paths: &[String]) -> Result<Vec<std::path::PathBuf>, Response> {
     if paths.len() > 1_000 {
         return Err(wire_status(malformed_body(
             "at most 1000 paths per decision",
@@ -2713,9 +2766,18 @@ fn agent_paths(paths: &[String]) -> Result<Vec<std::path::PathBuf>, Response> {
             return Err(wire_status(malformed_body("invalid path in decision")));
         }
         let p = std::path::Path::new(path);
-        if p.is_absolute() || path.split('/').any(|part| part == "..") {
+        let traversal = path.contains('\\')
+            || p.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            });
+        if p.is_absolute() || traversal {
             return Err(wire_status(malformed_body(
-                "decision paths must be workspace-relative without `..`",
+                "decision paths must be workspace-relative without `..` (both separators)",
             )));
         }
         out.push(p.to_path_buf());
@@ -2802,12 +2864,26 @@ pub(crate) struct NativeReviewQuery {
     limit: Option<u64>,
 }
 
+/// Latest checkpoint `after_hash` per path, read ONCE. The list endpoint
+/// used to call the single-path lookup per comment, and each lookup loaded
+/// EVERY checkpoint row of the session: O(comments x checkpoints) reads.
+fn latest_change_hashes(
+    handle: &faktor_session::SessionHandle,
+) -> std::collections::HashMap<String, String> {
+    let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut sequences: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in handle.checkpoints_of().ok().unwrap_or_default() {
+        let entry = sequences.entry(row.path.clone()).or_insert(i64::MIN);
+        if row.sequence >= *entry {
+            *entry = row.sequence;
+            latest.insert(row.path, row.after_hash);
+        }
+    }
+    latest
+}
+
 fn latest_change_hash(handle: &faktor_session::SessionHandle, path: &str) -> Option<String> {
-    let rows = handle.checkpoints_of().ok()?;
-    rows.into_iter()
-        .filter(|row| row.path == path)
-        .max_by_key(|row| row.sequence)
-        .map(|row| row.after_hash)
+    latest_change_hashes(handle).remove(path)
 }
 
 fn task_belongs_to_session(
@@ -2867,10 +2943,11 @@ pub(crate) async fn native_review_comments_list(
         q.limit.unwrap_or(200).clamp(1, 500) as usize,
     ) {
         Ok(comments) => {
+            let mut current_by_path = latest_change_hashes(&handle);
             let rows: Vec<serde_json::Value> = comments
                 .into_iter()
                 .map(|comment| {
-                    let current = latest_change_hash(&handle, &comment.path);
+                    let current = current_by_path.remove(&comment.path);
                     let stale = comment
                         .content_hash
                         .as_deref()
@@ -3327,10 +3404,38 @@ pub(crate) struct NativeSessionExportBody {
 }
 
 fn redact_export(value: &mut serde_json::Value, redacted_keys: &mut usize) {
+    let policy = SecretPolicy::default();
+    // Compile the frozen patterns ONCE per export: the recursive walk scans
+    // every string in the transcript, and a per-string compile would make
+    // redaction cost O(strings x patterns) instead of O(bytes).
+    let compiled = CompiledSecretPolicy::try_from(policy.clone()).ok();
+    redact_export_with(value, redacted_keys, &policy, compiled.as_ref());
+}
+
+/// Recursive export redaction: credential-shaped KEYS, credential-shaped
+/// VALUES (the default secret-pattern set, including keys embedded in user
+/// text), PEM private-key BLOCKS (header + body, not just the header) and
+/// generic `Bearer` credentials. A session title or message part that
+/// happens to contain a recognizable secret is redacted exactly like a
+/// structured `apiKey` field — otherwise `redacted: true` would be a lie.
+fn redact_export_with(
+    value: &mut serde_json::Value,
+    redacted_keys: &mut usize,
+    policy: &SecretPolicy,
+    compiled: Option<&CompiledSecretPolicy>,
+) {
     match value {
         serde_json::Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                let lower = key.to_ascii_lowercase().replace(['-', '_'], "");
+            let entries = std::mem::take(map);
+            for (key, mut child) in entries {
+                let redacted_key = match compiled {
+                    Some(compiled) => compiled.redact_text(&key),
+                    None => redact(&key, policy),
+                };
+                if redacted_key != key {
+                    *redacted_keys += 1;
+                }
+                let lower = redacted_key.to_ascii_lowercase().replace(['-', '_'], "");
                 let sensitive = matches!(
                     lower.as_str(),
                     "authorization"
@@ -3344,35 +3449,95 @@ fn redact_export(value: &mut serde_json::Value, redacted_keys: &mut usize) {
                         | "refreshtoken"
                         | "idtoken"
                         | "password"
+                        | "passwd"
                         | "secret"
                         | "clientsecret"
-                ) || lower.ends_with("token")
-                    || lower.ends_with("secret");
+                        | "privatekey"
+                        | "credential"
+                        | "credentials"
+                ) || lower.contains("apikey")
+                    || lower.contains("secret")
+                    || lower.contains("password")
+                    || lower.contains("credential")
+                    || lower.contains("privatekey")
+                    || lower.ends_with("token");
                 if sensitive {
-                    *child = serde_json::Value::String("[redacted]".into());
+                    child = serde_json::Value::String("[redacted]".into());
                     *redacted_keys += 1;
                 } else {
-                    redact_export(child, redacted_keys);
+                    redact_export_with(&mut child, redacted_keys, policy, compiled);
                 }
+                map.insert(redacted_key, child);
             }
         }
         serde_json::Value::Array(items) => {
             for child in items {
-                redact_export(child, redacted_keys);
+                redact_export_with(child, redacted_keys, policy, compiled);
             }
         }
-        serde_json::Value::String(text) if text.starts_with("Bearer ") && text.len() > 16 => {
-            *text = "[redacted]".into();
-            *redacted_keys += 1;
+        serde_json::Value::String(text) => {
+            if text.starts_with("Bearer ") && text.len() > 16 {
+                *text = "[redacted]".into();
+                *redacted_keys += 1;
+                return;
+            }
+            let without_keys = redact_private_key_blocks(text);
+            let cleaned = redact(&without_keys, policy);
+            if cleaned != *text {
+                *text = cleaned;
+                *redacted_keys += 1;
+            }
         }
         _ => {}
     }
 }
 
+/// Replace every PEM private-key block (header through END marker) with one
+/// marker. The pattern redactor only matches the `-----BEGIN … PRIVATE
+/// KEY-----` header, which would leave the base64 key body in the export.
+fn redact_private_key_blocks(text: &str) -> String {
+    const BEGIN: &str = "-----BEGIN";
+    const END: &str = "-----END";
+    const KEY_SUFFIX: &str = "PRIVATE KEY-----";
+    const MAX_HEADER: usize = 128;
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find(BEGIN) {
+        let start = cursor + rel;
+        let window_end = (start + MAX_HEADER).min(text.len());
+        let header = text[start..window_end].find(KEY_SUFFIX);
+        let Some(header_rel) = header else {
+            out.push_str(&text[cursor..start + BEGIN.len()]);
+            cursor = start + BEGIN.len();
+            continue;
+        };
+        if text[start..start + header_rel].contains('\n') {
+            out.push_str(&text[cursor..start + BEGIN.len()]);
+            cursor = start + BEGIN.len();
+            continue;
+        }
+        let header_end = start + header_rel + KEY_SUFFIX.len();
+        out.push_str(&text[cursor..start]);
+        out.push_str("<redacted:pem_private_key>");
+        let Some(end_rel) = text[header_end..].find(END) else {
+            return out;
+        };
+        let end_start = header_end + end_rel;
+        let Some(suffix_rel) = text[end_start..].find(KEY_SUFFIX) else {
+            return out;
+        };
+        cursor = end_start + suffix_rel + KEY_SUFFIX.len();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// `POST /native/session/{id}/export` — bounded bundle (metadata,
-/// transcript, checkpoint/diff identity, proof) with a content digest and
-/// optional recursive redaction of credential-shaped keys/values. Never
-/// includes vault material, cookies or auth headers.
+/// transcript, checkpoint/diff identity, proof) with a content digest.
+/// Secret-shaped material is ALWAYS redacted (credential-shaped keys,
+/// recognizable secret values, PEM private-key blocks and `Bearer` tokens);
+/// `redact:false` is accepted for wire compatibility but can no longer turn
+/// that scan off. Never includes vault material, cookies or auth headers.
 pub(crate) async fn native_session_export(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3416,15 +3581,17 @@ pub(crate) async fn native_session_export(
     let mut transcript = Vec::new();
     let mut transcript_bytes = 0usize;
     let mut truncated = false;
-    let rows = match store.messages_before(handle.id(), None, 1_000) {
-        Ok(rows) => rows,
-        Err(e) => return api_err(&store_err_to_core(e)),
-    };
-    let mut ordered = rows;
+    // ONE page read + ONE bounded batch parts read (the historical export
+    // ran a `parts_of` query per message: up to 1,000 round trips per
+    // export).
+    let mut ordered =
+        match store.messages_window_with_parts(handle.id(), None, None, 1_000, u64::MAX) {
+            Ok(rows) => rows,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
     ordered.reverse();
     let total_messages = ordered.len();
-    for message in &ordered {
-        let parts = store.parts_of(message.id).unwrap_or_default();
+    for (message, parts) in &ordered {
         let entry = serde_json::json!({
             "seq": message.seq,
             "role": message.role,
@@ -3501,15 +3668,27 @@ pub(crate) async fn native_session_export(
     };
     let mut proof = Vec::new();
     if let Ok(tasks) = store.list_tasks(handle.id()) {
-        for task in tasks.iter().take(50) {
-            if let Ok(records) = store.verification_record_list_by_task(task.task_id) {
-                for record in records.iter().take(20) {
-                    proof.push(serde_json::json!({
-                        "taskId": task.task_id.raw(),
-                        "revision": record.revision,
-                        "status": record.status,
-                    }));
-                }
+        let tasks: Vec<_> = tasks.into_iter().take(50).collect();
+        let ids: Vec<faktor_core::TaskId> = tasks.iter().map(|task| task.task_id).collect();
+        // ONE batched read (first 20 records per task) instead of one query
+        // per task; regrouped below in the original task order.
+        let mut by_task: std::collections::HashMap<i64, Vec<(i64, String)>> =
+            std::collections::HashMap::new();
+        if let Ok(records) = store.verification_record_head_by_tasks(&ids, 20) {
+            for (task_id, revision, status) in records {
+                by_task.entry(task_id).or_default().push((revision, status));
+            }
+        }
+        for task in tasks {
+            for (revision, status) in by_task
+                .remove(&(task.task_id.raw() as i64))
+                .unwrap_or_default()
+            {
+                proof.push(serde_json::json!({
+                    "taskId": task.task_id.raw(),
+                    "revision": revision,
+                    "status": status,
+                }));
             }
         }
     }
@@ -3535,12 +3714,13 @@ pub(crate) async fn native_session_export(
         },
         "changes": { "checkpoints": diffs, "latestDiff": latest_diff },
         "proof": proof,
-        "redacted": redact,
+        "redacted": true,
     });
+    // Secret hygiene is not opt-out: the scan runs for every export so a
+    // caller-supplied `redact:false` cannot exfiltrate a credential that a
+    // message/title/diff happens to contain.
     let mut redacted_keys = 0usize;
-    if redact {
-        redact_export(&mut bundle, &mut redacted_keys);
-    }
+    redact_export(&mut bundle, &mut redacted_keys);
     let bytes = match serde_json::to_vec(&bundle) {
         Ok(bytes) => bytes,
         Err(e) => return api_err(&faktor_core::Error::internal(format!("export encode: {e}"))),
@@ -3560,7 +3740,8 @@ pub(crate) async fn native_session_export(
         "sessionId": id,
         "digest": digest,
         "bytes": bytes.len(),
-        "redacted": redact,
+        "redacted": true,
+        "redactRequested": redact,
         "redactedFields": redacted_keys,
         "truncated": truncated,
         "bundle": bundle,

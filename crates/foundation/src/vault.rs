@@ -97,6 +97,12 @@ impl SecretVault {
                 "secret label must fit 128 bytes".into(),
             ));
         }
+        if crate::contains_secret_material(label) {
+            return Err(FoundationError::Malformed(
+                "secret label must not contain secret material; the value belongs in the secret field"
+                    .into(),
+            ));
+        }
         let id = new_secret_id();
         std::fs::create_dir_all(self.secrets_dir())
             .map_err(|e| FoundationError::Store(format!("create vault secrets dir: {e}")))?;
@@ -438,6 +444,22 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         let listing = serde_json::to_string(&vault.list().unwrap()).unwrap();
         assert!(!listing.contains("sk-secret-value"));
+    }
+
+    #[test]
+    fn secret_shaped_labels_are_refused_instead_of_persisted_as_metadata() {
+        let (_dir, vault) = vault();
+        let secret = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let err = vault
+            .store("provider", &format!("label {secret}"), b"material")
+            .unwrap_err();
+        assert!(err.to_string().contains("secret material"), "{err}");
+        assert!(
+            vault.list().unwrap().is_empty(),
+            "a refused label persists no row"
+        );
+        // The value itself remains storable: only metadata is constrained.
+        assert!(vault.store("provider", "prod key", b"material").is_ok());
     }
 
     #[test]

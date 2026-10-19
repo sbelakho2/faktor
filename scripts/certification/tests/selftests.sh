@@ -69,6 +69,7 @@ run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --self
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
 run "flake-tolerance.py selftest" python3 scripts/certification/flake-tolerance.py selftest
 run "publish-status.py selftest" python3 scripts/certification/publish-status.py selftest
+run "compile-and-smoke.sh checksum reconcile selftest" bash apps/jetbrains/compile-and-smoke.sh --selftest-checksum
 
 printf '\n=====================\n'
 if [ "$failures" -eq 0 ]; then

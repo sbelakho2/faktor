@@ -105,6 +105,12 @@ pub(crate) struct SessionResources {
     /// PER SESSION (never across the manager) so opening a long session can
     /// never block opens/decodes of every other session.
     pub(crate) ledger_verify_lock: std::sync::Mutex<()>,
+    /// PER-SESSION journal-append change signal. Live journal readers (the
+    /// SSE stream) subscribe to their own session: an append in session B
+    /// must never wake a reader of session A (the old single global watch
+    /// woke every stream — O(streams x appends) empty journal reads under
+    /// fan-out).
+    pub(crate) journal_gen: tokio::sync::watch::Sender<u64>,
 }
 
 /// The in-memory half of the durable op-id allocator: one reserved range
@@ -309,6 +315,30 @@ pub struct SessionManager {
     /// open verifies only entries above it (O(new entries)); a restart
     /// starts empty and re-verifies the surviving stream in full.
     ledger_verified: Mutex<HashMap<SessionId, i64>>,
+    /// Sessions whose open-time ledger + journal verification succeeded,
+    /// each stamped with the store's `corruption_epoch` at that moment.
+    /// A repeat resolution between typed writes is O(1): the historical
+    /// open ran a ledger aggregate + a journal verification transaction
+    /// (4 statements and two JSON state parses) on EVERY request that
+    /// resolved a session. Direct SQL / purge bumps the store epoch, which
+    /// invalidates every entry and forces a full re-verification (so the
+    /// adversarial corruption tests stay fail-closed).
+    open_verified: Mutex<HashMap<SessionId, u64>>,
+    /// The store corruption epoch this process last observed. Kept beside
+    /// the cache so an epoch advance clears the ledger cursor map too (a
+    /// direct SQL mutation can delete ledger rows, which the incremental
+    /// `verified >= max_seq` fast path would otherwise accept).
+    open_verified_epoch: AtomicU64,
+    /// Session rows this process has observed. Session rows are permanent
+    /// (deletion is a lifecycle tombstone; only direct SQL removes one, and
+    /// that bumps the corruption epoch). A repeat resolution therefore needs
+    /// NO point read at all: /native endpoints resolve a session on every
+    /// request, and the store row read was the last per-request SQLite
+    /// round trip left on that path.
+    known_sessions: Mutex<std::collections::HashSet<SessionId>>,
+    /// Monotonic count of real open verifications (not cache hits): the
+    /// deterministic probe that a steady-state resolution path is O(1).
+    open_verifications: AtomicU64,
     pub(crate) artifact_sizes: ArtifactSizes,
     /// Layered lifetime bound (audit 26): wall-clock budget of ONE logical
     /// turn — the prompt operation's deadline and the runtime's per-turn
@@ -416,6 +446,10 @@ impl SessionManager {
             op_id_probe: OpIdLockProbe::default(),
             resources: Mutex::new(HashMap::new()),
             ledger_verified: Mutex::new(HashMap::new()),
+            open_verified: Mutex::new(HashMap::new()),
+            open_verified_epoch: AtomicU64::new(0),
+            known_sessions: Mutex::new(std::collections::HashSet::new()),
+            open_verifications: AtomicU64::new(0),
             artifact_sizes: ArtifactSizes::default(),
             turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
             journal_gen: tokio::sync::watch::channel(0u64).0,
@@ -428,10 +462,16 @@ impl SessionManager {
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Best-effort wake for live journal readers. Called after a durable
-    /// append succeeds; a missed wake only costs one fallback poll.
-    pub(crate) fn note_journal_append(&self) {
+    /// Best-effort wake for live journal readers of THIS session. Called
+    /// after a durable append succeeds; a missed wake only costs one
+    /// fallback poll. The global generation is kept for compatibility
+    /// (`journal_generation`), while subscribers ride the per-session watch
+    /// so another session's append never wakes them.
+    pub(crate) fn note_journal_append(&self, resources: &SessionResources) {
         self.journal_gen
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        resources
+            .journal_gen
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
@@ -540,6 +580,25 @@ impl SessionManager {
             .submit_tagged(DbReadKind::History, move |store| {
                 store
                     .messages_window_with_parts(session, before, after, max_messages, max_bytes)
+                    .map_err(crate::map_store_err)
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// The durable journal page `seq > after` (the SSE catch-up read), off
+    /// the bounded read pool: a reconnect herd of 32 streams must never run
+    /// SQLite I/O inline on the Tokio workers.
+    pub async fn events_range_async(
+        &self,
+        session: SessionId,
+        from_seq: u64,
+        limit: Option<u64>,
+    ) -> faktor_core::Result<Vec<faktor_core::event::Event>> {
+        self.reads
+            .submit_tagged(DbReadKind::History, move |store| {
+                store
+                    .events_range(session, from_seq, limit)
                     .map_err(crate::map_store_err)
                     .map_err(Into::into)
             })
@@ -890,6 +949,7 @@ impl SessionManager {
                     processes: ProcessRegistry::default(),
                     command_lock: std::sync::Mutex::new(()),
                     ledger_verify_lock: std::sync::Mutex::new(()),
+                    journal_gen: tokio::sync::watch::channel(0u64).0,
                 })
             })
             .clone()
@@ -1261,6 +1321,64 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Observe the store's direct-SQL corruption epoch and invalidate every
+    /// cached verdict when it advances.
+    fn observe_corruption_epoch(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let epoch = self.store.corruption_epoch();
+        if epoch > self.open_verified_epoch.load(Ordering::Acquire) {
+            crate::recover_lock(&self.open_verified).clear();
+            crate::recover_lock(&self.ledger_verified).clear();
+            crate::recover_lock(&self.known_sessions).clear();
+            self.open_verified_epoch.store(epoch, Ordering::Release);
+        }
+        epoch
+    }
+
+    /// The ONE open-verification gate behind [`Self::get_session`] and
+    /// [`Self::list_sessions`].
+    ///
+    /// First resolution of a session in this process verifies its typed
+    /// ledger and journal (fail-closed on corruption). Every later
+    /// resolution between typed writes is an O(1) cache hit: the historical
+    /// path ran `MAX(seq)` + a journal verification transaction (four
+    /// statements plus two `AgentState` JSON parses) on EVERY request that
+    /// resolved a session, which dominated tail latency under concurrency.
+    ///
+    /// Invalidation: a direct-SQL mutation or a session purge bumps the
+    /// store's corruption epoch. The next resolution clears every cached
+    /// verdict AND the incremental ledger cursor (a direct deletion can
+    /// move `MAX(seq)` backwards, which the `verified >= max_seq` fast path
+    /// must never accept), then re-verifies in full. Typed writers cannot
+    /// break the invariants, so they leave the cache intact.
+    fn verify_open_cached(&self, handle: &SessionHandle) -> faktor_core::Result<()> {
+        use std::sync::atomic::Ordering;
+        let epoch = self.observe_corruption_epoch();
+        if crate::recover_lock(&self.open_verified)
+            .get(&handle.id())
+            .copied()
+            == Some(epoch)
+        {
+            return Ok(());
+        }
+        // Count the ATTEMPT: a corrupt session fails before any cache
+        // insert, so every later resolution genuinely re-verifies (and the
+        // probe must see each one).
+        self.open_verifications.fetch_add(1, Ordering::Relaxed);
+        self.verify_ledger_open_cached(handle)?;
+        handle.journal_verify_open()?;
+        crate::recover_lock(&self.open_verified).insert(handle.id(), epoch);
+        Ok(())
+    }
+
+    /// Real (non-cache-hit) session open verifications performed by this
+    /// process. Instrumentation for the concurrency probes: a steady-state
+    /// resolution path must stay O(1) and not grow this counter.
+    pub fn open_verification_count(&self) -> u64 {
+        self.open_verifications
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Strictly verify the typed ledger entries this process has not yet
     /// verified for the session, then advance the in-memory verified cursor.
     /// The decode is serialized by the SESSION's own lock (concurrent opens
@@ -1305,22 +1423,25 @@ impl SessionManager {
         self: &Arc<Self>,
         id: SessionId,
     ) -> faktor_core::Result<Option<SessionHandle>> {
-        match self.store.get_session(id).map_err(crate::map_store_err)? {
-            Some(_row) => {
-                let handle = SessionHandle::new(self.clone(), id, self.resources(id));
-                // Open-time typed-ledger verification (audit 27): an entry
-                // that fails its schema decode fails the session open
-                // loudly — never a silent drop.
-                self.verify_ledger_open_cached(&handle)?;
-                // Open-time event-journal verification (audit consolidation):
-                // the bounded store authority checks the seed contract, the
-                // gapless 1..=N span and the tail-vs-projection state
-                // agreement; a torn/corrupt journal fails the open typed.
-                handle.journal_verify_open()?;
-                Ok(Some(handle))
+        self.observe_corruption_epoch();
+        let known = crate::recover_lock(&self.known_sessions).contains(&id);
+        if !known {
+            // First resolution in this process: one durable existence read.
+            if self
+                .store
+                .get_session(id)
+                .map_err(crate::map_store_err)?
+                .is_none()
+            {
+                return Ok(None);
             }
-            None => Ok(None),
+            crate::recover_lock(&self.known_sessions).insert(id);
         }
+        let handle = SessionHandle::new(self.clone(), id, self.resources(id));
+        // Open-time ledger + journal verification (audit 27 /
+        // consolidation), cached per session between typed writes.
+        self.verify_open_cached(&handle)?;
+        Ok(Some(handle))
     }
 
     pub fn list_sessions(
@@ -1328,23 +1449,41 @@ impl SessionManager {
         ws: Option<WorkspaceId>,
     ) -> faktor_core::Result<Vec<SessionHandle>> {
         let rows = self.store.list_sessions(ws).map_err(crate::map_store_err)?;
+        // ONE resources-map lock for the whole listing (the historical body
+        // took the global registry lock once per row), released before the
+        // verification pass so a slow verify never blocks other sessions.
+        let resources: Vec<Arc<SessionResources>> = {
+            let mut map = crate::recover_lock(&self.resources);
+            rows.iter()
+                .map(|r| {
+                    map.entry(r.id)
+                        .or_insert_with(|| {
+                            Arc::new(SessionResources {
+                                ops: OpRegistry::default(),
+                                processes: ProcessRegistry::default(),
+                                command_lock: std::sync::Mutex::new(()),
+                                ledger_verify_lock: std::sync::Mutex::new(()),
+                                journal_gen: tokio::sync::watch::channel(0u64).0,
+                            })
+                        })
+                        .clone()
+                })
+                .collect()
+        };
         let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let handle = SessionHandle::new(self.clone(), r.id, self.resources(r.id));
-            // Open-time typed-ledger verification (audit 27): a corrupt
-            // typed entry fails the session open loudly. Incremental from
-            // this process's verified cursor, exactly like `get_session`.
-            self.verify_ledger_open_cached(&handle)?;
-            // Open-time event-journal verification (audit consolidation):
-            // the same bounded authority as `get_session`, so a session
-            // listed here is one that may be opened. On a large-history
-            // store this adds one covering-index aggregate per session
-            // (O(events) index entries, no row materialization); a
-            // performance-lane regression can fall back to the O(1)
-            // seed/tail points without dropping validation.
-            handle.journal_verify_open()?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for (r, resources) in rows.into_iter().zip(resources) {
+            let handle = SessionHandle::new(self.clone(), r.id, resources);
+            // The same bounded verification authority as `get_session`,
+            // cached per session between typed writes.
+            self.verify_open_cached(&handle)?;
+            ids.push(r.id);
             out.push(handle);
         }
+        // Insert after the verification pass (verification may itself
+        // clear the set on a corruption-epoch advance; never hold this
+        // lock across it).
+        crate::recover_lock(&self.known_sessions).extend(ids);
         Ok(out)
     }
 
@@ -1483,6 +1622,7 @@ impl SessionManager {
         // locks) so nothing references the session in-process any more.
         crate::recover_lock(&self.resources).remove(&id);
         crate::recover_lock(&self.ledger_verified).remove(&id);
+        crate::recover_lock(&self.open_verified).remove(&id);
         Ok(())
     }
 }

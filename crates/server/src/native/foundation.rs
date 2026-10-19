@@ -934,15 +934,15 @@ pub(crate) async fn native_context_preview(
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid context manifest body")),
     };
-    let sid = match parse_session_id(&id) {
-        Ok(s) => s,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
-    match manifest_from_body(foundation, sid, body) {
+    match manifest_from_body(foundation, handle.id(), body) {
         Err(e) => foundation_error(e),
         Ok(manifest) => match manifest.validate() {
             Ok(()) => Json(manifest.usage()).into_response(),
@@ -1018,17 +1018,19 @@ pub(crate) async fn native_context_manifest(
         Ok(q) => q,
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
-    let sid = match parse_session_id(&q.session) {
-        Ok(s) => s,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
     let found = match q.revision {
-        Some(revision) => foundation.context.revision(session_u64(sid), revision),
-        None => foundation.context.latest(session_u64(sid)),
+        Some(revision) => foundation
+            .context
+            .revision(session_u64(handle.id()), revision),
+        None => foundation.context.latest(session_u64(handle.id())),
     };
     match found {
         Ok(Some(manifest)) => Json(serde_json::json!({
@@ -1065,16 +1067,19 @@ pub(crate) async fn native_context_manifests(
         Ok(q) => q,
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
-    let sid = match parse_session_id(&q.session) {
-        Ok(s) => s,
-        Err(e) => return wire_status(e),
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
     };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
-    match foundation.context.page(session_u64(sid), q.before, limit) {
+    match foundation
+        .context
+        .page(session_u64(handle.id()), q.before, limit)
+    {
         Ok(manifests) => Json(serde_json::json!({ "manifests": manifests })).into_response(),
         Err(e) => foundation_error(e),
     }
@@ -1460,6 +1465,9 @@ fn diagnostics_facts(
         });
     }
     if let Ok(connections) = foundation.providers.list() {
+        // ONE health read for the whole diagnostics projection (the
+        // historical loop opened a reader connection per row).
+        let health = foundation.providers.health_all().unwrap_or_default();
         for c in connections {
             providers.push(ProviderSummary {
                 id: c.id.clone(),
@@ -1470,11 +1478,8 @@ fn diagnostics_facts(
                 } else {
                     "none".into()
                 },
-                health: foundation
-                    .providers
-                    .health(&c.id)
-                    .ok()
-                    .flatten()
+                health: health
+                    .get(&c.id)
                     .map(|h| h.state.as_str().to_string())
                     .unwrap_or_else(|| "unprobated".into()),
                 model_count: c.models.len(),

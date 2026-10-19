@@ -25,6 +25,9 @@ pub(crate) mod attachment;
 /// Wave 3 commercial metering routes (usage fold / entitlements / credits).
 pub(crate) mod billing;
 pub(crate) mod board;
+#[cfg(test)]
+#[path = "concurrency_probe_tests.rs"]
+mod concurrency_probe_tests;
 /// The control-plane surface (identity/orgs/members/repositories/approvals;
 /// absent unless the `[cloud]` section is enabled).
 pub(crate) mod control_plane;
@@ -173,21 +176,11 @@ pub(crate) fn parse_session_id(id: &str) -> Result<SessionId, ApiError> {
     Ok(SessionId::new(raw))
 }
 
-/// Strip the JSON string quotes from one serde-serialized enum name IN
-/// PLACE (one allocation instead of the historical
-/// `to_string().trim_matches('"').to_string()`). The fallbacks (`"unknown"`,
-/// `""`) carry no quotes, so they pass through unchanged.
-pub(crate) fn serde_name_in_place(mut raw: String) -> String {
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        raw.remove(0);
-        raw.pop();
-    }
-    raw
-}
-
-/// The snake_case agent-state tag for machine-readable summaries.
+/// The snake_case agent-state tag for machine-readable summaries. The
+/// tag is static (`AgentState::as_tag`, pinned to serde by core's test):
+/// listing N sessions no longer runs N JSON serializations.
 pub(crate) fn agent_state_tag(s: AgentState) -> String {
-    serde_name_in_place(serde_json::to_string(&s).unwrap_or_else(|_| "unknown".into()))
+    s.as_tag().to_string()
 }
 
 // ------------------------------------------------------------ disposal & auth

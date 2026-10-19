@@ -47,11 +47,109 @@
 #                      (apps/jetbrains/frontend/src/test/resources/parity/
 #                      visual-baselines.json); normal runs compare against the
 #                      pinned file and fail on drift
+#   --selftest-checksum  hermetic regression test for target/ checksum
+#                      reconciliation (stale record after a rebuild refreshes;
+#                      a mismatch without a rebuild refuses)
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JETBRAINS="$ROOT/apps/jetbrains"
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | sed 's/.*= //'
+  else
+    return 1
+  fi
+}
+
+# A checksum record beside a LOCAL cargo build output (target/...) is derived
+# state: a rebuild performed by THIS run invalidates it, so this run may
+# refresh it for the rebuilt bytes. A mismatch on a binary this run did NOT
+# rebuild is refused: an operator-supplied/tampered binary must never have its
+# fail-closed trust record laundered by the smoke harness. Records next to
+# binaries outside target/ are never rewritten either.
+reconcile_local_build_checksum() { # bin root rebuilt(0|1) prior_digest
+  local bin="$1" root="$2" rebuilt="$3" before="${4:-}" expected actual
+  case "$bin" in
+    "$root"/target/*)
+      [ -f "$bin.sha256" ] || return 0
+      expected="$(cut -d' ' -f1 "$bin.sha256" 2>/dev/null || true)"
+      actual="$(sha256_of "$bin" || true)"
+      if [ -z "$actual" ]; then
+        echo "FAIL: cannot hash $bin to reconcile $bin.sha256" >&2
+        return 1
+      fi
+      [ "$expected" = "$actual" ] && return 0
+      if [ "$rebuilt" != "1" ]; then
+        echo "FAIL: checksum record $bin.sha256 does not match $bin and this run did not rebuild it (refusing to rewrite a trust record for unverified bytes)" >&2
+        return 1
+      fi
+      if [ -n "$before" ] && [ "$before" = "$actual" ]; then
+        echo "FAIL: checksum record $bin.sha256 does not match $bin and the build did not change the binary (refusing to rewrite a trust record for unverified bytes)" >&2
+        return 1
+      fi
+      echo "[compile-and-smoke] refreshing local build checksum record $bin.sha256 (stale for the rebuilt binary)"
+      printf '%s  %s\n' "$actual" "$(basename "$bin")" > "$bin.sha256"
+      ;;
+  esac
+  return 0
+}
+
+checksum_reconcile_selftest() {
+  local tmp failures=0 good bad
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-checksum-selftest.XXXXXX")" || return 2
+  mkdir -p "$tmp/target/debug" "$tmp/outside"
+  printf '#!/bin/sh\nexit 0\n' >"$tmp/target/debug/faktor-cli"
+  printf '#!/bin/sh\nexit 0\n' >"$tmp/outside/faktor-cli"
+  chmod +x "$tmp/target/debug/faktor-cli" "$tmp/outside/faktor-cli"
+  good="$(sha256_of "$tmp/target/debug/faktor-cli")"
+  bad="$(printf '0%.0s' {1..64})"
+  check() { # name expected actual
+    if [ "$2" = "$3" ]; then
+      echo "[checksum-selftest] ok: $1"
+    else
+      echo "[checksum-selftest] FAIL: $1 (expected $2, got $3)" >&2
+      failures=$((failures + 1))
+    fi
+  }
+  # No record: nothing to reconcile.
+  check 'missing record is not an error' 0 "$(reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 0 '' >/dev/null 2>&1; echo $?)"
+  # Matching record: verified, no rewrite.
+  printf '%s  faktor-cli\n' "$good" >"$tmp/target/debug/faktor-cli.sha256"
+  check 'matching record verifies without a rebuild' 0 "$(reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 0 "$good" >/dev/null 2>&1; echo $?)"
+  # Stale record on an UNREBUILT binary: fail closed and leave the record alone.
+  printf '%s  faktor-cli\n' "$bad" >"$tmp/target/debug/faktor-cli.sha256"
+  check 'stale record without a rebuild refuses' 1 "$(reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 0 "$good" >/dev/null 2>&1; echo $?)"
+  check 'refused record is not rewritten' "$bad" "$(cut -d' ' -f1 "$tmp/target/debug/faktor-cli.sha256")"
+  # Stale record after a rebuild that CHANGED the bytes: refreshed.
+  check 'stale record after a rebuild refreshes' 0 "$(reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 1 "$bad" >/dev/null 2>&1; echo $?)"
+  check 'refreshed record matches the bytes' "$good" "$(cut -d' ' -f1 "$tmp/target/debug/faktor-cli.sha256")"
+  # The build was claimed but the bytes did not change: refuse, do not launder.
+  printf '%s  faktor-cli\n' "$bad" >"$tmp/target/debug/faktor-cli.sha256"
+  check 'rebuild with unchanged bytes refuses' 1 "$(reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 1 "$good" >/dev/null 2>&1; echo $?)"
+  check 'unchanged-bytes record is not rewritten' "$bad" "$(cut -d' ' -f1 "$tmp/target/debug/faktor-cli.sha256")"
+  # Outside target/: left untouched (the product trust gate owns the refusal).
+  printf '%s  faktor-cli\n' "$bad" >"$tmp/outside/faktor-cli.sha256"
+  check 'outside target is not reconciled' 0 "$(reconcile_local_build_checksum "$tmp/outside/faktor-cli" "$tmp" 1 '' >/dev/null 2>&1; echo $?)"
+  check 'outside record is untouched' "$bad" "$(cut -d' ' -f1 "$tmp/outside/faktor-cli.sha256")"
+  # No hasher: refuse rather than silently accept.
+  printf '%s  faktor-cli\n' "$bad" >"$tmp/target/debug/faktor-cli.sha256"
+  # shellcheck disable=SC2123 # deliberate: an empty search path proves fail-closed
+  check 'unavailable hasher fails closed' 1 "$(PATH=/nonexistent; hash -r; reconcile_local_build_checksum "$tmp/target/debug/faktor-cli" "$tmp" 1 '' >/dev/null 2>&1; echo $?)"
+  rm -rf "$tmp"
+  if [ "$failures" -ne 0 ]; then
+    echo "[checksum-selftest] FAIL ($failures assertion(s))" >&2
+    return 1
+  fi
+  echo '[checksum-selftest] PASS'
+  return 0
+}
 
 # Pinned core-fonts environment for the offscreen Swing render: the visual
 # digest derives component bounds from resolved font metrics, so the pinned
@@ -75,9 +173,14 @@ fi
 # `--offline` there).
 EXTRA_JVM_ARGS=""
 SMOKE_SELECTION=()
+SELFTEST_CHECKSUM=0
 KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork ControlExercise Acceptance Edition8ControlExercise Edition8Acceptance Edition8Workflow Edition8Evidence Edition8DaemonDogfood Edition8LiveAcceptance Visual"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --selftest-checksum)
+      SELFTEST_CHECKSUM=1
+      shift
+      ;;
     --write-baselines)
       EXTRA_JVM_ARGS="-Dfaktor.parity.writeBaselines=true"
       echo "[compile-and-smoke] writing pinned visual baselines from this render"
@@ -103,6 +206,12 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# Hermetic regression test for the checksum reconciliation (no toolchain/build).
+if [ "$SELFTEST_CHECKSUM" -eq 1 ]; then
+  checksum_reconcile_selftest
+  exit $?
+fi
 
 # TRUE when the label is selected (an empty selection means the full suite).
 smoke_selected() { # label
@@ -228,50 +337,29 @@ needs_cli_rebuild() {
   [ -n "$newer" ]
 }
 
+NEEDS_CLI_REBUILD=0
 if needs_cli_rebuild; then
+  NEEDS_CLI_REBUILD=1
+fi
+BIN_DIGEST_BEFORE=""
+if [ "$NEEDS_CLI_REBUILD" -eq 1 ] && [ -x "$BIN" ] && [ -f "$BIN.sha256" ]; then
+  BIN_DIGEST_BEFORE="$(sha256_of "$BIN" || true)"
+fi
+REBUILT_CLI=0
+if [ "$NEEDS_CLI_REBUILD" -eq 1 ]; then
   echo "[compile-and-smoke] building faktor-cli (missing or stale: $BIN)"
   (cd "$ROOT" && cargo build -p faktor-cli) || {
     echo "FAIL: cargo build -p faktor-cli" >&2
     exit 1
   }
+  REBUILT_CLI=1
 fi
 if [ ! -x "$BIN" ]; then
   echo "FAIL: $BIN missing or not executable after build" >&2
   exit 1
 fi
 
-# A checksum record beside a LOCAL cargo build output (target/...) is derived
-# state: the rebuild above invalidates it. Reconcile that local record so the
-# product trust gate (which still refuses any genuine mismatch at start) sees
-# the rebuilt bytes. Records next to operator-supplied binaries outside
-# target/ are never rewritten: their fail-closed refusal stands.
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | cut -d' ' -f1
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$1" | sed 's/.*= //'
-  else
-    return 1
-  fi
-}
-case "$BIN" in
-  "$ROOT"/target/*)
-    if [ -f "$BIN.sha256" ]; then
-      expected="$(cut -d' ' -f1 "$BIN.sha256" 2>/dev/null || true)"
-      actual="$(sha256_of "$BIN" || true)"
-      if [ -z "$actual" ]; then
-        echo "FAIL: cannot hash $BIN to reconcile $BIN.sha256" >&2
-        exit 1
-      fi
-      if [ "$expected" != "$actual" ]; then
-        echo "[compile-and-smoke] refreshing local build checksum record $BIN.sha256 (stale for the rebuilt binary)"
-        printf '%s  %s\n' "$actual" "$(basename "$BIN")" > "$BIN.sha256"
-      fi
-    fi
-    ;;
-esac
+reconcile_local_build_checksum "$BIN" "$ROOT" "$REBUILT_CLI" "$BIN_DIGEST_BEFORE" || exit 1
 
 # ---- 2. kotlinc, or the Gradle smoke tasks when it is absent ---------------
 KOTLINC="${KOTLINC:-}"

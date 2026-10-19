@@ -22,6 +22,31 @@ export interface ChatMessage {
   readonly [key: string]: unknown;
 }
 
+/**
+ * The composer can carry up to 32 MiB of raw attachment bytes (base64 on
+ * the wire), so the envelope bound sits above that contract; every handler
+ * still applies its own tighter field/count/byte caps.
+ */
+const MAX_WEBVIEW_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Validate the host<->webview envelope before dispatch: an object (not an
+ * array/null), a non-empty bounded `type`, and a bounded serialized size.
+ * Untrusted webview content cannot hand the host a multi-gigabyte nested
+ * value, a prototype-shaped non-object, or an unbounded command name.
+ */
+function validChatMessage(value: unknown): value is ChatMessage {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const type = (value as { type?: unknown }).type;
+  if (typeof type !== 'string' || type.length === 0 || type.length > 64) return false;
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === 'string' && encoded.length <= MAX_WEBVIEW_MESSAGE_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 /** The extension-side handler the provider delegates every message to. */
 export interface ChatHost {
   handle(message: ChatMessage): void | Promise<void>;
@@ -63,6 +88,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     view.webview.html = this.render(view.webview);
     view.webview.onDidReceiveMessage((message: ChatMessage) => {
+      if (!validChatMessage(message)) return;
       void this.host.handle(message);
     });
     view.onDidDispose(() => {

@@ -36,6 +36,21 @@ function esc(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/// Serialize a value for an inline `<script>` body. `JSON.stringify` alone
+/// leaves `<`, `>` and `&` literal, so a served provider/MCP/model/
+/// diagnostics string containing `</script>` terminates the element and
+/// injects markup into the panel (the nonce CSP blocks injected script
+/// execution, but HTML/UI spoofing and link injection are still injection).
+/// The U+2028/U+2029 escapes keep the result valid JavaScript.
+export function scriptJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 const DESTINATIONS: readonly { key: E8Destination; label: string; hint: string }[] = [
   { key: 'work', label: 'Work', hint: 'Intent, attention, transcript, composer and the live run' },
   { key: 'inspect', label: 'Inspect', hint: 'Plan, diff, verification, evidence and finish proof' },
@@ -297,7 +312,7 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
     <button type="button" class="e8-primary" id="e8-apply" disabled>Apply staged settings</button>
   </footer>
 </div>
-<script nonce="${options.nonce}">window.__faktorE8Initial = ${JSON.stringify(initial)};</script>
+<script nonce="${options.nonce}">window.__faktorE8Initial = ${scriptJson(initial)};</script>
 <script nonce="${options.nonce}" src="${esc(options.scriptUri)}"></script>
 </body>
 </html>`;

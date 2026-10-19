@@ -64,9 +64,9 @@ fn authorize_outcomes_organization(
             )))
         }
     };
-    let Some(service) = state.deps.billing.as_ref() else {
-        return Err(wire_status(billing_disabled()));
-    };
+    // Tenant isolation BEFORE any service/plan lookup: a foreign organization
+    // is the same typed 404 a missing one answers, even when the billing
+    // authority is not wired (never a `billing_disabled` oracle).
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &organization,
@@ -75,6 +75,9 @@ fn authorize_outcomes_organization(
     ) {
         return Err(wire_status(billing_err(denied.into())));
     }
+    let Some(service) = state.deps.billing.as_ref() else {
+        return Err(wire_status(billing_disabled()));
+    };
     match service.check_value_entitlement(
         &organization,
         faktor_cloud::ValueEntitlement::OutcomeAnalytics,
@@ -106,6 +109,36 @@ fn ledger_api_err(e: faktor_agent::OutcomeLedgerError) -> Response {
         other => wire_status(internal_graph_err(format!(
             "engineering outcome ledger: {other}"
         ))),
+    }
+}
+
+/// Process-wide single-flight cache of the DURABLE metrics fold, keyed by
+/// the ledger's monotonic revision. The fold decodes up to 10,000 run
+/// records + settlements; the `/native/outcomes` endpoint is polled, so
+/// recomputing it per request (the historical behavior) was O(ledger) work
+/// per poll under fan-out. A revision bump (append/correction) invalidates
+/// on the next read; the snapshot itself is one consistent transaction.
+#[derive(Default)]
+pub struct OutcomesMetricsCache {
+    cached: tokio::sync::Mutex<Option<(u64, faktor_agent::OutcomeLedgerMetricsReport)>>,
+}
+
+impl OutcomesMetricsCache {
+    async fn report(
+        &self,
+        store: &faktor_store::Store,
+        ledger: &faktor_agent::OutcomeLedger,
+    ) -> Result<faktor_agent::OutcomeLedgerMetricsReport, faktor_agent::OutcomeLedgerError> {
+        let revision = store.outcome_revision();
+        let mut cached = self.cached.lock().await;
+        if let Some((cached_revision, report)) = cached.as_ref() {
+            if *cached_revision == revision {
+                return Ok(*report);
+            }
+        }
+        let report = ledger.metrics()?;
+        *cached = Some((revision, report));
+        Ok(report)
     }
 }
 
@@ -347,8 +380,9 @@ pub(crate) async fn native_outcomes(
         Ok(rows) => rows,
         Err(_) => return wire_status(malformed_body("invalid outcomes page bound")),
     };
-    let ledger = faktor_agent::OutcomeLedger::new(state.deps.session.store());
-    let metrics = match ledger.metrics() {
+    let store = state.deps.session.store();
+    let ledger = faktor_agent::OutcomeLedger::new(store.clone());
+    let metrics = match state.deps.outcomes_cache.report(&store, &ledger).await {
         Ok(report) => report,
         Err(e) => return ledger_api_err(e),
     };

@@ -274,6 +274,12 @@ impl ProviderService {
                 "connection label must be 1..=128 bytes".into(),
             ));
         }
+        if crate::contains_secret_material(&draft.label) {
+            return Err(FoundationError::Malformed(
+                "connection label must not contain secret material; store the value in the vault"
+                    .into(),
+            ));
+        }
         if draft.models.len() > MAX_MODELS_PER_CONNECTION {
             return Err(FoundationError::Oversized(format!(
                 "at most {MAX_MODELS_PER_CONNECTION} model ids per connection"
@@ -518,6 +524,7 @@ impl ProviderService {
                     || parsed.password().is_some()
                     || parsed.query().is_some()
                     || parsed.fragment().is_some()
+                    || crate::contains_secret_material(raw)
                 {
                     return Err(FoundationError::Validation(vec![crate::config::FieldError {
                         key: "proxy_url".into(),
@@ -628,6 +635,30 @@ impl ProviderService {
             )
             .optional()
             .map_err(|e| FoundationError::Store(e.to_string()))
+        })
+    }
+
+    /// Every persisted health row in ONE read (diagnostics used to open one
+    /// reader connection and run one point query per saved connection).
+    pub fn health_all(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ProviderHealth>, FoundationError> {
+        self.db.read("provider health all", |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT connection_id, state, stages_json, observed_ms, detail
+                     FROM provider_health",
+                )
+                .map_err(|e| FoundationError::Store(e.to_string()))?;
+            let rows = stmt
+                .query_map([], map_health)
+                .map_err(|e| FoundationError::Store(e.to_string()))?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let health = row.map_err(|e| FoundationError::Store(e.to_string()))?;
+                out.insert(health.connection_id.clone(), health);
+            }
+            Ok(out)
         })
     }
 
@@ -1169,9 +1200,18 @@ fn validate_id(id: &str) -> Result<(), FoundationError> {
     Ok(())
 }
 
-/// Endpoint classification. Only loopback can be opted into; private LAN,
-/// link-local/metadata and every other special class stay refused under the
-/// current policy (`allow_loopback` is never a LAN bypass).
+/// Endpoint classification. Only loopback can be opted into; every other
+/// special class stays refused under the current policy (`allow_loopback` is
+/// never a LAN/metadata/tunnel bypass).
+///
+/// This validator consumes the ONE egress address authority
+/// ([`faktor_security::network::classify_ip`]) instead of re-deriving ranges.
+/// The historical local table classified IPv4-mapped/NAT64/6to4/Teredo IPv6
+/// spellings as `Public`, so `http://[::ffff:169.254.169.254]` and
+/// `http://[64:ff9b::a9fe:a9fe]` were persisted and then connected as
+/// link-local literals (the resolver never sees literal hosts). The shared
+/// authority classifies every transition form as `Reserved` and refuses the
+/// whole set, so those aliases now fail closed at save time.
 pub fn validate_endpoint(
     endpoint: &str,
     allow_loopback: bool,
@@ -1194,79 +1234,70 @@ pub fn validate_endpoint(
             "endpoint must not embed userinfo credentials".into(),
         ));
     }
-    let Some(host) = url.host_str() else {
+    if crate::contains_secret_material(endpoint) {
+        return Err(FoundationError::Malformed(
+            "endpoint must not embed secret material; store the value in the vault and reference it with credential_ref"
+                .into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(FoundationError::Malformed(
+            "endpoint must not carry a query or fragment; credentials belong in the vault reference".into(),
+        ));
+    }
+    let Some(host) = url.host() else {
         return Err(FoundationError::Malformed("endpoint has no host".into()));
     };
-    let class = classify_host(host);
+    let host_text = host.to_string();
+    let class = match host {
+        url::Host::Domain(domain) => {
+            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                EndpointClass::Loopback
+            } else {
+                EndpointClass::Public
+            }
+        }
+        url::Host::Ipv4(ip) => endpoint_class(faktor_security::network::classify_ip(
+            std::net::IpAddr::V4(ip),
+        )),
+        url::Host::Ipv6(ip) => endpoint_class(faktor_security::network::classify_ip(
+            std::net::IpAddr::V6(ip),
+        )),
+    };
     match class {
-        HostClass::Loopback => {
+        EndpointClass::Loopback => {
             if !allow_loopback {
                 return Err(FoundationError::Malformed(format!(
-                    "endpoint {host} is loopback; provider {id} must opt in with allow_loopback"
+                    "endpoint {host_text} is loopback; provider {id} must opt in with allow_loopback"
                 )));
             }
         }
-        HostClass::PrivateLan | HostClass::LinkLocal => {
+        EndpointClass::Special(address_class) => {
             return Err(FoundationError::Malformed(format!(
-                "endpoint {host} is a private/LAN destination; current provider policy refuses it (allow_loopback is not a LAN bypass)"
+                "endpoint {host_text} is a {class} destination; current provider policy refuses it (allow_loopback is not a LAN/metadata bypass)",
+                class = AddressClass::as_str(address_class)
             )))
         }
-        HostClass::Public => {}
+        EndpointClass::Public => {}
     }
     Ok(())
 }
 
+use faktor_security::network::AddressClass;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostClass {
+enum EndpointClass {
     Loopback,
-    PrivateLan,
-    LinkLocal,
+    Special(AddressClass),
     Public,
 }
 
-fn classify_host(host: &str) -> HostClass {
-    let lower = host.trim_end_matches('.').to_ascii_lowercase();
-    if lower == "localhost" {
-        return HostClass::Loopback;
-    }
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        return classify_ip(ip);
-    }
-    HostClass::Public
-}
-
-fn classify_ip(ip: std::net::IpAddr) -> HostClass {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            if v4.is_loopback() {
-                HostClass::Loopback
-            } else if v4.is_link_local() {
-                HostClass::LinkLocal
-            } else if o[0] == 10
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-            {
-                HostClass::PrivateLan
-            } else {
-                HostClass::Public
-            }
-        }
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                HostClass::Loopback
-            } else if v6.is_unicast_link_local() {
-                HostClass::LinkLocal
-            } else {
-                let first = v6.segments()[0];
-                if first & 0xfe00 == 0xfc00 {
-                    HostClass::PrivateLan
-                } else {
-                    HostClass::Public
-                }
-            }
-        }
+fn endpoint_class(class: AddressClass) -> EndpointClass {
+    match class {
+        AddressClass::Global => EndpointClass::Public,
+        AddressClass::Loopback => EndpointClass::Loopback,
+        other => EndpointClass::Special(other),
     }
 }
 
@@ -1347,15 +1378,79 @@ mod tests {
     }
 
     #[test]
+    fn secret_shaped_labels_endpoints_and_proxies_are_refused_before_persistence() {
+        let secret = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        // Endpoint PATH bytes are served back, exported by diagnostics and
+        // logged: a recognizable secret there must be refused typed.
+        let err = validate_endpoint(&format!("https://api.example.com/v1/{secret}"), false, "c")
+            .unwrap_err();
+        assert!(err.to_string().contains("secret material"), "{err}");
+        // Labels are metadata served by every connection listing.
+        let dir = tempfile::tempdir().unwrap();
+        let db = FoundationDb::open(dir.path().join("f.db")).unwrap();
+        let service = ProviderService::new(
+            db,
+            SecretVault::new(
+                FoundationDb::open(dir.path().join("v.db")).unwrap(),
+                dir.path(),
+            ),
+        );
+        let mut over = draft("openai", "https://api.example.com/v1", None);
+        over.label = format!("prod {secret}");
+        let err = service.save(&over, None).unwrap_err();
+        assert!(err.to_string().contains("secret material"), "{err}");
+        // The proxy boundary rejects the same bytes (no persistence).
+        let mut over = draft("openai", "https://api.example.com/v1", None);
+        over.proxy_url = Some(format!("http://proxy.example.com/{secret}"));
+        let err = service.save(&over, None).unwrap_err();
+        assert!(err.to_string().contains("proxy_url"), "{err}");
+    }
+
+    #[test]
     fn endpoint_policy_refuses_lan_and_requires_loopback_opt_in() {
         assert!(validate_endpoint("http://127.0.0.1:11434", true, "c").is_ok());
         assert!(validate_endpoint("http://127.0.0.1:11434", false, "c").is_err());
+        assert!(validate_endpoint("http://[::1]:11434", true, "c").is_ok());
+        assert!(validate_endpoint("http://[::1]:11434", false, "c").is_err());
         assert!(validate_endpoint("http://192.168.1.5:8080", true, "c").is_err());
         assert!(validate_endpoint("http://10.0.0.1", true, "c").is_err());
         assert!(validate_endpoint("http://169.254.169.254", true, "c").is_err());
         assert!(validate_endpoint("https://api.example.com/v1", false, "c").is_ok());
         assert!(validate_endpoint("ftp://api.example.com", false, "c").is_err());
         assert!(validate_endpoint("https://user:pw@api.example.com", false, "c").is_err());
+        // URL aliases that the shared address authority classifies as
+        // special-purpose (IPv4-mapped/NAT64/6to4/Teredo/documentation/
+        // unspecified) must never be persisted, even with allow_loopback.
+        for alias in [
+            "http://[::ffff:127.0.0.1]:11434",
+            "http://[::ffff:169.254.169.254]",
+            "http://[::ffff:10.0.0.1]",
+            "http://[64:ff9b::a9fe:a9fe]",
+            "http://[64:ff9b:1::a9fe:a9fe]",
+            "http://[2002:a9fe:a9fe::1]",
+            "http://[2001::a9fe:a9fe]",
+            "http://[2001:db8::1]",
+            "http://[::]",
+            "http://0.0.0.0",
+            "http://198.18.0.1",
+            "http://224.0.0.1",
+        ] {
+            assert!(
+                validate_endpoint(alias, true, "c").is_err(),
+                "{alias} must be refused as a special-purpose destination"
+            );
+        }
+        // Query/fragment endpoints would leak credentials into diagnostics
+        // and error text; they are not a valid provider base URL.
+        for unsafe_url in [
+            "https://api.example.com/v1?api_key=sk-secret",
+            "https://api.example.com/v1#token",
+        ] {
+            assert!(
+                validate_endpoint(unsafe_url, false, "c").is_err(),
+                "{unsafe_url} must be refused"
+            );
+        }
     }
 
     #[test]

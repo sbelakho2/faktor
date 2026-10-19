@@ -312,3 +312,58 @@ fn approval_null_parameter_plan_uses_the_org_index() {
         "the real NULL-status parameter plan regressed: {details:?}"
     );
 }
+
+/// The per-request auth/tenant gate is a fixed set of POINT lookups (token
+/// hash -> session/service account -> user -> organization -> membership).
+/// Each statement must stay index-backed: a table scan or a per-row N+1
+/// membership lookup would turn every authenticated request into O(rows).
+#[test]
+fn auth_and_tenant_gate_queries_are_index_point_lookups() {
+    let store = SqliteControlPlaneStore::open_in_memory().unwrap();
+    seed(&store);
+    let conn = store.lock().unwrap();
+    let cases: &[(&str, &[&dyn rusqlite::types::ToSql])] = &[
+        (
+            "SELECT payload FROM cp_auth_session WHERE token_hash = ?1",
+            &[&"hash" as &dyn rusqlite::types::ToSql],
+        ),
+        (
+            "SELECT payload FROM cp_service_account WHERE token_hash = ?1",
+            &[&"hash" as &dyn rusqlite::types::ToSql],
+        ),
+        (
+            "SELECT payload FROM cp_membership WHERE organization_id = ?1 AND user_id = ?2",
+            &[
+                &"org-0" as &dyn rusqlite::types::ToSql,
+                &"usr" as &dyn rusqlite::types::ToSql,
+            ],
+        ),
+        (
+            "SELECT payload FROM cp_user WHERE id = ?1",
+            &[&"usr" as &dyn rusqlite::types::ToSql],
+        ),
+        (
+            "SELECT payload FROM cp_organization WHERE id = ?1",
+            &[&"org-0" as &dyn rusqlite::types::ToSql],
+        ),
+    ];
+    for (sql, values) in cases {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let mut rows = stmt.query(*values).unwrap();
+        let mut details = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            details.push(row.get::<_, String>(3).unwrap());
+        }
+        assert!(!details.is_empty(), "no plan for {sql}");
+        for detail in &details {
+            assert!(
+                !detail.contains("SCAN "),
+                "auth/tenant gate query regressed to a scan ({sql}): {details:?}"
+            );
+            assert!(
+                detail.contains("SEARCH "),
+                "auth/tenant gate query is not a point lookup ({sql}): {details:?}"
+            );
+        }
+    }
+}

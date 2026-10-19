@@ -87,11 +87,18 @@ function percentile(values, fraction) {
 }
 
 function summary(values) {
+  // One sort serves p50/p95/p99: the historical helper copied+sorted the
+  // same sample set three times per probe (12 calls per full run).
+  const sorted = values.length === 0 ? [] : [...values].sort((a, b) => a - b);
+  const at = (fraction) =>
+    sorted.length === 0
+      ? 0
+      : sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
   return {
     n: values.length,
-    p50: Number(percentile(values, 0.5).toFixed(3)),
-    p95: Number(percentile(values, 0.95).toFixed(3)),
-    p99: Number(percentile(values, 0.99).toFixed(3)),
+    p50: Number(at(0.5).toFixed(3)),
+    p95: Number(at(0.95).toFixed(3)),
+    p99: Number(at(0.99).toFixed(3)),
     max: Number(Math.max(...values, 0).toFixed(3)),
   };
 }
