@@ -46,7 +46,7 @@
 # the Rust channel authority.
 #
 # Hermetic toolchain (P1): the PR lanes run NO apt either. The stock baselines
-# already ship the tools their old apt steps installed (python3, ps, unzip,
+# already ship the tools their old apt steps installed (ps, unzip,
 # ca-certificates) and keep their digest pins because they install nothing;
 # the JetBrains build and smoke lanes run on the dedicated Faktor CI image
 # from `docker/faktor-ci/Dockerfile` (git + JDK 17 included), referenced by
@@ -184,8 +184,8 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
     commands:
-      # No apt: the digest-pinned rust:1.98.0 baseline already ships python3,
-      # procps and ca-certificates (verified: `python3`, `ps`, unzip, curl and
+      # No apt: the digest-pinned rust:1.98.0 baseline already ships procps and
+      # ca-certificates (verified: `ps`, unzip, curl and
       # /etc/ssl/certs/ca-certificates.crt are present); the stock image is
       # kept because the lane installs nothing.
       # rust-toolchain.toml is authoritative; fail loudly if the shim does not resolve it.
@@ -200,15 +200,18 @@ steps:
       - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # Change-aware pull lane: only the affected crates/suites run by
-      # default. The selection is conservative (reverse-dependency closure);
-      # an unmapped path is a typed refusal escalated to the full workspace
-      # test and recorded in the selection evidence — never a silent skip.
-      # Trusted/nightly full lanes keep `cargo test --workspace` (see
-      # .woodpecker/trusted/).
+      # Change-aware pull lane: the affected crates/suites run first so a
+      # failure surfaces quickly. The selection is conservative
+      # (reverse-dependency closure); an unmapped path is a typed refusal.
+      # The canonical full workspace test still runs afterwards: gate parity
+      # (`scripts/certify.sh --check-gate-parity`) requires the PR linux lane
+      # to execute every canonical gate command, so a selection miss can
+      # never pass this lane.
       - cargo build -p faktor-cli
-      # Only the affected Rust command set selected by programme-selection.
+      # Affected Rust command set selected by programme-selection (fast feedback).
       - sh target/certification/programme/selected-cargo.sh
+      # Canonical full gate set (matches scripts/certify.sh canonical_gate_commands).
+      - cargo test --workspace --all-features
       - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
@@ -223,6 +226,7 @@ steps:
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo build -p faktor-cli
         sh target/certification/programme/selected-cargo.sh
+        cargo test --workspace --all-features
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
@@ -309,7 +313,7 @@ steps:
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     commands:
       # No apt: the digest-pinned node:24 baseline already ships unzip and
-      # ca-certificates (verified: `unzip`, `python3`, curl and
+      # ca-certificates (verified: `unzip`, curl and
       # /etc/ssl/certs/ca-certificates.crt are present); the stock image is
       # kept because the lane installs nothing.
       - cd apps/vscode
@@ -378,6 +382,11 @@ steps:
   # documents for this image (`id -u` = 0 refuses to start Chrome otherwise).
   - name: vscode-render
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as the trusted vscode-e2e lane; chromium runtime included)
+    # Steps of one workflow share the workspace. Both lanes run `npm ci` and
+    # `npm run build`, so running them concurrently lets one wipe the other's
+    # node_modules mid-build (the observed `npx --no-install vsce` failure).
+    # Serialize them; the render lane reuses the installed tree.
+    depends_on: [vscode]
     commands:
       - cd apps/vscode
       - npm ci

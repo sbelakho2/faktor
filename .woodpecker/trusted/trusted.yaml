@@ -614,7 +614,8 @@ steps:
         platform: darwin/arm64
     commands:
       - cargo check --workspace
-      - if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped: node unavailable"; fi
+      - >-
+        if command -v node >/dev/null 2>&1; then node apps/vscode/scripts/edition5-control-exercise.mjs && node apps/vscode/scripts/edition5-acceptance.mjs; else echo "edition5 macOS host exercise skipped:node unavailable"; fi
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -869,8 +870,8 @@ steps:
   # boundary; the isolated real-daemon dogfood for both hosts runs in the
   # darwin-edition8 lane where the host toolchain exists.
   - name: edition8
-    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-render/vscode-e2e; chromium runtime included)
-    depends_on: [linux, vscode, vscode-render, jetbrains-build, jetbrains-smoke]
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-e2e; chromium runtime included)
+    depends_on: [linux, vscode, jetbrains-build, jetbrains-smoke]
     commands:
       - |
         set -eu

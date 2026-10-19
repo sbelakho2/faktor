@@ -746,7 +746,13 @@ export async function launchChrome(chrome) {
   if (!page) {
     throw new Error('no page target in chrome');
   }
-  return { child, profile, pageWs: page.webSocketDebuggerUrl };
+  // Chrome reports the target URL on `localhost`, which may resolve to ::1
+  // first in a Linux container while Chrome binds the DevTools listener on
+  // 127.0.0.1 only. Pin the websocket host to the address we just proved
+  // reachable with /json/list.
+  const pageWsUrl = new URL(page.webSocketDebuggerUrl);
+  pageWsUrl.hostname = '127.0.0.1';
+  return { child, profile, pageWs: pageWsUrl.toString() };
 }
 
 const MEASURE_SCRIPT = `(() => {
