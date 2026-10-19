@@ -594,11 +594,17 @@ async function main() {
           perKTok(compactionSamples.length - compDecile, compDecile) /
           Math.max(perKTok(0, compDecile), 0.0001);
         const midDecile = Math.max(1, Math.floor(TURNS / 2));
-        const steadyCurve =
-          percentile(turnSamples.slice(-decile), 0.5) /
-          Math.max(percentile(turnSamples.slice(midDecile, midDecile + decile), 0.5), 0.05);
+        const firstP50 = percentile(turnSamples.slice(0, decile), 0.5);
+        const midP50 = percentile(turnSamples.slice(midDecile, midDecile + decile), 0.5);
+        const lastP50 = percentile(turnSamples.slice(-decile), 0.5);
+        const steadyCurve = lastP50 / Math.max(midP50, 0.05);
         assert('turns-compaction', turnCurve <= 20, `turn latency curve ${turnCurve.toFixed(2)} looks super-linear`);
-        assert('turns-compaction', steadyCurve <= 2, `steady-state turn latency curve ${steadyCurve.toFixed(2)} is not a plateau`);
+        assert(
+          'turns-compaction',
+          steadyCurve <= 2,
+          `steady-state turn latency curve ${steadyCurve.toFixed(2)} is not a plateau ` +
+            `(first p50 ${firstP50.toFixed(3)}ms, mid p50 ${midP50.toFixed(3)}ms, last p50 ${lastP50.toFixed(3)}ms)`,
+        );
         assert('turns-compaction', percentile(turnSamples, 0.95) <= 15_000, 'p95 turn latency exceeds 15s');
         assert('turns-compaction', compactionCurve <= 3, `compaction ms/1k-token curve ${compactionCurve.toFixed(2)} looks super-linear`);
         return {
