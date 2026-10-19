@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-19T10:55:42.253Z",
-  "commit": "8dddc1acd0c7b08c0169adda3be098ef9df734f6",
-  "tree": "5e77638ecb1864f0878c6caf57c7398ef1dfbd5b",
+  "generated_at": "2026-10-19T11:48:59.895Z",
+  "commit": "dbd528b43a6039c9cc72a8040f0a4075f734455d",
+  "tree": "6bd6942115a34d90bcbefea9ff432bae43705e18",
   "layers": [
     "structural",
     "unit",
@@ -20987,7 +20987,7 @@
           "hostile": {
             "case": "query:q=%F0%9F%92%A9%00",
             "status": 200,
-            "bytes": 790
+            "bytes": 789
           }
         }
       }
@@ -26106,7 +26106,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/d7ee83181cac4d25b171e8207a7b46e9"
+              "handle": "vault://provider_key/5af9846aed1d1f854ad1b27fd9fc6903"
             }
           },
           {
