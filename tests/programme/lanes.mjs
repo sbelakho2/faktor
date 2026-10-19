@@ -8,8 +8,9 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
 import { LANE_SCHEMA, LANES, LAYERS, canonicalJson } from './model.mjs';
@@ -185,21 +186,30 @@ export function validateLaneEncoding() {
 }
 
 /** Deterministic plan for one lane. */
-export function lanePlan(lane, { changedFiles = [], base = null, mode = null } = {}) {
+export function lanePlan(
+  lane,
+  { changedFiles = [], base = null, mode = null, selection: providedSelection = null } = {},
+) {
   const spec = LANES[lane];
   const plan = LANE_PLANS[lane];
   if (!spec || !plan) throw new Error(`unknown lane ${lane}`);
   const commands = [];
   const entries = [];
+  const seen = new Set();
+  const push = (entry) => {
+    if (seen.has(entry.command)) return;
+    seen.add(entry.command);
+    entries.push(entry);
+  };
   const selectionMode = plan.selection === 'full' ? 'trusted' : mode ?? 'pull';
   let selection = null;
   if (lane === 'pull') {
-    selection = select(changedFiles, { mode: selectionMode, base });
+    selection = providedSelection ?? select(changedFiles, { mode: selectionMode, base });
     for (const command of selection.commands) {
-      entries.push({ command, suite: 'affected', layers: ['unit', 'property', 'fault', 'integration'] });
+      push({ command, suite: 'affected', layers: ['unit', 'property', 'fault', 'integration'] });
     }
     if (selection.refused) {
-      entries.push({
+      push({
         command: 'cargo test --workspace --all-features',
         suite: 'affected-refusal-fallback',
         layers: ['unit', 'property', 'fault', 'integration'],
@@ -208,8 +218,7 @@ export function lanePlan(lane, { changedFiles = [], base = null, mode = null } =
   }
   for (const suite of plan.suites) {
     for (const command of SUITES[suite].commands) {
-      if (entries.some((entry) => entry.command === command)) continue;
-      entries.push({ command, suite, layers: [...SUITES[suite].layers] });
+      push({ command, suite, layers: [...SUITES[suite].layers] });
     }
   }
   for (const entry of entries) commands.push(entry.command);
@@ -235,6 +244,20 @@ function git(args) {
   }
 }
 
+const TAIL_LINES = 80;
+const TAIL_BYTES = 16 * 1024;
+
+/** Keep the evidence tail bounded in BOTH lines and bytes. */
+function tail(value) {
+  let text = String(value ?? '');
+  const lines = text.split('\n');
+  if (lines.length > TAIL_LINES) text = lines.slice(-TAIL_LINES).join('\n');
+  if (Buffer.byteLength(text) > TAIL_BYTES) {
+    text = Buffer.from(text).subarray(-TAIL_BYTES).toString('utf8');
+  }
+  return text;
+}
+
 function run(command) {
   const started = Date.now();
   const proc = spawnSync('bash', ['-lc', command], {
@@ -244,13 +267,10 @@ function run(command) {
     maxBuffer: 64 * 1024 * 1024,
     env: { ...process.env, CI: process.env.CI ?? '', NO_COLOR: '1' },
   });
-  const tail = (value) =>
-    String(value ?? '')
-      .split('\n')
-      .slice(-80)
-      .join('\n');
   const stdout = String(proc.stdout ?? '');
-  const passedTests = [...stdout.matchAll(/^test (\S+) \.\.\. ok$/gm)].map((match) => match[1]);
+  const passedTests = [
+    ...new Set([...stdout.matchAll(/^test (\S+) \.\.\. ok$/gm)].map((match) => match[1])),
+  ];
   return {
     command,
     status: proc.status === 0 ? 'passed' : 'failed',
@@ -264,7 +284,7 @@ function run(command) {
 }
 
 export function runLane(lane, options = {}) {
-  const plan = lanePlan(lane, options);
+  const plan = options.plan ?? lanePlan(lane, options);
   const results = [];
   for (const entry of plan.entries) {
     console.log(`[programme:${lane}] $ ${entry.command}`);
@@ -274,11 +294,13 @@ export function runLane(lane, options = {}) {
       console.error(`[programme:${lane}] FAILED: ${entry.command}`);
     }
   }
+  const revision = git(['rev-parse', 'HEAD', 'HEAD^{tree}']);
+  const [commit = null, tree = null] = revision ? revision.split('\n') : [];
   const document = {
     schema: LANE_SCHEMA,
     lane,
-    commit: git(['rev-parse', 'HEAD']),
-    tree: git(['rev-parse', 'HEAD^{tree}']),
+    commit,
+    tree,
     clean: (git(['status', '--porcelain', '--untracked-files=no']) ?? '') === '',
     started_at: new Date().toISOString(),
     layers: plan.layers,
@@ -296,16 +318,29 @@ export function runLane(lane, options = {}) {
   return document;
 }
 
-/** Promote rows whose own test id appears as a passed libtest entry. */
-export function mergeTestsIntoStatus(document) {
-  const statusPath = resolve(ROOT, 'target/certification/programme/registry-status.json');
-  if (!existsSync(statusPath)) return;
-  let status;
+const STATUS_CACHE = new Map();
+
+function loadStatus(path) {
+  let stat;
   try {
-    status = JSON.parse(readFileSync(statusPath, 'utf8'));
+    stat = statSync(path);
   } catch {
-    return;
+    return null;
   }
+  const key = `${stat.size}:${stat.mtimeMs}`;
+  const cached = STATUS_CACHE.get(path);
+  if (cached !== undefined && cached.key === key) return cached.document;
+  try {
+    const document = JSON.parse(readFileSync(path, 'utf8'));
+    STATUS_CACHE.set(path, { key, document });
+    return document;
+  } catch {
+    return null;
+  }
+}
+
+/** Collected passed libtest names, including their leaf segment. */
+export function collectPassedTests(document) {
   const passed = new Set();
   for (const result of document.results ?? []) {
     for (const test of result.passed_tests ?? []) {
@@ -314,7 +349,11 @@ export function mergeTestsIntoStatus(document) {
       if (leaf) passed.add(leaf);
     }
   }
-  if (passed.size === 0) return;
+  return passed;
+}
+
+/** Pure promotion pass over one already-parsed status document. */
+export function promoteStatus(status, passed, document) {
   let changed = false;
   for (const row of status.rows ?? []) {
     if (row.status === 'failed') continue;
@@ -327,7 +366,26 @@ export function mergeTestsIntoStatus(document) {
       changed = true;
     }
   }
-  if (changed) writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+  return changed;
+}
+
+/** Promote rows whose own test id appears as a passed libtest entry. */
+export function mergeTestsIntoStatus(document) {
+  const passed = collectPassedTests(document);
+  if (passed.size === 0) return;
+  const statusPath = resolve(ROOT, 'target/certification/programme/registry-status.json');
+  if (!existsSync(statusPath)) return;
+  const status = loadStatus(statusPath);
+  if (status === null) return;
+  if (promoteStatus(status, passed, document)) {
+    writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+    try {
+      const stat = statSync(statusPath);
+      STATUS_CACHE.set(statusPath, { key: `${stat.size}:${stat.mtimeMs}`, document: status });
+    } catch {
+      STATUS_CACHE.delete(statusPath);
+    }
+  }
 }
 
 export function selftest() {
@@ -391,6 +449,40 @@ export function selftest() {
     'an unmapped pull change falls back to the full workspace test, recorded',
     refused.selection?.refused && refused.commands.includes('cargo test --workspace --all-features'),
   );
+  const promotion = {
+    rows: [
+      { id: 'a', status: 'deferred', test_ids: ['crate::test_a', 'test_b'] },
+      { id: 'b', status: 'deferred', test_ids: ['test_b'] },
+      { id: 'c', status: 'deferred', test_ids: ['missing'] },
+      { id: 'd', status: 'failed', test_ids: ['test_a'] },
+    ],
+  };
+  const promoted = promoteStatus(
+    promotion,
+    collectPassedTests({ results: [{ passed_tests: ['crate::test_a', 'test_b'] }] }),
+    { lane: 'pull', commit: 'abc' },
+  );
+  check(
+    'passed tests promote every matched row except failed ones',
+    promoted === true &&
+      promotion.rows[0].status === 'proven' &&
+      promotion.rows[1].status === 'proven' &&
+      promotion.rows[2].status === 'deferred' &&
+      promotion.rows[3].status === 'failed',
+  );
+  const bulkRows = Array.from({ length: 10_000 }, (_, index) => ({
+    id: `row.${index}`,
+    status: 'deferred',
+    test_ids: [`bulk.test.${index}`],
+  }));
+  const bulkPassed = new Set(bulkRows.map((row) => row.test_ids[0]));
+  const bulkStart = performance.now();
+  const bulkChanged = promoteStatus({ rows: bulkRows }, bulkPassed, { lane: 'pull', commit: 'abc' });
+  const bulkMs = performance.now() - bulkStart;
+  check(
+    `10k-row evidence promotion is one linear pass (${Math.round(bulkMs)} ms < 2000 ms)`,
+    bulkChanged === true && bulkMs < 2000 && bulkRows[bulkRows.length - 1].status === 'proven',
+  );
   if (failures > 0) {
     console.error(`lane selftest: ${failures} failure(s)`);
     return 1;
@@ -415,8 +507,8 @@ export function main() {
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '--changed-file' && index + 1 < args.length) changed.push(args[index + 1]);
   }
-  const plan = lanePlan(lane, { changedFiles: changed, base: arg('base') });
   if (args.includes('--print-plan')) {
+    const plan = lanePlan(lane, { changedFiles: changed, base: arg('base') });
     process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
     return 0;
   }

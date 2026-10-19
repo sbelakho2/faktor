@@ -5,15 +5,22 @@
 
 use super::*;
 
-/// All durable facts of one session (bounded page scan).
-pub(crate) fn parent_facts(
+/// All durable facts of ONE kind (indexed kind page scan). Settlement reads
+/// are kind-scoped: a session's fact space also carries every per-turn
+/// `taskexec_run`/memory row, so walking the whole space to find a run's
+/// registry/plan rows grew with total history. The `(kind, session_id)`
+/// index makes this independent of unrelated churn.
+pub(crate) fn facts_of_kind(
     handle: &faktor_session::SessionHandle,
-) -> faktor_core::Result<Vec<(String, String, String)>> {
+    kind: &str,
+) -> faktor_core::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut after: Option<(i64, String, String)> = None;
-    for _ in 0..64 {
-        let page = handle.memory_facts_page(after.as_ref(), 200)?;
-        out.extend(page.facts);
+    loop {
+        let page = handle.memory_facts_by_kind_page(kind, after.as_ref(), 500)?;
+        for (_, key, value) in page.facts {
+            out.push((key, value));
+        }
         match page.cursor {
             Some(c) => after = Some(c),
             None => break,

@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-18T19:55:40.033Z",
-  "commit": "ec502901cf1d0b0318114f6d88340fb67f99e71e",
-  "tree": "6341fd190e8e6d3df73a71d16900db02a1fc738a",
+  "generated_at": "2026-10-19T00:00:55.231Z",
+  "commit": "b3ec030530b5156344f6f54b35839d778eeacfb8",
+  "tree": "26fc4d35d799b921ba0a2216862bd891fa843654",
   "layers": [
     "structural",
     "unit",
@@ -39,8 +39,7 @@
     },
     "by_status": {
       "deferred": 557,
-      "failed": 2,
-      "proven": 293,
+      "proven": 295,
       "stub": 62
     },
     "by_lane": {
@@ -1194,7 +1193,7 @@
       ],
       "evidence_kind": "static-scan",
       "oracle": "No ELF core, minidump or Mach-O core above the allowlisted size is reachable from HEAD or any ref; a removed-but-untracked dump is reported too.",
-      "status": "failed",
+      "status": "proven",
       "meta": {
         "report_row": 19
       },
@@ -1204,8 +1203,22 @@
         "corruption"
       ],
       "evidence": {
-        "passed": false,
-        "reason": "large crash artifact(s)/unallowlisted blobs: tree:qemu_chrome_20261018-133409_41.core (89522176 bytes, elf-core), tree:qemu_chrome_20261018-133409_43.core (89534464 bytes, elf-core), history:qemu_chrome_20261018-133409_41.core (89522176 bytes, elf-core), history:qemu_chrome_20261018-133409_43.core (89534464 bytes, elf-core)"
+        "passed": true,
+        "observed": {
+          "tree_findings": 0,
+          "history_findings": 0,
+          "findings": [],
+          "limits": {
+            "core_bytes": 8388608,
+            "generic_bytes": 67108864
+          },
+          "allowlist": [
+            "Faktor_IDE_UI_UX_3.pdf",
+            "Report.pdf",
+            "apps/vscode/scripts/baselines/edition5/darwin/contact.png",
+            "apps/vscode/scripts/baselines/edition8/macos.json"
+          ]
+        }
       }
     },
     {
@@ -1463,7 +1476,7 @@
       ],
       "evidence_kind": "static-scan",
       "oracle": "No lazy task_id() read in a settlement write path: every settlement mutation threads the admitted TaskId or a *_bound call; the reviewed baseline only shrinks.",
-      "status": "failed",
+      "status": "proven",
       "meta": {
         "report_row": "1-static"
       },
@@ -1473,8 +1486,60 @@
         "corruption"
       ],
       "evidence": {
-        "passed": false,
-        "reason": "crates/orchestrator/src/runtime.rs:981: lazy task_id() read inside derive_child_projection_from (banned settlement path; annotate only a reviewed non-settlement projection); crates/orchestrator/src/runtime.rs:2089: lazy task_id() read inside put_plan_row (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/turn/state.rs:1385: lazy task_id() read inside review_durable_criteria (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/turn/state.rs:2513: lazy task_id() read inside seed_task_attachments (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/compaction.rs:981: lazy task_id() read inside compaction_projection (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/compaction.rs:1145: lazy task_id() read inside budgeted_summarizer (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/retrieval.rs:948: lazy task_id() read inside latest_attempt_record (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/retrieval.rs:987: lazy task_id() read inside learning_corpus_evidence (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/runtime/verification_attribution.rs:919: lazy task_id() read inside run_independent_review_call (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/outcome_ledger.rs:2558: lazy task_id() read inside finalize_economic_settlement (banned settlement path; annotate only a reviewed non-settlement projection); crates/agent/src/outcome_ledger.rs:2606: lazy task_id() read inside derive_terminal_run (banned settlement path; annotate only a reviewed non-settlement projection); crates/orchestrator/src/runtime_helpers.rs:32: lazy task_id() read inside child_task_budget_cap (banned settlement path; annotate only a reviewed non-settlement projection)"
+        "passed": true,
+        "observed": {
+          "await_points": 3,
+          "files": {
+            "crates/agent/src/runtime/settlement.rs": {
+              "reads": 4
+            },
+            "crates/agent/src/runtime/turn/drive.rs": {
+              "reads": 0,
+              "annotated": 0
+            },
+            "crates/orchestrator/src/runtime.rs": {
+              "reads": 2,
+              "annotated": 0
+            },
+            "crates/orchestrator/src/task_executor/settlement.rs": {
+              "reads": 0,
+              "annotated": 0
+            },
+            "crates/orchestrator/src/task_executor/recovery.rs": {
+              "reads": 0,
+              "annotated": 0
+            },
+            "crates/orchestrator/src/task_executor/integration.rs": {
+              "reads": 0,
+              "annotated": 0
+            },
+            "crates/agent/src/runtime/turn/state.rs": {
+              "reads": 2,
+              "annotated": 0
+            },
+            "crates/agent/src/runtime/compaction.rs": {
+              "reads": 2,
+              "annotated": 0
+            },
+            "crates/agent/src/runtime/retrieval.rs": {
+              "reads": 2,
+              "annotated": 0
+            },
+            "crates/agent/src/runtime/verification_attribution.rs": {
+              "reads": 1,
+              "annotated": 0
+            },
+            "crates/agent/src/outcome_ledger.rs": {
+              "reads": 0,
+              "annotated": 0
+            },
+            "crates/orchestrator/src/runtime_helpers.rs": {
+              "reads": 1,
+              "annotated": 0
+            }
+          },
+          "settlement_reads": 14
+        }
       }
     },
     {
@@ -26041,7 +26106,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/585ae467f62796ab0c9bb2659175c67a"
+              "handle": "vault://provider_key/dd489aef853fdacdc0de476849ab56d4"
             }
           },
           {

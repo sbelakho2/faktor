@@ -215,12 +215,10 @@ impl AgentRuntime {
     ) -> faktor_core::Result<(bool, String)> {
         use faktor_session::child::{ChildControl, ChildPhase};
 
-        // Fast path: sessions without a single memory fact carry no
-        // orchestration rows (one bounded probe query).
-        let probe = handle.memory_facts_page(None, 1)?;
-        if probe.total_estimate == 0 {
-            return Ok((false, String::new()));
-        }
+        // Fast path: the child-identity row is ONE indexed point lookup.
+        // Counting the whole fact space here (the old `memory_facts_page`
+        // total estimate) made every non-child turn pay O(all facts) as a
+        // long task's per-turn rows accumulated.
         if handle.orchestrator_child_identity_get()?.is_none() {
             return Ok((false, String::new())); // not an orchestrated child
         }
@@ -1162,7 +1160,7 @@ impl AgentRuntime {
                 if let Some(facts) = &terminal_facts {
                     let run_id = session_terminal_run_id(handle.id());
                     let ledger = OutcomeLedger::new(self.deps.session.store());
-                    let attempt = ledger.record_terminal_run(handle, &run_id);
+                    let attempt = ledger.record_terminal_run(handle, &run_id, settlement_task_id);
                     if let Err(error) = &attempt {
                         match error {
                             crate::outcome_ledger::OutcomeLedgerError::Store(

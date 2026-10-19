@@ -44,8 +44,8 @@ if (args.includes('--selftest')) {
         }
       }
       const base = args.includes('--base') ? args[args.indexOf('--base') + 1] : null;
-      const plan = lanes.lanePlan(lane, { changedFiles: changed, base });
       if (args.includes('--print-plan')) {
+        const plan = lanes.lanePlan(lane, { changedFiles: changed, base });
         process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
         continue;
       }

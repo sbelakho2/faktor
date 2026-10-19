@@ -3482,7 +3482,12 @@ async fn terminal_verified_turn_produces_one_derived_engineering_outcome_record(
         .phase_stats("fake", "m", RouterPhase::Implement)
         .is_none());
     // A replay of the terminal settlement never re-derives or re-feeds.
-    assert_eq!(ledger.record_terminal_run(&handle, &run_id).unwrap(), None);
+    assert_eq!(
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
+        None
+    );
     assert_eq!(ledger.count().unwrap(), 1);
 }
 

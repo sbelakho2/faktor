@@ -1239,6 +1239,79 @@ impl Store {
         Ok(out)
     }
 
+    /// Read ONE TYPE-SCOPED ledger page: entries of `session_id` whose
+    /// `entry_type` is in `entry_types`, ascending by seq, strictly after
+    /// `after_seq`, at most `limit` rows. This is the terminal fold's read:
+    /// the session ledger also carries every message/event row, so a fold
+    /// that scanned the whole stream paid O(history) per listing. The
+    /// `(session_id, entry_type, seq)` index restricts the search to the
+    /// named types and serves the `seq` bound/order per type.
+    ///
+    /// `entry_types` is a trusted, compile-time tag list (the session layer's
+    /// terminal tags); values are bound as parameters, never interpolated.
+    /// An empty list is the empty page. Same typed limit rules as
+    /// [`Store::ledger_entries_page`].
+    pub fn ledger_entries_by_type_page(
+        &self,
+        session_id: SessionId,
+        entry_types: &[&str],
+        after_seq: Option<i64>,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<LedgerEntryRow>> {
+        if entry_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("ledger entry page limit exceeds SQLite signed range".into())
+            })?,
+        };
+        // One bounded subquery PER type rides `(session_id, entry_type,
+        // seq)`: each reads at most `limit` rows after the cursor, and the
+        // outer sort merges at most `types * limit` rows. A single `IN`
+        // query cannot use that index AND `ORDER BY seq` without scanning
+        // every row of the session (the planner falls back to the
+        // `(session_id, seq)` primary key and filters type-by-type), which
+        // is exactly the full-ledger sweep this read exists to avoid.
+        let mut sql =
+            String::from("SELECT seq, entry_type, schema_ver, payload, created_ms FROM (");
+        for (index, _) in entry_types.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" UNION ALL ");
+            }
+            // ?1 session, ?2 after, ?3+i type, then the per-type limit.
+            sql.push_str(&format!(
+                "SELECT * FROM (SELECT seq, entry_type, schema_ver, payload, created_ms
+                 FROM ledger_entry
+                 WHERE session_id = ?1 AND seq > ?2 AND entry_type = ?{}
+                 ORDER BY seq ASC LIMIT ?{})",
+                3 + index,
+                3 + entry_types.len()
+            ));
+        }
+        sql.push_str(&format!(
+            ") ORDER BY seq ASC LIMIT ?{}",
+            4 + entry_types.len()
+        ));
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(entry_types.len() + 4);
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
+        params.push(rusqlite::types::Value::Integer(after_seq.unwrap_or(0)));
+        for entry_type in entry_types {
+            params.push(rusqlite::types::Value::Text((*entry_type).to_string()));
+        }
+        params.push(rusqlite::types::Value::Integer(limit));
+        params.push(rusqlite::types::Value::Integer(limit));
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(ledger_entry_map(row, session_id)?);
+        }
+        Ok(out)
+    }
+
     /// Read ledger entries of one session NEWEST-FIRST (descending seq),
     /// strictly below `before_seq` (exclusive; `None` starts at the newest).
     /// Additive read used by the coordination-board reader, whose pages are
@@ -1636,22 +1709,29 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
-        self.memory_facts_page_filtered(session_id, after, limit, None)
+        self.memory_facts_page_filtered(session_id, after, limit, None, None)
     }
 
     /// Newest-first page restricted to the typed V2 memory records. The
     /// generic page is shared with high-churn internal facts (`taskexec_run`,
     /// orchestrator steps); a V2 listing that filtered in Rust had to page
     /// through every newer internal row on each turn (the 1,000-turn probe's
-    /// growing context-prep cost). The prefix predicate rides the
-    /// `(kind, session_id)` index, so the page is O(limit).
+    /// growing context-prep cost). The prefix predicate rides the partial
+    /// `idx_memory_fact_v2_page` index, whose order IS the page order, so
+    /// the page is O(limit) with no temp sort of the managed set.
     pub fn memory_facts_v2_page(
         &self,
         session_id: SessionId,
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
-        self.memory_facts_page_filtered(session_id, after, limit, Some("memory_v2:"))
+        self.memory_facts_page_filtered(
+            session_id,
+            after,
+            limit,
+            Some("memory_v2:"),
+            Some("idx_memory_fact_v2_page"),
+        )
     }
 
     fn memory_facts_page_filtered(
@@ -1660,12 +1740,21 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
         kind_prefix: Option<&str>,
+        forced_index: Option<&str>,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
         let conn = self.read()?;
-        let mut sql = String::from(
-            "SELECT kind, key, value, updated_ms FROM memory_fact
-             WHERE session_id = ?1",
-        );
+        let mut sql = String::from("SELECT kind, key, value, updated_ms FROM memory_fact");
+        if let Some(index) = forced_index {
+            // The partial V2 index is the ONLY index whose order IS the
+            // page order over exactly the managed range; SQLite's cost
+            // model otherwise prefers the unique `(session,kind,key)`
+            // index plus a temp sort of every managed row (unbounded as the
+            // memory record count grows). The index is schema-owned (v40)
+            // and pinned by a plan test, so the hint cannot dangle.
+            sql.push_str(" INDEXED BY ");
+            sql.push_str(index);
+        }
+        sql.push_str(" WHERE session_id = ?1");
         if let Some(prefix) = kind_prefix {
             // Trusted, compile-time prefix (never user input). The half-open
             // byte range is the exact literal prefix and rides the
@@ -1876,28 +1965,58 @@ impl Store {
     /// `true` when at least one fact of `kind` for the session has a key
     /// beginning with `prefix` (admission recovery probes the orchestrated
     /// run's `<run_id>/<child>` rows without loading the fact space). The
-    /// prefix is LIKE-escaped, so a hostile `%`/`_` never widens the probe.
+    /// half-open `[prefix, prefix_end)` range is the LITERAL prefix: no
+    /// LIKE wildcard/ASCII-case folding, and the unique
+    /// `(session_id, kind, key)` index serves the probe as a range seek.
     pub fn memory_fact_key_prefix_exists(
         &self,
         session_id: SessionId,
         kind: &str,
         prefix: &str,
     ) -> StoreResult<bool> {
-        let mut escaped = String::with_capacity(prefix.len());
-        for ch in prefix.chars() {
-            if matches!(ch, '\\' | '%' | '_') {
-                escaped.push('\\');
-            }
-            escaped.push(ch);
+        if prefix.is_empty() {
+            // A key begins with "" always; keep the caller's existential
+            // meaning without building a synthetic upper bound.
+            let conn = self.read()?;
+            let found: i64 = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM memory_fact WHERE session_id = ?1 AND kind = ?2
+                 )",
+                params![session_id.raw() as i64, kind],
+                |r| r.get(0),
+            )?;
+            return Ok(found != 0);
         }
-        escaped.push('%');
+        if !prefix.is_ascii() {
+            // `kind_prefix_end` is defined for ASCII prefixes (it bumps the
+            // last BYTE); non-ASCII prefixes keep the escaped-LIKE probe.
+            let mut escaped = String::with_capacity(prefix.len());
+            for ch in prefix.chars() {
+                if matches!(ch, '\\' | '%' | '_') {
+                    escaped.push('\\');
+                }
+                escaped.push(ch);
+            }
+            escaped.push('%');
+            let conn = self.read()?;
+            let found: i64 = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM memory_fact
+                    WHERE session_id = ?1 AND kind = ?2 AND key LIKE ?3 ESCAPE '\\'
+                 )",
+                params![session_id.raw() as i64, kind, escaped],
+                |r| r.get(0),
+            )?;
+            return Ok(found != 0);
+        }
+        let end = kind_prefix_end(prefix);
         let conn = self.read()?;
         let found: i64 = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM memory_fact
-                WHERE session_id = ?1 AND kind = ?2 AND key LIKE ?3 ESCAPE '\\'
+                WHERE session_id = ?1 AND kind = ?2 AND key >= ?3 AND key < ?4
              )",
-            params![session_id.raw() as i64, kind, escaped],
+            params![session_id.raw() as i64, kind, prefix, end],
             |r| r.get(0),
         )?;
         Ok(found != 0)

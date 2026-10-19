@@ -14,7 +14,19 @@
 // reachable from a branch/tag is caught.
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -82,12 +94,24 @@ function walk(root, dir, out) {
   }
 }
 
+/** Read only the prefix: a large core dump is never loaded into RAM. */
 function readHead(path, length) {
+  let fd;
   try {
-    const data = readFileSync(path);
-    return data.subarray(0, length);
+    fd = openSync(path, 'r');
+    const buffer = Buffer.alloc(length);
+    const read = readSync(fd, buffer, 0, length, 0);
+    return buffer.subarray(0, read);
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed by a failed open path
+      }
+    }
   }
 }
 
@@ -95,7 +119,7 @@ function git(root, args, options = {}) {
   return execFileSync('git', ['-C', root, ...args], {
     encoding: options.encoding ?? 'utf8',
     maxBuffer: options.maxBuffer ?? 256 * 1024 * 1024,
-    stdio: options.stdio,
+    stdio: options.stdio ?? ['ignore', 'pipe', 'ignore'],
   });
 }
 
@@ -113,8 +137,9 @@ export function scanTree({ root = ROOT, untracked = false } = {}) {
         .split('\0')
         .filter(Boolean)
         .map((path) => path.split('\\').join('/'));
-    } catch {
-      files = [];
+    } catch (error) {
+      // An enumeration failure is not "no large blobs": fail closed.
+      throw new Error(`cannot enumerate tracked files: ${error.message ?? error}`);
     }
   } else {
     files = [];
@@ -131,6 +156,10 @@ export function scanTree({ root = ROOT, untracked = false } = {}) {
     }
     if (size < CORE_SIZE_LIMIT) continue;
     const head = readHead(path, 32);
+    if (head === null) {
+      findings.push({ scope: 'tree', path: rel, bytes: size, kind: 'sniff-unavailable' });
+      continue;
+    }
     const kind = sniffCore(head);
     const named = CORE_NAME.test(rel);
     if (kind !== null) {
@@ -150,8 +179,8 @@ export function scanHistory({ root = ROOT } = {}) {
   let objects;
   try {
     objects = git(root, ['rev-list', '--objects', '--all']);
-  } catch {
-    return findings;
+  } catch (error) {
+    throw new Error(`cannot enumerate reachable objects: ${error.message ?? error}`);
   }
   const entries = objects
     .split('\n')
@@ -171,27 +200,46 @@ export function scanHistory({ root = ROOT } = {}) {
       encoding: 'utf8',
       maxBuffer: 512 * 1024 * 1024,
     });
-  } catch {
-    return findings;
+  } catch (error) {
+    throw new Error(`cannot size reachable objects: ${error.message ?? error}`);
   }
   const sizeBySha = new Map();
   for (const line of sizes.split('\n')) {
     const [sha, type, size] = line.split(' ');
     if (type === 'blob') sizeBySha.set(sha, Number(size));
   }
-  for (const entry of entries) {
-    const size = sizeBySha.get(entry.sha) ?? 0;
-    if (size < CORE_SIZE_LIMIT) continue;
-    const named = CORE_NAME.test(entry.path);
-    if (!named && size < GENERIC_SIZE_LIMIT) continue;
+  // A blob reachable at many paths is sniffed once; the content is identical
+  // and the subprocess is the expensive part.
+  const headBySha = new Map();
+  const blobHead = (sha) => {
+    if (headBySha.has(sha)) return headBySha.get(sha);
     let head = null;
     try {
-      const proc = spawnSync('git', ['-C', root, 'cat-file', 'blob', entry.sha], {
+      const proc = spawnSync('git', ['-C', root, 'cat-file', 'blob', sha], {
         maxBuffer: 4096,
       });
       head = proc.stdout && proc.stdout.length > 0 ? proc.stdout.subarray(0, 32) : null;
     } catch {
       head = null;
+    }
+    headBySha.set(sha, head);
+    return head;
+  };
+  for (const entry of entries) {
+    const size = sizeBySha.get(entry.sha) ?? 0;
+    if (size < CORE_SIZE_LIMIT) continue;
+    const named = CORE_NAME.test(entry.path);
+    if (!named && size < GENERIC_SIZE_LIMIT) continue;
+    const head = blobHead(entry.sha);
+    if (head === null) {
+      findings.push({
+        scope: 'history',
+        path: entry.path,
+        sha: entry.sha,
+        bytes: size,
+        kind: 'sniff-unavailable',
+      });
+      continue;
     }
     const kind = sniffCore(head);
     if (kind !== null) {
@@ -215,8 +263,19 @@ export function scan({ root = ROOT, history = true, untracked = false } = {}) {
   if (!existsSync(join(root, '.git')) && history) {
     history = false;
   }
-  const tree = scanTree({ root, untracked });
-  const reachable = history ? scanHistory({ root }) : [];
+  let tree;
+  let reachable;
+  try {
+    tree = scanTree({ root, untracked });
+    reachable = history ? scanHistory({ root }) : [];
+  } catch (error) {
+    // A scanner that cannot enumerate is not evidence of a clean tree.
+    return {
+      passed: false,
+      observed: { error: String(error.message ?? error) },
+      reason: `core-dump scan failed closed: ${error.message ?? error}`,
+    };
+  }
   const findings = [...tree, ...reachable];
   return {
     passed: findings.length === 0,
@@ -288,6 +347,21 @@ export function selftest() {
     check('history finding names the blob and kind', found[0]?.kind === 'elf-core');
   } finally {
     execFileSync('rm', ['-rf', tmp]);
+  }
+
+  // A `.git` directory whose enumeration fails must fail closed, never pass
+  // with an empty file list.
+  const broken = mkdtempSync(join(tmpdir(), 'faktor-core-scan-broken-'));
+  try {
+    mkdirSync(join(broken, '.git'), { recursive: true });
+    const result = scan({ root: broken, history: true });
+    check(
+      'an unreadable tree/history fails closed instead of reporting clean',
+      result.passed === false && /failed closed/.test(result.reason ?? ''),
+      result.reason,
+    );
+  } finally {
+    rmSync(broken, { recursive: true, force: true });
   }
   if (failures > 0) {
     console.error(`core-dump selftest: ${failures} failure(s)`);

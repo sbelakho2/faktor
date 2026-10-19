@@ -148,3 +148,83 @@ fn history_walk_snapshot_never_resurfaces_or_skips_mid_walk_updates() {
         "the next walk (fresh snapshot) lists the updated conversation first"
     );
 }
+
+/// ([fault]) 1M-session History walk probe:
+/// `cargo test -p faktor-store fault_history_walk -- --ignored --nocapture`.
+/// The per-workspace page must ride the `(workspace, updated_ms, id)` index
+/// (no whole-workspace sort), and 500 keyset pages must be ordered/unique.
+#[test]
+#[ignore = "[fault] 1M-session History walk probe; run explicitly with --ignored"]
+fn fault_history_walk_is_keyset_bounded_at_one_million_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let control = store.create_workspace("/control").unwrap();
+    let conn = store.raw_conn();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO session(id, workspace_id, title, provider, model, state, lifecycle,
+                    created_ms, updated_ms, worktree_id, task_id)
+                 VALUES (?1, ?2, 't', 'p', 'm', '\"idle\"', 'open', ?3, ?3, 1, 1)",
+            )
+            .unwrap();
+        for id in 1..=1_000_000i64 {
+            stmt.execute(params![id, ws.raw() as i64, id]).unwrap();
+        }
+        for id in 1..=200i64 {
+            stmt.execute(params![2_000_000 + id, control.raw() as i64, id])
+                .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+
+    let started = std::time::Instant::now();
+    let snapshot = store.session_listing_snapshot_ms().unwrap();
+    let snapshot_elapsed = started.elapsed();
+    assert!(snapshot >= 1_000_000);
+
+    let mut before: Option<(i64, i64)> = None;
+    let mut seen = 0usize;
+    let mut last: Option<(i64, i64)> = None;
+    let mut slowest = std::time::Duration::ZERO;
+    for _ in 0..500 {
+        let started = std::time::Instant::now();
+        let page = store
+            .list_sessions_page_at(Some(ws), before, 200, Some(snapshot))
+            .unwrap();
+        slowest = slowest.max(started.elapsed());
+        assert_eq!(page.len(), 201, "full page plus the probe row");
+        let page = &page[..200];
+        for row in page {
+            if let Some(previous) = last {
+                assert!(
+                    (row.updated_ms, row.id.raw() as i64) < previous,
+                    "keyset order must strictly descend"
+                );
+            }
+            last = Some((row.updated_ms, row.id.raw() as i64));
+        }
+        seen += page.len();
+        let tail = page.last().unwrap();
+        before = Some((tail.updated_ms, tail.id.raw() as i64));
+    }
+    assert_eq!(seen, 100_000);
+    eprintln!(
+        "[fault] 1M-session History: snapshot {snapshot_elapsed:?}, 500 pages in {slowest:?} worst page"
+    );
+    assert!(
+        slowest < std::time::Duration::from_millis(20),
+        "a 200-row page over 1M sessions took {slowest:?}"
+    );
+
+    let control_page = store
+        .list_sessions_page_at(Some(control), None, 200, Some(snapshot))
+        .unwrap();
+    assert_eq!(
+        control_page.len(),
+        200,
+        "the small workspace remains page-bounded"
+    );
+}

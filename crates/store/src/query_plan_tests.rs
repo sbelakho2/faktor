@@ -319,7 +319,109 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
                     lifecycle, created_ms, updated_ms
              FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
             &[1],
-            &["SEARCH session USING INDEX idx_session_workspace_updated (workspace_id=?)"],
+            &["SEARCH session USING INDEX idx_session_workspace_updated_id (workspace_id=?)"],
+        ),
+        (
+            "transcript search chunk",
+            "SELECT m.id, m.session_id, m.seq, m.role,
+                    CASE WHEN (m.data LIKE ?3 ESCAPE '\\' OR EXISTS (
+                        SELECT 1 FROM part p WHERE p.message_id = m.id
+                         AND p.data LIKE ?3 ESCAPE '\\')) THEN m.data ELSE NULL END,
+                    m.created_ms
+             FROM message m
+             WHERE m.session_id = ?1 AND m.seq < ?2
+               AND (m.data LIKE ?3 ESCAPE '\\' OR EXISTS (
+                    SELECT 1 FROM part p WHERE p.message_id = m.id
+                     AND p.data LIKE ?3 ESCAPE '\\'))
+             ORDER BY m.seq DESC LIMIT ?4",
+            &[1, 100, 1, 128],
+            &[
+                "SEARCH m USING INDEX sqlite_autoindex_message_1 (session_id=? AND seq<?)",
+                "CORRELATED SCALAR SUBQUERY 2",
+                "SEARCH p USING INDEX idx_part_message (message_id=?)",
+                "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH p USING INDEX idx_part_message (message_id=?)",
+            ],
+        ),
+        (
+            "memory key-prefix probe",
+            "SELECT EXISTS(SELECT 1 FROM memory_fact
+              WHERE session_id = ?1 AND kind = ?2 AND key >= ?3 AND key < ?4)",
+            &[1, 1, 1, 1],
+            &[
+                "SCAN CONSTANT ROW",
+                "SCALAR SUBQUERY 1",
+                "SEARCH memory_fact USING COVERING INDEX sqlite_autoindex_memory_fact_1 (session_id=? AND kind=? AND key>? AND key<?)",
+            ],
+        ),
+        (
+            "memory V2 page",
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             INDEXED BY idx_memory_fact_v2_page
+             WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
+             ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?2",
+            &[1, 201],
+            &["SEARCH memory_fact USING INDEX idx_memory_fact_v2_page (session_id=?)"],
+        ),
+        (
+            "memory V2 count",
+            "SELECT COUNT(*) FROM memory_fact INDEXED BY idx_memory_fact_v2_page
+             WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
+            &[1],
+            &["SEARCH memory_fact USING COVERING INDEX idx_memory_fact_v2_page (session_id=?)"],
+        ),
+        (
+            "workspace memory V2 page",
+            "SELECT kind, key, value, updated_ms FROM workspace_memory_fact
+             INDEXED BY idx_workspace_memory_fact_v2_page
+             WHERE workspace_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
+             ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?2",
+            &[1, 201],
+            &["SEARCH workspace_memory_fact USING INDEX idx_workspace_memory_fact_v2_page (workspace_id=?)"],
+        ),
+        (
+            "workspace memory V2 count",
+            "SELECT COUNT(*) FROM workspace_memory_fact
+             INDEXED BY idx_workspace_memory_fact_v2_page
+             WHERE workspace_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
+            &[1],
+            &["SEARCH workspace_memory_fact USING COVERING INDEX idx_workspace_memory_fact_v2_page (workspace_id=?)"],
+        ),
+        (
+            "workspace history page",
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state,
+                    lifecycle, created_ms, updated_ms
+             FROM session WHERE workspace_id = ?1 AND updated_ms <= ?2
+               AND (updated_ms < ?3 OR (updated_ms = ?3 AND id < ?4))
+             ORDER BY updated_ms DESC, id DESC LIMIT ?5",
+            &[1, 100, 50, 7, 21],
+            &["SEARCH session USING INDEX idx_session_workspace_updated_id (workspace_id=? AND updated_ms<?)"],
+        ),
+        (
+            "terminal ledger type page",
+            "SELECT seq, entry_type, schema_ver, payload, created_ms FROM (
+                 SELECT * FROM (SELECT seq, entry_type, schema_ver, payload, created_ms
+                  FROM ledger_entry WHERE session_id = ?1 AND seq > ?2
+                    AND entry_type = ?3 ORDER BY seq ASC LIMIT ?5)
+                 UNION ALL
+                 SELECT * FROM (SELECT seq, entry_type, schema_ver, payload, created_ms
+                  FROM ledger_entry WHERE session_id = ?1 AND seq > ?2
+                    AND entry_type = ?4 ORDER BY seq ASC LIMIT ?5))
+             ORDER BY seq ASC LIMIT ?6",
+            &[1, 0, 0, 0, 128, 128],
+            &[
+                "MERGE (UNION ALL)",
+                "LEFT",
+                "CO-ROUTINE (subquery-1)",
+                "SEARCH ledger_entry USING INDEX idx_ledger_entry_session_type_seq (session_id=? AND entry_type=? AND seq>?)",
+                "SCAN (subquery-1)",
+                "USE TEMP B-TREE FOR ORDER BY",
+                "RIGHT",
+                "CO-ROUTINE (subquery-3)",
+                "SEARCH ledger_entry USING INDEX idx_ledger_entry_session_type_seq (session_id=? AND entry_type=? AND seq>?)",
+                "SCAN (subquery-3)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ],
         ),
         (
             "legacy task ledger",

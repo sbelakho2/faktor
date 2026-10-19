@@ -9,13 +9,12 @@
 // and external adapters. A surface added anywhere in the tree therefore
 // arrives as a new registry row; it cannot be invisible.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   discover,
-  discoverCliCommands,
   discoverNativeRoutes,
   serverRouteFiles,
 } from '../../scripts/discover-capabilities.mjs';
@@ -133,20 +132,6 @@ function read(root, rel) {
   return existsSync(path) ? readFileSync(path, 'utf8') : '';
 }
 
-function walkFiles(root, rel, filter, out = []) {
-  const dir = join(root, rel);
-  if (!existsSync(dir)) return out;
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'target' || entry.name === 'node_modules' || entry.name === '.git') {
-      continue;
-    }
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) walkFiles(root, relative(root, path), filter, out);
-    else if (filter(path)) out.push(path);
-  }
-  return out;
-}
-
 /** Daemon config keys declared by the descriptor authority. */
 export function discoverConfigKeys(root = ROOT) {
   const text = read(root, 'crates/foundation/src/config.rs');
@@ -180,8 +165,12 @@ export function discoverVsCodeConfigKeys(root = ROOT) {
 }
 
 function baseRows(root) {
-  const discovered = discover(root);
-  const routes = new Map(discoverNativeRoutes(root, serverRouteFiles(root)).map((route) => [route.id, route.file]));
+  // One route walk feeds both the capability set and the row file mapping;
+  // the previous code scanned every production server module twice.
+  const routeFiles = serverRouteFiles(root);
+  const nativeRoutes = discoverNativeRoutes(root, routeFiles);
+  const discovered = discover(root, { nativeRoutes });
+  const routes = new Map(nativeRoutes.map((route) => [route.id, route.file]));
   const rows = [];
   for (const id of discovered.ids) {
     if (id.startsWith('native.')) {
@@ -579,11 +568,27 @@ function actNowRows() {
   ];
 }
 
+const SURFACE_CACHE = new Map();
+
+/** Fixture hook: drop one root's cached surface set (or all of them). */
+export function clearSurfaceCache(root = null) {
+  if (root === null) SURFACE_CACHE.clear();
+  else SURFACE_CACHE.delete(resolve(root));
+}
+
 /**
  * The complete surface set, de-duplicated by id (a route discovered by the
  * server scanner is one surface, even if a second class also names it).
+ * Within one process the parse is cached per root; callers that mutate a
+ * fixture tree pass `{ fresh: true }`. The CLI is process-per-run, so the
+ * cache is a snapshot of the tree at that moment.
  */
-export function discoverSurfaces(root = ROOT) {
+export function discoverSurfaces(root = ROOT, { fresh = false } = {}) {
+  const key = resolve(root);
+  if (!fresh) {
+    const cached = SURFACE_CACHE.get(key);
+    if (cached) return cached;
+  }
   const rows = [
     ...baseRows(root),
     ...edition8Rows(root),
@@ -609,7 +614,9 @@ export function discoverSurfaces(root = ROOT) {
       test_ids: [...new Set(row.test_ids)].sort(),
     });
   }
-  return [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const surfaces = [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  SURFACE_CACHE.set(key, surfaces);
+  return surfaces;
 }
 
 export function sourceDigests(root = ROOT) {

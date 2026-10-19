@@ -101,6 +101,10 @@ pub(crate) struct SessionResources {
     /// Serializes read-validate-append transition sequences per session so
     /// concurrent callers cannot both validate against the same state.
     pub(crate) command_lock: std::sync::Mutex<()>,
+    /// Serializes one session's incremental ledger verification. Kept
+    /// PER SESSION (never across the manager) so opening a long session can
+    /// never block opens/decodes of every other session.
+    pub(crate) ledger_verify_lock: std::sync::Mutex<()>,
 }
 
 /// The in-memory half of the durable op-id allocator: one reserved range
@@ -885,6 +889,7 @@ impl SessionManager {
                     ops: OpRegistry::default(),
                     processes: ProcessRegistry::default(),
                     command_lock: std::sync::Mutex::new(()),
+                    ledger_verify_lock: std::sync::Mutex::new(()),
                 })
             })
             .clone()
@@ -1258,23 +1263,41 @@ impl SessionManager {
 
     /// Strictly verify the typed ledger entries this process has not yet
     /// verified for the session, then advance the in-memory verified cursor.
-    /// The lock is held across the decode so concurrent opens of the same
-    /// session do the work once.
+    /// The decode is serialized by the SESSION's own lock (concurrent opens
+    /// of the same session do the work once) while the manager-wide cursor
+    /// map is held only for the two O(1) reads/writes. Holding the map across
+    /// the decode made one long session's open block every other session.
     fn verify_ledger_open_cached(&self, handle: &SessionHandle) -> faktor_core::Result<()> {
         let max_seq = self
             .store
             .ledger_max_seq(handle.id())
             .map_err(crate::map_store_err)?;
-        let mut verified = self
-            .ledger_verified
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let from = verified.get(&handle.id()).copied().unwrap_or(0);
-        if max_seq <= from {
-            return Ok(());
+        {
+            let verified = crate::recover_lock(&self.ledger_verified);
+            if verified.get(&handle.id()).copied().unwrap_or(0) >= max_seq {
+                return Ok(());
+            }
         }
+        let session_lock = handle
+            .resources
+            .ledger_verify_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let from = {
+            let verified = crate::recover_lock(&self.ledger_verified);
+            let from = verified.get(&handle.id()).copied().unwrap_or(0);
+            if from >= max_seq {
+                return Ok(());
+            }
+            from
+        };
         handle.ledger_verify_after(from)?;
-        verified.insert(handle.id(), max_seq);
+        // The decode released the map lock; advance to at least this point.
+        // A concurrent verifier may already have advanced further.
+        let mut verified = crate::recover_lock(&self.ledger_verified);
+        let entry = verified.entry(handle.id()).or_insert(0);
+        *entry = (*entry).max(max_seq);
+        drop(session_lock);
         Ok(())
     }
 
@@ -1309,8 +1332,9 @@ impl SessionManager {
         for r in rows {
             let handle = SessionHandle::new(self.clone(), r.id, self.resources(r.id));
             // Open-time typed-ledger verification (audit 27): a corrupt
-            // typed entry fails the session open loudly.
-            handle.ledger_verify_open()?;
+            // typed entry fails the session open loudly. Incremental from
+            // this process's verified cursor, exactly like `get_session`.
+            self.verify_ledger_open_cached(&handle)?;
             // Open-time event-journal verification (audit consolidation):
             // the same bounded authority as `get_session`, so a session
             // listed here is one that may be opened. On a large-history
@@ -1458,6 +1482,7 @@ impl SessionManager {
         // Close handles: drop the per-session registries (ops/processes/
         // locks) so nothing references the session in-process any more.
         crate::recover_lock(&self.resources).remove(&id);
+        crate::recover_lock(&self.ledger_verified).remove(&id);
         Ok(())
     }
 }
@@ -2706,5 +2731,43 @@ mod tests {
             .unwrap()
             .iter()
             .any(|h| h.id() == s.id()));
+    }
+
+    /// The ledger-verification lock is PER SESSION: a long decode of one
+    /// session must never block opening another. The manager-wide cursor map
+    /// is held only for O(1) reads/writes, never across the decode.
+    #[test]
+    fn ledger_verification_of_one_session_never_blocks_another_open() {
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/w").unwrap();
+        let a = m.create_session(ws, "a", "p", "m").unwrap();
+        let b = m.create_session(ws, "b", "p", "m").unwrap();
+        let a_handle = m.get_session(a.id()).unwrap().unwrap();
+        for index in 0..64 {
+            a_handle.ledger_goal_set(&format!("g{index}")).unwrap();
+        }
+        let resources = std::sync::Arc::clone(&a_handle.resources);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = resources.ledger_verify_lock.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        // A's verify lock is held; opening B must still complete promptly.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let manager = std::sync::Arc::clone(&m);
+        let opener = std::thread::spawn(move || {
+            let opened = manager.get_session(b.id());
+            let _ = done_tx.send(opened.is_ok());
+        });
+        let independent = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a different session blocked on another session's verify lock");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        opener.join().unwrap();
+        assert!(independent, "the other session must open");
     }
 }

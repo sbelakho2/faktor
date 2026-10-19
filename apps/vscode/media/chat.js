@@ -121,11 +121,6 @@
       label: 'Checking the change',
       copy: 'Required results remain attached to this candidate.',
     },
-    unverified: {
-      glyph: '!',
-      label: 'Verification needed',
-      copy: 'The change has no admitted verification result yet.',
-    },
     providerFailed: {
       glyph: '!',
       label: 'Run needs recovery',
@@ -2073,17 +2068,13 @@
     )
       .trim()
       .toLowerCase();
-    if (proofState === 'verifying') {
+    // T12 (docs/specs/edition8): both served proof states mean checking, and
+    // the same states on a run row are the fallback when the proof is absent.
+    if (proofState === 'verifying' || proofState === 'needs_verification') {
       return RUN_STATES.checking;
     }
-    if (proofState === 'needs_verification') {
-      return RUN_STATES.unverified;
-    }
-    if (runState === 'verifying') {
+    if (runState === 'verifying' || runState === 'needs_verification') {
       return RUN_STATES.checking;
-    }
-    if (runState === 'needs_verification') {
-      return RUN_STATES.unverified;
     }
     if (runState === 'blocked' || runState === 'waiting' || runState === 'pending') {
       return RUN_STATES.needsInput;

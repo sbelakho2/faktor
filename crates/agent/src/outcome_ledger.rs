@@ -2512,12 +2512,13 @@ impl OutcomeLedger {
         &self,
         handle: &faktor_session::SessionHandle,
         run_id: &str,
+        task_id: faktor_core::id::TaskId,
     ) -> Result<Option<LedgerAppend>, OutcomeLedgerError> {
         if self.get(run_id)?.is_some() {
             return Ok(None);
         }
         let facts = TerminalRunFactsOutbox::new(self.store.clone()).load(run_id)?;
-        let (outcome, settlement) = self.derive_terminal_run(handle, run_id, &facts)?;
+        let (outcome, settlement) = self.derive_terminal_run(handle, run_id, task_id, &facts)?;
         Ok(Some(self.record(&outcome, &settlement)?))
     }
 
@@ -2554,9 +2555,10 @@ impl OutcomeLedger {
             // Legacy rows synthesize a complete projection: nothing to move.
             return Ok(SettlementFinalize::AlreadySettled);
         }
-        let task_id = handle
-            .task_id()
-            .map_err(|e| OutcomeLedgerError::Facts(format!("task id read failed: {e}")))?;
+        // The run's admitted task identity, frozen with its engineering
+        // record. Re-reading the session's CURRENT identity here would fold a
+        // later task's reservation ledger into this run's settlement.
+        let task_id = faktor_core::id::TaskId::new(stored.outcome.task_id);
         let projection = self.derive_economic_projection(handle, task_id)?;
         let event = projection.into_event(run_id, 0, handle.now_ms());
         if let Some(latest) = &latest_decoded {
@@ -2600,11 +2602,9 @@ impl OutcomeLedger {
         &self,
         handle: &faktor_session::SessionHandle,
         run_id: &str,
+        task_id: faktor_core::id::TaskId,
         facts: &TerminalRunFacts,
     ) -> Result<(TerminalEngineeringOutcome, EconomicSettlement), OutcomeLedgerError> {
-        let task_id = handle
-            .task_id()
-            .map_err(|e| OutcomeLedgerError::Facts(format!("task id read failed: {e}")))?;
         // The FIRST money read of the derivation is the reservation state:
         // the settled-spend read below may only ever be a superset, so a
         // `complete` classification can never miss a reservation that was

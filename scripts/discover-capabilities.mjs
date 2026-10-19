@@ -40,7 +40,7 @@ export function normalizeCapabilityId(id) {
     .replace(/-+/g, '-');
 }
 
-export function discover(root = ROOT) {
+export function discover(root = ROOT, { nativeRoutes = null, cliCommands = null } = {}) {
   const ids = new Set();
   const sources = {};
 
@@ -56,7 +56,7 @@ export function discover(root = ROOT) {
   //    POST/PUT half of `get(...).post(...)` routes, and enumerating only
   //    lifecycle.rs/worker_plane.rs made a route in any other module
   //    invisible. Discovery walks the whole production module tree instead.
-  for (const route of discoverNativeRoutes(root)) {
+  for (const route of nativeRoutes ?? discoverNativeRoutes(root)) {
     add('native-route', route.id);
   }
 
@@ -73,7 +73,7 @@ export function discover(root = ROOT) {
 
   // 3. CLI commands: the real command tree from the built binary when
   // available, else the clap `Commands` enum in main.rs.
-  const cli = discoverCliCommands(root);
+  const cli = cliCommands ?? discoverCliCommands(root);
   for (const command of cli) {
     add('cli-command', `cli.${command}`);
   }

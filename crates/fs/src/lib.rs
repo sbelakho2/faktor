@@ -3676,6 +3676,65 @@ fn in_use_durable_root_is_never_evicted_by_shadow_churn() {
         .is_ok());
 }
 
+/// Adversarial bound: when EVERY cached root is still held there is no
+/// legal eviction victim. The registry must stay at the bound and serve the
+/// new root uncached; the historical code inserted anyway, so held-root
+/// churn grew the cache without limit (one watcher per turn).
+#[test]
+fn held_roots_never_grow_the_registry_past_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = WorkspaceFileService::with_watch_preflight_entries(0);
+    let id = faktor_core::id::WorkspaceId::new(9);
+    let overflow = 16;
+    let mut held = Vec::new();
+    for i in 0..(crate::workspace_service::MAX_CACHED_ROOTS + overflow) {
+        let root = dir.path().join(format!("held-{i}"));
+        std::fs::create_dir_all(&root).unwrap();
+        held.push(service.open(id, root).unwrap());
+    }
+    assert_eq!(
+        service.open_count(),
+        crate::workspace_service::MAX_CACHED_ROOTS,
+        "held roots must not push the registry past its hard bound"
+    );
+    // Every handle, cached or not, remains a usable root.
+    for handle in held {
+        std::fs::write(handle.root().join("probe.txt"), b"ok").unwrap();
+        assert!(handle
+            .read_default(std::path::Path::new("probe.txt"))
+            .is_ok());
+    }
+}
+
+/// Eviction order is the insertion index, not a hash-map scan: the oldest
+/// unused root is the victim and the newest root is retained.
+#[test]
+fn eviction_takes_the_oldest_unused_root_in_insertion_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = WorkspaceFileService::with_watch_preflight_entries(0);
+    let id = faktor_core::id::WorkspaceId::new(10);
+    for i in 0..crate::workspace_service::MAX_CACHED_ROOTS {
+        let root = dir.path().join(format!("ordered-{i:03}"));
+        std::fs::create_dir_all(&root).unwrap();
+        drop(service.open(id, root).unwrap());
+    }
+    let newest = dir.path().join("newest");
+    std::fs::create_dir_all(&newest).unwrap();
+    let newest_handle = service.open(id, newest.clone()).unwrap();
+    let cached = service.cached_roots();
+    assert!(
+        !cached.iter().any(|(_, root)| root.ends_with("ordered-000")),
+        "the oldest unused root must be evicted first: {cached:?}"
+    );
+    assert!(
+        cached
+            .iter()
+            .any(|(_, root)| *root == newest.canonicalize().unwrap()),
+        "the newest root must be retained: {cached:?}"
+    );
+    drop(newest_handle);
+}
+
 /// Scale probe regression: every shadowed turn opens a NEW root under the
 /// session's durable workspace id. The registry must stay bounded (one
 /// watcher thread per cached root), while still allowing the durable root and
@@ -3700,5 +3759,36 @@ fn cached_workspace_roots_are_hard_bounded() {
         service.open_count() <= crate::workspace_service::MAX_CACHED_ROOTS,
         "cached roots must not grow with turn count: {}",
         service.open_count()
+    );
+}
+
+/// Instrumented eviction cost: with ONE held durable root and the rest
+/// unused, each insert at capacity examines the oldest ordered entry (the
+/// historical full-map `min_by_key` scanned all 64 every time). The probe
+/// counts candidate examinations, not wall time, so it is CI-stable.
+#[test]
+fn eviction_examines_the_oldest_index_entry_not_the_whole_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = WorkspaceFileService::with_watch_preflight_entries(0);
+    let id = faktor_core::id::WorkspaceId::new(11);
+    let durable_root = dir.path().join("durable");
+    std::fs::create_dir_all(&durable_root).unwrap();
+    let _held = service.open(id, durable_root).unwrap();
+    for i in 0..crate::workspace_service::MAX_CACHED_ROOTS {
+        let root = dir.path().join(format!("churn-{i:03}"));
+        std::fs::create_dir_all(&root).unwrap();
+        drop(service.open(id, root).unwrap());
+    }
+    crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.set(0));
+    const ROUNDS: usize = 32;
+    for i in 0..ROUNDS {
+        let root = dir.path().join(format!("probe-{i:03}"));
+        std::fs::create_dir_all(&root).unwrap();
+        drop(service.open(id, root).unwrap());
+    }
+    let probes = crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.get());
+    assert!(
+        probes <= ROUNDS * 2,
+        "eviction scanned {probes} candidates over {ROUNDS} inserts (ordered index should probe ~1)"
     );
 }

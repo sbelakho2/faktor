@@ -305,3 +305,95 @@ fn dependency_propagation_across_settles_matches_the_plan_scan() {
         }
     }
 }
+
+/// Settlement reads are KIND-SCOPED and point-addressed. The historical
+/// `parent_facts` helper paged the whole fact space with a 64-page cap, so
+/// (a) every settlement paid O(all facts) and (b) a run whose plan/registry
+/// row sat past 12,800 newer churn rows was silently invisible. These probes
+/// pin the fixed shape: unrelated churn changes neither visibility nor the
+/// lookup class.
+#[test]
+fn settlement_reads_are_kind_scoped_and_not_truncated_by_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), Vec::new(), 0);
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    const CHURN: usize = 13_000;
+    for index in 0..CHURN {
+        handle
+            .upsert_memory_fact(
+                super::super::task_executor::TASK_RUN_ROW_KIND,
+                &format!("churn-{index:05}"),
+                "{}",
+            )
+            .unwrap();
+    }
+    handle
+        .upsert_memory_fact(PLAN_ROW_KIND, "run-target", "{}")
+        .unwrap();
+    handle
+        .upsert_memory_fact(crate::runtime::REGISTRY_ROW_KIND, "run-target/child", "{}")
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let plans = facts_of_kind(&handle, PLAN_ROW_KIND).unwrap();
+    let plan_elapsed = started.elapsed();
+    assert_eq!(
+        plans.len(),
+        1,
+        "the plan row must not be truncated: {plans:?}"
+    );
+    assert_eq!(plans[0].0, "run-target");
+    let registry = facts_of_kind(&handle, crate::runtime::REGISTRY_ROW_KIND).unwrap();
+    assert_eq!(registry.len(), 1);
+
+    let started = std::time::Instant::now();
+    for _ in 0..1_000 {
+        assert!(
+            handle
+                .memory_fact_get(PLAN_ROW_KIND, "run-target")
+                .unwrap()
+                .is_some(),
+            "point identity lookup must be exact"
+        );
+    }
+    let point_elapsed = started.elapsed();
+    eprintln!(
+        "settlement reads with {CHURN} churn rows: kind page {plan_elapsed:?}; 1000 point lookups {point_elapsed:?}"
+    );
+    assert!(
+        plan_elapsed < std::time::Duration::from_millis(250),
+        "kind-scoped plan read paid for unrelated churn: {plan_elapsed:?}"
+    );
+}
+
+/// A present-but-corrupt task linkage row is durable corruption, not a
+/// reason to fall back to the run-policy row. The old `if let Ok(...)` chain
+/// silently ignored the decode failure (a corrupt identity could settle
+/// into a different task as long as a policy row existed).
+#[test]
+fn settlement_identity_corruption_is_typed_not_a_policy_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), Vec::new(), 0);
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    handle
+        .upsert_memory_fact(
+            super::super::task_executor::TASK_RUN_ROW_KIND,
+            "run-corrupt",
+            "{not json",
+        )
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            super::super::task_executor::RUN_POLICY_ROW_KIND,
+            "run-corrupt",
+            &serde_json::json!({"task_id": 7}).to_string(),
+        )
+        .unwrap();
+    match super::super::task_executor::settlement_task_id(&handle, "run-corrupt") {
+        Err(ExecError::Internal(message)) => assert!(
+            message.contains("corrupt durable state") && message.contains("run-corrupt"),
+            "refusal must name the corrupt linkage row: {message}"
+        ),
+        other => panic!("corrupt linkage row must refuse typed, got {other:?}"),
+    }
+}

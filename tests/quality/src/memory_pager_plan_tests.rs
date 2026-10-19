@@ -223,3 +223,232 @@ fn memory_pager_plan_names_an_index_at_200k_rows() {
         "count must use the same range and cover every managed row"
     );
 }
+
+/// 1,000,000-churn scale probe ([fault], run explicitly):
+/// `cargo test -p faktor-tests-quality fault_memory_pagers -- --ignored --nocapture`.
+///
+/// Proves BOTH pagers and BOTH counts use the partial V2 indexes (no table
+/// scan, no temp b-tree over the managed set) and measures page/count cost
+/// against the same query on a 250-row control session/workspace.
+#[test]
+#[ignore = "[fault] 1M-churn scale probe; run explicitly with --ignored"]
+fn fault_memory_pagers_and_counts_stay_index_backed_at_1m_churn() {
+    const CHURN: u64 = 1_000_000;
+    const MANAGED: u64 = 250;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().join("store"), true).expect("store");
+    let workspace = store
+        .create_workspace("/tmp/1m-workspace")
+        .expect("workspace");
+    let session = store
+        .create_session(workspace, "1m", "provider", "model")
+        .expect("session")
+        .id;
+    let control = store
+        .create_session(workspace, "control", "provider", "model")
+        .expect("control")
+        .id;
+    let control_workspace = store
+        .create_workspace("/tmp/1m-control")
+        .expect("control workspace");
+
+    let seed_started = Instant::now();
+    {
+        let conn = Connection::open(store.path()).expect("seed connection");
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        {
+            let mut session_fact = conn
+                .prepare(
+                    "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .unwrap();
+            let mut workspace_fact = conn
+                .prepare(
+                    "INSERT INTO workspace_memory_fact(workspace_id, kind, key, value, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .unwrap();
+            for index in 0..CHURN {
+                let kind = format!("churn:{index}");
+                let key = format!("key{index}");
+                session_fact
+                    .execute(rusqlite::params![
+                        session.raw() as i64,
+                        kind,
+                        key,
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+                workspace_fact
+                    .execute(rusqlite::params![
+                        workspace.raw() as i64,
+                        format!("churn:{index}"),
+                        format!("key{index}"),
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+            }
+            for index in 0..MANAGED {
+                let kind = format!("memory_v2:fact{index}");
+                let key = format!("key{index}");
+                session_fact
+                    .execute(rusqlite::params![
+                        session.raw() as i64,
+                        kind,
+                        key,
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+                workspace_fact
+                    .execute(rusqlite::params![
+                        workspace.raw() as i64,
+                        format!("memory_v2:fact{index}"),
+                        format!("key{index}"),
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+                session_fact
+                    .execute(rusqlite::params![
+                        control.raw() as i64,
+                        kind,
+                        key,
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+                workspace_fact
+                    .execute(rusqlite::params![
+                        control_workspace.raw() as i64,
+                        format!("memory_v2:fact{index}"),
+                        format!("key{index}"),
+                        "v",
+                        index as i64
+                    ])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    eprintln!(
+        "[fault] seeded {CHURN} session + {CHURN} workspace churn rows in {:?}",
+        seed_started.elapsed()
+    );
+
+    let connection = Connection::open(store.path()).expect("plan connection");
+    let explain = |sql: &str| -> Vec<String> {
+        let mut statement = connection.prepare(sql).expect("prepare plan");
+        statement
+            .query_map([session.raw() as i64], |row| row.get::<_, String>(3))
+            .expect("explain")
+            .map(|row| row.expect("plan row"))
+            .collect()
+    };
+    let page_plan = explain(
+        "EXPLAIN QUERY PLAN
+         SELECT kind, key, value, updated_ms FROM memory_fact INDEXED BY idx_memory_fact_v2_page
+         WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
+         ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 201",
+    )
+    .join("\n");
+    let count_plan = explain(
+        "EXPLAIN QUERY PLAN
+         SELECT COUNT(*) FROM memory_fact INDEXED BY idx_memory_fact_v2_page
+         WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
+    )
+    .join("\n");
+    let workspace_page_plan = explain(
+        "EXPLAIN QUERY PLAN
+         SELECT kind, key, value, updated_ms FROM workspace_memory_fact INDEXED BY idx_workspace_memory_fact_v2_page
+         WHERE workspace_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
+         ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 201",
+    )
+    .join("\n");
+    let workspace_count_plan = explain(
+        "EXPLAIN QUERY PLAN
+         SELECT COUNT(*) FROM workspace_memory_fact INDEXED BY idx_workspace_memory_fact_v2_page
+         WHERE workspace_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
+    )
+    .join("\n");
+    for (name, plan) in [
+        ("session page", &page_plan),
+        ("session count", &count_plan),
+        ("workspace page", &workspace_page_plan),
+        ("workspace count", &workspace_count_plan),
+    ] {
+        assert!(
+            plan.contains("idx_memory_fact_v2_page")
+                || plan.contains("idx_workspace_memory_fact_v2_page"),
+            "{name} must ride the partial V2 index: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN memory_fact")
+                && !plan.contains("SCAN workspace_memory_fact")
+                && !plan.contains("TEMP B-TREE"),
+            "{name} must not scan/sort the churn table: {plan}"
+        );
+    }
+
+    fn stats(mut samples: Vec<f64>) -> (f64, f64) {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        (samples[samples.len() / 2], p95)
+    }
+    let mut session_samples = Vec::new();
+    let mut workspace_samples = Vec::new();
+    let mut control_samples = Vec::new();
+    for _ in 0..50 {
+        let started = Instant::now();
+        let (rows, _more) = store
+            .memory_facts_v2_page(session, None, 200)
+            .expect("session page");
+        assert!(rows.len() <= 200, "page bound");
+        let _ = store.memory_fact_count_v2(session).expect("session count");
+        session_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+        let started = Instant::now();
+        let (rows, _more) = store
+            .workspace_memory_facts_v2_page(workspace.raw(), None, 200)
+            .expect("workspace page");
+        assert!(rows.len() <= 200, "workspace page bound");
+        let _ = store
+            .workspace_memory_fact_count(workspace.raw())
+            .expect("workspace count");
+        workspace_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+        let started = Instant::now();
+        let _ = store
+            .memory_facts_v2_page(control, None, 200)
+            .expect("control page");
+        let _ = store.memory_fact_count_v2(control).expect("control count");
+        control_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let (session_p50, session_p95) = stats(session_samples);
+    let (workspace_p50, workspace_p95) = stats(workspace_samples);
+    let (_, control_p95) = stats(control_samples);
+    eprintln!(
+        "[fault] session page+count p50 {session_p50:.3} ms p95 {session_p95:.3} ms; workspace p50 {workspace_p50:.3} ms p95 {workspace_p95:.3} ms; control p95 {control_p95:.3} ms"
+    );
+    assert_eq!(
+        store.memory_fact_count_v2(session).expect("count"),
+        MANAGED as i64
+    );
+    assert_eq!(
+        store
+            .workspace_memory_fact_count(workspace.raw())
+            .expect("count"),
+        MANAGED as i64
+    );
+    assert!(
+        session_p95 <= 2.0 && workspace_p95 <= 2.0,
+        "1M churn page+count p95 must stay bounded: session {session_p95:.3} ms workspace {workspace_p95:.3} ms"
+    );
+    assert!(
+        session_p95 <= control_p95 * 10.0 + 0.5,
+        "1M churn changed session page+count cost: {session_p95:.3} ms vs control {control_p95:.3} ms"
+    );
+}

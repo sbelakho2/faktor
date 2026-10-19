@@ -1157,6 +1157,9 @@ pub struct TerminalOwnership {
 #[derive(Debug, Default)]
 struct SessionIndex {
     watermark: i64,
+    /// Next durable terminal seq of the bounded rotated prefix verification
+    /// (0 = start over at the oldest row).
+    verify_cursor: i64,
     recovered: bool,
     terminals: BTreeMap<String, DurableTerminal>,
 }
@@ -1556,52 +1559,75 @@ impl TerminalService {
     }
 
     /// Refresh one session's durable fold from the entry stream (the rows
-    /// remain the authority; the index only caches the decoded fold).
+    /// remain the authority; the index only caches the decoded fold). The
+    /// read is TYPE-SCOPED and keyset-bounded after the watermark: a long
+    /// session's message/event rows are never walked, and a steady-state
+    /// refresh decodes only the terminal rows appended since the last call.
     fn fold(
         &self,
         handle: &SessionHandle,
         sid: u64,
     ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
-        self.fold_from(handle, sid, false)
+        self.fold_from(handle, sid)
     }
 
-    /// [`Self::fold`] with an optional FULL sweep. The listing read uses the
-    /// full sweep: the per-session index otherwise only decodes rows newer
-    /// than its watermark, so an already-folded row corrupted in place (the
-    /// run-state probe's poison) would stay invisible until a daemon
-    /// restart. A durable decode failure is a typed refusal, never a stale
-    /// cached view.
+    /// Bounded prefix verification for the listing read. The fold cursor is
+    /// append-only, so an already-folded row hand-corrupted in place is
+    /// invisible to the incremental refresh; the listing therefore decodes
+    /// up to [`TERMINAL_VERIFY_BATCH`] durable terminal rows per call,
+    /// rotating from the OLDEST prefix row to the newest across calls. Work
+    /// per listing is bounded (never O(ledger)), and every terminal row is
+    /// re-validated at least once per rotation. A durable decode failure is
+    /// a typed refusal, never a stale cached view.
     fn fold_verified(
         &self,
         handle: &SessionHandle,
         sid: u64,
     ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
-        self.fold_from(handle, sid, true)
+        let terminals = self.fold_from(handle, sid)?;
+        self.verify_terminal_prefix(handle, sid)?;
+        Ok(terminals)
     }
 
     fn fold_from(
         &self,
         handle: &SessionHandle,
         sid: u64,
-        from_scratch: bool,
     ) -> Result<BTreeMap<String, DurableTerminal>, TerminalServiceError> {
         let mut index = self.lock_index();
         let entry = index.entry(sid).or_default();
-        if from_scratch {
-            entry.terminals.clear();
-        }
-        let after = if from_scratch {
-            None
-        } else {
-            Some(entry.watermark)
-        };
+        let after = (entry.watermark > 0).then_some(entry.watermark);
         let records = handle
-            .ledger_terminal_rows(after)
+            .ledger_terminal_rows_bounded(after, usize::MAX)
             .map_err(|e| TerminalServiceError::Refused(e.message))?;
         for record in records {
             entry.apply(record);
         }
         Ok(entry.terminals.clone())
+    }
+
+    /// One bounded verification slice of the durable terminal prefix. The
+    /// slice is decoded (not applied: the fold already carries the newest
+    /// state) so a corrupt row refuses typed. Fewer than a full batch means
+    /// the rotation reached the head and restarts at the oldest row.
+    fn verify_terminal_prefix(
+        &self,
+        handle: &SessionHandle,
+        sid: u64,
+    ) -> Result<(), TerminalServiceError> {
+        const TERMINAL_VERIFY_BATCH: usize = 128;
+        let mut index = self.lock_index();
+        let entry = index.entry(sid).or_default();
+        let after = (entry.verify_cursor > 0).then_some(entry.verify_cursor);
+        let records = handle
+            .ledger_terminal_rows_bounded(after, TERMINAL_VERIFY_BATCH)
+            .map_err(|e| TerminalServiceError::Refused(e.message))?;
+        entry.verify_cursor = if records.len() < TERMINAL_VERIFY_BATCH {
+            0
+        } else {
+            records.last().map(|record| record.seq).unwrap_or(0)
+        };
+        Ok(())
     }
 
     fn apply_durable(&self, sid: u64, record: TerminalLedgerRecord) {
@@ -2199,7 +2225,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold_verified(&handle, sid.raw())?;
+        let terminals = self.fold(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2270,7 +2296,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold_verified(&handle, sid.raw())?;
+        let terminals = self.fold(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2343,7 +2369,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold_verified(&handle, sid.raw())?;
+        let terminals = self.fold(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2415,7 +2441,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold_verified(&handle, sid.raw())?;
+        let terminals = self.fold(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {
@@ -2467,7 +2493,7 @@ impl TerminalService {
         let sid = handle.id();
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
-        let terminals = self.fold_verified(&handle, sid.raw())?;
+        let terminals = self.fold(&handle, sid.raw())?;
         let entry = terminals
             .get(terminal_id)
             .ok_or_else(|| TerminalServiceError::Unknown {

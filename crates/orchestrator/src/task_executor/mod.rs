@@ -80,7 +80,7 @@ use super::shadow::ShadowRoots;
 #[cfg(any(test, feature = "fault-injection"))]
 use super::CrashSeam;
 use super::{
-    parent_facts, ChildSpec, ExecConfig, ExecError, OrchestratorRuntime, ASSIGNMENT_ROW_KIND,
+    facts_of_kind, ChildSpec, ExecConfig, ExecError, OrchestratorRuntime, ASSIGNMENT_ROW_KIND,
     MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
@@ -373,11 +373,7 @@ fn run_no_op_disposition(
     handle: &faktor_session::SessionHandle,
     run_id: &str,
 ) -> Result<NoOpDisposition, ExecError> {
-    let facts = parent_facts(handle)?;
-    let Some((_, _, value)) = facts
-        .into_iter()
-        .find(|(kind, key, _)| kind == RUN_POLICY_ROW_KIND && key == run_id)
-    else {
+    let Some(value) = handle.memory_fact_get(RUN_POLICY_ROW_KIND, run_id)? else {
         return Ok(NoOpDisposition::default_for_mutating_task());
     };
     let row: RunPolicyRow = serde_json::from_str(&value).map_err(|e| {
@@ -2405,19 +2401,16 @@ impl TaskExecutor {
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         let mut runs: BTreeSet<String> = BTreeSet::new();
-        for (kind, key, _value) in parent_facts(&handle)? {
-            match kind.as_str() {
-                PLAN_ROW_KIND => {
-                    runs.insert(key);
-                }
-                REGISTRY_ROW_KIND | ASSIGNMENT_ROW_KIND => {
-                    if let Some(run) = key.rsplit_once('/').map(|(r, _c)| r) {
-                        if !run.is_empty() {
-                            runs.insert(run.to_string());
-                        }
+        for (key, _value) in facts_of_kind(&handle, PLAN_ROW_KIND)? {
+            runs.insert(key);
+        }
+        for kind in [REGISTRY_ROW_KIND, ASSIGNMENT_ROW_KIND] {
+            for (key, _value) in facts_of_kind(&handle, kind)? {
+                if let Some(run) = key.rsplit_once('/').map(|(r, _c)| r) {
+                    if !run.is_empty() {
+                        runs.insert(run.to_string());
                     }
                 }
-                _ => {}
             }
         }
         let mut live = Vec::new();

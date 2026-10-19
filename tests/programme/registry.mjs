@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dirname, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -29,7 +30,7 @@ import {
   summarizeRegistry,
 } from './model.mjs';
 import { discoverSurfaces } from './discovery.mjs';
-import { probeCliSurface, probeScaleSchedule } from './evidence.mjs';
+import { findRustFn, probeCliSurface, probeScaleSchedule, rustFnIndex } from './evidence.mjs';
 import { normalizeCapabilityId } from '../../scripts/discover-capabilities.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -62,7 +63,7 @@ function compactEvidence(result) {
  * Run the fast/dynamic probes and derive a status/evidence map keyed by row
  * id. Heavy lanes are not run here.
  */
-export async function deriveStatuses(rows, { dynamic = true } = {}) {
+export async function deriveStatuses(rows, { dynamic = true, root = ROOT, stats = null } = {}) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const statuses = new Map();
   const set = (id, status, evidence) => {
@@ -81,7 +82,7 @@ export async function deriveStatuses(rows, { dynamic = true } = {}) {
   // Static act-now scans.
   try {
     const settlement = await import('./checks/settlement.mjs');
-    const result = settlement.scan({ root: ROOT });
+    const result = settlement.scan({ root });
     set('act-now.settlement-static-ban', result.passed ? 'proven' : 'failed', {
       passed: result.passed,
       observed: result.observed,
@@ -92,7 +93,7 @@ export async function deriveStatuses(rows, { dynamic = true } = {}) {
   }
   try {
     const core = await import('./checks/core-dumps.mjs');
-    const result = core.scan({ root: ROOT });
+    const result = core.scan({ root });
     set('act-now.core-dump-history', result.passed ? 'proven' : 'failed', {
       passed: result.passed,
       observed: result.observed,
@@ -101,7 +102,7 @@ export async function deriveStatuses(rows, { dynamic = true } = {}) {
   } catch (error) {
     set('act-now.core-dump-history', 'failed', { passed: false, reason: String(error) });
   }
-  const scale = probeScaleSchedule();
+  const scale = probeScaleSchedule(root);
   set('act-now.scale-probe-schedule', scale.passed ? 'proven' : 'failed', scale);
 
   // Hostile/race generator selftests are pure and always runnable.
@@ -190,16 +191,18 @@ export async function deriveStatuses(rows, { dynamic = true } = {}) {
 
   // Invariant unit/wiring tests exist (execution evidence comes from lanes).
   // Script-level invariants carry a `script.<ID>` id; they are deferred to
-  // their named lane command, not failed for lacking a Rust function.
+  // their named lane command, not failed for lacking a Rust function. One
+  // indexed pass answers every lookup: re-walking the tree per test id made
+  // this O(invariants x files) and re-read gigabytes at scale.
+  if (stats) stats.rust_index = { ...rustFnIndex(root).stats };
   for (const row of rows) {
     if (row.kind !== 'invariant' || statuses.get(row.id)?.status === 'proven') continue;
-    const { findRustFn } = await import('./evidence.mjs');
     const rustIds = row.test_ids.filter((id) => !id.startsWith('script.'));
     if (rustIds.length === 0) {
       set(row.id, 'deferred', null);
       continue;
     }
-    const found = rustIds.some((id) => findRustFn(id) !== null);
+    const found = rustIds.some((id) => findRustFn(id, root) !== null);
     set(row.id, found ? 'deferred' : 'failed', found ? null : { passed: false, reason: 'test fn missing' });
   }
 
@@ -213,12 +216,11 @@ export async function deriveStatuses(rows, { dynamic = true } = {}) {
   return statuses;
 }
 
-export async function buildRegistry({ dynamic = true, root = ROOT } = {}) {
-  void root;
-  const discovered = discoverSurfaces();
-  const statuses = await deriveStatuses(discovered, { dynamic });
+export async function buildRegistry({ dynamic = true, root = ROOT, discovered = null, stats = null } = {}) {
+  const surfaceRows = discovered ?? discoverSurfaces(root);
+  const statuses = await deriveStatuses(surfaceRows, { dynamic, root, stats });
   const rows = sortRows(
-    discovered.map((row) => {
+    surfaceRows.map((row) => {
       const derived = statuses.get(row.id) ?? { status: 'stub', evidence: null };
       return {
         ...row,
@@ -229,11 +231,14 @@ export async function buildRegistry({ dynamic = true, root = ROOT } = {}) {
     }),
   );
   const summary = summarizeRegistry({ rows });
+  // One rev-parse for both identities (the lane does the same).
+  const revision = git(['rev-parse', 'HEAD', 'HEAD^{tree}']);
+  const [commit = null, tree = null] = revision ? revision.split('\n') : [];
   return {
     schema: REGISTRY_SCHEMA,
     generated_at: new Date().toISOString(),
-    commit: git(['rev-parse', 'HEAD']),
-    tree: git(['rev-parse', 'HEAD^{tree}']),
+    commit,
+    tree,
     layers: ['structural', 'unit', 'property', 'fault', 'integration', 'live'],
     lanes: ['pull', 'trusted', 'nightly', 'weekly-live', 'release'],
     counts: summary,
@@ -255,21 +260,33 @@ export function stableRows(registry) {
   }));
 }
 
-export function validateRegistry(registry, { discovered = null, release = false } = {}) {
+export function validateRegistry(
+  registry,
+  { discovered = null, release = false, root = ROOT, stats = null } = {},
+) {
   const problems = [];
   const rows = Array.isArray(registry?.rows) ? registry.rows : [];
   if (rows.length === 0) problems.push('registry: no rows');
   const ids = new Set();
+  // Many rows share one file (routes/config keys/controls). Stat each distinct
+  // path once instead of issuing one existsSync per row.
+  const pathChecks = new Map();
   for (const row of rows) {
     for (const problem of rowProblems(row)) problems.push(problem);
     if (ids.has(row.id)) problems.push(`duplicate row: ${row.id}`);
     ids.add(row.id);
     const rowPath = String(row.path ?? '').split('#')[0];
-    if (rowPath && !existsSync(join(ROOT, rowPath))) {
-      problems.push(`missing surface path: ${row.id} -> ${row.path}`);
+    if (rowPath) {
+      if (!pathChecks.has(rowPath)) {
+        pathChecks.set(rowPath, existsSync(join(root, rowPath)));
+        if (stats) stats.path_checks = (stats.path_checks ?? 0) + 1;
+      }
+      if (!pathChecks.get(rowPath)) {
+        problems.push(`missing surface path: ${row.id} -> ${row.path}`);
+      }
     }
   }
-  const surfaces = discovered ?? discoverSurfaces();
+  const surfaces = discovered ?? discoverSurfaces(root);
   const surfaceIds = new Set(surfaces.map((row) => row.id));
   for (const id of surfaceIds) {
     if (!ids.has(id)) problems.push(`uncovered surface: ${id}`);
@@ -287,10 +304,56 @@ export function validateRegistry(registry, { discovered = null, release = false 
   return problems;
 }
 
+const STABLE_FIELDS = Object.freeze([
+  'kind',
+  'path',
+  'layers',
+  'lanes',
+  'test_ids',
+  'evidence_kind',
+  'oracle',
+  'adversarial',
+]);
+
+/**
+ * Order-sensitive structural equality: strings/arrays compare directly and
+ * canonical JSON is only produced when an actual difference (or a non-array
+ * object) must be rendered. The old loop serialized both sides of every field
+ * of every row, even when identical.
+ */
+function stableEqual(left, right, stats = null) {
+  if (left === right) return true;
+  if (left == null && right == null) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      const a = left[index];
+      const b = right[index];
+      if (a === b || (a == null && b == null)) continue;
+      if (a && b && typeof a === 'object' && typeof b === 'object') {
+        if (stats) stats.canonical_calls = (stats.canonical_calls ?? 0) + 1;
+        if (canonicalJson(a) !== canonicalJson(b)) return false;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+  if (left && right && typeof left === 'object' && typeof right === 'object') {
+    if (stats) stats.canonical_calls = (stats.canonical_calls ?? 0) + 1;
+    return canonicalJson(left) === canonicalJson(right);
+  }
+  return false;
+}
+
 /** Compare committed registry stable fields with a fresh discovery. */
-export function driftProblems(committed, discovered = discoverSurfaces()) {
+export function driftProblems(committed, discovered = null, { stats = null, root = ROOT } = {}) {
+  if (stats) {
+    stats.field_comparisons ??= 0;
+    stats.canonical_calls ??= 0;
+  }
   const problems = [];
-  const expected = new Map(discovered.map((row) => [row.id, row]));
+  const expected = new Map((discovered ?? discoverSurfaces(root)).map((row) => [row.id, row]));
   const actual = new Map((committed.rows ?? []).map((row) => [row.id, row]));
   for (const [id, row] of expected) {
     const have = actual.get(id);
@@ -298,12 +361,12 @@ export function driftProblems(committed, discovered = discoverSurfaces()) {
       problems.push(`registry drift: ${id} is discovered but absent from the committed registry (run build-registry.mjs)`);
       continue;
     }
-    for (const field of ['kind', 'path', 'layers', 'lanes', 'test_ids', 'evidence_kind', 'oracle', 'adversarial']) {
+    for (const field of STABLE_FIELDS) {
+      if (stats) stats.field_comparisons = (stats.field_comparisons ?? 0) + 1;
+      if (stableEqual(have[field], row[field], stats)) continue;
       const left = canonicalJson(have[field]);
       const right = canonicalJson(row[field]);
-      if (left !== right) {
-        problems.push(`registry drift: ${id}.${field} differs from discovery (${left} != ${right})`);
-      }
+      problems.push(`registry drift: ${id}.${field} differs from discovery (${left} != ${right})`);
     }
   }
   for (const id of actual.keys()) {
@@ -406,11 +469,70 @@ export function selftest() {
     'a layer not run by its lane fails',
     validateRegistry(wrongLayer, { discovered }).some((problem) => problem.includes('not run by any assigned lane')),
   );
+  const surfaces = discoverSurfaces();
   const real = validateRegistry(
-    { rows: discoverSurfaces().map((entry) => ({ ...entry, status: 'deferred' })) },
-    { discovered: discoverSurfaces() },
+    { rows: surfaces.map((entry) => ({ ...entry, status: 'deferred' })) },
+    { discovered: surfaces },
   );
   check(`real discovery validates (${real.length} problems)`, real.length === 0, real.slice(0, 3).join('; '));
+  check('surface discovery is cached per root', discoverSurfaces() === surfaces);
+  const freshSurfaces = discoverSurfaces(ROOT, { fresh: true });
+  check(
+    'a fresh discovery pass is deterministic',
+    freshSurfaces.length === surfaces.length &&
+      JSON.stringify(freshSurfaces) === JSON.stringify(surfaces),
+  );
+
+  // Scale fixture: the checker must stay linear at 10k rows. Paths are
+  // deliberately shared so the stat cache is observable.
+  const SCALE_ROWS = 10_000;
+  const scalePaths = [
+    'crates/server/src/api/lifecycle.rs',
+    'crates/server/src/worker_plane.rs',
+    'crates/foundation/src/config.rs',
+    'tests/invariants.toml',
+  ];
+  const scaleRow = (index) =>
+    row(`native.get.scale.${index}`, {
+      path: scalePaths[index % scalePaths.length],
+      test_ids: [`native.route-contract.scale.${index}`],
+    });
+  const scale = Array.from({ length: SCALE_ROWS }, (_, index) => scaleRow(index));
+  const validateStats = {};
+  const validateStart = performance.now();
+  const scaleProblems = validateRegistry({ rows: scale }, { discovered: scale, stats: validateStats });
+  const validateMs = performance.now() - validateStart;
+  check(`10k-row registry validates clean (${scaleProblems.length} problems)`, scaleProblems.length === 0);
+  check(
+    `10k-row validation stats one path once (${validateStats.path_checks}/${scalePaths.length} stats)`,
+    validateStats.path_checks === scalePaths.length,
+  );
+  check(`10k-row validation stays linear (${Math.round(validateMs)} ms < 2000 ms)`, validateMs < 2000);
+
+  const drifted = { rows: scale.map((entry) => ({ ...entry })) };
+  drifted.rows[SCALE_ROWS - 1].test_ids = ['native.route-contract.scale.drifted'];
+  const driftStats = {};
+  const driftStart = performance.now();
+  const scaleDrift = driftProblems(drifted, scale, { stats: driftStats });
+  const driftMs = performance.now() - driftStart;
+  check('10k-row drift finds exactly the changed field', scaleDrift.length === 1, scaleDrift[0]);
+  check(
+    '10k-row drift compares every stable field once without canonical churn',
+    driftStats.field_comparisons === SCALE_ROWS * STABLE_FIELDS.length && driftStats.canonical_calls === 0,
+    JSON.stringify(driftStats),
+  );
+  check(`10k-row drift stays linear (${Math.round(driftMs)} ms < 2000 ms)`, driftMs < 2000);
+
+  const index = rustFnIndex(ROOT);
+  check(
+    `rust function index is one pass (${index.stats.files} files, ${Math.round(index.stats.bytes / 1048576)} MB)`,
+    index.stats.files > 0 && index.stats.dirs > 0,
+  );
+  check(
+    'indexed lookup finds a real invariant test fn',
+    findRustFn('settlement_is_bound_to_the_admitted_task_id', ROOT) !== null,
+  );
+
   if (failures > 0) {
     console.error(`registry selftest: ${failures} failure(s)`);
     return 1;
@@ -434,7 +556,7 @@ export async function main() {
       problems.push(...validateRegistry(committed, { discovered, release: mode === 'release' }));
     }
     if (dynamic) {
-      const fresh = await buildRegistry({ dynamic: true });
+      const fresh = await buildRegistry({ dynamic: true, discovered });
       problems.push(...validateRegistry(fresh, { discovered, release: mode === 'release' }));
       writeRegistry(fresh);
       for (const [kind, count] of Object.entries(fresh.counts.by_status)) {

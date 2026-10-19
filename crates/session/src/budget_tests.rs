@@ -2236,3 +2236,30 @@ fn change_budget_fact_is_bounded_and_hostile_safe() {
         Err(crate::task::TaskError::Oversized(_))
     ));
 }
+
+/// Per-tool-loop change-budget read is a POINT lookup, not a fact-space walk:
+/// 20k per-turn churn rows must not change the cost or the result.
+#[test]
+fn change_budget_read_is_point_addressed_under_turn_churn() {
+    let (_d, m) = test_manager();
+    let s = session(&m);
+    for index in 0..20_000 {
+        s.upsert_memory_fact("taskexec_run", &format!("churn-{index:05}"), "{}")
+            .unwrap();
+    }
+    let budget = ChangeBudget {
+        allowed_paths: vec!["src".into()],
+        ..Default::default()
+    };
+    s.set_change_budget(Some(&budget)).unwrap();
+    let started = std::time::Instant::now();
+    for _ in 0..1_000 {
+        assert_eq!(s.change_budget().unwrap().as_ref(), Some(&budget));
+    }
+    let elapsed = started.elapsed();
+    eprintln!("1000 change_budget reads with 20k churn: {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "change budget paid for unrelated fact churn: {elapsed:?}"
+    );
+}

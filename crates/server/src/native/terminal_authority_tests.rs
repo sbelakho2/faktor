@@ -2389,4 +2389,57 @@ mod terminal_authority_tests {
         assert_eq!(repaired.len(), 1, "{repaired:?}");
         assert_eq!(repaired[0].operation_id, OpId::new(9));
     }
+
+    /// Scale probe regression: terminal OPERATIONS and the LISTING read only
+    /// terminal ledger rows. The listing additionally re-validates a BOUNDED
+    /// rotating prefix slice (`TERMINAL_VERIFY_BATCH`), so its cost is
+    /// independent of the transcript/churn row count. The historical listing
+    /// re-read the whole ledger on every call.
+    #[test]
+    fn terminal_listing_and_operations_are_independent_of_transcript_churn() {
+        let (_d, manager) = manager();
+        let sid = session(&manager, "terminal-sweep");
+        let id = SessionId::new(sid.parse().unwrap());
+        let handle = manager.get_session(id).unwrap().unwrap();
+        let service = service_over(&manager, Arc::new(|_pid: u32| None), granted_policy());
+        // Warm both paths: session open verifies the ledger once (cache), and
+        // the first fold advances the terminal watermark.
+        let _ = service.list(&sid).unwrap();
+        let _ = service.resize(&sid, "missing", 24, 80);
+
+        let median = |samples: &mut Vec<f64>| {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        };
+        let measure = || {
+            let mut list_ms = Vec::new();
+            let mut op_ms = Vec::new();
+            for _ in 0..15 {
+                let started = std::time::Instant::now();
+                let _ = service.list(&sid).unwrap();
+                list_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                let started = std::time::Instant::now();
+                let _ = service.resize(&sid, "missing", 24, 80);
+                op_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            (median(&mut list_ms), median(&mut op_ms))
+        };
+        let (warm_list, warm_op) = measure();
+        const CHURN: usize = 20_000;
+        for index in 0..CHURN {
+            handle.ledger_goal_set(&format!("g{index}")).unwrap();
+        }
+        let (list, op) = measure();
+        eprintln!(
+            "terminal listing/op over {CHURN} churn rows: {warm_list:.3}/{warm_op:.3} -> {list:.3}/{op:.3} ms"
+        );
+        assert!(
+            list < 10.0 && op < 10.0,
+            "terminal listing/op must stay bounded over churn: list {list:.3} ms op {op:.3} ms"
+        );
+        assert!(
+            list <= warm_list * 3.0 + 1.0,
+            "transcript churn changed listing cost: {warm_list:.3} -> {list:.3} ms over {CHURN} rows"
+        );
+    }
 }

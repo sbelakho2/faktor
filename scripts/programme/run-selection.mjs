@@ -61,7 +61,13 @@ function main() {
   // Baseline structural suites always run (registry, selector, act-now,
   // invariants, edition8, docs). The affected Rust commands come from the
   // selection document.
-  const plan = lanePlan('pull', { changedFiles: selection.changed ?? [], base: selection.base ?? null });
+  // Reuse the already-persisted selection: recomputing it would re-parse the
+  // registry and re-walk every manifest for the same diff.
+  const plan = lanePlan('pull', {
+    changedFiles: selection.changed ?? [],
+    base: selection.base ?? null,
+    selection,
+  });
   const baseline = plan.entries
     .filter((entry) => entry.suite !== 'affected')
     .map((entry) => entry.command);

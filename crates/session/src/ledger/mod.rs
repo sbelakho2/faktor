@@ -152,20 +152,6 @@ pub const ENTRY_TERMINAL_KILLED: &str = "terminal_killed";
 pub const ENTRY_TERMINAL_LOST: &str = "terminal_lost";
 pub const ENTRY_TERMINAL_RECONCILED: &str = "terminal_reconciled";
 
-/// Whether a durable ledger entry type is one of the six terminal lifetime
-/// tags (the terminal projection reads only these).
-pub(crate) fn is_terminal_entry_type(tag: &str) -> bool {
-    matches!(
-        tag,
-        ENTRY_TERMINAL_CREATED
-            | ENTRY_TERMINAL_RUNNING
-            | ENTRY_TERMINAL_EXITED
-            | ENTRY_TERMINAL_KILLED
-            | ENTRY_TERMINAL_LOST
-            | ENTRY_TERMINAL_RECONCILED
-    )
-}
-
 /// Hard bound on one durable terminal UUID (UTF-8 bytes). The daemon mints
 /// canonical 36-byte UUID v4 strings; the bound admits every honest id.
 pub const MAX_TERMINAL_ID_BYTES: usize = 64;
@@ -3418,15 +3404,14 @@ impl SessionHandle {
     }
 
     /// Keyset-bounded twin of [`SessionHandle::ledger_terminal_rows`]: reads
-    /// the session ledger from `after_seq` forward, skips non-terminal rows
-    /// WITHOUT decoding their payload JSON, and stops as soon as
-    /// `max_records` terminal rows are materialized.
+    /// terminal rows of the session ledger strictly after `after_seq` in
+    /// `seq` order, and stops as soon as `max_records` rows are materialized.
     ///
-    /// This is the cursor page behind `/native/session/{id}/terminal/events`:
-    /// a reconnect at seq N never re-scans or re-decodes the whole session
-    /// ledger, and a page of `limit + 1` terminal rows costs O(page), not
-    /// O(entire history). The durable `seq` is the cursor, so paging stays
-    /// gapless and duplicate-free across restarts.
+    /// The store read is TYPE-SCOPED (`entry_type IN <terminal tags>`), so a
+    /// page never walks the message/event rows that share the ledger: the
+    /// `(session_id, entry_type)` index restricts the search before any row
+    /// (let alone payload) is read. The durable `seq` is the cursor, so
+    /// paging stays gapless and duplicate-free across restarts.
     pub fn ledger_terminal_rows_bounded(
         &self,
         after_seq: Option<i64>,
@@ -3435,24 +3420,30 @@ impl SessionHandle {
         if max_records == 0 {
             return Ok(Vec::new());
         }
+        const TERMINAL_TAGS: &[&str] = &[
+            ENTRY_TERMINAL_CREATED,
+            ENTRY_TERMINAL_RUNNING,
+            ENTRY_TERMINAL_EXITED,
+            ENTRY_TERMINAL_KILLED,
+            ENTRY_TERMINAL_LOST,
+            ENTRY_TERMINAL_RECONCILED,
+        ];
         let store = self.manager.store();
+        let page_limit = u64::try_from(max_records)
+            .unwrap_or(MAX_LEDGER_PAGE)
+            .min(MAX_LEDGER_PAGE);
         let mut cursor = after_seq;
         let mut out: Vec<TerminalLedgerRecord> = Vec::new();
         loop {
             let page = store
-                .ledger_entries(self.id, cursor, MAX_LEDGER_PAGE)
+                .ledger_entries_by_type_page(self.id, TERMINAL_TAGS, cursor, Some(page_limit))
                 .map_err(map_store_err)?;
             if page.is_empty() {
                 break;
             }
+            let page_len = page.len() as u64;
             cursor = page.last().map(|r| r.seq);
             for row in page {
-                // Cheap tag gate BEFORE the JSON decode: non-terminal rows
-                // (messages, task history, ...) never pay a parse on this
-                // streaming read path.
-                if !is_terminal_entry_type(&row.entry_type) {
-                    continue;
-                }
                 let entry = self.decode_row(&row)?;
                 if let Some(record) = terminal_record_of(entry) {
                     out.push(record);
@@ -3461,7 +3452,7 @@ impl SessionHandle {
                     }
                 }
             }
-            if cursor.is_none() {
+            if page_len < page_limit {
                 break;
             }
         }

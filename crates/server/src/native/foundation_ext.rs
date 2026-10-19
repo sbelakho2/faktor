@@ -7,7 +7,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
@@ -1448,6 +1448,134 @@ pub(crate) async fn native_mcp_server_delete(
 
 // ---------------------------------------------------------------- skills
 
+/// Bounded discovery cache for the skills listing. A cursor walk issues one
+/// HTTP request per page; each used to run a FULL [`SkillRegistry::discover`]
+/// (every `SKILL.md` opened and parsed) even though the tree had not changed.
+/// The cache is keyed by the admitted workspace root and validated by a
+/// metadata fingerprint (path, kind, size, mtime of every skill entry and its
+/// `SKILL.md`): a content or rename change yields a new fingerprint and a
+/// fresh discovery, so listing semantics stay exact.
+const MAX_CACHED_SKILL_TREES: usize = 8;
+const SKILL_FINGERPRINT_ENTRIES: usize = 4096;
+
+struct CachedSkillTree {
+    fingerprint: u64,
+    registry: Arc<SkillRegistry>,
+    #[cfg(test)]
+    discoveries: usize,
+}
+
+static SKILL_TREES: OnceLock<Mutex<HashMap<std::path::PathBuf, CachedSkillTree>>> = OnceLock::new();
+
+fn skill_trees() -> &'static Mutex<HashMap<std::path::PathBuf, CachedSkillTree>> {
+    SKILL_TREES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One metadata-only fingerprint of the two skill directories. No file body
+/// is read: a hit costs a bounded directory walk/stat pass, a miss pays the
+/// real discovery parse.
+fn skill_tree_fingerprint(root: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let rooted = faktor_fs::RootedDir::open(root).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for dir_rel in [".faktor/skills", ".claude/skills"] {
+        let dir = std::path::Path::new(dir_rel);
+        let listing = match rooted.list_entries(dir, SKILL_FINGERPRINT_ENTRIES) {
+            Ok(listing) => listing,
+            Err(error) => {
+                // Include the failure in the fingerprint so a repair
+                // (directory becomes readable) invalidates the cache.
+                (true, error.message).hash(&mut hasher);
+                continue;
+            }
+        };
+        (dir_rel, listing.overflowed).hash(&mut hasher);
+        let mut entries = listing.entries;
+        entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+        for entry in entries {
+            entry.rel.hash(&mut hasher);
+            (entry.kind as u8).hash(&mut hasher);
+            entry.size.hash(&mut hasher);
+            entry.modified_ms.hash(&mut hasher);
+            if entry.kind == faktor_fs::rooted::RootedEntryKind::Directory {
+                match rooted.list_entries(&entry.rel, SKILL_FINGERPRINT_ENTRIES) {
+                    Ok(inner) => {
+                        inner.overflowed.hash(&mut hasher);
+                        let mut inner_entries = inner.entries;
+                        inner_entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+                        for inner_entry in inner_entries {
+                            inner_entry.rel.hash(&mut hasher);
+                            (inner_entry.kind as u8).hash(&mut hasher);
+                            inner_entry.size.hash(&mut hasher);
+                            inner_entry.modified_ms.hash(&mut hasher);
+                        }
+                    }
+                    Err(error) => (true, error.message).hash(&mut hasher),
+                }
+            }
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// The cached registry for `root`; a fingerprint miss re-discovers. The
+/// map is hard-bounded (one existing tree is evicted when full) and never
+/// holds more than one registry per root.
+fn skill_registry(root: &std::path::Path) -> Arc<SkillRegistry> {
+    // One cache key per tree: the stored workspace root may be a
+    // non-canonical spelling, so canonicalize before keying (the same
+    // spelling the test probes use).
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let Some(fingerprint) = skill_tree_fingerprint(&key) else {
+        // Unopenable root: discovery itself surfaces the skips; no cache.
+        return Arc::new(SkillRegistry::discover(&key));
+    };
+    {
+        let cache = skill_trees()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(&key) {
+            if cached.fingerprint == fingerprint {
+                return Arc::clone(&cached.registry);
+            }
+        }
+    }
+    let registry = Arc::new(SkillRegistry::discover(&key));
+    let mut cache = skill_trees()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= MAX_CACHED_SKILL_TREES && !cache.contains_key(&key) {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    #[cfg(test)]
+    let prior_discoveries = cache
+        .get(&key)
+        .map(|cached| cached.discoveries)
+        .unwrap_or(0);
+    cache.insert(
+        key,
+        CachedSkillTree {
+            fingerprint,
+            registry: Arc::clone(&registry),
+            #[cfg(test)]
+            discoveries: prior_discoveries + 1,
+        },
+    );
+    registry
+}
+
+#[cfg(test)]
+pub(crate) fn skill_discoveries_for(root: &std::path::Path) -> usize {
+    skill_trees()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root)
+        .map(|cached| cached.discoveries)
+        .unwrap_or(0)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeSkillQuery {
@@ -1530,7 +1658,7 @@ pub(crate) async fn native_skills(
             Err(r) => return r,
         };
         if let Ok(Some(root)) = state.deps.session.resolve_workspace_root(handle.id()) {
-            let registry = SkillRegistry::discover(&root);
+            let registry = skill_registry(&root);
             let installed_names: BTreeSet<&str> = records.iter().map(|r| r.name.as_str()).collect();
             let mut candidates: Vec<&faktor_instructions::SkillMeta> = registry
                 .entries()

@@ -542,7 +542,9 @@ async fn persisted_terminal_facts_are_the_durable_truth_both_producers_derive() 
     let handle = graph.session.get_session(parent).unwrap().unwrap();
     let ledger = OutcomeLedger::new(graph.session.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(faktor_agent::LedgerAppend::Recorded)
     );
     let record = ledger.get(&run_id).unwrap().unwrap();

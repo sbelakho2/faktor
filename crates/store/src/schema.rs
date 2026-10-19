@@ -1205,6 +1205,33 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // workspace index already serves the per-workspace listing.
     "CREATE INDEX IF NOT EXISTS idx_session_updated_id
         ON session(updated_ms DESC, id DESC);",
+    // v40 — hot-path covering indexes for the Report.pdf fixes.
+    //
+    // `idx_memory_fact_v2_page` is PARTIAL on the exact half-open kind range
+    // the V2 pagers and counts use (`memory_v2:` .. `memory_v2;`), and its
+    // columns are the page's total order, so a page is an index range scan
+    // (no temp b-tree over the managed set) and the count is a covering
+    // index scan. The predicate is literal and shared verbatim with
+    // `memory_facts_page_filtered` / `memory_fact_count_v2`; SQLite refuses
+    // to use the index for a query whose predicate does not imply it, which
+    // is exactly the drift guard the plan tests pin.
+    //
+    // `idx_session_workspace_updated_id` adds the `id DESC` tie-break of the
+    // `(updated_ms, id)` History cursor to the per-workspace listing, so a
+    // workspace page is an index range scan instead of a temp b-tree sort
+    // of every session of the workspace.
+    "CREATE INDEX IF NOT EXISTS idx_memory_fact_v2_page
+        ON memory_fact(session_id, updated_ms DESC, kind DESC, key DESC)
+        WHERE kind >= 'memory_v2:' AND kind < 'memory_v2;';
+     CREATE INDEX IF NOT EXISTS idx_workspace_memory_fact_v2_page
+        ON workspace_memory_fact(workspace_id, updated_ms DESC, kind DESC, key DESC)
+        WHERE kind >= 'memory_v2:' AND kind < 'memory_v2;';
+     DROP INDEX IF EXISTS idx_session_workspace_updated;
+     CREATE INDEX IF NOT EXISTS idx_session_workspace_updated_id
+        ON session(workspace_id, updated_ms DESC, id DESC);
+     DROP INDEX IF EXISTS idx_ledger_entry_session_type;
+     CREATE INDEX IF NOT EXISTS idx_ledger_entry_session_type_seq
+        ON ledger_entry(session_id, entry_type, seq);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

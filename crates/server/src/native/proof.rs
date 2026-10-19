@@ -797,26 +797,21 @@ fn criteria_block(
             truncated: false,
         };
     };
-    // O(1) typed-criterion lookup: the historical `task_criteria.iter()
-    // .find(...)` ran once per record criterion, so a 10k-criterion proof
-    // against a 10k-criterion task was O(n^2). Index the task's criteria by
-    // both accepted key forms once; the decoded-envelope form resolves
-    // through the text map.
-    let mut by_encoded: HashMap<String, &faktor_session::task::Criterion> = HashMap::new();
-    let mut by_text: HashMap<&str, &faktor_session::task::Criterion> = HashMap::new();
-    for criterion in task_criteria {
-        by_text.entry(criterion.text.as_str()).or_insert(criterion);
-        by_encoded
-            .entry(criterion.encoded_entry())
-            .or_insert(criterion);
-    }
     let mut items = Vec::new();
     // Counts cover EVERY durable row; only `items` is paged. Reporting
     // `total = items.len()` made a 10k-claim record look like a 500-claim
     // record and made the pass/fail counts silently page-local.
+    //
+    // The first pass also records the SERVED rows (at most
+    // `MAX_NATIVE_LIST`), so the typed lookups below index only the task
+    // criteria that can appear on this page. The historical map covered
+    // every task criterion on every proof call (10k `encoded_entry`
+    // allocations for 500 served rows).
     let mut passed = 0u64;
     let mut failed = 0u64;
     let mut unavailable = 0u64;
+    let mut served: Vec<&faktor_core::state::CriterionVerification> =
+        Vec::with_capacity(record.criteria.len().min(MAX_NATIVE_LIST));
     for criterion in record.criteria.iter() {
         let verdict = criterion_verdict_label(criterion.passed, criterion.binding.as_ref());
         match verdict {
@@ -824,20 +819,50 @@ fn criteria_block(
             "fail" => failed += 1,
             _ => unavailable += 1,
         }
-        if items.len() >= MAX_NATIVE_LIST {
-            continue;
+        if served.len() < MAX_NATIVE_LIST {
+            served.push(criterion);
         }
+    }
+    // O(1) typed-criterion lookup: the historical `task_criteria.iter()
+    // .find(...)` ran once per record criterion, so a 10k-criterion proof
+    // against a 10k-criterion task was O(n^2). One map, scoped to the texts
+    // the served keys can resolve to (the raw key and, for the V2 envelope,
+    // its decoded text).
+    let mut by_text: HashMap<&str, &faktor_session::task::Criterion> = HashMap::new();
+    if !served.is_empty() {
+        let mut wanted: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(served.len());
+        for criterion in &served {
+            wanted.insert(criterion.criterion_key.as_str());
+        }
+        let decoded_texts: Vec<String> = served
+            .iter()
+            .filter_map(|criterion| {
+                faktor_session::task::Criterion::decode(&criterion.criterion_key)
+                    .map(|decoded| decoded.text)
+            })
+            .collect();
+        for text in &decoded_texts {
+            wanted.insert(text.as_str());
+        }
+        by_text = HashMap::with_capacity(wanted.len().min(task_criteria.len()));
+        for criterion in task_criteria {
+            if wanted.contains(criterion.text.as_str()) {
+                by_text.entry(criterion.text.as_str()).or_insert(criterion);
+            }
+        }
+    }
+    for criterion in served {
         // Durable criterion keys are the RAW acceptance-criteria entries: a
         // V2 task stores the encoded envelope, so the typed match resolves
-        // the encoded form first, then the plain key, then the decoded text.
-        let typed = by_encoded
-            .get(criterion.criterion_key.as_str())
-            .copied()
-            .or_else(|| by_text.get(criterion.criterion_key.as_str()).copied())
-            .or_else(|| {
-                faktor_session::task::Criterion::decode(&criterion.criterion_key)
-                    .and_then(|decoded| by_text.get(decoded.text.as_str()).copied())
-            });
+        // the encoded form (its decoded text) or the plain key.
+        let verdict = criterion_verdict_label(criterion.passed, criterion.binding.as_ref());
+        // Exact historical priority: encoded-envelope match first, then the
+        // plain key. (If the key is not a V2 envelope, only the plain lookup
+        // can ever match, exactly like the removed `by_encoded` map.)
+        let typed = faktor_session::task::Criterion::decode(&criterion.criterion_key)
+            .and_then(|decoded| by_text.get(decoded.text.as_str()).copied())
+            .or_else(|| by_text.get(criterion.criterion_key.as_str()).copied());
         items.push(TaskProofCriterionRow {
             criterion_key: criterion.criterion_key.clone(),
             origin: typed.map(|t| t.origin.label().to_string()),
@@ -1325,5 +1350,38 @@ mod totals_tests {
                 "checks truncated at {n}"
             );
         }
+
+        // Per-call cost at the 10k boundary: the served-page map is built
+        // from at most MAX_NATIVE_LIST wanted texts; the historical code
+        // serialized an encoded envelope for EVERY task criterion on every
+        // proof call. Measure the build it replaced against the fixed one.
+        let n = 10_000usize;
+        let record = record(n);
+        let task_criteria: Vec<faktor_session::task::Criterion> = (0..n)
+            .map(|i| faktor_session::task::Criterion::user(format!("criterion-{i}")))
+            .collect();
+        let started = std::time::Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..20 {
+            sink += criteria_block(Some(&record), &task_criteria, false)
+                .items
+                .len();
+        }
+        let fixed = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let mut old_map = std::collections::HashMap::new();
+            for criterion in &task_criteria {
+                old_map.insert(criterion.encoded_entry(), criterion.text.as_str());
+            }
+            sink += old_map.len();
+        }
+        let replaced = started.elapsed();
+        eprintln!("proof criteria at {n}: fixed {fixed:?}, replaced envelope map {replaced:?}");
+        assert!(sink > 0);
+        assert!(
+            fixed < replaced,
+            "the served-page lookup must beat the every-criterion envelope map: {fixed:?} vs {replaced:?}"
+        );
     }
 }

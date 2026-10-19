@@ -1300,7 +1300,6 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
             "idx_part_message",
             "idx_permission_session_pending",
             "idx_permission_decision_id",
-            "idx_session_workspace_updated",
             "idx_task_ledger_session_updated",
             "idx_prompt_queue_status_session",
             "idx_memory_fact_kind_session",
@@ -1318,9 +1317,14 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(present, 1, "v35 must create {index}");
+            assert_eq!(present, 1, "migrations must create {index}");
         }
-        for dropped in ["idx_event_session_seq", "idx_message_session_seq"] {
+        for dropped in [
+            "idx_event_session_seq",
+            "idx_message_session_seq",
+            "idx_session_workspace_updated",
+            "idx_ledger_entry_session_type",
+        ] {
             let present: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
@@ -1328,7 +1332,7 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(present, 0, "v35 must drop the duplicate {dropped}");
+            assert_eq!(present, 0, "migrations must drop the superseded {dropped}");
         }
     }
     assert_eq!(

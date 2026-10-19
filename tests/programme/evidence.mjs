@@ -8,7 +8,7 @@
 // scripts/programme/run-lane.mjs; this module never claims their results.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,33 +16,60 @@ import { discoverCliCommands } from '../../scripts/discover-capabilities.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-function read(rel) {
-  const path = join(ROOT, rel);
-  return existsSync(path) ? readFileSync(path, 'utf8') : '';
-}
+const RUST_FN_RE = /\bfn\s+([A-Za-z0-9_]+)\s*\(/g;
+const rustFnIndexes = new Map();
 
-function walk(rel, filter, out = []) {
-  const dir = join(ROOT, rel);
-  if (!existsSync(dir)) return out;
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'target' || entry.name === 'node_modules' || entry.name === '.git') continue;
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) walk(relative(ROOT, path), filter, out);
-    else if (filter(path)) out.push(path);
-  }
-  return out;
-}
-
-export function findRustFn(name) {
-  const needle = new RegExp(`fn\\s+${name.replace(/[$]/g, '\\$')}\\s*\\(`);
-  for (const top of ['crates', 'tests']) {
-    for (const file of walk(top, (path) => path.endsWith('.rs'))) {
-      if (needle.test(readFileSync(file, 'utf8'))) {
-        return relative(ROOT, file).split('\\').join('/');
+/**
+ * One deterministic pass over crates/** and tests/**, mapping every
+ * `fn name(` to the first file that declares it. Callers ask the index
+ * instead of re-walking (and re-reading) the whole tree per test id; the
+ * walk is sorted so "first file" is stable across platforms.
+ */
+export function rustFnIndex(root = ROOT) {
+  const key = resolve(root);
+  const cached = rustFnIndexes.get(key);
+  if (cached) return cached;
+  const byName = new Map();
+  const stats = { files: 0, dirs: 0, bytes: 0 };
+  const scan = (rel) => {
+    const dir = join(key, rel);
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    stats.dirs += 1;
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      if (entry.name === 'target' || entry.name === 'node_modules' || entry.name === '.git') continue;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        scan(relative(key, path));
+      } else if (entry.isFile() && entry.name.endsWith('.rs')) {
+        const text = readFileSync(path, 'utf8');
+        stats.files += 1;
+        stats.bytes += text.length;
+        for (const match of text.matchAll(RUST_FN_RE)) {
+          if (!byName.has(match[1])) byName.set(match[1], relative(key, path).split('\\').join('/'));
+        }
       }
     }
-  }
-  return null;
+  };
+  for (const top of ['crates', 'tests']) scan(top);
+  const index = { root: key, byName, stats };
+  rustFnIndexes.set(key, index);
+  return index;
+}
+
+/** Test/fixture hook: drop the cached index for one root (or all roots). */
+export function clearRustFnIndex(root = null) {
+  if (root === null) rustFnIndexes.clear();
+  else rustFnIndexes.delete(resolve(root));
+}
+
+export function findRustFn(name, root = ROOT) {
+  return rustFnIndex(root).byName.get(name) ?? null;
 }
 
 export function cliBinary() {
@@ -127,8 +154,13 @@ export function probeInvariant(row) {
 }
 
 /** Check a nightly lane actually schedules the scale probe. */
-export function probeScaleSchedule() {
-  const yaml = read('.woodpecker/trusted/nightly.yaml');
+export function probeScaleSchedule(root = ROOT) {
+  let yaml = '';
+  try {
+    yaml = readFileSync(join(root, '.woodpecker/trusted/nightly.yaml'), 'utf8');
+  } catch {
+    yaml = '';
+  }
   const hasStep = /^  - name:\s*scale\s*$/m.test(yaml);
   const hasCommand = /scale-probe\.mjs/.test(yaml);
   return hasStep && hasCommand

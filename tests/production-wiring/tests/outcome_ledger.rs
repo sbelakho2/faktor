@@ -334,7 +334,9 @@ async fn late_finalization_moves_pending_to_complete() {
         .unwrap();
     let ledger = OutcomeLedger::new(graph.session.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(faktor_agent::LedgerAppend::Recorded)
     );
     let initial = ledger.settlement(&run_id).unwrap().unwrap();
@@ -424,14 +426,18 @@ async fn dual_producers_converge_for_every_interleaving() {
     let handle = graph.session.get_session(parent).unwrap().unwrap();
     let ledger = OutcomeLedger::new(graph.session.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(faktor_agent::LedgerAppend::Recorded)
     );
     settle(&graph, parent, &run_id).await;
     assert_eq!(ledger.count().unwrap(), 1);
     let agent_first = ledger.get(&run_id).unwrap().unwrap();
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         None,
         "the executor's win leaves the agent path a no-op"
     );
@@ -444,7 +450,12 @@ async fn dual_producers_converge_for_every_interleaving() {
     settle(&graph, parent, &run_id).await;
     assert_eq!(ledger.count().unwrap(), 1);
     let executor_first = ledger.get(&run_id).unwrap().unwrap();
-    assert_eq!(ledger.record_terminal_run(&handle, &run_id).unwrap(), None);
+    assert_eq!(
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
+        None
+    );
 
     // (c) Genuinely concurrent producers: the store's immediate transaction
     // picks exactly one winner and every loser observes a no-op.
@@ -479,7 +490,7 @@ async fn dual_producers_converge_for_every_interleaving() {
             handles.push(scope.spawn(move || {
                 let handle = graph.session.get_session(parent).unwrap().unwrap();
                 ledger
-                    .record_terminal_run(&handle, run_id)
+                    .record_terminal_run(&handle, run_id, handle.task_id().unwrap())
                     .expect("a losing producer observes a replay, never an error")
             }));
         }
@@ -619,7 +630,9 @@ async fn nonzero_settled_reservations_are_byte_identical_across_producer_orders(
     let handle_a = graph_a.session.get_session(parent_a).unwrap().unwrap();
     let ledger_a = OutcomeLedger::new(graph_a.session.store());
     assert_eq!(
-        ledger_a.record_terminal_run(&handle_a, &run_a).unwrap(),
+        ledger_a
+            .record_terminal_run(&handle_a, &run_a, handle_a.task_id().unwrap())
+            .unwrap(),
         Some(faktor_agent::LedgerAppend::Recorded)
     );
     settle(&graph_a, parent_a, &run_a).await;
@@ -640,7 +653,9 @@ async fn nonzero_settled_reservations_are_byte_identical_across_producer_orders(
     let ledger_b = OutcomeLedger::new(graph_b.session.store());
     settle(&graph_b, parent_b, &run_b).await;
     assert_eq!(
-        ledger_b.record_terminal_run(&handle_b, &run_b).unwrap(),
+        ledger_b
+            .record_terminal_run(&handle_b, &run_b, handle_b.task_id().unwrap())
+            .unwrap(),
         None
     );
     let record_b = ledger_b.get(&run_b).unwrap().unwrap();
@@ -704,7 +719,9 @@ async fn sequential_divergent_producers_repair_money_without_rewriting_the_recor
         .unwrap();
     let ledger = OutcomeLedger::new(graph.session.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(faktor_agent::LedgerAppend::Recorded)
     );
     let frozen = ledger.get(&run_id).unwrap().unwrap();
@@ -736,7 +753,12 @@ async fn sequential_divergent_producers_repair_money_without_rewriting_the_recor
         !settled.steps.is_empty(),
         "the settled projection carries the measured step the frozen row cannot"
     );
-    assert_eq!(ledger.record_terminal_run(&handle, &run_id).unwrap(), None);
+    assert_eq!(
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
+        None
+    );
     // A third pass converges: no record movement, no settlement movement.
     settle(&graph, parent, &run_id).await;
     assert_eq!(ledger.get(&run_id).unwrap().unwrap(), frozen);

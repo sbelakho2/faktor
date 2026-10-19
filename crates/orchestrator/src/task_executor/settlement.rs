@@ -15,11 +15,18 @@ pub(crate) fn settlement_task_id(
     handle: &faktor_session::SessionHandle,
     run_id: &str,
 ) -> Result<faktor_core::TaskId, ExecError> {
-    if let Ok(Some(value)) = handle.memory_fact_get(TASK_RUN_ROW_KIND, run_id) {
-        if let Ok(row) = TaskRunRow::decode(&value) {
-            if let Some(task_id) = row.task_id {
-                return Ok(faktor_core::TaskId::new(task_id));
-            }
+    if let Some(value) = handle
+        .memory_fact_get(TASK_RUN_ROW_KIND, run_id)
+        .map_err(|e| classify_session_read("task run row of the post-run settlement", e))?
+    {
+        let row = TaskRunRow::decode(&value).map_err(|detail| {
+            ExecError::from(DurableStateError::CorruptDurableState {
+                what: format!("task run row of run {run_id}"),
+                detail,
+            })
+        })?;
+        if let Some(task_id) = row.task_id {
+            return Ok(faktor_core::TaskId::new(task_id));
         }
     }
     run_policy_task_id(handle, run_id)
@@ -166,7 +173,7 @@ impl TaskExecutor {
             }
         }
         let ledger = faktor_agent::OutcomeLedger::new(self.session.store());
-        match ledger.record_terminal_run(&handle, run_id) {
+        match ledger.record_terminal_run(&handle, run_id, task_id) {
             Ok(_) => {}
             Err(faktor_agent::OutcomeLedgerError::Store(faktor_store::StoreError::Conflict(
                 detail,
@@ -297,11 +304,10 @@ impl TaskExecutor {
         // FIX 2: the verification-fact scan is an explicit durable read — a
         // store failure is an error (never "no runs to settle") and a
         // corrupt fact page refuses typed.
-        let runs: Vec<String> = match handle.memory_facts() {
+        let runs: Vec<String> = match facts_of_kind(&handle, ROOT_ATTEMPT_FACT_KIND) {
             Ok(facts) => facts
                 .into_iter()
-                .filter(|(kind, key, _)| kind == ROOT_ATTEMPT_FACT_KIND && key.starts_with("root:"))
-                .filter_map(|(_, key, _)| key.strip_prefix("root:").map(str::to_string))
+                .filter_map(|(key, _)| key.strip_prefix("root:").map(str::to_string))
                 .filter(|run| !run.is_empty())
                 .collect(),
             Err(e) => {
@@ -803,12 +809,12 @@ impl TaskExecutor {
         // policy (nothing this settlement may name), while a PRESENT row that
         // is undecodable or lacks its `specs` is corrupt durable state and
         // refuses the settlement typed (never "no plan").
-        let plan_specs: Option<Vec<ChildSpec>> = match parent_facts(&handle)?
-            .into_iter()
-            .find(|(kind, key, _)| kind == PLAN_ROW_KIND && key == &run_id)
-        {
+        let plan_row = handle
+            .memory_fact_get(PLAN_ROW_KIND, &run_id)
+            .map_err(|e| classify_session_read("plan row of the post-run settlement", e))?;
+        let plan_specs: Option<Vec<ChildSpec>> = match plan_row {
             None => None,
-            Some((_, _, value)) => {
+            Some(value) => {
                 let parsed: serde_json::Value = serde_json::from_str(&value).map_err(|e| {
                     ExecError::from(DurableStateError::CorruptDurableState {
                         what: format!("plan row of run {run_id}"),

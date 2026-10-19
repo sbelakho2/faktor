@@ -874,6 +874,7 @@ fn v2_memory_page_plan_and_latency_at_200k_churn_rows() {
             .prepare(
                 "EXPLAIN QUERY PLAN
                  SELECT kind, key, value, updated_ms FROM memory_fact
+                 INDEXED BY idx_memory_fact_v2_page
                  WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'
                  ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 65",
             )
@@ -885,8 +886,12 @@ fn v2_memory_page_plan_and_latency_at_200k_churn_rows() {
     };
     assert!(
         plan.iter().any(|detail| detail
-            == "SEARCH memory_fact USING INDEX sqlite_autoindex_memory_fact_1 (session_id=? AND kind>? AND kind<?)"),
-        "the V2 page must name the (session_id, kind, key) index: {plan:?}"
+            == "SEARCH memory_fact USING INDEX idx_memory_fact_v2_page (session_id=?)"),
+        "the V2 page must name the partial V2 order index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+        "the V2 page must be served in index order: {plan:?}"
     );
     let started = std::time::Instant::now();
     let (rows, more) = store.memory_facts_v2_page(s.id, None, 64).unwrap();
@@ -904,10 +909,57 @@ fn v2_memory_page_plan_and_latency_at_200k_churn_rows() {
     store
         .upsert_workspace_memory_fact(w.raw(), "memory_v2:decision", "framework", "rust")
         .unwrap();
+    // A non-V2 row (only reachable from a foreign writer) is NOT managed
+    // memory: the page and its count must share the exact V2 range.
+    store
+        .upsert_workspace_memory_fact(w.raw(), "taskexec_run", "churn", "{}")
+        .unwrap();
+    assert_eq!(
+        store.workspace_memory_fact_count(w.raw()).unwrap(),
+        1,
+        "the workspace count must use the same V2 predicate as the page"
+    );
     let (wrows, wmore) = store
         .workspace_memory_facts_v2_page(w.raw(), None, 64)
         .unwrap();
     assert!(!wmore);
     assert_eq!(wrows.len(), 1);
     assert_eq!(wrows[0].kind, "memory_v2:decision");
+}
+
+/// The admission/recovery key-prefix probe is a LITERAL half-open range:
+/// no LIKE case folding, no `_`/`%` wildcard widening, and hostile
+/// non-ASCII/empty prefixes stay exact.
+#[test]
+fn memory_fact_key_prefix_probe_is_literal_not_a_like_pattern() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    for key in ["run/child", "run/child/2", "runXchild", "é/child"] {
+        store
+            .upsert_memory_fact(s.id, "taskexec_registry", key, "{}")
+            .unwrap();
+    }
+    let probe = |prefix: &str| {
+        store
+            .memory_fact_key_prefix_exists(s.id, "taskexec_registry", prefix)
+            .unwrap()
+    };
+    assert!(probe("run/"));
+    assert!(!probe("RUN/"), "prefix matching is case-sensitive");
+    assert!(!probe("Run/"));
+    assert!(
+        !probe("run_"),
+        "`_` is a literal byte, not a LIKE single-char wildcard"
+    );
+    assert!(
+        !probe("run%"),
+        "`%` is a literal byte, not a LIKE multi-char wildcard"
+    );
+    assert!(probe("é/"), "non-ASCII prefixes keep exact semantics");
+    assert!(!probe("missing/"));
+    assert!(probe(""), "an empty prefix is an existential kind probe");
+    assert!(!store
+        .memory_fact_key_prefix_exists(s.id, "absent-kind", "")
+        .unwrap());
 }

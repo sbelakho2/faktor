@@ -3184,3 +3184,40 @@ async fn settlement_binds_to_the_runs_recorded_task_identity() {
         "an unrecorded run must refuse typed, never fall back to the advanced current identity: {err:?}"
     );
 }
+/// Settlement must never page the WHOLE fact space per run: the per-turn
+/// `taskexec_run`/memory churn would make every settle O(all facts) and the
+/// old 64-page helper could silently truncate a run's plan/registry rows.
+/// Kind-scoped pages (`facts_of_kind`) and point reads (`memory_fact_get`)
+/// are the only admitted shapes.
+#[test]
+pub(crate) fn settlement_modules_never_scan_the_whole_fact_space() {
+    const FILES: &[(&str, &str)] = &[
+        (
+            "task_executor/settlement.rs",
+            include_str!("../task_executor/settlement.rs"),
+        ),
+        (
+            "task_executor/integration.rs",
+            include_str!("../task_executor/integration.rs"),
+        ),
+        (
+            "task_executor/run_policy.rs",
+            include_str!("../task_executor/run_policy.rs"),
+        ),
+        (
+            "task_executor/verification.rs",
+            include_str!("../task_executor/verification.rs"),
+        ),
+        (
+            "task_executor/recovery.rs",
+            include_str!("../task_executor/recovery.rs"),
+        ),
+    ];
+    for (name, src) in FILES {
+        assert!(
+            !src.contains(".memory_facts()") && !src.contains("parent_facts("),
+            "{name}: whole-fact-space scan in a settlement path; use \
+             `facts_of_kind` or `memory_fact_get`"
+        );
+    }
+}

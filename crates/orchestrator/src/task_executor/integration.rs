@@ -660,21 +660,21 @@ impl TaskExecutor {
                 // corrupt observation row is a typed refusal — never "no
                 // unintegrated changes" (which silently destroyed applied
                 // writes).
-                let facts = handle.memory_facts().map_err(|e| {
+                let facts = facts_of_kind(handle, "verification").map_err(|e| {
                     ExecError::from(classify_session_read(
                         "memory facts of the interrupted shadow run",
                         e,
                     ))
                 })?;
                 let mut unintegrated = false;
-                for (kind, key, value) in &facts {
-                    if kind != "verification" || !key.contains("root:") {
+                for (key, value) in &facts {
+                    if !key.contains("root:") {
                         continue;
                     }
                     let parsed =
                         serde_json::from_str::<serde_json::Value>(value).map_err(|e| {
                             ExecError::Malformed(format!(
-                                "verification observation {kind}/{key} of shadow {} is undecodable ({e}); refusing to discard the shadow",
+                                "verification observation verification/{key} of shadow {} is undecodable ({e}); refusing to discard the shadow",
                                 row.shadow_id
                             ))
                         })?;
@@ -989,18 +989,12 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let facts = parent_facts(&handle)?;
-        let run_row = facts
-            .iter()
-            .find(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == run_id);
-        if let Some((_, _, value)) = run_row {
-            let row = TaskRunRow::decode(value)
+        if let Some(value) = handle.memory_fact_get(TASK_RUN_ROW_KIND, run_id)? {
+            let row = TaskRunRow::decode(&value)
                 .map_err(|m| ExecError::Internal(format!("stored run row {run_id}: {m}")))?;
             return self.cancel_in_session_run(parent, &handle, &row);
         }
-        let has_plan = facts
-            .iter()
-            .any(|(kind, key, _)| kind == PLAN_ROW_KIND && key == run_id);
+        let has_plan = handle.memory_fact_get(PLAN_ROW_KIND, run_id)?.is_some();
         let children = OrchestratorRuntime::registry_rows(self.session.clone(), parent, run_id)?;
         if has_plan || !children.is_empty() {
             return self.cancel_orchestrated_run(&handle, run_id, &children);

@@ -483,7 +483,7 @@ async function main() {
                 maxHistoryMessages: 200,
               },
             );
-            compactionSamples.push(performance.now() - compactionStarted);
+            const compactionMs = performance.now() - compactionStarted;
             assert('turns-compaction', compact.status === 200, `compaction ${turn} -> ${compact.status} ${compact.text.slice(0, 300)}`);
             const op = compact.json;
             const result = op.result ?? {};
@@ -496,6 +496,10 @@ async function main() {
             }
             assert('turns-compaction', op.state === 'applied', `compaction ${turn} state ${op.state} result=${JSON.stringify(result).slice(0, 500)}`);
             applied += 1;
+            // Sample ONLY applied compactions: `compactionBefore` is pushed
+            // for the same rows, so the per-1k-token curve can never index an
+            // undefined input (quick/early refusals used to produce NaN).
+            compactionSamples.push(compactionMs);
             assert('turns-compaction', result.accepted === true, `compaction ${turn} not accepted`);
             assert('turns-compaction', result.after < result.before, `compaction ${turn} did not reduce (${result.before}->${result.after})`);
             assert(
@@ -893,6 +897,7 @@ async function main() {
     // -------------------------------------------------------------- history
     await probe('history-2000', async () => {
       let before = null;
+      let snapshotMs = null;
       let total = 0;
       const seen = new Set();
       const pageSamples = [];
@@ -903,12 +908,22 @@ async function main() {
         if (before !== null) {
           query.set('beforeMs', String(before.beforeMs));
           query.set('beforeId', String(before.beforeId));
+          // A cursored walk is bound to the first page's snapshot: updates
+          // during the walk cannot re-surface or skip a conversation.
+          assert('history-2000', snapshotMs !== null, 'cursored page without a snapshot');
+          query.set('snapshotMs', String(snapshotMs));
         }
         const started = performance.now();
         const page = await getJson(base, token, `/native/sessions?${query}`);
         pageSamples.push(performance.now() - started);
         assert('history-2000', page.status === 200, `history page ${page.status}`);
         assert('history-2000', page.json.sessions.length <= 200, `history page ${page.json.sessions.length} > 200`);
+        if (snapshotMs === null) {
+          snapshotMs = Number(page.json.snapshotMs);
+          assert('history-2000', Number.isFinite(snapshotMs) && snapshotMs >= 0, 'first page carries no snapshotMs');
+        } else {
+          assert('history-2000', Number(page.json.snapshotMs) === snapshotMs, 'snapshot changed mid-walk');
+        }
         for (const row of page.json.sessions) {
           assert('history-2000', !seen.has(row.id), `duplicate history session ${row.id}`);
           seen.add(row.id);

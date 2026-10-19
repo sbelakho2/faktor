@@ -896,6 +896,40 @@ async fn skills_listing_cursor_reaches_every_discovered_skill() {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), 600, "every discovered skill is reachable");
+    // The cursor is four pages over one unchanged tree: exactly ONE full
+    // discovery may run (fingerprint hits for every later page).
+    let root = rig.dir.path().canonicalize().unwrap();
+    assert_eq!(
+        crate::native::foundation_ext::skill_discoveries_for(&root),
+        1,
+        "the cursor walk must not re-run discovery per page"
+    );
+    // Exactness: a changed SKILL.md invalidates the fingerprint and the next
+    // page reflects the new summary (no stale cache).
+    std::fs::write(
+        rig.dir.path().join(".faktor/skills/skill-0000/SKILL.md"),
+        "# Changed summary with a different size and body\n",
+    )
+    .unwrap();
+    let (status, changed) = rig
+        .get(&format!("/native/skills?session={}", rig.session))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    let changed_skill = changed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "skill-0000")
+        .expect("changed skill still listed");
+    assert_eq!(
+        changed_skill["description"], "Changed summary with a different size and body",
+        "the cache must not mask a changed skill: {changed_skill}"
+    );
+    assert_eq!(
+        crate::native::foundation_ext::skill_discoveries_for(&root),
+        2,
+        "a changed tree must re-discover exactly once"
+    );
 
     fn urlencoding(value: &str) -> String {
         value

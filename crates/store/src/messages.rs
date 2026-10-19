@@ -41,6 +41,13 @@ pub(crate) fn message_map_data(r: &rusqlite::Row<'_>, data_raw: &str) -> StoreRe
     })
 }
 
+// Test-only count of serde decodes performed by transcript search on the
+// current thread (proves the SQL prefilter skips non-candidate payloads).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SEARCH_JSON_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn part_map(r: &rusqlite::Row<'_>) -> StoreResult<PartRow> {
     let id = r.get::<_, i64>(0)?;
     Ok(PartRow {
@@ -456,32 +463,147 @@ impl Store {
         }
         let limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(200);
         let needle = query.to_lowercase();
-        const CHUNK: u64 = 256;
+        // ASCII needles without JSON-escaped bytes (`"`, `\`, controls)
+        // appear literally in the stored JSON for every visible match, so
+        // SQLite can reject non-matching rows before Rust materializes their
+        // payload or serde decodes a single leaf. Any other needle falls
+        // back to decoding the bounded chunk (Unicode escapes/case folding
+        // cannot be expressed by SQLite's ASCII `lower`).
+        let prefilter = ascii_prefilter_needle(&needle);
+        let prefilter = prefilter.as_deref();
+        const CHUNK: u64 = 128;
         let mut out: Vec<MessageRow> = Vec::with_capacity(limit);
-        let mut before: Option<u64> = None;
+        let mut before: Option<i64> = None;
+        let mut folded = String::new();
         loop {
-            let page =
-                self.messages_window_with_parts(session_id, before, None, CHUNK, u64::MAX)?;
-            if page.is_empty() {
+            let rows = self.search_message_chunk(session_id, before, prefilter, CHUNK)?;
+            if rows.is_empty() {
                 break;
             }
-            let mut last_seq: Option<u64> = None;
-            for (message, parts) in &page {
-                last_seq = Some(message.seq as u64);
-                if out.len() >= limit {
-                    break;
+            let chunk_len = rows.len() as u64;
+            let last_seq = rows.last().map(|row| row.seq);
+            // Candidate parts in ONE bounded batch per chunk (an IN list of
+            // at most CHUNK ids; ids are i64 and the chunk is 128).
+            let candidates: Vec<i64> = rows
+                .iter()
+                .filter(|row| row.data.is_some())
+                .map(|row| row.id)
+                .collect();
+            let mut parts_by_message: std::collections::HashMap<i64, Vec<PartRow>> =
+                std::collections::HashMap::with_capacity(candidates.len());
+            if !candidates.is_empty() {
+                let mut placeholders = String::new();
+                let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(candidates.len());
+                for (index, id) in candidates.iter().enumerate() {
+                    if index > 0 {
+                        placeholders.push(',');
+                    }
+                    placeholders.push('?');
+                    params.push(rusqlite::types::Value::Integer(*id));
                 }
-                if message_matches(message, parts, &needle) {
-                    out.push(message.clone());
+                let conn = self.read()?;
+                let sql = format!(
+                    "SELECT id, message_id, kind, data, created_ms FROM part
+                     WHERE message_id IN ({placeholders}) ORDER BY message_id, id"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut part_rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+                while let Some(row) = part_rows.next()? {
+                    let part = part_map(row)?;
+                    parts_by_message
+                        .entry(part.message_id)
+                        .or_default()
+                        .push(part);
                 }
             }
-            if out.len() >= limit {
-                break;
+            for row in rows {
+                let Some(raw) = row.data else { continue };
+                #[cfg(test)]
+                SEARCH_JSON_DECODES.with(|count| count.set(count.get() + 1));
+                let message = MessageRow {
+                    id: row.id,
+                    session_id: row.session_id,
+                    seq: row.seq,
+                    role: row.role,
+                    data: parse_json(&format!("message {} data", row.id), &raw)?,
+                    created_ms: row.created_ms,
+                };
+                let parts = parts_by_message.remove(&row.id).unwrap_or_default();
+                if message_matches(&message, &parts, &needle, &mut folded) {
+                    out.push(message);
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
             }
             match last_seq {
-                Some(seq) if page.len() as u64 == CHUNK => before = Some(seq),
+                Some(seq) if chunk_len == CHUNK => before = Some(seq),
                 _ => break,
             }
+        }
+        Ok(out)
+    }
+
+    /// One bounded newest-first chunk of the transcript for search. The
+    /// `CASE` returns `data` ONLY for rows whose stored JSON (message or
+    /// part) contains the ASCII prefilter needle; every other row is
+    /// returned with `data = NULL` and is never materialized. Without a
+    /// prefilter (Unicode needle) every row of the chunk is a candidate.
+    fn search_message_chunk(
+        &self,
+        session_id: SessionId,
+        before: Option<i64>,
+        prefilter: Option<&str>,
+        chunk: u64,
+    ) -> StoreResult<Vec<SearchChunkRow>> {
+        // `LIKE` is SQLite's ASCII-case-insensitive matcher without a
+        // per-row `lower()` copy (measured ~30% faster than
+        // `instr(lower(data), ...)` on a 50k-row transcript). Wildcards in
+        // the needle are escaped by `ascii_prefilter_needle`.
+        let predicate = "m.data LIKE ?3 ESCAPE '\\' OR EXISTS (
+                SELECT 1 FROM part p WHERE p.message_id = m.id
+                 AND p.data LIKE ?3 ESCAPE '\\')";
+        let data_expr = if prefilter.is_some() {
+            format!("CASE WHEN ({predicate}) THEN m.data ELSE NULL END")
+        } else {
+            "m.data".to_string()
+        };
+        let filter = if prefilter.is_some() {
+            format!(" AND ({predicate})")
+        } else {
+            String::new()
+        };
+        let limit_placeholder = if prefilter.is_some() { "?4" } else { "?3" };
+        let sql = format!(
+            "SELECT m.id, m.session_id, m.seq, m.role, {data_expr}, m.created_ms
+             FROM message m
+             WHERE m.session_id = ?1 AND m.seq < ?2{filter}
+             ORDER BY m.seq DESC LIMIT {limit_placeholder}"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(4);
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
+        params.push(rusqlite::types::Value::Integer(before.unwrap_or(i64::MAX)));
+        if let Some(needle) = prefilter {
+            params.push(rusqlite::types::Value::Text(needle.to_string()));
+        }
+        params.push(rusqlite::types::Value::Integer(
+            i64::try_from(chunk).unwrap_or(i64::MAX),
+        ));
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            let raw: Option<String> = row.get(4)?;
+            out.push(SearchChunkRow {
+                id,
+                session_id: id_field(&format!("message {id} session_id"), row.get(1)?)?,
+                seq: row.get(2)?,
+                role: row.get(3)?,
+                data: raw,
+                created_ms: row.get(5)?,
+            });
         }
         Ok(out)
     }
@@ -489,59 +611,122 @@ impl Store {
     // ---------------------------------------------------------------- task ledger
 }
 
+/// One payload-bearing search candidate (see
+/// [`Store::search_message_chunk`]): `data` is `None` for rows the SQL
+/// prefilter rejected, so their JSON is never decoded.
+struct SearchChunkRow {
+    id: i64,
+    session_id: SessionId,
+    seq: i64,
+    role: String,
+    data: Option<String>,
+    created_ms: i64,
+}
+
+/// The SQL prefilter is only sound when the already-folded needle occurs
+/// literally in JSON string bodies: ASCII printable bytes except `"` and
+/// `\` (the two bytes serde_json escapes). Everything else must be decoded.
+fn ascii_prefilter_needle(needle: &str) -> Option<String> {
+    if !needle.is_ascii()
+        || needle
+            .bytes()
+            .any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\')
+    {
+        return None;
+    }
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for ch in needle.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    Some(pattern)
+}
+
 /// True when any VISIBLE field of one durable message/parts pair contains
 /// the already-folded search needle. String leaves of a tool call's `input`
 /// are visible (rendered as the call's arguments); identifiers/state are
-/// not. `to_lowercase()` gives Unicode-aware folding for both sides.
-fn message_matches(message: &MessageRow, parts: &[PartRow], needle: &str) -> bool {
-    let mut haystacks: Vec<&str> = Vec::new();
+/// not.
+fn message_matches(
+    message: &MessageRow,
+    parts: &[PartRow],
+    needle: &str,
+    folded: &mut String,
+) -> bool {
     if let Some(text) = message.data.get("text").and_then(|v| v.as_str()) {
-        haystacks.push(text);
+        if contains_folded(text, needle, folded) {
+            return true;
+        }
     }
     for part in parts {
         let data = &part.data;
         match part.kind.as_str() {
             "text" | "reasoning" | "summary" => {
                 if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                    haystacks.push(text);
+                    if contains_folded(text, needle, folded) {
+                        return true;
+                    }
                 }
             }
             "tool_result" => {
                 if let Some(excerpt) = data.get("excerpt").and_then(|v| v.as_str()) {
-                    haystacks.push(excerpt);
+                    if contains_folded(excerpt, needle, folded) {
+                        return true;
+                    }
                 }
             }
             "tool_call" => {
                 if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
-                    haystacks.push(name);
+                    if contains_folded(name, needle, folded) {
+                        return true;
+                    }
                 }
                 if let Some(input) = data.get("input") {
-                    collect_visible_strings(input, &mut haystacks);
+                    if visible_value_matches(input, needle, folded) {
+                        return true;
+                    }
                 }
             }
             _ => {}
         }
     }
-    haystacks
-        .into_iter()
-        .any(|text| text.to_lowercase().contains(needle))
+    false
 }
 
-fn collect_visible_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+fn visible_value_matches(value: &serde_json::Value, needle: &str, folded: &mut String) -> bool {
     match value {
-        serde_json::Value::String(text) => out.push(text),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_visible_strings(item, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values() {
-                collect_visible_strings(item, out);
-            }
-        }
-        _ => {}
+        serde_json::Value::String(text) => contains_folded(text, needle, folded),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| visible_value_matches(item, needle, folded)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|item| visible_value_matches(item, needle, folded)),
+        _ => false,
     }
+}
+
+/// Case-insensitive substring test over one visible field. The needle is
+/// already Unicode-lowercased. ASCII haystacks compare bytes in place; a
+/// non-ASCII haystack is folded ONCE into the caller's reused buffer (never
+/// one allocation per character) and matched there.
+fn contains_folded(haystack: &str, needle: &str, folded: &mut String) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() {
+        return needle.is_ascii()
+            && haystack
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()));
+    }
+    folded.clear();
+    folded.extend(haystack.chars().flat_map(char::to_lowercase));
+    folded.contains(needle)
 }
 
 #[cfg(test)]
@@ -664,6 +849,63 @@ mod tests {
             2,
             "the page bound is exact"
         );
+    }
+
+    /// The SQL ASCII prefilter must reject non-candidate payloads BEFORE the
+    /// serde decode: 2,000 ordinary rows + one match must decode exactly the
+    /// candidate row (the old search decoded every row it walked).
+    #[test]
+    fn transcript_search_prefilter_skips_non_candidate_json_decode() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let session = store.create_session(ws, "t", "p", "m").unwrap();
+        for seq in 1..=2_000i64 {
+            store
+                .put_message(
+                    session.id,
+                    seq,
+                    "user",
+                    serde_json::json!({"text": format!("ordinary payload {seq}")}),
+                )
+                .unwrap();
+        }
+        store
+            .put_message(
+                session.id,
+                2_001,
+                "assistant",
+                serde_json::json!({"text": "the unique-needle-42 answer"}),
+            )
+            .unwrap();
+        SEARCH_JSON_DECODES.with(|count| count.set(0));
+        let hits = store
+            .search_messages(session.id, "unique-needle-42", 50)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 2_001);
+        let decoded = SEARCH_JSON_DECODES.with(|count| count.get());
+        assert_eq!(
+            decoded, 1,
+            "only the candidate row may be JSON-decoded (decoded {decoded})"
+        );
+    }
+
+    /// Unicode folding is per-string, never per-character allocation: the
+    /// fully expanded lowercase mapping (İ -> i + combining dot) matches, and
+    /// the reused buffer is the only allocation on the non-ASCII path.
+    #[test]
+    fn unicode_fold_matches_expanded_lowercase_without_per_char_allocations() {
+        let needle = "İSTANBUL".to_lowercase();
+        let mut folded = String::new();
+        assert!(contains_folded(
+            "visit İSTANBUL today",
+            &needle,
+            &mut folded
+        ));
+        assert!(contains_folded("CAFÉ au lait", "café", &mut folded));
+        assert!(contains_folded("ABC", "abc", &mut folded));
+        assert!(!contains_folded("ASCII only", "café", &mut folded));
+        assert!(folded.capacity() >= 1);
     }
 
     /// Report row 9: Find matches the VISIBLE decoded text, never the raw
@@ -1307,5 +1549,152 @@ mod perf_tests {
         assert_eq!(after.len(), 2);
         assert_eq!(after[0].0.seq, 3);
         assert_eq!(after[1].0.seq, 2);
+    }
+}
+
+#[cfg(test)]
+mod search_scale_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// ([fault]) 50k-row transcript probe:
+    /// `cargo test -p faktor-store fault_transcript_search_scan -- --ignored --nocapture`.
+    /// The prefiltered streaming search must decode only the matching row and
+    /// stay far below the historical whole-window decode walk it replaces.
+    #[test]
+    #[ignore = "[fault] transcript search scale probe; run explicitly with --ignored"]
+    fn fault_transcript_search_scan_is_streaming_and_prefiltered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let session = store.create_session(ws, "t", "p", "m").unwrap().id;
+        const ROWS: i64 = 50_000;
+        let filler = "ordinary transcript text without the marker ".repeat(20);
+        let seed = Instant::now();
+        for seq in 1..=ROWS {
+            store
+                .put_message(
+                    session,
+                    seq,
+                    "user",
+                    serde_json::json!({ "text": format!("{filler}{seq}") }),
+                )
+                .unwrap();
+        }
+        store
+            .put_message(
+                session,
+                ROWS + 1,
+                "assistant",
+                serde_json::json!({ "text": "the unique-marker-777 answer" }),
+            )
+            .unwrap();
+        eprintln!(
+            "[fault] seeded {} messages in {:?}",
+            ROWS + 1,
+            seed.elapsed()
+        );
+
+        SEARCH_JSON_DECODES.with(|count| count.set(0));
+        let started = Instant::now();
+        let hits = store
+            .search_messages(session, "unique-marker-777", 50)
+            .unwrap();
+        let search = started.elapsed();
+        assert_eq!(hits.len(), 1);
+        let decoded = SEARCH_JSON_DECODES.with(|count| count.get());
+
+        // Historical shape: decode every message window (and its parts)
+        // until the page is full.
+        let started = Instant::now();
+        let mut before: Option<u64> = None;
+        let mut walked = 0usize;
+        loop {
+            let page = store
+                .messages_window_with_parts(session, before, None, 256, u64::MAX)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            walked += page.len();
+            let last = page.last().unwrap().0.seq as u64;
+            if page.len() < 256 {
+                break;
+            }
+            before = Some(last);
+        }
+        let decode_walk = started.elapsed();
+        let conn = Connection::open(store.path()).unwrap();
+        for (name, sql, param) in [
+            (
+                "instr(lower)",
+                "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND instr(lower(data), ?2) > 0",
+                "unique-marker-777",
+            ),
+            (
+                "LIKE",
+                "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND data LIKE ?2 ESCAPE '\\'",
+                "%unique-marker-777%",
+            ),
+            (
+                "instr raw",
+                "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND instr(data, ?2) > 0",
+                "unique-marker-777",
+            ),
+        ] {
+            let started = Instant::now();
+            let count: i64 = conn
+                .query_row(sql, rusqlite::params![session.raw() as i64, param], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            eprintln!(
+                "[fault] {name} scan {count} hits in {:?}",
+                started.elapsed()
+            );
+        }
+        eprintln!(
+            "[fault] prefiltered search {search:?} (decoded {decoded}); whole-window decode walk {decode_walk:?} over {walked} rows"
+        );
+        assert_eq!(decoded, 1, "only the matching payload may be decoded");
+        assert!(walked as i64 >= ROWS);
+    }
+}
+
+#[cfg(test)]
+mod search_corruption_tests {
+    use super::*;
+
+    /// A corrupt CANDIDATE row is still loud: the prefilter only skips rows
+    /// whose bytes cannot match, never hides a decode failure for a row that
+    /// the search would return.
+    #[test]
+    fn transcript_search_refuses_a_corrupt_matching_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let session = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let id = store
+            .put_message(
+                session,
+                1,
+                "assistant",
+                serde_json::json!({ "text": "needle in a valid row first" }),
+            )
+            .unwrap();
+        store
+            .raw_conn()
+            .execute(
+                "UPDATE message SET data = '{\"text\":\"needle truncated' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        let error = store
+            .search_messages(session, "needle", 10)
+            .expect_err("a corrupt matching row must refuse typed");
+        assert!(
+            matches!(error, StoreError::Corrupt(_) | StoreError::Malformed(_)),
+            "expected typed corruption, got {error:?}"
+        );
     }
 }

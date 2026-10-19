@@ -1455,16 +1455,16 @@ fn enrollments_of(
     let mut out = Vec::new();
     let mut after: Option<(i64, String, String)> = None;
     for _ in 0..MAX_SCOPE_FACT_PAGES {
+        // KIND-SCOPED: a root session's fact space also carries every
+        // per-turn `taskexec_run` row, so paging it whole made every budget
+        // reserve O(all history). The kind index visits only enrollments.
         let page = handle
-            .memory_facts_page(after.as_ref(), SCOPE_FACT_PAGE)
+            .memory_facts_by_kind_page(BUDGET_SCOPE_KIND, after.as_ref(), SCOPE_FACT_PAGE)
             .map_err(|e| BudgetError::Store(e.message))?;
-        for (kind, key, value) in &page.facts {
-            if kind != BUDGET_SCOPE_KIND {
-                continue;
-            }
+        for (_, key, value) in &page.facts {
             let scope: BudgetScope = serde_json::from_str(value).map_err(|e| {
                 BudgetError::Malformed(format!(
-                    "hostile budget scope row {kind}/{key} of session {root_session}: {e}"
+                    "hostile budget scope row {BUDGET_SCOPE_KIND}/{key} of session {root_session}: {e}"
                 ))
             })?;
             out.push(scope);
@@ -2079,13 +2079,12 @@ impl crate::SessionHandle {
     /// today's behavior (no change-scope enforcement). A corrupted/hostile
     /// fact is a typed refusal, never a silently ignored policy.
     pub fn change_budget(&self) -> Result<Option<ChangeBudget>, crate::task::TaskError> {
-        let facts = self
-            .memory_facts()
+        // Point lookup: this runs on every tool-loop pass, and the session
+        // fact space also carries per-turn run rows (1M-churn probe).
+        let value = self
+            .memory_fact_get(CHANGE_BUDGET_FACT_KIND, CHANGE_BUDGET_FACT_KEY)
             .map_err(|e| crate::task::TaskError::Store(e.to_string()))?;
-        let fact = facts.into_iter().find(|(kind, key, _)| {
-            kind == CHANGE_BUDGET_FACT_KIND && key == CHANGE_BUDGET_FACT_KEY
-        });
-        let Some((_, _, value)) = fact else {
+        let Some(value) = value else {
             return Ok(None);
         };
         match serde_json::from_str::<Option<ChangeBudget>>(&value) {

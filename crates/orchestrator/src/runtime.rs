@@ -899,11 +899,10 @@ impl OrchestratorRuntime {
             .get_session(parent)?
             .ok_or_else(|| faktor_core::Error::not_found(format!("parent session {parent}")))?;
         let mut rows = Vec::new();
-        for (kind, key, value) in parent_facts(&handle)? {
-            if kind == REGISTRY_ROW_KIND
-                && key
-                    .strip_prefix(run_id)
-                    .is_some_and(|rest| rest.starts_with('/'))
+        for (key, value) in facts_of_kind(&handle, REGISTRY_ROW_KIND)? {
+            if key
+                .strip_prefix(run_id)
+                .is_some_and(|rest| rest.starts_with('/'))
             {
                 let mut row: ChildRuntime = serde_json::from_str(&value).map_err(|e| {
                     faktor_core::Error::internal(format!("registry row decode: {e}"))
@@ -1020,11 +1019,10 @@ impl OrchestratorRuntime {
             .get_session(parent)?
             .ok_or_else(|| faktor_core::Error::not_found(format!("parent session {parent}")))?;
         let mut rows = Vec::new();
-        for (kind, key, value) in parent_facts(&handle)? {
-            if kind == ASSIGNMENT_ROW_KIND
-                && key
-                    .strip_prefix(run_id)
-                    .is_some_and(|rest| rest.starts_with('/'))
+        for (key, value) in facts_of_kind(&handle, ASSIGNMENT_ROW_KIND)? {
+            if key
+                .strip_prefix(run_id)
+                .is_some_and(|rest| rest.starts_with('/'))
             {
                 let row: WorkItemAssignment = serde_json::from_str(&value).map_err(|e| {
                     faktor_core::Error::internal(format!("assignment row decode: {e}"))
@@ -2146,60 +2144,59 @@ impl OrchestratorRuntime {
             .manager
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("owner session {parent}")))?;
-        for (kind, key, value) in
-            parent_facts(&handle).map_err(|e| ExecError::Internal(format!("plan row read: {e}")))?
+        if let Some(value) = handle
+            .memory_fact_get(PLAN_ROW_KIND, run_id)
+            .map_err(|e| ExecError::Internal(format!("plan row read: {e}")))?
         {
-            if kind == PLAN_ROW_KIND && key == run_id {
-                let v: serde_json::Value = serde_json::from_str(&value)
-                    .map_err(|e| ExecError::Internal(format!("plan row decode: {e}")))?;
-                // ONE-TIME compatibility conversion at the durability
-                // boundary: old plan rows still carry the plan-global
-                // `ownership` field; `from_legacy_value` adopts it onto
-                // mutating items exactly once (new rows pass through).
-                let plan: crate::TaskPlan =
-                    crate::TaskPlan::from_legacy_value(v.get("plan").cloned().unwrap_or_default())
-                        .map_err(|e| ExecError::Internal(format!("plan row plan decode: {e}")))?;
-                let specs: Vec<ChildSpec> =
-                    serde_json::from_value(v.get("specs").cloned().unwrap_or_default())
-                        .map_err(|e| ExecError::Internal(format!("plan row specs decode: {e}")))?;
-                let spec_map: HashMap<String, ChildSpec> =
-                    specs.into_iter().map(|s| (s.item_id.clone(), s)).collect();
-                let owner = OwnerContext {
-                    parent_session: parent,
-                    workspace_id: v.get("owner_ws").and_then(|x| x.as_u64()).unwrap_or(0),
-                    worktree_id: v.get("owner_wt").and_then(|x| x.as_u64()).unwrap_or(0),
-                    root: v
-                        .get("owner_root")
-                        .and_then(|x| x.as_str())
-                        .map(PathBuf::from)
-                        .unwrap_or_default(),
-                };
-                let provider = v
-                    .get("provider")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let default_model = v
-                    .get("default_model")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let isolated_root = v
-                    .get("isolated_root")
+            let v: serde_json::Value = serde_json::from_str(&value)
+                .map_err(|e| ExecError::Internal(format!("plan row decode: {e}")))?;
+            // ONE-TIME compatibility conversion at the durability
+            // boundary: old plan rows still carry the plan-global
+            // `ownership` field; `from_legacy_value` adopts it onto
+            // mutating items exactly once (new rows pass through).
+            let plan: crate::TaskPlan =
+                crate::TaskPlan::from_legacy_value(v.get("plan").cloned().unwrap_or_default())
+                    .map_err(|e| ExecError::Internal(format!("plan row plan decode: {e}")))?;
+            let specs: Vec<ChildSpec> =
+                serde_json::from_value(v.get("specs").cloned().unwrap_or_default())
+                    .map_err(|e| ExecError::Internal(format!("plan row specs decode: {e}")))?;
+            let spec_map: HashMap<String, ChildSpec> =
+                specs.into_iter().map(|s| (s.item_id.clone(), s)).collect();
+            let owner = OwnerContext {
+                parent_session: parent,
+                workspace_id: v.get("owner_ws").and_then(|x| x.as_u64()).unwrap_or(0),
+                worktree_id: v.get("owner_wt").and_then(|x| x.as_u64()).unwrap_or(0),
+                root: v
+                    .get("owner_root")
                     .and_then(|x| x.as_str())
                     .map(PathBuf::from)
-                    .unwrap_or_default();
-                let task_id = v.get("task_id").and_then(|x| x.as_u64());
-                return Ok(DurablePlanRow {
-                    plan,
-                    owner,
-                    specs: spec_map,
-                    provider,
-                    default_model,
-                    isolated_root,
-                    task_id,
-                });
-            }
+                    .unwrap_or_default(),
+            };
+            let provider = v
+                .get("provider")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let default_model = v
+                .get("default_model")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let isolated_root = v
+                .get("isolated_root")
+                .and_then(|x| x.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let task_id = v.get("task_id").and_then(|x| x.as_u64());
+            return Ok(DurablePlanRow {
+                plan,
+                owner,
+                specs: spec_map,
+                provider,
+                default_model,
+                isolated_root,
+                task_id,
+            });
         }
         Err(ExecError::NotFound(format!(
             "run '{run_id}' has no durable plan row under session {parent}"
@@ -3798,42 +3795,33 @@ fn drive_op_entry(
             match manager.get_session(parent_session) {
                 Ok(Some(parent)) => {
                     let key = format!("{run_id}/{child_id}");
-                    match parent_facts(&parent) {
-                        Ok(facts) => {
-                            for (kind, k, value) in facts {
-                                if kind == REGISTRY_ROW_KIND && k == key {
-                                    match serde_json::from_str::<ChildRuntime>(&value) {
-                                        Ok(mut row) => {
-                                            row.operation_id = turn_op.raw();
-                                            match serde_json::to_string(&row) {
-                                                Ok(value) => {
-                                                    if let Err(e) = parent.upsert_memory_fact(
-                                                        REGISTRY_ROW_KIND,
-                                                        &key,
-                                                        &value,
-                                                    ) {
-                                                        op_id_error = Some(format!(
-                                                            "child op-id registry persist: {e}"
-                                                        ));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    op_id_error = Some(format!(
-                                                        "child op-id registry serialize: {e}"
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
+                    match parent.memory_fact_get(REGISTRY_ROW_KIND, &key) {
+                        Ok(Some(value)) => match serde_json::from_str::<ChildRuntime>(&value) {
+                            Ok(mut row) => {
+                                row.operation_id = turn_op.raw();
+                                match serde_json::to_string(&row) {
+                                    Ok(value) => {
+                                        if let Err(e) = parent.upsert_memory_fact(
+                                            REGISTRY_ROW_KIND,
+                                            &key,
+                                            &value,
+                                        ) {
                                             op_id_error =
-                                                Some(format!("child op-id registry decode: {e}"))
+                                                Some(format!("child op-id registry persist: {e}"));
                                         }
                                     }
-                                    break;
+                                    Err(e) => {
+                                        op_id_error =
+                                            Some(format!("child op-id registry serialize: {e}"))
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => op_id_error = Some(format!("child op-id registry scan: {e}")),
+                            Err(e) => {
+                                op_id_error = Some(format!("child op-id registry decode: {e}"))
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => op_id_error = Some(format!("child op-id registry read: {e}")),
                     }
                 }
                 Ok(None) => {}

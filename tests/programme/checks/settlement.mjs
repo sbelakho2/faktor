@@ -30,16 +30,32 @@ export const SETTLEMENT_ALLOWLIST = Object.freeze({
   'crates/agent/src/runtime/turn/drive.rs': [
     { function: 'typed_ledger_drive_start', reason: 'admission reads the session identity once before the tail' },
   ],
-  'crates/orchestrator/src/runtime.rs': [],
+  'crates/orchestrator/src/runtime.rs': [
+    { function: 'derive_child_projection_from', reason: 'read-only child presentation projection reads the row it already applies; never decides scheduling or money' },
+    { function: 'put_plan_row', reason: 'admission-time plan-row seed before any turn; the id is persisted into the row settlement later reads' },
+  ],
   'crates/orchestrator/src/task_executor/settlement.rs': [],
   'crates/orchestrator/src/task_executor/recovery.rs': [],
   'crates/orchestrator/src/task_executor/integration.rs': [],
-  'crates/agent/src/runtime/turn/state.rs': [],
-  'crates/agent/src/runtime/compaction.rs': [],
-  'crates/agent/src/runtime/retrieval.rs': [],
-  'crates/agent/src/runtime/verification_attribution.rs': [],
+  'crates/agent/src/runtime/turn/state.rs': [
+    { function: 'review_durable_criteria', reason: 'read-only review package selection; no task row is written' },
+    { function: 'seed_task_attachments', reason: 'turn admission seeds the attachment plan before the completion gate reads the row' },
+  ],
+  'crates/agent/src/runtime/compaction.rs': [
+    { function: 'compaction_projection', reason: 'read-only projection; compaction has no ledger write authority' },
+    { function: 'budgeted_summarizer', reason: 'read-only budget prediction at compaction admission' },
+  ],
+  'crates/agent/src/runtime/retrieval.rs': [
+    { function: 'latest_attempt_record', reason: 'read-only learning evidence selection' },
+    { function: 'learning_corpus_evidence', reason: 'read-only auxiliary corpus evidence; unreadable id is non-fatal' },
+  ],
+  'crates/agent/src/runtime/verification_attribution.rs': [
+    { function: 'run_independent_review_call', reason: 'read-only routing attribution for the paid review; unreadable id refuses typed' },
+  ],
   'crates/agent/src/outcome_ledger.rs': [],
-  'crates/orchestrator/src/runtime_helpers.rs': [],
+  'crates/orchestrator/src/runtime_helpers.rs': [
+    { function: 'child_task_budget_cap', reason: 'read-only registry budget projection; unreadable id yields None' },
+  ],
 });
 
 export const BANNED_FILES = Object.freeze(Object.keys(SETTLEMENT_ALLOWLIST));
@@ -54,48 +70,61 @@ function read(root, rel) {
  * saying "re-reading task_id() would be wrong" is documentation, not a read.
  */
 export function maskComments(text) {
-  let out = '';
+  const out = [];
   let quote = null;
   for (let index = 0; index < text.length; index += 1) {
     const ch = text[index];
     const next = text[index + 1];
     if (quote) {
-      out += ch;
+      out.push(ch);
       if (ch === '\\') {
-        out += next ?? '';
+        out.push(next ?? '');
         index += 1;
       } else if (ch === quote) {
         quote = null;
       }
       continue;
     }
-    if (ch === '"' || ch === "'") {
+    if (ch === '"') {
       quote = ch;
-      out += ch;
+      out.push(ch);
+      continue;
+    }
+    if (ch === "'") {
+      // A Rust CHAR literal closes within a few characters; an apostrophe in
+      // a lifetime (`<'a>`) does not start a string and must not swallow the
+      // comments that follow it.
+      const literal = /^'(?:\\.|[^'\\])'/.exec(text.slice(index, index + 8));
+      if (literal !== null) {
+        out.push(literal[0]);
+        index += literal[0].length - 1;
+        continue;
+      }
+      out.push(ch);
       continue;
     }
     if (ch === '/' && next === '/') {
       while (index < text.length && text[index] !== '\n') {
-        out += ' ';
+        out.push(' ');
         index += 1;
       }
-      if (index < text.length) out += '\n';
+      if (index < text.length) out.push('\n');
       continue;
     }
     if (ch === '/' && next === '*') {
-      out += '  ';
+      out.push('  ');
       index += 2;
       while (index < text.length && !(text[index] === '*' && text[index + 1] === '/')) {
-        out += text[index] === '\n' ? '\n' : ' ';
+        out.push(text[index] === '\n' ? '\n' : ' ');
         index += 1;
       }
-      if (index < text.length) out += '  ';
+      if (index < text.length) out.push('  ');
       index += 1;
       continue;
     }
-    out += ch;
+    out.push(ch);
   }
-  return out;
+  return out.join('');
 }
 
 function callArguments(text, openParen) {
@@ -121,35 +150,47 @@ function callArguments(text, openParen) {
   return '';
 }
 
+/** One linear pass: every matched `{` -> `}` pair, skipping strings. */
+function bracePairs(text) {
+  const pairs = new Map();
+  const stack = [];
+  let quote = null;
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (quote) {
+      if (ch === '\\') index += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "'") {
+      const literal = /^'(?:\\.|[^'\\])'/.exec(text.slice(index, index + 8));
+      if (literal !== null) index += literal[0].length - 1;
+      continue;
+    }
+    if (ch === '{') stack.push(index);
+    else if (ch === '}') {
+      const open = stack.pop();
+      if (open !== undefined) pairs.set(open, index);
+    }
+  }
+  return pairs;
+}
+
 /** Function ranges (`fn name(...) { ... }`) by brace matching. */
 export function functionRanges(text) {
   const ranges = [];
+  const pairs = bracePairs(text);
   const re = /\bfn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(/g;
   for (const match of text.matchAll(re)) {
     const open = text.indexOf('{', match.index);
     if (open === -1) continue;
-    let depth = 0;
-    let quote = null;
-    for (let index = open; index < text.length; index += 1) {
-      const ch = text[index];
-      if (quote) {
-        if (ch === '\\') index += 1;
-        else if (ch === quote) quote = null;
-        continue;
-      }
-      if (ch === '"') {
-        quote = ch;
-        continue;
-      }
-      if (ch === '{') depth += 1;
-      else if (ch === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          ranges.push({ name: match[1], start: match.index, end: index + 1 });
-          break;
-        }
-      }
-    }
+    const close = pairs.get(open);
+    if (close === undefined) continue;
+    ranges.push({ name: match[1], start: match.index, end: close + 1 });
   }
   return ranges;
 }
@@ -340,6 +381,15 @@ export function selftest() {
     drive,
   });
   check('bound tail passes', clean.passed);
+  check(
+    'a lifetime apostrophe does not hide a following line comment',
+    !maskComments("fn h<'a>(x: &'a S) { // task_id() is documented\n}").includes('task_id'),
+  );
+  check(
+    'a char literal brace does not unbalance function ranges',
+    functionRanges("fn h() { let c = '{'; }").length === 1 &&
+      functionRanges("fn h() { let c = '{'; }")[0].end === "fn h() { let c = '{'; }".length,
+  );
   const lazyTail = scanSources({
     relative: 'fixture.rs',
     settlement: 'fn session_task(&self, h: &S) -> R { Ok(()) }',

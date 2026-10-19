@@ -26,6 +26,16 @@ pub(crate) const DEFAULT_WATCH_PREFLIGHT_ENTRIES: usize = 50_000;
 /// the registry's strong ref: a handle still in use by a turn keeps its
 /// watcher until that clone drops.
 pub(crate) const MAX_CACHED_ROOTS: usize = 64;
+
+// Instrumented candidate probes of the eviction index (test evidence: the
+// ordered index must examine the oldest entry first, not scan the map).
+// Thread-local so parallel fs tests cannot pollute the probe.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EVICTION_CANDIDATES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 const WATCH_PREFLIGHT_MAX_DEPTH: usize = 64;
 
 /// Bounded, symlink-safe preflight walk through the ANCHORED root (audit
@@ -277,6 +287,13 @@ pub(crate) struct CachedRoot {
 #[derive(Debug)]
 pub struct WorkspaceFileService {
     pub(crate) workspaces: Mutex<HashMap<(WorkspaceId, PathBuf), CachedRoot>>,
+    /// Insertion-ordered index over the cached roots. Eviction takes the
+    /// FIRST (oldest) entry and only skips forward while that root is still
+    /// held, so the common insert is O(log n) instead of a full-map
+    /// `min_by_key` scan on every open at capacity. Maintained under the
+    /// same critical section as `workspaces` (lock order: workspaces, then
+    /// this index).
+    cache_order: Mutex<std::collections::BTreeMap<u64, (WorkspaceId, PathBuf)>>,
     /// Bounded recursive-watcher registration deadline (see
     /// [`DEFAULT_WATCH_REGISTRATION_DEADLINE`]).
     watch_registration_deadline: std::time::Duration,
@@ -295,6 +312,7 @@ impl Default for WorkspaceFileService {
     fn default() -> Self {
         Self {
             workspaces: Mutex::new(HashMap::new()),
+            cache_order: Mutex::new(std::collections::BTreeMap::new()),
             watch_registration_deadline: DEFAULT_WATCH_REGISTRATION_DEADLINE,
             watch_preflight_entries: DEFAULT_WATCH_PREFLIGHT_ENTRIES,
             next_ephemeral_id: AtomicU64::new(EPHEMERAL_WORKSPACE_ID_BASE),
@@ -375,21 +393,48 @@ impl WorkspaceFileService {
         }
         let handle = self.build_handle(workspace_id, root.clone())?;
         let mut workspaces = recover_lock(&self.workspaces);
+        let mut order = recover_lock(&self.cache_order);
         if workspaces.len() >= MAX_CACHED_ROOTS {
             // Evict the OLDEST entry no caller still holds. A live handle
             // (`rooted` strong count > 1) keeps its cache slot: evicting it
             // would recreate the watcher on the next resolve and could drop
             // the hot durable root in favour of a freshly opened shadow.
-            let evict = workspaces
-                .iter()
-                .filter(|(_, cached)| Arc::strong_count(&cached.handle.rooted) == 1)
-                .min_by_key(|(_, cached)| cached.sequence)
-                .map(|(key, _)| key.clone());
-            if let Some(evict) = evict {
-                workspaces.remove(&evict);
+            // The ordered index starts at the oldest sequence, so the scan
+            // only runs over roots that are all still in use.
+            let mut stale: Vec<u64> = Vec::new();
+            let mut victim: Option<(u64, (WorkspaceId, PathBuf))> = None;
+            for (&sequence, key) in order.iter() {
+                #[cfg(test)]
+                EVICTION_CANDIDATES.with(|count| count.set(count.get() + 1));
+                match workspaces.get(key) {
+                    Some(cached) if cached.sequence == sequence => {
+                        if Arc::strong_count(&cached.handle.rooted) == 1 {
+                            victim = Some((sequence, key.clone()));
+                            break;
+                        }
+                    }
+                    // A key removed by `close` (or replaced) is not a
+                    // candidate; drop it from the index lazily.
+                    _ => stale.push(sequence),
+                }
+            }
+            for sequence in stale {
+                order.remove(&sequence);
+            }
+            if let Some((sequence, key)) = victim {
+                workspaces.remove(&key);
+                order.remove(&sequence);
+            } else {
+                // Every cached root is held. Do NOT insert past the hard
+                // bound: return the (fully usable) uncached handle, whose
+                // watcher lives exactly as long as its owner. The old code
+                // inserted anyway, so held-root churn grew the registry
+                // without limit.
+                return Ok(handle);
             }
         }
         let sequence = self.next_cache_sequence.fetch_add(1, Ordering::SeqCst);
+        order.insert(sequence, (workspace_id, root.clone()));
         workspaces.insert(
             (workspace_id, root),
             CachedRoot {
@@ -518,7 +563,17 @@ impl WorkspaceFileService {
     /// Idle unload (spec §21): drops the watcher and every cached root of
     /// this workspace id (real and shadow).
     pub fn close(&self, workspace_id: WorkspaceId) {
-        recover_lock(&self.workspaces).retain(|(id, _), _| *id != workspace_id);
+        let mut workspaces = recover_lock(&self.workspaces);
+        let mut order = recover_lock(&self.cache_order);
+        let removed: Vec<u64> = workspaces
+            .iter()
+            .filter(|((id, _), _)| *id == workspace_id)
+            .map(|(_, cached)| cached.sequence)
+            .collect();
+        workspaces.retain(|(id, _), _| *id != workspace_id);
+        for sequence in removed {
+            order.remove(&sequence);
+        }
     }
 
     pub fn open_count(&self) -> usize {

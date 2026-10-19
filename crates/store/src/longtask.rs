@@ -374,7 +374,7 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
-        self.workspace_memory_facts_page_filtered(workspace_id, after, limit, None)
+        self.workspace_memory_facts_page_filtered(workspace_id, after, limit, None, None)
     }
 
     /// Newest-first page restricted to typed V2 workspace memory records;
@@ -385,7 +385,13 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
-        self.workspace_memory_facts_page_filtered(workspace_id, after, limit, Some("memory_v2:"))
+        self.workspace_memory_facts_page_filtered(
+            workspace_id,
+            after,
+            limit,
+            Some("memory_v2:"),
+            Some("idx_workspace_memory_fact_v2_page"),
+        )
     }
 
     fn workspace_memory_facts_page_filtered(
@@ -394,12 +400,19 @@ impl Store {
         after: Option<&MemoryFactCursor>,
         limit: u64,
         kind_prefix: Option<&str>,
+        forced_index: Option<&str>,
     ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
         let conn = self.read()?;
-        let mut sql = String::from(
-            "SELECT kind, key, value, updated_ms FROM workspace_memory_fact
-             WHERE workspace_id = ?1",
-        );
+        let mut sql =
+            String::from("SELECT kind, key, value, updated_ms FROM workspace_memory_fact");
+        if let Some(index) = forced_index {
+            // See `memory_facts_page_filtered`: the partial V2 index is the
+            // page's total order; the primary key would sort the managed
+            // range on every page.
+            sql.push_str(" INDEXED BY ");
+            sql.push_str(index);
+        }
+        sql.push_str(" WHERE workspace_id = ?1");
         if let Some(prefix) = kind_prefix {
             // Trusted, compile-time prefix (never user input). The half-open
             // byte range is the exact literal prefix and rides the
@@ -507,7 +520,7 @@ impl Store {
     pub fn memory_fact_count_v2(&self, session_id: SessionId) -> StoreResult<i64> {
         let conn = self.read()?;
         let out = conn.query_row(
-            "SELECT COUNT(*) FROM memory_fact
+            "SELECT COUNT(*) FROM memory_fact INDEXED BY idx_memory_fact_v2_page
              WHERE session_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
             params![session_id.raw() as i64],
             |r| r.get::<_, i64>(0),
@@ -515,10 +528,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Count of managed V2 workspace memory rows. The predicate is the
+    /// EXACT half-open range `workspace_memory_facts_v2_page` uses (and the
+    /// partial index `idx_workspace_memory_fact_v2_page` carries), so the
+    /// pager and its count can never disagree: the workspace table currently
+    /// holds only V2 rows, but the shared predicate makes that an invariant
+    /// rather than an assumption a future non-V2 writer could break.
     pub fn workspace_memory_fact_count(&self, workspace_id: u64) -> StoreResult<i64> {
         let conn = self.read()?;
         let out = conn.query_row(
-            "SELECT COUNT(*) FROM workspace_memory_fact WHERE workspace_id = ?1",
+            "SELECT COUNT(*) FROM workspace_memory_fact INDEXED BY idx_workspace_memory_fact_v2_page
+             WHERE workspace_id = ?1 AND kind >= 'memory_v2:' AND kind < 'memory_v2;'",
             params![workspace_id as i64],
             |r| r.get::<_, i64>(0),
         )?;

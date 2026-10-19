@@ -239,8 +239,9 @@ pub(crate) fn verification_passed(handle: &faktor_session::SessionHandle) -> boo
     // Documented UI-only projection (never authorization). A store read
     // failure still reports not-passed, but it is VISIBLE as a typed log
     // instead of being indistinguishable from a recorded failure.
-    let facts = match handle.memory_facts() {
-        Ok(facts) => facts,
+    let last = match handle.memory_fact_get("verification", "last") {
+        Ok(Some(last)) => last,
+        Ok(None) => return false,
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -249,13 +250,7 @@ pub(crate) fn verification_passed(handle: &faktor_session::SessionHandle) -> boo
             return false;
         }
     };
-    let Some((_, _, last)) = facts
-        .iter()
-        .find(|(kind, key, _)| kind == "verification" && key == "last")
-    else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(last) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&last) else {
         return false;
     };
     value.get("status").and_then(|s| s.as_str()) == Some("passed")
@@ -683,12 +678,9 @@ pub(crate) fn read_root_attempt_op(
     run_id: &str,
 ) -> Result<Option<u64>, ExecError> {
     let key = root_attempt_op_key(run_id);
-    let facts = handle
-        .memory_facts()
-        .map_err(|e| ExecError::from(classify_session_read("verification-attempt facts", e)))?;
-    let Some((_, _, value)) = facts
-        .iter()
-        .find(|(kind, k, _)| kind == ROOT_ATTEMPT_FACT_KIND && k == &key)
+    let Some(value) = handle
+        .memory_fact_get(ROOT_ATTEMPT_FACT_KIND, &key)
+        .map_err(|e| ExecError::from(classify_session_read("verification-attempt facts", e)))?
     else {
         return Ok(None);
     };

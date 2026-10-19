@@ -504,7 +504,9 @@ async fn multiple_implementation_attempts_before_one_passing_verification_are_a_
     let run_id = session_terminal_run_id(session_id);
     let ledger = OutcomeLedger::new(manager.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     let record = ledger.get(&run_id).unwrap().unwrap();
@@ -665,7 +667,9 @@ async fn derivation_classifies_from_durable_route_authority_not_from_cost() {
     let run_id = session_terminal_run_id(session_id);
     let ledger = OutcomeLedger::new(manager.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     let record = ledger.get(&run_id).unwrap().unwrap();
@@ -807,7 +811,9 @@ async fn a_failed_first_verification_attempt_is_not_a_first_verification_pass() 
     let run_id = session_terminal_run_id(session_id);
     let ledger = OutcomeLedger::new(manager.store());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     let record = ledger.get(&run_id).unwrap().unwrap();
@@ -1675,7 +1681,9 @@ async fn adversarial_settle_between_the_two_money_reads_never_completes_missing_
         .unwrap();
     let run_id = session_terminal_run_id(handle.id());
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     assert!(
@@ -1788,7 +1796,9 @@ async fn truncated_provider_call_history_marks_partial_and_excludes_the_learning
     // explicit unattributed provenance.
     let ledger = OutcomeLedger::with_spend_call_bound(store.clone(), 1);
     assert_eq!(
-        ledger.record_terminal_run(&handle, &run_id).unwrap(),
+        ledger
+            .record_terminal_run(&handle, &run_id, handle.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     let record = ledger.get(&run_id).unwrap().unwrap();
@@ -1838,7 +1848,9 @@ async fn truncated_provider_call_history_marks_partial_and_excludes_the_learning
         attribution_env("/tmp/ledger-attribution-complete").await;
     let ledger2 = OutcomeLedger::new(store2.clone());
     assert_eq!(
-        ledger2.record_terminal_run(&handle2, &run_id2).unwrap(),
+        ledger2
+            .record_terminal_run(&handle2, &run_id2, handle2.task_id().unwrap())
+            .unwrap(),
         Some(LedgerAppend::Recorded)
     );
     let record2 = ledger2.get(&run_id2).unwrap().unwrap();
@@ -1898,6 +1910,7 @@ async fn finalize_never_wedges_same_state_noops_and_complete_corrections_land() 
     // transition, so finalize must return the deterministic no-op —
     // never an error that would wedge every later settlement.
     let mut record = full_record();
+    record.task_id = task_id.raw();
     record.run_id = "run-pending".into();
     record.verified_samples.clear();
     let initial_pending = pending_settlement("run-pending");
@@ -1924,6 +1937,7 @@ async fn finalize_never_wedges_same_state_noops_and_complete_corrections_land() 
     // (2) unavailable -> pending: a recovered read (the ledger is
     // readable now and the reservation is open) is a legal improvement.
     let mut record = full_record();
+    record.task_id = task_id.raw();
     record.run_id = "run-recover".into();
     record.verified_samples.clear();
     let initial_unavailable = EconomicSettlement {
@@ -1980,6 +1994,7 @@ async fn finalize_never_wedges_same_state_noops_and_complete_corrections_land() 
     // with a STALE projection; a later derivation whose money MOVED
     // appends the documented correction instead of being impossible.
     let mut record = full_record();
+    record.task_id = task_id.raw();
     record.run_id = "run-correct".into();
     record.verified_samples.clear();
     let stale_complete = EconomicSettlement {
