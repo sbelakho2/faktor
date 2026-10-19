@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-19T13:33:16.549Z",
-  "commit": "50280d2e6069f405d5f802546f4eac97d2f6a3ff",
-  "tree": "96fbe027e6cd97b5424f9d8e747888d36789fb59",
+  "generated_at": "2026-10-19T18:47:47.029Z",
+  "commit": "b5d83753065bd1a73f68880f9d2da6e5f50de43f",
+  "tree": "b49665d5f8392a820627059c212b9cd1eaf53a0f",
   "layers": [
     "structural",
     "unit",
@@ -38,9 +38,8 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 600,
-      "failed": 1,
-      "proven": 255,
+      "deferred": 557,
+      "proven": 299,
       "stub": 62
     },
     "by_lane": {
@@ -1786,7 +1785,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "acp"
       },
@@ -1797,7 +1796,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "acp",
+          "help_bytes": 260,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.bootstrap",
@@ -1816,7 +1822,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "bootstrap"
       },
@@ -1827,7 +1833,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "bootstrap",
+          "help_bytes": 670,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.build",
@@ -1846,7 +1859,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "build"
       },
@@ -1857,7 +1870,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "build",
+          "help_bytes": 324,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce",
@@ -1876,7 +1896,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce"
       },
@@ -1887,7 +1907,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce",
+          "help_bytes": 967,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.clear-cache",
@@ -1906,7 +1933,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.clear-cache"
       },
@@ -1917,7 +1944,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.clear-cache",
+          "help_bytes": 255,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.doctor",
@@ -1936,7 +1970,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.doctor"
       },
@@ -1947,7 +1981,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.doctor",
+          "help_bytes": 316,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.login",
@@ -1966,7 +2007,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.login"
       },
@@ -1977,7 +2018,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.login",
+          "help_bytes": 366,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.logout",
@@ -1996,7 +2044,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.logout"
       },
@@ -2007,7 +2055,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.logout",
+          "help_bytes": 334,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.status",
@@ -2026,7 +2081,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.status"
       },
@@ -2037,7 +2092,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.status",
+          "help_bytes": 244,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.doctor",
@@ -2056,7 +2118,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "doctor"
       },
@@ -2067,7 +2129,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "doctor",
+          "help_bytes": 838,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise",
@@ -2086,7 +2155,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise"
       },
@@ -2097,7 +2166,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise",
+          "help_bytes": 1098,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact",
@@ -2116,7 +2192,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact"
       },
@@ -2127,7 +2203,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact",
+          "help_bytes": 489,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.eligible",
@@ -2146,7 +2229,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.eligible"
       },
@@ -2157,7 +2240,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.eligible",
+          "help_bytes": 321,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.list",
@@ -2176,7 +2266,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.list"
       },
@@ -2187,7 +2277,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.list",
+          "help_bytes": 333,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.register",
@@ -2206,7 +2303,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.register"
       },
@@ -2217,7 +2314,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.register",
+          "help_bytes": 669,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.audit",
@@ -2236,7 +2340,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.audit"
       },
@@ -2247,7 +2351,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.audit",
+          "help_bytes": 378,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.config",
@@ -2266,7 +2377,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.config"
       },
@@ -2277,7 +2388,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.config",
+          "help_bytes": 298,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion",
@@ -2296,7 +2414,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion"
       },
@@ -2307,7 +2425,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion",
+          "help_bytes": 495,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.advance",
@@ -2326,7 +2451,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.advance"
       },
@@ -2337,7 +2462,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.advance",
+          "help_bytes": 313,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.show",
@@ -2356,7 +2488,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.show"
       },
@@ -2367,7 +2499,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.show",
+          "help_bytes": 288,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.start",
@@ -2386,7 +2525,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.start"
       },
@@ -2397,7 +2536,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.start",
+          "help_bytes": 371,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.gc",
@@ -2416,7 +2562,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.gc"
       },
@@ -2427,7 +2573,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.gc",
+          "help_bytes": 379,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.settings",
@@ -2446,7 +2599,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.settings"
       },
@@ -2457,7 +2610,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.settings",
+          "help_bytes": 260,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.status",
@@ -2476,7 +2636,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.status"
       },
@@ -2487,7 +2647,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.status",
+          "help_bytes": 278,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.impact",
@@ -2506,7 +2673,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "failed",
+      "status": "proven",
       "meta": {
         "command": "impact"
       },
@@ -2518,7 +2685,12 @@
         "idempotence"
       ],
       "evidence": {
-        "passed": false
+        "passed": true,
+        "observed": {
+          "command": "impact",
+          "help_bytes": 576,
+          "unknown_flag_exit": 2
+        }
       }
     },
     {
@@ -2538,7 +2710,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "run"
       },
@@ -2549,7 +2721,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "run",
+          "help_bytes": 548,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox",
@@ -2568,7 +2747,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox"
       },
@@ -2579,7 +2758,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox",
+          "help_bytes": 807,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox.choose",
@@ -2598,7 +2784,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox.choose"
       },
@@ -2609,7 +2795,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox.choose",
+          "help_bytes": 593,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox.status",
@@ -2628,7 +2821,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox.status"
       },
@@ -2639,7 +2832,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox.status",
+          "help_bytes": 328,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.serve",
@@ -2658,7 +2858,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "serve"
       },
@@ -2669,7 +2869,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "serve",
+          "help_bytes": 266,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sessions",
@@ -2688,7 +2895,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sessions"
       },
@@ -2699,7 +2906,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sessions",
+          "help_bytes": 152,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater",
@@ -2718,7 +2932,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater"
       },
@@ -2729,7 +2943,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater",
+          "help_bytes": 2322,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.abort",
@@ -2748,7 +2969,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.abort"
       },
@@ -2759,7 +2980,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.abort",
+          "help_bytes": 415,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.activate",
@@ -2778,7 +3006,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.activate"
       },
@@ -2789,7 +3017,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.activate",
+          "help_bytes": 555,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.apply",
@@ -2808,7 +3043,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.apply"
       },
@@ -2819,7 +3054,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.apply",
+          "help_bytes": 353,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.check",
@@ -2838,7 +3080,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.check"
       },
@@ -2849,7 +3091,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.check",
+          "help_bytes": 570,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.downgrade",
@@ -2868,7 +3117,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.downgrade"
       },
@@ -2879,7 +3128,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.downgrade",
+          "help_bytes": 875,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.finalize",
@@ -2898,7 +3154,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.finalize"
       },
@@ -2909,7 +3165,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.finalize",
+          "help_bytes": 623,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.recover",
@@ -2928,7 +3191,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.recover"
       },
@@ -2939,7 +3202,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.recover",
+          "help_bytes": 281,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.rollback",
@@ -2958,7 +3228,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.rollback"
       },
@@ -2969,7 +3239,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.rollback",
+          "help_bytes": 318,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.stage",
@@ -2988,7 +3265,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.stage"
       },
@@ -2999,7 +3276,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.stage",
+          "help_bytes": 771,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.status",
@@ -3018,7 +3302,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.status"
       },
@@ -3029,7 +3313,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.status",
+          "help_bytes": 299,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.worker",
@@ -3048,7 +3339,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "worker"
       },
@@ -3059,7 +3350,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "worker",
+          "help_bytes": 656,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.worker.run",
@@ -3078,7 +3376,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "worker.run"
       },
@@ -3089,7 +3387,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "worker.run",
+          "help_bytes": 478,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "config.faktor.agent.maxConsecutiveFailures",
@@ -17594,12 +17899,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:after=%00",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -17881,7 +18186,7 @@
           "hostile": {
             "case": "query:limit=-1",
             "status": 200,
-            "bytes": 229
+            "bytes": 220
           }
         }
       }
@@ -17969,13 +18274,13 @@
       "evidence": {
         "passed": true,
         "observed": {
-          "unauthenticated": 404,
-          "authenticated": 404,
-          "error_code": "not_found",
+          "unauthenticated": 401,
+          "authenticated": 200,
+          "error_code": null,
           "hostile": {
             "case": "query:cursor=..%2F..%2Fetc%2Fpasswd",
-            "status": 404,
-            "bytes": 81
+            "status": 200,
+            "bytes": 1599
           }
         }
       }
@@ -18022,7 +18327,7 @@
           "hostile": {
             "case": "query:path=%2e%2e%2fescape",
             "status": 200,
-            "bytes": 27171
+            "bytes": 27157
           }
         }
       }
@@ -18210,7 +18515,7 @@
           "hostile": {
             "case": "query:limit=-1",
             "status": 200,
-            "bytes": 9174
+            "bytes": 9167
           }
         }
       }
@@ -18440,12 +18745,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=21141508&after=NaN",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18487,12 +18792,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=18446744073709551616",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18534,12 +18839,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=-1",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18581,12 +18886,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:after=%00",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18628,12 +18933,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:cursor=..%2F..%2Fetc%2Fpasswd",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18675,12 +18980,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:path=%2e%2e%2fescape",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18722,12 +19027,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:q=%F0%9F%92%A9%00",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -18769,12 +19074,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=21141508&after=NaN",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -19045,12 +19350,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:q=%F0%9F%92%A9%00",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -19374,12 +19679,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "workers_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:q=%F0%9F%92%A9%00",
-            "status": 409,
-            "bytes": 137
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -19845,13 +20150,13 @@
       "evidence": {
         "passed": true,
         "observed": {
-          "unauthenticated": 404,
-          "authenticated": 404,
-          "error_code": "not_found",
+          "unauthenticated": 401,
+          "authenticated": 200,
+          "error_code": null,
           "hostile": {
             "case": "query:limit=-1",
-            "status": 404,
-            "bytes": 81
+            "status": 200,
+            "bytes": 1574
           }
         }
       }
@@ -19940,12 +20245,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:cursor=..%2F..%2Fetc%2Fpasswd",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -19987,12 +20292,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:path=%2e%2e%2fescape",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -20761,12 +21066,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=21141508&after=NaN",
-            "status": 400,
-            "bytes": 98
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -20907,7 +21212,7 @@
           "hostile": {
             "case": "query:after=%00",
             "status": 200,
-            "bytes": 486
+            "bytes": 484
           }
         }
       }
@@ -22592,13 +22897,13 @@
       "evidence": {
         "passed": true,
         "observed": {
-          "unauthenticated": 404,
-          "authenticated": 404,
-          "error_code": "not_found",
+          "unauthenticated": 401,
+          "authenticated": 200,
+          "error_code": null,
           "hostile": {
             "case": "query:cursor=..%2F..%2Fetc%2Fpasswd",
-            "status": 404,
-            "bytes": 81
+            "status": 200,
+            "bytes": 572
           }
         }
       }
@@ -22781,12 +23086,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:limit=18446744073709551616",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -22875,12 +23180,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:after=%00",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -22922,12 +23227,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "workers_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "query:cursor=..%2F..%2Fetc%2Fpasswd",
-            "status": 409,
-            "bytes": 137
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -23495,12 +23800,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "duplicate-keys",
-            "status": 400,
-            "bytes": 103
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -23542,12 +23847,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "deep-nesting",
-            "status": 400,
-            "bytes": 104
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24070,12 +24375,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "wrong-types",
-            "status": 400,
-            "bytes": 99
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24164,12 +24469,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "unicode-boundaries",
-            "status": 400,
-            "bytes": 95
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24211,12 +24516,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "negative-and-overflow",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24258,12 +24563,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "empty-object",
-            "status": 400,
-            "bytes": 101
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24305,12 +24610,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "array-instead-of-object",
-            "status": 409,
-            "bytes": 134
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24352,12 +24657,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "oversized-string",
-            "status": 400,
-            "bytes": 103
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24399,12 +24704,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "nul-and-controls",
-            "status": 400,
-            "bytes": 89
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -24775,12 +25080,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "array-instead-of-object",
-            "status": 400,
-            "bytes": 104
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -25537,12 +25842,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "prototype-keys",
-            "status": 400,
-            "bytes": 93
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -25979,7 +26284,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/7121cc8e9eda6de2e3497488fabe250e"
+              "handle": "vault://provider_key/e828bddecab0eb8daeb984b14f8572f7"
             }
           },
           {
@@ -27796,12 +28101,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "duplicate-keys",
-            "status": 400,
-            "bytes": 99
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -27843,12 +28148,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "deep-nesting",
-            "status": 400,
-            "bytes": 97
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -27890,12 +28195,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 400,
-          "error_code": "malformed",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "wrong-types",
-            "status": 400,
-            "bytes": 96
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -27937,12 +28242,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "prototype-keys",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -27984,12 +28289,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "unicode-boundaries",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28031,12 +28336,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "negative-and-overflow",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28078,12 +28383,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "empty-object",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28125,12 +28430,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "updater_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "array-instead-of-object",
-            "status": 409,
-            "bytes": 132
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28219,12 +28524,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "workers_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "nul-and-controls",
-            "status": 409,
-            "bytes": 137
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28313,12 +28618,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "workers_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "deep-nesting",
-            "status": 409,
-            "bytes": 137
+            "status": 401,
+            "bytes": 119
           }
         }
       }
@@ -28360,12 +28665,12 @@
         "passed": true,
         "observed": {
           "unauthenticated": 401,
-          "authenticated": 409,
-          "error_code": "cloud_disabled",
+          "authenticated": 401,
+          "error_code": "unauthorized",
           "hostile": {
             "case": "wrong-types",
-            "status": 400,
-            "bytes": 95
+            "status": 401,
+            "bytes": 119
           }
         }
       }
