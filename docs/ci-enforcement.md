@@ -18,8 +18,10 @@ it needs credentials or a server this checkout does not have.
 | Invariant criticality + planted-mutation proof: every entry is release-critical by default (its `authority` names the production gate) and must ship a planted `mutation_command`; non-empty `mutation_debt` fails both checker modes, downgrades require `criticality_reason` | Applied | `tests/invariants.toml`, `scripts/check-invariants.mjs`, `scripts/mutation-run.mjs`, `scripts/mutations/*.json`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
 | Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict) and the PR path | Applied | GitHub API |
-| Woodpecker publishes `ci/woodpecker/pr/pr` for this repo | **Operator** | Woodpecker server |
-| Commit signature shows `verified:true` on GitHub | **Operator** | GitHub account email |
+| Woodpecker webhook for this repo | Applied (local tunnel) | hook `685914438`, ping `200` |
+| `ci/woodpecker/pr/pr` publication | Applied via single-project switch (upstream 3.18/3.19 has no two-projects-per-repo selector) | Woodpecker server |
+| Commit signature shows `verified:true` on GitHub | Applied (repo-local account noreply identity) | GitHub account + SSH signing key |
+| Release-signing role `faktor-release-signing` | Provisioned (secret matches allowlist) | Woodpecker secret + `scripts/certification/attestation-keys.json` |
 
 ## 1. Branch protection (applied)
 
@@ -30,14 +32,13 @@ it needs credentials or a server this checkout does not have.
   (branch must be up to date before merge);
 - a pull request is required before merging (`required_approving_review_count: 0`);
 - force pushes and branch deletion disabled;
-- `enforce_admins: false`: the repository admin retains a bypass. This is
-  deliberate until the Woodpecker PR context actually publishes on this repo
-  (below); with a required context that no one publishes, the bypass is the
-  only escape hatch. Once the first green `ci/woodpecker/pr/pr` run is
-  observed, tighten it:
+- `enforce_admins: true` after the first exact-SHA `ci/woodpecker/pr/pr`
+  green run. Before that run the bypass stays available (the required context
+  had no publisher); it is closed immediately afterwards:
 
   ```sh
   gh api --method POST repos/sbelakho2/faktor/branches/main/protection/enforce_admins
+  gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
   ```
 
 To re-apply the exact configuration (idempotent PUT):
@@ -46,7 +47,7 @@ To re-apply the exact configuration (idempotent PUT):
 cat > /tmp/protection.json <<'JSON'
 {
   "required_status_checks": { "strict": true, "contexts": ["ci/woodpecker/pr/pr"] },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": false,
     "require_code_owner_reviews": false,
@@ -63,71 +64,104 @@ gh api --method PUT repos/sbelakho2/faktor/branches/main/protection --input /tmp
 To remove it entirely (only if the Woodpecker project is abandoned):
 `gh api --method DELETE repos/sbelakho2/faktor/branches/main/protection`.
 
-## 2. Woodpecker PR publication (operator action; residual)
+## 2. Woodpecker webhook and PR publication (local, applied)
 
-Right now the repository has **no Woodpecker webhook and no GitHub App
-installation** (`gh api repos/sbelakho2/faktor/hooks` is `[]`), so no run
-ever publishes `ci/woodpecker/pr/pr`. The in-tree certificate therefore
-still cannot turn green on GitHub: the required check stays "Expected —
-waiting" until a Woodpecker instance is connected to the repo.
-
-Connect it with the in-tree activation script (Woodpecker 3.x server + an
-instance admin token; the `--trusted` flag requests `trusted.volumes` for the
-caches and needs the admin token):
+The local operator instance is Woodpecker 3.18.1 on
+`http://localhost:8010` (container `faktor-woodpecker-server`; SQLite in
+`~/.woodpecker/data`, admin API token in `~/.woodpecker/api-token`, never
+committed). Two agents are registered: `darwin/arm64` (local backend) and
+`linux/amd64` (docker backend). The repository webhook exists and is active:
 
 ```sh
-WOODPECKER_HOST=https://<your-woodpecker-host> WOODPECKER_TOKEN=<admin-pat> \
-  bash scripts/woodpecker/activate.sh sbelakho2/faktor --trusted --timeout-minutes 1560
-bash scripts/woodpecker/verify-boundary.sh sbelakho2/faktor   # offline layout + server settings
+gh api repos/sbelakho2/faktor/hooks --jq '.[] | {id,active,events}'
+gh api --method POST repos/sbelakho2/faktor/hooks/<id>/pings
+gh api 'repos/sbelakho2/faktor/hooks/<id>/deliveries?per_page=1' --jq '.[0] | {event,status_code}'
 ```
 
-This creates the two projects (untrusted `.woodpecker/untrusted/` with
-`allow_pr: true`; trusted `.woodpecker/trusted/` with `trusted.volumes: true`)
-and registers the `nightly` cron; the server then installs the GitHub webhook
-and publishes commit statuses with the default context format, including
-`ci/woodpecker/pr/pr` on pull requests. Full walkthrough:
+The hook URL must point at the live tunnel origin and keep its
+`?access_token=` query value. The quick tunnel hostname changes on restart, so
+repair it fail-closed (extract the token from the existing hook, never print
+it):
+
+```sh
+URL=$(grep -o 'https://[a-z-]*\.trycloudflare\.com' ~/.woodpecker/tunnel.log | tail -1)
+# PATCH config.url to "$URL/api/hook?access_token=<existing token>"
+```
+
+**Upstream limitation (verified in 3.18.1 and 3.19.0 source):** the server
+has no `?project=` selector and stores one project per forge repository.
+`scripts/woodpecker/activate.sh`'s "two projects over one repository" model
+requires a server build that implements that selector; this instance ignores
+it and the lookup returns the same project id. Do not run the script's
+trusted step against an instance that behaves this way — it would overwrite
+the PR configuration.
+
+The applied fail-closed sequence for one project (repo id 2) is:
+
+1. Before pushing the candidate branch, PATCH the project to the untrusted
+   shape: `config_file=.woodpecker/untrusted/`, `allow_pr=true`,
+   `trusted.volumes=false`. This is the only shape that can run
+   `pull_request` events; it can never mount the trusted volumes.
+2. Push the branch and open the PR. Woodpecker publishes
+   `ci/woodpecker/pr/pr` for the PR head SHA.
+3. Only after the PR is green, PATCH the project back to the trusted shape:
+   `config_file=.woodpecker/trusted/`, `allow_pr=false`,
+   `trusted.volumes=true`.
+4. Fast-forward the exact PR head onto `main`. The push event runs the full
+   trusted matrix (linux + darwin + windows) at that same SHA; the aggregate
+   `status-publish` runs only on `main`.
+5. Re-assert branch protection and close the admin bypass.
+
+Never leave `allow_pr=true` on a project that has `trusted.volumes=true`,
+and never point the trusted project at `.woodpecker/untrusted/`.
+
+If no webhook or App can be created with the available credentials, the
+fail-closed stop condition is: do not weaken or remove the required context,
+do not substitute a parent/merge SHA, and record the local trusted run by
+triggering the exact commit on the local server via the API (`POST
+/api/repos/<id>/pipelines` with a manual event is not a release lane; use the
+forge webhook path or a `push`/`pull_request` payload). `certify.sh
+--verify-ci-evidence` only accepts an observed pipeline for the exact SHA.
+
+If the instance runs elsewhere (hosted CI), the required context string is
+fixed by `WOODPECKER_STATUS_CONTEXT_FORMAT` and must stay
+`ci/woodpecker/pr/pr`. Full walkthrough:
 `scripts/woodpecker/setup.md` (§3 activation, §5 trust, §6 cron).
 
-If the instance runs elsewhere (hosted CI), only the webhook/publication part
-matters: the required context string is fixed by
-`WOODPECKER_STATUS_CONTEXT_FORMAT` and must stay
-`ci/woodpecker/pr/pr`.
+## 3. Commit signature (applied)
 
-## 3. Commit signature (operator action; residual)
+Resolution: keep signing with the registered SSH key but commit with the
+account's associated noreply address in the repository-local config only
+(no global change):
 
-Diagnosis of HEAD (`3c67f794`, same for the pushed `main`):
+```sh
+git config user.email "240468762+sbelakho2@users.noreply.github.com"
+git config user.name "sabelakhoua"
+```
 
-- `git log -1 --show-signature` -> `Good "git" signature ... ED25519 key
-  SHA256:aE3x/e/26DPnlX19RR6P3foOCCPaNaL9iNEhH5Ar3s8`;
-  `git config` signs with `/Users/sabelakhoua/.ssh/kiwicaptcha_signing`
-  (`gpg.format ssh`, `commit.gpgsign true`) and uses
-  `user.email belakhoua.s@northeastern.edu`.
-- `gh api user/ssh_signing_keys` contains exactly that fingerprint (title
-  `kiwicaptcha-commit-signing`, id 1115429), so the signing key **is**
-  registered on the GitHub account.
-- GitHub still reports `verified:false, reason:"no_user"` and the commit's
-  `author`/`committer` fields are `null` — the commit email
-  `belakhoua.s@northeastern.edu` is not an associated/verified email on
-  account `sbelakho2`. For SSH signatures GitHub requires both the key and
-  the committer email to belong to the account.
+The signing key is already registered on the account
+(`gh api user/ssh_signing_keys`; ED25519
+`SHA256:aE3x/e/26DPnlX19RR6P3foOCCPaNaL9iNEhH5Ar3s8`, title
+`kiwicaptcha-commit-signing`). The previous `verified:false, reason:no_user`
+came from `belakhoua.s@northeastern.edu` not being an associated account
+email; that address remains unverified because the current `gh` token lacks
+the `user` scope. If the northeastern address must verify instead, the
+operator step is interactive and cannot be automated here:
 
-Operator options (no git config was changed by this hardening pass):
+```sh
+gh auth refresh -h github.com -s user     # interactive browser flow
+# Settings -> Emails -> add + verify belakhoua.s@northeastern.edu
+```
 
-1. Add and verify `belakhoua.s@northeastern.edu` in GitHub
-   Settings -> Emails, then re-run any signed commit; verification turns
-   green. The current `gh` token lacks the `user` scope, so this cannot be
-   done from here (`gh auth refresh -h github.com -s user` is interactive).
-2. Or keep signing with the same key but use a verified address, e.g. the
-   account noreply address:
-   `git config --global user.email "240468762+sbelakho2@users.noreply.github.com"`.
-   Decide this deliberately: it is a global git-config change, not applied
-   here.
-
-Re-check with:
+Re-check the exact commit after pushing:
 
 ```sh
 gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verification'
 ```
+
+The expected result is `{"verified":true,"reason":"valid"}`. Do not rewrite
+or re-sign a commit after certification: the trusted-build attestation binds
+the exact source SHA and tree.
 
 ## 4. Toolchain, images, vsce (applied; how to verify)
 

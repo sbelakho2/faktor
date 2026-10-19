@@ -46,7 +46,7 @@
 # the Rust channel authority.
 #
 # Hermetic toolchain (P1): the PR lanes run NO apt either. The stock baselines
-# already ship the tools their old apt steps installed (python3, ps, unzip,
+# already ship the tools their old apt steps installed (ps, unzip,
 # ca-certificates) and keep their digest pins because they install nothing;
 # the JetBrains build and smoke lanes run on the dedicated Faktor CI image
 # from `docker/faktor-ci/Dockerfile` (git + JDK 17 included), referenced by
@@ -180,12 +180,15 @@ steps:
   # ---------------------------------------------------------------- linux --
   - name: linux
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
-    depends_on: [programme-selection]
+    depends_on: [programme-selection, static]
     environment:
       RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     commands:
-      # No apt: the digest-pinned rust:1.98.0 baseline already ships python3,
-      # procps and ca-certificates (verified: `python3`, `ps`, unzip, curl and
+      # No apt: the digest-pinned rust:1.98.0 baseline already ships procps and
+      # ca-certificates (verified: `ps`, unzip, curl and
       # /etc/ssl/certs/ca-certificates.crt are present); the stock image is
       # kept because the lane installs nothing.
       # rust-toolchain.toml is authoritative; fail loudly if the shim does not resolve it.
@@ -200,15 +203,18 @@ steps:
       - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # Change-aware pull lane: only the affected crates/suites run by
-      # default. The selection is conservative (reverse-dependency closure);
-      # an unmapped path is a typed refusal escalated to the full workspace
-      # test and recorded in the selection evidence — never a silent skip.
-      # Trusted/nightly full lanes keep `cargo test --workspace` (see
-      # .woodpecker/trusted/).
+      # Change-aware pull lane: the affected crates/suites run first so a
+      # failure surfaces quickly. The selection is conservative
+      # (reverse-dependency closure); an unmapped path is a typed refusal.
+      # The canonical full workspace test still runs afterwards: gate parity
+      # (`scripts/certify.sh --check-gate-parity`) requires the PR linux lane
+      # to execute every canonical gate command, so a selection miss can
+      # never pass this lane.
       - cargo build -p faktor-cli
-      # Only the affected Rust command set selected by programme-selection.
+      # Affected Rust command set selected by programme-selection (fast feedback).
       - sh target/certification/programme/selected-cargo.sh
+      # Canonical full gate set (matches scripts/certify.sh canonical_gate_commands).
+      - cargo test --workspace --all-features
       - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
@@ -223,6 +229,7 @@ steps:
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo build -p faktor-cli
         sh target/certification/programme/selected-cargo.sh
+        cargo test --workspace --all-features
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
@@ -248,9 +255,15 @@ steps:
       - node tests/programme/probes/ordering.mjs
       - node scripts/programme/release-gate.mjs --status
   - name: static
+    # The supply-chain fast-path test runs `cargo metadata`; serialize it
+    # after the docs cargo-doc step so the package-cache lock is free.
+    depends_on: [docs]
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     commands:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
@@ -282,6 +295,9 @@ steps:
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     commands:
       - cargo doc --workspace --all-features --no-deps
       - bash scripts/branding-scan.sh
@@ -309,7 +325,7 @@ steps:
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     commands:
       # No apt: the digest-pinned node:24 baseline already ships unzip and
-      # ca-certificates (verified: `unzip`, `python3`, curl and
+      # ca-certificates (verified: `unzip`, curl and
       # /etc/ssl/certs/ca-certificates.crt are present); the stock image is
       # kept because the lane installs nothing.
       - cd apps/vscode
@@ -372,12 +388,19 @@ steps:
   # Chrome discovery is deterministic and fail-closed: the image ships
   # chromium under /ms-playwright/chromium-*/chrome-linux/chrome; the lane
   # resolves it with that shell glob, refuses an empty/unusable result, and
-  # exports FAKTOR_CHROME (render-webview.mjs honors it). render-webview.mjs
-  # has no chrome-flag surface, so a tiny wrapper adds `--no-sandbox` ONLY when
-  # the container runs as root — the same root rule scripts/vscode-e2e.sh
-  # documents for this image (`id -u` = 0 refuses to start Chrome otherwise).
+  # exports FAKTOR_CHROME (render-webview.mjs honors it). The harness adds
+  # `--no-sandbox` itself when it runs as root — the same root rule
+  # scripts/vscode-e2e.sh documents for this image.
   - name: vscode-render
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as the trusted vscode-e2e lane; chromium runtime included)
+    # Steps of one workflow share the workspace. Both lanes run `npm ci` and
+    # `npm run build`, so running them concurrently lets one wipe the other's
+    # node_modules mid-build (the observed `npx --no-install vsce` failure).
+    # Serialize them; the render lane reuses the installed tree.
+    # Serialize after the Rust lane: the browser and the workspace compiler
+    # both run under QEMU on the local amd64 agent, and concurrent heavy steps
+    # starve Chrome's DevTools startup (observed: CDP closed / no DevTools).
+    depends_on: [vscode, linux]
     commands:
       - cd apps/vscode
       - npm ci
@@ -392,19 +415,8 @@ steps:
           echo "vscode-render: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
           exit 1
         fi
-        chrome_wrapper="$(mktemp)"
-        if [ "$(id -u)" -eq 0 ]; then
-          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
-        else
-          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
-        fi
-        chmod +x "$chrome_wrapper"
-        if [ ! -x "$chrome_wrapper" ]; then
-          echo "vscode-render: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
-          exit 1
-        fi
-        echo "vscode-render: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
-        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
+        echo "vscode-render: chromium at $chrome_bin (uid $(id -u))"
+        FAKTOR_CHROME="$chrome_bin" node scripts/render-webview.mjs --check
       - cd "$CI_WORKSPACE"
       - |
         set -eu
@@ -422,20 +434,8 @@ steps:
           echo "vscode-render: no chromium under /ms-playwright/chromium-*/chrome-linux/chrome (fail closed)" >&2
           exit 1
         fi
-        chrome_wrapper="$(mktemp)"
-        if [ "$(id -u)" -eq 0 ]; then
-          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
-        else
-          printf '#!/bin/sh\nexec "%s" "$@"\n' "$chrome_bin" > "$chrome_wrapper"
-        fi
-        chmod +x "$chrome_wrapper"
-        if [ ! -x "$chrome_wrapper" ]; then
-          echo "vscode-render: chrome wrapper $chrome_wrapper unusable (fail closed)" >&2
-          exit 1
-        fi
-        echo "vscode-render: chromium at $chrome_bin (wrapper $chrome_wrapper, uid $(id -u))"
-        FAKTOR_CHROME="$chrome_wrapper" node scripts/render-webview.mjs --check
-        cd "$CI_WORKSPACE"
+        echo "vscode-render: chromium at $chrome_bin (uid $(id -u))"
+        FAKTOR_CHROME="$chrome_bin" node scripts/render-webview.mjs --check
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
@@ -454,7 +454,9 @@ steps:
     # that the pinned Gradle wrapper (9.7.1) requires.
     image: ghcr.io/sbelakho2/faktor-ci@sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
-    depends_on: [ci-image]
+    # Serialize the heavy QEMU lanes: Gradle+Kotlin compilation alongside the
+    # full Rust workspace caused a linker SIGSEGV (QEMU) in a sibling lane.
+    depends_on: [ci-image, linux, vscode-render]
     commands:
       - cd apps/jetbrains
       # Validate wrapper jar + distribution sha256 + verification metadata + locks first.
@@ -507,9 +509,12 @@ steps:
   - name: jetbrains-smoke
     image: ghcr.io/sbelakho2/faktor-ci@sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
-    depends_on: [ci-image]
+    # The smoke lane compiles the daemon with the plugin ZIP; it must not run
+    # beside the Gradle build or the linux workspace compile under QEMU.
+    depends_on: [ci-image, jetbrains-build]
     environment:
       RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "1"
     commands:
       # No apt: the digest-pinned Faktor CI image already carries the pinned
       # toolchain (standalone kotlinc 2.4.20 matching the Gradle Kotlin plugin,

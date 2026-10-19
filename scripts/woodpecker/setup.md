@@ -22,6 +22,15 @@ projects with different server-side trust and different pipeline paths:
 | **untrusted** | `trusted.volumes=false`, `allow_pr=true` | `.woodpecker/untrusted/` | `pull_request` | `pr.yaml` (`pr`) |
 | **trusted** | `trusted.volumes=true` (admin), `allow_pr=false` | `.woodpecker/trusted/` | `push`, `tag`, `cron` | `trusted.yaml` (`trusted`) + `nightly.yaml` (`nightly`) |
 
+> **Upstream limitation (verified in 3.18.1 and 3.19.0 source):** upstream
+> Woodpecker stores one project per forge repository and does not implement
+> the `?project=` selector used by `activate.sh`. On such a server the model
+> above is a target layout, not something activation can create. Use the
+> single-project fail-closed switch in `docs/ci-enforcement.md` §2 (untrusted
+> shape for the PR event, then trusted shape for the `main` push), or run a
+> second instance whose only project is the untrusted one. Never enable
+> `allow_pr` on the trusted project.
+
 `pull_request` events only ever reach the untrusted project, and Woodpecker
 refuses `volumes:` at policy level for a project that is not trusted. The
 trusted project never loads the PR workflow because its *pipeline path* — a
@@ -168,17 +177,34 @@ on the trusted project only:
 
 ### 3c. Activation status in this checkout
 
-**Activation could not be executed from this machine:** there is no
-`WOODPECKER_HOST`/`WOODPECKER_TOKEN` in the environment, no Woodpecker
-instance reachable on `localhost:8000`, and no server credentials of any kind
-were available. Nothing in this repository has been enabled on an instance by
-this change. The exact commands to run somewhere with credentials are:
+The local operator instance is Woodpecker 3.18.1 on
+`http://localhost:8010` with a SQLite store under `~/.woodpecker/data`, an
+admin token in `~/.woodpecker/api-token` (never committed) and two live
+agents (`darwin/arm64` local backend, `linux/amd64` docker backend). The
+repository webhook is active and answered a GitHub ping with HTTP 200; repo
+id 2 is the single Woodpecker project for `sbelakho2/faktor`.
+
+**Verified upstream limitation:** Woodpecker 3.18.1 and 3.19.0 have no
+`?project=` selector and store one project per forge repository (checked in
+the tagged server source). The two-project model in §1/§3b therefore only
+applies to a server build that implements that selector; on this instance
+`GET /api/repos/lookup/<owner>/<repo>?project=trusted` returns the same id as
+the primary lookup. Do **not** run the script's trusted step in that case —
+it would overwrite the PR configuration on the one project.
+
+For a single-project server, use the fail-closed switch in
+`docs/ci-enforcement.md` §2: set the project to
+`.woodpecker/untrusted/` + `allow_pr=true` + `trusted.volumes=false` for the
+PR event, then restore `.woodpecker/trusted/` + `allow_pr=false` +
+`trusted.volumes=true` before the `main` push. Never combine
+`allow_pr=true` with `trusted.volumes=true`.
 
 ```sh
 export WOODPECKER_HOST="https://<your-instance>"
 export WOODPECKER_TOKEN="<personal access token>"
 bash scripts/woodpecker/activate.sh <owner/repo> --timeout-minutes 1560 --trusted --run-now
-# then verify the boundary (layout guards + both server-side projects):
+# then verify the layout guards; the script reports whether the server
+# actually stored distinct project settings:
 bash scripts/woodpecker/verify-boundary.sh <owner/repo>
 ```
 
@@ -259,9 +285,9 @@ writes no attestation. The build key MUST NOT sign release signatures:
 The trusted workflow's `release-signature` step signs the release
 artifact/certificate class (`faktor-release-signature/v1`), binding the
 exact build-attestation payload plus the release artifact digests, with the
-RELEASE identity `faktor-release-signing`. The pipeline mapping ships
-commented out because a `from_secret` reference to a not-yet-registered
-secret is a Woodpecker config compile error. Provision it in order:
+RELEASE identity `faktor-release-signing`. The pipeline mapping is enabled
+in `.woodpecker/trusted/trusted.yaml` and the trusted project must carry the
+secret before the workflow is compiled. Provision it in order:
 
 ```sh
 # 1. generate the release keypair (on the operator machine, never in CI logs)
@@ -279,15 +305,29 @@ bash scripts/woodpecker/activate.sh <owner/repo> \
 #    release-signature log block and verifies it with the release role
 ```
 
-FAIL-CLOSED split (this checkout): the operator key registration above
-cannot be completed non-interactively from here, so the distinct release
-role is present in the allowlist with an EMPTY public key and
-`status: unprovisioned`. Until steps 1-3 are done, `release-signature`
-exits 3 with the typed `signing-key-missing` refusal, no release signature
-is published, and certification refuses the release class with the typed
-denial `release-signing role (release-signing) signature: absent` — a
-build attestation alone can never print a RELEASE CERTIFICATE. Never reuse
-`faktor_attest_signing_key` for this role.
+PROVISIONED STATE (this checkout, verified non-interactively): the trusted
+project secret `faktor_release_signing_key` holds an ed25519 PKCS#8 key
+whose derived public key equals the allowlist entry
+`faktor-release-signing` (`status: active`, `valid_from: 2026-10-12`;
+public fingerprint `SHA256:q1RKo31uh1NPHRPKCCGMQkUk5YOtBGtmgOu3jVOeivo`).
+The private key is never printed, committed or copied into a log. Verify the
+binding without exposing it:
+
+```sh
+val=$(sqlite3 -readonly ~/.woodpecker/data/woodpecker.sqlite \
+  "select value from secrets where repo_id=2 and name='faktor_release_signing_key';")
+VALUE="$val" node -e '
+const c=require("crypto");
+const pub=c.createPublicKey(c.createPrivateKey(process.env.VALUE)).export({type:"spki",format:"der"});
+console.log("SHA256:"+c.createHash("sha256").update(pub.subarray(pub.length-32)).digest("base64").replace(/=+$/,""));'
+```
+
+If the secret is missing or the fingerprint differs, `release-signature`
+exits 3 with the typed `signing-key-missing` refusal, no release signature is
+published, and certification refuses the release class (`release-signing
+role (release-signing) signature: absent`) — a build attestation alone can
+never print a RELEASE CERTIFICATE. Never reuse `faktor_attest_signing_key`
+for this role.
 
 The same `attestation` step resolves the OBSERVED Woodpecker pipeline id
 before signing: certification binds `pipeline_id` to the API's own id for
