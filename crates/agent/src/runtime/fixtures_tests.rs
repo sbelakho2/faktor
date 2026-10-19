@@ -1462,12 +1462,16 @@ impl SemanticProvider for FakeSemanticProvider {
                         affected,
                         tests: vec![],
                         degraded: false,
+                        provenance: Vec::new(),
+                        unavailable: Vec::new(),
                     }
                 }
                 FakeSemanticKind::Degraded => AffectedSet {
                     affected: vec![],
                     tests: vec![],
                     degraded: true,
+                    provenance: Vec::new(),
+                    unavailable: Vec::new(),
                 },
                 FakeSemanticKind::Hostile(text) => AffectedSet {
                     affected: vec![faktor_semantic::SemanticEntityRef::new(
@@ -1477,6 +1481,8 @@ impl SemanticProvider for FakeSemanticProvider {
                     )],
                     tests: vec![],
                     degraded: false,
+                    provenance: Vec::new(),
+                    unavailable: Vec::new(),
                 },
                 FakeSemanticKind::Panic => panic!("hostile semantic provider panicked"),
             };

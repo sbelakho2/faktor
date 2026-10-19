@@ -23,6 +23,15 @@
 //! - Stderr is drained continuously into a bounded byte ring (recent tail
 //!   kept for diagnostics; total bytes counted unboundedly) so a verbose
 //!   server can never block itself on a full stderr pipe.
+//!
+//! # Semantic API
+//!
+//! [`semantic`] exposes the typed, capability-gated, bounded and cancellable
+//! surface used by Faktor's semantic/index consumers: definition, references
+//! (with `includeDeclaration`), workspace symbols and the three call-hierarchy
+//! requests. [`LspClient::capabilities`] reports exactly what the server
+//! advertised; an unadvertised method is a typed
+//! [`SemanticError::Unsupported`] and is never sent.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, BufWriter, Write};
@@ -35,12 +44,52 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
+pub mod semantic;
+pub mod types;
+
+pub use faktor_core::CancellationToken;
+pub use semantic::{
+    DefinitionResult, IncomingCalls, OutgoingCalls, ReferencesResult, SemanticCacheStats,
+    SemanticError, SemanticMethod, SemanticOptions, ServerCapabilities, TextDocumentSyncKind,
+    WorkspaceSymbols, DEFAULT_SEMANTIC_TIMEOUT, MAX_SEMANTIC_CACHE_BYTES,
+    MAX_SEMANTIC_CACHE_ENTRIES, METHOD_DEFINITION, METHOD_DOCUMENT_SYMBOL, METHOD_INCOMING_CALLS,
+    METHOD_OUTGOING_CALLS, METHOD_PREPARE_CALL_HIERARCHY, METHOD_REFERENCES,
+    METHOD_WORKSPACE_SYMBOL,
+};
+pub use types::{
+    Bounded, CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
+    DocumentRevision, Location, Position, Range, SymbolKind, SymbolTag, WorkspaceSymbol,
+    WorkspaceSymbolLocation, MAX_CALL_HIERARCHY_ITEMS, MAX_DATA_BYTES, MAX_DETAIL_BYTES,
+    MAX_LOCATIONS, MAX_NAME_BYTES, MAX_QUERY_BYTES, MAX_SYMBOL_TAGS, MAX_URI_BYTES,
+    MAX_WORKSPACE_SYMBOLS,
+};
+
 /// Re-exported delivery-unknown contract (owned by `faktor-mcp`, the framing/
 /// writer sibling): a timed-out frame whose write had already begun can never
 /// be reported as a clean, provably-not-delivered Timeout.
 pub use faktor_mcp::{
     delivery_unknown, is_delivery_unknown, DeliveryUnknown, FrameGuard, FrameState,
 };
+
+/// Stable [`ErrorKind::Provider`] code for a capability-gated method on the
+/// raw (untyped) API surface.
+pub const LSP_UNSUPPORTED_CODE: &str = "lsp_unsupported";
+
+/// True when a raw-API error is the typed "server did not advertise this
+/// method" refusal (match the code, never the message).
+pub fn is_unsupported_error(error: &Error) -> bool {
+    matches!(&error.kind, ErrorKind::Provider { code, .. } if code == LSP_UNSUPPORTED_CODE)
+}
+
+fn unsupported_error(method: &str) -> Error {
+    Error::new(
+        ErrorKind::Provider {
+            code: LSP_UNSUPPORTED_CODE.into(),
+            retryable: false,
+        },
+        format!("lsp {method} is not advertised by the server capabilities"),
+    )
+}
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Bounded everything: at most this many requests may be awaiting responses.
@@ -328,7 +377,7 @@ impl StderrRing {
 /// Minimal file:// URI from an absolute path: unreserved RFC 3986
 /// characters plus `/` and `:` pass through; everything else (spaces,
 /// non-ASCII, ...) is percent-encoded per byte.
-fn file_uri(path: &Path) -> String {
+pub fn file_uri(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut out = String::with_capacity(raw.len() + 8);
     out.push_str("file://");
@@ -359,12 +408,56 @@ pub struct LspClient {
     /// The stdout reader and stderr drain JoinHandles: consumed by the
     /// bounded join on shutdown/Drop (None = already joined).
     threads: Mutex<ClientThreads>,
+    /// Exactly what the server advertised in its `initialize` result. Empty
+    /// until the handshake completes; never optimistically populated.
+    capabilities: Mutex<ServerCapabilities>,
+    /// Open-document revisions: the cache key component for semantic
+    /// requests, updated by didOpen/didChange and dropped by didClose.
+    documents: Mutex<HashMap<String, TrackedDocument>>,
+    semantic_cache: semantic::SemanticCache,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackedDocument {
+    revision: DocumentRevision,
+    /// End position of the text (used for a whole-document incremental
+    /// `didChange` when the server advertises incremental sync).
+    end: Position,
+}
+
+fn document_end(text: &str) -> Position {
+    let line = text.bytes().filter(|byte| *byte == b'\n').count();
+    let tail = text.rsplit('\n').next().unwrap_or("");
+    let character: usize = tail.chars().map(char::len_utf16).sum();
+    Position::new(
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(character).unwrap_or(u32::MAX),
+    )
 }
 
 #[derive(Default)]
 struct ClientThreads {
     reader: Option<std::thread::JoinHandle<()>>,
     stderr: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Internal request outcome. The raw `request` path maps `Write` straight
+/// back to the original [`Error`] (preserving typed delivery-unknown), while
+/// the semantic path maps everything into [`semantic::SemanticError`].
+#[derive(Debug)]
+pub(crate) enum RequestFailure {
+    /// The server had already exited before the request was written.
+    Exited(String),
+    /// A write/flush/enqueue failure (keeps the typed `Error` intact).
+    Write(Error),
+    /// The reader dropped the response channel without a response.
+    Dropped,
+    /// The shared write+response deadline expired.
+    Timeout(Duration),
+    /// The caller's cancellation token won the race.
+    Cancelled,
+    /// A JSON-RPC error object.
+    Rpc(serde_json::Value),
 }
 
 impl LspClient {
@@ -403,7 +496,8 @@ impl LspClient {
         let reader = {
             let conn2 = conn.clone();
             let exited2 = exited.clone();
-            std::thread::spawn(move || read_loop(conn2, exited2, spawned.stdout))
+            let writer2 = writer.clone();
+            std::thread::spawn(move || read_loop(conn2, exited2, spawned.stdout, writer2))
         };
         // Stderr drain thread: a verbose server must never block itself on a
         // full stderr pipe; the bounded ring keeps the recent tail.
@@ -423,6 +517,9 @@ impl LspClient {
                 reader: Some(reader),
                 stderr: Some(stderr_thread),
             }),
+            capabilities: Mutex::new(ServerCapabilities::default()),
+            documents: Mutex::new(HashMap::new()),
+            semantic_cache: semantic::SemanticCache::default(),
         }))
     }
 
@@ -435,22 +532,57 @@ impl LspClient {
         params: serde_json::Value,
         deadline: Duration,
     ) -> Result<serde_json::Value, Error> {
+        match self.request_raw(method, params, deadline, None).await {
+            Ok(value) => Ok(value),
+            Err(RequestFailure::Exited(message)) => Err(Error::new(ErrorKind::Network, message)),
+            Err(RequestFailure::Write(error)) => Err(error),
+            Err(RequestFailure::Dropped) => {
+                Err(Error::new(ErrorKind::Network, "lsp connection dropped"))
+            }
+            Err(RequestFailure::Timeout(deadline)) => Err(Error::timeout(format!(
+                "lsp {method} exceeded {}ms",
+                deadline.as_millis()
+            ))),
+            Err(RequestFailure::Cancelled) => Err(Error::cancelled()),
+            Err(RequestFailure::Rpc(error)) => Err(Error::new(
+                ErrorKind::Provider {
+                    code: "lsp".into(),
+                    retryable: false,
+                },
+                format!("lsp {method}: {error}"),
+            )),
+        }
+    }
+
+    /// Shared request engine. ONE deadline covers the write AND the response
+    /// wait; an optional cancellation token races both phases. Cancellation
+    /// removes the pending entry and queues `$/cancelRequest` for the exact
+    /// id (best-effort, ordered after the request frame by the writer FIFO).
+    async fn request_raw(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<serde_json::Value, RequestFailure> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(RequestFailure::Cancelled);
+        }
         if self.exited.load(Ordering::SeqCst) {
-            return Err(Error::new(
-                ErrorKind::Network,
-                format!("lsp server exited before {method}"),
-            ));
+            return Err(RequestFailure::Exited(format!(
+                "lsp server exited before {method}"
+            )));
         }
         // ONE deadline covers the write AND the response wait: a server that
         // stops draining can never extend the request past it.
         let deadline_at = tokio::time::Instant::now() + deadline;
-        let (id, request) = {
+        let (id_number, id, request) = {
             let mut conn = recover_lock(&self.conn);
             if conn.pending.len() >= MAX_INFLIGHT_REQUESTS {
-                return Err(Error::new(
+                return Err(RequestFailure::Write(Error::new(
                     ErrorKind::Oversized,
                     "too many in-flight lsp requests",
-                ));
+                )));
             }
             let id = conn.next_id;
             conn.next_id += 1;
@@ -460,7 +592,7 @@ impl LspClient {
                 "method": method,
                 "params": params,
             });
-            (id.to_string(), request)
+            (id, id.to_string(), request)
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -481,39 +613,87 @@ impl LspClient {
         // be answered, and a delivery-unknown frame is no longer awaited
         // (its late response is discarded) — while the ERROR itself carries
         // the difference: clean Timeout vs typed delivery-unknown.
-        if let Err(e) = self
+        let write = self
             .writer
-            .write_and_flush(wire.into_bytes(), deadline_at, method)
-            .await
-        {
+            .write_and_flush(wire.into_bytes(), deadline_at, method);
+        let write_result = match cancellation {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    recover_lock(&self.conn).pending.remove(&id);
+                    self.queue_cancel(id_number);
+                    return Err(RequestFailure::Cancelled);
+                }
+                result = write => result,
+            },
+            None => write.await,
+        };
+        if let Err(error) = write_result {
             recover_lock(&self.conn).pending.remove(&id);
-            return Err(e);
+            return Err(RequestFailure::Write(error));
         }
         if let Some(a) = &self.activity {
             a();
         }
-        match tokio::time::timeout_at(deadline_at, rx).await {
-            Ok(Ok(v)) => {
-                if let Some(err) = v.get("error") {
-                    return Err(Error::new(
-                        ErrorKind::Provider {
-                            code: "lsp".into(),
-                            retryable: false,
-                        },
-                        format!("lsp {method}: {err}"),
-                    ));
+        let wait = tokio::time::timeout_at(deadline_at, rx);
+        let response = match cancellation {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                result = wait => Some(result),
+            },
+            None => Some(wait.await),
+        };
+        let Some(response) = response else {
+            recover_lock(&self.conn).pending.remove(&id);
+            self.queue_cancel(id_number);
+            return Err(RequestFailure::Cancelled);
+        };
+        match response {
+            Ok(Ok(value)) => {
+                if let Some(error) = value.get("error") {
+                    return Err(RequestFailure::Rpc(error.clone()));
                 }
-                Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                Ok(value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
             }
-            Ok(Err(_)) => Err(Error::new(ErrorKind::Network, "lsp connection dropped")),
+            Ok(Err(_)) => Err(RequestFailure::Dropped),
             Err(_) => {
                 recover_lock(&self.conn).pending.remove(&id);
-                Err(Error::timeout(format!(
-                    "lsp {method} exceeded {}ms",
-                    deadline.as_millis()
-                )))
+                // The server may still be computing; tell it to stop even
+                // though we have already stopped waiting.
+                self.queue_cancel(id_number);
+                Err(RequestFailure::Timeout(deadline))
             }
         }
+    }
+
+    /// Queue `$/cancelRequest` without waiting for its write: cancellation
+    /// must never be delayed by the very server it is cancelling. The writer
+    /// FIFO keeps the notification strictly after the request frame.
+    fn queue_cancel(&self, id: u64) {
+        if self.exited.load(Ordering::SeqCst) {
+            return;
+        }
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": id },
+        });
+        let wire = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            notification.to_string().len(),
+            notification
+        );
+        let (ack, _rx) = std::sync::mpsc::sync_channel(1);
+        let _ = self.writer.enqueue(
+            wire.into_bytes(),
+            WriterAck::Sync(ack),
+            Arc::new(FrameState::queued()),
+            "$/cancelRequest",
+        );
     }
 
     /// NOTIFICATION path: fire-and-forget. No id, no pending entry, no
@@ -555,18 +735,23 @@ impl LspClient {
     }
 
     /// `initialize` REQUEST with the REAL workspace root as `rootUri`
-    /// (spec §3.15: servers resolve project roots from this URI).
+    /// (spec §3.15: servers resolve project roots from this URI). The result
+    /// is parsed into [`ServerCapabilities`] BEFORE any semantic request can
+    /// run; malformed/absent providers stay `false`.
     pub async fn initialize(&self, root: &Path) -> Result<serde_json::Value, Error> {
-        self.request(
-            "initialize",
-            serde_json::json!({
-                "processId": null,
-                "rootUri": file_uri(root),
-                "capabilities": {},
-            }),
-            Duration::from_secs(10),
-        )
-        .await
+        let result = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "processId": null,
+                    "rootUri": file_uri(root),
+                    "capabilities": {},
+                }),
+                Duration::from_secs(30),
+            )
+            .await?;
+        *recover_lock(&self.capabilities) = ServerCapabilities::from_initialize(&result);
+        Ok(result)
     }
 
     /// `initialized` NOTIFICATION — must arrive right after the initialize
@@ -579,23 +764,112 @@ impl LspClient {
     /// it, so this returns as soon as the frame is written — no response
     /// wait, no timeout.
     pub fn did_open(&self, uri: &str, text: &str) -> Result<(), Error> {
+        self.did_open_version(uri, text, 1)
+    }
+
+    /// Versioned `didOpen`: the tracked revision (version + content hash)
+    /// becomes the semantic cache key for this document.
+    ///
+    /// Idempotent for an unchanged tracked document (no duplicate `didOpen`,
+    /// no cache invalidation); if the text changed while tracked, the update
+    /// is sent as the protocol-correct `didChange` with the next version.
+    pub fn did_open_version(&self, uri: &str, text: &str, version: i64) -> Result<(), Error> {
+        let revision = DocumentRevision::of(version, text);
+        let existing = recover_lock(&self.documents).get(uri).copied();
+        if let Some(document) = existing {
+            if document.revision == revision {
+                return Ok(());
+            }
+            return self.did_change(uri, text, document.revision.version.saturating_add(1));
+        }
+        self.track_document(uri, version, text);
         self.notify(
             "textDocument/didOpen",
             serde_json::json!({
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_of(uri),
-                    "version": 1,
+                    "version": version,
                     "text": text,
                 }
             }),
         )
     }
 
+    /// Full-text `textDocument/didChange`. Bumps the tracked revision and
+    /// clears semantic caches (a change can alter cross-document resolution).
+    ///
+    /// The wire shape follows the negotiated `textDocumentSync.change`: a
+    /// full-sync server receives `{text}`; an incremental server receives one
+    /// whole-document replacement range covering the previous tracked end.
+    pub fn did_change(&self, uri: &str, text: &str, version: i64) -> Result<(), Error> {
+        let previous_end = recover_lock(&self.documents)
+            .get(uri)
+            .map(|document| document.end);
+        let change = match self.capabilities().text_document_sync {
+            TextDocumentSyncKind::Incremental => {
+                let end = previous_end.unwrap_or(Position::new(0, 0));
+                serde_json::json!([{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": end.line, "character": end.character },
+                    },
+                    "text": text,
+                }])
+            }
+            TextDocumentSyncKind::Full | TextDocumentSyncKind::None => {
+                serde_json::json!([{ "text": text }])
+            }
+        };
+        self.track_document(uri, version, text);
+        self.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": change,
+            }),
+        )
+    }
+
+    /// `textDocument/didClose`: forgets the tracked revision and clears the
+    /// semantic caches.
+    pub fn did_close(&self, uri: &str) -> Result<(), Error> {
+        self.untrack_document(uri);
+        self.notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        )
+    }
+
+    fn track_document(&self, uri: &str, version: i64, text: &str) {
+        let revision = DocumentRevision::of(version, text);
+        recover_lock(&self.documents).insert(
+            uri.to_string(),
+            TrackedDocument {
+                revision,
+                end: document_end(text),
+            },
+        );
+        // Cross-document resolution can change with any edit: the bounded
+        // cache is cleared rather than guessed stale.
+        self.semantic_cache.clear();
+    }
+
+    fn untrack_document(&self, uri: &str) {
+        recover_lock(&self.documents).remove(uri);
+        self.semantic_cache.clear();
+    }
+
+    /// Raw document symbols (compatibility surface). Capability-gated: a
+    /// server that did not advertise `documentSymbolProvider` gets a typed
+    /// [`LSP_UNSUPPORTED_CODE`] refusal instead of an empty fabrication.
     pub async fn document_symbols(&self, uri: &str) -> Result<Vec<serde_json::Value>, Error> {
+        if !self.capabilities().supports(SemanticMethod::DocumentSymbol) {
+            return Err(unsupported_error(METHOD_DOCUMENT_SYMBOL));
+        }
         let result = self
             .request(
-                "textDocument/documentSymbol",
+                METHOD_DOCUMENT_SYMBOL,
                 serde_json::json!({ "textDocument": { "uri": uri } }),
                 Duration::from_secs(10),
             )
@@ -938,6 +1212,7 @@ fn read_loop(
     conn: Arc<Mutex<LspConn>>,
     exited: Arc<AtomicBool>,
     stdout: std::process::ChildStdout,
+    writer: WriterHandle,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -957,6 +1232,15 @@ fn read_loop(
             match faktor_mcp::parse_frame(&buf) {
                 Ok(Some((consumed, value))) => {
                     buf.drain(..consumed);
+                    // A message carrying `method` is a server notification or
+                    // a SERVER->CLIENT request, never a response — even when
+                    // its id numerically collides with a client request id.
+                    if value.get("method").is_some() {
+                        if let Some(id) = value.get("id") {
+                            queue_server_response(&writer, id, &value);
+                        }
+                        continue;
+                    }
                     let id = value
                         .get("id")
                         .and_then(|i| i.as_u64())
@@ -987,6 +1271,51 @@ fn read_loop(
     }
 }
 
+/// Answer a SERVER->CLIENT request (`client/registerCapability`,
+/// `window/workDoneProgress/create`, `workspace/diagnostic/refresh`, ...).
+/// Real servers (rust-analyzer included) issue these during project loading;
+/// ignoring them can stall or degrade analysis. The response is queued
+/// fire-and-forget on the bounded writer, never blocking the reader. For
+/// `workspace/configuration` a null per requested item is the only honest
+/// answer (this client advertises no configuration capability).
+fn queue_server_response(
+    writer: &WriterHandle,
+    id: &serde_json::Value,
+    request: &serde_json::Value,
+) {
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let result = if method == "workspace/configuration" {
+        let items = request
+            .get("params")
+            .and_then(|params| params.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        serde_json::Value::Array(vec![serde_json::Value::Null; items])
+    } else {
+        serde_json::Value::Null
+    };
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    });
+    let wire = format!(
+        "Content-Length: {}\r\n\r\n{}",
+        response.to_string().len(),
+        response
+    );
+    let (ack, _rx) = std::sync::mpsc::sync_channel(1);
+    let _ = writer.enqueue(
+        wire.into_bytes(),
+        WriterAck::Sync(ack),
+        Arc::new(FrameState::queued()),
+        "server request",
+    );
+}
+
 /// Stderr drain (own thread): read everything into the bounded ring — an
 /// unread stderr pipe would let a verbose server block itself on a full
 /// pipe and stall every request.
@@ -1006,117 +1335,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    const MOCK: &str = r#"
-import json, os, sys, threading, time
-
-def send(obj):
-    body = json.dumps(obj).encode("utf-8")
-    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-def read_msg():
-    cl = 0
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":")[1])
-    if cl == 0:
-        return {}
-    return json.loads(sys.stdin.buffer.read(cl))
-
-def log(msg):
-    sys.stderr.write(msg + "\n")
-    sys.stderr.flush()
-
-mode = sys.argv[1]
-expected_root = sys.argv[2]
-expected_uri = sys.argv[3]
-
-if mode == "flood":
-    def flood_loop():
-        chunk = b"z" * 8192
-        while True:
-            sys.stderr.buffer.write(chunk)
-            sys.stderr.buffer.flush()
-    threading.Thread(target=flood_loop, daemon=True).start()
-
-initialized_seen = False
-didopen_seen = False
-
-def check(cond, what):
-    log(("OK " if cond else "FAIL ") + what)
-
-while True:
-    msg = read_msg()
-    if msg is None:
-        break
-    if "method" not in msg:
-        continue
-    m = msg["method"]
-    if m == "initialize":
-        p = msg.get("params", {})
-        check(p.get("rootUri") == expected_uri, "initialize rootUri")
-        check(os.path.realpath(os.getcwd()) == os.path.realpath(expected_root), "initialize cwd")
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
-            "capabilities": {},
-            "serverInfo": {"name": "mock-lsp", "version": "1"},
-        }})
-        log("SENT initialize result")
-    elif m == "initialized":
-        initialized_seen = True
-        log("GOT initialized")
-    elif m == "textDocument/didOpen":
-        didopen_seen = True
-        check(initialized_seen, "didOpen after initialized")
-        log("GOT didOpen")
-        if mode == "stops-draining":
-            # Stop reading stdin: the next large write fills the pipe and
-            # blocks the writer thread; the client must return a typed
-            # deadline error instead of deadlocking on the conn mutex.
-            log("STOPPED draining")
-            while True:
-                time.sleep(0.05)
-        if mode == "close-stdin":
-            # Close our read end of the pipe and keep running: the client's
-            # NEXT write/flush must fail typed, not time out. (`os.close` —
-            # closing the sys.stdin wrapper would NOT close the fd.)
-            os.close(sys.stdin.fileno())
-            log("CLOSED stdin")
-            while True:
-                time.sleep(0.05)
-    elif m == "textDocument/documentSymbol":
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": []})
-    elif m == "shutdown":
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
-        log("SENT shutdown result")
-    elif m == "exit":
-        log("GOT exit")
-        break
-log("mock exiting")
-"#;
-
-    fn python_available() -> bool {
-        std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_ok()
-    }
-
-    /// A real language-server stand-in (written to a temp file at test
-    /// time): speaks Content-Length JSON-RPC on stdio, checks the handshake
-    /// contract on behalf of the "server side" and reports via stderr
-    /// markers that the client drains into its bounded ring.
+    /// A real language-server stand-in (compiled by faktor-test-mocks at
+    /// test time): speaks Content-Length JSON-RPC on stdio, checks the
+    /// handshake contract on behalf of the "server side" and reports via
+    /// stderr markers that the client drains into its bounded ring.
     fn mock_server_script() -> std::path::PathBuf {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("lsp_mock.py");
-        std::fs::write(&path, MOCK).unwrap();
-        std::mem::forget(dir); // the temp file lives for the test process
-        path
+        faktor_test_mocks::lsp_bin()
     }
 
     fn supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
@@ -1130,9 +1354,8 @@ log("mock exiting")
         (
             LspConfig {
                 name: "mock".into(),
-                command: "python3".into(),
+                command: script.to_string_lossy().into_owned(),
                 args: vec![
-                    script.to_str().unwrap().into(),
                     mode.into(),
                     root.to_str().unwrap().into(),
                     expected_uri.into(),
@@ -1141,6 +1364,449 @@ log("mock exiting")
             },
             script.to_str().unwrap().to_string(),
         )
+    }
+
+    /// Start a mock-backed client, keeping both temp dirs (workspace + CAS)
+    /// alive for the duration of the test.
+    async fn start_mock(
+        mode: &str,
+        ws: u64,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        LspManager,
+        Arc<LspClient>,
+        String,
+    ) {
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let expected_uri = file_uri(&root);
+        let (cas_dir, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let (cfg, _script) = cfg_with(root, mode, &expected_uri);
+        let client = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.start(WorkspaceId::new(ws), cfg),
+        )
+        .await
+        .expect("start timeout")
+        .expect("start failed");
+        (root_dir, cas_dir, mgr, client, expected_uri)
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    fn sample_item(uri: &str) -> CallHierarchyItem {
+        CallHierarchyItem {
+            name: "add_one".into(),
+            kind: SymbolKind::Function,
+            tags: Vec::new(),
+            detail: None,
+            uri: uri.into(),
+            range: Range {
+                start: Position::new(7, 0),
+                end: Position::new(7, 20),
+            },
+            selection_range: Range {
+                start: Position::new(7, 4),
+                end: Position::new(7, 11),
+            },
+            data: Some(serde_json::json!({"mock": "add_one"})),
+        }
+    }
+
+    /// Full typed surface against an advertising server: definition (plain
+    /// and linked), references with/without declaration, workspace symbols,
+    /// call hierarchy, and a measured cache hit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn semantic_surface_is_typed_and_revision_cached() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("plain", 101).await;
+        let caps = client.capabilities();
+        assert!(caps.definition);
+        assert!(caps.references);
+        assert!(caps.workspace_symbol);
+        assert!(caps.call_hierarchy);
+        assert!(caps.document_symbol);
+        assert_eq!(caps.server_name.as_deref(), Some("mock-lsp"));
+        assert_eq!(caps.server_version.as_deref(), Some("1"));
+
+        let uri = format!("{root_uri}/src/lib.rs");
+        let text = "pub fn add_one(v: i64) -> i64 { v + 1 }\n\
+                    pub fn compute(v: i64) -> i64 { add_one(v) }\n";
+        client.did_open(&uri, text).unwrap();
+        assert!(client.document_revision(&uri).is_some());
+        let revision = client.document_revision(&uri).unwrap();
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            revision.content_hash,
+            DocumentRevision::of(1, text).content_hash
+        );
+
+        let position = Position::new(1, 32);
+        let started = std::time::Instant::now();
+        let definition = client.definition(&uri, position).await.unwrap();
+        let cold = started.elapsed();
+        assert_eq!(definition.items.len(), 1);
+        assert_eq!(definition.items[0].uri, format!("{root_uri}/target.rs"));
+        assert_eq!(definition.items[0].range.start.line, 7);
+        assert_eq!(
+            definition.items[0].selection_range,
+            definition.items[0].range
+        );
+        assert!(!definition.truncated);
+
+        let started = std::time::Instant::now();
+        let cached = client.definition(&uri, position).await.unwrap();
+        let warm = started.elapsed();
+        assert_eq!(cached, definition);
+        let stats = client.semantic_cache_stats();
+        assert!(stats.hits >= 1, "cache hit must be measured: {stats:?}");
+        assert!(stats.misses >= 1, "{stats:?}");
+        eprintln!("definition cold={cold:?} warm(cache)={warm:?}");
+        assert!(
+            warm < Duration::from_millis(100),
+            "a warm cache hit must not wait on the server: {warm:?}"
+        );
+
+        // Re-opening the unchanged document is a no-op: no duplicate
+        // didOpen and the revision-keyed cache survives.
+        let hits_before = client.semantic_cache_stats().hits;
+        client.did_open(&uri, text).unwrap();
+        let again = client.definition(&uri, position).await.unwrap();
+        assert_eq!(again, definition);
+        assert!(
+            client.semantic_cache_stats().hits > hits_before,
+            "an unchanged didOpen must not clear the semantic cache"
+        );
+
+        let refs = client.references(&uri, position, true).await.unwrap();
+        assert_eq!(refs.items.len(), 2);
+        let refs_no_decl = client.references(&uri, position, false).await.unwrap();
+        assert_eq!(refs_no_decl.items.len(), 1);
+        assert_ne!(
+            refs.items, refs_no_decl.items,
+            "includeDeclaration must be part of the request and the cache key"
+        );
+
+        let symbols = client.workspace_symbols("Counter").await.unwrap();
+        assert_eq!(symbols.items.len(), 1);
+        assert_eq!(symbols.items[0].name, "Counter");
+        assert_eq!(symbols.items[0].kind, SymbolKind::Struct);
+        assert_eq!(symbols.items[0].container_name.as_deref(), Some("crate"));
+        assert_eq!(
+            symbols.items[0].location.uri,
+            format!("{root_uri}/target.rs")
+        );
+        assert!(symbols.items[0].location.range.is_some());
+
+        let prepared = client.prepare_call_hierarchy(&uri, position).await.unwrap();
+        assert_eq!(prepared.items.len(), 1);
+        let item = &prepared.items[0];
+        assert_eq!(item.name, "add_one");
+        assert_eq!(item.kind, SymbolKind::Function);
+        assert_eq!(item.data.as_ref().unwrap()["mock"], "add_one");
+
+        let incoming = client.incoming_calls(item).await.unwrap();
+        assert_eq!(incoming.items.len(), 1);
+        assert_eq!(incoming.items[0].from.name, "compute");
+        assert_eq!(incoming.items[0].from_ranges.len(), 1);
+
+        let outgoing = client.outgoing_calls(item).await.unwrap();
+        assert_eq!(outgoing.items.len(), 1);
+        assert_eq!(outgoing.items[0].to.name, "add_one");
+
+        // The item round-trips through the wire unchanged (data preserved).
+        let wire = item.to_wire();
+        assert_eq!(wire["data"]["mock"], "add_one");
+        assert_eq!(wire["selectionRange"]["start"]["line"], 7);
+
+        mgr.shutdown(WorkspaceId::new(101)).await.unwrap();
+    }
+
+    /// A server that advertises nothing gets typed `Unsupported` for every
+    /// semantic method, and no semantic request is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absent_capabilities_are_typed_unsupported_and_never_sent() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("no-capabilities", 102).await;
+        let caps = client.capabilities();
+        assert!(!caps.definition);
+        assert!(!caps.references);
+        assert!(!caps.workspace_symbol);
+        assert!(!caps.call_hierarchy);
+        assert!(!caps.document_symbol);
+
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let position = Position::new(0, 3);
+
+        let definition = client.definition(&uri, position).await.unwrap_err();
+        assert_eq!(
+            definition,
+            SemanticError::Unsupported {
+                method: METHOD_DEFINITION.into()
+            }
+        );
+        assert!(definition.is_unsupported() && !definition.is_retryable());
+        let references = client.references(&uri, position, true).await.unwrap_err();
+        assert_eq!(
+            references,
+            SemanticError::Unsupported {
+                method: METHOD_REFERENCES.into()
+            }
+        );
+        let symbols = client.workspace_symbols("x").await.unwrap_err();
+        assert_eq!(
+            symbols,
+            SemanticError::Unsupported {
+                method: METHOD_WORKSPACE_SYMBOL.into()
+            }
+        );
+        let prepared = client
+            .prepare_call_hierarchy(&uri, position)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            prepared,
+            SemanticError::Unsupported {
+                method: METHOD_PREPARE_CALL_HIERARCHY.into()
+            }
+        );
+        let item = sample_item(&uri);
+        assert_eq!(
+            client.incoming_calls(&item).await.unwrap_err(),
+            SemanticError::Unsupported {
+                method: METHOD_INCOMING_CALLS.into()
+            }
+        );
+        assert_eq!(
+            client.outgoing_calls(&item).await.unwrap_err(),
+            SemanticError::Unsupported {
+                method: METHOD_OUTGOING_CALLS.into()
+            }
+        );
+        let raw = client.document_symbols(&uri).await.unwrap_err();
+        assert!(is_unsupported_error(&raw), "{raw:?}");
+
+        mgr.shutdown(WorkspaceId::new(102)).await.unwrap();
+        let tail = client.stderr_tail();
+        for marker in [
+            "GOT definition",
+            "GOT references",
+            "GOT workspaceSymbol",
+            "GOT prepareCallHierarchy",
+            "GOT incomingCalls",
+            "GOT outgoingCalls",
+        ] {
+            assert!(
+                !tail.contains(marker),
+                "unsupported methods must never reach the server ({marker}): {tail}"
+            );
+        }
+    }
+
+    /// Partial advertisements gate independently: definition/references work
+    /// while call hierarchy stays typed-unsupported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_capabilities_gate_each_method() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) =
+            start_mock("partial-capabilities", 103).await;
+        let caps = client.capabilities();
+        assert!(caps.definition);
+        assert!(!caps.call_hierarchy);
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let position = Position::new(0, 3);
+        assert_eq!(client.definition(&uri, position).await.unwrap().len(), 1);
+        let error = client
+            .prepare_call_hierarchy(&uri, position)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SemanticError::Unsupported {
+                method: METHOD_PREPARE_CALL_HIERARCHY.into()
+            }
+        );
+        mgr.shutdown(WorkspaceId::new(103)).await.unwrap();
+    }
+
+    /// Oversized arrays are capped and flagged without unbounded conversion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_semantic_results_are_bounded_and_flagged() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("bounded", 104).await;
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let position = Position::new(0, 3);
+
+        let started = std::time::Instant::now();
+        let definition = client.definition(&uri, position).await.unwrap();
+        let definition_elapsed = started.elapsed();
+        assert_eq!(definition.items.len(), MAX_LOCATIONS);
+        assert!(definition.truncated);
+        assert_eq!(definition.items[MAX_LOCATIONS - 1].range.start.line, 4095);
+
+        let references = client.references(&uri, position, true).await.unwrap();
+        assert_eq!(references.items.len(), MAX_LOCATIONS);
+        assert!(references.truncated);
+
+        let symbols = client.workspace_symbols("symbol").await.unwrap();
+        assert_eq!(symbols.items.len(), MAX_WORKSPACE_SYMBOLS);
+        assert!(symbols.truncated);
+
+        let prepared = client.prepare_call_hierarchy(&uri, position).await.unwrap();
+        assert_eq!(prepared.items.len(), MAX_CALL_HIERARCHY_ITEMS);
+        assert!(prepared.truncated);
+        let item = prepared.items[0].clone();
+        let incoming = client.incoming_calls(&item).await.unwrap();
+        assert_eq!(incoming.items.len(), MAX_CALL_HIERARCHY_ITEMS);
+        assert!(incoming.truncated);
+        let outgoing = client.outgoing_calls(&item).await.unwrap();
+        assert_eq!(outgoing.items.len(), MAX_CALL_HIERARCHY_ITEMS);
+        assert!(outgoing.truncated);
+        eprintln!("bounded 5000-location definition converted in {definition_elapsed:?}");
+        assert!(
+            definition_elapsed < Duration::from_secs(5),
+            "bounded conversion must stay linear and fast: {definition_elapsed:?}"
+        );
+
+        mgr.shutdown(WorkspaceId::new(104)).await.unwrap();
+    }
+
+    /// Hostile payload shapes are typed `Malformed`, never a panic or a
+    /// fabricated empty result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hostile_semantic_payloads_are_malformed() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("hostile", 105).await;
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let position = Position::new(0, 3);
+        assert!(matches!(
+            client.definition(&uri, position).await,
+            Err(SemanticError::Malformed { .. })
+        ));
+        assert!(matches!(
+            client.workspace_symbols("x").await,
+            Err(SemanticError::Malformed { .. })
+        ));
+        assert!(matches!(
+            client.prepare_call_hierarchy(&uri, position).await,
+            Err(SemanticError::Malformed { .. })
+        ));
+        mgr.shutdown(WorkspaceId::new(105)).await.unwrap();
+    }
+
+    /// Cancellation is typed, prompt, and sends `$/cancelRequest`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn semantic_request_cancellation_is_typed_and_propagated() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("slow", 106).await;
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let token = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let request = client.definition_with(
+            &uri,
+            Position::new(0, 3),
+            SemanticOptions::new()
+                .with_timeout(Duration::from_secs(10))
+                .with_cancellation(&token),
+        );
+        tokio::pin!(request);
+        let outcome = tokio::select! {
+            result = &mut request => result,
+            _ = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            } => {
+                tokio::time::timeout(Duration::from_secs(2), &mut request)
+                    .await
+                    .expect("cancellation must be prompt")
+            }
+        };
+        assert_eq!(
+            outcome.unwrap_err(),
+            SemanticError::Cancelled {
+                method: METHOD_DEFINITION.into()
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let tail = wait_for_stderr(&client, "GOT cancel").await;
+        assert!(
+            tail.contains("GOT cancel"),
+            "cancellation must send $/cancelRequest: {tail}"
+        );
+        mgr.shutdown(WorkspaceId::new(106)).await.unwrap();
+    }
+
+    /// The request deadline maps to a typed `Timeout` (never a hang).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn semantic_request_timeout_is_typed() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("slow", 107).await;
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open(&uri, "fn a() {}\n").unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .definition_with(
+                &uri,
+                Position::new(0, 3),
+                SemanticOptions::new().with_timeout(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SemanticError::Timeout {
+                method: METHOD_DEFINITION.into(),
+                timeout_ms: 200,
+            }
+        );
+        assert!(error.is_retryable());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        mgr.shutdown(WorkspaceId::new(107)).await.unwrap();
+    }
+
+    /// A revision change invalidates cached definition results: the same
+    /// position is re-requested after `didChange`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision_change_invalidates_the_semantic_cache() {
+        let (_root_dir, _cas_dir, mgr, client, root_uri) = start_mock("plain", 108).await;
+        let uri = format!("{root_uri}/src/lib.rs");
+        client.did_open_version(&uri, "fn a() {}\n", 1).unwrap();
+        let position = Position::new(0, 3);
+        client.definition(&uri, position).await.unwrap();
+        client.definition(&uri, position).await.unwrap();
+        let tail = wait_for_stderr(&client, "GOT definition").await;
+        assert_eq!(
+            count_occurrences(&tail, "GOT definition"),
+            1,
+            "the second identical request must be a cache hit: {tail}"
+        );
+        assert!(client.semantic_cache_stats().hits >= 1);
+
+        client
+            .did_change(&uri, "fn a() { let x = 1; }\n", 2)
+            .unwrap();
+        assert_eq!(client.document_revision(&uri).unwrap().version, 2);
+        client.definition(&uri, position).await.unwrap();
+        let tail = wait_for_stderr(&client, "GOT didChange").await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut tail = tail;
+        while count_occurrences(&tail, "GOT definition") < 2 && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tail = client.stderr_tail();
+        }
+        assert_eq!(
+            count_occurrences(&tail, "GOT definition"),
+            2,
+            "a revision change must invalidate the cache and re-request: {tail}"
+        );
+
+        client.did_close(&uri).unwrap();
+        assert!(client.document_revision(&uri).is_none());
+        client.definition(&uri, position).await.unwrap();
+        mgr.shutdown(WorkspaceId::new(108)).await.unwrap();
     }
 
     /// Poll the client's stderr ring until `needle` appears (markers are
@@ -1154,6 +1820,16 @@ log("mock exiting")
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[test]
+    fn document_end_counts_lines_and_utf16_units() {
+        assert_eq!(document_end(""), Position::new(0, 0));
+        assert_eq!(document_end("abc"), Position::new(0, 3));
+        assert_eq!(document_end("a\nbc"), Position::new(1, 2));
+        assert_eq!(document_end("a\n"), Position::new(1, 0));
+        // UTF-16 units, not UTF-8 bytes: é = 1, emoji = 2.
+        assert_eq!(document_end("é😀"), Position::new(0, 3));
     }
 
     #[test]
@@ -1266,10 +1942,6 @@ log("mock exiting")
     /// REAL workspace id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initialize_carries_real_root_and_owner() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1332,10 +2004,6 @@ log("mock exiting")
     /// for a response that is not coming by design).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn did_open_notification_never_waits_for_a_response() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1368,10 +2036,6 @@ log("mock exiting")
     /// registered it and only surfaced the failure as a deadline timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_stdin_request_fails_typed_and_registers_no_pending() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1429,10 +2093,6 @@ log("mock exiting")
     /// not-delivered Timeout — the server may still execute it on resume.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stops_draining_server_is_delivery_unknown_not_a_deadlock() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1771,10 +2431,6 @@ log("mock exiting")
     /// kill is never the first move.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_request_then_exit_notification_within_grace() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1822,10 +2478,6 @@ log("mock exiting")
     /// child process; every caller adopts the winner's handle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_starts_single_flight_to_one_child() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1872,10 +2524,6 @@ log("mock exiting")
     /// left, and the manager stays usable for a later start.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_start_failure_leaves_no_orphan_and_rolls_back() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
@@ -1883,8 +2531,12 @@ log("mock exiting")
         let ws = WorkspaceId::new(32);
         let cfg = LspConfig {
             name: "dies".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), "import sys; sys.exit(0)".into()],
+            command: mock_server_script().to_string_lossy().into_owned(),
+            args: vec![
+                "close".into(),
+                dir.path().to_str().unwrap().into(),
+                "file:///dead".into(),
+            ],
             root: dir.path().to_path_buf(),
         };
         let mut tasks = Vec::new();
@@ -1919,10 +2571,6 @@ log("mock exiting")
     /// dedicated threads within the bound; the supervisor registry drains.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_joins_threads_and_leaves_no_child() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1949,10 +2597,6 @@ log("mock exiting")
     /// answers requests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stderr_flood_is_drained_bounded_and_never_blocks() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();
         let expected_uri = file_uri(&root);
@@ -1997,10 +2641,6 @@ log("mock exiting")
     /// before the sweep is NOT unloaded (touch-on-use proven).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_unload_ignores_recently_used_old_servers() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let idle_ms = 250i64;
         let root_dir = tempdir().unwrap();
         let root = root_dir.path().to_path_buf();

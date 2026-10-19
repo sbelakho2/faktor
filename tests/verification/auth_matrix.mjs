@@ -4,58 +4,48 @@
 // 401 plus one hostile case). This probe additionally exercises:
 //   * a wrong-but-well-formed daemon password on every route;
 //   * typed-refusal shape (JSON error code, bounded, no password echo);
+//   * the SHARED ordering rule (`checks/auth-order.mjs`): an invalid/foreign
+//     principal is refused before any `*_disabled`/plan/tenant state, both on
+//     enabled and disabled subsystems (missing AND bogus control tokens);
 //   * spoofed x-faktor-org / x-faktor-session / x-faktor-workspace headers;
 //   * query-param scope overrides on PATH-scoped routes (id confusion);
 //   * path aliases (dot segments, encoded slash, trailing slash, case);
 //   * cross-tenant control-plane refusals, revoked tokens and principal
 //     spoofing with a real cloud control plane and two bootstrapped orgs.
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { discoverNativeRoutes, serverRouteFiles } from '../../scripts/discover-capabilities.mjs';
+import {
+  discoverNativeRoutes,
+  normalizeCapabilityId,
+  serverRouteFiles,
+} from '../../scripts/discover-capabilities.mjs';
+import {
+  assertAuthOrder,
+  assertForeignOrgOrder,
+  BOOTSTRAP_ROUTES,
+  credentialProbeBody,
+  errorCode,
+  PUBLIC_ROUTES,
+  requiresControlToken,
+  typedRefusal,
+  WORKER_CREDENTIAL_ROUTES,
+} from '../programme/checks/auth-order.mjs';
 import { cliBinary, request, startDaemon } from '../programme/probes/routes.mjs';
 import { sqliteExec } from './sqlite_exec.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const OUT = resolve(ROOT, 'target/certification/verification/auth-matrix.json');
-const DISABLED_CODES = new Set([
-  'cloud_disabled',
-  'scm_disabled',
-  'scm_webhook_disabled',
-  'billing_disabled',
-  'updater_disabled',
-  'workers_disabled',
-  'enterprise_disabled',
-  'sso_disabled',
-  'foundation_disabled',
-  'retention_runtime_disabled',
-]);
+const AUTHORITY_PATH = resolve(ROOT, 'tests/programme/route-authority.json');
 const LISTING_PATHS = new Set(['/native/sessions', '/native/sessions/parallel']);
-// Routes whose credential is NOT the daemon password: the SCM HMAC inbox and
-// the worker registration-token surface. A typed 400/401/403/409 there is a
-// credential refusal, never an unauthenticated product read.
-const CREDENTIAL_ROUTES = new Set([
-  '/native/scm/webhook',
-  '/native/workers/register',
-  '/native/workers/{id}/heartbeat',
-  '/native/jobs/claim',
-  '/native/jobs/{id}/result',
-]);
 
-function errorCode(result) {
-  return result.json?.error?.code ?? result.json?.code ?? null;
-}
-
-function typedRefusal(result) {
-  return (
-    result.status !== null &&
-    result.status >= 400 &&
-    result.status < 500 &&
-    errorCode(result) !== null &&
-    Buffer.byteLength(result.text) <= 4096
+function routePrincipals() {
+  const document = JSON.parse(readFileSync(AUTHORITY_PATH, 'utf8'));
+  return new Map(
+    document.entries.map((entry) => [normalizeCapabilityId(entry.id), entry.principal]),
   );
 }
 
@@ -73,7 +63,7 @@ async function bootstrap(base, password, name, email, key) {
   const result = await request(base, password, 'post', '/native/orgs',
     { name, owner_email: email, display_name: name }, 3000, { 'idempotency-key': key });
   if (result.status !== 200) throw new Error(`bootstrap ${name}: ${result.status} ${result.text.slice(0, 200)}`);
-  return result.json;
+  return { ...result.json, owner_email: email };
 }
 
 export async function probeAuthMatrix({ report = false } = {}) {
@@ -143,31 +133,74 @@ export async function probeAuthMatrix({ report = false } = {}) {
     }
 
     const routes = discoverNativeRoutes(ROOT, serverRouteFiles(ROOT));
+    const principals = routePrincipals();
     let unauthRefusals = 0;
     let wrongPasswordRefusals = 0;
+    let disabledSubsystemOrderCells = 0;
+    let invalidControlRefusals = 0;
     for (const route of routes) {
       const method = route.method.toUpperCase();
       const path = resolvePath(route.path, a);
-      const body = method === 'GET' || method === 'DELETE' ? undefined : {};
+      const principal = principals.get(normalizeCapabilityId(route.id)) ?? null;
+      const workerCredential = WORKER_CREDENTIAL_ROUTES.has(route.path);
+      const publicRoute = PUBLIC_ROUTES.has(route.path);
+      const bootstrap = BOOTSTRAP_ROUTES.has(route.path) && method === 'POST';
+      // A valid-shaped body carrying an UNBOUND worker credential, so the
+      // cell measures credential ordering, not strict-DTO parsing.
+      const body = workerCredential
+        ? credentialProbeBody(route.path)
+        : bootstrap
+          ? { name: 'Matrix Bootstrap', owner_email: 'owner@matrix.test', display_name: 'Matrix' }
+          : method === 'GET' || method === 'DELETE'
+            ? undefined
+            : {};
+
       const unauth = await request(base, null, method, path, body, 1500);
-      const unauthAllowed =
-        (unauth.status === 401 && typedRefusal(unauth)) ||
-        (unauth.status === 409 && DISABLED_CODES.has(errorCode(unauth))) ||
-        (CREDENTIAL_ROUTES.has(route.path) && typedRefusal(unauth));
+      const unauthOrder = assertAuthOrder(unauth);
+      const unauthAllowed = publicRoute
+        ? unauth.status >= 400 && unauth.status < 500 && errorCode(unauth) !== null
+        : unauthOrder.ok;
       if (unauthAllowed) unauthRefusals += 1;
-      else add(`unauth:${method} ${route.path}`, false, unauth.status);
-      if (!unauth.text.includes(password)) {
-        // no password echo in any refusal body
-      } else {
+      else add(`unauth:${method} ${route.path}`, false, unauthOrder.observed);
+      if (unauth.text.includes(password)) {
         add(`unauth-echo:${method} ${route.path}`, false, 'password echoed');
       }
       const wrongResult = await request(base, wrong, method, path, body, 1500);
-      const wrongAllowed =
-        (wrongResult.status === 401 && typedRefusal(wrongResult)) ||
-        (wrongResult.status === 409 && DISABLED_CODES.has(errorCode(wrongResult))) ||
-        (CREDENTIAL_ROUTES.has(route.path) && typedRefusal(wrongResult));
+      const wrongOrder = assertAuthOrder(wrongResult);
+      const wrongAllowed = publicRoute
+        ? wrongResult.status >= 400 && wrongResult.status < 500 && errorCode(wrongResult) !== null
+        : wrongOrder.ok;
       if (wrongAllowed) wrongPasswordRefusals += 1;
-      else add(`wrong-password:${method} ${route.path}`, false, wrongResult.status);
+      else add(`wrong-password:${method} ${route.path}`, false, wrongOrder.observed);
+
+      // Disabled subsystems: the SAME route with a valid daemon password and
+      // a MISSING or BOGUS control credential must answer the auth refusal,
+      // never `*_disabled`. This is the ordering cell the old matrix lacked.
+      if (requiresControlToken(principal) || bootstrap) {
+        disabledSubsystemOrderCells += 1;
+        for (const control of [null, 'bogus-control-token']) {
+          const headers = {
+            authorization: `Bearer ${password}`,
+            ...(control === null ? {} : { 'x-faktor-control-token': control }),
+            ...(bootstrap ? { 'idempotency-key': 'matrix-bootstrap-order' } : {}),
+          };
+          const result = await request(base, null, method, path, body, 1500, headers);
+          if (bootstrap && control === null) {
+            // The explicit daemon bootstrap is the ONE documented exception:
+            // with NO token presented it may bootstrap (200 on a wired cloud)
+            // or answer the typed `cloud_disabled` configuration refusal.
+            const ok =
+              result.status === 200 ||
+              (result.status === 409 && errorCode(result) === 'cloud_disabled');
+            if (ok) invalidControlRefusals += 1;
+            else add(`bootstrap-order:${method} ${route.path}`, false, { status: result.status, code: errorCode(result) });
+          } else {
+            const order = assertAuthOrder(result);
+            if (order.ok) invalidControlRefusals += 1;
+            else add(`control-order:${method} ${route.path}:${control ?? 'missing'}`, false, order.observed);
+          }
+        }
+      }
 
       if (method === 'GET' && route.path.includes('{')) {
         // A path names session A; out-of-band spoofed headers/query naming B
@@ -192,6 +225,9 @@ export async function probeAuthMatrix({ report = false } = {}) {
     add('route-count', routes.length >= 240, routes.length);
     add('unauthenticated-refusals', unauthRefusals === routes.length, unauthRefusals);
     add('wrong-password-refusals', wrongPasswordRefusals === routes.length, wrongPasswordRefusals);
+    add('disabled-subsystem-order-cells', disabledSubsystemOrderCells >= 38, disabledSubsystemOrderCells);
+    add('invalid-control-refusals', invalidControlRefusals === disabledSubsystemOrderCells * 2,
+      invalidControlRefusals);
 
     // --- control-plane tenant / principal / revocation matrix -------------
     const hdr = hdrFor;
@@ -201,13 +237,33 @@ export async function probeAuthMatrix({ report = false } = {}) {
       identityB.status === 200 && identityB.json?.identity?.organization === orgB.organization.id,
       identityB.status);
 
-    for (const path of [
+    const missingOrg = `org_${'0'.repeat(32)}`;
+    for (const template of [
       `/native/orgs/${orgA.organization.id}/members?limit=10`,
       `/native/usage?org=${orgA.organization.id}`,
       `/native/outcomes?org=${orgA.organization.id}`,
     ]) {
-      const result = await request(base, null, 'GET', path, undefined, 2000, hdr(orgB.token));
-      add(`foreign-org:${path}`, result.status === 404 && !result.text.includes(orgA.organization.id), result.status);
+      const result = await request(base, null, 'GET', template, undefined, 2000, hdr(orgB.token));
+      const missing = await request(base, null, 'GET',
+        template.replaceAll(orgA.organization.id, missingOrg), undefined, 2000, hdr(orgB.token));
+      const order = assertForeignOrgOrder(result, missing, [orgA.organization.id, orgA.owner_email]);
+      add(`foreign-org:${template.split('?')[0]}`, order.ok, order.observed);
+    }
+    // Body-named organization (SSO) is bound to the principal: foreign and
+    // missing organizations are the same typed 404 even though SSO is off.
+    for (const [route, makeBody] of [
+      ['/native/sso/start', (org) => ({ organization: org, redirect_uri: 'http://127.0.0.1/callback' })],
+      ['/native/sso/callback', (org) => ({
+        organization: org,
+        redirect_uri: 'http://127.0.0.1/callback',
+        code: 'c',
+        state: 's',
+      })],
+    ]) {
+      const foreign = await request(base, null, 'POST', route, makeBody(orgA.organization.id), 2000, hdr(orgB.token));
+      const missing = await request(base, null, 'POST', route, makeBody(missingOrg), 2000, hdr(orgB.token));
+      const order = assertForeignOrgOrder(foreign, missing, [orgA.organization.id, orgA.owner_email]);
+      add(`foreign-org:${route}`, order.ok, order.observed);
     }
 
     const membersA = await request(base, null, 'GET',
@@ -253,6 +309,8 @@ export async function probeAuthMatrix({ report = false } = {}) {
       routes: routes.length,
       unauth_refusals: unauthRefusals,
       wrong_password_refusals: wrongPasswordRefusals,
+      disabled_subsystem_order_cells: disabledSubsystemOrderCells,
+      invalid_control_refusals: invalidControlRefusals,
       failed: failures.length,
       expiry_driver,
       cases,

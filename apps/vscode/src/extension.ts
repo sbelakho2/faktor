@@ -3948,9 +3948,26 @@ function edition8Deps(context: vscode.ExtensionContext): Edition8PanelDeps {
           });
           return `Captured ${diagnostics.length} host diagnostics for the active file.`;
         }
-        case 'X-11':
-          await vscode.commands.executeCommand('editor.action.quickFix');
-          return 'The native code-action list is open; no action is selected automatically.';
+        case 'X-11': {
+          const editor = vscode.window.activeTextEditor;
+          if (editor === undefined) return 'No active editor exists; no code action was offered.';
+          const action = await vscode.window.showQuickPick(
+            ['Explain selection', 'Fix selection', 'Test selection', 'Add selection to context'],
+            { placeHolder: 'Inline code action (never edits silently)' },
+          );
+          if (action === undefined) return 'No inline code action was selected.';
+          const selection = editor.selection;
+          addContextDraft({
+            kind: 'selection',
+            uri: editor.document.uri.toString(),
+            range: `${selection.start.line}:${selection.start.character}-${selection.end.line}:${selection.end.character}`,
+            version: String(editor.document.version),
+            reason: `Inline code action: ${action}`,
+            text: editor.document.getText(selection).slice(0, 32 * 1024),
+          });
+          if (action !== 'Add selection to context') await vscode.commands.executeCommand('faktor.openChat');
+          return `Captured ${editor.document.uri.fsPath}:${selection.start.line + 1}-${selection.end.line + 1} at version ${editor.document.version} for “${action}”; the draft opens without editing the file.`;
+        }
         case 'S-05':
           await vscode.commands.executeCommand('workbench.action.showCommands');
           return 'The native command palette is open.';

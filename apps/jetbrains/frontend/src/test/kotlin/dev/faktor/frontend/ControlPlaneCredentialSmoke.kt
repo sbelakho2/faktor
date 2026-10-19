@@ -333,21 +333,23 @@ object ControlPlaneCredentialSmoke {
                 try {
                     service.start()
                     assertTrue(service.isRunning(), "the real daemon must be adopted")
-                    // The live client reaches the REAL route: the daemon
-                    // parses the strict body and answers the typed refusal
-                    // (no [cloud] section => 409 cloud_disabled); a malformed
-                    // body would be a 400 and an unreachable route a
-                    // transport error, so both fail this assertion.
+                    // The live client reaches the REAL route. With no
+                    // control plane wired the presented token cannot be
+                    // verified, so the SHARED auth-ordering rule makes it a
+                    // 401 invalid-principal refusal BEFORE any feature state
+                    // (a 409 `cloud_disabled` here would be an auth oracle).
+                    // A malformed body would be 400 and an unreachable route
+                    // a transport error, so both still fail this assertion.
                     try {
                         service.revokeControlPlaneSession(scope.organization, "ses-smoke")
-                        fail("a cloud-disabled daemon must refuse the revoke")
+                        fail("an unverifiable control-plane token must be refused")
                     } catch (e: NativeApiException) {
                         assertEquals(
-                            409,
+                            401,
                             e.status,
-                            "strict body parsed, typed refusal expected: ${e.message}"
+                            "invalid principal must lose before feature state: ${e.message}"
                         )
-                        assertEquals("cloud_disabled", e.code)
+                        assertEquals("unauthorized", e.code)
                     }
                     // The panel gesture still removes the local credential
                     // and clears the live client token.

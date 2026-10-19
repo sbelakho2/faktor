@@ -121,6 +121,21 @@ fn plane(state: &AppState) -> Result<&std::sync::Arc<faktor_worker::WorkerPlane>
     state.deps.workers.as_ref().ok_or_else(workers_disabled)
 }
 
+/// Credential-first gate for the worker-token routes. A token that cannot be
+/// verified (including because the plane is disabled) is the SAME typed
+/// credential refusal `unknown_worker_token` (401) an unknown token answers
+/// on an enabled plane — `workers_disabled` is never an unauthenticated
+/// feature-state oracle.
+fn credential_plane(
+    state: &AppState,
+) -> Result<&std::sync::Arc<faktor_worker::WorkerPlane>, ApiError> {
+    state
+        .deps
+        .workers
+        .as_ref()
+        .ok_or_else(|| worker_err(WorkerError::UnknownToken))
+}
+
 fn parse_worker_id(id: &str) -> Result<WorkerId, ApiError> {
     WorkerId::try_new(id.to_string()).map_err(worker_err)
 }
@@ -241,7 +256,7 @@ pub(crate) async fn native_worker_register(
             ));
         }
     };
-    let plane = match plane(&state) {
+    let plane = match credential_plane(&state) {
         Ok(plane) => plane,
         Err(e) => return wire_status(e),
     };
@@ -286,23 +301,29 @@ pub(crate) async fn native_worker_heartbeat(
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid heartbeat body (strict DTO)")),
     };
-    let plane = match plane(&state) {
+    let token = match worker_token(&body.token) {
+        Ok(token) => token,
+        Err(e) => return wire_status(e),
+    };
+    let plane = match credential_plane(&state) {
         Ok(plane) => plane,
         Err(e) => return wire_status(e),
     };
+    // The token authenticates the caller BEFORE the path id is resolved:
+    // an invalid/foreign credential never learns whether a worker id exists.
+    let token_worker = match plane.worker_for_token(&token) {
+        Ok(worker) => worker,
+        Err(e) => return wire_status(worker_err(e)),
+    };
     let worker_id = match parse_worker_id(&id) {
         Ok(id) => id,
-        Err(e) => return wire_status(e),
-    };
-    let token = match worker_token(&body.token) {
-        Ok(token) => token,
         Err(e) => return wire_status(e),
     };
     let lease_id = match WorkerLeaseId::try_new(body.lease_id.clone()) {
         Ok(id) => id,
         Err(e) => return wire_status(worker_err(e)),
     };
-    let organization = match plane.worker_organization(&worker_id) {
+    let organization = match plane.worker_organization(&token_worker) {
         Ok(org) => org,
         Err(e) => return wire_status(worker_err(e)),
     };
@@ -344,7 +365,11 @@ pub(crate) async fn native_job_claim(
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid claim body (strict DTO)")),
     };
-    let plane = match plane(&state) {
+    let token = match worker_token(&body.token) {
+        Ok(token) => token,
+        Err(e) => return wire_status(e),
+    };
+    let plane = match credential_plane(&state) {
         Ok(plane) => plane,
         Err(e) => return wire_status(e),
     };
@@ -355,10 +380,6 @@ pub(crate) async fn native_job_claim(
             )));
         }
     }
-    let token = match worker_token(&body.token) {
-        Ok(token) => token,
-        Err(e) => return wire_status(e),
-    };
     let worker_id = match plane.worker_for_token(&token) {
         Ok(worker_id) => worker_id,
         Err(e) => return wire_status(worker_err(e)),
@@ -400,16 +421,8 @@ pub(crate) async fn native_workers_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    // The plane's own gate is answered FIRST: with both [cloud] and
-    // [workers] disabled every worker route must say `workers_disabled`,
-    // not `cloud_disabled` from principal resolution.
-    if let Err(e) = plane(&state) {
-        return wire_status(e);
-    }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
+    // ORDERING: the control-plane principal and its role decide first; the
+    // `[workers]` feature state is disclosed only to an authorized caller.
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -417,12 +430,16 @@ pub(crate) async fn native_workers_list(
     if let Err(e) = authorize_worker(&principal, Action::WorkerRead) {
         return wire_status(e);
     }
-    let limit = match page_limit(query.limit) {
-        Ok(limit) => limit,
-        Err(e) => return wire_status(e),
-    };
     let plane = match plane(&state) {
         Ok(plane) => plane,
+        Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
+    let limit = match page_limit(query.limit) {
+        Ok(limit) => limit,
         Err(e) => return wire_status(e),
     };
     match plane.list_workers(&principal.organization, query.cursor.as_deref(), limit) {
@@ -446,16 +463,7 @@ pub(crate) async fn native_worker_token_mint(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    // The plane's own gate is answered FIRST: with both [cloud] and
-    // [workers] disabled every worker route must say `workers_disabled`,
-    // not `cloud_disabled` from principal resolution.
-    if let Err(e) = plane(&state) {
-        return wire_status(e);
-    }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid token mint body (strict DTO)")),
-    };
+    // ORDERING: principal and role first, then the `[workers]` feature state.
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -466,6 +474,10 @@ pub(crate) async fn native_worker_token_mint(
     let plane = match plane(&state) {
         Ok(plane) => plane,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid token mint body (strict DTO)")),
     };
     let label = body.label.unwrap_or_else(|| "worker".to_string());
     let trust_domain = body
@@ -496,12 +508,7 @@ pub(crate) async fn native_worker_revoke(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    // The plane's own gate is answered FIRST: with both [cloud] and
-    // [workers] disabled every worker route must say `workers_disabled`,
-    // not `cloud_disabled` from principal resolution.
-    if let Err(e) = plane(&state) {
-        return wire_status(e);
-    }
+    // ORDERING: principal and role first, then the `[workers]` feature state.
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -541,12 +548,7 @@ pub(crate) async fn native_job_status(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    // The plane's own gate is answered FIRST: with both [cloud] and
-    // [workers] disabled every worker route must say `workers_disabled`,
-    // not `cloud_disabled` from principal resolution.
-    if let Err(e) = plane(&state) {
-        return wire_status(e);
-    }
+    // ORDERING: principal and role first, then the `[workers]` feature state.
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -590,16 +592,16 @@ pub(crate) async fn native_job_result(
             return wire_status(malformed_body("invalid job result body (strict DTO)"));
         }
     };
-    let plane = match plane(&state) {
+    let token = match worker_token(&body.token) {
+        Ok(token) => token,
+        Err(e) => return wire_status(e),
+    };
+    let plane = match credential_plane(&state) {
         Ok(plane) => plane,
         Err(e) => return wire_status(e),
     };
     let job_id = match parse_job_id(&id) {
         Ok(job_id) => job_id,
-        Err(e) => return wire_status(e),
-    };
-    let token = match worker_token(&body.token) {
-        Ok(token) => token,
         Err(e) => return wire_status(e),
     };
     let lease_id = match WorkerLeaseId::try_new(body.lease_id.clone()) {

@@ -329,17 +329,20 @@ impl SemanticCfg {
 }
 
 /// Build the daemon's ONE semantic-provider registry from the additive
-/// `[semantic]` section: fallback-only by default, with the section's
-/// response caps applied and every configured external provider built over
-/// the daemon's OWN authorities — the ONE [`ProcessSupervisor`] for process
+/// `[semantic]` section. The fallback is NEVER the empty default in the
+/// production daemon: when `sources` is supplied it is the real native
+/// composition (index, LSP, tree-sitter, git, verification) over the
+/// daemon's OWN authorities — the ONE [`ProcessSupervisor`] for process
 /// children and the checked egress [`HttpTransport`] for endpoints. A
 /// malformed section or an unbuildable provider refuses the daemon at boot
 /// (never a silent half-configured registry); a valid section with no
-/// providers stays fallback-only, so ordinary operation never requires one.
+/// providers stays fallback-only, so ordinary operation never requires an
+/// external semantic service or model inference.
 pub fn semantic_registry(
     cfg: &SemanticCfg,
     supervisor: &Arc<ProcessSupervisor>,
     transport: &Arc<dyn HttpTransport>,
+    sources: Option<&crate::daemon::SemanticSources>,
 ) -> Result<Arc<faktor_semantic::SemanticProviderRegistry>, String> {
     cfg.validate()?;
     let mut caps = faktor_semantic::SemanticResponseCaps::default();
@@ -354,10 +357,12 @@ pub fn semantic_registry(
         transport: transport.clone(),
         caps,
     };
-    let mut registry = faktor_semantic::SemanticProviderRegistry::new(
-        faktor_semantic::GenericSemanticFallback::default(),
-    )
-    .with_response_caps(caps);
+    let fallback = sources.map_or_else(
+        faktor_semantic::GenericSemanticFallback::default,
+        |sources| sources.fallback(),
+    );
+    let mut registry =
+        faktor_semantic::SemanticProviderRegistry::new(fallback).with_response_caps(caps);
     for provider in &cfg.providers {
         let built = provider
             .build(&env)

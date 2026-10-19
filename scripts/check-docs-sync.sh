@@ -375,6 +375,19 @@ header_claim_rule crates/session/src/lib.rs \
     'deliberately **synchronous**' crates/session/src/actor.rs 'pub async fn append_message' \
     'the hot append path awaits the supervised async DbActor'
 
+# ------------------------------------------------ Edition 8 evidence ledger
+# ONE machine-readable ledger owns every Rev8 control's status. This gate
+# fails when controls.json, backlog.md, registry.json, the generated host
+# registries/route map or a cited evidence line/receipt diverges from it.
+if command -v node >/dev/null 2>&1; then
+    if ! node scripts/edition8/ledger.mjs --check; then
+        echo "CONTRADICTION: Edition 8 functional-evidence ledger diverged (see above)" >&2
+        fail=1
+    fi
+else
+    echo "SKIP: node is unavailable; the Edition 8 ledger divergence check did not run" >&2
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "$DOC / ${TRUTH_DOCS[*]} are out of sync with the code — fix the items listed above before merging." >&2
     exit 1

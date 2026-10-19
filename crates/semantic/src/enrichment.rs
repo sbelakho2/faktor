@@ -294,9 +294,9 @@ fn diagnostic_code_for(error: &SemanticError) -> FindingDiagnosticCode {
     match error {
         SemanticError::SnapshotMismatch { .. } => FindingDiagnosticCode::SnapshotMismatch,
         SemanticError::Oversized { .. } => FindingDiagnosticCode::Oversized,
-        SemanticError::Cancelled { .. } | SemanticError::ProviderRequired { .. } => {
-            FindingDiagnosticCode::ProviderUnavailable
-        }
+        SemanticError::Cancelled { .. }
+        | SemanticError::ProviderRequired { .. }
+        | SemanticError::Unavailable { .. } => FindingDiagnosticCode::ProviderUnavailable,
         SemanticError::DeadlineExceeded { .. } | SemanticError::ProviderTimeout { .. } => {
             FindingDiagnosticCode::ProviderTimedOut
         }
@@ -533,6 +533,7 @@ mod tests {
                     items,
                     truncated: false,
                     degraded: false,
+                    unavailable: Vec::new(),
                 },
             );
             if self.launder_provenance {
@@ -559,6 +560,7 @@ mod tests {
             entity,
             relevance_bps,
             excerpt: excerpt.to_string(),
+            provenance: Vec::new(),
         }
     }
 

@@ -1261,6 +1261,7 @@ pub(crate) fn build_daemon_core(
     let embedder = config
         .semantic_embedder(&providers, &retry_policy)
         .map_err(|e| format!("embeddings config: {e}"))?;
+    let semantic_embedder = embedder.clone();
     let repo_evidence = Arc::new(RepoEvidence::new(session.clone(), embedder));
     // Step 11 — per-workspace repository instructions (P0-32): the
     // resolver is built over the daemon's SessionManager workspace table
@@ -1321,7 +1322,14 @@ pub(crate) fn build_daemon_core(
         // provider below. An empty provider list installs nothing (native
         // byte-identical contract compilation).
     let semantic_enrichment_configured = !semantic.providers.is_empty();
-    let semantic = graph::semantic_registry(&semantic, &supervisor, &transport)?;
+    let semantic_sources = SemanticSources {
+        index: index.clone(),
+        session: session.clone(),
+        supervisor: supervisor.clone(),
+        embedder: semantic_embedder,
+    };
+    let semantic =
+        graph::semantic_registry(&semantic, &supervisor, &transport, Some(&semantic_sources))?;
     let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
     let memory = graph::DaemonMemory::new(store.clone());
     let tokenizers = Arc::new(faktor_context::TokenizerRegistry::with_builtin_backends());

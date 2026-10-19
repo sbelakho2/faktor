@@ -283,10 +283,12 @@ impl faktor_semantic::SemanticProvider for FakeContextProvider {
                     entity,
                     relevance_bps: 9_500,
                     excerpt: "fn validate(token: &Token) -> Result<(), AuthError>".into(),
+                    provenance: Vec::new(),
                 }],
                 truncated: false,
                 total_bytes: 64,
                 degraded: false,
+                unavailable: Vec::new(),
             };
             Ok(SemanticEnvelope::new(
                 provider_id,
@@ -325,6 +327,7 @@ mod tests {
                 truncated: false,
                 items,
                 degraded,
+                unavailable: Vec::new(),
             },
             provenance: Default::default(),
         }
@@ -340,6 +343,7 @@ mod tests {
             ),
             relevance_bps: 9_000,
             excerpt: "x".repeat(SEMANTIC_QUERY_EXCERPT_MAX_BYTES * 2),
+            provenance: Vec::new(),
         };
         let rendered = render(&envelope(vec![item], false));
         assert!(rendered.contains("provider=tangerine"));

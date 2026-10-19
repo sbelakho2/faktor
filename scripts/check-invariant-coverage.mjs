@@ -385,7 +385,7 @@ export function refreshCrateSnapshot() {
       {
         schema: 'faktor-production-crates/v1',
         crates,
-        note: 'Generated from `cargo metadata --no-deps` local non-test packages; freshness is enforced by scripts/certification/check-capability-tests-compiled.py in a cargo-bearing lane, so the node-only certificate lane can validate capability completeness without cargo.',
+        note: 'Generated from `cargo metadata --no-deps` local non-test packages; freshness is enforced by target/release/faktor-ci-tools capability-tests in a cargo-bearing lane, so the node-only certificate lane can validate capability completeness without cargo.',
       },
       null,
       1,
@@ -397,7 +397,7 @@ export function refreshCrateSnapshot() {
 function load() {
   // The certificate lane is node-only (no cargo): the production crate list
   // is a checked-in snapshot mechanically verified against `cargo metadata`
-  // by check-capability-tests-compiled.py in the cargo-bearing linux lane.
+  // by faktor-ci-tools capability-tests in the cargo-bearing linux lane.
   const snapshot = JSON.parse(readFileSync(CRATE_SNAPSHOT_FILE, 'utf8'));
   if (!Array.isArray(snapshot.crates) || snapshot.crates.length === 0) {
     throw new Error('tests/production-crates.json has no crates; run --refresh-crates');

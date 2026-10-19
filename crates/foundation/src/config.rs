@@ -704,7 +704,7 @@ pub fn default_descriptors() -> BTreeMap<String, Descriptor> {
         "browser",
         ValueKind::Bool,
         Value::Bool(false),
-        ApplyTiming::RestartRequired,
+        ApplyTiming::Effective,
     ));
     add(Descriptor::new(
         "faktor.telemetry.enabled",

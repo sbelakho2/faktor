@@ -430,6 +430,23 @@ const ROUTE_CLASSES: &[(&str, &str)] = &[
     ("POST", "/native/credits/grant"),
 ];
 
+/// Route classes in ROUTE_CLASSES that require a control-plane principal in
+/// addition to the daemon password. With no control plane wired the daemon
+/// password alone is an INVALID principal: 401 before any feature state.
+fn needs_control_principal(path: &str) -> bool {
+    matches!(
+        path,
+        "/native/entitlements"
+            | "/native/identity"
+            | "/native/repositories"
+            | "/native/updater/status"
+            | "/native/updater/check"
+            | "/native/updater/stage"
+            | "/native/workers"
+            | "/native/credits/grant"
+    )
+}
+
 #[tokio::test]
 async fn every_route_class_rejects_missing_and_malformed_credentials() {
     let dir = tempfile::tempdir().unwrap();
@@ -497,24 +514,35 @@ async fn every_route_class_rejects_missing_and_malformed_credentials() {
         "the unwired webhook refusal names the configuration state"
     );
     // Worker registration is registration-token authenticated (a worker
-    // does not hold the daemon password): a malformed body is the strict
-    // DTO 400, and with a valid body an unwired plane is the typed 409
-    // `workers_disabled`. Never a 200 without a token.
+    // does not hold the daemon password): a well-formed body with an
+    // unbound token is the SAME typed credential refusal an enabled plane
+    // answers, never a `workers_disabled` feature-state oracle. Never a 200
+    // without a token.
     let response = client
         .post(format!("{base}/native/workers/register"))
-        .json(&serde_json::json!({"token": "w".repeat(64), "worker_id": "w1"}))
+        .json(&serde_json::json!({
+            "token": "w".repeat(64),
+            "worker_id": "wrk_probe",
+            "display_name": "probe",
+            "capabilities": {
+                "os": "linux", "arch": "x86_64", "toolchains": ["rust"],
+                "sandbox": [], "network": "none", "cpu_cores": 1,
+                "memory_mb": 1024, "gpu": null, "region": "probe",
+                "trust_domain": "probe", "protocol_version": 1,
+            },
+        }))
         .send()
         .await
         .unwrap();
-    assert!(
-        response.status() == 400 || response.status() == 409,
-        "worker registration without a valid token and DTO is a typed refusal, got {}",
-        response.status()
+    assert_eq!(
+        response.status(),
+        401,
+        "worker registration without a valid token must lose before the plane state"
     );
     let body: serde_json::Value = response.json().await.unwrap_or_default();
-    assert!(
-        body["error"]["code"].is_string(),
-        "worker registration refusal carries a typed code: {body}"
+    assert_eq!(
+        body["error"]["code"], "unknown_worker_token",
+        "worker registration refusal names the credential, not the feature: {body}"
     );
     // Oversized credentials are 401-or-431, never 200, and the daemon stays
     // alive afterwards.
@@ -720,6 +748,7 @@ async fn all_three_credential_forms_authenticate_every_route_class() {
     let client = reqwest::Client::new();
 
     for (method, path) in ROUTE_CLASSES {
+        let control = needs_control_principal(path);
         let send = |builder: reqwest::RequestBuilder| async {
             let body = if *method == "GET" {
                 None
@@ -743,11 +772,19 @@ async fn all_three_credential_forms_authenticate_every_route_class() {
                 .bearer_auth(password.as_str()),
         )
         .await;
-        assert_ne!(
-            response.status(),
-            401,
-            "{method} {path} must accept the password bearer"
-        );
+        if control {
+            assert_eq!(
+                response.status(),
+                401,
+                "{method} {path}: daemon password is not a control principal"
+            );
+        } else {
+            assert_ne!(
+                response.status(),
+                401,
+                "{method} {path} must accept the password bearer"
+            );
+        }
         // x-faktor-server-password.
         let response = send(
             client
@@ -758,11 +795,19 @@ async fn all_three_credential_forms_authenticate_every_route_class() {
                 .header("x-faktor-server-password", password.as_str()),
         )
         .await;
-        assert_ne!(
-            response.status(),
-            401,
-            "{method} {path} must accept the x-header password"
-        );
+        if control {
+            assert_eq!(
+                response.status(),
+                401,
+                "{method} {path}: daemon password is not a control principal"
+            );
+        } else {
+            assert_ne!(
+                response.status(),
+                401,
+                "{method} {path} must accept the x-header password"
+            );
+        }
         // Legacy per-start token.
         let response = send(
             client
@@ -773,11 +818,19 @@ async fn all_three_credential_forms_authenticate_every_route_class() {
                 .bearer_auth(token.as_str()),
         )
         .await;
-        assert_ne!(
-            response.status(),
-            401,
-            "{method} {path} must accept the legacy bearer token"
-        );
+        if control {
+            assert_eq!(
+                response.status(),
+                401,
+                "{method} {path}: daemon token is not a control principal"
+            );
+        } else {
+            assert_ne!(
+                response.status(),
+                401,
+                "{method} {path} must accept the legacy bearer token"
+            );
+        }
     }
     handle.request_shutdown();
     wait_until_server_dead(&handle).await;

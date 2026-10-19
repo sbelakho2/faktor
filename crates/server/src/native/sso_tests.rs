@@ -139,6 +139,24 @@ async fn sso_disabled_parity() {
     let h = harness(dir.path(), false, true, None).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
+    // ORDERING: missing/invalid control credentials lose BEFORE `sso_disabled`.
+    for control in [None, Some("bogus-sso-token")] {
+        let mut request = client
+            .post(format!("{base}/native/sso/start"))
+            .bearer_auth(&h.daemon_token)
+            .json(&start_body(&h.org));
+        if let Some(control) = control {
+            request = request.header("x-faktor-control-token", control);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "control={control:?} must lose before sso_disabled"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
     let resp = client
         .post(format!("{base}/native/sso/start"))
         .bearer_auth(&h.daemon_token)
@@ -387,12 +405,39 @@ async fn logout_refuses_foreign_and_mismatched_sessions() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-    // The other owner's token naming THIS organization's session: 401 (the
-    // credential does not own the named session).
+    // The other owner's token naming THIS organization's session: the named
+    // organization is FOREIGN to the principal, so it is the same typed 404
+    // a missing organization answers (no tenant/existence oracle).
     let resp = client
         .post(format!("{base}/native/sso/logout"))
         .bearer_auth(&h.daemon_token)
         .header("x-faktor-control-token", &other_token)
+        .json(&logout_body(&h.org, &h.session_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    // A token in the SAME organization that does not own the named session is
+    // a 401 (the credential is valid, but it is not this session's owner).
+    let owner = h.control_plane.authenticate(&h.owner_token).unwrap();
+    let same_org = h
+        .control_plane
+        .create_service_account(
+            &owner,
+            &faktor_cloud::OrganizationId::try_new(h.org.clone()).unwrap(),
+            "same-org-probe",
+            Role::Member,
+            vec![faktor_cloud::Action::BillingRead],
+        )
+        .unwrap()
+        .token
+        .expect("first issuance")
+        .expose()
+        .to_string();
+    let resp = client
+        .post(format!("{base}/native/sso/logout"))
+        .bearer_auth(&h.daemon_token)
+        .header("x-faktor-control-token", &same_org)
         .json(&logout_body(&h.org, &h.session_id))
         .send()
         .await
@@ -424,10 +469,10 @@ async fn logout_refuses_foreign_and_mismatched_sessions() {
     assert_eq!(resp.status(), 400);
 }
 
-/// Without a control plane wired, logout answers the typed 409
-/// `cloud_disabled` (disabled parity), exactly like the other cloud routes.
+/// Without a control plane wired, logout refuses the unverifiable credential
+/// with 401 BEFORE the `[cloud]` feature state (never `cloud_disabled`).
 #[tokio::test]
-async fn logout_without_control_plane_is_cloud_disabled() {
+async fn logout_without_control_plane_is_an_auth_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let deps = test_deps(dir.path());
     let token = deps.auth_token.clone();
@@ -442,9 +487,18 @@ async fn logout_without_control_plane_is_cloud_disabled() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 409);
+    assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "cloud_disabled");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    // Missing credential is the same auth refusal.
+    let resp = client
+        .post(format!("{base}/native/sso/logout"))
+        .bearer_auth(token.as_str())
+        .json(&logout_body("acme", "ses_x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }
 
 /// The identity-federation ENTRY is gated by the `enterprise_governance`

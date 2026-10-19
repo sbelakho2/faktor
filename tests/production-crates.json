@@ -23,6 +23,7 @@
   "faktor-git",
   "faktor-google",
   "faktor-hooks",
+  "faktor-impact",
   "faktor-index",
   "faktor-instructions",
   "faktor-kiwi",
@@ -53,5 +54,5 @@
   "faktor-winjob",
   "faktor-worker"
  ],
- "note": "Generated from `cargo metadata --no-deps` local non-test packages; freshness is enforced by scripts/certification/check-capability-tests-compiled.py in a cargo-bearing lane, so the node-only certificate lane can validate capability completeness without cargo."
+ "note": "Generated from `cargo metadata --no-deps` local non-test packages; freshness is enforced by target/release/faktor-ci-tools capability-tests in a cargo-bearing lane, so the node-only certificate lane can validate capability completeness without cargo."
 }

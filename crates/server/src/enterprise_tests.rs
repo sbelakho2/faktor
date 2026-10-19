@@ -147,6 +147,24 @@ async fn enterprise_disabled_answers_typed_409() {
     let dir = tempfile::tempdir().unwrap();
     let env = enterprise_deps(dir.path(), Wiring::Disabled).await;
     let client = reqwest::Client::new();
+    // ORDERING: missing/invalid control credentials are the same typed 401 a
+    // wired enterprise service would answer — never `enterprise_disabled`.
+    for control in [None, Some("bogus-enterprise-token")] {
+        let mut request = client
+            .get(url(&env, "/native/enterprise/status"))
+            .bearer_auth(&env.daemon_token);
+        if let Some(control) = control {
+            request = request.header("x-faktor-control-token", control);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "control={control:?} must lose before enterprise_disabled"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
     // The owner token authenticates against the control plane, but the
     // enterprise service itself is not wired: every route is a typed 409.
     let cases: [(&str, &str, serde_json::Value); 6] = [

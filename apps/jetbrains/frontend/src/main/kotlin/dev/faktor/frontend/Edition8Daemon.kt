@@ -308,6 +308,62 @@ internal class Edition8Daemon(
         }
     }
 
+    /**
+     * X-06: validate and launch the real advertised browser adapter. The
+     * daemon owns URL validation and launch; the host never invents a
+     * connected state.
+     */
+    fun connectBrowser(url: String, after: (Edition8Result) -> Unit) {
+        val session = sessionId()
+        if (session == null) {
+            after(Edition8Result.Refused("no conversation is bound; browser sessions are session-scoped", "session"))
+            return
+        }
+        val body = JsonCodec.write(
+            JsonValue.Obj(
+                linkedMapOf(
+                    "adapterId" to JsonValue.Str("chromium-local"),
+                    "session" to JsonValue.Str(session),
+                    "url" to JsonValue.Str(url)
+                )
+            )
+        )
+        call("POST", "/native/browser/sessions", body, after)
+    }
+
+    fun boundSession(): String? = sessionId()
+
+    fun mcpServers(after: (Edition8Result) -> Unit) = call("GET", "/native/mcp/servers", null, after)
+
+    fun mcpCatalogs(id: String, after: (Edition8Result) -> Unit) =
+        call("GET", "/native/mcp/servers/" + java.net.URLEncoder.encode(id, "UTF-8") + "/resources", null, after)
+
+    fun browserSessions(after: (Edition8Result) -> Unit) {
+        val session = sessionId()
+        if (session == null) {
+            after(Edition8Result.Refused("no conversation is bound; browser sessions are session-scoped", "session"))
+            return
+        }
+        call("GET", "/native/browser/sessions?session=" + java.net.URLEncoder.encode(session, "UTF-8"), null, after)
+    }
+
+    fun browserObservations(browserId: String, after: (Edition8Result) -> Unit) {
+        call("GET", "/native/browser/sessions/" + java.net.URLEncoder.encode(browserId, "UTF-8") + "/observations", null, after)
+    }
+
+    fun browserScreenshot(browserId: String, after: (Edition8Result) -> Unit) {
+        val body = JsonCodec.write(
+            JsonValue.Obj(
+                linkedMapOf(
+                    "mime" to JsonValue.Str("image/png"),
+                    "dataBase64" to JsonValue.Str(""),
+                    "inModelContext" to JsonValue.Bool(false)
+                )
+            )
+        )
+        call("POST", "/native/browser/sessions/" + java.net.URLEncoder.encode(browserId, "UTF-8") + "/screenshot", body, after)
+    }
+
     fun call(
         method: String,
         path: String,
@@ -375,6 +431,18 @@ internal class Edition8Daemon(
     }
 
     fun endpointFor(control: Edition8Control): String? {
+        // The generated functional-evidence route map is authoritative: a
+        // hand-written catalog hint can be stale, and an unrelated route that
+        // happens to answer 200 is never a fallback.
+        val mapped = Edition8RouteMap.route(control.id)
+        if (mapped != null) {
+            when (mapped.kind) {
+                "config" -> return resolve("/native/config/snapshot")
+                "host" -> return null
+                "read" -> return resolve(mapped.path)
+                else -> Unit
+            }
+        }
         for (endpoint in control.endpoints) {
             if (endpoint.state != "exists") continue
             val actual = endpoint.actual

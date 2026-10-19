@@ -1270,14 +1270,14 @@ fn mcp_config_validation_bounds_and_duplicates() {
     assert!(cfg.mcp_servers().unwrap().is_empty());
     cfg.mcp.push(McpEntry {
         name: "server".into(),
-        command: "python3".into(),
+        command: "mock-server".into(),
         args: vec!["-m".into(), "srv".into()],
     });
     assert_eq!(cfg.mcp_servers().unwrap().len(), 1);
     // Duplicate names.
     cfg.mcp.push(McpEntry {
         name: "server".into(),
-        command: "python3".into(),
+        command: "mock-server".into(),
         args: vec![],
     });
     assert!(cfg.mcp_servers().is_err(), "duplicate names rejected");
@@ -1328,7 +1328,7 @@ fn mcp_config_validation_bounds_and_duplicates() {
     let path = dir.path().join("faktor-plus.json");
     std::fs::write(
         &path,
-        r#"{"mcp": [{"name": "fixture", "command": "python3", "args": ["mock.py"]}]}"#,
+        r#"{"mcp": [{"name": "fixture", "command": "mock-server", "args": ["mock.bin"]}]}"#,
     )
     .unwrap();
     let loaded = Config::load(&path).unwrap();

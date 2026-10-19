@@ -63,7 +63,7 @@ async fn bootstrap_org(
 }
 
 #[tokio::test]
-async fn cloud_disabled_answers_typed_409_and_changes_nothing_else() {
+async fn cloud_disabled_is_only_disclosed_to_the_daemon_bootstrap() {
     let dir = tempfile::tempdir().unwrap();
     let deps = test_deps(dir.path());
     let token = deps.auth_token.clone();
@@ -74,14 +74,11 @@ async fn cloud_disabled_answers_typed_409_and_changes_nothing_else() {
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
 
-    let cases: [(&str, &str, serde_json::Value); 8] = [
+    // Principal-required routes: a missing OR unverifiable control credential
+    // is the SAME typed 401, never a `cloud_disabled` feature-state oracle.
+    let cases: [(&str, &str, serde_json::Value); 7] = [
         ("GET", "/native/identity", serde_json::Value::Null),
         ("GET", "/native/orgs", serde_json::Value::Null),
-        (
-            "POST",
-            "/native/orgs",
-            serde_json::json!({"name": "X", "owner_email": "x@x.test", "display_name": "X"}),
-        ),
         ("GET", "/native/orgs/org_1/members", serde_json::Value::Null),
         (
             "POST",
@@ -97,20 +94,74 @@ async fn cloud_disabled_answers_typed_409_and_changes_nothing_else() {
         ("GET", "/native/approvals", serde_json::Value::Null),
     ];
     for (method, path, body) in cases {
-        let request = match method {
-            "GET" => client.get(url(&base, path)),
-            _ => client.post(url(&base, path)).json(&body),
-        };
-        let resp = request
-            .bearer_auth(token.as_str())
-            .header("idempotency-key", "k-disabled")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409, "{method} {path}");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"], "cloud_disabled", "{method} {path}");
+        for control in [None, Some("bogus-control-token")] {
+            let request = match method {
+                "GET" => client.get(url(&base, path)),
+                _ => client.post(url(&base, path)).json(&body),
+            };
+            let mut request = request
+                .bearer_auth(token.as_str())
+                .header("idempotency-key", "k-disabled");
+            if let Some(control) = control {
+                request = request.header("x-faktor-control-token", control);
+            }
+            let resp = request.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                401,
+                "{method} {path} control={control:?} must lose before cloud_disabled"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["error"]["code"], "unauthorized",
+                "{method} {path} control={control:?}"
+            );
+        }
     }
+
+    // The explicit daemon bootstrap (NO token presented) is the ONE typed
+    // cloud-disabled configuration refusal.
+    let bootstrap = serde_json::json!({
+        "name": "X", "owner_email": "x@x.test", "display_name": "X",
+    });
+    let resp = client
+        .post(url(&base, "/native/orgs"))
+        .bearer_auth(token.as_str())
+        .header("idempotency-key", "k-disabled")
+        .json(&bootstrap)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "cloud_disabled");
+    // A PRESENTED (unverifiable) credential still loses first.
+    let resp = client
+        .post(url(&base, "/native/orgs"))
+        .bearer_auth(token.as_str())
+        .header("idempotency-key", "k-disabled")
+        .header("x-faktor-control-token", "bogus-control-token")
+        .json(&bootstrap)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+
+    // The bootstrap DTO is still strict for the established bootstrap caller.
+    let resp = client
+        .post(url(&base, "/native/orgs"))
+        .bearer_auth(token.as_str())
+        .header("idempotency-key", "k-disabled")
+        .json(&serde_json::json!({
+            "name": "X", "owner_email": "x@x.test", "display_name": "X", "smuggled": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
     // The rest of the daemon is untouched: health/ready keep their exact
     // shapes.
     let health: serde_json::Value = client
@@ -494,14 +545,13 @@ async fn strict_dtos_reject_unknown_fields_and_malformed_values() {
     let base = format!("http://{}", handle.addr);
     let (org, token) = bootstrap_org(&client, &base, &daemon, "Acme", "owner@acme.test", "k").await;
 
-    // Unknown JSON fields are refused everywhere.
+    // Unknown JSON fields are refused everywhere. (The daemon bootstrap is
+    // covered separately: a control-plane principal may not mint tenants, so
+    // its DTO is parsed only after the bootstrap caller is established.)
+    let members_path = format!("/native/orgs/{org}/members");
     for (path, body) in [
         (
-            "/native/orgs",
-            serde_json::json!({"name": "X", "owner_email": "x@x.test", "display_name": "X", "smuggled": 1}),
-        ),
-        (
-            &format!("/native/orgs/{org}/members"),
+            members_path.as_str(),
             serde_json::json!({"email": "x@y.test", "role": "member", "smuggled": 1}),
         ),
         (
@@ -526,7 +576,6 @@ async fn strict_dtos_reject_unknown_fields_and_malformed_values() {
     }
 
     // Malformed values are typed 400s, never coerced.
-    let members_path = format!("/native/orgs/{org}/members");
     let malformed_cases: [(&str, serde_json::Value); 3] = [
         (
             members_path.as_str(),

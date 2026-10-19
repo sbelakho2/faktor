@@ -554,7 +554,9 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
         // native JSON.
         .route("/session/{id}/projection", get(native_session_projection))
         .route("/models", get(native_models))
+        .route("/native/models", get(native_models))
         .route("/capabilities", get(native_capabilities))
+        .route("/native/capabilities", get(native_capabilities))
         // Native Protocol v1, audit 55-56 wiring: liveness/readiness plus
         // the durable session listings under an explicit /native prefix.
         // Every handler is auth-gated; request bodies parse with the strict
@@ -964,7 +966,7 @@ fn native_foundation_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/native/tools", get(foundation_ext::native_tools))
         .route(
             "/native/browser/status",
-            get(foundation_ext::native_browser_status),
+            get(browser_surface::native_browser_status),
         )
         .route(
             "/native/browser/validate-url",
@@ -1041,6 +1043,9 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
             post(r8::native_runtime_trust_check),
         )
         .route("/native/runtime/status", get(r8::native_runtime_status))
+        // Explicit opt-in telemetry settings and the exact local payload
+        // preview (S29/O-10); no upload endpoint is invented.
+        .route("/native/telemetry", get(r8::native_telemetry_preview))
         // Browser adapter/session lifecycle, bounded observations and
         // content-addressed captures (S20/X-06..X-09). There is deliberately
         // no route that marks a session connected or fabricates an event.

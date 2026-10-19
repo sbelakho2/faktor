@@ -1,5 +1,13 @@
 {
   "schema": "faktor-route-authority/v1",
+  "ordering": {
+    "rule": "authorize-before-feature-state",
+    "assertion": "tests/programme/checks/auth-order.mjs",
+    "exceptions": {
+      "public": ["/native/scm/webhook"],
+      "bootstrap": ["/native/orgs"]
+    }
+  },
   "entries": [
     {
       "id": "native.delete.native.hooks.id",
@@ -445,6 +453,14 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
+      "id": "native.get.native.capabilities",
+      "method": "get",
+      "path": "/native/capabilities",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.get.native.mcp.servers",
       "method": "get",
       "path": "/native/mcp/servers",
@@ -512,6 +528,14 @@
       "id": "native.get.native.model-parameters",
       "method": "get",
       "path": "/native/model-parameters",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.models",
+      "method": "get",
+      "path": "/native/models",
       "principal": "daemon",
       "scope": "global",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -975,6 +999,14 @@
       "principal": "daemon",
       "scope": "session_query",
       "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.telemetry",
+      "method": "get",
+      "path": "/native/telemetry",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/native/foundation_r8.rs"
     },
     {
       "id": "native.get.native.terminals",

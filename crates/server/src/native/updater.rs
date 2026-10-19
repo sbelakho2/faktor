@@ -16,11 +16,11 @@
 //!   the updater's existing audit path (actor, before/after versions and
 //!   digests, signed release generation) BEFORE any effect and resets the
 //!   high-water mark only after the swap and its health probe succeed;
-//! - when the `[updater]` section is disabled (the default), every route
-//!   answers a typed 409 `updater_disabled` and NOTHING else in the daemon
-//!   changes; when the updater is enabled but the control plane is not, the
-//!   routes answer a typed 409 `cloud_disabled` (role gating needs a
-//!   principal);
+//! - when the `[updater]` section is disabled (the default), an AUTHORIZED
+//!   control-plane principal (viewer/member/admin per action) answers a typed
+//!   409 `updater_disabled`; the feature state is never disclosed to a
+//!   missing, invalid or foreign principal, which loses with 401
+//!   `unauthorized` first;
 //! - mutating routes (`stage`/`apply`/`rollback`/`downgrade`) require an
 //!   `Idempotency-Key` header (bounded, printable ASCII); `apply` and
 //!   `downgrade` also require `confirm: true` — an update is never applied
@@ -37,7 +37,7 @@ use faktor_cloud::{Action, Resource};
 use faktor_protocol::error::ApiError;
 use serde::Deserialize;
 
-use super::control_plane::{CONTROL_TOKEN_HEADER, IDEMPOTENCY_KEY_HEADER};
+use super::control_plane::{require_principal, IDEMPOTENCY_KEY_HEADER};
 use super::{authed, control_plane_err, malformed_body, wire_status};
 use crate::api::AppState;
 
@@ -336,17 +336,6 @@ fn updater_disabled() -> ApiError {
     }
 }
 
-fn cloud_disabled() -> ApiError {
-    ApiError {
-        code: "cloud_disabled",
-        message: "the control plane is disabled; updater routes are role-gated and need a \
-                  control-plane principal"
-            .into(),
-        http_status: 409,
-        retryable: false,
-    }
-}
-
 /// Map one updater failure onto the frozen API error surface.
 pub(crate) fn update_err(e: faktor_updater::UpdateError) -> ApiError {
     ApiError {
@@ -360,6 +349,10 @@ pub(crate) fn update_err(e: faktor_updater::UpdateError) -> ApiError {
 /// The auth + role gate shared by every updater route. The error is an
 /// [`ApiError`] (mapped by the caller through [`wire_status`]) so the
 /// `Result` stays small enough to satisfy `clippy::result_large_err`.
+///
+/// ORDERING: daemon password -> control-plane principal -> role -> the
+/// updater's own feature state. A missing/invalid/foreign principal never
+/// learns whether `[updater]` is enabled.
 fn updater_gate(
     state: &AppState,
     headers: &HeaderMap,
@@ -367,26 +360,7 @@ fn updater_gate(
     require_key: bool,
 ) -> Result<faktor_cloud::Principal, ApiError> {
     authed(headers, state)?;
-    if state.deps.updater.is_none() {
-        return Err(updater_disabled());
-    }
-    let Some(control_plane) = state.deps.control_plane.as_ref() else {
-        return Err(cloud_disabled());
-    };
-    let Some(token) = headers
-        .get(CONTROL_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return Err(ApiError {
-            code: "unauthorized",
-            message: format!("missing {CONTROL_TOKEN_HEADER} control-plane credential"),
-            http_status: 401,
-            retryable: false,
-        });
-    };
-    let principal = control_plane
-        .authenticate(token)
-        .map_err(control_plane_err)?;
+    let principal = require_principal(state, headers)?;
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &principal.organization,
@@ -394,6 +368,9 @@ fn updater_gate(
         action,
     ) {
         return Err(control_plane_err(denied.into()));
+    }
+    if state.deps.updater.is_none() {
+        return Err(updater_disabled());
     }
     if require_key
         && headers

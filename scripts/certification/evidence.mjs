@@ -90,6 +90,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CI_TOOLS = process.env.FAKTOR_CI_TOOLS || (process.env.CARGO_TARGET_DIR ? join(process.env.CARGO_TARGET_DIR, 'release/faktor-ci-tools') : join(ROOT, 'target/release/faktor-ci-tools'));
 const EVIDENCE_SCHEMA = 'faktor-cert-evidence/v1';
 const MARKER_SCHEMA = 'faktor-woodpecker-lane/v2';
 const CI_CERT_SCHEMA = 'faktor-ci-certification/v2';
@@ -838,7 +839,7 @@ function extractLaneCommands(yamlText, lane) {
   }
   const actual = [];
   for (const item of items) {
-    if (item.some((raw) => /target\/certification\/lanes|faktor-woodpecker-lane|lane-marker\.(sh|mjs|py)/.test(raw))) {
+    if (item.some((raw) => /target\/certification\/lanes|faktor-woodpecker-lane|lane-marker\.(sh|mjs)/.test(raw))) {
       continue;
     }
     actual.push(...item.map((raw) => raw.trim()).filter((raw) => raw !== ''));
@@ -1706,7 +1707,7 @@ function runSelftest() {
     });
 
     // ------------------------------------------------- lane-marker helper
-    run('lane-marker generators (node/python/launcher) agree byte-for-byte and bind auth', () => {
+    run('lane-marker generators (rust/node/launcher) agree byte-for-byte and bind auth', () => {
       const genDir = join(repo, 'target/certification/lanes-gen');
       mkdirSync(genDir, { recursive: true });
       const commands = 'echo lane-a\nsleep 0';
@@ -1738,33 +1739,25 @@ function runSelftest() {
         'woodpecker',
       ];
       const tokenEnv = { ...process.env, faktor_lane_token_lane_a: 'token-a' };
-      const runHelper = (interpreter, script, out) => {
-        execFileSync(interpreter, [script, ...commonArgs, '--out', out], {
+      const runHelper = (interpreter, preArgs, out) => {
+        execFileSync(interpreter, [...preArgs, ...commonArgs, '--out', out], {
           cwd: repo,
           env: tokenEnv,
         });
         return readJsonStrict(join(repo, out));
       };
-      const nodeRecord = runHelper(process.execPath, join(ROOT, 'scripts/certification/lane-marker.mjs'), 'target/certification/lanes-gen/node.json');
-      const launcherRecord = runHelper('sh', join(ROOT, 'scripts/certification/lane-marker.sh'), 'target/certification/lanes-gen/launcher.json');
+      const nodeRecord = runHelper(process.execPath, [join(ROOT, 'scripts/certification/lane-marker.mjs')], 'target/certification/lanes-gen/node.json');
+      const launcherRecord = runHelper('sh', [join(ROOT, 'scripts/certification/lane-marker.sh')], 'target/certification/lanes-gen/launcher.json');
+      const rustRecord = runHelper(CI_TOOLS, ['lane-marker'], 'target/certification/lanes-gen/rust.json');
+      assert(
+        JSON.stringify(rustRecord) === JSON.stringify(nodeRecord),
+        'rust and node generators must produce identical marker JSON',
+      );
       assert(nodeRecord.auth === computeMarkerAuth(nodeRecord, 'token-a'), 'node helper auth must verify');
       assert(
         JSON.stringify(nodeRecord) === JSON.stringify(launcherRecord),
         'lane-marker.sh must produce the same record as lane-marker.mjs',
       );
-      let pythonAvailable = true;
-      try {
-        execFileSync('python3', ['--version'], { stdio: 'ignore' });
-      } catch {
-        pythonAvailable = false;
-      }
-      if (pythonAvailable) {
-        const pyRecord = runHelper('python3', join(ROOT, 'scripts/certification/lane-marker.py'), 'target/certification/lanes-gen/python.json');
-        assert(
-          JSON.stringify(pyRecord) === JSON.stringify(nodeRecord),
-          'python and node generators must produce identical marker JSON',
-        );
-      }
       const noToken = {
         ...process.env,
         faktor_lane_token_lane_a: '',

@@ -162,6 +162,25 @@ async fn billing_disabled_answers_typed_409_and_legacy_usage_is_unchanged() {
     let base = format!("http://{}", handle.addr);
     let (org, control_token) = bootstrap(&control_plane, "Acme", "owner@acme.test");
 
+    // ORDERING: a missing/invalid control credential is the same typed 401 a
+    // wired billing service would answer — never `billing_disabled`.
+    for control in [None, Some("bogus-billing-token")] {
+        let mut request = client
+            .get(format!("{base}/native/entitlements"))
+            .bearer_auth(token.as_str());
+        if let Some(control) = control {
+            request = request.header("x-faktor-control-token", control);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "control={control:?} must lose before billing_disabled"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+
     // Every billing surface answers the typed disabled refusal.
     let resp = client
         .get(format!("{base}/native/usage?org={org}"))

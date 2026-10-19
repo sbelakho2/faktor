@@ -471,6 +471,12 @@ function bodyFor(controlId: string, payload: Readonly<Record<string, Json>>, sna
         dryRun: body.dryRun ?? true,
         limit: body.limit ?? null,
       };
+    case 'X-06':
+      return {
+        adapterId: body.adapterId ?? 'chromium-local',
+        session: body.session ?? snapshot?.binding?.session ?? '',
+        url: body.url ?? body.text ?? '',
+      };
     case 'X-07':
       return { url: body.url ?? '' };
     case 'X-08':

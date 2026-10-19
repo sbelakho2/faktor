@@ -726,7 +726,10 @@ export async function launchChrome(chrome) {
   );
   const wsUrl = await new Promise((resolve, reject) => {
     let stderr = '';
-    const timer = setTimeout(() => reject(new Error(`chrome did not report DevTools: ${stderr}`)), 20000);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`chrome did not report DevTools: ${stderr}`));
+    }, 60000);
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       const match = /DevTools listening on (ws:\/\/\S+)/.exec(stderr);
@@ -740,19 +743,24 @@ export async function launchChrome(chrome) {
       reject(new Error(`chrome exited early (${code}): ${stderr}`));
     });
   });
-  const port = new URL(wsUrl).port;
-  const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((response) => response.json());
-  const page = list.find((target) => target.type === 'page');
-  if (!page) {
-    throw new Error('no page target in chrome');
+  try {
+    const port = new URL(wsUrl).port;
+    const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((response) => response.json());
+    const page = list.find((target) => target.type === 'page');
+    if (!page) {
+      throw new Error('no page target in chrome');
+    }
+    // Chrome reports the target URL on `localhost`, which may resolve to ::1
+    // first in a Linux container while Chrome binds the DevTools listener on
+    // 127.0.0.1 only. Pin the websocket host to the address we just proved
+    // reachable with /json/list.
+    const pageWsUrl = new URL(page.webSocketDebuggerUrl);
+    pageWsUrl.hostname = '127.0.0.1';
+    return { child, profile, pageWs: pageWsUrl.toString() };
+  } catch (error) {
+    child.kill('SIGKILL');
+    throw error;
   }
-  // Chrome reports the target URL on `localhost`, which may resolve to ::1
-  // first in a Linux container while Chrome binds the DevTools listener on
-  // 127.0.0.1 only. Pin the websocket host to the address we just proved
-  // reachable with /json/list.
-  const pageWsUrl = new URL(page.webSocketDebuggerUrl);
-  pageWsUrl.hostname = '127.0.0.1';
-  return { child, profile, pageWs: pageWsUrl.toString() };
 }
 
 const MEASURE_SCRIPT = `(() => {
@@ -1206,8 +1214,24 @@ export async function runHarness(args) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const result = await runHarness(args);
-  process.exitCode = result.status;
+  // The local amd64 CI agent runs this image under QEMU, where Chrome's
+  // DevTools socket can be starved or close once. Retry a failed launch/read
+  // a bounded number of times; assertion failures are returned, not retried.
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const result = await runHarness(args);
+      process.exitCode = result.status;
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        console.error(`render-webview: attempt ${attempt} failed: ${error.message}; retrying`);
+        await sleep(2000);
+      }
+    }
+  }
+  throw lastError;
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

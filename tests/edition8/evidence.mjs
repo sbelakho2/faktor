@@ -29,6 +29,7 @@ export const RAW_SCHEMA = 'faktor-edition8-raw/v1';
 
 export const GATES = Object.freeze({
   registry: { kind: 'registry', host: 'both' },
+  ledger: { kind: 'ledger', host: 'both' },
   'control-exercise-vscode': { kind: 'control-exercise', host: 'vscode' },
   'control-exercise-jetbrains': { kind: 'control-exercise', host: 'jetbrains' },
   'acceptance-vscode': { kind: 'acceptance', host: 'vscode' },
@@ -243,6 +244,21 @@ export function verifyGates({ allowDirty = false, requireDogfood = false, allowU
     }
     if (doc.status !== 'passed') problems.push(`${name}: status ${doc.status}`);
     if (doc.dirty && !allowDirty) problems.push(`${name}: recorded a dirty checkout`);
+  }
+
+  const ledger = docs.ledger;
+  if (ledger) {
+    requireCount(ledger, 'controls', EXPECTED.controls, 'controls', problems);
+    const byStatus = ledger.counts ?? {};
+    if ((byStatus.exists ?? 0) + (byStatus.partial ?? 0) + (byStatus.missing ?? 0) !== EXPECTED.controls) {
+      problems.push('ledger: exists + partial + missing must equal 200');
+    }
+    if ((byStatus.missing ?? 0) !== 0) {
+      problems.push(`ledger: ${byStatus.missing} controls have no implementation evidence`);
+    }
+    if (!Array.isArray(ledger.results) || ledger.results.length !== EXPECTED.controls) {
+      problems.push('ledger: per-control evidence rows are missing');
+    }
   }
 
   const controlIds = registry.controls.map((control) => control.id);

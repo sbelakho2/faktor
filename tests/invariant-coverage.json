@@ -507,6 +507,17 @@
    ]
   },
   {
+   "crate": "faktor-impact",
+   "class": "release-critical",
+   "reason": "repository relationship graph and impacted-test authority: deterministic digest/revision binding, hostile path/oversize refusal, O(V+E) traversal, live rust-analyzer and 10k-file scale proofs; CI selector consumes its serialized graph",
+   "capabilities": [
+    {
+     "id": "impact.graph.bounded-deterministic-query",
+     "unit": "bounded_results_always_reserve_a_test_slot"
+    }
+   ]
+  },
+  {
    "crate": "faktor-index",
    "class": "release-critical",
    "owners": [

@@ -14,4 +14,4 @@ steps:
         printf 'deb [check-valid-until=no] %s trixie-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
         rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
         apt-get update
-        apt-get install -y --no-install-recommends python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419
+        apt-get install -y --no-install-recommends procps=2:4.0.4-9 ca-certificates=20250419

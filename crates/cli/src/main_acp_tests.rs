@@ -868,29 +868,17 @@ async fn mcp_hook_and_terminal_children_share_one_daemon_supervisor() {
     // the single supervisor accounts 4 live children (2 mcp + hook +
     // terminal) — the old per-server supervisors would have split them
     // across registries.
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("python3 missing; skipping");
-        return;
-    }
-    let fixture = format!("{}/tests/fixtures/mcp_mock.py", env!("CARGO_MANIFEST_DIR"));
-    assert!(
-        std::path::Path::new(&fixture).exists(),
-        "mcp fixture missing at {fixture}"
-    );
+    let fixture = faktor_test_mocks::mcp_bin();
     let mcp_entries = vec![
         config::McpEntry {
             name: "mock-a".into(),
-            command: "python3".into(),
-            args: vec![fixture.clone()],
+            command: fixture.to_string_lossy().into_owned(),
+            args: vec![],
         },
         config::McpEntry {
             name: "mock-b".into(),
-            command: "python3".into(),
-            args: vec![fixture.clone()],
+            command: fixture.to_string_lossy().into_owned(),
+            args: vec![],
         },
     ];
     let cfg = config::Config {

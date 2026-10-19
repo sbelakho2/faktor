@@ -35,7 +35,7 @@ use faktor_core::{CancellationToken, Clock, Deadline, SystemClock, WorkspaceId};
 
 use crate::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use crate::health::{ProviderHealthKey, SemanticHealthTracker};
-use crate::intelligence::{fallback_intelligence_capability, IntelligenceCapability};
+use crate::intelligence::IntelligenceCapability;
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, EnvelopeIdentity, SemanticCall, SemanticCapabilities,
     SemanticCompleteness, SemanticContextPack, SemanticContextRequest, SemanticDelta,
@@ -229,7 +229,7 @@ impl SemanticProviderRegistry {
                 };
             }
         }
-        fallback_operation_status(op)
+        self.fallback.operation_status(op)
     }
 
     /// The per-operation intelligence capability (tier metadata + bounded
@@ -269,7 +269,7 @@ impl SemanticProviderRegistry {
                 };
             }
         }
-        fallback_intelligence_capability(op)
+        self.fallback.intelligence_capability(op)
     }
 
     /// Every semantic operation's intelligence capability, in
@@ -391,10 +391,12 @@ impl SemanticProviderRegistry {
         envelope: &SemanticEnvelope<T>,
     ) -> Result<(), SemanticError> {
         envelope.validate_provider_id(provider)?;
-        envelope.validate(
-            &SemanticExpectation::new(workspace, expected_snapshot),
-            &self.response_caps,
-        )
+        let expectation = SemanticExpectation::new(workspace, expected_snapshot);
+        if provider == &self.fallback.id() {
+            envelope.validate_native(&expectation, &self.response_caps)
+        } else {
+            envelope.validate(&expectation, &self.response_caps)
+        }
     }
 
     /// The typed refusal of a provider-required call that no provider served
@@ -905,6 +907,7 @@ mod tests {
                     truncated: false,
                     total_bytes: 0,
                     degraded: false,
+                    unavailable: Vec::new(),
                 },
             )
         }
@@ -1647,6 +1650,7 @@ mod tests {
                     passed: true,
                     degraded: false,
                     checks: Vec::new(),
+                    unavailable: Vec::new(),
                 },
             )
         }
@@ -1733,6 +1737,8 @@ mod tests {
                             affected: vec![],
                             tests: vec![],
                             degraded: false,
+                            provenance: Vec::new(),
+                            unavailable: Vec::new(),
                         },
                     )),
                     ScriptedBehavior::HeuristicRefs => {
@@ -1744,6 +1750,8 @@ mod tests {
                             )],
                             tests: vec![],
                             degraded: false,
+                            provenance: Vec::new(),
+                            unavailable: Vec::new(),
                         };
                         Ok(SemanticEnvelope::new(
                             id,
@@ -1914,6 +1922,7 @@ mod tests {
                     passed: true,
                     degraded: false,
                     checks: Vec::new(),
+                    unavailable: Vec::new(),
                 },
             );
             Box::pin(async move { Ok(envelope) })

@@ -139,8 +139,17 @@ done
 [ -n "$TOKEN" ] || die "WOODPECKER_TOKEN is required (personal access token)"
 HOST="${HOST%/}"
 API="${HOST}/api"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
-command -v python3 >/dev/null 2>&1 || die "python3 is required (JSON parsing)"
+[ -x "$CI_TOOLS" ] || die "faktor-ci-tools is required (cargo build --release -p faktor-ci-tools)"
 
 if [ -z "$REPO_FULL_NAME" ]; then
     remote="$(git remote get-url origin 2>/dev/null || true)"
@@ -197,30 +206,11 @@ request() {
 
 # json_field PATH [DEFAULT] -- reads RESPONSE_BODY.
 json_field() {
-    local path="$1" default="${2:-}"
-    printf '%s' "$RESPONSE_BODY" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print(sys.argv[2])
-    sys.exit(0)
-for key in sys.argv[1].split("."):
-    if key == "":
-        continue
-    try:
-        if isinstance(data, list):
-            data = data[int(key)]
-        else:
-            data = data.get(key)
-    except Exception:
-        print(sys.argv[2])
-        sys.exit(0)
-    if data is None:
-        print(sys.argv[2])
-        sys.exit(0)
-print(data if not isinstance(data, (dict, list)) else json.dumps(data))
-' "$path" "$default"
+    local path="$1" default="${2:-}" body_file
+    body_file="$(mktemp)"
+    printf '%s' "$RESPONSE_BODY" >"$body_file"
+    "$CI_TOOLS" json-get "$body_file" "$path" "$default"
+    rm -f "$body_file"
 }
 
 # forge_remote_id -- the forge's numeric repository id used for activation.
@@ -322,14 +312,7 @@ fi
 # reports the stored value otherwise.
 configure_project() {
     local name="$1" repo_id="$2" config_file="$3" allow_pr="$4" volumes="$5" body
-    body="$(python3 -c '
-import json, sys
-config_file, allow_pr, volumes = sys.argv[1], sys.argv[2] == "true", sys.argv[3]
-data = {"config_file": config_file, "allow_pr": allow_pr}
-if volumes != "skip":
-    data["trusted"] = {"volumes": volumes == "true"}
-print(json.dumps(data))
-' "$config_file" "$allow_pr" "$volumes")"
+    body="$("$CI_TOOLS" wo-body settings "$config_file" "$allow_pr" "$volumes")"
     note "${name}: PATCH /repos/${repo_id} ${body}"
     request PATCH "/repos/${repo_id}" "$body"
     case "$RESPONSE_STATUS" in
@@ -409,9 +392,9 @@ else
         note "secrets  : ${name} (trusted project)"
         request GET "/repos/${TRUSTED_REPO_ID}/secrets/${name}"
         if [ "$RESPONSE_STATUS" = "200" ]; then
-            request PATCH "/repos/${TRUSTED_REPO_ID}/secrets/${name}" "$(python3 -c 'import json,sys; print(json.dumps({"value": sys.argv[1]}))' "$value")"
+            request PATCH "/repos/${TRUSTED_REPO_ID}/secrets/${name}" "$("$CI_TOOLS" wo-body secret-value "$value")"
         else
-            request POST "/repos/${TRUSTED_REPO_ID}/secrets" "$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "value": sys.argv[2]}))' "$name" "$value")"
+            request POST "/repos/${TRUSTED_REPO_ID}/secrets" "$("$CI_TOOLS" wo-body secret "$name" "$value")"
         fi
         case "$RESPONSE_STATUS" in
         200 | 201) note "secrets  : ${name} set" ;;
@@ -434,23 +417,14 @@ fi
 if [ -n "$TRUSTED_REPO_ID" ]; then
     for spec in "${CRON_SPECS[@]}"; do
         IFS='|' read -r cron_name cron_schedule cron_branch cron_timezone <<<"$spec"
-        cron_body="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "schedule": sys.argv[2], "branch": sys.argv[3], "timezone": sys.argv[4], "enabled": True}))' \
-            "$cron_name" "$cron_schedule" "$cron_branch" "$cron_timezone")"
+        cron_body="$("$CI_TOOLS" wo-body cron "$cron_name" "$cron_schedule" "$cron_branch" "$cron_timezone")"
         request GET "/repos/${TRUSTED_REPO_ID}/cron"
         cron_id=""
         if [ "$RESPONSE_STATUS" = "200" ]; then
-            cron_id="$(printf '%s' "$RESPONSE_BODY" | python3 -c '
-import json, sys
-name = sys.argv[1]
-try:
-    jobs = json.load(sys.stdin)
-except Exception:
-    jobs = []
-for job in jobs if isinstance(jobs, list) else []:
-    if job.get("name") == name:
-        print(job.get("id", ""))
-        break
-' "$cron_name")"
+            cron_body_file="$(mktemp)"
+            printf '%s' "$RESPONSE_BODY" >"$cron_body_file"
+            cron_id="$("$CI_TOOLS" json cron-id "$cron_body_file" "$cron_name")"
+            rm -f "$cron_body_file"
         fi
         if [ -n "$cron_id" ]; then
             note "cron     : ${cron_name} exists on the trusted project (id=${cron_id}); patching schedule/branch"

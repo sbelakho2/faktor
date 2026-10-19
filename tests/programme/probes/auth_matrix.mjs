@@ -6,8 +6,13 @@
 // declared principal class/scope (route-authority.json) decides the cells:
 //
 //   * unauthenticated            -> 401 (worker/webhook credential routes are
-//                                   typed 4xx/409, never a daemon-password 200)
+//                                   typed credential refusals; the webhook is
+//                                   the one explicit public exception)
 //   * wrong bearer               -> 401
+//   * control route, no token    -> 401 (never `*_disabled`)
+//   * control route, bad token   -> 401 (never `*_disabled`)
+//   * disabled subsystem         -> the auth refusal is identical to the
+//                                   enabled case: no feature-state oracle
 //   * daemon bearer              -> not 401 (daemon class) / 401|403|409 for a
 //                                   control-plane route that also needs a token
 //   * x-faktor-server-password   -> same as the bearer form
@@ -31,6 +36,15 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { normalizeCapabilityId } from '../../../scripts/discover-capabilities.mjs';
+import {
+  assertAuthOrder,
+  assertForeignOrgOrder,
+  credentialProbeBody,
+  errorCode,
+  isOrderingException,
+  requiresControlToken,
+  typedRefusal,
+} from '../checks/auth-order.mjs';
 import { scan } from '../checks/route-authority.mjs';
 import { cliBinary, request } from './routes.mjs';
 
@@ -182,6 +196,13 @@ function queryFor(path, session) {
 
 function bodyFor(method, path) {
   if (method === 'get' || method === 'delete') return undefined;
+  if (path === '/native/orgs') {
+    return { name: 'Matrix Bootstrap', owner_email: 'owner@matrix.test', display_name: 'Matrix' };
+  }
+  // Worker-token routes: a VALID DTO carrying a credential that is not bound
+  // to any worker, so the cell tests credential ordering (401), not parsing.
+  const credentialBody = credentialProbeBody(path);
+  if (credentialBody !== null) return credentialBody;
   if (path === '/native/session/{id}/abort') return { session_id: FOREIGN_SESSION };
   if (path === '/native/permission/reply') {
     return { session_id: FOREIGN_SESSION, permission_id: '999999', decision: 'allow' };
@@ -234,11 +255,15 @@ async function localMatrix(base, password, entries, sessions, results) {
     const ownPath = `${resolvePath(route.path, ownSession)}${queryFor(route.path, ownSession)}`;
     const body = bodyFor(method, route.path);
     const timeoutMs = isStream(ownPath) ? 900 : 5_000;
+    const exception = isOrderingException(method, route.path);
+    // The bootstrap route needs its idempotency key to reach the explicit
+    // cloud-disabled cell; it is not a credential.
+    const cellHeaders = exception === 'bootstrap' ? { 'idempotency-key': 'matrix-bootstrap' } : {};
 
     const unauth = await call(base, method, ownPath, { body, timeoutMs });
     const wrongAuth = await call(base, method, ownPath, { body, timeoutMs, headers: wrong });
-    const bearer = await call(base, method, ownPath, { body, timeoutMs, headers: daemon });
-    const xForm = await call(base, method, ownPath, { body, timeoutMs, headers: xHeader });
+    const bearer = await call(base, method, ownPath, { body, timeoutMs, headers: { ...daemon, ...cellHeaders } });
+    const xForm = await call(base, method, ownPath, { body, timeoutMs, headers: { ...xHeader, ...cellHeaders } });
     const foreignBearer = await call(base, method, ownPath, {
       body,
       timeoutMs,
@@ -248,22 +273,31 @@ async function localMatrix(base, password, entries, sessions, results) {
     const credentialOnly = route.principal === 'worker_token' || route.principal === 'webhook';
 
     if (credentialOnly) {
-      check(results, route, 'unauthenticated is a typed credential refusal', [400, 401, 409].includes(unauth.status), {
-        status: unauth.status,
-        code: unauth.code,
-      });
-      check(results, route, 'daemon password is NOT a credential', [400, 401, 409].includes(bearer.status), {
-        status: bearer.status,
-        code: bearer.code,
-      });
+      if (route.principal === 'worker_token') {
+        // The worker token IS the credential: a missing/unbound token is the
+        // same typed 401 an enabled plane answers, even with the plane off.
+        const unauthOrder = assertAuthOrder(unauth);
+        check(results, route, 'unauthenticated credential is refused before the plane state', unauthOrder.ok, unauthOrder.observed);
+        const daemonOrder = assertAuthOrder(bearer);
+        check(results, route, 'daemon password is NOT a worker credential', daemonOrder.ok, daemonOrder.observed);
+        const wrongOrder = assertAuthOrder(wrongAuth);
+        check(results, route, 'wrong bearer is refused before the plane state', wrongOrder.ok, wrongOrder.observed);
+      } else {
+        // Explicitly public: the HMAC signature cannot be verified without
+        // the sink, so its configuration refusal is documented.
+        check(
+          results,
+          route,
+          'public webhook is a typed refusal (configuration exception)',
+          exception === 'public' && typedRefusal(unauth) && [401, 409].includes(unauth.status),
+          { status: unauth.status, code: errorCode(unauth) },
+        );
+      }
     } else {
-      check(results, route, 'unauthenticated 401', unauth.status === 401, {
-        status: unauth.status,
-        code: unauth.code,
-      });
-      check(results, route, 'wrong bearer 401', wrongAuth.status === 401, {
-        status: wrongAuth.status,
-      });
+      const unauthOrder = assertAuthOrder(unauth);
+      check(results, route, 'unauthenticated is 401 before any feature state', unauthOrder.ok, unauthOrder.observed);
+      const wrongOrder = assertAuthOrder(wrongAuth);
+      check(results, route, 'wrong bearer is 401 before any feature state', wrongOrder.ok, wrongOrder.observed);
       if (route.principal === 'daemon' || route.principal === 'daemon_or_control_org') {
         check(results, route, 'daemon bearer is admitted', admitted(bearer), {
           status: bearer.status,
@@ -274,27 +308,55 @@ async function localMatrix(base, password, entries, sessions, results) {
           status: xForm.status,
           aborted: xForm.aborted,
         });
-      } else {
-        // A malformed body may be refused before the principal lookup, but
-        // NEVER with a success: the control-plane credential is mandatory.
+      } else if (exception === 'bootstrap') {
+        // The daemon bootstrap (NO token presented) is the ONE place the
+        // explicit `cloud_disabled` configuration state is disclosed.
         check(
           results,
           route,
-          'control-plane route without its token is refused',
-          [400, 401, 403, 409].includes(bearer.status),
-          { status: bearer.status, code: bearer.code },
+          'daemon bootstrap sees the typed configuration state',
+          bearer.status === 409 && errorCode(bearer) === 'cloud_disabled',
+          { status: bearer.status, code: errorCode(bearer) },
         );
         check(
           results,
           route,
-          'x-faktor-server-password alone is refused on a control-plane route',
-          [400, 401, 403, 409].includes(xForm.status),
-          { status: xForm.status },
+          'x-faktor-server-password bootstrap sees the typed configuration state',
+          xForm.status === 409 && errorCode(xForm) === 'cloud_disabled',
+          { status: xForm.status, code: errorCode(xForm) },
+        );
+      } else {
+        const bearerOrder = assertAuthOrder(bearer);
+        check(
+          results,
+          route,
+          'control-plane route without its token is 401 before any feature state',
+          bearerOrder.ok,
+          bearerOrder.observed,
+        );
+        const xOrder = assertAuthOrder(xForm);
+        check(
+          results,
+          route,
+          'x-faktor-server-password alone is 401 before any feature state',
+          xOrder.ok,
+          xOrder.observed,
         );
       }
       check(results, route, 'control token as bearer is refused', foreignBearer.status === 401, {
         status: foreignBearer.status,
       });
+      // A PRESENTED invalid control token must lose exactly like a missing
+      // one, including on every disabled subsystem.
+      if (requiresControlToken(route.principal) || exception === 'bootstrap') {
+        const invalidControl = await call(base, method, ownPath, {
+          body,
+          timeoutMs,
+          headers: { ...daemon, 'x-faktor-control-token': randomBytes(32).toString('hex'), ...(exception === 'bootstrap' ? { 'idempotency-key': 'matrix-bootstrap' } : {}) },
+        });
+        const order = assertAuthOrder(invalidControl);
+        check(results, route, 'invalid control token is 401 before any feature state', order.ok, order.observed);
+      }
     }
 
     // Owner-only resources addressed by id: an absent id is a typed client
@@ -516,12 +578,26 @@ async function cloudMatrix(base, password, entries, results) {
       body,
       timeoutMs: isStream(path) ? 900 : 5_000,
     });
+    const daemonOrder = assertAuthOrder(daemonOnly);
     check(
       results,
       route,
-      'daemon password alone cannot use the control plane',
-      [400, 401, 403, 409].includes(daemonOnly.status),
-      { status: daemonOnly.status, code: daemonOnly.code },
+      'daemon password alone is 401 before any feature state',
+      daemonOrder.ok,
+      daemonOrder.observed,
+    );
+    const invalidControl = await call(base, route.method, path, {
+      headers: { ...daemon, 'x-faktor-control-token': randomBytes(32).toString('hex') },
+      body,
+      timeoutMs: isStream(path) ? 900 : 5_000,
+    });
+    const invalidOrder = assertAuthOrder(invalidControl);
+    check(
+      results,
+      route,
+      'invalid control token is 401 before any feature state',
+      invalidOrder.ok,
+      invalidOrder.observed,
     );
   }
 
@@ -553,45 +629,42 @@ async function cloudMatrix(base, password, entries, results) {
         code: response.code,
       });
     } else {
-      check(results, { id: 'tenant.cross-org' }, `${method.toUpperCase()} ${path.split('?')[0]} foreign org is 404`, response.status === 404, {
-        status: response.status,
-        code: response.code,
-      });
-      const leaked = response.text.includes(b.id) || response.text.includes(b.email) || /permission_denied|forbidden/i.test(response.text);
-      check(results, { id: 'tenant.cross-org' }, 'cross-org refusal leaks no tenant data', !leaked, {
-        bytes: Buffer.byteLength(response.text),
-      });
       // Same status/code as a tenant that never existed: foreign existence is
-      // not observable from the refusal.
+      // not observable from the refusal, and no disabled/plan state may lead.
       const missingOrg = `org_${'0'.repeat(32)}`;
       const missing = await call(base, method, path.replaceAll(b.id, missingOrg), {
         headers: { ...authA, 'idempotency-key': 'matrix-missing-org' },
         body: bodies[index],
       });
+      const order = assertForeignOrgOrder(response, missing, [b.id, b.email]);
       check(
         results,
         { id: 'tenant.cross-org' },
-        'foreign and missing tenants answer the same refusal',
-        missing.status === response.status && missing.code === response.code,
-        { foreign: response.status, missing: missing.status, foreign_code: response.code, missing_code: missing.code },
+        `${method.toUpperCase()} ${path.split('?')[0]} foreign org is the same typed 404 as a missing org`,
+        order.ok,
+        order.observed,
       );
     }
   }
 
-  // Body-named organization (SSO) is bound to the principal, never trusted.
-  const ssoBody = { organization: b.id, redirect_uri: 'http://127.0.0.1/callback' };
-  const ssoCross = await call(base, 'post', '/native/sso/start', { headers: authA, body: ssoBody });
-  check(results, { id: 'tenant.sso' }, 'SSO body org B with token A is refused', [400, 404, 409].includes(ssoCross.status), {
-    status: ssoCross.status,
-    code: ssoCross.code,
-  });
-  check(
-    results,
-    { id: 'tenant.sso' },
-    'SSO refusal names no foreign tenant data',
-    !ssoCross.text.includes(b.id) && !ssoCross.text.includes(b.email),
-    { bytes: Buffer.byteLength(ssoCross.text) },
-  );
+  // Body-named organization (SSO) is bound to the principal, never trusted:
+  // a foreign org is the SAME 404 a missing one answers (no SSO-existence or
+  // disabled oracle), even though the SSO authority is disabled here.
+  const missingOrg = `org_${'0'.repeat(32)}`;
+  for (const [route, makeBody] of [
+    ['/native/sso/start', (org) => ({ organization: org, redirect_uri: 'http://127.0.0.1/callback' })],
+    ['/native/sso/callback', (org) => ({
+      organization: org,
+      redirect_uri: 'http://127.0.0.1/callback',
+      code: 'c',
+      state: 's',
+    })],
+  ]) {
+    const ssoCross = await call(base, 'post', route, { headers: authA, body: makeBody(b.id) });
+    const ssoMissing = await call(base, 'post', route, { headers: authA, body: makeBody(missingOrg) });
+    const order = assertForeignOrgOrder(ssoCross, ssoMissing, [b.id, b.email]);
+    check(results, { id: 'tenant.sso' }, `${route} foreign org is the same 404 as a missing org`, order.ok, order.observed);
+  }
 
   // Approval IDOR: create in B, decide with A.
   const created = await call(base, 'post', '/native/approvals', {
@@ -738,6 +811,11 @@ export async function probeAuthMatrix({ report = false } = {}) {
     results.cases.map((entry) => entry.route).filter((id) => declaredIds.has(id)),
   );
   const syntheticCases = results.cases.filter((entry) => !declaredIds.has(entry.route)).length;
+  // The shared ordering rule's evidence: every invalid/foreign-principal cell
+  // that proved the auth refusal came before any feature/tenant state.
+  const orderCases = results.cases.filter((entry) =>
+    /before any feature state|before the plane state|same typed 404/.test(entry.name),
+  ).length;
   const document = {
     schema: 'faktor-auth-tenant-matrix/v1',
     generated_at: new Date().toISOString(),
@@ -747,6 +825,7 @@ export async function probeAuthMatrix({ report = false } = {}) {
     route_cases: results.cases.length,
     synthetic_cases: syntheticCases,
     routes_covered: routesCovered.size,
+    auth_order_cases: orderCases,
     failures: results.failures.length,
     sessions,
     tenants: tenants ? { a: tenants.a.id, b: tenants.b.id } : null,

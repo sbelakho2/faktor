@@ -291,6 +291,7 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5ScreenRegistry.k
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8ScreenRegistry.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Daemon.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Panels.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition8RouteMap.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ModelPickerDialog.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt

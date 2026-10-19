@@ -49,7 +49,9 @@ object Edition8ControlExercise {
             stopScope = { scope -> "cancel acknowledged for scope=$scope" },
             replyApproval = { id, session, decision -> "permission $id $decision ack session=$session" },
             openDiff = { "opened native diff (fixture ack)" },
-            openTerminal = { "opened console (fixture ack)" }
+            openTerminal = { "opened console (fixture ack)" },
+            inlineCodeAction = { "captured file://fixture/Fixture.kt offset=0..4 version=1; intentions opened" },
+            hostAction = { id -> "host action $id acknowledged (fixture)" }
         )
         var screensBuilt = 0
         var controlsFound = 0
@@ -230,7 +232,9 @@ object Edition8ControlExercise {
             val host = Edition8Host(
                 client = { client },
                 sessionId = { sessionId },
-                taskId = { null }
+                taskId = { null },
+                inlineCodeAction = { "captured live editor selection; intentions opened" },
+                hostAction = { id -> "host action $id acknowledged (live)" }
             )
             try {
                 for (screen in Edition8Registry.screens) {
@@ -246,7 +250,11 @@ object Edition8ControlExercise {
                         host.work.awaitIdle(30_000)
                         val state = row.stateText()
                         when {
-                            state.startsWith("Read") -> { ok++; statuses["read"] = (statuses["read"] ?: 0) + 1 }
+                            state.startsWith("Read") || state.startsWith("Connected") ||
+                                state.startsWith("Captured") || state.startsWith("Host") -> {
+                                ok++
+                                statuses["read"] = (statuses["read"] ?: 0) + 1
+                            }
                             state.startsWith("Disabled") -> {
                                 refused++
                                 statuses["disabled"] = (statuses["disabled"] ?: 0) + 1

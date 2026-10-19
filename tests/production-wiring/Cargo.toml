@@ -45,6 +45,7 @@ faktor-mcp.workspace = true
 faktor-lsp.workspace = true
 faktor-index.workspace = true
 faktor-search.workspace = true
+faktor-impact = { workspace = true, features = ["runtime"] }
 faktor-sandbox.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
@@ -83,9 +84,11 @@ tempfile.workspace = true
 # crates/cli/Cargo.toml.
 hmac = "0.12"
 sha2 = "0.10"
+blake3.workspace = true
 
 [dev-dependencies]
 faktor-provider = { workspace = true, features = ["test-utils"] }
+faktor-test-mocks = { path = "../../crates/test-mocks" }
 # The Alibaba/1688 contract mock recomputes the documented AOP signature
 # from the actual wire bytes, independently of the production signer.
 hmac = "0.12"

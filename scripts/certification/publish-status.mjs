@@ -183,7 +183,7 @@ export function platformKeyFromEnv(platform, env = process.env) {
 
 /**
  * The canonical signed payload for one platform certificate. Byte-identical
- * in the JS, Python and PowerShell publishers/verifiers. Every field that
+ * in the JS, Rust and PowerShell publishers/verifiers. Every field that
  * binds the certificate to a run is inside the MAC.
  */
 export function platformSigningPayload({ platform, sha, tree, run, state, context }) {

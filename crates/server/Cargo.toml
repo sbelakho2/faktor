@@ -17,6 +17,7 @@ faktor-context.workspace = true
 faktor-memory.workspace = true
 faktor-hooks.workspace = true
 faktor-mcp.workspace = true
+faktor-browser.workspace = true
 zeroize.workspace = true
 url = "2"
 faktor-protocol.workspace = true

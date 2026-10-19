@@ -47,8 +47,8 @@ hygiene scanner.
   cannot distinguish them; the script excludes path edges).
 
 Enforcement: `scripts/check-licenses.sh` evaluates exactly this policy
-against `cargo metadata --format-version 1 --locked` with python3 (no tool
-install required) and additionally runs
+against `cargo metadata --format-version 1 --locked` with the Rust
+`faktor-ci-tools license-policy` binary (built in the lane) and additionally runs
 `cargo deny --offline check licenses bans sources` when a cargo-deny binary
 is on `PATH`, so the two engines cannot drift. The trusted CI static lane
 runs `bash scripts/check-licenses.sh` as a required step (also recorded in
@@ -80,6 +80,15 @@ place.
 Every exception is an exact `HYGIENE_ALLOWLIST` entry with a written
 justification; the scan asserts each entry is non-stale (the committed file
 exists) and load-bearing (the rules would flag it without the exemption).
+
+The same crate also enforces the absolute no-Python tooling constraint:
+`repository_has_zero_python_sources_or_invocations` fails on any committed
+`.py` file and on any `python`/`python3` token in `scripts/`, `.woodpecker/`,
+`docker/` or `deny.toml`. `no_python_scan_fires_on_planted_sources_and_invocations`
+proves the scan is load-bearing. Repository tooling that used to be Python
+is implemented by the Rust `faktor-ci-tools` binary; product support for
+user Python projects in `crates/verify` is not a repository-tooling
+invocation and stays out of scope.
 Current entries: the pinned Gradle wrapper jar (sha256-verified by
 `scripts/check-gradle-integrity.sh`) and two certification fixtures that
 simulate packaged release artifacts for the `scripts/certification`
@@ -103,10 +112,10 @@ that cannot meet that bar does not belong in the repository.
 ## 4. Historical violations and disposition
 
 - `crates/cli/tests/fixtures/__pycache__/mcp_mock.cpython-314.pyc`
-  (2791 B Python 3.14 bytecode for the committed
-  `crates/cli/tests/fixtures/mcp_mock.py` mock server): deleted; the `.py`
-  source is the fixture, `__pycache__/` is now ignored, and scan 13 keeps
-  the class out.
+  (2791 B Python 3.14 bytecode): deleted together with the former `.py`
+  mock server. The repository now has zero Python sources or runtime
+  invocations; test servers are compiled Rust fixtures
+  (`crates/test-mocks`), and scan 13 keeps bytecode out.
 - root `mu_test` (465576 B Mach-O 64-bit arm64 executable, sha256
   `27f1470a9de168d23c8a407dc3738b90d857c35082a52fe7b906dac00cb08e12`):
   added 2026-09-04 by commit 9d4824a ("Wave 4: CI overhaul, ...") with zero

@@ -18,13 +18,13 @@
     "extracted_text_sha256": "sha256:bef802a6d53744ce30023be7a12fe5859e5c3b0802efe6c78b3b804a155604a8"
   },
   "inputs": {
-    "controls": "sha256:dbe7d921cb9961bf4ccba01071fdbdce76694dfb7939f961b65eada015b70a70",
+    "controls": "sha256:2481f6f42b627b73e4c77da6a7fae62927805f55fe142a3c53166199adecd6af",
     "screens": "sha256:c2b9655666e47c23d1ab65aa77164851d25b9bdc187afecef52dc9a50e29fb87",
     "flows": "sha256:a22fa1582ec98d65bab168e6df499ea8604248519ffdf4fe8a522445aaaf8c8d",
     "acceptance": "sha256:ae28d8067593e6a5baef8cf7ab891e01b4ae980c1c71b66a3e8c1ee1ebcb4908",
     "expectations": "sha256:8be92336ebc8553a3f76cf9f8808cd60a5b697f0c8a2c473270c63d7e8b60ac1"
   },
-  "inputs_digest": "sha256:f6a38ee411177886b49ba4135df7d83c067b2862ba12be7f9d435ba311293854",
+  "inputs_digest": "sha256:c84bfbe2cd7de0d78ec06b55b3d8bcc629bda436f1fb126eca413605536aa31d",
   "counts": {
     "screens": 72,
     "host_contracts": 144,
@@ -2694,10 +2694,9 @@
       },
       "classification": "E",
       "config_keys": [
-        "faktor.defaultProvider",
-        "faktor.run.defaultProvider"
+        "faktor.defaultProvider"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -2740,10 +2739,9 @@
       },
       "classification": "E",
       "config_keys": [
-        "faktor.defaultModel",
-        "faktor.run.defaultModel"
+        "faktor.defaultModel"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -2784,7 +2782,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -2829,7 +2827,7 @@
       "config_keys": [
         "routing_mode"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -2954,7 +2952,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3037,10 +3035,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "model.contextLimit",
-        "(proposed)"
+        "faktor.model.contextLimit"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3085,7 +3082,7 @@
         "provider.quality",
         "(per-instance)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3128,7 +3125,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3170,7 +3167,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3213,7 +3210,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3256,7 +3253,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3300,7 +3297,7 @@
       "config_keys": [
         "providers[].id"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3344,7 +3341,7 @@
       "config_keys": [
         "providers[].kind"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3388,7 +3385,7 @@
       "config_keys": [
         "providers[].base_url"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3433,7 +3430,7 @@
       "config_keys": [
         "providers[].api_key_env"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3479,7 +3476,7 @@
         "(adapter",
         "ExtraHeaders)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3523,7 +3520,7 @@
       "config_keys": [
         "providers[].models"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3567,7 +3564,7 @@
       "config_keys": [
         "providers[].kind=ollama"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3609,9 +3606,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "providers[].allow_loopback"
+        "faktor.sandbox.allowLoopback"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3653,12 +3650,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "sandbox.network",
-        "(proposed",
-        "LAN",
-        "policy)"
+        "faktor.sandbox.network"
       ],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3700,7 +3694,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3832,7 +3826,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3874,7 +3868,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A01",
         "A02",
@@ -3965,7 +3959,7 @@
         "(core",
         "enum)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4004,7 +3998,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4043,9 +4037,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "task.max_tokens"
+        "faktor.generation.maxOutput"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4083,8 +4077,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "N",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.generation.temperature"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4122,8 +4118,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "N",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.generation.topP"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4162,7 +4160,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4201,7 +4199,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4240,7 +4238,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4279,7 +4277,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4318,7 +4316,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4357,7 +4355,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4396,7 +4394,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4438,7 +4436,7 @@
         "streaming",
         "(adapter)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4478,7 +4476,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A02",
         "A03",
@@ -4519,7 +4517,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4559,7 +4557,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4599,7 +4597,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4640,7 +4638,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4681,7 +4679,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4723,7 +4721,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4765,7 +4763,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4807,7 +4805,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4850,7 +4848,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4938,7 +4936,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -4983,7 +4981,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -5025,7 +5023,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A11",
         "A12"
@@ -5063,7 +5061,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A11",
         "A12"
@@ -5102,7 +5100,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A13"
       ],
@@ -5139,7 +5137,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A13"
       ],
@@ -5215,7 +5213,7 @@
       },
       "classification": "E",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A14"
       ],
@@ -5252,7 +5250,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5337,8 +5335,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "R",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.retrieval.strategy"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5381,8 +5381,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "R",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.retrieval.embeddingProvider"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5425,7 +5427,7 @@
       },
       "classification": "E",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5468,7 +5470,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5511,7 +5513,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5553,7 +5555,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A11",
@@ -5595,9 +5597,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "compact_at_usage"
+        "faktor.context.compactionMinReduction"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5679,7 +5681,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A15"
       ],
@@ -5715,7 +5717,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A15"
       ],
@@ -5752,9 +5754,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "efficiency.failure_learning"
+        "faktor.efficiency.failureLearning"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5794,9 +5796,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "efficiency.ccr"
+        "faktor.efficiency.ccr"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5836,9 +5838,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "efficiency.typed_handoff"
+        "faktor.efficiency.typedHandoff"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5878,11 +5880,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "efficiency.semantic_context",
-        "(alias",
-        "information_gain)"
+        "faktor.efficiency.semanticContext"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5922,9 +5922,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "efficiency.rework_routing"
+        "faktor.efficiency.reworkGuard"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -5964,8 +5964,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "N",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.memory.captureMode"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A16"
       ],
@@ -6002,7 +6004,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A16"
       ],
@@ -6040,7 +6042,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A12",
         "A15",
@@ -6082,7 +6084,7 @@
       "config_keys": [
         "instructions"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6123,7 +6125,7 @@
       "config_keys": [
         "AGENTS.md"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6165,7 +6167,7 @@
         ".faktor/rules",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6205,7 +6207,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6244,7 +6246,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6287,7 +6289,7 @@
         "profiles/commands",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6326,7 +6328,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6366,7 +6368,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6405,7 +6407,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6444,7 +6446,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6485,7 +6487,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6526,11 +6528,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "permission",
-        "preset",
-        "(proposed)"
+        "faktor.permissions.preset"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6572,11 +6572,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "permission-rules",
-        "store",
-        "(proposed)"
+        "faktor.permissions.allowedTools"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6618,10 +6616,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "sandbox.filesystem",
-        "(proposed)"
+        "faktor.sandbox.shell"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6663,9 +6660,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "sandbox.shell"
+        "faktor.sandbox.shell"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6707,9 +6704,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "sandbox.network"
+        "faktor.sandbox.network"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6790,7 +6787,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A18"
       ],
@@ -6826,7 +6823,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A18"
       ],
@@ -6864,7 +6861,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A17",
         "A28"
@@ -6904,7 +6901,7 @@
       "config_keys": [
         "sandbox.network_guarantee"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6947,10 +6944,8 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "R",
-      "config_keys": [
-        "sandbox.shell"
-      ],
-      "current_status": "partial",
+      "config_keys": [],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -6995,7 +6990,7 @@
       "config_keys": [
         "enterprise.settings"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -7038,7 +7033,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -7080,7 +7075,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A09",
         "A10",
@@ -7122,7 +7117,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7161,8 +7156,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "N",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.permissions.allowedTools"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7205,7 +7202,7 @@
       "config_keys": [
         "mcp[]"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A21"
       ],
@@ -7246,7 +7243,7 @@
         "mcp[].transport",
         "(proposed)"
       ],
-      "current_status": "missing",
+      "current_status": "partial",
       "acceptance_scenario_ids": [
         "A22"
       ],
@@ -7285,7 +7282,7 @@
         "mcp[].env",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7366,7 +7363,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7406,10 +7403,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "permission-rules",
-        "(proposed)"
+        "faktor.permissions.allowedTools"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7450,7 +7446,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7535,7 +7531,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7575,7 +7571,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7616,7 +7612,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7656,7 +7652,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7697,7 +7693,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A21",
@@ -7737,7 +7733,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7776,7 +7772,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7815,7 +7811,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7854,7 +7850,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7893,7 +7889,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7932,7 +7928,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -7975,7 +7971,7 @@
         "(env",
         "FAKTOR_HOOKS)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A24"
       ],
@@ -8013,7 +8009,7 @@
       "config_keys": [
         "hooks[].command/args"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A24"
       ],
@@ -8049,7 +8045,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -8090,7 +8086,7 @@
       "config_keys": [
         "hooks[].env_allowlist"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -8131,7 +8127,7 @@
       "config_keys": [
         "hooks[].deadline_ms/stdout_cap/stderr_cap"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -8173,7 +8169,7 @@
       "config_keys": [
         "hooks[].failure_policy"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -8216,7 +8212,7 @@
         "hooks[].test",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A24"
       ],
@@ -8253,7 +8249,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A10",
@@ -8328,8 +8324,7 @@
       },
       "classification": "R",
       "config_keys": [
-        "sandbox.shell",
-        "sandbox.home"
+        "faktor.sandbox.shell"
       ],
       "current_status": "exists",
       "acceptance_scenario_ids": [
@@ -8497,7 +8492,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8540,7 +8535,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8583,7 +8578,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8626,7 +8621,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8670,7 +8665,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8714,7 +8709,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8758,7 +8753,7 @@
       },
       "classification": "R",
       "config_keys": [
-        "sandbox.shell"
+        "faktor.sandbox.shell"
       ],
       "current_status": "exists",
       "acceptance_scenario_ids": [
@@ -8805,7 +8800,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A08",
         "A09",
@@ -8852,8 +8847,7 @@
       },
       "classification": "E",
       "config_keys": [
-        "faktor.budgetTokens",
-        "max_tokens"
+        "faktor.budget.maxTokens"
       ],
       "current_status": "exists",
       "acceptance_scenario_ids": [
@@ -8895,8 +8889,7 @@
       },
       "classification": "E",
       "config_keys": [
-        "faktor.budgetCostMicro",
-        "max_cost_micro"
+        "faktor.budget.maxCostMicro"
       ],
       "current_status": "exists",
       "acceptance_scenario_ids": [
@@ -8933,8 +8926,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "N",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.budget.warnAtPercent"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A30",
         "A31"
@@ -8978,7 +8973,7 @@
       "config_keys": [
         "usage.durable.reservations"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9026,7 +9021,7 @@
         "revision",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9069,9 +9064,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "retry.max_attempts"
+        "faktor.retry.maxAttempts"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9114,11 +9109,9 @@
       },
       "classification": "R",
       "config_keys": [
-        "retry.base_delay_ms",
-        "retry.max_delay_ms",
-        "retry.jitter"
+        "faktor.retry.baseDelayMs"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9161,7 +9154,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9255,7 +9248,7 @@
         "verification.quick_max_s",
         "verification.unit_max_s"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9299,7 +9292,7 @@
       },
       "classification": "E",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A05",
         "A17",
@@ -9345,7 +9338,7 @@
       },
       "classification": "E",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A28",
         "A29"
@@ -9515,7 +9508,7 @@
       },
       "classification": "R",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A33"
       ],
@@ -9587,7 +9580,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A33",
         "A34"
@@ -9682,7 +9675,7 @@
         "verification.unit_max_s",
         "verification.full_as_background"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A15",
         "A29",
@@ -9822,7 +9815,7 @@
         "completion.scm",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A15",
         "A29",
@@ -9871,7 +9864,7 @@
       "config_keys": [
         "expected_current_hash"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A34"
       ],
@@ -9992,7 +9985,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A40"
       ],
@@ -10032,7 +10025,7 @@
         "metadata",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10079,7 +10072,7 @@
         "prompt",
         "queue"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10252,13 +10245,8 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "H",
-      "config_keys": [
-        "host",
-        "theme/zoom",
-        "density",
-        "(proposed)"
-      ],
-      "current_status": "partial",
+      "config_keys": [],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10297,10 +10285,7 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "H",
-      "config_keys": [
-        "send",
-        "keybinding"
-      ],
+      "config_keys": [],
       "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
@@ -10341,11 +10326,8 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "H",
-      "config_keys": [
-        "package.json",
-        "commands/keybindings"
-      ],
-      "current_status": "partial",
+      "config_keys": [],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10385,8 +10367,10 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "H",
-      "config_keys": [],
-      "current_status": "partial",
+      "config_keys": [
+        "faktor.telemetry.categories"
+      ],
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10466,7 +10450,7 @@
       },
       "classification": "H",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A39"
       ],
@@ -10504,7 +10488,7 @@
       },
       "classification": "N",
       "config_keys": [],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",
         "A29",
@@ -10551,7 +10535,7 @@
         "search",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -10596,7 +10580,7 @@
         "route/egress",
         "policy"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -10642,7 +10626,7 @@
         "export",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -10878,7 +10862,7 @@
       "config_keys": [
         "enterprise.*"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -10925,7 +10909,7 @@
         "policy",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -10967,10 +10951,9 @@
       },
       "classification": "N",
       "config_keys": [
-        "telemetry",
-        "(proposed)"
+        "faktor.telemetry.enabled"
       ],
-      "current_status": "missing",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -11014,7 +10997,7 @@
       "config_keys": [
         "workers.*"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -11060,7 +11043,7 @@
         "import/export",
         "(proposed)"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",
@@ -11106,7 +11089,7 @@
         "version/capability",
         "handshake"
       ],
-      "current_status": "partial",
+      "current_status": "exists",
       "acceptance_scenario_ids": [
         "A06",
         "A11",

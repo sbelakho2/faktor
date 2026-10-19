@@ -29,6 +29,7 @@ function arg(name, fallback = null) {
 const baseUrl = arg('--base-url');
 const token = arg('--token');
 const workspace = arg('--workspace');
+const browserUrl = arg('--browser-url');
 const outPath = arg('--out', resolve(ROOT, 'target/certification/edition8/dogfood-vscode.raw.json'));
 if (!baseUrl || !token || !workspace) {
   console.error('usage: edition8-dogfood.mjs --base-url URL --token TOKEN --workspace DIR [--out FILE]');
@@ -227,6 +228,92 @@ await flow('rev8-field-contracts', async () => {
     [200], 'mcp-auth');
   if (auth.text.includes('dogfood-secret')) throw new Error('auth token leaked');
   await expect('POST', '/native/mcp/servers/dogfood-mcp/oauth/revoke', {}, [200], 'mcp-revoke');
+
+  // C-07/C-14/K-12: pins, manifest export and measured efficiency are real
+  // session-scoped reads/writes, not placeholder rows.
+  await expect('POST', `/native/session/${encodeURIComponent(sessionId)}/context/pins`,
+    { sourceId: 'kept', action: 'pin' }, [200], 'pin');
+  const pins = JSON.parse((await expect('GET',
+    `/native/session/${encodeURIComponent(sessionId)}/context/pins`, undefined, [200], 'pins')).text);
+  if (!JSON.stringify(pins).includes('kept')) throw new Error('pinned source was not retained');
+  await expect('GET', `/native/context/export?session=${encodeURIComponent(sessionId)}`,
+    undefined, [200], 'context-export');
+  await expect('GET', `/native/session/${encodeURIComponent(sessionId)}/efficiency?limit=10`,
+    undefined, [200], 'efficiency');
+
+  // S-09: the richer matcher is a real schema field; a non-matching input is
+  // previewed without spawning, and a matching input runs the exact path.
+  await expect('POST', '/native/hooks', {
+    id: 'dogfood-matcher',
+    spec: {
+      id: 'dogfood-matcher', events: ['pre_tool'], command: '/bin/sh',
+      args: ['-c', 'exit 0'], env: [], env_allowlist: true, deadline_ms: 2000,
+      stdout_cap: 65536, stderr_cap: 65536, failure_policy: 'fail_closed',
+      permission_scope: [],
+      matcher: { tools: ['run_*'], paths: ['src/**'] },
+    },
+    trusted: true, enabled: true,
+  }, [200], 'hook-matcher');
+  const miss = JSON.parse((await expect('POST', '/native/hooks/dogfood-matcher/test', {
+    event: 'pre_tool', payload: { tool: 'read_file', path: 'src/app.rs' },
+  }, [200], 'hook-miss')).text);
+  if (miss.matched !== false) throw new Error('matcher did not reject a non-matching tool');
+  const hit = JSON.parse((await expect('POST', '/native/hooks/dogfood-matcher/test', {
+    event: 'pre_tool', payload: { tool: 'run_command', path: 'src/app.rs' },
+  }, [200], 'hook-hit')).text);
+  if (hit.matched !== true) throw new Error('matcher did not select a matching input');
+
+  // T-12: a configured but stopped server answers a typed not-ready state;
+  // an adapter that does not implement resources is never given a fake
+  // catalog. Both are honest outcomes.
+  const resources = await expect('GET', '/native/mcp/servers/dogfood-mcp/resources',
+    undefined, [200, 409], 'mcp-resources');
+  if (resources.status === 409 && !resources.text.includes('mcp_')) {
+    throw new Error(`mcp resources refusal is not typed: ${resources.text}`);
+  }
+
+  // X-06/X-08/X-09: enable the real browser surface, connect to a loopback
+  // page and capture its observations/screenshot. Without an executable or
+  // when disabled the same paths answer a typed refusal; a connected state
+  // is never invented.
+  const browserSnapshot = JSON.parse((await typedFetch('GET', '/native/config/snapshot')).text);
+  const browserRevision = Number(browserSnapshot.revision ?? 0);
+  await expect('POST', '/native/config/commit', {
+    expected_revision: browserRevision,
+    changes: [
+      { key: 'faktor.browser.enabled', scope: 'user', value: true },
+      { key: 'faktor.sandbox.allowLoopback', scope: 'user', value: true },
+    ],
+  }, [200], 'browser-config');
+  await expect('GET', '/native/browser/adapters', undefined, [200], 'browser-adapters');
+  const created = await expect('POST', '/native/browser/sessions', {
+    adapterId: 'chromium-local', session: sessionId, url: browserUrl ?? 'http://127.0.0.1:9/',
+  }, [200, 409, 503], 'browser-session');
+  if (created.status === 200) {
+    const session = JSON.parse(created.text);
+    if (!['requested', 'connected'].includes(session.state)) {
+      throw new Error(`browser session claimed an invalid state: ${created.text}`);
+    }
+    const observations = JSON.parse((await expect('GET',
+      `/native/browser/sessions/${encodeURIComponent(session.id)}/observations`,
+      undefined, [200], 'browser-observations')).text);
+    if (!Array.isArray(observations.observations) || observations.observations.length === 0) {
+      throw new Error('a connected browser session produced no observations');
+    }
+    const screenshot = JSON.parse((await expect('POST',
+      `/native/browser/sessions/${encodeURIComponent(session.id)}/screenshot`,
+      { mime: 'image/png', dataBase64: '', inModelContext: false },
+      [200], 'browser-screenshot')).text);
+    if (!(Number(screenshot.bytes) > 0)) throw new Error('browser screenshot artifact is empty');
+  } else if (!/browser|adapter|chromium|disabled/i.test(created.text)) {
+    throw new Error(`browser refusal is not typed: ${created.text}`);
+  }
+
+  // O-10: the payload preview is explicit and there is no upload endpoint.
+  const telemetry = JSON.parse((await expect('GET', '/native/telemetry',
+    undefined, [200], 'telemetry')).text);
+  if (telemetry.endpoint !== null) throw new Error('telemetry invented an upload endpoint');
+  if (telemetry.payloadPreview?.bounded !== true) throw new Error('telemetry preview is not bounded');
 
   // V-02: durable review comment CRUD.
   const comment = JSON.parse((await expect('POST', `/native/session/${encodeURIComponent(sessionId)}/review/comments`, {

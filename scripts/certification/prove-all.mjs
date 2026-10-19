@@ -37,6 +37,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CI_TOOLS = process.env.FAKTOR_CI_TOOLS || (process.env.CARGO_TARGET_DIR ? join(process.env.CARGO_TARGET_DIR, 'release/faktor-ci-tools') : join(ROOT, 'target/release/faktor-ci-tools'));
 const OUT = join(ROOT, 'target/certification/prove-all.json');
 const VISUAL_BASELINE = 'apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json';
 const CI_EVIDENCE = 'ci-evidence';
@@ -97,7 +98,7 @@ const COMMON_CHECKS = [
   { name: 'discovery', command: ['node', ['scripts/discover-capabilities.mjs', 'selftest']] },
   { name: 'workflow-graph', command: ['node', ['scripts/certification/check-workflow-graph.mjs', '--check']] },
   { name: 'publisher', command: ['node', ['scripts/certification/publish-status.mjs', 'selftest']] },
-  { name: 'visual-record-selftest', command: ['python3', ['scripts/certification/check-visual-baseline.py', 'selftest']] },
+  { name: 'visual-record-selftest', command: [CI_TOOLS, ['visual-baseline', 'selftest']] },
   // Every REQUIRED platform record, including its resolved font fingerprint:
   // the real committed baseline, never a synthetic fixture. In the
   // CI-evidence class a MISSING record is a typed platform boundary (exit 3,
@@ -107,16 +108,15 @@ const COMMON_CHECKS = [
     name: `visual-${platform}`,
     platform,
     command: [
-      'python3',
-      ['scripts/certification/check-visual-baseline.py', '--platform', platform,
-       '--file', VISUAL_BASELINE],
+      CI_TOOLS,
+      ['visual-baseline', '--platform', platform, '--file', VISUAL_BASELINE],
     ],
   })),
   { name: 'contracts-emit', command: ['node', ['scripts/contracts/emit.mjs', 'selftest']] },
   // P2: the REAL checked-in contract digest, not merely the emitter's
   // selftest — a stale generated contract must fail inside prove-all itself.
   { name: 'contracts-verify', command: ['node', ['scripts/contracts/emit.mjs', 'verify', '--print-digest']] },
-  { name: 'compiled-proofs-gate', command: ['python3', ['scripts/certification/check-capability-tests-compiled.py', 'selftest']] },
+  { name: 'compiled-proofs-gate', command: [CI_TOOLS, ['capability-tests', 'selftest']] },
   { name: 'visual-accept', command: ['node', ['scripts/certification/accept-visual-baseline.mjs', 'selftest']] },
 ];
 
@@ -377,9 +377,8 @@ function selftest() {
     writeFileSync(baseline, JSON.stringify(partial));
     const runWindows = (cls) =>
       spawnSync(
-        'python3',
-        ['scripts/certification/check-visual-baseline.py', '--class', cls,
-         '--platform', 'windows', '--file', baseline],
+        CI_TOOLS,
+        ['visual-baseline', '--class', cls, '--platform', 'windows', '--file', baseline],
         { cwd: ROOT, encoding: 'utf8' },
       );
     check('ci-evidence: missing windows is the typed boundary (exit 3)', runWindows(CI_EVIDENCE).status === 3);

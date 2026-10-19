@@ -230,6 +230,23 @@ function convert() {
     },
   });
 
+  run('scripts/edition8/ledger.mjs', ['--check', '--require-live']);
+  const ledger = JSON.parse(readFileSync(resolve(ROOT, 'docs/specs/edition8/functional-evidence.json'), 'utf8'));
+  writeGate('ledger', {
+    status: 'passed',
+    counts: { controls: ledger.controls.length, ...ledger.counts.by_status },
+    results: ledger.controls.map((row) => ({
+      id: row.id,
+      status: row.status,
+      note: row.note,
+      hosts: Object.fromEntries(
+        Object.entries(row.hosts).map(([host, evidence]) => [host, evidence.status]),
+      ),
+    })),
+    artifacts: { ledger: 'docs/specs/edition8/functional-evidence.json', controls: 'docs/specs/edition8/controls.json' },
+    detail: { hosts: ledger.counts.by_host, backlog: 'docs/specs/edition8/backlog.md' },
+  });
+
   const vscodeControls = raw('control-exercise-vscode.raw.json');
   requireCounts(
     vscodeControls,

@@ -144,6 +144,10 @@ pub struct ServerDeps {
     /// Live stdio MCP children owned by this daemon surface (explicit start/
     /// stop; one process group per server under the daemon supervisor).
     pub mcp_runtime: Arc<crate::native::foundation_ext::McpRuntime>,
+    /// The daemon's one browser authority. It owns the supervised Chromium
+    /// manager; dropping `ServerDeps` drops the manager and kills every
+    /// browser tree (no process outlives the daemon).
+    pub(crate) browser: Arc<crate::native::browser_surface::BrowserSurface>,
     /// Single-flight cache of the Engineering Outcome Ledger metrics fold
     /// (`/native/outcomes`). Keyed by the store's monotonic outcome
     /// revision; a new terminal run or settlement correction invalidates it.
@@ -224,6 +228,10 @@ impl ServerDeps {
         let mcp_runtime = Arc::new(crate::native::foundation_ext::McpRuntime::new(
             agent.deps().supervisor.clone(),
         ));
+        let browser = Arc::new(crate::native::browser_surface::BrowserSurface::new(
+            session.store().root().to_path_buf(),
+            agent.deps().supervisor.clone(),
+        ));
         Self {
             session,
             agent,
@@ -258,6 +266,7 @@ impl ServerDeps {
             worker_plane_listener: None,
             foundation: None,
             mcp_runtime,
+            browser,
             outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

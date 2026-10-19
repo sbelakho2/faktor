@@ -25,6 +25,9 @@ pub(crate) mod attachment;
 /// Wave 3 commercial metering routes (usage fold / entitlements / credits).
 pub(crate) mod billing;
 pub(crate) mod board;
+/// Revision 8 daemon contract routes (instructions/presets/trust/browser/
+/// context pins/export/efficiency/budget/provenance).
+pub(crate) mod browser_surface;
 #[cfg(test)]
 #[path = "concurrency_probe_tests.rs"]
 mod concurrency_probe_tests;
@@ -41,8 +44,6 @@ pub(crate) mod evidence;
 pub(crate) mod foundation;
 /// Edition 5 lifecycle surfaces (MCP/skills/hooks/memory/session ops).
 pub(crate) mod foundation_ext;
-/// Revision 8 daemon contract routes (instructions/presets/trust/browser/
-/// context pins/export/efficiency/budget/provenance).
 pub(crate) mod foundation_r8;
 #[cfg(test)]
 #[path = "foundation_rev8_contracts_tests.rs"]

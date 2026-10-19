@@ -42,11 +42,8 @@ pub(crate) async fn native_value_entitlements(
         Ok(p) => p,
         Err(e) => return wire_status(e),
     };
-    let Some(service) = state.deps.billing.as_ref() else {
-        return wire_status(billing_disabled());
-    };
     // The report is a BILLING READ (viewer and above), the same role gate as
-    // `/native/entitlements`.
+    // `/native/entitlements`, decided before the billing feature state.
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &principal.organization,
@@ -55,6 +52,9 @@ pub(crate) async fn native_value_entitlements(
     ) {
         return wire_status(billing_err(denied.into()));
     }
+    let Some(service) = state.deps.billing.as_ref() else {
+        return wire_status(billing_disabled());
+    };
     match service.value_entitlements(&principal.organization) {
         Ok(set) => Json(serde_json::json!({
             "ok": true,

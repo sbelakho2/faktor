@@ -1,34 +1,38 @@
 # Edition 8 implementation backlog
 
-Source: `Faktor_IDE_UI_UX_3.pdf` Revision 8 (17 Oct 2026), product/behaviour pp.197–225, construction pp.226–238, outlines pp.239–256, controls pp.257–294, screens pp.20–180, workflows pp.183–186, acceptance pp.343–345. Status is the functional audit in `controls.json`; it is not pixel acceptance.
+Source: `Faktor_IDE_UI_UX_3.pdf` Revision 8 (17 Oct 2026), product/behaviour pp.197–225, construction pp.226–238, outlines pp.239–256, controls pp.257–294, screens pp.20–180, workflows pp.183–186, acceptance pp.343–345. Status is generated from `functional-evidence.json`; it is not pixel acceptance.
 
 ## Current-state snapshot
 
-- **200 controls:** 40 `exists`, 148 `partial`, 12 `missing` (the 15 Rev8 field-level daemon contracts reported by the VS Code Rev8 implementation are closed; unrelated UI gaps remain). The 200 control IDs, defaults, scopes, apply timing and E/R/N/H classes are unchanged from Edition 5; the delta is the 72-surface native presentation and its states.
+<!-- edition8-status-counts:begin -->
+- **200 controls:** 199 `exists`, 1 `partial`, 0 `missing`. Generated from `functional-evidence.json` by `node scripts/edition8/ledger.mjs --sync`; do not edit this block by hand.
+<!-- edition8-status-counts:end -->
 - **72 screens:** both hosts carry the Rev8 registry (`apps/vscode/src/generated/edition8Registry.ts`, `Edition8CatalogData.kt`), generated from `registry.json` with 144 host contracts. The plate/layout contract is `screens.md`; the visual matrix gate executes all 72 screens in both hosts.
 - **16 flows:** W01–W16 are executable in both hosts with five cells (pointer, keyboard, screen-reader automation, compact/zoom, recovery) in `tests/edition8/workflows.mjs`; the isolated dogfood drives the real daemon through every flow family.
 - **40 acceptance scenarios:** A01–A40 are executable in both hosts with forbidden-state scans and field checks (`apps/vscode/scripts/edition8-acceptance.mjs`, the JetBrains smoke, and the daemon production-wiring probes). The PDF's "none executed" statement (p.343) describes the spec handoff, not this tree.
-- **Backend:** 506/506 HTTP capabilities named by the 200 control contracts have a matching daemon route (path aliases normalized; every match is recorded in `controls.json`). The primary gap is UI/contract wiring and Rev8 screen states, not missing route families.
+- **Backend:** every control's daemon seam (route, configuration descriptor or explicit host-owned surface) and the live receipt that proves it are recorded per host in `functional-evidence.json`; `node scripts/edition8/ledger.mjs --check` normalizes aliases and fails on a missing seam. No route-family gap remains.
 
 ## Per-category status
 
+<!-- edition8-status-table:begin -->
 | Category | exists | partial | missing | Main blocker |
 |---|---:|---:|---:|---|
-| M Models and routing | 3 | 11 | 0 | Generic model settings/picker; no Rev8 capability sheet or exact-route/tuning screen. |
-| P Providers, credentials and local inference | 3 | 10 | 1 | Provider CRUD/vault/test exists as routes/settings; no Rev8 connection/editor and no private-LAN/proxy policy. |
-| G Reasoning and generation | 0 | 14 | 0 | Edition 5 tuning panel exists; no Rev8 parameter/effective-request surface wiring. |
-| A Agent presets and delegation | 1 | 11 | 0 | Agent controls exist; no Rev8 presets/custom-agent/steer surfaces. |
-| C Context, attachments and retrieval | 2 | 10 | 2 | Context routes exist; no Rev8 context meter/manifest/source preview. |
-| K Compaction, memory and efficiency | 1 | 10 | 1 | Compaction/memory routes exist; no Rev8 compaction/memory/effect surfaces. |
-| I Instructions, rules and prompt composition | 0 | 11 | 0 | Config descriptors exist; no Rev8 instruction precedence/conflict/version screen. |
-| Q Permissions, autonomy and sandbox | 1 | 13 | 0 | One-shot approval exists; persistent rules/simulator/audit UI not Rev8. |
-| T Tool catalog and MCP | 2 | 10 | 2 | MCP stdio lifecycle exists; no remote transport/OAuth/resources-prompts/logs screen. |
-| S Skills, commands and hooks | 0 | 13 | 1 | Skills/hooks routes exist; no Rev8 library/trust/command palette. |
-| X Terminal, browser and language tooling | 6 | 3 | 4 | Terminal/LSP exist; browser adapter and inline code actions are absent. |
-| B Budgets, retries and reliability | 3 | 9 | 0 | Caps/admission exist; no Rev8 budget revision/retry/queue surface. |
-| V Changes, checkpoints, verification and finish | 7 | 5 | 0 | Diff/proof/verification exist; no Rev8 evidence/finish/restore surfaces and no partial landing. |
-| D Sessions, displays and accessibility | 7 | 8 | 0 | History/search exists; no Rev8 Find/rename/pin/archive/parallel-switch surfaces. |
-| O Privacy, diagnostics, optional cloud and distribution | 4 | 8 | 1 | Diagnostics/config export exist; no Rev8 settings provenance/retention/telemetry surfaces. |
+| M Models and routing | 14 | 0 | 0 | None. |
+| P Providers, credentials and local inference | 15 | 0 | 0 | None. |
+| G Reasoning and generation | 14 | 0 | 0 | None. |
+| A Agent presets and delegation | 12 | 0 | 0 | None. |
+| C Context, attachments and retrieval | 14 | 0 | 0 | None. |
+| K Compaction, memory and efficiency | 12 | 0 | 0 | None. |
+| I Instructions, rules and prompt composition | 11 | 0 | 0 | None. |
+| Q Permissions, autonomy and sandbox | 14 | 0 | 0 | None. |
+| T Tool catalog and MCP | 14 | 1 | 0 | vscode: typed unavailable: Streamable HTTP is not negotiated by this daemon build; stdio is the implemented transport and no HTTP/OAuth state is claimed. jetbrains: the live receipt read the provider collection, not an MCP transport action; remote transport is not exercised. daemon: the MCP save route serves stdio; no streamable-HTTP destination/auth/reconnect path is negotiated. |
+| S Skills, commands and hooks | 14 | 0 | 0 | None. |
+| X Terminal, browser and language tooling | 13 | 0 | 0 | None. |
+| B Budgets, retries and reliability | 12 | 0 | 0 | None. |
+| V Changes, checkpoints, verification and finish | 12 | 0 | 0 | None. |
+| D Sessions, displays and accessibility | 15 | 0 | 0 | None. |
+| O Privacy, diagnostics, optional cloud and distribution | 13 | 0 | 0 | None. |
+<!-- edition8-status-table:end -->
 
 ## Wave 0 — Freeze and regenerate (no UI effects)
 

@@ -30,16 +30,20 @@
 //! requested one.
 //!
 //! All routes ride the daemon password. With no SSO authority wired,
-//! start/callback answer a typed 409 `sso_disabled`; with no control plane
-//! wired, 409 `cloud_disabled`; an organization without an enabled
-//! `[enterprise]` SSO configuration answers a typed 409
-//! `sso_not_configured`.
+//! start/callback answer a typed 409 `sso_disabled`; an organization without
+//! an enabled `[enterprise]` SSO configuration answers a typed 409
+//! `sso_not_configured`. Every route resolves the control-plane credential
+//! FIRST: start/callback require a principal (401 when missing/unknown), and
+//! logout requires the presented session token (401 when missing/unknown,
+//! even with no control plane wired).
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faktor_cloud::{AuthSessionId, GovernanceCapability, OidcError, OrganizationId, SsoConfigRef};
+use faktor_cloud::{
+    AuthSessionId, ControlPlaneError, GovernanceCapability, OidcError, OrganizationId, SsoConfigRef,
+};
 use faktor_protocol::error::ApiError;
 
 use super::billing::billing_disabled;
@@ -137,11 +141,9 @@ fn parse_organization(raw: &str) -> Result<OrganizationId, ApiError> {
 /// SAME typed refusal and names only the CALLER's own organization, so the
 /// route can never be a plan/existence oracle for daemon-password callers.
 fn require_own_organization(
-    state: &AppState,
-    headers: &HeaderMap,
+    principal: &faktor_cloud::Principal,
     named: &OrganizationId,
 ) -> Result<(), ApiError> {
-    let principal = require_principal(state, headers)?;
     if principal.organization != *named {
         return Err(ApiError {
             code: "not_found",
@@ -203,6 +205,13 @@ pub(crate) async fn native_sso_start(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    // Principal law: the control-plane principal authenticates BEFORE the
+    // body is parsed, so an invalid/foreign credential never reaches an
+    // organization id, a plan or the SSO feature state.
+    let principal = match require_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(e) => return wire_status(e),
+    };
     let Json(body) = match body {
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid sso start body (strict DTO)")),
@@ -214,7 +223,7 @@ pub(crate) async fn native_sso_start(
     // Principal law: the daemon password alone cannot probe organizations —
     // the presented control-plane principal must own the named organization
     // (the scope refusal names only the caller's own data).
-    if let Err(e) = require_own_organization(&state, &headers, &organization) {
+    if let Err(e) = require_own_organization(&principal, &organization) {
         return wire_status(e);
     }
     let authority = match sso_authority(&state) {
@@ -258,6 +267,12 @@ pub(crate) async fn native_sso_callback(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    // Principal law: identical to `start` — the principal authenticates
+    // before any login state, plan or settings row is read.
+    let principal = match require_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(e) => return wire_status(e),
+    };
     let Json(body) = match body {
         Ok(body) => body,
         Err(_) => return wire_status(malformed_body("invalid sso callback body (strict DTO)")),
@@ -266,9 +281,7 @@ pub(crate) async fn native_sso_callback(
         Ok(organization) => organization,
         Err(e) => return wire_status(e),
     };
-    // Principal law: identical to `start` — the principal must own the named
-    // organization before any login state, plan or settings row is read.
-    if let Err(e) = require_own_organization(&state, &headers, &organization) {
+    if let Err(e) = require_own_organization(&principal, &organization) {
         return wire_status(e);
     }
     let Some(control_plane) = state.deps.control_plane.as_ref() else {
@@ -349,26 +362,53 @@ pub(crate) async fn native_sso_logout(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid sso logout body (strict DTO)")),
-    };
-    let Some(control_plane) = state.deps.control_plane.as_ref() else {
-        return wire_status(ApiError {
-            code: "cloud_disabled",
-            message: "the control plane is disabled (enable the [cloud] section)".into(),
-            http_status: 409,
-            retryable: false,
-        });
-    };
+    // ORDERING: the presented control-plane credential is resolved BEFORE the
+    // body or the control-plane feature state. A missing/unknown/foreign
+    // credential is 401/404 even when `[cloud]` is disabled. A REVOKED
+    // session token is deliberately allowed through to `revoke_session` so a
+    // second logout remains the documented idempotent replay.
     let token = match control_token(&headers) {
         Ok(token) => token,
         Err(e) => return wire_status(e),
+    };
+    let Some(control_plane) = state.deps.control_plane.as_ref() else {
+        return wire_status(ApiError {
+            code: "unauthorized",
+            message: "invalid control-plane credential: no control plane is wired".into(),
+            http_status: 401,
+            retryable: false,
+        });
+    };
+    let principal = match control_plane.authenticate(token) {
+        Ok(principal) => Some(principal),
+        Err(ControlPlaneError::Unauthorized(message))
+            if message == "control-plane session is expired or revoked" =>
+        {
+            None
+        }
+        Err(e) => return wire_status(control_plane_err(e)),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid sso logout body (strict DTO)")),
     };
     let organization = match parse_organization(&body.organization) {
         Ok(organization) => organization,
         Err(e) => return wire_status(e),
     };
+    // Tenant isolation before any session lookup: the named organization must
+    // be the authenticated principal's own (a foreign org is the same typed
+    // 404 a missing one answers).
+    if let Some(principal) = &principal {
+        if principal.organization != organization {
+            return wire_status(ApiError {
+                code: "not_found",
+                message: "control-plane session not found".into(),
+                http_status: 404,
+                retryable: false,
+            });
+        }
+    }
     let session_id = match AuthSessionId::try_new(body.session_id.clone()) {
         Ok(session_id) => session_id,
         Err(e) => return wire_status(control_plane_err(e)),

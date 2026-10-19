@@ -2010,12 +2010,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "E",
     "configKeys": [
-      "faktor.defaultProvider",
-      "faktor.run.defaultProvider"
+      "faktor.defaultProvider"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2065,12 +2064,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "E",
     "configKeys": [
-      "faktor.defaultModel",
-      "faktor.run.defaultModel"
+      "faktor.defaultModel"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2120,7 +2118,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2174,7 +2172,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2326,7 +2324,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2425,12 +2423,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "model.contextLimit",
-      "(proposed)"
+      "faktor.model.contextLimit"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2484,7 +2481,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2536,7 +2533,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2587,7 +2584,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2639,7 +2636,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2691,7 +2688,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2744,7 +2741,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2797,7 +2794,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2850,7 +2847,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2904,7 +2901,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -2959,7 +2956,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3012,7 +3009,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3065,7 +3062,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3114,11 +3111,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "providers[].allow_loopback"
+      "faktor.sandbox.allowLoopback"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3167,14 +3164,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "sandbox.network",
-      "(proposed",
-      "LAN",
-      "policy)"
+      "faktor.sandbox.network"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3225,7 +3219,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3384,7 +3378,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3435,7 +3429,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A01",
       "A02",
@@ -3544,7 +3538,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3592,7 +3586,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3638,11 +3632,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "task.max_tokens"
+      "faktor.generation.maxOutput"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3687,10 +3681,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.generation.temperature"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3735,10 +3731,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.generation.topP"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3786,7 +3784,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3834,7 +3832,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3882,7 +3880,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3930,7 +3928,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -3978,7 +3976,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -4026,7 +4024,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -4074,7 +4072,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -4125,7 +4123,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -4174,7 +4172,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A02",
       "A03",
@@ -4224,7 +4222,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4273,7 +4271,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4322,7 +4320,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4372,7 +4370,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4422,7 +4420,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4473,7 +4471,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4524,7 +4522,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4575,7 +4573,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4627,7 +4625,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4733,7 +4731,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4787,7 +4785,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -4838,7 +4836,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A11",
       "A12"
@@ -4885,7 +4883,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A11",
       "A12"
@@ -4933,7 +4931,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A13"
     ],
@@ -4979,7 +4977,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A13"
     ],
@@ -5073,7 +5071,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A14"
     ],
@@ -5119,7 +5117,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5220,10 +5218,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.retrieval.strategy"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5273,10 +5273,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.retrieval.embeddingProvider"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5328,7 +5330,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5380,7 +5382,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5432,7 +5434,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5483,7 +5485,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A11",
@@ -5532,11 +5534,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "compact_at_usage"
+      "faktor.context.compactionMinReduction"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5636,7 +5638,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A15"
     ],
@@ -5681,7 +5683,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A15"
     ],
@@ -5725,11 +5727,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "efficiency.failure_learning"
+      "faktor.efficiency.failureLearning"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5776,11 +5778,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "efficiency.ccr"
+      "faktor.efficiency.ccr"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5827,11 +5829,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "efficiency.typed_handoff"
+      "faktor.efficiency.typedHandoff"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5878,13 +5880,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "efficiency.semantic_context",
-      "(alias",
-      "information_gain)"
+      "faktor.efficiency.semanticContext"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5931,11 +5931,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "efficiency.rework_routing"
+      "faktor.efficiency.reworkGuard"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -5982,10 +5982,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.memory.captureMode"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A16"
     ],
@@ -6031,7 +6033,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A16"
     ],
@@ -6078,7 +6080,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A12",
       "A15",
@@ -6129,7 +6131,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6179,7 +6181,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6230,7 +6232,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6279,7 +6281,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6327,7 +6329,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6379,7 +6381,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6427,7 +6429,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6476,7 +6478,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6524,7 +6526,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6572,7 +6574,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6622,7 +6624,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6670,13 +6672,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "permission",
-      "preset",
-      "(proposed)"
+      "faktor.permissions.preset"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6725,13 +6725,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "permission-rules",
-      "store",
-      "(proposed)"
+      "faktor.permissions.allowedTools"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6780,12 +6778,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "sandbox.filesystem",
-      "(proposed)"
+      "faktor.sandbox.shell"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6834,11 +6831,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "sandbox.shell"
+      "faktor.sandbox.shell"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6887,11 +6884,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "sandbox.network"
+      "faktor.sandbox.network"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -6990,7 +6987,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A18"
     ],
@@ -7035,7 +7032,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A18"
     ],
@@ -7082,7 +7079,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A17",
       "A28"
@@ -7131,7 +7128,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -7181,12 +7178,10 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
-    "configKeys": [
-      "sandbox.shell"
-    ],
+    "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -7240,7 +7235,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -7292,7 +7287,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -7343,7 +7338,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A09",
       "A10",
@@ -7394,7 +7389,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7440,10 +7435,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.permissions.allowedTools"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7495,7 +7492,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A21"
     ],
@@ -7545,7 +7542,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "partial",
     "acceptanceIds": [
       "A22"
     ],
@@ -7593,7 +7590,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7692,7 +7689,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7739,12 +7736,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "permission-rules",
-      "(proposed)"
+      "faktor.permissions.allowedTools"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7794,7 +7790,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7897,7 +7893,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7946,7 +7942,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -7996,7 +7992,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -8045,7 +8041,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -8095,7 +8091,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A21",
@@ -8144,7 +8140,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8192,7 +8188,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8240,7 +8236,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8288,7 +8284,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8336,7 +8332,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8384,7 +8380,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8436,7 +8432,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A24"
     ],
@@ -8483,7 +8479,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A24"
     ],
@@ -8528,7 +8524,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8578,7 +8574,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8628,7 +8624,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8679,7 +8675,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8731,7 +8727,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A24"
     ],
@@ -8777,7 +8773,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A10",
@@ -8868,8 +8864,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "sandbox.shell",
-      "sandbox.home"
+      "faktor.sandbox.shell"
     ],
     "endpoints": [],
     "contractGap": "",
@@ -9075,7 +9070,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9127,7 +9122,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9179,7 +9174,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9231,7 +9226,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9284,7 +9279,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9337,7 +9332,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9388,7 +9383,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "sandbox.shell"
+      "faktor.sandbox.shell"
     ],
     "endpoints": [],
     "contractGap": "",
@@ -9446,7 +9441,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A08",
       "A09",
@@ -9500,8 +9495,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "E",
     "configKeys": [
-      "faktor.budgetTokens",
-      "max_tokens"
+      "faktor.budget.maxTokens"
     ],
     "endpoints": [],
     "contractGap": "",
@@ -9552,8 +9546,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "E",
     "configKeys": [
-      "faktor.budgetCostMicro",
-      "max_cost_micro"
+      "faktor.budget.maxCostMicro"
     ],
     "endpoints": [],
     "contractGap": "",
@@ -9599,10 +9592,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.budget.warnAtPercent"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A30",
       "A31"
@@ -9655,7 +9650,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -9712,7 +9707,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -9762,11 +9757,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "retry.max_attempts"
+      "faktor.retry.maxAttempts"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -9816,13 +9811,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "R",
     "configKeys": [
-      "retry.base_delay_ms",
-      "retry.max_delay_ms",
-      "retry.jitter"
+      "faktor.retry.baseDelayMs"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -9874,7 +9867,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -9986,7 +9979,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -10039,7 +10032,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A05",
       "A17",
@@ -10094,7 +10087,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A28",
       "A29"
@@ -10300,7 +10293,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A33"
     ],
@@ -10390,7 +10383,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A33",
       "A34"
@@ -10503,7 +10496,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A15",
       "A29",
@@ -10670,7 +10663,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A15",
       "A29",
@@ -10728,7 +10721,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A34"
     ],
@@ -10876,7 +10869,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A40"
     ],
@@ -10925,7 +10918,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -10981,7 +10974,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -11188,15 +11181,10 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "H",
-    "configKeys": [
-      "host",
-      "theme/zoom",
-      "density",
-      "(proposed)"
-    ],
+    "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -11242,10 +11230,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "H",
-    "configKeys": [
-      "send",
-      "keybinding"
-    ],
+    "configKeys": [],
     "endpoints": [],
     "contractGap": "",
     "currentStatus": "exists",
@@ -11295,13 +11280,10 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "H",
-    "configKeys": [
-      "package.json",
-      "commands/keybindings"
-    ],
+    "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -11348,10 +11330,12 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "H",
-    "configKeys": [],
+    "configKeys": [
+      "faktor.telemetry.categories"
+    ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -11449,7 +11433,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A39"
     ],
@@ -11496,7 +11480,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "configKeys": [],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A27",
       "A29",
@@ -11552,7 +11536,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -11606,7 +11590,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -11661,7 +11645,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -11942,7 +11926,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -11998,7 +11982,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -12047,12 +12031,11 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "N",
     "configKeys": [
-      "telemetry",
-      "(proposed)"
+      "faktor.telemetry.enabled"
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "missing",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -12105,7 +12088,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -12160,7 +12143,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",
@@ -12215,7 +12198,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     ],
     "endpoints": [],
     "contractGap": "",
-    "currentStatus": "partial",
+    "currentStatus": "exists",
     "acceptanceIds": [
       "A06",
       "A11",

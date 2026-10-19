@@ -36,6 +36,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CI_TOOLS = process.env.FAKTOR_CI_TOOLS || (process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR, 'release/faktor-ci-tools') : resolve(ROOT, 'target/release/faktor-ci-tools'));
 const DEFAULT_BASELINE = resolve(
   ROOT,
   'apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json',
@@ -216,14 +217,8 @@ function main(args) {
   // End-to-end: the canonical per-platform checker must now accept it.
   try {
     execFileSync(
-      'python3',
-      [
-        resolve(ROOT, 'scripts/certification/check-visual-baseline.py'),
-        '--platform',
-        platform,
-        '--file',
-        baselinePath,
-      ],
+      CI_TOOLS,
+      ['visual-baseline', '--platform', platform, '--file', baselinePath],
       { stdio: 'inherit' },
     );
   } catch {

@@ -149,7 +149,7 @@ const PLAN_GATES = [
   ['cargo-check', '§1', 'cargo check --workspace --all-features'],
   ['cargo-clippy', '§1', 'cargo clippy --workspace --all-targets --all-features -- -D warnings'],
   ['cargo-test', '§1', 'cargo test --workspace --all-features'],
-  ['compiled-capability-tests', '§1', 'check-capability-tests-compiled.py'],
+  ['compiled-capability-tests', '§1', '\\"$CI_TOOLS\\" capability-tests'],
   ['invariants', '§2', 'check-invariants.mjs'],
   ['invariant-coverage-selftest', '§2', 'check-invariant-coverage.mjs selftest'],
   ['invariant-coverage-check', '§2', 'check-invariant-coverage.mjs --check'],
@@ -233,7 +233,7 @@ const CI_LANE_MAP = [
     // The compiled --list enumeration runs only in the trusted linux lane
     // (the PR linux lane deliberately keeps its reduced command list).
     id: 'compiled-capability-tests',
-    lanes: [['.woodpecker/trusted/trusted.yaml', 'check-capability-tests-compiled.py']],
+    lanes: [['.woodpecker/trusted/trusted.yaml', '$CARGO_TARGET_DIR/release/faktor-ci-tools capability-tests']],
   },
   {
     id: 'invariants',
@@ -505,14 +505,8 @@ const SCRIPT_ALLOWLIST = new Map(
       'hardware-in-the-loop release lane driver: requires FAKTOR_HIL=1 and a rig command, so it is a typed refusal outside the release rig.',
     'scripts/woodpecker/verify-boundary.sh':
       'operator assertion for the trusted/untrusted Woodpecker project boundary; exercised during server setup, not by the dogfood suite.',
-    'scripts/certification/fixtures/woodpecker-api/mock_server.py':
-      'fixture mock Woodpecker API; spawned by scripts/certify.sh release gates and the certification selftests.',
     'scripts/certification/prove-all.mjs':
       'certificate aggregate binding the checkout bytes; its component selftests (discovery, workflow graph, publisher, visual) each run in dogfood §2.',
-    'scripts/certification/publish-status.py':
-      'Python publisher implementation pinned to the same canonical payload vector as publish-status.mjs (whose selftest runs in dogfood §2).',
-    'scripts/certification/lane-marker.py':
-      'Python lane-marker writer; its byte-for-byte agreement with the node/shell writers is proven by the lane-marker selftest inside evidence.mjs selftest (dogfood §2).',
     'scripts/check-fault-seams.sh':
       'static fault-seam checker executed directly by the PR static lane and the trusted static lane (sh scripts/check-fault-seams.sh); it is a lane command, not a dogfood-plan step.',
     'scripts/mutations/vscode-ts-loader.mjs':
@@ -520,7 +514,7 @@ const SCRIPT_ALLOWLIST = new Map(
     'scripts/mutation-run.mjs':
       'planted-mutation runner; tests/invariants.toml mutation_command invokes it per invariant and check-invariants --mutations (dogfood §3) executes that registry.',
     'scripts/generate-iana-network-table':
-      'extensionless python generator for the frozen IANA table in crates/security/src/network.rs; invoked by scripts/update-iana-special-registry.sh (operator refresh) and the generated table is exercised by the security crate tests under §1 cargo test --workspace.',
+      'thin wrapper for the Rust faktor-ci-tools iana-table generator of the frozen IANA table in crates/security/src/network.rs; invoked by scripts/update-iana-special-registry.sh (operator refresh) and the generated table is exercised by the security crate tests.',
     'scripts/edition5/dogfood.sh':
       'isolated real-daemon Edition 5 dogfood (git worktree + data dir + loopback fake provider); runs in the trusted certificate lane and locally because it needs the full daemon/JetBrains toolchains, not the node-only dogfood plan.',
     'scripts/edition5/fake-openai.mjs':
@@ -2551,7 +2545,7 @@ function panelGaps(root, options = {}) {
 
 export function scriptFiles(root) {
   return walkFiles(join(root, 'scripts'), (path) => {
-    if (/\.(sh|mjs|js|cjs|ps1|py)$/.test(path)) return true;
+    if (/\.(sh|mjs|js|cjs|ps1)$/.test(path)) return true;
     // Extensionless executable scripts (e.g. scripts/generate-iana-network-table)
     // are part of the surface too: a shebang'd file must not hide behind its
     // missing extension.

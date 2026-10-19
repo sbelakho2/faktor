@@ -96,11 +96,108 @@ pub const MAX_HOOK_ARG_BYTES: usize = 4096;
 pub const MAX_HOOK_ENV: usize = 32;
 pub const MAX_HOOK_ENV_NAME_BYTES: usize = 128;
 pub const MAX_HOOK_ENV_VALUE_BYTES: usize = 4096;
+/// Bounded tool/path predicates on one hook spec.
+pub const MAX_HOOK_MATCHERS: usize = 32;
+pub const MAX_HOOK_MATCHER_BYTES: usize = 512;
+
+/// Tool/path predicates evaluated against a hook input. An empty matcher is
+/// the event-set-only subscription the Edition 5 contract already expressed;
+/// a non-empty matcher requires the named field to be present and to match
+/// (fail closed when the payload does not carry it).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HookMatcher {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl HookMatcher {
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.paths.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.tools.len() > MAX_HOOK_MATCHERS || self.paths.len() > MAX_HOOK_MATCHERS {
+            return Err(format!(
+                "a hook matcher may carry at most {MAX_HOOK_MATCHERS} tool/path predicates"
+            ));
+        }
+        for value in self.tools.iter().chain(self.paths.iter()) {
+            if value.is_empty()
+                || value.len() > MAX_HOOK_MATCHER_BYTES
+                || value.contains('\u{0}')
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "hook matcher predicates must be 1..={MAX_HOOK_MATCHER_BYTES} bytes without control characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn matches(&self, input: &HookInput) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        if !self.tools.is_empty() {
+            let tool = input
+                .payload
+                .get("tool")
+                .or_else(|| input.payload.get("toolName"))
+                .and_then(|value| value.as_str());
+            let Some(tool) = tool else { return false };
+            if !self.tools.iter().any(|pattern| glob_match(pattern, tool)) {
+                return false;
+            }
+        }
+        if !self.paths.is_empty() {
+            let path = input
+                .payload
+                .get("path")
+                .or_else(|| input.payload.get("file"))
+                .or_else(|| input.payload.get("canonical_path"))
+                .and_then(|value| value.as_str());
+            let Some(path) = path else { return false };
+            if !self.paths.iter().any(|pattern| glob_match(pattern, path)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Whole-string glob matcher (`*`, `**`, `?`) used by hook predicates.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn walk(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some(b'*') => {
+                if pattern.get(1) == Some(&b'*') {
+                    // `**` crosses path separators.
+                    walk(&pattern[2..], text) || (!text.is_empty() && walk(pattern, &text[1..]))
+                } else {
+                    // `*` stays within one path segment.
+                    walk(&pattern[1..], text)
+                        || (!text.is_empty() && text[0] != b'/' && walk(pattern, &text[1..]))
+                }
+            }
+            Some(b'?') => !text.is_empty() && walk(&pattern[1..], &text[1..]),
+            Some(expected) => text.first() == Some(expected) && walk(&pattern[1..], &text[1..]),
+        }
+    }
+    walk(pattern.as_bytes(), text.as_bytes())
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HookSpec {
     pub id: String,
     pub events: Vec<HookEvent>,
+    /// Tool/path predicates; empty means the event set alone (the Edition 5
+    /// contract). A richer matcher is a schema feature, never a silent guess.
+    #[serde(default)]
+    pub matcher: HookMatcher,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -126,11 +223,19 @@ pub struct HookSpec {
     pub permission_scope: CapabilitySet,
 }
 
+impl HookSpec {
+    /// Whether this spec applies to the concrete input (event + predicates).
+    pub fn matches_input(&self, input: &HookInput) -> bool {
+        self.events.contains(&input.event) && self.matcher.matches(input)
+    }
+}
+
 impl Default for HookSpec {
     fn default() -> Self {
         Self {
             id: String::new(),
             events: vec![],
+            matcher: HookMatcher::default(),
             command: String::new(),
             args: vec![],
             env: vec![],
@@ -307,6 +412,7 @@ impl HookRegistry {
                 HookEvent::ALL.len()
             ));
         }
+        spec.matcher.validate()?;
         if spec.args.len() > MAX_HOOK_ARGS {
             return Err(format!("a hook may carry at most {MAX_HOOK_ARGS} args"));
         }
@@ -409,6 +515,11 @@ impl HookRegistry {
             .collect()
     }
 
+    /// Event + tool/path predicate match for one concrete input.
+    pub fn matches_input(&self, spec: &HookSpec, event: HookEvent, input: &HookInput) -> bool {
+        spec.events.contains(&event) && spec.matcher.matches(input)
+    }
+
     fn audit_push(&self, rec: HookAuditRecord) {
         // Classified: the audit trail is a bounded RING; a poisoned guard
         // is recovered with the poison flag cleared (rebuilt in place).
@@ -430,6 +541,9 @@ impl HookRegistry {
     pub fn run(&self, event: HookEvent, input: &HookInput) -> HookVerdict {
         let mut out = HookVerdict::Allow;
         for spec in self.matching(event) {
+            if !spec.matcher.matches(input) {
+                continue;
+            }
             let verdict = self.run_one(&spec, input);
             match verdict {
                 HookVerdict::Deny { .. } => return verdict,
@@ -729,6 +843,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn tool_path_matchers_are_fail_closed_and_bounded() {
+        let spec = HookSpec {
+            id: "m".into(),
+            events: vec![HookEvent::PreTool],
+            matcher: HookMatcher {
+                tools: vec!["run_*".into()],
+                paths: vec!["src/**/*.rs".into()],
+            },
+            ..Default::default()
+        };
+        let input = |tool: &str, path: &str| HookInput {
+            event: HookEvent::PreTool,
+            payload: serde_json::json!({ "tool": tool, "path": path }),
+            ..Default::default()
+        };
+        assert!(spec.matches_input(&input("run_command", "src/runtime/loop.rs")));
+        assert!(!spec.matches_input(&input("read_file", "src/runtime/loop.rs")));
+        assert!(!spec.matches_input(&input("run_command", "docs/spec.md")));
+        assert!(!spec.matches_input(&HookInput {
+            event: HookEvent::PreTool,
+            payload: serde_json::json!({ "tool": "run_command" }),
+            ..Default::default()
+        }));
+        assert!(!spec.matches_input(&input("run_command", "src\\runtime\\loop.rs")));
+        let single = HookSpec {
+            matcher: HookMatcher {
+                tools: vec![],
+                paths: vec!["src/*.rs".into()],
+            },
+            ..spec.clone()
+        };
+        assert!(single.matches_input(&input("run_command", "src/lib.rs")));
+        assert!(!single.matches_input(&input("run_command", "src/deep/lib.rs")));
+        let mut too_many = spec.clone();
+        too_many.matcher.tools = vec!["x".into(); MAX_HOOK_MATCHERS + 1];
+        assert!(HookRegistry::try_new().unwrap().register(too_many).is_err());
+    }
 
     #[test]
     fn poisoned_hook_policy_refuses_mutations_and_recovers_reads() {

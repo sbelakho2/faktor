@@ -640,10 +640,4 @@ woodpecker-cli lint .woodpecker/            # one pass over all workflow files
 # No local binary? The official CLI image works the same (Docker daemon required):
 docker run --rm -v "$PWD":/repo -w /repo woodpeckerci/woodpecker-cli:v3 lint .woodpecker/
 bash scripts/woodpecker/verify-boundary.sh  # layout guards (offline) + server settings (with credentials)
-python3 - <<'PY'                            # dependency-light parse gate
-import glob, yaml
-for f in sorted(glob.glob(".woodpecker/**/*.yml", recursive=True) + glob.glob(".woodpecker/**/*.yaml", recursive=True)):
-    yaml.safe_load(open(f))
-    print("ok", f)
-PY
 ```

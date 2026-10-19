@@ -7,6 +7,12 @@
 // dependencies, because a change in `faktor-store` can break `faktor-agent`,
 // `faktor-server` and every test crate that depends on them.
 //
+// The crate/test/dependency map is the ONE serialized repository graph from
+// `faktor-impact` (`faktor impact graph --selector`), produced by the same
+// builder the native semantic `affected()` provider consumes. A missing,
+// stale, unsupported or corrupt graph is a typed refusal with a conservative
+// full-lane fallback; this file never re-derives a private manifest graph.
+//
 // A path outside the mapped roots is a typed refusal, never a silent skip:
 // callers either run the full relevant layer (documented) or fail.
 //
@@ -76,19 +82,219 @@ export function workspaceMembers(root = ROOT) {
 
 const GRAPH_CACHE = new Map();
 
-function manifestSignature(root, members) {
-  const paths = [join(root, 'Cargo.toml')];
-  for (const member of members) paths.push(join(root, member, 'Cargo.toml'));
-  let signature = '';
-  for (const path of paths) {
+export const IMPACT_GRAPH_SCHEMA = 'faktor-impact-graph/v1';
+
+function graphCandidates(root, explicit = null) {
+  const paths = [];
+  if (explicit) paths.push(explicit);
+  if (process.env.FAKTOR_IMPACT_GRAPH) paths.push(process.env.FAKTOR_IMPACT_GRAPH);
+  paths.push(join(root, 'target/certification/impact/graph.json'));
+  paths.push(join(root, 'tests/programme/impact-graph.json'));
+  return [...new Set(paths.map((path) => resolve(root, path)))];
+}
+
+function readJson(path) {
+  const text = read(path);
+  return JSON.parse(text);
+}
+
+/**
+ * Load the ONE serialized repository graph. The document is structurally
+ * validated here; a missing, stale (revision != HEAD), unsupported or
+ * corrupt graph is a typed error and the caller falls back conservatively
+ * (whole workspace), never to a second manifest heuristic.
+ */
+export function loadImpactGraph(root = ROOT, { head = null, path = null } = {}) {
+  const candidates = graphCandidates(root, path);
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    let document;
     try {
-      const stat = statSync(path);
-      signature += `${path}\0${stat.size}\0${stat.mtimeMs}\n`;
-    } catch {
-      signature += `${path}\0missing\n`;
+      document = readJson(candidate);
+    } catch (error) {
+      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate };
+    }
+    const error = validateImpactGraph(document, head);
+    if (error) return { document: null, error, path: candidate };
+    return { document, error: null, path: candidate };
+  }
+  return { document: null, error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)', path: null };
+}
+
+export function validateImpactGraph(document, head = null) {
+  if (document === null || typeof document !== 'object') return 'impact graph is not an object';
+  if (document.schema !== IMPACT_GRAPH_SCHEMA) return `unsupported impact graph schema ${JSON.stringify(document.schema)}`;
+  if (!Array.isArray(document.nodes) || !Array.isArray(document.edges) || !Array.isArray(document.reverse_edges)) {
+    return 'impact graph has no nodes/edges/reverse_edges arrays';
+  }
+  if (document.nodes.length > 2_000_000 || document.edges.length > 8_000_000) {
+    return 'impact graph exceeds the node/edge bound';
+  }
+  if (typeof document.digest !== 'string' || document.digest.length === 0) {
+    return 'impact graph carries no digest';
+  }
+  const revision = document.revision ?? {};
+  if (head && revision.commit && revision.commit !== head) {
+    return `impact graph is stale: revision ${revision.commit} != HEAD ${head}`;
+  }
+  const nodes = new Map();
+  let previous = null;
+  for (const node of document.nodes) {
+    if (!node || typeof node.id !== 'string' || typeof node.kind !== 'string') {
+      return 'impact graph contains a node without id/kind';
+    }
+    if (previous !== null && !(previous < node.id)) return `impact graph nodes are not sorted at ${node.id}`;
+    previous = node.id;
+    if (nodes.has(node.id)) return `impact graph contains duplicate node ${node.id}`;
+    nodes.set(node.id, node);
+  }
+  const edges = new Set();
+  previous = null;
+  for (const edge of document.edges) {
+    if (!edge || typeof edge.from !== 'string' || typeof edge.to !== 'string' || typeof edge.kind !== 'string') {
+      return 'impact graph contains an edge without from/to/kind';
+    }
+    if (!nodes.has(edge.from) || !nodes.has(edge.to)) return `impact graph edge references unknown node: ${edge.from} -> ${edge.to}`;
+    const key = `${edge.from}\0${edge.kind}\0${edge.to}`;
+    if (previous !== null && !(previous < key)) return `impact graph edges are not sorted at ${edge.from}`;
+    previous = key;
+    if (edges.has(key)) return `impact graph contains duplicate edge ${edge.from} -> ${edge.to}`;
+    edges.add(key);
+  }
+  for (const edge of document.reverse_edges) {
+    const forward = `${edge.to}\0${edge.kind}\0${edge.from}`;
+    if (!edges.has(forward)) return `impact reverse edge has no forward counterpart: ${edge.from} -> ${edge.to}`;
+  }
+  return null;
+}
+
+function authorityModel(document) {
+  const crates = new Map();
+  const crateByDir = new Map();
+  const dependents = new Map();
+  const testsByCrate = new Map();
+  const nodesById = new Map();
+  const reverse = new Map();
+  const files = new Map();
+  const fileCrate = new Map();
+  const byPath = new Map();
+  for (const node of document.nodes) {
+    nodesById.set(node.id, node);
+    if (node.path) {
+      if (!byPath.has(node.path)) byPath.set(node.path, []);
+      byPath.get(node.path).push(node.id);
+    }
+    if (node.kind === 'crate') {
+      const dir = node.path === '.' || node.path === undefined ? '' : String(node.path).replace(/\/+$/, '');
+      crates.set(node.name, { name: node.name, dir, deps: new Set() });
+      if (dir.length > 0) crateByDir.set(dir, crates.get(node.name));
+    }
+    if (node.kind === 'file' && node.path) {
+      files.set(node.path, node.id);
+      if (node.crate_name) fileCrate.set(node.path, node.crate_name);
+    }
+    if (node.kind === 'test') {
+      const crate = node.crate_name;
+      if (crate) {
+        if (!testsByCrate.has(crate)) testsByCrate.set(crate, []);
+        testsByCrate.get(crate).push(node.id);
+      }
     }
   }
-  return signature;
+  for (const crate of crates.values()) dependents.set(crate.name, new Set());
+  for (const edge of document.edges) {
+    if (edge.kind === 'depends_on') {
+      const from = nodesById.get(edge.from);
+      const to = nodesById.get(edge.to);
+      if (from?.kind === 'crate' && to?.kind === 'crate') {
+        const crate = crates.get(from.name);
+        const dependency = crates.get(to.name);
+        if (crate && dependency) {
+          crate.deps.add(dependency.name);
+          dependents.get(dependency.name).add(crate.name);
+        }
+      }
+    }
+  }
+  for (const edge of document.reverse_edges) {
+    if (!reverse.has(edge.from)) reverse.set(edge.from, []);
+    reverse.get(edge.from).push(edge);
+  }
+  for (const tests of testsByCrate.values()) tests.sort();
+  const byDir = [...crates.values()].sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
+  return { crates, byDir, crateByDir, dependents, testsByCrate, nodesById, reverse, files, fileCrate, byPath, document };
+}
+
+/**
+ * Reverse traversal over the SAME serialized graph the native authority
+ * uses. Crate nodes propagate to dependent crates and their tests, exactly
+ * like `faktor-impact`'s query; other nodes follow the materialized reverse
+ * edges with a depth bound. Deterministic, bounded, and conservative.
+ */
+export function impactFromAuthority(authority, changed, { maxDepth = 8, maxResults = 4096 } = {}) {
+  const seeds = new Set();
+  for (const path of changed) {
+    const file = authority.files.get(path);
+    if (file) seeds.add(file);
+    // Symbols/tests defined by the changed file are seeds too: coverage
+    // edges then point from tests to exactly those declarations.
+    for (const id of authority.byPath.get(path) ?? []) seeds.add(id);
+    const crate = crateForPath(path, authority);
+    if (crate) seeds.add(`crate:${crate.name}`);
+  }
+  const best = new Map();
+  const queue = [];
+  const push = (id, distance, reason) => {
+    const current = best.get(id);
+    if (current && current.distance <= distance) return;
+    best.set(id, { distance, reason });
+    queue.push(id);
+  };
+  for (const id of [...seeds].sort()) push(id, 0, 'changed');
+  const tests = [];
+  const crates = new Set();
+  let visitedEdges = 0;
+  let cursor = 0;
+  while (cursor < queue.length) {
+    const id = queue[cursor];
+    cursor += 1;
+    const current = best.get(id);
+    if (!current || current.distance >= maxDepth) continue;
+    const node = authority.nodesById.get(id);
+    if (!node) continue;
+    if (node.kind === 'crate') {
+      crates.add(node.name);
+      for (const test of authority.testsByCrate.get(node.name) ?? []) {
+        push(test, current.distance + 1, `tests:${node.name}`);
+      }
+    }
+    for (const edge of authority.reverse.get(id) ?? []) {
+      visitedEdges += 1;
+      if (node.kind === 'crate' && !['depends_on', 'tests'].includes(edge.kind)) continue;
+      if (node.kind === 'file' && edge.kind === 'defines') continue;
+      push(edge.to, current.distance + 1, `${edge.kind}:${id}`);
+    }
+  }
+  for (const [id, value] of best) {
+    const node = authority.nodesById.get(id);
+    if (node?.kind !== 'test') continue;
+    tests.push({
+      id,
+      name: node.name,
+      path: node.path ?? null,
+      crate: node.crate_name ?? null,
+      reason: value.reason,
+      distance: value.distance,
+    });
+  }
+  tests.sort((a, b) => a.id.localeCompare(b.id));
+  const truncated = tests.length > maxResults;
+  return {
+    tests: tests.slice(0, maxResults),
+    crates: [...crates].sort(),
+    visited_edges: visitedEdges,
+    truncated,
+  };
 }
 
 /** Fixture hook: drop cached graphs for one root (or all roots). */
@@ -101,60 +307,20 @@ export function clearWorkspaceGraphCache(root = null) {
 }
 
 /**
- * Crate metadata: name, directory, direct workspace dependencies and the
- * test/binary targets that `cargo test -p <name>` compiles.
- *
- * The graph (and its reverse edges) is cached per commit; a manifest-size/
- * mtime fingerprint keeps an uncommitted worktree edit from reusing a stale
- * graph. `refresh` bypasses the cache for fixture mutation.
+ * The workspace graph consumed by selection: the serialized authority
+ * document, with reverse crate edges, crate directories and test nodes.
+ * `authority: false` means the caller MUST fall back conservatively.
  */
-export function workspaceGraph(root = ROOT, { head = null, refresh = false } = {}) {
-  const members = workspaceMembers(root);
-  const key = `${resolve(root)}\0${head ?? ''}\0${manifestSignature(root, members)}`;
+export function workspaceGraph(root = ROOT, { head = null, refresh = false, path = null } = {}) {
+  const loaded = loadImpactGraph(root, { head, path });
+  const key = `${resolve(root)}\0${head ?? ''}\0${loaded.path ?? ''}\0${loaded.error ?? ''}`;
   if (!refresh) {
     const cached = GRAPH_CACHE.get(key);
     if (cached) return cached;
   }
-  const crates = new Map();
-  const byDir = [];
-  const crateByDir = new Map();
-  for (const member of members) {
-    const manifest = join(root, member, 'Cargo.toml');
-    if (!existsSync(manifest)) continue;
-    const text = read(manifest);
-    const name = /\[package\][\s\S]*?^name\s*=\s*"([^"]+)"/m.exec(text)?.[1];
-    if (!name) continue;
-    const deps = new Set();
-    let section = '';
-    for (const line of text.split('\n')) {
-      const header = /^\s*\[([^\]]+)\]/.exec(line);
-      if (header) {
-        section = header[1];
-        continue;
-      }
-      if (
-        !/^(dependencies|dev-dependencies|build-dependencies)$/.test(section) &&
-        !/\.(dependencies|dev-dependencies|build-dependencies)$/.test(section)
-      ) {
-        continue;
-      }
-      const dep = /^\s*([A-Za-z0-9_-]+)\s*(?:=|\.workspace)/.exec(line);
-      if (dep && dep[1].startsWith('faktor-')) deps.add(dep[1]);
-    }
-    const crate = { name, dir: member, deps: [...deps].sort() };
-    crates.set(name, crate);
-    byDir.push(crate);
-    crateByDir.set(member, crate);
-  }
-  // Reverse dependency closure over workspace crates.
-  const dependents = new Map();
-  for (const crate of crates.values()) dependents.set(crate.name, new Set());
-  for (const crate of crates.values()) {
-    for (const dep of crate.deps) {
-      if (dependents.has(dep)) dependents.get(dep).add(crate.name);
-    }
-  }
-  const graph = { crates, byDir, crateByDir, dependents };
+  const graph = loaded.document
+    ? { ...authorityModel(loaded.document), authority: true, source: 'authority', error: null, revision: loaded.document.revision ?? null, digest: loaded.document.digest, path: loaded.path }
+    : { crates: new Map(), byDir: [], crateByDir: new Map(), dependents: new Map(), testsByCrate: new Map(), nodesById: new Map(), reverse: new Map(), files: new Map(), fileCrate: new Map(), byPath: new Map(), document: null, authority: false, source: 'conservative-fallback', error: loaded.error, revision: null, digest: null, path: null };
   GRAPH_CACHE.set(key, graph);
   return graph;
 }
@@ -175,6 +341,8 @@ export function crateForPath(path, graph) {
       if (slash < 0) break;
       candidate = candidate.slice(0, slash);
     }
+    const exact = graph.fileCrate?.get(normalized);
+    if (exact) return graph.crates.get(exact) ?? null;
     return null;
   }
   let best = null;
@@ -360,9 +528,44 @@ function affectedSurfaces(index, rows, changed, graph, full) {
   return [...selected].sort();
 }
 
-export function select(changedPaths, { mode = 'pull', base = null, root = ROOT } = {}) {
+function manifestCrateNames(root) {
+  const names = [];
+  for (const member of workspaceMembers(root)) {
+    try {
+      const text = read(join(root, member, 'Cargo.toml'));
+      const name = /\[package\][\s\S]*?^name\s*=\s*"([^"]+)"/m.exec(text)?.[1];
+      if (name) names.push(name);
+    } catch {
+      // A member without a readable manifest is skipped visibly by the
+      // caller's full-lane command, never fabricated as a selectable crate.
+    }
+  }
+  return [...new Set(names)].sort();
+}
+
+function testCommandsFor(tests, limit = 256) {
+  const commands = new Set();
+  for (const test of tests.slice(0, limit)) {
+    if (!test.crate || !test.name) continue;
+    if (!/^[A-Za-z0-9_:.-]+$/.test(test.name)) continue;
+    if (!/^[A-Za-z0-9_-]+$/.test(test.crate)) continue;
+    const path = String(test.path ?? '');
+    const marker = path.lastIndexOf('/tests/');
+    if (marker >= 0) {
+      const file = path.slice(marker + '/tests/'.length);
+      if (!file.endsWith('.rs') || file.includes('/')) continue;
+      const target = file.slice(0, -3);
+      commands.add(`cargo test -p ${test.crate} --test ${target} ${test.name}`);
+    } else {
+      commands.add(`cargo test -p ${test.crate} --lib ${test.name}`);
+    }
+  }
+  return [...commands].sort();
+}
+
+export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, graphPath = null } = {}) {
   const head = git(['rev-parse', 'HEAD'], root);
-  const graph = workspaceGraph(root, { head });
+  const graph = workspaceGraph(root, { head, path: graphPath });
   const full = FULL_MODES.has(mode);
   // Directory spellings (`tests/programme/`) select their whole subtree; a
   // trailing slash must not turn a mapped path into an empty surface set.
@@ -378,6 +581,12 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
   const unmapped = [];
   const notes = [];
   let forceFull = false;
+  const graphFallback = !full && !graph.authority;
+  if (graphFallback) {
+    notes.push(
+      `repository graph unavailable (${graph.error}); typed refusal with a conservative full-lane fallback`,
+    );
+  }
 
   for (const path of changed) {
     if (path === 'Cargo.toml' || path === 'Cargo.lock' || path === 'rust-toolchain.toml') {
@@ -414,10 +623,17 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
   }
 
   let selectedCrates;
-  if (full) {
+  if (full || (graphFallback && (forceFull || changed.length === 0))) {
     selectedCrates = [...graph.crates.keys()].sort();
+    if (selectedCrates.length === 0) selectedCrates = manifestCrateNames(root);
     for (const suite of Object.keys(SUITE_COMMANDS)) suites.add(suite);
-    notes.push(`mode ${mode} is a full lane: every crate and suite is selected`);
+    notes.push(
+      full
+        ? `mode ${mode} is a full lane: every crate and suite is selected`
+        : 'repository graph unavailable: every workspace crate and suite is selected conservatively',
+    );
+  } else if (graphFallback) {
+    selectedCrates = [];
   } else {
     selectedCrates = reverseClosure([...crates], graph);
     if (selectedCrates.length < crates.size) {
@@ -437,11 +653,16 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
     }
     selectedCrates = kept;
   }
+  const impact = graph.authority && changed.length > 0
+    ? impactFromAuthority(graph, changed, { maxDepth: 8, maxResults: 4096 })
+    : { tests: [], crates: [], visited_edges: 0, truncated: false };
+  const testCommands = full || forceFull || graphFallback ? [] : testCommandsFor(impact.tests, 16);
   const commands = [];
   if (selectedCrates.length > 0) {
     commands.push(`cargo test -p ${selectedCrates.join(' -p ')} --all-features`);
     commands.push(`cargo check -p ${selectedCrates.join(' -p ')} --all-targets --all-features`);
   }
+  for (const command of testCommands) commands.push(command);
   for (const suite of [...suites].sort()) {
     for (const command of SUITE_COMMANDS[suite] ?? []) commands.push(command);
   }
@@ -464,7 +685,7 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
   const blockedSurfaces = surfaces.filter((id) => statusById.get(id) !== 'proven');
   const registryRefused = loaded.error !== null && !full;
   const empty = changed.length === 0;
-  const refused = (unmapped.length > 0 || empty || registryRefused) && !full;
+  const refused = (unmapped.length > 0 || empty || registryRefused || graphFallback) && !full;
   if (empty) {
     notes.push(
       'empty diff/base unavailable: typed refusal; the caller must run the full relevant layer rather than silently test nothing',
@@ -478,6 +699,14 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
   if (registryRefused) {
     notes.push(
       `registry: ${loaded.error}: typed refusal; surface evidence is unavailable, so the caller must run the full relevant layer`,
+    );
+  }
+  if (impact.truncated) {
+    notes.push('impacted test set reached the graph bound; crate-level tests remain the conservative floor');
+  }
+  if (impact.tests.length > testCommands.length) {
+    notes.push(
+      `impacted tests: ${impact.tests.length} selected from the graph; ${testCommands.length} per-test commands previewed (crate tests remain the floor)`,
     );
   }
   return {
@@ -494,10 +723,17 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT }
     blocked_surfaces: blockedSurfaces,
     unmapped: unmapped.sort(),
     refused,
+    tests: impact.tests,
+    test_commands: testCommands,
+    graph_source: graph.source,
+    graph_revision: graph.revision?.commit ?? null,
+    graph_digest: graph.digest,
+    impacted_crates: impact.crates,
+    ...(graph.error ? { graph_error: graph.error } : {}),
     ...(loaded.error ? { registry_error: loaded.error } : {}),
     conservative: true,
     notes,
-    digest: `sha256:${sha256(canonicalJson({ mode, changed, crates: selectedCrates, deferredCrates, suites: [...suites].sort(), commands, surfaces }))}`,
+    digest: `sha256:${sha256(canonicalJson({ mode, changed, crates: selectedCrates, deferredCrates, suites: [...suites].sort(), commands, surfaces, graphSource: graph.source, graphRevision: graph.revision?.commit ?? null, tests: impact.tests }))}`,
   };
 }
 
@@ -555,6 +791,62 @@ export function changedFiles({ base, worktree = false, root = ROOT } = {}) {
     }
   }
   return [...files].sort();
+}
+
+function writeImpactGraphFixture(root, { crateNames = [], testsPerCrate = 0 } = {}) {
+  const nodes = [];
+  const edges = [];
+  for (const [index, name] of crateNames.entries()) {
+    const suffix = String(index).padStart(2, '0');
+    nodes.push({
+      id: `crate:${name}`,
+      kind: 'crate',
+      name,
+      path: `crates/c${suffix}`,
+      provenance: 'manifest',
+    });
+    if (testsPerCrate > 0) {
+      const testId = `test:crates/c${suffix}/tests/smoke.rs#smoke${suffix}@1`;
+      nodes.push({
+        id: testId,
+        kind: 'test',
+        name: `smoke${suffix}`,
+        path: `crates/c${suffix}/tests/smoke.rs`,
+        crate_name: name,
+        line: 1,
+        provenance: 'coverage',
+      });
+      edges.push({ from: testId, to: `crate:${name}`, kind: 'tests', provenance: 'coverage' });
+    }
+    if (index > 0) {
+      edges.push({
+        from: `crate:${name}`,
+        to: `crate:${crateNames[index - 1]}`,
+        kind: 'depends_on',
+        provenance: 'manifest',
+      });
+    }
+  }
+  nodes.sort((a, b) => a.id.localeCompare(b.id));
+  edges.sort((a, b) => `${a.from}\0${a.kind}\0${a.to}`.localeCompare(`${b.from}\0${b.kind}\0${b.to}`));
+  const reverse_edges = edges
+    .map((edge) => ({ ...edge, from: edge.to, to: edge.from }))
+    .sort((a, b) => `${a.from}\0${a.kind}\0${a.to}`.localeCompare(`${b.from}\0${b.kind}\0${b.to}`));
+  const document = {
+    schema: IMPACT_GRAPH_SCHEMA,
+    revision: { commit: null, tree: null, dirty: false },
+    workspace: 1,
+    files: [],
+    nodes,
+    edges,
+    reverse_edges,
+    stats: { nodes: nodes.length, edges: edges.length, reverse_edges: reverse_edges.length },
+    digest: 'fixture',
+  };
+  mkdirSync(join(root, 'tests/programme'), { recursive: true });
+  writeFileSync(join(root, 'tests/programme/impact-graph.json'), `${JSON.stringify(document)}\n`);
+  clearWorkspaceGraphCache(root);
+  return document;
 }
 
 function createScaleFixture({ crates = 50, rows = 10_000, changedPerCrate = 10 } = {}) {
@@ -615,6 +907,7 @@ function createScaleFixture({ crates = 50, rows = 10_000, changedPerCrate = 10 }
       changed.push(`crates/c${suffix}/src/changed${index}.rs`);
     }
   }
+  writeImpactGraphFixture(root, { crateNames: names, testsPerCrate: 1 });
   return { root, members, names, rows: registryRows, changed };
 }
 
@@ -768,6 +1061,21 @@ export function selftest() {
       missing.length === 0 && actualIds.size === expectedIds.length,
       `missing ${missing.length}`,
     );
+    check(
+      'selection consumes the repository graph authority',
+      scaled.graph_source === 'authority' && scaled.graph_revision === null,
+      `${scaled.graph_source}:${scaled.graph_error ?? ''}`,
+    );
+    check(
+      'impacted tests propagate across the 50-crate reverse chain',
+      scaled.tests.length === scale.names.length,
+      `${scaled.tests.length}/${scale.names.length}`,
+    );
+    check(
+      'impacted tests emit per-test commands from the same graph',
+      scaled.test_commands.some((command) => command.includes('--test smoke')),
+      scaled.test_commands.slice(0, 2).join(' | '),
+    );
     check(`500-file selection stays near-linear (${Math.round(scaleMs)} ms < 3000 ms)`, scaleMs < 3000);
     check(
       `500-file selection heap delta stays bounded (${Math.round(heapMb)} MB < 256 MB)`,
@@ -790,6 +1098,17 @@ export function selftest() {
       'an unmapped path with a valid registry is still a typed refusal',
       unmappedScale.refused && unmappedScale.registry_error === undefined,
     );
+    writeFileSync(join(scale.root, 'tests/programme/impact-graph.json'), '{not json');
+    clearWorkspaceGraphCache(scale.root);
+    const corruptGraph = select([scale.changed[0]], { root: scale.root });
+    check(
+      'a corrupt graph is a typed refusal with conservative fallback, never a silent heuristic',
+      corruptGraph.refused === true &&
+        corruptGraph.graph_source === 'conservative-fallback' &&
+        typeof corruptGraph.graph_error === 'string',
+      JSON.stringify(corruptGraph.graph_error),
+    );
+    writeImpactGraphFixture(scale.root, { crateNames: scale.names, testsPerCrate: 1 });
     writeFileSync(join(scale.root, 'tests/programme/registry.json'), '{not json');
     clearRegistryCache(scale.root);
     const corrupt = select([scale.changed[0]], { root: scale.root });
@@ -802,6 +1121,25 @@ export function selftest() {
     rmSync(scale.root, { recursive: true, force: true });
     clearWorkspaceGraphCache(scale.root);
     clearRegistryCache(scale.root);
+  }
+
+  const stalePath = join(tmpdir(), `faktor-impact-stale-${process.pid}.json`);
+  try {
+    const document = JSON.parse(readFileSync(join(ROOT, 'tests/programme/impact-graph.json'), 'utf8'));
+    document.revision = { commit: 'deadbeef', tree: null, dirty: false };
+    writeFileSync(stalePath, `${JSON.stringify(document)}\n`);
+    clearWorkspaceGraphCache(ROOT);
+    const stale = select(['crates/core/src/lib.rs'], { graphPath: stalePath });
+    check(
+      'a graph bound to another revision is a typed refusal, never trusted',
+      stale.refused === true &&
+        stale.graph_source === 'conservative-fallback' &&
+        /stale/.test(stale.graph_error ?? ''),
+      JSON.stringify(stale.graph_error),
+    );
+  } finally {
+    rmSync(stalePath, { force: true });
+    clearWorkspaceGraphCache(ROOT);
   }
 
   const first = JSON.stringify(select(['crates/core/src/lib.rs']));
@@ -844,7 +1182,11 @@ export function main() {
     explicit.length > 0
       ? [...new Set(explicit)].sort()
       : changedFiles({ base: arg('base'), worktree: args.includes('--worktree') });
-  const selection = select(files, { mode, base: arg('base') });
+  const selection = select(files, {
+    mode,
+    base: arg('base'),
+    graphPath: arg('impact-graph'),
+  });
   if (selection.refused && args.includes('--fallback-full')) {
     selection.commands.push('cargo test --workspace --all-features');
     selection.fell_back = 'full-workspace';

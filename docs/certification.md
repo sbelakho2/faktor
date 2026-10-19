@@ -22,7 +22,7 @@ an LLM: everything below is deterministic and offline.
 | `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND every external evidence gate (cross-platform lanes, real provider). Exits 0 only when every assertion holds. |
 | `cargo test -p faktor-tests-fault --release -- --ignored` | long lane | The full `[fault]` campaigns (also part of `full`). |
 | `cargo test -p faktor-tests-fuzz-seeds` | long lane | Seeded pseudo-fuzz harnesses + bounded deterministic campaign; owned by the Woodpecker `static` job and manual runs. |
-| `bash scripts/check-licenses.sh` | trusted static lane | Evaluates the committed `deny.toml` license/bans/sources policy against the locked `cargo metadata` graph with python3 (and runs `cargo deny` too when the binary is present); fails on any non-Apache-2.0 workspace member, disallowed dependency license or source, or wildcard requirement on an external dependency. Committed bytecode/build-artifact hygiene is enforced by the static-authority scan 13; see `docs/repo-hygiene.md`. |
+| `bash scripts/check-licenses.sh` | trusted static lane | Evaluates the committed `deny.toml` license/bans/sources policy against the locked `cargo metadata` graph with the Rust `faktor-ci-tools license-policy` (and runs `cargo deny` too when the binary is present); fails on any non-Apache-2.0 workspace member, disallowed dependency license or source, or wildcard requirement on an external dependency. Committed bytecode/build-artifact hygiene is enforced by the static-authority scan 13; see `docs/repo-hygiene.md`. |
 | `bash scripts/package-artifacts.sh` | packaging (part of `full`) | Builds the release daemon bundle (`tar.gz`), the VS Code VSIX (via the lockfile-pinned `npx --no-install vsce`) and copies the JetBrains plugin zip when present; writes `target/certification/artifacts.json` with `{name, path, sha256, size, commit, status, detail}` per artifact, recording exact errors and retry commands for anything not produced. |
 | `node scripts/install-matrix.mjs` | matrix (part of `full`) | Installs/verifies every built artifact on this host into clean temp prefixes: daemon extraction + `faktor-cli doctor --data-dir <tmp>`, VSIX zip/manifest structure, JetBrains `plugin.xml` id/version; writes `target/certification/install-matrix.json`. Non-zero on any verification failure. |
 | `TAMPER=1 node scripts/install-matrix.mjs` | matrix self-test | Copies a built artifact, flips one byte, and requires the verifier to reject the copy (sha256 mismatch); exits 0 only on rejection. Evidence: `target/certification/install-matrix-tamper.json`. |
@@ -148,8 +148,8 @@ linux marker set and the nightly campaign set therefore emit through ONE
 helper,
 `scripts/certification/lane-marker.sh write --lane <id> --status ...
 --artifact ...` (Node implementation `lane-marker.mjs`, byte-for-byte
-parity fallback `lane-marker.py` for the python-only rust/Faktor-CI lane
-images), which computes `"auth":"hmac-sha256:<hex>"` =
+fallback `lane-marker.mjs` for node-only images; the built Rust binary is
+authoritative), which computes `"auth":"hmac-sha256:<hex>"` =
 HMAC-SHA256(key = the lane's own `faktor_lane_token_<lane>` CI secret env,
 message = the canonical JSON of the marker with `auth` removed). The helper
 also derives `commands_b64`/`commands_digest` and the artifact digests from
@@ -176,7 +176,7 @@ shared with every other lane, where one load-sensitive test can stall past
 its budget once per run (a different test each time, each green in
 isolation) and pre-empt the dependent `vscode-e2e`/`certificate` lanes.
 Silent retries would hide regressions, so the linux lane runs its test gate
-through `python3 scripts/certification/flake-tolerance.py run --lane linux
+through `target/release/faktor-ci-tools flake-tolerance run --lane linux
 --max-flakes 3 -- cargo test --workspace --all-features`, whose exit
 semantics are exactly:
 
@@ -210,9 +210,10 @@ semantics are exactly:
   (no orphans); `verify-markers` refuses a marker claiming more than 16
   tolerated flakes.
 
-`flake-tolerance.py selftest` (34 hermetic checks through a fake `cargo`:
-flaky-passes recorded, persistent failure stays red, budget/unverified-pass
-refusals, no retry for fault lanes) runs inside the linux
+`target/release/faktor-ci-tools flake-tolerance selftest` (32 hermetic
+checks through a fake `cargo`: flaky-passes recorded, persistent failure
+stays red, budget/unverified-pass refusals, no retry for fault lanes) runs
+inside the linux
 lane and in `scripts/certification/tests/selftests.sh` (dogfood §2). Gate
 parity is preserved: `scripts/certify.sh extract_ci_gate_commands`
 normalizes the wrapper to its inner canonical argv, so
@@ -888,8 +889,9 @@ failure-state posting and non-2xx refusals; the certify selftest plants
 every gate-11 reject case hermetically.
 
 `bash scripts/certify.sh --selftest` proves the whole matrix hermetically
-against the mock API in
-`scripts/certification/fixtures/woodpecker-api/mock_server.py`: success,
+against the mock API implemented by
+`faktor-ci-tools mock-woodpecker` (fixtures in
+`scripts/certification/fixtures/woodpecker-api/`): success,
 absent, other-SHA, pending, failure, error, wrong-workflow, unregistered
 context (operator error), the observed-fact rejection matrix
 (repository/config-file/trusted-class/event/pipeline-id), trusted-context
@@ -961,7 +963,7 @@ with `unconventional-tag`).
   `snapshot.debian.org/archive/debian/<ts>` (and `debian-security` for
   security pockets) or `snapshot.ubuntu.com/ubuntu/<ts>` with
   `ts = 20260923T000000Z` — and install exact `pkg=version` pins
-  (e.g. `python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419` on the
+  (e.g. `procps=2:4.0.4-9 ca-certificates=20250419` on the
   `rust:1.98.0`/trixie lane). The `image-pins` check audits this: an
   apt-bearing step needs `# apt-snapshot: <ts> <reason>` with the matching
   snapshot URL present in the same step and only exact-version installs, or
@@ -976,7 +978,7 @@ with `unconventional-tag`).
   `docker/faktor-ci/Dockerfile` pins the `ubuntu:24.04` base by multi-arch
   index digest, pins the same noble snapshot, and installs the full CI apt
   toolchain at exact versions (`build-essential`, `curl`, `pkg-config`,
-  `libssl-dev`, `openjdk-17-jdk-headless`, `git`, `unzip`, `python3`,
+  `libssl-dev`, `openjdk-17-jdk-headless`, `git`, `unzip`,
   `procps`, `ca-certificates`). The standalone `kotlinc` is the pinned Kotlin
   release matching the Gradle Kotlin plugin (2.4.20), fetched from the
   pinned release URL and SHA-256-verified at build time (the noble apt

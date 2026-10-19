@@ -25,13 +25,13 @@
 #   scripts/check-gradle-integrity.sh       planted tampering + temp-name migration
 #   scripts/check-ci-image-pins.sh          image pins + apt-snapshot/apt-pinned audit
 #   scripts/build-ci-image.sh --selftest    Faktor CI image pin hygiene
-#   scripts/certification/flake-tolerance.py selftest
+#   target/release/faktor-ci-tools flake-tolerance selftest
 #                                           bounded retry-once semantics for the
 #                                           trusted linux test lane: flaky pass
 #                                           recorded, persistent failure red,
 #                                           budget/unverified-pass/no-retry
 #                                           refusals (fault/release/visual)
-#   scripts/certification/publish-status.py selftest
+#   target/release/faktor-ci-tools publish-status selftest
 #                                           stdlib GitHub status publisher:
 #                                           validation + fail-closed POST,
 #                                           pinned platform signature vector,
@@ -44,6 +44,19 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT" || exit 2
+
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
+if [ ! -x "$CI_TOOLS" ]; then
+    printf 'selftests: %s is missing; build it with cargo build --release -p faktor-ci-tools\n' "$CI_TOOLS" >&2
+    exit 2
+fi
 
 failures=0
 ran=0
@@ -67,8 +80,11 @@ run "cross-target-check.sh classify selftest" env CROSS_TARGET_SELFTEST=classify
 run "check-gradle-integrity.sh --selftest" bash scripts/check-gradle-integrity.sh --selftest
 run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --selftest
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
-run "flake-tolerance.py selftest" python3 scripts/certification/flake-tolerance.py selftest
-run "publish-status.py selftest" python3 scripts/certification/publish-status.py selftest
+run "faktor-ci-tools flake-tolerance selftest" "$CI_TOOLS" flake-tolerance selftest
+run "faktor-ci-tools publish-status selftest" "$CI_TOOLS" publish-status selftest
+run "faktor-ci-tools capability-tests selftest" "$CI_TOOLS" capability-tests selftest
+run "faktor-ci-tools visual-baseline selftest" "$CI_TOOLS" visual-baseline selftest
+run "faktor-ci-tools iana-table --check" "$CI_TOOLS" iana-table --check
 run "compile-and-smoke.sh checksum reconcile selftest" bash apps/jetbrains/compile-and-smoke.sh --selftest-checksum
 
 printf '\n=====================\n'

@@ -112,6 +112,21 @@ for _ in $(seq 1 100); do
 done
 [ -s "$TMP/fake.port" ] || fail "fake provider did not start"
 FAKE_PORT="$(cat "$TMP/fake.port")"
+BROWSER_EXE="${FAKTOR_BROWSER_EXECUTABLE:-}"
+if [ -z "$BROWSER_EXE" ]; then
+  for candidate in /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome /Applications/Chromium.app/Contents/MacOS/Chromium; do
+    [ -x "$candidate" ] && BROWSER_EXE="$candidate" && break
+  done
+fi
+if [ -z "$BROWSER_EXE" ]; then
+  BROWSER_EXE="$(find /ms-playwright -path '*/chrome-linux/chrome' -type f 2>/dev/null | head -n1 || true)"
+fi
+if [ -n "$BROWSER_EXE" ]; then
+  export FAKTOR_BROWSER_EXECUTABLE="$BROWSER_EXE"
+  note "browser executable: $BROWSER_EXE"
+else
+  note "no browser executable found; browser controls will report a typed unavailable state"
+fi
 CONFIG="$TMP/faktor-plus.json"
 cat >"$CONFIG" <<JSON
 {"config_version":1,"model":"m","providers":[{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:${FAKE_PORT}/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true,"models":["m"]}]}
@@ -146,6 +161,7 @@ curl -fsS -H "authorization: Bearer $PASSWORD" "$BASE_URL/native/ready" >/dev/nu
 note "running the VS Code Edition 8 host against the real daemon"
 if ! node "$RUN_ROOT/apps/vscode/scripts/edition8-dogfood.mjs" \
   --base-url "$BASE_URL" --token "$PASSWORD" --workspace "$WORKSPACE" \
+  --browser-url "http://127.0.0.1:${FAKE_PORT}/" \
   --out "$TMP/dogfood-vscode.json" >"$TMP/vscode-dogfood.log" 2>&1; then
   cat "$TMP/vscode-dogfood.log" >&2 || true
   flow_result "vscode-host" "failed" "VS Code Edition 8 host dogfood failed"

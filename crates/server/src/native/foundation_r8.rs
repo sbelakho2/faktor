@@ -32,6 +32,15 @@ fn malformed(message: impl Into<String>) -> Response {
     })
 }
 
+fn conflict(code: &'static str, message: impl Into<String>) -> Response {
+    wire_status(ApiError {
+        code,
+        message: message.into(),
+        http_status: 409,
+        retryable: false,
+    })
+}
+
 fn session_from(raw: &str) -> Result<SessionId, Response> {
     parse_session_id(raw).map_err(wire_status)
 }
@@ -690,6 +699,13 @@ pub(crate) async fn native_browser_adapters(
         Ok(f) => f,
         Err(r) => return r,
     };
+    let surface = &state.deps.browser;
+    let available = surface.ensure(foundation).is_ok();
+    if available {
+        if let Err(reason) = surface.advertise(foundation) {
+            return conflict("browser_adapter_failed", reason);
+        }
+    }
     match foundation.browser.adapters() {
         Ok(adapters) => {
             let advertised = adapters.iter().any(|a| a.advertised);
@@ -698,7 +714,7 @@ pub(crate) async fn native_browser_adapters(
                 "advertised": advertised,
                 "state": if advertised { "advertised" } else { "unavailable" },
                 "reason": if advertised { serde_json::Value::Null } else {
-                    serde_json::json!("no browser adapter is advertised by this daemon")
+                    serde_json::json!(surface.reason().unwrap_or_else(|| "no browser adapter is advertised by this daemon".to_string()))
                 },
             }))
             .into_response()
@@ -770,6 +786,16 @@ pub(crate) async fn native_browser_session_request(
         Ok(f) => f,
         Err(r) => return r,
     };
+    let surface = &state.deps.browser;
+    if req.adapter_id == super::browser_surface::adapter_id() {
+        if let Err(reason) = surface.ensure(foundation) {
+            return conflict("browser_unavailable", reason);
+        }
+        return match surface.open(foundation, sid.raw(), &req.url).await {
+            Ok(session) => Json(session).into_response(),
+            Err(reason) => conflict("browser_session_failed", reason),
+        };
+    }
     match foundation
         .browser
         .request_session(&req.adapter_id, sid.raw(), &req.url)
@@ -807,6 +833,10 @@ pub(crate) async fn native_browser_observations(
         Ok(f) => f,
         Err(r) => return r,
     };
+    let surface = &state.deps.browser;
+    if surface.available() {
+        let _ = surface.sync_observations(foundation, &id).await;
+    }
     let limit = q.limit.unwrap_or(200).clamp(1, 500) as usize;
     match foundation
         .browser
@@ -843,13 +873,25 @@ pub(crate) async fn native_browser_screenshot(
         Ok(b) => b,
         Err(_) => return malformed("invalid browser screenshot body"),
     };
-    let bytes = match decode_attachment_base64(req.data_base64.as_bytes()) {
-        Ok(bytes) => bytes,
-        Err(e) => return wire_status(e),
-    };
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
+    };
+    let bytes = if req.data_base64.is_empty() {
+        if req.mime != "image/png" && req.mime != "image/jpeg" && req.mime != "image/webp" {
+            return malformed("screenshot mime must be image/png, image/jpeg or image/webp");
+        }
+        let format = req.mime.rsplit('/').next().unwrap_or("png").to_string();
+        let surface = &state.deps.browser;
+        match surface.screenshot(&id, &format).await {
+            Ok(bytes) => bytes,
+            Err(reason) => return conflict("browser_screenshot_failed", reason),
+        }
+    } else {
+        match decode_attachment_base64(req.data_base64.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(e) => return wire_status(e),
+        }
     };
     match foundation
         .browser
@@ -1620,4 +1662,56 @@ pub(crate) async fn native_preset_fallback_set(
         .into_response(),
         Err(e) => foundation_error(e),
     }
+}
+
+/// `GET /native/telemetry` — the explicit opt-in telemetry settings and the
+/// exact bounded payload preview. There is deliberately no upload endpoint in
+/// this build: the response says so and never turns "off" into a green
+/// connected state.
+pub(crate) async fn native_telemetry_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let enabled = foundation
+        .config
+        .value("faktor.telemetry.enabled")
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let categories = foundation
+        .config
+        .value("faktor.telemetry.categories")
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "state": if enabled { "local_only" } else { "disabled" },
+        "categories": categories,
+        "endpoint": null,
+        "endpointScope": "none: no upload endpoint is configured; local-only counters",
+        "payloadPreview": {
+            "schema": "faktor.telemetry-preview/v1",
+            "fields": ["category", "event", "count", "duration_ms", "version"],
+            "excluded": ["prompt text", "source code", "file contents", "secrets", "credentials", "tool arguments"],
+            "bounded": true,
+        },
+        "notes": [
+            "Telemetry is opt-in and defaults off; enabling it only permits the listed local counters.",
+            "No remote upload, feedback endpoint or compliance badge is claimed by this daemon build."
+        ],
+    }))
+    .into_response()
 }

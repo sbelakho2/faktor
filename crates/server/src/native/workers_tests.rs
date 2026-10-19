@@ -153,7 +153,7 @@ fn schedule(plane: &WorkerPlane, org: &str, key: &str) -> faktor_worker::Schedul
 }
 
 #[tokio::test]
-async fn worker_routes_are_typed_409_when_the_plane_is_disabled() {
+async fn worker_credential_routes_refuse_before_the_plane_state() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness(dir.path(), false).await;
     let client = reqwest::Client::new();
@@ -198,17 +198,35 @@ async fn worker_routes_are_typed_409_when_the_plane_is_disabled() {
     ];
     for (label, req) in bodies {
         let resp = req.send().await.unwrap();
-        assert_eq!(resp.status(), 409, "{label}");
+        assert_eq!(resp.status(), 401, "{label}");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"], "workers_disabled", "{label}");
+        assert_eq!(body["error"]["code"], "unknown_worker_token", "{label}");
     }
-    // Operator routes stay behind the daemon password AND the principal.
+    // Operator routes stay behind the daemon password AND the principal: the
+    // missing/invalid credential loses before `workers_disabled`, while an
+    // authorized principal sees the typed disabled refusal.
     let resp = client
         .get(format!("{base}/native/workers"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "no daemon password");
+    for control in [None, Some("not-a-real-token")] {
+        let mut request = client
+            .get(format!("{base}/native/workers"))
+            .bearer_auth(&h.daemon_token);
+        if let Some(control) = control {
+            request = request.header("x-faktor-control-token", control);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "control={control:?} must lose before workers_disabled"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
     let resp = client
         .get(format!("{base}/native/workers"))
         .bearer_auth(&h.daemon_token)
@@ -518,9 +536,9 @@ async fn revocation_and_org_isolation_over_http() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "worker_revoked");
+    assert_eq!(body["error"]["code"], "worker_token_revoked");
     // Re-registering with the dead token is refused typed.
     let resp = register(&client, &base, &org_a, "wrk_a", &token_a, &["rust"]).await;
     assert_eq!(resp.status(), 401);
@@ -594,7 +612,6 @@ async fn operator_routes_require_a_principal_and_ids_roundtrip() {
     let client = reqwest::Client::new();
     let base = format!("http://{}", h.handle.addr);
     let (org, control_token) = bootstrap(&h.control_plane, "Acme", "owner@acme.test");
-    let _ = org;
     // No control-plane principal: the operator surface answers the typed
     // unauthorized (the daemon password alone is not a principal).
     let resp = client
@@ -620,13 +637,20 @@ async fn operator_routes_require_a_principal_and_ids_roundtrip() {
     // The owner mints successfully and the plaintext is presented once.
     let token = mint_token(&client, &base, &h.daemon_token, &control_token).await;
     assert!(token.starts_with("wkr_"));
-    // A malformed worker id is a 400, never a lookup.
+    // A malformed worker id is a 400, never a lookup — but only AFTER the
+    // token authenticates (an invalid credential still loses first).
+    assert_eq!(
+        register(&client, &base, &org, "wrk_id", &token, &["rust"])
+            .await
+            .status(),
+        200
+    );
     let resp = client
         .post(format!(
             "{base}/native/workers/not%20a%20valid%20id/heartbeat"
         ))
         .json(&serde_json::json!({
-            "token": "wkr_x",
+            "token": token,
             "protocol_version": WORKER_PROTOCOL_VERSION,
             "lease_id": "lease_1",
             "generation": 1,

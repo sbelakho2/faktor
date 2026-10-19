@@ -93,7 +93,7 @@
 # three and publishes green ONLY when every platform status signature
 # verifies with its own key; a missing secret, a missing signature or a
 # signature minted with the wrong platform key is a conclusive non-success.
-# The linux publisher (node), the darwin publisher (python3) and the windows
+# The linux publisher (node), the darwin publisher (Rust faktor-ci-tools) and the windows
 # publisher (PowerShell) pin the same canonical-payload test vector so the
 # three implementations cannot drift.
 #
@@ -136,7 +136,7 @@
 #
 # Hermetic toolchain (P1): trusted lanes run NO apt at all. The rust/node
 # stock baselines already ship the tools their old apt steps installed
-# (python3, ps, unzip and ca-certificates are present in the pinned images),
+# (ps, unzip and ca-certificates are present in the pinned images),
 # and the JetBrains build and smoke lanes run on the dedicated Faktor CI
 # image from `docker/faktor-ci/Dockerfile` (git + JDK 17 included),
 # referenced by the digest recorded in
@@ -241,13 +241,14 @@ steps:
       # rustc fan-out for the same reason (shared host with the darwin lane).
       RUST_TEST_THREADS: "2"
       CARGO_BUILD_JOBS: "4"
+      FAKTOR_CI_TOOLS: /woodpecker-cache/target/release/faktor-ci-tools
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
       - faktor-trusted-target-linux:/woodpecker-cache/target
     commands:
-      # No apt: the digest-pinned rust:1.98.0 baseline already ships python3,
-      # procps and ca-certificates (verified: `python3`, `ps`, unzip, curl and
+      # No apt: the digest-pinned rust:1.98.0 baseline already ships procps and
+      # ca-certificates (verified: `ps`, unzip, curl and
       # /etc/ssl/certs/ca-certificates.crt are present). Toolchain authority
       # stays rust-toolchain.toml.
       # rust-toolchain.toml is authoritative; fail loudly if the shim does not resolve it.
@@ -262,7 +263,8 @@ steps:
       - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # Bounded, RECORDED flake tolerance (scripts/certification/flake-tolerance.py;
+      - cargo build --release -p faktor-ci-tools
+      # Bounded, RECORDED flake tolerance (faktor-ci-tools flake-tolerance;
       # honest exit semantics in docs/certification.md): the workspace suite runs
       # exactly once; only the EXACT failed test names are re-run, once each, alone
       # (`-- --exact <name> --test-threads=1`). A name that fails again in isolation
@@ -272,13 +274,13 @@ steps:
       # the certificate manifest — never a silent green. Initial failures above the
       # flake budget (3) fail the lane with no retries at all; fault lanes and any
       # `--ignored` selection are refused typed by the runner.
-      - python3 scripts/certification/flake-tolerance.py selftest
-      - python3 scripts/certification/flake-tolerance.py run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
+      - $CARGO_TARGET_DIR/release/faktor-ci-tools flake-tolerance selftest
+      - $CARGO_TARGET_DIR/release/faktor-ci-tools flake-tolerance run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
       # P0-PROOF (audit 3): compiled test enumeration, not source-text
       # matching. Every proven capability's unit proof must be a REAL libtest
       # entry exactly once, and tests/production-crates.json must be fresh
       # against cargo metadata (the node-only certificate lane trusts it).
-      - cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py
+      - cargo test --workspace --all-features -- --list | $CARGO_TARGET_DIR/release/faktor-ci-tools capability-tests
       - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
@@ -291,9 +293,10 @@ steps:
         sh scripts/check-fault-seams.sh
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
-        python3 scripts/certification/flake-tolerance.py selftest
-        python3 scripts/certification/flake-tolerance.py run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
-        cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py
+        cargo build --release -p faktor-ci-tools
+        $CARGO_TARGET_DIR/release/faktor-ci-tools flake-tolerance selftest
+        $CARGO_TARGET_DIR/release/faktor-ci-tools flake-tolerance run --lane linux --max-flakes 3 -- cargo test --workspace --all-features
+        cargo test --workspace --all-features -- --list | $CARGO_TARGET_DIR/release/faktor-ci-tools capability-tests
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
@@ -309,6 +312,7 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      FAKTOR_CI_TOOLS: /woodpecker-cache/target/release/faktor-ci-tools
       # Shared self-hosted runner: the darwin lane's tests run on the same
       # host while these containers build, so cap rustc fan-out and keep the
       # fixture children schedulable (bounded, documented resource setting —
@@ -319,6 +323,7 @@ steps:
       - faktor-trusted-cargo-git:/usr/local/cargo/git
       - faktor-trusted-target-static:/woodpecker-cache/target
     commands:
+      - cargo build --release -p faktor-ci-tools
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
       - cargo test -p faktor-tests-fuzz-seeds
@@ -338,6 +343,7 @@ steps:
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
+        cargo build --release -p faktor-ci-tools
         cargo test -p faktor-tests-static-authority
         cargo test -p faktor-security
         cargo test -p faktor-tests-fuzz-seeds
@@ -392,7 +398,7 @@ steps:
       - faktor-trusted-npm-cache:/root/.npm
     commands:
       # No apt: the digest-pinned node:24 baseline already ships unzip and
-      # ca-certificates (verified: `unzip`, `python3`, curl and
+      # ca-certificates (verified: `unzip`, curl and
       # /etc/ssl/certs/ca-certificates.crt are present).
       # Audit 25: the generated protocol DTO/parsers must match the checked-in
       # canonical schema artifact (the artifact-vs-emitter half runs in the
@@ -461,7 +467,9 @@ steps:
   # into the diagnostics, and a failed cell is never retried or downgraded.
   - name: vscode-e2e
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (lane requires genuine x86_64; Rosetta runs it on arm64 hosts)
-    depends_on: [vscode]
+    # Serialize after the full Rust lane: both are heavy under the local
+    # amd64 emulation and concurrent runs starve the browser/CDP startup.
+    depends_on: [vscode, linux]
     when:
       matrix:
         platform: linux/amd64
@@ -493,7 +501,9 @@ steps:
     # that the pinned Gradle wrapper (9.7.1) requires.
     image: ghcr.io/sbelakho2/faktor-ci@sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
-    depends_on: [ci-image]
+    # Serialize the QEMU-heavy lanes: Gradle/Kotlin beside the full Rust
+    # workspace caused a linker SIGSEGV in the sibling smoke compilation.
+    depends_on: [ci-image, linux, vscode-e2e]
     when:
       matrix:
         platform: linux/amd64
@@ -544,6 +554,9 @@ steps:
     # a hard dependency and FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 makes a
     # missing ZIP a typed failure, never a silent source-only downgrade.
     depends_on: [ci-image, jetbrains-build]
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_BUILD_JOBS: "1"
     when:
       matrix:
         platform: linux/amd64
@@ -1288,8 +1301,9 @@ steps:
         # `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` and
         # commit visual-baselines.json. Until then this refuses the darwin
         # certificate by design (fail-closed operator step).
-        python3 scripts/certification/check-visual-baseline.py selftest
-        if python3 scripts/certification/check-visual-baseline.py \
+        cargo build --release -p faktor-ci-tools
+        target/release/faktor-ci-tools visual-baseline selftest
+        if target/release/faktor-ci-tools visual-baseline \
              --platform macos \
              --file apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json; then
           echo "passed darwin-visual-baseline"
@@ -1316,7 +1330,7 @@ steps:
         echo "certification=$st platform=darwin"
         [ "$rc" -eq 0 ]
   # P0-1: the darwin platform's own exact-SHA status (node-free host:
-  # python3 stdlib publisher, fail-closed).
+  # Rust publisher, fail-closed).
   - name: certificate-status-darwin
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     depends_on: [certificate-darwin]
@@ -1335,7 +1349,7 @@ steps:
         if [ -f target/certification/ci-certification-darwin.json ] && grep -qE '"status": *"pass"' target/certification/ci-certification-darwin.json; then
           state=success
         fi
-        python3 scripts/certification/publish-status.py publish \
+        target/release/faktor-ci-tools publish-status publish \
           --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --state "$state" \
           --platform darwin --tree "$tree" --run-prefix "$CI_PIPELINE_NUMBER" \
           --context ci/faktor/trusted-certified-darwin
@@ -1426,7 +1440,7 @@ steps:
       - |
         $ErrorActionPreference = "Stop"
         # P0-CERT canonical-payload parity: this pinned vector must equal the
-        # node/python implementations' digest before any certificate is
+        # node/Rust implementations' digest before any certificate is
         # signed, so the three publishers can never drift.
         $parityKey = "parity-check"
         $parityPayload = @(

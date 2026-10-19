@@ -40,6 +40,14 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
 CONTEXT="$ROOT/docker/faktor-ci"
 DOCKERFILE="$CONTEXT/Dockerfile"
 
@@ -117,7 +125,7 @@ verify_runtime() {
         echo "build-ci-image verify-runtime: FAIL: expected linux/amd64 (x86_64), running on $arch" >&2
         rc=1
     fi
-    for tool in cc gcc make pkg-config python3 ps kotlinc java javac git curl unzip; do
+    for tool in cc gcc make pkg-config ps kotlinc java javac git curl unzip; do
         command -v "$tool" >/dev/null 2>&1 || {
             echo "build-ci-image verify-runtime: FAIL: required tool '$tool' is not on PATH" >&2
             rc=1
@@ -250,15 +258,7 @@ else
         --tag "$IMAGE" --load --metadata-file "$META" "$CONTEXT"
 fi
 
-DIGEST="$(python3 - "$META" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as fh:
-    meta = json.load(fh)
-print(meta.get("containerimage.digest", ""))
-PY
-)" || DIGEST=""
+DIGEST="$("$CI_TOOLS" json-get "$META" containerimage.digest 2>/dev/null)" || DIGEST=""
 
 if [ -z "$DIGEST" ]; then
     INSPECT="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"

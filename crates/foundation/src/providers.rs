@@ -115,6 +115,8 @@ pub struct ProviderConnection {
 pub enum HealthState {
     Stopped,
     Connecting,
+    /// The endpoint answered the discovery handshake AND returned a
+    /// recognized, non-empty model list. Never set optimistically.
     Ready,
     AuthenticationRequired,
     Failed,
@@ -963,7 +965,7 @@ impl ProviderService {
                         .map(Duration::from_millis)
                         .unwrap_or(total_timeout);
                     let body_deadline = total_timeout.saturating_sub(started.elapsed());
-                    let bytes = match response
+                    let verification = match response
                         .read_bytes(&faktor_provider::egress::ResponseBudget::new(
                             first_byte,
                             first_byte,
@@ -973,33 +975,36 @@ impl ProviderService {
                         ))
                         .await
                     {
-                        Ok(bytes) => bytes,
+                        Ok(bytes) => verify_model_list(connection.family, &bytes),
                         Err(e) => {
-                            stages.push(ProbeStage {
-                                stage: "model_list".into(),
-                                state: "failed".into(),
-                                detail: e.to_string(),
-                                duration_ms: started.elapsed().as_millis() as u64,
-                            });
-                            Vec::new()
+                            ModelListVerification::Failed(ModelListFailure::BodyRead(e.to_string()))
                         }
                     };
-                    if !bytes.is_empty() {
-                        model_ids = parse_model_list(connection.family, &bytes);
-                        if model_ids.is_empty() {
-                            stages.push(ProbeStage {
-                                stage: "model_list".into(),
-                                state: "failed".into(),
-                                detail: "response carried no recognized model list".into(),
-                                duration_ms: started.elapsed().as_millis() as u64,
-                            });
-                        } else {
+                    match verification {
+                        ModelListVerification::Verified(models) => {
+                            model_ids = models;
                             stages.push(ProbeStage {
                                 stage: "model_list".into(),
                                 state: "ok".into(),
                                 detail: format!("{} models listed", model_ids.len()),
                                 duration_ms: started.elapsed().as_millis() as u64,
                             });
+                            if let Some(reference) = &connection.credential_ref {
+                                if reference.starts_with("vault://") {
+                                    let _ = self.vault.mark_verified(reference, true);
+                                }
+                            }
+                            state = HealthState::Ready;
+                        }
+                        ModelListVerification::Failed(failure) => {
+                            stages.push(ProbeStage {
+                                stage: "model_list".into(),
+                                state: "failed".into(),
+                                detail: failure.detail().to_string(),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                            });
+                            state = HealthState::Failed;
+                            detail = Some("model list verification failed".into());
                         }
                     }
                     stages.push(ProbeStage {
@@ -1010,12 +1015,6 @@ impl ProviderService {
                                 .into(),
                         duration_ms: 0,
                     });
-                    if let Some(reference) = &connection.credential_ref {
-                        if reference.starts_with("vault://") {
-                            let _ = self.vault.mark_verified(reference, true);
-                        }
-                    }
-                    state = HealthState::Ready;
                 }
             }
             Err(e) => {
@@ -1101,32 +1100,78 @@ impl ProviderService {
     }
 }
 
-fn parse_model_list(family: ProviderFamily, bytes: &[u8]) -> Vec<String> {
+/// The typed outcome of verifying a discovery response. `Ready` is only
+/// reachable from [`ModelListVerification::Verified`]; every read, parse,
+/// schema or emptiness failure stays explicitly unverified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelListVerification {
+    Verified(Vec<String>),
+    Failed(ModelListFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelListFailure {
+    BodyRead(String),
+    EmptyBody,
+    InvalidJson,
+    WrongSchema,
+    EmptyList,
+}
+
+impl ModelListFailure {
+    fn detail(&self) -> &str {
+        match self {
+            ModelListFailure::BodyRead(detail) => detail,
+            ModelListFailure::EmptyBody => "the discovery response body was empty",
+            ModelListFailure::InvalidJson => "the discovery response body is not valid JSON",
+            ModelListFailure::WrongSchema => {
+                "the discovery response has no recognized model entries"
+            }
+            ModelListFailure::EmptyList => "the discovery response carried an empty model list",
+        }
+    }
+}
+
+/// Verify the family's discovery schema. A recognized, non-empty model list
+/// is the ONLY verified outcome; an empty body, malformed JSON, a wrong
+/// schema and an empty list are typed failures rather than an empty success.
+/// Every loop is bounded by [`MAX_MODELS_PER_CONNECTION`].
+fn verify_model_list(family: ProviderFamily, bytes: &[u8]) -> ModelListVerification {
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return ModelListVerification::Failed(ModelListFailure::EmptyBody);
+    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return Vec::new();
+        return ModelListVerification::Failed(ModelListFailure::InvalidJson);
     };
-    let mut out = Vec::new();
     let entries = match family {
         ProviderFamily::Ollama => value.get("models").and_then(|v| v.as_array()),
         _ => value.get("data").and_then(|v| v.as_array()),
     };
-    if let Some(entries) = entries {
-        for entry in entries.iter().take(MAX_MODELS_PER_CONNECTION) {
-            let id = entry
-                .get("name")
-                .or_else(|| entry.get("id"))
-                .or_else(|| entry.get("model"))
-                .and_then(|v| v.as_str());
-            if let Some(id) = id {
-                if !id.is_empty() && id.len() <= 256 {
-                    out.push(id.to_string());
-                }
+    let Some(entries) = entries else {
+        return ModelListVerification::Failed(ModelListFailure::WrongSchema);
+    };
+    if entries.is_empty() {
+        return ModelListVerification::Failed(ModelListFailure::EmptyList);
+    }
+    let mut out = Vec::new();
+    for entry in entries.iter().take(MAX_MODELS_PER_CONNECTION) {
+        let id = entry
+            .get("name")
+            .or_else(|| entry.get("id"))
+            .or_else(|| entry.get("model"))
+            .and_then(|v| v.as_str());
+        if let Some(id) = id {
+            if !id.is_empty() && id.len() <= 256 {
+                out.push(id.to_string());
             }
         }
     }
+    if out.is_empty() {
+        return ModelListVerification::Failed(ModelListFailure::WrongSchema);
+    }
     out.sort();
     out.dedup();
-    out
+    ModelListVerification::Verified(out)
 }
 
 fn map_connection(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderConnection> {
@@ -1377,6 +1422,51 @@ mod tests {
         }
     }
 
+    /// One live HTTP fixture: answer the probe request with `body`, declaring
+    /// `declared_len` (a value larger than the body simulates a truncated
+    /// response). The connection then closes, so an incomplete body is a
+    /// transport failure rather than a hang.
+    fn serve_once(
+        body: Vec<u8>,
+        declared_len: Option<usize>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let len = declared_len.unwrap_or(body.len());
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn probe_openai_against(
+        body: Vec<u8>,
+        declared_len: Option<usize>,
+    ) -> (ProviderHealth, ProviderHealth) {
+        let (endpoint, server) = serve_once(body, declared_len);
+        let dir = tempfile::tempdir().unwrap();
+        let db = FoundationDb::open(dir.path().join("f.db")).unwrap();
+        let vault = SecretVault::new(db.clone(), dir.path());
+        let service = ProviderService::new(db, vault);
+        let saved = service
+            .save(&draft("openai", &endpoint, Some(true)), None)
+            .unwrap();
+        let health = service.probe(&saved.id).await.unwrap();
+        server.join().unwrap();
+        let persisted = service.health(&saved.id).unwrap().unwrap();
+        (health, persisted)
+    }
+
     #[test]
     fn secret_shaped_labels_endpoints_and_proxies_are_refused_before_persistence() {
         let secret = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
@@ -1553,17 +1643,117 @@ mod tests {
     }
 
     #[test]
-    fn model_list_parsing_is_bounded_and_family_shaped() {
+    fn model_list_verification_is_explicit_bounded_and_family_shaped() {
+        use ModelListVerification::{Failed, Verified};
         let openai = br#"{"data":[{"id":"b"},{"id":"a"},{"id":"a"}]}"#;
         assert_eq!(
-            parse_model_list(ProviderFamily::OpenAi, openai),
-            vec!["a".to_string(), "b".to_string()]
+            verify_model_list(ProviderFamily::OpenAi, openai),
+            Verified(vec!["a".to_string(), "b".to_string()])
         );
         let ollama = br#"{"models":[{"name":"llama3:8b"}]}"#;
         assert_eq!(
-            parse_model_list(ProviderFamily::Ollama, ollama),
-            vec!["llama3:8b".to_string()]
+            verify_model_list(ProviderFamily::Ollama, ollama),
+            Verified(vec!["llama3:8b".to_string()])
         );
-        assert!(parse_model_list(ProviderFamily::OpenAi, b"not-json").is_empty());
+        for (name, bytes, reason) in [
+            ("empty", &b""[..], ModelListFailure::EmptyBody),
+            ("whitespace", &b" \n\t"[..], ModelListFailure::EmptyBody),
+            (
+                "invalid json",
+                &br#"{"data":[}"#[..],
+                ModelListFailure::InvalidJson,
+            ),
+            ("array root", &br#"[]"#[..], ModelListFailure::WrongSchema),
+            (
+                "wrong key",
+                &br#"{"models":[{"name":"llama3"}]}"#[..],
+                ModelListFailure::WrongSchema,
+            ),
+            (
+                "not an array",
+                &br#"{"data":{"id":"gpt-4o"}}"#[..],
+                ModelListFailure::WrongSchema,
+            ),
+            (
+                "empty list",
+                &br#"{"data":[]}"#[..],
+                ModelListFailure::EmptyList,
+            ),
+            (
+                "no recognized entries",
+                &br#"{"data":[{"object":"model"}]}"#[..],
+                ModelListFailure::WrongSchema,
+            ),
+        ] {
+            assert_eq!(
+                verify_model_list(ProviderFamily::OpenAi, bytes),
+                Failed(reason.clone()),
+                "{name}"
+            );
+        }
+        let entries: Vec<String> = (0..MAX_MODELS_PER_CONNECTION * 2)
+            .map(|i| format!(r#"{{"id":"model-{i}"}}"#))
+            .collect();
+        let oversized = format!(r#"{{"data":[{}]}}"#, entries.join(","));
+        let Verified(models) = verify_model_list(ProviderFamily::OpenAi, oversized.as_bytes())
+        else {
+            panic!("bounded list must verify");
+        };
+        assert_eq!(models.len(), MAX_MODELS_PER_CONNECTION);
+    }
+
+    #[tokio::test]
+    async fn probe_2xx_without_a_verified_model_list_is_never_ready() {
+        for (name, body, declared_len) in [
+            ("empty body", &b""[..], None),
+            ("invalid json", &br#"{"data":[}"#[..], None),
+            (
+                "wrong schema",
+                &br#"{"models":[{"name":"llama3"}]}"#[..],
+                None,
+            ),
+            ("empty list", &br#"{"data":[]}"#[..], None),
+            (
+                "no recognized entries",
+                &br#"{"data":[{"object":"model"}]}"#[..],
+                None,
+            ),
+            (
+                "truncated body",
+                &br#"{"data":[{"id":"gpt-4o"}"#[..],
+                Some(512),
+            ),
+        ] {
+            let (health, persisted) = probe_openai_against(body.to_vec(), declared_len).await;
+            assert_eq!(health.state, HealthState::Failed, "{name}: {health:?}");
+            assert_eq!(
+                persisted.state,
+                HealthState::Failed,
+                "{name}: {persisted:?}"
+            );
+            assert_eq!(
+                health.detail.as_deref(),
+                Some("model list verification failed"),
+                "{name}: {health:?}"
+            );
+            let model_list = health
+                .stages
+                .iter()
+                .find(|stage| stage.stage == "model_list")
+                .unwrap_or_else(|| panic!("{name}: no model_list stage: {health:?}"));
+            assert_eq!(model_list.state, "failed", "{name}: {health:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_2xx_with_a_verified_model_list_is_ready() {
+        let (health, persisted) =
+            probe_openai_against(br#"{"data":[{"id":"gpt-4o"}]}"#.to_vec(), None).await;
+        assert_eq!(health.state, HealthState::Ready, "{health:?}");
+        assert_eq!(persisted.state, HealthState::Ready);
+        assert!(health
+            .stages
+            .iter()
+            .any(|stage| stage.stage == "model_list" && stage.state == "ok"));
     }
 }

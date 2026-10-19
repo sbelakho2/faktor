@@ -55,17 +55,12 @@ pub struct McpTool { pub name: String, pub description: String, pub input_schema
 pub struct McpResult { pub content: Vec<Value>, pub is_error: bool }
 ```
 Rules: Content-Length framed JSON-RPC 2.0; initialize handshake; every call has a deadline; bad servers (garbage output, hangs, crashes) never destabilize the caller: garbage → Malformed error, hang → timeout + kill, crash → NotFound with restart-ability. Bounded: each call's response ≤ 16MB.
-Adversarial tests (write tiny fake MCP servers in the test as `sh -c` scripts or a compiled helper... simplest: use `python3 -c` if available, else `sh` with printf — prefer a tiny Rust helper binary? NO: use `sh -c 'while read l; do ...'` is painful; instead test with a mock server implemented as a thread that spawns a child process speaking JSON-RPC over a pipe? Simpler: implement the JSON-RPC framing parser tests directly (pure), and integration tests spawn `python3` if present (skip gracefully when absent)):
-1. framing_roundtrip_content_length (pure parser)
-2. garbage_output_is_malformed_not_hang
-3. hang_killed_by_deadline (server sleeps forever; timeout error; process reaped)
-4. crash_after_connect_reports_not_found
-5. oversized_response_rejected (16MB cap)
-6. malformed_jsonrpc_rejected (wrong version, missing id, non-object)
-7. call_with_unknown_tool_errors
-8. close_terminates_process (no leftover; ps check)
-9. concurrent_calls_multiplexed (2 tools × 5 calls parallel, ids match responses)
-10. notification_ignored (server sends unsolicited notification → ignored)
+Adversarial tests use the shared Rust mock binaries compiled by
+`faktor-test-mocks` (Content-Length framed JSON-RPC children with explicit
+modes for close, garbage, oversized handshake, closed stdin, stopped
+draining and stalled bursts). They are built with `rustc` at test time, so
+the suite has no interpreter or fixture-script dependency and is portable
+across the CI host images.
 
 ## Part C — faktor-lsp: workspace-scoped language server
 

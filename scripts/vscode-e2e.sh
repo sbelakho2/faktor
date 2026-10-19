@@ -1351,16 +1351,12 @@ selftest() {
   #    that tree (never silently from the dev checkout). The pinned CI image
   #    ships no `unzip`, so when it is absent the case asserts the typed
   #    fail-closed refusal instead of a silent downgrade.
-  if command -v zip >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  if command -v zip >/dev/null 2>&1; then
     mkdir -p "$tmp/vsix-src/extension/out" "$tmp/vsix-src/extension/media"
     printf '{"name":"faktor","publisher":"faktor"}\n' >"$tmp/vsix-src/extension/package.json"
     printf 'module.exports = {};\n' >"$tmp/vsix-src/extension/out/extension.js"
     printf '' >"$tmp/vsix-src/extension/media/chat.css"
-    if command -v zip >/dev/null 2>&1; then
-      (cd "$tmp/vsix-src" && zip -qr "$tmp/fake.vsix" extension)
-    else
-      (cd "$tmp/vsix-src" && python3 -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); [z.write(p) for p in ["extension/package.json","extension/out/extension.js","extension/media/chat.css"]]; z.close()' "$tmp/fake.vsix")
-    fi
+    (cd "$tmp/vsix-src" && zip -qr "$tmp/fake.vsix" extension)
     if command -v unzip >/dev/null 2>&1; then
       out="$tmp/vsix.json"
       FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
@@ -1380,7 +1376,7 @@ selftest() {
       check "vsix missing unzip reason" "$(printf '%s' "$(reason_of "$out")" | grep -q '^vsix-extract-tool-missing' && echo 0 || echo 1)"
     fi
   else
-    echo "vscode-e2e selftest skip: packaged-vsix case needs zip or python3 to build a test archive"
+    echo "vscode-e2e selftest skip: packaged-vsix case needs zip to build a test archive"
   fi
 
   if [ "$failures" -gt 0 ]; then

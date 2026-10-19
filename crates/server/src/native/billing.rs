@@ -269,7 +269,7 @@ pub(crate) fn billing_usage(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let (_principal, organization) = match resolve_org(&state, &headers, &org) {
+    let (principal, organization) = match resolve_org(&state, &headers, &org) {
         Ok(resolved) => resolved,
         Err(e) => return wire_status(e),
     };
@@ -283,6 +283,16 @@ pub(crate) fn billing_usage(
         }
         Some(l) => l as usize,
     };
+    // Role authorization BEFORE the billing feature state: an underprivileged
+    // principal is refused without learning whether `[billing]` is wired.
+    if let Err(denied) = faktor_cloud::authorize(
+        &principal,
+        &principal.organization,
+        faktor_cloud::Resource::Billing,
+        faktor_cloud::Action::BillingRead,
+    ) {
+        return wire_status(billing_err(denied.into()));
+    }
     let Some(service) = state.deps.billing.as_ref() else {
         return wire_status(billing_disabled());
     };
@@ -327,10 +337,8 @@ pub(crate) async fn native_entitlements(
         Ok(p) => p,
         Err(e) => return wire_status(e),
     };
-    let Some(service) = state.deps.billing.as_ref() else {
-        return wire_status(billing_disabled());
-    };
-    // Entitlements are a BILLING READ (viewer and above).
+    // Entitlements are a BILLING READ (viewer and above): authorize before
+    // the billing feature state is disclosed.
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &principal.organization,
@@ -339,6 +347,9 @@ pub(crate) async fn native_entitlements(
     ) {
         return wire_status(billing_err(denied.into()));
     }
+    let Some(service) = state.deps.billing.as_ref() else {
+        return wire_status(billing_disabled());
+    };
     match service.entitlement_snapshot(&principal.organization) {
         Ok(snapshot) => money_json(serde_json::json!({
             "ok": true,
@@ -358,22 +369,20 @@ pub(crate) async fn native_credits_grant(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid credit grant body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid credit grant body (strict DTO)")),
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(k) => k,
         Err(e) => return wire_status(e),
     };
-    let Some(service) = state.deps.billing.as_ref() else {
-        return wire_status(billing_disabled());
-    };
-    // Admin role only (the role matrix's `CreditsGrant` row).
+    // Admin role only (the role matrix's `CreditsGrant` row), decided before
+    // the billing feature state.
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &principal.organization,
@@ -382,6 +391,9 @@ pub(crate) async fn native_credits_grant(
     ) {
         return wire_status(billing_err(denied.into()));
     }
+    let Some(service) = state.deps.billing.as_ref() else {
+        return wire_status(billing_disabled());
+    };
     let account = match &body.account_id {
         Some(raw) => match faktor_cloud::BillingAccountId::try_new(raw.clone()) {
             Ok(id) => {

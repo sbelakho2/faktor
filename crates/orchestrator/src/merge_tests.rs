@@ -473,6 +473,7 @@ fn delta_change(
         kind,
         old_hash: old.map(|h| FileHash::from_hex(h).unwrap()),
         new_hash: new.map(|h| FileHash::from_hex(h).unwrap()),
+        provenance: Vec::new(),
     }
 }
 
@@ -492,6 +493,7 @@ fn provider_delta(changes: Vec<SemanticDeltaChange>) -> SemanticDelta {
         to_snapshot: snapshot,
         changes,
         degraded: false,
+        unavailable: Vec::new(),
     }
 }
 
@@ -886,6 +888,7 @@ mod preflight_integration {
                         kind: SemanticDeltaKind::Modified,
                         old_hash: Some(base),
                         new_hash: Some(hash),
+                        provenance: Vec::new(),
                     },
                     None => SemanticDeltaChange {
                         entity: SemanticEntityRef::new(
@@ -896,6 +899,7 @@ mod preflight_integration {
                         kind: SemanticDeltaKind::Removed,
                         old_hash: Some(base),
                         new_hash: None,
+                        provenance: Vec::new(),
                     },
                 };
                 Ok(SemanticEnvelope::new(
@@ -910,6 +914,7 @@ mod preflight_integration {
                         to_snapshot,
                         changes: vec![change],
                         degraded: false,
+                        unavailable: Vec::new(),
                     },
                 ))
             })
@@ -1230,6 +1235,7 @@ mod preflight_integration {
                             to_snapshot: request.from_snapshot,
                             changes: Vec::new(),
                             degraded: false,
+                            unavailable: Vec::new(),
                         },
                     )),
                     CountingDeltaMode::Fail => Err(faktor_semantic::SemanticError::Refused(

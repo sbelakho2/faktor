@@ -7,9 +7,12 @@
 //!   CONTROL-PLANE principal additionally rides the `x-faktor-control-token`
 //!   header (an auth-session or service-account token; the daemon password
 //!   is never a control-plane principal);
-//! - when no control plane is wired (`[cloud] enabled = false`, the
-//!   default), every route answers a typed 409 `cloud_disabled` and NOTHING
-//!   else in the daemon changes;
+//! - authorization ordering: the daemon password and the control-plane
+//!   credential are resolved BEFORE any feature-state read. When no control
+//!   plane is wired, a route that requires a principal refuses the missing or
+//!   invalid credential with 401 `unauthorized`; only the explicit daemon
+//!   bootstrap (`POST /native/orgs`, no token presented) answers the typed
+//!   409 `cloud_disabled`;
 //! - tenant isolation: the principal's organization is fixed by its token;
 //!   a path `{id}` naming a foreign organization is a 404 indistinguishable
 //!   from a nonexistent one (no existence leak);
@@ -90,15 +93,39 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Resolve the control-plane principal from the request. `Ok(None)` = no
 /// token presented (only the bootstrap path accepts that).
+///
+/// ORDERING: the presented credential decides first. A missing token is the
+/// absence of a principal (the bootstrap path may proceed), but a PRESENTED
+/// token with no control plane is an unverifiable/invalid principal and is
+/// refused 401 — never a 409 feature-state oracle about `[cloud]`.
 fn resolve_principal(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<faktor_cloud::Principal>, ApiError> {
-    let Some(control_plane) = state.deps.control_plane.as_ref() else {
-        return Err(cloud_disabled());
-    };
-    let Some(token) = header_value(headers, CONTROL_TOKEN_HEADER) else {
+    let Some(value) = headers.get(CONTROL_TOKEN_HEADER) else {
         return Ok(None);
+    };
+    // A PRESENT but unrepresentable/oversized token is invalid, never the
+    // "absent" bootstrap case.
+    let Some(token) = value
+        .to_str()
+        .ok()
+        .filter(|token| token.len() <= MAX_CONTROL_HEADER_BYTES)
+    else {
+        return Err(ApiError {
+            code: "unauthorized",
+            message: format!("invalid {CONTROL_TOKEN_HEADER} control-plane credential"),
+            http_status: 401,
+            retryable: false,
+        });
+    };
+    let Some(control_plane) = state.deps.control_plane.as_ref() else {
+        return Err(ApiError {
+            code: "unauthorized",
+            message: format!("invalid {CONTROL_TOKEN_HEADER} control-plane credential"),
+            http_status: 401,
+            retryable: false,
+        });
     };
     control_plane
         .authenticate(token)
@@ -247,6 +274,13 @@ pub(crate) async fn native_orgs_list(
     headers: HeaderMap,
     query: Result<Query<PageQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let principal = match require_principal(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return wire_status(e),
+    };
     // Strict DTOs everywhere: unknown/out-of-band pagination is a typed 400
     // (this route used to ignore `?limit=0`, `?limit=abc` and `?bogus=1`).
     let Query(query) = match query {
@@ -258,13 +292,6 @@ pub(crate) async fn native_orgs_list(
     if let Err(e) = page_limit(query.limit) {
         return wire_status(e);
     }
-    if let Err(e) = authed(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
-    }
-    let principal = match require_principal(&state, &headers) {
-        Ok(p) => p,
-        Err(e) => return wire_status(e),
-    };
     if let Err(denied) = faktor_cloud::authorize(
         &principal,
         &principal.organization,
@@ -305,18 +332,9 @@ pub(crate) async fn native_orgs_create(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => {
-            return wire_status(malformed_body(
-                "invalid organization bootstrap body (strict DTO)",
-            ));
-        }
-    };
-    let idempotency_key = match require_idempotency_key(&headers) {
-        Ok(k) => k,
-        Err(e) => return wire_status(e),
-    };
+    // The principal (or its absence, for the daemon bootstrap) is decided
+    // before any DTO parsing: an invalid/foreign credential never reaches the
+    // body or the `[cloud]` feature state.
     match resolve_principal(&state, &headers) {
         Ok(None) => {}
         Ok(Some(_)) => {
@@ -329,6 +347,18 @@ pub(crate) async fn native_orgs_create(
         }
         Err(e) => return wire_status(e),
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return wire_status(malformed_body(
+                "invalid organization bootstrap body (strict DTO)",
+            ));
+        }
+    };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(k) => k,
+        Err(e) => return wire_status(e),
+    };
     let Some(control_plane) = state.deps.control_plane.as_ref() else {
         return wire_status(cloud_disabled());
     };
@@ -363,13 +393,13 @@ pub(crate) async fn native_org_members_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let organization = match parse_org_id(&id) {
         Ok(o) => o,
@@ -414,13 +444,13 @@ pub(crate) async fn native_org_members_invite(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid invite body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid invite body (strict DTO)")),
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(k) => k,
@@ -483,6 +513,10 @@ pub(crate) async fn native_invitation_accept(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let principal = match require_principal(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return wire_status(e),
+    };
     let Json(body) = match body {
         Ok(body) => body,
         Err(_) => {
@@ -490,10 +524,6 @@ pub(crate) async fn native_invitation_accept(
                 "invalid invitation accept body (strict DTO)",
             ));
         }
-    };
-    let principal = match require_principal(&state, &headers) {
-        Ok(p) => p,
-        Err(e) => return wire_status(e),
     };
     let user =
         match &principal.subject {
@@ -530,13 +560,13 @@ pub(crate) async fn native_repositories(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let limit = match page_limit(query.limit) {
         Ok(l) => l,
@@ -612,13 +642,13 @@ pub(crate) async fn native_approvals_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let limit = match page_limit(query.limit) {
         Ok(l) => l,
@@ -664,13 +694,13 @@ pub(crate) async fn native_approvals_create(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid approval request body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid approval request body (strict DTO)")),
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(k) => k,
@@ -711,6 +741,10 @@ pub(crate) async fn native_approvals_decide(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let principal = match require_principal(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return wire_status(e),
+    };
     let Json(body) = match body {
         Ok(body) => body,
         Err(_) => {
@@ -718,10 +752,6 @@ pub(crate) async fn native_approvals_decide(
                 "invalid approval decision body (strict DTO)",
             ));
         }
-    };
-    let principal = match require_principal(&state, &headers) {
-        Ok(p) => p,
-        Err(e) => return wire_status(e),
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(k) => k,

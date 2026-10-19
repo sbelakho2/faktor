@@ -10,6 +10,7 @@ members = [
     "crates/browser",
     "crates/evidence",
     "crates/semantic",
+    "crates/impact",
     "crates/protocol",
     "crates/cas",
     "crates/store",
@@ -51,6 +52,8 @@ members = [
     "crates/worker",
     "crates/updater",
     "crates/cli",
+    "crates/ci-tools",
+    "crates/test-mocks",
     "crates/acp",
     "tests/integration",
     "tests/longrun",
@@ -118,6 +121,7 @@ faktor-browser = { path = "crates/browser" }
 faktor-mcp = { path = "crates/mcp" }
 faktor-lsp = { path = "crates/lsp" }
 faktor-index = { path = "crates/index" }
+faktor-impact = { path = "crates/impact" }
 faktor-search = { path = "crates/search" }
 faktor-security = { path = "crates/security" }
 faktor-sandbox = { path = "crates/sandbox" }
@@ -126,6 +130,7 @@ faktor-cloud = { path = "crates/cloud" }
 faktor-worker = { path = "crates/worker" }
 faktor-updater = { path = "crates/updater" }
 faktor-cli = { path = "crates/cli" }
+faktor-ci-tools = { path = "crates/ci-tools" }
 
 serde = { version = "1", features = ["derive"] }
 unicode-normalization = "0.1"

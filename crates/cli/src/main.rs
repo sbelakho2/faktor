@@ -39,6 +39,7 @@ mod config;
 mod embeddings;
 mod evidence;
 mod graph;
+mod impact;
 mod mcp_bridge;
 mod payload;
 mod scm_daemon;
@@ -122,6 +123,15 @@ pub(crate) enum Command {
     Acp {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
+    },
+    /// Repository relationship graph authority: `graph` serializes the one
+    /// document; `affected` returns impacted files/symbols/tests with
+    /// reasons/provenance. CI and the semantic provider consume this same
+    /// graph.
+    #[command(display_order = 105)]
+    Impact {
+        #[command(subcommand)]
+        action: impact::ImpactAction,
     },
     /// Signed updater lifecycle (local parity with the control-plane
     /// routes): status, check, stage, apply, rollback, recover and the
@@ -487,6 +497,12 @@ pub(crate) fn expand(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The ONE standalone supervisor constructor for CLI-only commands
+/// (doctor, impact). The daemon graph injects its own supervisor.
+fn shared_supervisor() -> Result<std::sync::Arc<ProcessSupervisor>, faktor_core::error::Error> {
+    ProcessSupervisor::try_shared()
+}
+
 #[tokio::main]
 pub(crate) async fn main() {
     // Bootstrap mode is detected BEFORE the CLI: a file named `launcher`
@@ -540,6 +556,19 @@ pub(crate) async fn main() {
         }
         Command::Acp { data_dir } => {
             acp(expand(&data_dir)).await;
+        }
+        Command::Impact { action } => {
+            let supervisor = match shared_supervisor() {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    eprintln!("impact: process supervisor unavailable: {error}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(error) = impact::command(action, supervisor).await {
+                eprintln!("impact: {error}");
+                std::process::exit(1);
+            }
         }
         Command::Updater {
             action,
@@ -3281,7 +3310,7 @@ pub(crate) fn deep_doctor(
     //     map of THIS process (informational: the zero-orphan guarantee is
     //     an in-process lifetime contract, not durable rows another process
     //     could audit).
-    match ProcessSupervisor::try_shared() {
+    match shared_supervisor() {
         Ok(shared) => {
             let alive = shared.alive();
             let session_owned = alive

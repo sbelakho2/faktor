@@ -4,9 +4,11 @@
 use super::*;
 
 pub mod builder;
+pub mod semantic;
 pub mod serve;
 pub mod wiring;
 
 pub use builder::*;
+pub(crate) use semantic::SemanticSources;
 pub(crate) use serve::*;
 pub(crate) use wiring::*;

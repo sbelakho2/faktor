@@ -402,13 +402,13 @@ pub(crate) async fn native_enterprise_audit(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let extended = query.extended.unwrap_or(false);
     if extended {
@@ -565,13 +565,13 @@ pub(crate) async fn native_enterprise_settings_put(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid settings body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid settings body (strict DTO)")),
     };
     if let Err(e) = require_idempotency_key(&headers) {
         return wire_status(e);
@@ -615,13 +615,13 @@ pub(crate) async fn native_enterprise_artifacts_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let limit = match enterprise_page_limit(query.limit) {
         Ok(limit) => limit,
@@ -656,13 +656,13 @@ pub(crate) async fn native_enterprise_artifacts_register(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid artifact body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid artifact body (strict DTO)")),
     };
     if let Err(e) = require_idempotency_key(&headers) {
         return wire_status(e);
@@ -728,13 +728,13 @@ pub(crate) async fn native_enterprise_gc(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid gc body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid gc body (strict DTO)")),
     };
     if let Err(e) = require_idempotency_key(&headers) {
         return wire_status(e);
@@ -771,13 +771,13 @@ pub(crate) async fn native_enterprise_deletion_jobs_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
     let limit = match enterprise_page_limit(query.limit) {
         Ok(limit) => limit,
@@ -808,13 +808,13 @@ pub(crate) async fn native_enterprise_deletion_jobs_create(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid deletion scope body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid deletion scope body (strict DTO)")),
     };
     if let Err(e) = require_idempotency_key(&headers) {
         return wire_status(e);
@@ -960,13 +960,13 @@ pub(crate) async fn native_enterprise_effective_config(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(_) => return wire_status(malformed_body("invalid effective-config body (strict DTO)")),
-    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid effective-config body (strict DTO)")),
     };
     if let Err(denied) = faktor_cloud::authorize(
         &principal,

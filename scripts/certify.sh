@@ -172,6 +172,22 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
+
+require_ci_tools() {
+    if [ ! -x "$CI_TOOLS" ]; then
+        echo "certify: $CI_TOOLS is missing; build it with 'cargo build --release -p faktor-ci-tools'" >&2
+        return 2
+    fi
+    return 0
+}
 cd "$ROOT"
 
 step() { printf '\n== %s ==\n' "$*"; }
@@ -250,7 +266,7 @@ run_canonical_gates() { # runs the canonical list; 0 all pass, 1 any fail
 
 extract_ci_gate_commands() { # workflow_yaml lane -> unique cargo gate commands
     # The trusted linux lane may wrap the canonical `cargo test` gate in the
-    # bounded flake-tolerance recorder (scripts/certification/flake-tolerance.py)
+    # bounded flake-tolerance recorder (faktor-ci-tools flake-tolerance)
     # — `run --lane linux --max-flakes N -- cargo test ...` executes the
     # canonical argv byte-for-byte and only ever adds isolation reruns of
     # already-failed test names, so parity is proven against the WRAPPED
@@ -261,9 +277,9 @@ extract_ci_gate_commands() { # workflow_yaml lane -> unique cargo gate commands
             if ($0 ~ /^      - cargo (fmt|check|clippy|test)( |$)/) {
                 sub(/^      - /, ""); print; next
             }
-            if ($0 ~ /^      - python3 scripts\/certification\/flake-tolerance\.py run /) {
+            if ($0 ~ /^      - .*faktor-ci-tools"? flake-tolerance run /) {
                 inner = $0
-                sub(/^      - python3 scripts\/certification\/flake-tolerance\.py run .* -- /, "", inner)
+                sub(/^      - .*faktor-ci-tools"? flake-tolerance run .* -- /, "", inner)
                 if (inner ~ /^cargo (fmt|check|clippy|test)( |$)/) print inner
             }
         }
@@ -414,7 +430,7 @@ check_forge_metadata() { # commit [context] -> 0 verified, 1 violation, 2 extern
         return 2
     fi
     local description
-    description="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get("description"); print(v if isinstance(v,str) else "")' "$repo_file" 2>/dev/null)" || {
+    description="$("$CI_TOOLS" github repo-description "$repo_file" 2>/dev/null)" || {
         FORGE_METADATA_STATUS="mismatch"
         FORGE_METADATA_DETAIL="GitHub repo metadata unreadable (malformed JSON)"
         rm -rf "$tmp"
@@ -442,43 +458,7 @@ check_forge_metadata() { # commit [context] -> 0 verified, 1 violation, 2 extern
         return 2
     fi
     local verdict detail
-    if verdict="$(python3 - "$status_file" "$commit" "$context" <<'PY'
-import json
-import sys
-
-path, commit, context = sys.argv[1:4]
-try:
-    with open(path) as fh:
-        doc = json.load(fh)
-except Exception:
-    print("violation|forge-status-unreadable")
-    sys.exit(0)
-if not isinstance(doc, dict):
-    print("violation|forge-status-unreadable")
-    sys.exit(0)
-sha = doc.get("sha")
-if isinstance(sha, str) and sha != commit:
-    print("violation|forge-status-sha-mismatch")
-    sys.exit(0)
-statuses = doc.get("statuses")
-if not isinstance(statuses, list):
-    statuses = []
-matching = [s for s in statuses if isinstance(s, dict) and s.get("context") == context]
-if not matching:
-    print("violation|forge-status-absent")
-    sys.exit(0)
-latest = max(matching, key=lambda s: str(s.get("updated_at") or ""))
-state = str(latest.get("state") or "unknown")
-if state == "pending":
-    print("violation|forge-status-pending")
-elif state == "success":
-    print("ok|forge-status-success")
-elif state in ("failure", "error"):
-    print("violation|forge-status-not-success")
-else:
-    print("violation|forge-status-unknown")
-PY
-    )"; then
+    if verdict="$("$CI_TOOLS" github status-verdict "$status_file" "$commit" "$context")"; then
         local kind="${verdict%%|*}" pdetail="${verdict#*|}"
         if [ "$kind" = "ok" ]; then
             FORGE_METADATA_STATUS="match"
@@ -611,6 +591,8 @@ while [ "$#" -gt 0 ]; do
         ;;
     esac
 done
+
+require_ci_tools || exit 2
 
 # The context is validated against the registry before anything else runs.
 # Gate-parity and selftest modes are pure offline checks and skip it.
@@ -1005,10 +987,7 @@ require_woodpecker_env() {
         echo "certify: curl is required for CI verification" >&2
         return 2
     }
-    command -v python3 >/dev/null 2>&1 || {
-        echo "certify: python3 is required for CI verification" >&2
-        return 2
-    }
+    require_ci_tools || return 2
     command -v node >/dev/null 2>&1 || {
         echo "certify: node is required to verify the trusted-build attestation (scripts/certification/attestation.mjs)" >&2
         return 2
@@ -1017,156 +996,7 @@ require_woodpecker_env() {
 }
 
 py_json() { # mode file [arg]
-    python3 - "$@" <<'PY'
-import base64
-import json
-import re
-import sys
-
-
-def load(path):
-    try:
-        with open(path) as fh:
-            return json.load(fh)
-    except Exception:
-        return None
-
-
-def number(value):
-    try:
-        return int(value)
-    except Exception:
-        return 0
-
-
-mode = sys.argv[1]
-data = load(sys.argv[2])
-arg = sys.argv[3] if len(sys.argv) > 3 else ""
-arg2 = sys.argv[4] if len(sys.argv) > 4 else ""
-
-if mode == "repo_id":
-    print(data.get("id", "") if isinstance(data, dict) else "")
-elif mode == "field":
-    value = data
-    for part in arg.split("."):
-        if isinstance(value, dict):
-            value = value.get(part)
-        else:
-            value = None
-            break
-    if value is None:
-        print("")
-    elif isinstance(value, bool):
-        print("true" if value else "false")
-    else:
-        print(value)
-elif mode == "candidates":
-    rows = data if isinstance(data, list) else []
-    for p in sorted(rows, key=lambda x: number(x.get("number")), reverse=True):
-        print("%s\t%s\t%s\t%s\t%s" % (
-            p.get("number", ""), p.get("id", ""), p.get("status", ""),
-            p.get("commit", ""), p.get("event", ""),
-        ))
-elif mode == "workflow_state":
-    for w in (data or {}).get("workflows") or []:
-        if w.get("name") == arg:
-            print(w.get("state", ""))
-            break
-elif mode == "attestation_step":
-    steps = []
-    for w in (data or {}).get("workflows") or []:
-        for key in ("children", "steps", "tasks"):
-            if isinstance(w.get(key), list):
-                steps.extend(w[key])
-    if isinstance((data or {}).get("steps"), list):
-        steps.extend(data["steps"])
-    for s in steps:
-        if isinstance(s, dict) and s.get("name") == arg:
-            # `id` is the global step id the log endpoint addresses; `pid` is
-            # only the step's ordinal inside its workflow/pipeline and fetches
-            # a different step's log (which made a published attestation look
-            # absent).
-            print(s.get("id", s.get("pid", "")))
-            break
-elif mode == "context_boundaries":
-    # Classify the workflows a certified context does NOT own when the
-    # certified workflow is green but the overall pipeline is not: a pending
-    # workflow whose platform label no CONNECTED agent advertises is a typed
-    # self-hosted-absence boundary (visible, never a silent green); anything
-    # else stays a hard failure for the caller.
-    agents = load(arg2) if arg2 else []
-    platforms = set()
-    if isinstance(agents, list):
-        for a in agents:
-            if not isinstance(a, dict) or not a.get("last_contact"):
-                continue
-            labels = a.get("custom_labels") or {}
-            if isinstance(labels, dict) and labels.get("platform"):
-                platforms.add(labels["platform"])
-            elif a.get("platform"):
-                platforms.add(a["platform"])
-    for w in (data or {}).get("workflows") or []:
-        # Matrix workflows share the pipeline's name, so the certified one is
-        # identified by state: every green workflow is already proven, and
-        # anything else is classified below.
-        name = w.get("name", "")
-        state = w.get("state", "")
-        if state == "success":
-            continue
-        platform = (w.get("environ") or {}).get("platform") or ""
-        if state in ("pending", "running", "blocked", "created", "started") and platform and platform not in platforms:
-            print("BOUNDARY\tworkflow %s is %s and no connected agent advertises platform=%s (self-hosted lane absent; typed, visible, never green)" % (name, state, platform))
-        else:
-            print("PROBLEM\tworkflow %s is %s (platform=%s)" % (name, state, platform or "unknown"))
-elif mode in ("attestation_extract", "release_signature_extract"):
-    # The log endpoint returns each entry's `data` base64-encoded; older
-    # shapes may carry plain text. Search BOTH renderings so the block is
-    # found either way (never silently missing).
-    if mode == "attestation_extract":
-        marker = "FAKTOR ATTESTATION"
-        prefix = "attestation-extract"
-    else:
-        marker = "FAKTOR RELEASE SIGNATURE"
-        prefix = "release-signature-extract"
-    raw_parts = []
-    decoded_parts = []
-    if isinstance(data, list):
-        for e in data:
-            if not isinstance(e, dict) or not isinstance(e.get("data"), str):
-                continue
-            raw_parts.append(e["data"])
-            try:
-                decoded_parts.append(base64.b64decode(e["data"]).decode("utf-8", "replace"))
-            except Exception:
-                decoded_parts.append(e["data"])
-    elif isinstance(data, dict):
-        if isinstance(data.get("data"), str):
-            raw_parts.append(data["data"])
-            try:
-                decoded_parts.append(base64.b64decode(data["data"]).decode("utf-8", "replace"))
-            except Exception:
-                decoded_parts.append(data["data"])
-        elif isinstance(data.get("lines"), list):
-            decoded_parts.extend(x for x in data["lines"] if isinstance(x, str))
-    text = "\n".join(raw_parts) + "\n" + "\n".join(decoded_parts)
-    match = re.search(
-        r"-----BEGIN %s-----(.*?)-----END %s-----" % (marker, marker),
-        text, re.S,
-    )
-    if not match:
-        sys.exit(3)
-    blob = "".join(match.group(1).split())
-    try:
-        obj = json.loads(base64.b64decode(blob).decode())
-    except Exception as exc:
-        print("%s: %s" % (prefix, exc), file=sys.stderr)
-        sys.exit(4)
-    if not isinstance(obj, dict):
-        sys.exit(4)
-    print(json.dumps(obj, sort_keys=True))
-else:
-    sys.exit(2)
-PY
+    "$CI_TOOLS" json "$@"
 }
 
 api_get() { # api path out_file -> http code on stdout
@@ -1292,7 +1122,7 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
     ATT_SOURCE_SHA="$commit"
     ATT_TREE_SHA="$tree"
     ATT_IDENTITY="$(py_json field "$att_file" signature.identity)"
-    ATT_ARTIFACTS="$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("artifacts"); print(len(a) if isinstance(a, dict) else 0)' "$att_file" 2>/dev/null || printf '0')"
+    ATT_ARTIFACTS="$("$CI_TOOLS" json len "$att_file" artifacts 2>/dev/null || printf '0')"
     if [ "$rc" -ne 0 ]; then
         printf 'attestation-invalid: pipeline %s: %s\n' "$number" "$(printf '%s\n' "$out" | grep -m1 'attestation problem:' || printf '%s\n' "$out" | head -n1)" >>"$problems"
         ATT_STATUS="failed"
@@ -1308,32 +1138,7 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
     # attestation itself, so an empty local artifact list can never pass.
     RA_ATTESTED="0"
     if [ -n "$RA_REQUIRED_TSV" ] && [ -f "$RA_REQUIRED_TSV" ]; then
-        RA_ATTESTED="$(python3 - "$att_file" "$RA_REQUIRED_TSV" <<'PY'
-import json
-import os
-import sys
-
-try:
-    artifacts = json.load(open(sys.argv[1])).get("artifacts") or {}
-except Exception:
-    artifacts = {}
-if not isinstance(artifacts, dict):
-    artifacts = {}
-count = 0
-try:
-    lines = open(sys.argv[2]).read().splitlines()
-except Exception:
-    lines = []
-for line in lines:
-    parts = line.split("\t")
-    if len(parts) != 3:
-        continue
-    _kind, sha, path = parts
-    if artifacts.get(os.path.basename(path)) == sha:
-        count += 1
-print(count)
-PY
-)"
+        RA_ATTESTED="$("$CI_TOOLS" release-attested-count "$att_file" "$RA_REQUIRED_TSV")"
     fi
     [ -n "$RA_ATTESTED" ] || RA_ATTESTED="0"
     return 0
@@ -1410,7 +1215,7 @@ probe_release_signature() { # api repo_id number detail commit tree artifacts_ts
     REL_DIGEST="sha256:$(hash_file "$rel_file")"
     REL_STEP_PID="$pid"
     REL_IDENTITY="$(py_json field "$rel_file" signature.identity)"
-    REL_ARTIFACTS="$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("artifacts"); print(len(a) if isinstance(a, dict) else 0)' "$rel_file" 2>/dev/null || printf '0')"
+    REL_ARTIFACTS="$("$CI_TOOLS" json len "$rel_file" artifacts 2>/dev/null || printf '0')"
     if [ "$rc" -ne 0 ]; then
         printf 'release-signature-invalid: pipeline %s: %s\n' "$number" "$(printf '%s\n' "$out" | grep -m1 'release-signature problem:' || printf '%s\n' "$out" | head -n1)" >>"$problems"
         REL_STATUS="failed"
@@ -1579,225 +1384,7 @@ write_ci_manifest() { # out_file artifacts_file problems_file notes_file
         CERTIFY_M_REL_ROLE="$RELEASE_SIGN_ROLE" CERTIFY_M_REL_DIGEST="$REL_DIGEST" \
         CERTIFY_M_REL_ARTIFACTS="$REL_ARTIFACTS" \
         CERTIFY_M_LOCAL_STATUS="$LOCAL_STATUS" \
-        python3 <<'PY'
-import hashlib
-import json
-import os
-from datetime import datetime, timezone
-
-
-def env(name):
-    return os.environ.get(name, "")
-
-
-def digest(text):
-    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
-
-
-artifacts = []
-with open(env("CERTIFY_M_ARTIFACTS")) as fh:
-    for line in fh:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        sha, path = line.split("\t", 1)
-        artifacts.append({"path": path, "sha256": sha})
-artifacts.sort(key=lambda a: a["path"])
-artifact_digest = digest("".join("%s\t%s\n" % (a["sha256"], a["path"]) for a in artifacts))
-
-problems = []
-with open(env("CERTIFY_M_PROBLEMS")) as fh:
-    for line in fh:
-        line = line.strip()
-        if line:
-            problems.append(line)
-
-notes = []
-with open(env("CERTIFY_M_NOTES")) as fh:
-    for line in fh:
-        line = line.strip()
-        if line:
-            notes.append(line)
-
-context = {
-    "name": env("CERTIFY_M_CONTEXT"),
-    "event": env("CERTIFY_M_CONTEXT_EVENT"),
-    "workflow": env("CERTIFY_M_CONTEXT_WORKFLOW"),
-    "class": env("CERTIFY_M_CONTEXT_CLASS"),
-    "config_file": env("CERTIFY_M_CONTEXT_CONFIG_FILE"),
-    "registry": "immutable",
-}
-observed = {
-    "repository": env("CERTIFY_M_REPO"),
-    "repository_id": env("CERTIFY_M_REPO_ID"),
-    "event": env("CERTIFY_M_OBS_EVENT"),
-    "workflow": env("CERTIFY_M_OBS_WORKFLOW"),
-    "workflow_state": env("CERTIFY_M_OBS_WORKFLOW_STATE"),
-    "pipeline_status": env("CERTIFY_M_OBS_PIPELINE_STATUS"),
-    "pipeline_id": env("CERTIFY_M_OBS_PIPELINE_ID"),
-    "pipeline_number": env("CERTIFY_M_OBS_PIPELINE_NUMBER"),
-    "config_file": env("CERTIFY_M_OBS_CONFIG_FILE"),
-    "trusted_volumes": env("CERTIFY_M_OBS_TRUSTED_VOLUMES"),
-}
-attestation = {
-    "status": env("CERTIFY_M_ATT_STATUS"),
-    "origin_context": env("CERTIFY_M_ATT_ORIGIN"),
-    "pipeline_number": env("CERTIFY_M_ATT_PIPELINE"),
-    "pipeline_id": env("CERTIFY_M_ATT_PIPELINE_ID"),
-    "step_pid": env("CERTIFY_M_ATT_STEP_PID"),
-    "signature_identity": env("CERTIFY_M_ATT_IDENTITY"),
-    "source_sha": env("CERTIFY_M_ATT_SOURCE"),
-    "tree_sha": env("CERTIFY_M_ATT_TREE"),
-    "artifacts_matched": env("CERTIFY_M_ATT_MATCHED"),
-    "artifacts_attested": env("CERTIFY_M_ATT_ARTIFACTS"),
-    "evidence_digest": env("CERTIFY_M_ATT_DIGEST"),
-}
-# Role split: the release artifact/certificate class is signed by the
-# separate `release-signing` identity (faktor-release-signature/v1 binding
-# the build-attestation bytes + release artifact digests); the verifier
-# refuses a build-role signature typed.
-release_signature = {
-    "status": env("CERTIFY_M_REL_STATUS") or "not-run",
-    "origin_context": env("CERTIFY_M_REL_ORIGIN"),
-    "pipeline_number": env("CERTIFY_M_REL_PIPELINE"),
-    "pipeline_id": env("CERTIFY_M_REL_PIPELINE_ID"),
-    "step_pid": env("CERTIFY_M_REL_STEP_PID"),
-    "signature_identity": env("CERTIFY_M_REL_IDENTITY"),
-    "role": env("CERTIFY_M_REL_ROLE") or "release-signing",
-    "evidence_digest": env("CERTIFY_M_REL_DIGEST"),
-    "artifacts_signed": env("CERTIFY_M_REL_ARTIFACTS"),
-}
-local_status = env("CERTIFY_M_LOCAL_STATUS") or "not-run"
-
-
-def as_int(value):
-    try:
-        return int(value)
-    except Exception:
-        return 0
-
-
-release_artifacts = {
-    "status": env("CERTIFY_M_RA_STATUS") or "not-run",
-    "required": as_int(env("CERTIFY_M_RA_REQUIRED")),
-    "matched": as_int(env("CERTIFY_M_RA_MATCHED")),
-    "attested": as_int(env("CERTIFY_M_RA_ATTESTED")),
-    "missing": [item for item in env("CERTIFY_M_RA_MISSING").split(",") if item],
-    "branding": env("CERTIFY_M_RA_BRANDING") or "not-run",
-}
-fault_tests = []
-fault_tests_path = env("CERTIFY_M_FAULT_TESTS")
-if fault_tests_path and os.path.exists(fault_tests_path):
-    try:
-        with open(fault_tests_path) as fh:
-            fault_tests = [line.strip() for line in fh if line.strip()][:200]
-    except Exception:
-        fault_tests = []
-fault_campaign = {
-    "status": env("CERTIFY_M_FAULT_STATUS") or "not-run",
-    "executed": as_int(env("CERTIFY_M_FAULT_COUNT")),
-    "evidence_digest": env("CERTIFY_M_FAULT_DIGEST"),
-    "tests": fault_tests,
-}
-# P1 completeness: a release certificate additionally requires the declared
-# ReleaseArtifactSet to be complete (matched == required > 0), digest-covered
-# by the signed attestation (attested == required), brand-scanned where
-# applicable, plus a passed fault campaign with executed > 0. An empty
-# artifact list or a branding skip can therefore never print the release class.
-release_preconditions = {
-    "required_artifacts": release_artifacts["required"] > 0,
-    "matched_equals_required": (
-        release_artifacts["required"] > 0
-        and release_artifacts["matched"] == release_artifacts["required"]
-    ),
-    "attested_equals_required": (
-        release_artifacts["required"] > 0
-        and release_artifacts["attested"] == release_artifacts["required"]
-    ),
-    "artifact_set_complete": release_artifacts["status"] == "complete",
-    "artifact_branding_pass": release_artifacts["branding"] == "pass",
-    "fault_campaign_pass": fault_campaign["status"] == "pass",
-    "fault_tests_executed": fault_campaign["executed"] > 0,
-    # Role split: the release artifact/certificate class requires its own
-    # release-signing role signature (never the build key that signed the
-    # build attestation).
-    "release_signing_role_verified": release_signature["status"] == "verified",
-}
-release_ready = all(release_preconditions.values())
-release_certificate = (
-    not problems
-    and local_status == "pass"
-    and (context["class"] == "trusted" or attestation["status"] == "verified")
-    and release_ready
-)
-certificate_class = "release" if release_certificate else ("source" if not problems else "none")
-core = {
-    "artifacts": artifacts,
-    "commit": env("CERTIFY_M_COMMIT"),
-    "context": context,
-    "event": observed["event"],
-    "pipeline_number": observed["pipeline_number"],
-    "pipeline_status": observed["pipeline_status"],
-    "repository": observed["repository"],
-    "run_url": env("CERTIFY_M_RUN_URL"),
-    "tree": env("CERTIFY_M_TREE"),
-    "workflow_state": observed["workflow_state"],
-    "attestation": attestation,
-    "release_signature": release_signature,
-    "release_artifacts": release_artifacts,
-    "fault_campaign": fault_campaign,
-}
-manifest = {
-    "schema": "faktor-release-certification/v2",
-    "status": "passed" if not problems else "failed",
-    "repository": observed["repository"],
-    "repository_id": observed["repository_id"],
-    "commit": env("CERTIFY_M_COMMIT"),
-    "tree": env("CERTIFY_M_TREE"),
-    "context": context,
-    "woodpecker_host": env("CERTIFY_M_HOST"),
-    "pipeline_number": observed["pipeline_number"],
-    "pipeline_id": observed["pipeline_id"],
-    "pipeline_status": observed["pipeline_status"],
-    "workflow": observed["workflow"],
-    "workflow_state": observed["workflow_state"],
-    "event": observed["event"],
-    "trusted_class": {
-        "expected": context["class"],
-        "observed_volumes": observed["trusted_volumes"],
-    },
-    "run_url": env("CERTIFY_M_RUN_URL"),
-    "artifacts": artifacts,
-    "artifact_digest": artifact_digest,
-    "attestation": attestation,
-    "release_signature": release_signature,
-    "release_artifacts": release_artifacts,
-    "fault_campaign": fault_campaign,
-    "release_preconditions": release_preconditions,
-    "certificate_class": certificate_class,
-    "local_gates": local_status,
-    "release_certificate": release_certificate,
-    "release_rule": (
-        "release = full local gates pass AND (trusted context verified OR signed "
-        "build attestation verified) AND the release-signing role signature "
-        "(faktor-release-signature/v1) verifies AND ReleaseArtifactSet "
-        "complete+attested (required>0, matched==required, branding pass) AND "
-        "fault campaign pass with executed>0; no flag weakens this"
-    ),
-    "observed": observed,
-    "evidence_digest": digest(json.dumps(core, sort_keys=True, separators=(",", ":"))),
-    "evidence_policy": "commit-message claims are not evidence; only the observed CI context and signed attestation at this exact commit certify",
-    "certified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "problems": problems,
-    "notes": notes,
-}
-out = env("CERTIFY_M_OUT")
-with open(out, "w") as fh:
-    fh.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-print(manifest["status"])
-print("true" if release_certificate else "false")
-print(manifest["evidence_digest"])
-PY
+        "$CI_TOOLS" ci-manifest
 }
 
 # Observed values (P1-I): every field below is loaded from the Woodpecker API
@@ -2158,7 +1745,7 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
     *)
         echo "certify: CI verification FAILED for $commit — problems:" >&2
         if [ -f "$manifest_out" ]; then
-            python3 -c 'import json,sys; [print("  - " + p) for p in json.load(open(sys.argv[1])).get("problems", [])]' "$manifest_out" >&2
+            "$CI_TOOLS" manifest-problems "$manifest_out"
         fi
         bad "CI context not certified; see $manifest_out"
         return 1
@@ -2176,63 +1763,15 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
 # `CI_CERT_STATUS != match`, which refuses every local ReleaseArtifact as a
 # release artifact and fails `--release`.
 ci_cert_manifest_check() { # manifest_path commit tree -> "status|problem|detail"
-    local file="$1" commit="$2" tree="$3"
-    if [ ! -f "$file" ]; then
-        printf 'absent|ci-certification-absent|no CI certification manifest at %s' "$file"
-        return 0
-    fi
-    python3 - "$file" "$commit" "$tree" <<'PY'
-import json
-import sys
-
-path, commit, tree = sys.argv[1:4]
-
-
-def reject_duplicates(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise ValueError(f"duplicate key {key!r}")
-        seen.add(key)
-    return dict(pairs)
-
-
-try:
-    with open(path, encoding="utf-8") as fh:
-        manifest = json.loads(fh.read(), object_pairs_hook=reject_duplicates)
-except Exception as exc:  # pragma: no cover - exercised by the selftest
-    print(f"malformed|ci-certification-unreadable|{exc}")
-    raise SystemExit(0)
-if not isinstance(manifest, dict):
-    print("malformed|ci-certification-unreadable|not a JSON object")
-    raise SystemExit(0)
-schema = manifest.get("schema")
-workflow = manifest.get("workflow")
-status = manifest.get("status")
-file_commit = manifest.get("commit")
-file_tree = manifest.get("tree")
-pipeline = manifest.get("pipeline") or manifest.get("run_id") or ""
-if schema != "faktor-ci-certification/v2":
-    print(f"mismatch|ci-certification-schema|schema={schema!r}")
-elif workflow != "trusted":
-    print(f"mismatch|ci-certification-workflow|workflow={workflow!r}")
-elif status not in ("pass", "passed"):
-    print(f"mismatch|ci-certification-status|status={status!r}")
-elif file_commit != commit:
-    print(f"mismatch|ci-certification-commit-mismatch|manifest={file_commit} shipped={commit}")
-elif file_tree != tree:
-    print(f"mismatch|ci-certification-tree-mismatch|manifest={file_tree} shipped={tree}")
-else:
-    print(f"match||pipeline={pipeline}")
-PY
+    "$CI_TOOLS" github ci-cert-manifest "$1" "$2" "$3"
 }
 
 verify_ci_certification_manifest() { # commit tree -> 0 match, 1 not verified
     local commit="$1" tree="$2" out
-    if ! command -v python3 >/dev/null 2>&1; then
+    if ! require_ci_tools; then
         CI_CERT_STATUS="unreadable"
-        CI_CERT_PROBLEM="ci-certification-python3-missing"
-        CI_CERT_DETAIL="python3 is required to validate $CI_CERT_FILE"
+        CI_CERT_PROBLEM="ci-certification-tool-missing"
+        CI_CERT_DETAIL="$CI_TOOLS is required to validate $CI_CERT_FILE"
         bad "CI certification manifest NOT verified: $CI_CERT_DETAIL"
         return 1
     fi
@@ -2349,8 +1888,8 @@ certificate_class() { # local_pass ci_status ctx_class att_status -> release|sou
 }
 
 run_ci_selftest() {
-    command -v python3 >/dev/null 2>&1 || {
-        echo "certify selftest: python3 is required" >&2
+    require_ci_tools || {
+        echo "certify selftest: build faktor-ci-tools first" >&2
         return 2
     }
     command -v curl >/dev/null 2>&1 || {
@@ -2390,19 +1929,10 @@ run_ci_selftest() {
     node "$ATTESTATION_JS" keygen --out-key "$tmp/release.pem" --out-keys "$tmp/release-keys.json" --key-id faktor-release-selftest --role release-signing >/dev/null
     # Role split: the allowlist carries one build-bound identity and one
     # release-bound identity; the two are not interchangeable at verification.
-    python3 - "$tmp/build-keys.json" "$tmp/release-keys.json" "$tmp/keys.json" <<'PY'
-import json
-import sys
+    "$CI_TOOLS" keys-merge "$tmp/keys.json" "$tmp/build-keys.json" "$tmp/release-keys.json"
 
-identities = {}
-for path in sys.argv[1:3]:
-    identities.update(json.load(open(path)).get("identities", {}))
-with open(sys.argv[3], "w") as fh:
-    json.dump({"schema": "faktor-signing-allowlist/v2", "identities": identities}, fh)
-PY
-
-    port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-    python3 "$tmp/mock_server.py" "$port" "$tmp" >/dev/null 2>&1 &
+    port="$("$CI_TOOLS" free-port)"
+    "$CI_TOOLS" mock-woodpecker --port "$port" --state-dir "$tmp" >/dev/null 2>&1 &
     pid=$!
     ready=0
     for _ in $(seq 1 50); do
@@ -2442,66 +1972,19 @@ PY
     fault_record "pass" 3 "$tmp/fault-names.txt"
 
     list_json() { # number id status commit event
-        python3 -c 'import json,sys; print(json.dumps({"number":int(sys.argv[1]),"id":int(sys.argv[2]),"status":sys.argv[3],"commit":sys.argv[4],"event":sys.argv[5]}))' "$@"
+        "$CI_TOOLS" fixture pipeline-json "$@"
     }
 
     detail_json() { # number id status commit event workflows [attestation_pid] [release_signature_pid]
-        python3 - "$@" <<'PY'
-import json
-import sys
-
-number, pid_value, status, commit, event, workflows = sys.argv[1:7]
-children = []
-if len(sys.argv) > 7 and sys.argv[7]:
-    children.append({"name": "attestation", "pid": int(sys.argv[7]), "state": "success"})
-if len(sys.argv) > 8 and sys.argv[8]:
-    children.append({"name": "release-signature", "pid": int(sys.argv[8]), "state": "success"})
-items = []
-for pair in workflows.split(","):
-    if not pair:
-        continue
-    name, state = pair.split("=")
-    items.append({"name": name, "state": state, "children": children if name == "trusted" else []})
-print(json.dumps({"number": int(number), "id": int(pid_value), "status": status, "commit": commit, "event": event, "workflows": items}))
-PY
+        "$CI_TOOLS" fixture detail-json "$@"
     }
 
     details_json() { # number detail_json [number detail_json ...]
-        python3 - "$@" <<'PY'
-import json
-import sys
-
-out = {}
-args = sys.argv[1:]
-for i in range(0, len(args) - 1, 2):
-    out[args[i]] = json.loads(args[i + 1])
-print(json.dumps(out))
-PY
+        "$CI_TOOLS" fixture details-json "$@"
     }
 
     set_state() {
-        python3 - "$tmp/state.json" <<'PY'
-import json
-import os
-import sys
-
-state = {
-    "lookup": {"id": 7, "full_name": "acme/widgets", "config_file": ".woodpecker/untrusted/", "trusted": {"volumes": False}},
-    "lookup_trusted": {"id": 8, "full_name": "acme/widgets", "config_file": ".woodpecker/trusted/", "trusted": {"volumes": True}},
-    "repo7": {"id": 7, "full_name": "acme/widgets", "config_file": ".woodpecker/untrusted/", "trusted": {"volumes": False}},
-    "repo8": {"id": 8, "full_name": "acme/widgets", "config_file": ".woodpecker/trusted/", "trusted": {"volumes": True}},
-    "pipelines": json.loads(os.environ.get("CERTIFY_TEST_PIPELINES", "[]")),
-    "detail": json.loads(os.environ.get("CERTIFY_TEST_DETAIL", "null")),
-    "details": json.loads(os.environ.get("CERTIFY_TEST_DETAILS", "{}")),
-    "logs": json.loads(os.environ.get("CERTIFY_TEST_LOGS", "{}")),
-}
-if os.environ.get("CERTIFY_TEST_REPO7"):
-    state["repo7"] = json.loads(os.environ["CERTIFY_TEST_REPO7"])
-if os.environ.get("CERTIFY_TEST_REPO8"):
-    state["repo8"] = json.loads(os.environ["CERTIFY_TEST_REPO8"])
-with open(sys.argv[1], "w") as fh:
-    json.dump(state, fh)
-PY
+        "$CI_TOOLS" fixture state "$tmp/state.json"
     }
 
     log_block() { # json_file [begin_marker end_marker]
@@ -2514,18 +1997,7 @@ PY
     }
 
     logs_json() { # marker_block_file pid [marker_block_file pid ...]
-        python3 - "$@" <<'PY'
-import json
-import sys
-
-out = {}
-args = sys.argv[1:]
-for i in range(0, len(args) - 1, 2):
-    with open(args[i]) as fh:
-        block = fh.read()
-    out[str(args[i + 1])] = [{"data": block}]
-print(json.dumps(out))
-PY
+        "$CI_TOOLS" fixture logs-json "$@"
     }
 
     make_attestation() { # out_file [extra create args...]; ATT_REPO/ATT_PIPELINE_ID override
@@ -2580,17 +2052,7 @@ PY
 
     expect_problem() { # name code
         local name="$1" want_code="$2" hit
-        hit="$(python3 - "$tmp/manifest-$name.json" "$want_code" <<'PY'
-import json
-import sys
-
-try:
-    problems = json.load(open(sys.argv[1])).get("problems", [])
-except Exception:
-    problems = []
-print("yes" if any(sys.argv[2] in p for p in problems) else "no")
-PY
-)"
+        hit="$("$CI_TOOLS" manifest-has-problem "$tmp/manifest-$name.json" "$want_code")"
         if [ "$hit" = "yes" ]; then
             echo "selftest ok: $name carries problem '$want_code'"
         else
@@ -2599,9 +2061,9 @@ PY
         fi
     }
 
-    expect_manifest() { # name python_assertions
-        local name="$1" body="$2" out
-        if out="$(python3 -c "$body" "$tmp/manifest-$name.json" 2>&1)"; then
+    expect_manifest() { # name
+        local name="$1" out
+        if out="$("$CI_TOOLS" manifest-check "$name" "$tmp/manifest-$name.json" 2>&1)"; then
             echo "selftest ok: $name manifest"
         else
             echo "selftest FAIL: $name manifest" >&2
@@ -2615,37 +2077,10 @@ PY
         CERTIFY_TEST_DETAIL="$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" \
         set_state
     expect success 0
-    expect_manifest success '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["status"] == "passed", m
-assert m["schema"] == "faktor-release-certification/v2", m
-assert m["commit"] == "0123456789abcdef0123456789abcdef01234567", m
-assert m["context"]["name"] == "ci/woodpecker/pr/pr", m
-assert m["context"]["class"] == "untrusted", m
-assert m["context"]["registry"] == "immutable", m
-# values OBSERVED from the API, not caller literals
-assert m["event"] == "pull_request", m
-assert m["workflow"] == "pr", m
-assert m["workflow_state"] == "success", m
-assert m["pipeline_id"] == "111", m
-assert m["pipeline_number"] == "11", m
-assert m["trusted_class"] == {"expected": "untrusted", "observed_volumes": "false"}, m
-assert m["observed"]["pipeline_id"] == "111" and m["observed"]["event"] == "pull_request", m
-assert m["release_certificate"] is False, m
-assert m["attestation"]["status"] == "absent", m
-assert m["evidence_digest"].startswith("sha256:") and len(m["evidence_digest"]) == 71, m
-assert m["run_url"].endswith("/repos/7/pipeline/11"), m
-assert len(m["artifacts"]) == 3, m
-assert m["release_artifacts"]["status"] == "complete", m
-assert m["release_artifacts"]["required"] == 3 and m["release_artifacts"]["matched"] == 3, m
-assert m["release_artifacts"]["attested"] == 0, m
-assert m["fault_campaign"]["status"] == "pass" and m["fault_campaign"]["executed"] > 0, m
-assert m["certificate_class"] == "source", m
-'
-    first_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence_digest"])' "$tmp/manifest-success.json")"
+    expect_manifest success
+    first_digest="$("$CI_TOOLS" manifest-digest "$tmp/manifest-success.json")"
     expect success-again 0
-    second_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence_digest"])' "$tmp/manifest-success-again.json")"
+    second_digest="$("$CI_TOOLS" manifest-digest "$tmp/manifest-success-again.json")"
     if [ "$first_digest" = "$second_digest" ]; then
         echo "selftest ok: evidence digest is deterministic"
     else
@@ -2749,31 +2184,7 @@ assert m["certificate_class"] == "source", m
         set_state
     CONTEXT="ci/woodpecker/push/trusted"
     expect trusted-success 0
-    expect_manifest trusted-success '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["status"] == "passed", m
-assert m["context"]["class"] == "trusted", m
-assert m["trusted_class"] == {"expected": "trusted", "observed_volumes": "true"}, m
-assert m["event"] == "push" and m["workflow"] == "trusted", m
-assert m["observed"]["pipeline_id"] == "211", m
-assert m["attestation"]["status"] == "verified", m
-assert m["attestation"]["pipeline_number"] == "21", m
-assert m["attestation"]["signature_identity"] == "faktor-selftest", m
-assert m["attestation"]["evidence_digest"].startswith("sha256:"), m
-assert m["release_signature"]["status"] == "verified", m
-assert m["release_signature"]["role"] == "release-signing", m
-assert m["release_signature"]["signature_identity"] == "faktor-release-selftest", m
-assert m["release_signature"]["pipeline_number"] == "21", m
-assert m["release_signature"]["evidence_digest"].startswith("sha256:"), m
-assert m["release_preconditions"]["release_signing_role_verified"] is True, m
-assert m["release_artifacts"]["status"] == "complete", m
-assert m["release_artifacts"]["required"] == 3 and m["release_artifacts"]["attested"] == 3, m
-assert m["release_artifacts"]["branding"] == "pass", m
-assert m["fault_campaign"]["status"] == "pass" and m["fault_campaign"]["executed"] > 0, m
-assert m["certificate_class"] == "release", m
-assert m["release_certificate"] is True, m
-'
+    expect_manifest trusted-success
     # --- role split: a release signature made with the BUILD key is refused
     # typed (signature-role-mismatch): the release artifact/certificate class
     # requires the release-signing role, never the build identity.
@@ -2794,17 +2205,7 @@ assert m["release_certificate"] is True, m
         CERTIFY_TEST_LOGS="$(logs_json "$tmp/trusted-block.txt" 701)" \
         set_state
     expect release-signature-absent 0
-    expect_manifest release-signature-absent '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["status"] == "passed", m
-assert m["attestation"]["status"] == "verified", m
-assert m["release_signature"]["status"] == "absent", m
-assert m["release_preconditions"]["release_signing_role_verified"] is False, m
-assert m["release_certificate"] is False, m
-assert m["certificate_class"] == "source", m
-assert any("release-signature-absent" in n for n in m["notes"]), m
-'
+    expect_manifest release-signature-absent
     # --- attestation tamper: the local artifact no longer matches the attested digest.
     printf 'tampered artifact\n' >>"${ART_FULL[0]}"
     expect trusted-tampered 1
@@ -2852,16 +2253,7 @@ assert any("release-signature-absent" in n for n in m["notes"]), m
     # `create` is fail-closed (no unsigned code path), so this fixture is a
     # legacy/foreign object: a valid signed attestation with the signature
     # stripped, exactly what the verifier must refuse.
-    python3 - "$tmp/trusted-att.json" "$tmp/unsigned-att.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as fh:
-    attestation = json.load(fh)
-attestation["signature"] = None
-with open(sys.argv[2], "w") as fh:
-    json.dump(attestation, fh)
-PY
+    "$CI_TOOLS" strip-signature "$tmp/trusted-att.json" "$tmp/unsigned-att.json"
     log_block "$tmp/unsigned-att.json" >"$tmp/unsigned-block.txt"
     CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
         CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
@@ -2889,19 +2281,7 @@ PY
     CONTEXT="ci/woodpecker/pr/pr"
     ATT_KEYS="$tmp/keys.json"
     expect pr-upgraded 0
-    expect_manifest pr-upgraded '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["context"]["class"] == "untrusted", m
-assert m["attestation"]["status"] == "verified", m
-assert m["attestation"]["origin_context"] == "ci/woodpecker/push/trusted", m
-assert m["release_signature"]["status"] == "verified", m
-assert m["release_signature"]["origin_context"] == "ci/woodpecker/push/trusted", m
-assert m["release_signature"]["role"] == "release-signing", m
-assert m["release_artifacts"]["attested"] == 3, m
-assert m["certificate_class"] == "release", m
-assert m["release_certificate"] is True, m
-'
+    expect_manifest pr-upgraded
     # --- P1: the trusted project id (WOODPECKER_TRUSTED_REPO_ID or a
     # ?project=trusted lookup answer) is a claim, not authority: the project
     # record is re-fetched and its observed identity/config/trust facts must
@@ -2930,13 +2310,7 @@ assert m["release_certificate"] is True, m
     # --- without an allowlist the attestation is not consulted; no release class.
     ATT_KEYS=""
     expect pr-no-keys 0
-    expect_manifest pr-no-keys '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["attestation"]["status"] == "not-checked", m
-assert m["release_certificate"] is False, m
-assert any("attestation-not-checked" in n for n in m["notes"]), m
-'
+    expect_manifest pr-no-keys
     ATT_KEYS="$tmp/keys.json"
 
     # --- operator error: credentials missing.
@@ -3095,12 +2469,7 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         printf '%s\n' "$cli_out" | tail -n 5 >&2
         failures=$((failures + 1))
     fi
-    if python3 -c '
-import json, sys
-m = json.load(open(sys.argv[1]))
-assert m["release_certificate"] is False, m
-assert m["local_gates"] == "skipped", m
-' "$tmp/cli-ci-manifest.json" 2>/dev/null; then
+    if "$CI_TOOLS" manifest-check ci-evidence "$tmp/cli-ci-manifest.json" 2>/dev/null; then
         echo "selftest ok: --verify-ci-evidence manifest is not a release certificate"
     else
         echo "selftest FAIL: --verify-ci-evidence manifest" >&2
@@ -3385,8 +2754,8 @@ YAML
     # never touches the network; the live path is the same code with curl.
     forge_sha="$(git rev-parse HEAD)"
     forge_desc="Faktor — native Rust engineering runtime with Faktor-owned IDE UIs"
-    forge_repo_ok="$(python3 -c 'import json,sys; print(json.dumps({"full_name":sys.argv[1],"description":sys.argv[2]}))' acme/widgets "$forge_desc")"
-    forge_status_ok="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"success","statuses":[{"context":"ci/woodpecker/push/trusted","state":"success","updated_at":"2026-01-01T00:00:00Z"}]}))' "$forge_sha")"
+    forge_repo_ok="$("$CI_TOOLS" fixture repo-json acme/widgets "$forge_desc")"
+    forge_status_ok="$("$CI_TOOLS" fixture status-json "$forge_sha" success ci/woodpecker/push/trusted success)"
     forge_case() { # name want_rc repo_json status_json token -> asserts status/detail
         local name="$1" want_rc="$2" repo="$3" status="$4" token="$5" rc
         FORGE_METADATA_STATUS="not-run"
@@ -3405,7 +2774,7 @@ YAML
     }
     forge_case match 0 "$forge_repo_ok" "$forge_status_ok" selftest-token
     [ "$FORGE_METADATA_STATUS" = "match" ] || { echo "selftest FAIL: forge match status=$FORGE_METADATA_STATUS" >&2; failures=$((failures + 1)); }
-    forge_repo_legacy="$(python3 -c 'import json,sys; print(json.dumps({"full_name":sys.argv[1],"description":sys.argv[2]}))' acme/widgets "Faktor — native Rust coding-agent runtime with foreign-compatible IDE UX")"
+    forge_repo_legacy="$("$CI_TOOLS" fixture repo-json acme/widgets "Faktor — native Rust coding-agent runtime with foreign-compatible IDE UX")"
     forge_case description-mismatch 1 "$forge_repo_legacy" "$forge_status_ok" selftest-token
     case "$FORGE_METADATA_DETAIL" in
     *forge-metadata-description-mismatch*)
@@ -3414,13 +2783,13 @@ YAML
         echo "selftest FAIL: description mismatch detail=$FORGE_METADATA_DETAIL" >&2
         failures=$((failures + 1)) ;;
     esac
-    forge_status_absent="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"success","statuses":[{"context":"ci/other","state":"success"}]}))' "$forge_sha")"
+    forge_status_absent="$("$CI_TOOLS" fixture status-json "$forge_sha" success ci/other success)"
     forge_case status-absent 1 "$forge_repo_ok" "$forge_status_absent" selftest-token
-    forge_status_pending="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"pending","statuses":[{"context":"ci/woodpecker/push/trusted","state":"pending"}]}))' "$forge_sha")"
+    forge_status_pending="$("$CI_TOOLS" fixture status-json "$forge_sha" pending ci/woodpecker/push/trusted pending)"
     forge_case status-pending 1 "$forge_repo_ok" "$forge_status_pending" selftest-token
-    forge_status_failure="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"failure","statuses":[{"context":"ci/woodpecker/push/trusted","state":"error"}]}))' "$forge_sha")"
+    forge_status_failure="$("$CI_TOOLS" fixture status-json "$forge_sha" failure ci/woodpecker/push/trusted error)"
     forge_case status-error 1 "$forge_repo_ok" "$forge_status_failure" selftest-token
-    forge_status_sha="$(python3 -c 'import json,sys; print(json.dumps({"sha":"ffffffffffffffffffffffffffffffffffffffff","statuses":[{"context":"ci/woodpecker/push/trusted","state":"success"}]}))' )"
+    forge_status_sha="$("$CI_TOOLS" fixture status-json ffffffffffffffffffffffffffffffffffffffff success ci/woodpecker/push/trusted success)"
     forge_case status-sha-mismatch 1 "$forge_repo_ok" "$forge_status_sha" selftest-token
     forge_case repo-malformed 1 'not json' "$forge_status_ok" selftest-token
     saved_gh="${GH_TOKEN:-}"

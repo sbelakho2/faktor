@@ -580,6 +580,57 @@ impl McpServer {
         Ok(out)
     }
 
+    /// Discover MCP resources. The server's own lifecycle is authoritative:
+    /// an adapter that does not implement `resources/list` returns its error
+    /// verbatim (never a fabricated empty catalog).
+    pub async fn list_resources(&self) -> Result<Vec<serde_json::Value>, Error> {
+        let result = self
+            .call(
+                "resources/list",
+                serde_json::json!({}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        Ok(result
+            .get("resources")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Discover MCP resources/templates reported alongside resources.
+    pub async fn list_resource_templates(&self) -> Result<Vec<serde_json::Value>, Error> {
+        let result = self
+            .call(
+                "resources/templates/list",
+                serde_json::json!({}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        Ok(result
+            .get("resourceTemplates")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Discover MCP prompts. Prompts are attributed content, not policy: the
+    /// caller keeps them separate from tools and resources.
+    pub async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, Error> {
+        let result = self
+            .call(
+                "prompts/list",
+                serde_json::json!({}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        Ok(result
+            .get("prompts")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     pub async fn call_tool(
         &self,
         name: &str,
@@ -881,30 +932,14 @@ mod tests {
 
     #[tokio::test]
     async fn close_terminates_process() {
-        // Use a real MCP-ish server: a python one-liner that reads one frame
-        // and exits. Skip gracefully if python3 is absent.
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
+        // Use a real MCP-ish server: it reads one frame and exits.
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
-        let script = r#"
-import sys
-line = sys.stdin.readline()
-while line:
-    line = sys.stdin.readline()
-sys.exit(0)
-"#;
         let cfg = McpConfig {
             name: "mock".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["close".into()],
             env: vec![],
         };
         // connect() will time out on initialize (the mock never answers);
@@ -920,52 +955,14 @@ sys.exit(0)
     /// child process is gone; Drop does the same without a graceful close.
     #[tokio::test]
     async fn close_and_drop_join_threads_bounded_with_no_lingering_child() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         // A minimal MCP server that answers every id-bearing frame.
-        let script = r#"
-import sys, json
-
-def read_msg():
-    cl = 0
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":")[1])
-    if cl == 0:
-        return {}
-    return json.loads(sys.stdin.buffer.read(cl))
-
-def send(obj):
-    body = json.dumps(obj).encode("utf-8")
-    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-while True:
-    msg = read_msg()
-    if msg is None:
-        break
-    if isinstance(msg, dict) and "id" in msg:
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
-"#;
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let cfg = McpConfig {
             name: "mock".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["echo".into()],
             env: vec![],
         };
         let server = McpServer::connect(cfg.clone(), sup.clone())
@@ -1006,21 +1003,13 @@ while True:
     #[tokio::test]
     async fn garbage_server_is_malformed_not_hang() {
         // A server that emits garbage on stdout: framing must fail fast.
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
-        let script = "import sys, time\nwhile True:\n    sys.stdout.write('garbage\\n')\n    sys.stdout.flush()\n    time.sleep(0.01)\n";
         let cfg = McpConfig {
             name: "garbage".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["garbage".into()],
             env: vec![],
         };
         let server = McpServer::connect(cfg, sup.clone()).await;
@@ -1044,33 +1033,14 @@ while True:
     /// child is killed — no orphan), never buffered.
     #[tokio::test]
     async fn oversized_initial_handshake_is_refused_typed_and_bounded() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let pad = MAX_INITIAL_BYTES * 2;
-        let script = format!(
-            r#"
-import sys, time
-body = ('{{"jsonrpc":"2.0","id":1,"result":{{"pad":"' + 'x' * {pad} + '"}}}}').encode()
-sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-sys.stdout.buffer.write(body)
-sys.stdout.buffer.flush()
-while True:
-    time.sleep(0.05)
-"#
-        );
         let cfg = McpConfig {
             name: "oversized-init".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["oversized-init".into(), pad.to_string()],
             env: vec![],
         };
         let err = match McpServer::connect(cfg, sup.clone()).await {
@@ -1098,49 +1068,13 @@ while True:
     /// timeout instead.
     #[tokio::test]
     async fn closed_stdin_surfaces_typed_error_without_pending_entry() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
-        let script = r#"
-import json, os, sys, time
-
-def read_msg():
-    cl = 0
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":")[1])
-    if cl == 0:
-        return {}
-    return json.loads(sys.stdin.buffer.read(cl))
-
-msg = read_msg()
-body = json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}).encode("utf-8")
-sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-sys.stdout.buffer.write(body)
-sys.stdout.buffer.flush()
-# Close the read end of the pipe: os.close on the FD — closing the sys.stdin
-# wrapper would NOT close the descriptor.
-os.close(sys.stdin.fileno())
-while True:
-    time.sleep(0.05)
-"#;
         let cfg = McpConfig {
             name: "closes-stdin".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["close-stdin".into()],
             env: vec![],
         };
         let server = McpServer::connect(cfg, sup.clone()).await.unwrap();
@@ -1179,47 +1113,13 @@ while True:
     /// resumes draining.
     #[tokio::test]
     async fn a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
-        let script = r#"
-import json, sys, time
-
-def read_msg():
-    cl = 0
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":")[1])
-    if cl == 0:
-        return {}
-    return json.loads(sys.stdin.buffer.read(cl))
-
-msg = read_msg()
-body = json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}).encode("utf-8")
-sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-sys.stdout.buffer.write(body)
-sys.stdout.buffer.flush()
-# STOP draining stdin: the next large write fills the pipe and blocks.
-while True:
-    time.sleep(0.05)
-"#;
         let cfg = McpConfig {
             name: "stops-draining".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["stop-draining".into()],
             env: vec![],
         };
         let server = McpServer::connect(cfg, sup.clone()).await.unwrap();
@@ -1569,65 +1469,13 @@ while True:
     /// the client never deadlocks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stalled_child_burst_is_cleanly_cancelled_and_never_executed() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
-        let script = r#"
-import json, sys, time
-
-def read_msg():
-    cl = 0
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        if line in (b"\r\n", b"\n"):
-            break
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":")[1])
-    if cl == 0:
-        return {}
-    return json.loads(sys.stdin.buffer.read(cl))
-
-def send(obj):
-    body = json.dumps(obj).encode("utf-8")
-    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-executed = []
-while True:
-    msg = read_msg()
-    if msg is None:
-        break
-    method = msg.get("method")
-    if method is None:
-        continue
-    if method == "stall":
-        # Reset the transcript to the post-handshake baseline, answer, then
-        # STOP draining stdin for 1.5s: the large frame behind this response
-        # fills the pipe and blocks the client's writer.
-        executed = ["stall"]
-        if "id" in msg:
-            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"executed": executed}})
-        time.sleep(1.5)
-        continue
-    executed.append(method)
-    if "id" in msg:
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"executed": executed}})
-"#;
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let cfg = McpConfig {
             name: "stall-burst".into(),
-            command: "python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["stall".into()],
             env: vec![],
         };
         let server = tokio::time::timeout(

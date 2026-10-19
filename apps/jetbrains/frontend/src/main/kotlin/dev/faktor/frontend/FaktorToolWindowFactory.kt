@@ -57,7 +57,8 @@ class FaktorToolWindowFactory : ToolWindowFactory {
             sessionStore,
             workspaceRoot,
             FaktorSettingsController(IntelliJApplicationSettingsStore()),
-            ChangeReviewAdapter(project)
+            ChangeReviewAdapter(project),
+            edition8HostEditor = IntelliJHostEditor(project)
         )
         val content = ContentFactory.getInstance().createContent(panel, "Faktor", false)
         Disposer.register(

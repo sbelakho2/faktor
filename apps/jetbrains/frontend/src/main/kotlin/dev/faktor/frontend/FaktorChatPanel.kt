@@ -139,7 +139,16 @@ class FaktorChatPanel(
      * `ChangeReviewAdapter` in production). Null keeps the pure surface but
      * refuses an open with a typed reason instead of silently doing nothing.
      */
-    private val changeReviewHost: ChangeReviewHost? = null
+    private val changeReviewHost: ChangeReviewHost? = null,
+    /** Revision 8 host-local MRU/context surfaces (never daemon state). */
+    private val edition8Favorites: MutableSet<String> = linkedSetOf(),
+    private val edition8Drafts: MutableList<String> = ArrayList(),
+    /**
+     * Revision 8 editor host seam. Production passes
+     * `IntelliJHostEditor`; the split-mode smoke and display tests leave it
+     * null so the panel never links against platform classes it does not own.
+     */
+    private val edition8HostEditor: Edition8HostEditor? = null
 ) : JPanel(BorderLayout()), FaktorFrontendService.Listener {
 
     private val worker = Executors.newSingleThreadExecutor { runnable ->
@@ -603,6 +612,40 @@ class FaktorChatPanel(
         restartService = {
             val health = service.restart()
             "restarted ok=${health.ok} version=${health.version}"
+        },
+        inlineCodeAction = {
+            edition8HostEditor?.inlineCodeAction()
+                ?: "contract-required: no IDE editor host is attached; no inline code action was claimed"
+        },
+        hostAction = { id ->
+            when (id) {
+                "M-03" -> {
+                    val model = "current"
+                    val added = if (edition8Favorites.add(model)) {
+                        "added to"
+                    } else {
+                        edition8Favorites.remove(model)
+                        "removed from"
+                    }
+                    "$model $added local favorites. This is host MRU state; no daemon write is claimed."
+                }
+                "C-04" -> edition8HostEditor?.captureSelection()?.let { captured ->
+                    if (edition8Drafts.size >= 32) edition8Drafts.removeAt(0)
+                    edition8Drafts.add(captured)
+                    "Captured the current editor selection at its source version."
+                } ?: "No active editor selection exists; nothing was attached."
+                "S-05" -> edition8HostEditor?.insertSlashCommand()
+                    ?: "No active editor exists; no command text was inserted."
+                "X-10" -> edition8HostEditor?.openProblems()
+                    ?: "No project is open; no diagnostics surface exists."
+                "Q-11" -> "Sandbox setup is host-owned; the daemon policy remains fail-closed. Open Settings > Tools > Faktor to review setup guidance."
+                "D-08" -> "Display focus is host-local; choose Compact, Balanced or Verbose in the IDE appearance settings."
+                "D-09" -> "Theme, zoom and density are host-owned; Faktor never overrides them. Open Settings > Appearance."
+                "D-10" -> "Send behavior is a host keybinding; the default remains Ctrl/Cmd+Enter."
+                "D-11" -> "Keymaps and command discovery are host-owned; open Settings > Keymap to inspect them."
+                "D-14" -> "Accessibility and reduced-motion preferences are read from the host; open Settings > Appearance > Accessibility."
+                else -> "contract-required: no host action is defined for $id"
+            }
         },
         confirmTrust = { path ->
             SwingUtilities.invokeLater { startButton.doClick() }

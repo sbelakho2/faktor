@@ -43,6 +43,15 @@ if [ -z "$NODE_BIN" ]; then
 fi
 PATH="$(dirname "$NODE_BIN"):$PATH"
 export PATH
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
+export FAKTOR_CI_TOOLS="$CI_TOOLS"
 printf 'dogfood: node = %s (%s)\n' "$NODE_BIN" "$("$NODE_BIN" --version 2>/dev/null || printf unknown)"
 printf 'dogfood: root = %s\n' "$ROOT"
 
@@ -131,6 +140,7 @@ trap cleanup EXIT
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 begin_section cargo "canonical cargo gates (fmt/check/clippy/tests)"
+run_cmd cargo build --release -p faktor-ci-tools
 run_cmd cargo fmt --check
 run_cmd cargo check --workspace --all-features
 run_cmd cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -152,7 +162,7 @@ else
     SKIPPED+=("browser: sandbox network namespaces unavailable on this host (typed isolation refusal); faktor-browser excluded locally, covered by the CI trusted lane")
     run_cmd cargo test --workspace --all-features --exclude faktor-browser
 fi
-run_shell "cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py"
+run_shell "cargo test --workspace --all-features -- --list | \"$CI_TOOLS\" capability-tests"
 end_section
 
 # ===========================================================================
@@ -201,7 +211,7 @@ run_cmd "$NODE_BIN" scripts/check-blob-hygiene.mjs
 run_cmd "$NODE_BIN" scripts/programme/release-gate.mjs --selftest
 run_cmd "$NODE_BIN" scripts/protocol-codegen.mjs --check-clients
 run_cmd "$NODE_BIN" scripts/check-visual-platforms.mjs --selftest
-run_cmd python3 scripts/certification/check-visual-baseline.py selftest
+run_cmd "$CI_TOOLS" visual-baseline selftest
 run_cmd "$NODE_BIN" scripts/contracts/emit.mjs selftest
 run_cmd "$NODE_BIN" scripts/certification/evidence.mjs selftest
 run_cmd "$NODE_BIN" scripts/certification/check-workflow-graph.mjs selftest

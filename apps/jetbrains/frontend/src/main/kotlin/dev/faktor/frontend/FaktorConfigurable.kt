@@ -257,6 +257,7 @@ class FaktorConfigurable : Configurable {
         taskId = { null },
         vault = secretVault,
         settings = controller,
+        hostAction = { id -> "host action $id acknowledged; the Settings host owns this preference" },
         navigate = { screenId ->
             javax.swing.SwingUtilities.invokeLater {
                 Edition8ScreenBrowser(edition8Host()).show(component, screenId)

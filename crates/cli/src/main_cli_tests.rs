@@ -823,7 +823,7 @@ fn semantic_section_is_additive_strict_and_empty_by_default() {
     assert_eq!(semantic.max_entity_refs, Some(64));
     let supervisor = ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(dir.path().join("cas"))));
     let transport: Arc<dyn HttpTransport> = permissive_transport();
-    let registry = graph::semantic_registry(&semantic, &supervisor, &transport).unwrap();
+    let registry = graph::semantic_registry(&semantic, &supervisor, &transport, None).unwrap();
     assert!(
         registry.providers().is_empty(),
         "caps-only section registers no provider"
@@ -839,7 +839,7 @@ fn semantic_section_is_additive_strict_and_empty_by_default() {
         )
         .unwrap();
     let (_cfg, semantic) = serve_config_and_semantic(Some(path.clone())).unwrap();
-    let registry = graph::semantic_registry(&semantic, &supervisor, &transport).unwrap();
+    let registry = graph::semantic_registry(&semantic, &supervisor, &transport, None).unwrap();
     let ids: Vec<String> = registry
         .providers()
         .iter()

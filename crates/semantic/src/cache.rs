@@ -459,6 +459,7 @@ mod tests {
                     tree_hash,
                     entity_count: 3,
                     created_ms: 5,
+                    unavailable: Vec::new(),
                 },
             );
             Box::pin(async move { Ok(envelope) })
@@ -480,10 +481,12 @@ mod tests {
                         entity: entity("src/lib.rs", &request.query),
                         relevance_bps: 5000,
                         excerpt: request.query.clone(),
+                        provenance: Vec::new(),
                     }],
                     truncated: false,
                     total_bytes: request.query.len(),
                     degraded: false,
+                    unavailable: Vec::new(),
                 },
             );
             Box::pin(async move { Ok(envelope) })
@@ -517,6 +520,7 @@ mod tests {
                 entity: entity("src/lib.rs", id),
                 relevance_bps: 100,
                 excerpt: "x".to_string(),
+                provenance: Vec::new(),
             })
             .collect();
         SemanticCached::Context(SemanticEnvelope::new(
@@ -530,6 +534,7 @@ mod tests {
                 truncated: false,
                 total_bytes: 0,
                 degraded: false,
+                unavailable: Vec::new(),
             },
         ))
     }
@@ -577,6 +582,7 @@ mod tests {
             workspace,
             from_snapshot: snapshot(WorkspaceId::new(1), "rev-1"),
             to_snapshot: snapshot(WorkspaceId::new(1), "rev-2"),
+            unavailable: Vec::new(),
             changes: changed
                 .iter()
                 .map(|id| SemanticDeltaChange {
@@ -588,6 +594,7 @@ mod tests {
                     kind: SemanticDeltaKind::Modified,
                     old_hash: None,
                     new_hash: None,
+                    provenance: Vec::new(),
                 })
                 .collect(),
             degraded: false,

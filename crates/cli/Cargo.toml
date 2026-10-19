@@ -30,6 +30,7 @@ faktor-terminal.workspace = true
 faktor-mcp.workspace = true
 faktor-lsp.workspace = true
 faktor-index.workspace = true
+faktor-impact = { workspace = true, features = ["runtime"] }
 faktor-search.workspace = true
 faktor-sandbox.workspace = true
 faktor-store.workspace = true
@@ -67,8 +68,10 @@ tempfile.workspace = true
 # 0600 key created on first use (same crates the SCM webhook signer uses).
 hmac = "0.12"
 sha2 = "0.10"
+blake3.workspace = true
 
 [dev-dependencies]
+faktor-test-mocks = { path = "../test-mocks" }
 faktor-provider = { workspace = true, features = ["test-utils"] }
 # Tests drive the deterministic crash seams: store crash-arm boundaries and
 # the orchestrator's resume/reattach seam vocabulary.
@@ -79,11 +82,6 @@ faktor-orchestrator = { workspace = true, features = ["fault-injection"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 # Test-only: the worker-transport round-trip binds the same payload digest
 # the orchestrator's placement spec mints (BLAKE3 hex).
-blake3.workspace = true
-# Test-only: doctor --deep adversarial tests craft durable corruptions
-# (dangling cost reservations, deleted verification records, orphaned
-# orchestrator fact rows, ownerless active turns) by direct SQL against the
-# store file, exactly like the store crate's own corruption tests.
 rusqlite = { version = "0.40", features = ["bundled"] }
 # Test-only: the ACP terminal round-trip probes a real pty child's liveness
 # with kill(pid, 0) directly. The shell probe it replaced could not

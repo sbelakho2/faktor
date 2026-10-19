@@ -108,7 +108,15 @@ if [ -z "$HOST" ] || [ -z "$TOKEN" ]; then
 fi
 
 command -v curl >/dev/null 2>&1 || die "curl is required for API checks"
-command -v python3 >/dev/null 2>&1 || die "python3 is required for API checks"
+CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$CI_TOOLS" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
+[ -x "$CI_TOOLS" ] || die "faktor-ci-tools is required for API checks (cargo build --release -p faktor-ci-tools)"
 
 if [ -z "$REPO_FULL_NAME" ]; then
     remote="$(git remote get-url origin 2>/dev/null || true)"
@@ -145,30 +153,11 @@ request() {
 }
 
 json_field() {
-    local path="$1" default="${2:-}"
-    printf '%s' "$RESPONSE_BODY" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print(sys.argv[2])
-    sys.exit(0)
-for key in sys.argv[1].split("."):
-    if key == "":
-        continue
-    try:
-        if isinstance(data, list):
-            data = data[int(key)]
-        else:
-            data = data.get(key)
-    except Exception:
-        print(sys.argv[2])
-        sys.exit(0)
-    if data is None:
-        print(sys.argv[2])
-        sys.exit(0)
-print(data if not isinstance(data, (dict, list)) else json.dumps(data))
-' "$path" "$default"
+    local path="$1" default="${2:-}" body_file
+    body_file="$(mktemp)"
+    printf '%s' "$RESPONSE_BODY" >"$body_file"
+    "$CI_TOOLS" json-get "$body_file" "$path" "$default"
+    rm -f "$body_file"
 }
 
 check_project() { # NAME QUERY CONFIG_FILE ALLOW_PR VOLUMES

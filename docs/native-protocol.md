@@ -651,12 +651,15 @@ authority.
 
 ### Control-plane surface (disabled by default)
 
-With no `[cloud]` section every route below answers a typed 409
-`cloud_disabled` and nothing else in the daemon changes. Every route rides
-the daemon password AND, except the bootstrap, an
-`x-faktor-control-token` control-plane principal; a principal is fixed to
-one organization, and a path `{id}` naming a foreign organization is the
-same 404 a nonexistent one answers (no existence leak). Mutating
+With no `[cloud]` section the feature state is `cloud_disabled`, but it is
+disclosed only AFTER identity: a missing, invalid or foreign
+`x-faktor-control-token` is the same typed 401 `unauthorized` whether the
+control plane is enabled or disabled, and a foreign organization is the
+same 404 a nonexistent one answers. The one exception is the daemon
+bootstrap (`POST /native/orgs` with NO token presented), which may answer
+the typed 409 `cloud_disabled`. Every route rides the daemon password AND,
+except the bootstrap, an `x-faktor-control-token` control-plane principal;
+a principal is fixed to one organization (no existence leak). Mutating
 control-plane routes require a bounded printable-ASCII idempotency key:
 the same key + same request replays the recorded response; the same key +
 a different request is a typed 409.

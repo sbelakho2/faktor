@@ -24,6 +24,7 @@ const PROGRAMME_CHECKS = Object.freeze([
   'node scripts/programme/check-registry.mjs --check',
   'node scripts/programme/check-registry.mjs --selftest',
   'node scripts/programme/select-tests.mjs selftest',
+  'node scripts/programme/build-impact-graph.mjs --selftest',
   'node scripts/programme/check-settlement.mjs --selftest',
   'node scripts/programme/check-settlement.mjs',
   'node scripts/programme/check-core-dumps.mjs --selftest',
@@ -37,7 +38,10 @@ export const SUITES = Object.freeze({
   },
   selector: {
     layers: ['contracts'],
-    commands: ['node scripts/programme/select-tests.mjs selftest'],
+    commands: [
+      'node scripts/programme/select-tests.mjs selftest',
+      'node scripts/programme/build-impact-graph.mjs --selftest',
+    ],
   },
   'act-now': {
     layers: ['contracts', 'state-model-crash', 'unit-property'],

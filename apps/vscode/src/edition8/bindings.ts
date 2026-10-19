@@ -215,17 +215,19 @@ export function bindingFor8(control: E8Control): E8Binding {
   const e5 = bindingFor(control as never);
   const kind = route.kind;
   const input: E8InputKind =
-    kind === 'missing'
-      ? 'readonly'
-      : kind === 'host'
-        ? 'action'
-        : route.kind === 'config'
-          ? e5.input
-          : route.kind === 'read'
-            ? 'readonly'
-            : e5.input === 'readonly'
-              ? 'action'
-              : e5.input;
+    control.id === 'X-06'
+      ? 'text'
+      : kind === 'missing'
+        ? 'readonly'
+        : kind === 'host'
+          ? 'action'
+          : route.kind === 'config'
+            ? e5.input
+            : route.kind === 'read'
+              ? 'readonly'
+              : e5.input === 'readonly'
+                ? 'action'
+                : e5.input;
   return {
     controlId: control.id,
     route,
@@ -242,7 +244,9 @@ export function bindingFor8(control: E8Control): E8Binding {
             ? 'Unavailable'
             : input === 'money'
               ? 'Exact amount, e.g. 5.00'
-              : 'Enter a value'
+              : control.id === 'X-06'
+                ? 'https://example.com/ — validated by the daemon before launch'
+                : 'Enter a value'
           : null,
     min: route.kind === 'config' && e5.input === 'number' ? (control.id === 'G-04' || control.id === 'G-05' ? 0 : e5.min) : null,
     max: route.kind === 'config' && e5.input === 'number' ? (control.id === 'G-04' ? 2 : control.id === 'G-05' ? 1 : e5.max) : null,
@@ -252,7 +256,7 @@ export function bindingFor8(control: E8Control): E8Binding {
     // ('on'/'off'); passing that option string to the toggle parser made the
     // real control look unavailable. The checkbox handler already stages a
     // boolean, so the harness must stage the same type.
-    sample: input === 'toggle' ? true : e5.sample,
+    sample: control.id === 'X-06' ? 'https://example.com/' : input === 'toggle' ? true : e5.sample,
     kind,
   };
 }

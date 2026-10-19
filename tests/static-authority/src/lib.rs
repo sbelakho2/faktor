@@ -1216,6 +1216,11 @@ mod scans {
         if rel.starts_with("crates/terminal/") || rel.starts_with("crates/pty/") {
             return Vec::new(); // the supervisor crate + the pty launcher wrapper
         }
+        if rel.starts_with("crates/ci-tools/") || rel.starts_with("crates/test-mocks/") {
+            // CI/test tooling: spawns cargo, curl, kill and mock servers on
+            // behalf of lanes and tests; never part of the daemon runtime.
+            return Vec::new();
+        }
         if is_test_file(&rel) {
             return Vec::new(); // out-of-line test bodies are test-only by declaration
         }
@@ -1942,8 +1947,8 @@ mod scans {
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            if rel == ATOMIC_ANCHOR || is_test_file(&rel) {
-                continue; // the one sanctioned home; out-of-line test bodies
+            if rel == ATOMIC_ANCHOR || is_test_file(&rel) || rel.starts_with("crates/test-mocks/") {
+                continue; // the one sanctioned home; test-only mocks
             }
             let Some(f) = load(&rel) else {
                 continue;
@@ -8477,15 +8482,25 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         for needle in [
             "check_forge_metadata",
             "FAKTOR_REPO_DESCRIPTION=\"Faktor — native Rust engineering runtime with Faktor-owned IDE UIs\"",
-            "forge-status-absent",
-            "forge-status-pending",
-            "forge-status-sha-mismatch",
             "external, non-source",
             "certification/publish-status.mjs publish",
         ] {
             assert!(
                 certify.contains(needle),
                 "certify.sh misses the audit-22/23 marker `{needle}`"
+            );
+        }
+        let forge_tool = std::fs::read_to_string(root.join("crates/ci-tools/src/github.rs"))
+            .expect("crates/ci-tools/src/github.rs");
+        for needle in [
+            "forge-status-absent",
+            "forge-status-pending",
+            "forge-status-sha-mismatch",
+            "forge-status-not-success",
+        ] {
+            assert!(
+                forge_tool.contains(needle),
+                "the Rust forge-status verifier misses the audit-22/23 marker `{needle}`"
             );
         }
         let trusted = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
@@ -9542,5 +9557,125 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
              plane.set_claim_entitlement_gate(value_gate.clone());\n}\n",
         )
         .is_empty());
+    }
+
+    /// Paths whose committed text may never invoke an interpreter: repo
+    /// scripts, CI definitions and the CI image build surface.
+    fn python_tooling_path(rel: &str) -> bool {
+        rel.starts_with("scripts/")
+            || rel.starts_with(".woodpecker/")
+            || rel.starts_with("docker/")
+            || rel == "deny.toml"
+    }
+
+    /// A `python`/`python3` token on a tooling line (shebang, command,
+    /// comment example) is an invocation offender. Product code that
+    /// supports user Python projects is out of scope and lives in crates/.
+    fn python_invocation(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("python3") {
+            return true;
+        }
+        let mut rest = lower.as_str();
+        while let Some(index) = rest.find("python") {
+            let after = &rest[index + "python".len()..];
+            let next = after.chars().next();
+            if next.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '-' | '/' | '"' | '\'')) {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+
+    fn python_tooling_offenders(root: &Path, files: &[String]) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for rel in files {
+            if rel.ends_with(".py") {
+                offenders.push(format!("{rel}: Python source file"));
+                continue;
+            }
+            if !python_tooling_path(rel) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+                continue;
+            };
+            for (number, line) in text.lines().enumerate() {
+                if python_invocation(line) {
+                    offenders.push(format!(
+                        "{rel}:{}: Python invocation in repository tooling: {}",
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn repository_has_zero_python_sources_or_invocations() {
+        let root = repo_root();
+        let files = hygiene_tracked_files();
+        let offenders = python_tooling_offenders(&root, &files);
+        assert!(
+            offenders.is_empty(),
+            "the absolute no-Python constraint is violated (remove the source/invocation or port it to faktor-ci-tools): {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn no_python_scan_fires_on_planted_sources_and_invocations() {
+        let dir =
+            std::env::temp_dir().join(format!("faktor-no-python-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts/planted.py"), "print('x')\n").unwrap();
+        std::fs::write(
+            dir.join("scripts/planted.sh"),
+            "#!/bin/sh\npython3 scripts/planted.py\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("scripts/planted-var.sh"),
+            "#!/bin/sh\nINTERPRETER=python\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("scripts/clean.sh"),
+            "#!/bin/sh\ntarget/release/faktor-ci-tools iana-table --check\n",
+        )
+        .unwrap();
+        let files = [
+            "scripts/planted.py",
+            "scripts/planted.sh",
+            "scripts/planted-var.sh",
+            "scripts/clean.sh",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let offenders = python_tooling_offenders(&dir, &files);
+        assert!(
+            offenders.iter().any(|item| item.contains("planted.py")),
+            "a planted .py source must fire: {offenders:#?}"
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|item| item.contains("python3 scripts/planted.py")),
+            "a planted python3 invocation must fire: {offenders:#?}"
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|item| item.contains("INTERPRETER=python")),
+            "a planted python alias must fire: {offenders:#?}"
+        );
+        assert!(
+            !offenders.iter().any(|item| item.contains("clean.sh")),
+            "the sanctioned Rust invocation must stay clean: {offenders:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

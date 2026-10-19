@@ -233,9 +233,9 @@ the exact source SHA and tree.
   while its production authority was no longer exercised.
 - Lane-bound marker auth: the trusted linux and nightly campaign lanes emit
   their `faktor-woodpecker-lane/v2` markers through ONE helper
-  (`scripts/certification/lane-marker.sh write --lane ...`, Node
-  `lane-marker.mjs`, python parity fallback `lane-marker.py` for the
-  python-only lane images), which adds `auth = hmac-sha256:<hex>` over the
+  (`scripts/certification/lane-marker.sh write --lane ...`, backed by the
+  built Rust `faktor-ci-tools lane-marker` and the byte-identical Node
+  reference `lane-marker.mjs`), which adds `auth = hmac-sha256:<hex>` over the
   canonical unsigned marker JSON keyed by the lane's own
   `faktor_lane_token_<lane>` CI secret (`-` -> `_`; uppercase accepted). The
   `certificate`/`certificate-nightly` step maps every lane token in its

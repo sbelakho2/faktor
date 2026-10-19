@@ -1222,6 +1222,7 @@ mod tests {
                 truncated: false,
                 total_bytes: 0,
                 degraded: false,
+                unavailable: Vec::new(),
             },
         );
         serde_json::to_value(envelope).unwrap()

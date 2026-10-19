@@ -943,6 +943,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-ci-tools"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-cli"
 version = "0.1.0"
 dependencies = [
@@ -968,6 +981,7 @@ dependencies = [
  "faktor-git",
  "faktor-google",
  "faktor-hooks",
+ "faktor-impact",
  "faktor-index",
  "faktor-instructions",
  "faktor-kiwi",
@@ -992,6 +1006,7 @@ dependencies = [
  "faktor-snapshot",
  "faktor-store",
  "faktor-terminal",
+ "faktor-test-mocks",
  "faktor-updater",
  "faktor-verify",
  "faktor-worker",
@@ -1278,6 +1293,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-impact"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-git",
+ "faktor-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "faktor-index"
 version = "0.1.0"
 dependencies = [
@@ -1342,10 +1372,12 @@ dependencies = [
 name = "faktor-lsp"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-cas",
  "faktor-core",
  "faktor-mcp",
  "faktor-terminal",
+ "faktor-test-mocks",
  "serde",
  "serde_json",
  "tempfile",
@@ -1361,6 +1393,7 @@ dependencies = [
  "faktor-cas",
  "faktor-core",
  "faktor-terminal",
+ "faktor-test-mocks",
  "futures",
  "reqwest",
  "serde",
@@ -1610,6 +1643,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "faktor-agent",
+ "faktor-browser",
  "faktor-cas",
  "faktor-cloud",
  "faktor-context",
@@ -1721,6 +1755,10 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "faktor-test-mocks"
+version = "0.1.0"
 
 [[package]]
 name = "faktor-tests-accounting-modelcheck"
@@ -1868,6 +1906,7 @@ dependencies = [
  "faktor-git",
  "faktor-google",
  "faktor-hooks",
+ "faktor-impact",
  "faktor-index",
  "faktor-instructions",
  "faktor-kiwi",
@@ -1892,6 +1931,7 @@ dependencies = [
  "faktor-snapshot",
  "faktor-store",
  "faktor-terminal",
+ "faktor-test-mocks",
  "faktor-updater",
  "faktor-verify",
  "faktor-worker",

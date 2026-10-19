@@ -96,6 +96,7 @@ export interface E8Snapshot {
   readonly index: Json | null;
   readonly semantic: Json | null;
   readonly terminals: Json | null;
+  readonly telemetry: Json | null;
 }
 
 export interface E8ConfigValue {
@@ -261,6 +262,7 @@ export const E8_SOURCE_KEYS = [
   'index',
   'semantic',
   'terminals',
+  'telemetry',
 ] as const;
 
 export type E8SourceKey = (typeof E8_SOURCE_KEYS)[number];

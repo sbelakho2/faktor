@@ -270,14 +270,36 @@ async fn post(
 }
 
 #[tokio::test]
-async fn updater_disabled_answers_typed_409_and_changes_nothing_else() {
+async fn updater_disabled_is_disclosed_only_to_an_authorized_principal() {
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps(dir.path());
+    let control_plane = Arc::new(ControlPlane::new(
+        Arc::new(MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let deps = test_deps(dir.path()).with_control_plane(control_plane.clone());
     assert!(!crate::native::updater_enabled(&deps));
     let token = deps.auth_token.clone();
     let handle = serve(deps, 0).await.unwrap();
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
+
+    // Bootstrap the owner principal (bootstrap answers 409 without a control
+    // plane; with one wired it succeeds).
+    let resp = client
+        .post(url(&base, "/native/orgs"))
+        .bearer_auth(token.as_str())
+        .header("idempotency-key", "k-updater-owner")
+        .json(&serde_json::json!({
+            "name": "Ops", "owner_email": "owner@ops.test", "display_name": "Owner",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let owner = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let cases: [(&str, serde_json::Value); 4] = [
         ("GET", serde_json::Value::Null),
@@ -292,6 +314,30 @@ async fn updater_disabled_answers_typed_409_and_changes_nothing_else() {
         "/native/updater/apply",
     ];
     for ((method, body), path) in cases.into_iter().zip(paths) {
+        // Missing and invalid credentials lose BEFORE `updater_disabled`.
+        for control in [None, Some("tok_bogus")] {
+            let request = if method == "GET" {
+                client.get(url(&base, path))
+            } else {
+                client
+                    .post(url(&base, path))
+                    .header("idempotency-key", "k-disabled")
+                    .json(&body)
+            };
+            let mut request = request.bearer_auth(token.as_str());
+            if let Some(control) = control {
+                request = request.header("x-faktor-control-token", control);
+            }
+            let resp = request.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                401,
+                "{method} {path} control={control:?} must lose before updater_disabled"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "unauthorized", "{method} {path}");
+        }
+        // An authorized principal sees the typed disabled refusal.
         let request = if method == "GET" {
             client.get(url(&base, path))
         } else {
@@ -302,7 +348,7 @@ async fn updater_disabled_answers_typed_409_and_changes_nothing_else() {
         };
         let resp = request
             .bearer_auth(token.as_str())
-            .header("x-faktor-control-token", "tok_x")
+            .header("x-faktor-control-token", &owner)
             .send()
             .await
             .unwrap();
@@ -324,7 +370,7 @@ async fn updater_disabled_answers_typed_409_and_changes_nothing_else() {
 }
 
 #[tokio::test]
-async fn updater_enabled_without_a_control_plane_refuses_with_cloud_disabled() {
+async fn updater_without_a_control_plane_refuses_the_unverifiable_credential() {
     let dir = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(FakeFetcher::new());
     let updater = Arc::new(
@@ -363,23 +409,28 @@ async fn updater_enabled_without_a_control_plane_refuses_with_cloud_disabled() {
         "/native/updater/apply",
     ];
     for ((method, body), path) in cases.into_iter().zip(paths) {
-        let request = if method == "GET" {
-            client.get(url(&base, path))
-        } else {
-            client
-                .post(url(&base, path))
-                .header("idempotency-key", "k-cloud-off")
-                .json(&body)
-        };
-        let resp = request
-            .bearer_auth(token.as_str())
-            .header("x-faktor-control-token", "tok_x")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409, "{method} {path}");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"], "cloud_disabled", "{method} {path}");
+        for control in [None, Some("tok_x")] {
+            let request = if method == "GET" {
+                client.get(url(&base, path))
+            } else {
+                client
+                    .post(url(&base, path))
+                    .header("idempotency-key", "k-cloud-off")
+                    .json(&body)
+            };
+            let mut request = request.bearer_auth(token.as_str());
+            if let Some(control) = control {
+                request = request.header("x-faktor-control-token", control);
+            }
+            let resp = request.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                401,
+                "{method} {path} control={control:?} must be an auth refusal"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "unauthorized", "{method} {path}");
+        }
     }
 }
 

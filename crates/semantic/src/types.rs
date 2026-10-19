@@ -121,6 +121,10 @@ pub enum SemanticError {
     /// [`crate::intelligence::IntelligenceTier`]). Refused at handshake, so
     /// an out-of-range claim can never drive the status surface.
     InvalidIntelligenceTier { tier: u8 },
+    /// A metadata subsystem is absent or cannot serve this workspace. This is
+    /// the typed UNAVAILABLE signal the production fallback records in its
+    /// payloads; it is never converted into a fabricated empty success.
+    Unavailable { subsystem: String, reason: String },
 }
 
 impl SemanticError {
@@ -202,6 +206,9 @@ impl fmt::Display for SemanticError {
                 f,
                 "semantic provider descriptor intelligence tier {tier} is outside 0..=5"
             ),
+            Self::Unavailable { subsystem, reason } => {
+                write!(f, "semantic subsystem {subsystem} unavailable: {reason}")
+            }
         }
     }
 }
@@ -515,8 +522,132 @@ impl SemanticEntityRef {
     }
 }
 
-/// The operations a semantic provider can serve. Capability-driven selection
-/// never inspects a provider name or a programming language.
+/// The native metadata subsystems the production fallback composes. Every
+/// finding names the subsystem(s) that produced it, and every absent
+/// subsystem is reported as typed unavailable instead of an empty success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticSubsystem {
+    Index,
+    Lsp,
+    TreeSitter,
+    Git,
+    Verification,
+    Embedding,
+    /// The repository relationship graph authority (files/symbols/tests,
+    /// calls/references/implementations/coverage/dependencies).
+    Graph,
+}
+
+impl SemanticSubsystem {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Lsp => "lsp",
+            Self::TreeSitter => "tree_sitter",
+            Self::Git => "git",
+            Self::Verification => "verification",
+            Self::Embedding => "embedding",
+            Self::Graph => "graph",
+        }
+    }
+}
+
+/// Hard bound on one provenance source label.
+pub const MAX_FINDING_SOURCE_BYTES: usize = 256;
+/// Hard bound on one typed-unavailable reason.
+pub const MAX_UNAVAILABLE_REASON_BYTES: usize = 512;
+
+/// Provenance carried by ONE finding: which native subsystem produced it,
+/// the stable source identity (e.g. `lsp:rust-analyzer`, `index:gen:7`), the
+/// fidelity of THAT finding and, when known, the source revision it is bound
+/// to. A finding without provenance is never emitted by the fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticFindingProvenance {
+    /// The entity/check/claim this provenance entry describes.
+    pub subject: String,
+    pub subsystem: SemanticSubsystem,
+    /// Stable source identity, bounded to [`MAX_FINDING_SOURCE_BYTES`].
+    pub source: String,
+    pub fidelity: SemanticFidelity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl SemanticFindingProvenance {
+    pub fn new(
+        subject: impl Into<String>,
+        subsystem: SemanticSubsystem,
+        source: impl Into<String>,
+        fidelity: SemanticFidelity,
+        revision: Option<String>,
+    ) -> Self {
+        Self {
+            subject: bounded_finding_text(subject.into(), MAX_ENTITY_ID_BYTES),
+            subsystem,
+            source: bounded_finding_text(source.into(), MAX_FINDING_SOURCE_BYTES),
+            fidelity,
+            revision: revision.map(|r| bounded_finding_text(r, MAX_FINDING_SOURCE_BYTES)),
+        }
+    }
+}
+
+/// One typed unavailability: a subsystem that could not answer, with the
+/// bounded reason. Callers branch on `subsystem`, never on a bare bool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticUnavailable {
+    pub subsystem: SemanticSubsystem,
+    pub reason: String,
+}
+
+impl SemanticUnavailable {
+    pub fn new(subsystem: SemanticSubsystem, reason: impl Into<String>) -> Self {
+        Self {
+            subsystem,
+            reason: bounded_finding_text(reason.into(), MAX_UNAVAILABLE_REASON_BYTES),
+        }
+    }
+}
+
+fn bounded_finding_text(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// The identity of every native subsystem a production fallback was composed
+/// with. `None` means the subsystem was not wired at all (a typed-unavailable
+/// outcome), never a silently empty success.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticBackendReport {
+    pub index: Option<String>,
+    pub lsp: Option<String>,
+    pub tree_sitter: Option<String>,
+    pub git: Option<String>,
+    pub verification: Option<String>,
+    /// The repository relationship graph authority (impact/call/coverage).
+    pub impact: Option<String>,
+}
+
+impl SemanticBackendReport {
+    /// At least one native subsystem is wired (the production fallback is
+    /// never the empty `default()` composition).
+    pub fn is_wired(&self) -> bool {
+        self.index.is_some()
+            || self.lsp.is_some()
+            || self.tree_sitter.is_some()
+            || self.git.is_some()
+            || self.verification.is_some()
+            || self.impact.is_some()
+    }
+}
+
+/// The operations a semantic provider can serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticOp {
@@ -1056,6 +1187,10 @@ pub struct SemanticSnapshot {
     /// (audit Tangerine-1). Absent = the response only carries the view key.
     #[serde(default)]
     pub program_manifest: Option<ProgramSnapshotManifest>,
+    /// Subsystems that could not contribute to this snapshot (typed, never a
+    /// silent zero).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticSnapshot {
@@ -1105,6 +1240,9 @@ pub struct SemanticContextItem {
     /// Relevance in basis points (`0..=10_000`); integer to keep payloads Eq.
     pub relevance_bps: u32,
     pub excerpt: String,
+    /// Provenance of THIS finding, one entry per contributing subsystem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<SemanticFindingProvenance>,
 }
 
 /// Context pack payload. `degraded` is true when only fallback metadata
@@ -1115,6 +1253,9 @@ pub struct SemanticContextPack {
     pub truncated: bool,
     pub total_bytes: usize,
     pub degraded: bool,
+    /// Subsystems that could not contribute (typed, never fabricated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticPayload for SemanticContextPack {
@@ -1139,6 +1280,10 @@ pub struct SemanticDeltaChange {
     pub kind: SemanticDeltaKind,
     pub old_hash: Option<FileHash>,
     pub new_hash: Option<FileHash>,
+    /// Provenance of THIS change (git revision identity and, when available,
+    /// the tree-sitter/index source that resolved the entity).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<SemanticFindingProvenance>,
 }
 
 /// The durable PROGRAM SNAPSHOT manifest (audit Tangerine-1): a real
@@ -1236,6 +1381,9 @@ pub struct SemanticDelta {
     pub to_snapshot: SemanticSnapshotId,
     pub changes: Vec<SemanticDeltaChange>,
     pub degraded: bool,
+    /// Subsystems that could not contribute (e.g. no git identity).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticDelta {
@@ -1261,6 +1409,12 @@ pub struct AffectedSet {
     pub affected: Vec<SemanticEntityRef>,
     pub tests: Vec<SemanticEntityRef>,
     pub degraded: bool,
+    /// Provenance per affected/test finding, keyed by entity id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<SemanticFindingProvenance>,
+    /// Subsystems that could not contribute (typed unavailable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticPayload for AffectedSet {
@@ -1275,6 +1429,9 @@ pub struct SemanticCheck {
     pub name: String,
     pub passed: bool,
     pub detail: String,
+    /// Provenance of this discovered check (verification subsystem + source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<SemanticFindingProvenance>,
 }
 
 /// Verification payload. `degraded` marks verification gaps (no metadata
@@ -1284,6 +1441,9 @@ pub struct SemanticVerification {
     pub passed: bool,
     pub degraded: bool,
     pub checks: Vec<SemanticCheck>,
+    /// Subsystems that could not contribute (typed unavailable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticPayload for SemanticVerification {}
@@ -1294,6 +1454,12 @@ pub struct SemanticExplanation {
     pub entity: SemanticEntityRef,
     pub text: String,
     pub citations: Vec<SemanticEntityRef>,
+    /// Provenance of every citation and of the explanation text itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<SemanticFindingProvenance>,
+    /// Subsystems that could not contribute (typed unavailable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SemanticUnavailable>,
 }
 
 impl SemanticPayload for SemanticExplanation {
@@ -1437,6 +1603,30 @@ impl<T: SemanticPayload> SemanticEnvelope<T> {
         expected: &SemanticExpectation,
         caps: &SemanticResponseCaps,
     ) -> Result<(), SemanticError> {
+        self.validate_with_origin_policy(expected, caps, false)
+    }
+
+    /// Native-fallback validation: the in-crate fallback is the ONE provider
+    /// allowed to emit explicitly HEURISTIC (path-derived) ids, because it
+    /// is not an external authority claiming compiler identity. Its findings
+    /// still carry per-finding provenance/fidelity, and every other check
+    /// (schema, workspace, snapshot, bounds, duplicates, payload size) is
+    /// unchanged. External providers are ALWAYS validated with
+    /// [`Self::validate`], so this relaxation cannot widen their surface.
+    pub fn validate_native(
+        &self,
+        expected: &SemanticExpectation,
+        caps: &SemanticResponseCaps,
+    ) -> Result<(), SemanticError> {
+        self.validate_with_origin_policy(expected, caps, true)
+    }
+
+    fn validate_with_origin_policy(
+        &self,
+        expected: &SemanticExpectation,
+        caps: &SemanticResponseCaps,
+        allow_heuristic: bool,
+    ) -> Result<(), SemanticError> {
         if self.provenance.has_instruction_authority() {
             return Err(SemanticError::Refused(
                 "semantic provider envelopes can never carry UserPolicy instruction authority"
@@ -1470,7 +1660,7 @@ impl<T: SemanticPayload> SemanticEnvelope<T> {
         }
         let mut seen = BTreeSet::new();
         for entity_ref in refs {
-            if entity_ref.origin == SemanticEntityOrigin::Heuristic {
+            if !allow_heuristic && entity_ref.origin == SemanticEntityOrigin::Heuristic {
                 return Err(SemanticError::InvalidEntityRef(format!(
                     "entity {} is Faktor-heuristic (path-derived); provider responses must carry provider-origin ids",
                     entity_ref.entity_id
@@ -1722,6 +1912,7 @@ mod tests {
                 truncated: false,
                 total_bytes: 4,
                 degraded: false,
+                unavailable: Vec::new(),
             },
         )
     }
@@ -1731,6 +1922,7 @@ mod tests {
             entity: entity(path, id),
             relevance_bps: 9000,
             excerpt: excerpt.to_string(),
+            provenance: Vec::new(),
         }
     }
 
@@ -2196,6 +2388,7 @@ mod program_snapshot_tests {
             entity_count: 3,
             created_ms: 1,
             program_manifest: None,
+            unavailable: Vec::new(),
         };
         assert!(bare.program_id().is_none());
         let with_manifest = SemanticSnapshot {
@@ -2217,6 +2410,7 @@ mod program_snapshot_tests {
             entity_count: 1,
             created_ms: 1,
             program_manifest: Some(full_manifest()),
+            unavailable: Vec::new(),
         };
         assert!(snapshot
             .validate_identity(&matching, SEMANTIC_SCHEMA_VERSION)
@@ -2257,6 +2451,7 @@ mod program_snapshot_tests {
             entity_count: 2,
             created_ms: 1,
             program_manifest: Some(full_manifest()),
+            unavailable: Vec::new(),
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let decoded: SemanticSnapshot = serde_json::from_str(&json).unwrap();
@@ -2295,10 +2490,12 @@ mod entity_origin_tests {
                     entity: heuristic,
                     relevance_bps: 100,
                     excerpt: "x".into(),
+                    provenance: Vec::new(),
                 }],
                 truncated: false,
                 total_bytes: 1,
                 degraded: false,
+                unavailable: Vec::new(),
             },
         );
         let expectation = SemanticExpectation::new(ws, envelope.snapshot_id);
@@ -2308,5 +2505,10 @@ mod entity_origin_tests {
             }
             other => panic!("expected InvalidEntityRef, got {other:?}"),
         }
+        // The in-crate native fallback is the ONE provider allowed to emit
+        // explicitly heuristic ids; its per-finding provenance states why.
+        envelope
+            .validate_native(&expectation, &SemanticResponseCaps::default())
+            .expect("native fallback validation accepts explicit heuristic ids");
     }
 }

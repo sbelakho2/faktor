@@ -91,7 +91,7 @@ The new surfaces concentrate on four areas: setup/admission/recovery (S34–S39,
 
 - **Nothing was removed from the product or documentation** (p.3). The original first-report content, both source reports, identity, website and evidence are retained; R7 pages are reproduced unchanged where retained.
 - What left the default interface is implementation instructions and backend vocabulary. It moved to control contracts, details disclosures, build map and backlog; for example the micro-USD conversion moved from the money-cap field to control B-02, and empty-history developer instructions moved to S61 (p.3).
-- Some Edition 5 artifact assumptions are now wrong: it described 32 screens and a 25/105/70 status split. Rev8 adds 40 screens; the current code audit is 25 `exists`, 160 `partial`, 15 `missing` with the backend route coverage described above.
+- Some Edition 5 artifact assumptions are now wrong: it described 32 screens and a 25/105/70 status split. Rev8 adds 40 screens; the current functional status is generated from `functional-evidence.json` (`node scripts/edition8/ledger.mjs --check`) and is never repeated as a hand-maintained count here.
 
 ## 7. Build/artifact delta
 

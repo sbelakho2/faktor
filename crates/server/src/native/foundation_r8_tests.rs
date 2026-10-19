@@ -948,3 +948,44 @@ async fn skills_listing_cursor_reaches_every_discovered_skill() {
             .collect()
     }
 }
+
+#[tokio::test]
+async fn telemetry_payload_preview_is_explicit_and_never_claims_upload() {
+    let rig = Rig::new().await;
+    let (status, body) = rig.get("/native/telemetry").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], json!(false));
+    assert_eq!(body["state"], json!("disabled"));
+    assert_eq!(body["endpoint"], Value::Null);
+    assert!(body["endpointScope"]
+        .as_str()
+        .unwrap()
+        .contains("no upload endpoint"));
+    let excluded = body["payloadPreview"]["excluded"].as_array().unwrap();
+    for expected in ["secrets", "credentials", "prompt text", "source code"] {
+        assert!(
+            excluded.iter().any(|entry| entry == expected),
+            "payload preview must exclude {expected:?}: {body}"
+        );
+    }
+    assert!(body["payloadPreview"]["bounded"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn native_model_aliases_require_the_native_prefix() {
+    let rig = Rig::new().await;
+    for path in ["/native/models", "/native/capabilities"] {
+        let (status, body) = rig.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let (status, body) = rig.get("/models").await;
+    assert_eq!(status, StatusCode::OK, "legacy alias stays served: {body}");
+}
+
+#[tokio::test]
+async fn mcp_resources_for_an_unknown_server_is_typed_not_a_catalog() {
+    let rig = Rig::new().await;
+    let (status, body) = rig.get("/native/mcp/servers/missing/resources").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], json!("not_found"));
+}

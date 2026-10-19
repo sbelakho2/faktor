@@ -30,7 +30,7 @@ use super::foundation::foundation_error;
 use super::*;
 use crate::api::AppState;
 
-fn foundation(state: &AppState) -> Result<&Foundation, Response> {
+pub(crate) fn foundation(state: &AppState) -> Result<&Foundation, Response> {
     state.deps.foundation.as_deref().ok_or_else(|| {
         wire_status(ApiError {
             code: "foundation_disabled",
@@ -825,6 +825,60 @@ impl McpRuntime {
         }
     }
 
+    async fn catalogs(
+        &self,
+        id: &str,
+        cap: Option<u64>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let server = {
+            let live = self.live.lock().await;
+            live.get(id).cloned()
+        };
+        let Some(server) = server.filter(|server| server.is_alive()) else {
+            return Ok(None);
+        };
+        let mut notes = Vec::new();
+        let resources = match server.list_resources().await {
+            Ok(resources) => resources,
+            Err(error) => {
+                notes.push(format!("resources/list: {error}"));
+                Vec::new()
+            }
+        };
+        let resource_templates = match server.list_resource_templates().await {
+            Ok(templates) => templates,
+            Err(error) => {
+                notes.push(format!("resources/templates/list: {error}"));
+                Vec::new()
+            }
+        };
+        let prompts = match server.list_prompts().await {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                notes.push(format!("prompts/list: {error}"));
+                Vec::new()
+            }
+        };
+        let value = serde_json::json!({
+            "serverId": id,
+            "resources": resources,
+            "resourceTemplates": resource_templates,
+            "prompts": prompts,
+            "notes": notes,
+        });
+        if let Some(cap) = cap {
+            let bytes = serde_json::to_vec(&value)
+                .map_err(|error| format!("resources encoding: {error}"))?
+                .len() as u64;
+            if bytes > cap {
+                return Err(format!(
+                    "resources/prompts output is {bytes} bytes, over the configured {cap}-byte cap; the catalog was not exposed"
+                ));
+            }
+        }
+        Ok(Some(value))
+    }
+
     async fn health(&self, id: &str) -> Option<bool> {
         let live = self.live.lock().await;
         live.get(id).map(|server| server.is_alive())
@@ -1370,9 +1424,10 @@ pub(crate) async fn native_mcp_server_oauth_revoke(
     }
 }
 
-/// `GET /native/mcp/servers/{id}/resources` — MCP resources/prompts are not
-/// negotiated by the stdio adapter; the typed refusal never fabricates a
-/// catalog.
+/// `GET /native/mcp/servers/{id}/resources` — the started server's own
+/// resources, resource templates and prompts. A method the adapter does not
+/// implement is reported in `notes`; an empty catalog is never invented for a
+/// failing server, and a server that is not started is a typed 409.
 pub(crate) async fn native_mcp_server_resources(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1385,13 +1440,18 @@ pub(crate) async fn native_mcp_server_resources(
         Ok(f) => f,
         Err(r) => return r,
     };
-    match foundation.customization.mcp_server(&id) {
-        Ok(Some(_)) => conflict(
-            "mcp_resources_unsupported",
-            "this daemon build negotiates tools only; resources and prompts are not advertised by the stdio adapter",
+    let cap = match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => record.output_cap_bytes,
+        Ok(None) => return wire_status(not_found("MCP server")),
+        Err(e) => return foundation_error(e),
+    };
+    match state.deps.mcp_runtime.catalogs(&id, cap).await {
+        Ok(Some(catalogs)) => Json(catalogs).into_response(),
+        Ok(None) => conflict(
+            "mcp_not_ready",
+            "the server is not started; start it explicitly to read resources and prompts",
         ),
-        Ok(None) => wire_status(not_found("MCP server")),
-        Err(e) => foundation_error(e),
+        Err(message) => conflict("mcp_resources_failed", message),
     }
 }
 
@@ -1999,6 +2059,24 @@ fn parse_hook_spec(value: &serde_json::Value) -> Result<HookSpec, Response> {
             "a hook may subscribe to at most 17 event kinds",
         )));
     }
+    if spec.matcher.tools.len() > faktor_hooks::MAX_HOOK_MATCHERS
+        || spec.matcher.paths.len() > faktor_hooks::MAX_HOOK_MATCHERS
+    {
+        return Err(wire_status(malformed_body(
+            "a hook matcher may carry at most 32 tool/path predicates",
+        )));
+    }
+    for predicate in spec.matcher.tools.iter().chain(spec.matcher.paths.iter()) {
+        if predicate.is_empty()
+            || predicate.len() > faktor_hooks::MAX_HOOK_MATCHER_BYTES
+            || predicate.contains('\u{0}')
+            || predicate.chars().any(char::is_control)
+        {
+            return Err(wire_status(malformed_body(
+                "hook matcher predicates must be 1..=512 bytes without control characters",
+            )));
+        }
+    }
     if spec.env.len() > faktor_hooks::MAX_HOOK_ENV
         || spec.env.iter().any(|(name, value)| {
             name.is_empty()
@@ -2277,10 +2355,22 @@ pub(crate) async fn native_hook_test(
         workspace_root,
         payload: req.payload,
     };
+    if !spec.matches_input(&input) {
+        return Json(serde_json::json!({
+            "hookId": id,
+            "event": req.event,
+            "matched": false,
+            "verdict": "not_matched",
+            "reason": "the event/tool/path matcher did not select this input; nothing was spawned",
+            "audit": null,
+        }))
+        .into_response();
+    }
     let verdict = registry.run_one(&spec, &input);
     Json(serde_json::json!({
         "hookId": id,
         "event": req.event,
+        "matched": true,
         "verdict": verdict,
         "audit": registry.audit().last().cloned(),
     }))
@@ -2413,38 +2503,6 @@ pub(crate) async fn native_tools(
 
 /// `GET /native/browser/status` — honest adapter availability and configured
 /// capability. No browser authority is launched by listing.
-pub(crate) async fn native_browser_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(e) = authed(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
-    }
-    let enabled = state
-        .deps
-        .foundation
-        .as_deref()
-        .and_then(|f| f.config.value("faktor.browser.enabled").ok().flatten())
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    Json(serde_json::json!({
-        "enabled": enabled,
-        "available": false,
-        "adapters": [{
-            "id": "chromium",
-            "families": ["chromium"],
-            "state": if enabled { "unsupported" } else { "disabled" },
-            "detail": if enabled {
-                "the browser crate is not attached to this daemon's native surface; no launch authority is wired"
-            } else {
-                "enable faktor.browser.enabled and restart with a browser authority to use the browser panel"
-            },
-        }],
-        "attached": false,
-    }))
-    .into_response()
-}
-
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeUrlBody {

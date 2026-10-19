@@ -1,26 +1,39 @@
 #!/bin/sh
 # Universal lane-marker entry point for every CI lane image.
 #
-# Lane images deliberately differ: the rust and Faktor CI images carry
-# python3 but NOT node, while the node/playwright images carry both. This
-# launcher runs the canonical Node implementation when node exists and the
-# byte-for-byte parity Python implementation otherwise, so every lane emits
-# the marker JSON and its per-lane HMAC binding through ONE helper contract
-# (`write --lane ... --status ... --artifact ...`), never hand-rolled printf.
-#
-# Secrets are per lane: the helper reads `faktor_lane_token_<lane>` (lane
-# lowercased with non-alphanumerics as `_`; uppercase form accepted) from the
-# step environment. When the token is absent the marker is emitted without
-# `auth` and `verify-markers` records the lane as `unattested`.
+# The canonical implementation is the Rust `faktor-ci-tools lane-marker`
+# binary built at target/release by the CI build step (and by the Rust lanes
+# themselves). The Node implementation remains as a fallback for node-only
+# images where the release binary has not been built; both must produce
+# byte-identical markers (scripts/certification/evidence.mjs proves it).
 set -eu
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DIR/../.." && pwd)"
+TOOL="${FAKTOR_CI_TOOLS:-}"
+if [ -z "$TOOL" ]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        TOOL="$CARGO_TARGET_DIR/release/faktor-ci-tools"
+    else
+        TOOL="$ROOT/target/release/faktor-ci-tools"
+    fi
+fi
 
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
+if [ -x "$TOOL" ]; then
+    exec "$TOOL" lane-marker "$@"
+fi
 if command -v node >/dev/null 2>&1; then
     exec node "$DIR/lane-marker.mjs" "$@"
 fi
-if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$DIR/lane-marker.py" "$@"
+if command -v cargo >/dev/null 2>&1; then
+    echo "lane-marker: building faktor-ci-tools (cargo build --release -p faktor-ci-tools)" >&2
+    (cd "$ROOT" && cargo build --release -p faktor-ci-tools) >&2
+    if [ -x "$TOOL" ]; then
+        exec "$TOOL" lane-marker "$@"
+    fi
+    TOOL="$ROOT/target/release/faktor-ci-tools"
+    if [ -x "$TOOL" ]; then
+        exec "$TOOL" lane-marker "$@"
+    fi
 fi
-echo "lane-marker: neither node nor python3 is available" >&2
-exit 1
+echo "lane-marker: neither $TOOL nor node is available; build faktor-ci-tools with 'cargo build --release -p faktor-ci-tools'" >&2
+exit 2

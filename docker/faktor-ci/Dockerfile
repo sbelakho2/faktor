@@ -69,7 +69,6 @@ RUN set -eux; \
         openjdk-17-jdk-headless=17.0.20.1+1-1~24.04 \
         git=1:2.43.0-1ubuntu7.3 \
         unzip=6.0-28ubuntu4.1 \
-        python3=3.12.3-0ubuntu2.1 \
         procps=2:4.0.4-4ubuntu3.3; \
     for spec in \
         ca-certificates=20260601~24.04.1 \
@@ -84,7 +83,6 @@ RUN set -eux; \
         openjdk-17-jdk-headless=17.0.20.1+1-1~24.04 \
         git=1:2.43.0-1ubuntu7.3 \
         unzip=6.0-28ubuntu4.1 \
-        python3=3.12.3-0ubuntu2.1 \
         procps=2:4.0.4-4ubuntu3.3; do \
         pkg="${spec%%=*}"; want="${spec#*=}"; got="$(dpkg-query -W -f='${Version}' "$pkg")"; \
         [ "$got" = "$want" ] || { echo "version drift: $pkg = $got (want $want)" >&2; exit 1; }; \

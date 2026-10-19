@@ -1,0 +1,12 @@
+{
+  "id": "INV-IMPACT-BOUNDED-QUERY",
+  "file": "crates/impact/src/query.rs",
+  "find": "        let max_results = options.max_results.clamp(1, MAX_RESULTS);",
+  "replace": "        let max_results = MAX_RESULTS;",
+  "gate": "cargo test -p faktor-impact --lib bounded_results_always_reserve_a_test_slot",
+  "expect": "FAILED",
+  "note": "Ignoring the caller's result bound makes the truncation assertion fail; the graph must never return an unbounded affected set.",
+  "capabilities": [
+    "impact.graph.bounded-deterministic-query"
+  ]
+}

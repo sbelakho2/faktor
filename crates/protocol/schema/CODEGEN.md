@@ -168,6 +168,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET /native/browser/status` | handwritten-grandfathered |  |
 | `POST /native/browser/validate-url` | handwritten-grandfathered |  |
 | `GET /native/call-receipts` | handwritten-grandfathered |  |
+| `GET /native/capabilities` | handwritten-grandfathered |  |
 | `POST /native/config/commit` | handwritten-grandfathered |  |
 | `GET /native/config/descriptors` | handwritten-grandfathered |  |
 | `GET /native/config/export` | handwritten-grandfathered |  |
@@ -213,6 +214,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/memory/retention` | handwritten-grandfathered |  |
 | `DELETE /native/memory/{kind}/{key}` | handwritten-grandfathered |  |
 | `GET /native/model-parameters` | handwritten-grandfathered |  |
+| `GET /native/models` | handwritten-grandfathered |  |
 | `POST /native/model-parameters/compile` | handwritten-grandfathered |  |
 | `GET /native/permissions/audit` | handwritten-grandfathered |  |
 | `GET /native/permissions/policy` | handwritten-grandfathered |  |
@@ -263,6 +265,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/skills/{id}/invocation` | handwritten-grandfathered |  |
 | `POST /native/skills/{id}/invoke` | handwritten-grandfathered |  |
 | `POST /native/skills/{id}/trust` | handwritten-grandfathered |  |
+| `GET /native/telemetry` | handwritten-grandfathered |  |
 | `GET /native/tools` | handwritten-grandfathered |  |
 | `GET /native/transcript/search` | handwritten-grandfathered |  |
 

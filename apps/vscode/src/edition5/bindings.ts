@@ -495,7 +495,7 @@ const OPTIONS: Readonly<Record<string, readonly string[]>> = {
   'Q-01': ['inspect', 'confirm_edits', 'project_auto', 'custom'],
   'Q-02': ['Allow', 'Ask', 'Deny'],
   'Q-10': ['strict', 'network_fallback', 'unavailable'],
-  'T-04': ['stdio', 'streamable_http'],
+  'T-04': ['stdio'],
   'S-07': [
     'SessionStart',
     'UserPromptSubmit',

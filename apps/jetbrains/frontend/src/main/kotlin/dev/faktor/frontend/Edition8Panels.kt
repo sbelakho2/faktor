@@ -65,6 +65,8 @@ internal class Edition8Host(
     val replyApproval: ((String, String, String) -> String)? = null,
     val openDiff: ((String) -> String)? = null,
     val openTerminal: (() -> String)? = null,
+    val inlineCodeAction: (() -> String)? = null,
+    val hostAction: ((String) -> String)? = null,
     val navigate: ((String) -> Unit)? = null,
     val notice: (String) -> Unit = {},
     val credentials: ControlPlaneCredentialStore? = null
@@ -75,6 +77,29 @@ internal class Edition8Host(
 
     fun shutdown() = work.close()
 }
+
+/**
+ * The IDE-editor host seam for the controls whose effect belongs to the real
+ * editor (inline code action, current-selection capture, slash-command insert,
+ * diagnostics tool window). The split-mode kotlinc smoke compiles without the
+ * IntelliJ platform jars, so `FaktorChatPanel` depends on this interface only;
+ * `IntelliJHostEditor` supplies the platform implementation in the plugin
+ * build. A null host keeps every callback typed `contract-required` instead
+ * of pretending an editor effect happened.
+ */
+interface Edition8HostEditor {
+    fun inlineCodeAction(): String
+    /** The capture line to store, or null when no editor selection exists. */
+    fun captureSelection(): String?
+    fun insertSlashCommand(): String
+    fun openProblems(): String
+}
+
+/** Controls whose effect belongs to the host editor (no daemon write exists). */
+internal val HOST_CONTROLS: Set<String> = setOf(
+    "M-03", "C-04", "Q-11", "S-05", "X-10",
+    "D-08", "D-09", "D-10", "D-11", "D-14"
+)
 
 internal object Edition8ScreenRegistry {
 
@@ -105,7 +130,8 @@ internal class Edition8ControlRow(
     private val panel: Edition8ScreenPanel
 ) : JPanel(GridBagLayout()) {
 
-    val field: JTextField? = if (control.configKeys.isNotEmpty()) JTextField(24) else null
+    val field: JTextField? =
+        if (control.configKeys.isNotEmpty() || control.id == "X-06") JTextField(24) else null
     val toggle: JCheckBox? = if (isToggle(control) && control.configKeys.isNotEmpty()) JCheckBox() else null
     val probe: JButton = if (control.endpoints.any { it.state == "exists" } ||
         control.configKeys.isEmpty()
@@ -140,7 +166,11 @@ internal class Edition8ControlRow(
                         "${control.id} ${control.name}",
                         "Value for ${control.control}. ${control.applyTiming}."
                     )
-                    field.text = control.defaultValue.takeUnless { it.equals("none", true) } ?: ""
+                    field.text = if (control.id == "X-06") {
+                        "https://example.com/"
+                    } else {
+                        control.defaultValue.takeUnless { it.equals("none", true) } ?: ""
+                    }
                     if (configKey != null && panel.daemon.draft.isLocked(configKey)) {
                         field.isEnabled = false
                         field.toolTipText = "Set by managed policy; read-only"
@@ -277,7 +307,9 @@ internal class Edition8ScreenPanel(
             "Apply ${screen.title} settings",
             "Commits one atomic configuration patch and waits for the daemon acknowledgement."
         )
-        apply.isVisible = rows.any { it.field != null || it.toggle != null }
+        apply.isVisible = rows.any {
+            (it.field != null && it.control.configKeys.isNotEmpty()) || it.toggle != null
+        }
         apply.addActionListener { applySettings() }
         back.a11y("Back from ${screen.title}", "Returns to the invoking screen with the draft intact.")
         back.addActionListener { host.navigate?.invoke("S01") ?: setStatus("Back is a host navigation action", SemanticState.DIM) }
@@ -463,6 +495,136 @@ internal class Edition8ScreenPanel(
 
     fun activate(row: Edition8ControlRow) {
         if (closed) return
+        if (row.control.id in HOST_CONTROLS) {
+            val action = host.hostAction
+            if (action == null) {
+                row.setState("Disabled — no host action callback is wired", SemanticState.DIM)
+                setStatus("Disabled — this control is host-owned", SemanticState.DIM)
+                return
+            }
+            val result = try {
+                action(row.control.id)
+            } catch (failure: Throwable) {
+                "contract-required: host action failed: ${failure.message ?: failure.javaClass.simpleName}"
+            }
+            detail.text = bound(result, 4000)
+            row.setState("Host — ${row.control.name}", SemanticState.POSITIVE)
+            setStatus("Host action — $result", SemanticState.POSITIVE)
+            return
+        }
+        if (row.control.id == "T-12") {
+            setStatus("Reading resources and prompts…", SemanticState.WARNING)
+            row.setState("Loading — bounded MCP catalog read", SemanticState.WARNING)
+            daemon.mcpServers { servers ->
+                val id = firstMcpServerId(servers)
+                if (id == null) {
+                    row.setState("Disabled — no MCP server is configured", SemanticState.DIM)
+                    setStatus("Disabled — configure and start an MCP server first", SemanticState.DIM)
+                    return@mcpServers
+                }
+                daemon.mcpCatalogs(id) { result ->
+                    when (result) {
+                        is Edition8Result.Ok -> {
+                            detail.text = bound(result.body, 4000)
+                            row.setState("Read — live MCP resources/prompts catalog", SemanticState.POSITIVE)
+                            setStatus("Read — ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                        }
+                        is Edition8Result.Failed -> {
+                            row.setState("Failed — ${result.reason}", SemanticState.NEGATIVE)
+                            setStatus("Unavailable — ${result.reason}", SemanticState.NEGATIVE)
+                        }
+                        is Edition8Result.Refused -> {
+                            row.setState("Disabled — ${result.reason}", SemanticState.DIM)
+                            setStatus("Disabled — ${result.reason}", SemanticState.DIM)
+                        }
+                    }
+                }
+            }
+            return
+        }
+        if (row.control.id == "X-08" || row.control.id == "X-09") {
+            setStatus("Reading the live browser session…", SemanticState.WARNING)
+            row.setState("Loading — bounded browser read", SemanticState.WARNING)
+            daemon.browserSessions { sessions ->
+                val browserId = firstBrowserSessionId(sessions)
+                if (browserId == null) {
+                    row.setState("Disabled — no live browser session is attached; connect it first", SemanticState.DIM)
+                    setStatus("Disabled — no live browser session; the daemon never fabricates one", SemanticState.DIM)
+                    return@browserSessions
+                }
+                if (row.control.id == "X-08") {
+                    daemon.browserScreenshot(browserId) { result ->
+                        when (result) {
+                            is Edition8Result.Ok -> {
+                                detail.text = bound(result.body, 4000)
+                                row.setState("Captured — bounded daemon screenshot artifact", SemanticState.POSITIVE)
+                                setStatus("Captured — ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                            }
+                            is Edition8Result.Failed -> row.setState("Failed — ${result.reason}", SemanticState.NEGATIVE)
+                            is Edition8Result.Refused -> row.setState("Disabled — ${result.reason}", SemanticState.DIM)
+                        }
+                    }
+                } else {
+                    daemon.browserObservations(browserId) { result ->
+                        when (result) {
+                            is Edition8Result.Ok -> {
+                                detail.text = bound(result.body, 4000)
+                                row.setState("Read — live console/network observations", SemanticState.POSITIVE)
+                                setStatus("Read — ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                            }
+                            is Edition8Result.Failed -> row.setState("Failed — ${result.reason}", SemanticState.NEGATIVE)
+                            is Edition8Result.Refused -> row.setState("Disabled — ${result.reason}", SemanticState.DIM)
+                        }
+                    }
+                }
+            }
+            return
+        }
+        if (row.control.id == "X-06") {
+            val url = row.value().trim()
+            if (url.isEmpty()) {
+                row.setState("Disabled — enter the destination URL before connecting", SemanticState.DIM)
+                setStatus("Disabled — a destination URL is required", SemanticState.DIM)
+                return
+            }
+            setStatus("Connecting browser…", SemanticState.WARNING)
+            row.setState("Connecting — daemon validation and launch", SemanticState.WARNING)
+            daemon.connectBrowser(url) { result ->
+                when (result) {
+                    is Edition8Result.Ok -> {
+                        detail.text = bound(result.body, 4000)
+                        row.setState("Connected — real browser session", SemanticState.POSITIVE)
+                        setStatus("Connected — ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                    }
+                    is Edition8Result.Failed -> {
+                        row.setState("Failed — ${result.reason}", SemanticState.NEGATIVE)
+                        setStatus("Unavailable — ${result.reason}", SemanticState.NEGATIVE)
+                    }
+                    is Edition8Result.Refused -> {
+                        row.setState("Disabled — ${result.reason}", SemanticState.DIM)
+                        setStatus("Disabled — ${result.reason}", SemanticState.DIM)
+                    }
+                }
+            }
+            return
+        }
+        if (row.control.id == "X-11") {
+            val action = host.inlineCodeAction
+            if (action == null) {
+                row.setState("Disabled — no inline code-action host callback", SemanticState.DIM)
+                setStatus("Disabled — inline code actions need a host editor callback", SemanticState.DIM)
+                return
+            }
+            val captured = try {
+                action()
+            } catch (failure: Throwable) {
+                "contract-required: inline code action failed: ${failure.message ?: failure.javaClass.simpleName}"
+            }
+            detail.text = bound(captured, 4000)
+            row.setState("Host — inline code actions", SemanticState.POSITIVE)
+            setStatus("Inline code actions — $captured", SemanticState.POSITIVE)
+            return
+        }
         if (row.field != null || row.toggle != null) {
             stage(row)
             val key = row.control.configKeys.firstOrNull()
@@ -490,6 +652,32 @@ internal class Edition8ScreenPanel(
                     setStatus("Disabled — ${result.reason}", SemanticState.DIM)
                 }
             }
+        }
+    }
+
+    private fun firstMcpServerId(result: Edition8Result): String? {
+        if (result !is Edition8Result.Ok) return null
+        return try {
+            val root = JsonCodec.parse(result.body)
+            (root.view("servers").value as? JsonValue.Arr)?.items
+                ?.firstOrNull()
+                ?.let { (it as? JsonValue.Obj)?.fields?.get("id") as? JsonValue.Str }
+                ?.value
+        } catch (ignored: Exception) {
+            null
+        }
+    }
+
+    private fun firstBrowserSessionId(result: Edition8Result): String? {
+        if (result !is Edition8Result.Ok) return null
+        return try {
+            val root = JsonCodec.parse(result.body)
+            (root.view("sessions").value as? JsonValue.Arr)?.items
+                ?.firstOrNull()
+                ?.let { (it as? JsonValue.Obj)?.fields?.get("id") as? JsonValue.Str }
+                ?.value
+        } catch (ignored: Exception) {
+            null
         }
     }
 

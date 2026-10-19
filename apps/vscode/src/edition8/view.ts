@@ -179,6 +179,8 @@ function prerequisite(controlId: string, snapshot: E8Snapshot | null): string | 
         : null;
     case 'Q-06':
       return arrayAt(snapshot.approvals, 'permissions').length === 0 ? 'No live permission waiter exists.' : null;
+    case 'T-04':
+      return 'Streamable HTTP is not negotiated by this daemon build; stdio remains the implemented transport and no remote state is claimed.';
     case 'T-06':
       return null;
     case 'T-09':
@@ -768,6 +770,19 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
         cap(`provenance-${index}`, text(rowValue, 'key') ?? `Setting ${index + 1}`, `${text(objectAt(rowValue, 'effective'), 'source') ?? 'unset'} · ${text(rowValue, 'applyTiming') ?? ''}`);
       }
       cap('count', 'Effective settings', String(values.length));
+      cap(
+        'telemetry-endpoint',
+        'Telemetry endpoint',
+        text(snapshot.telemetry, 'endpointScope') ?? sourceError(snapshot, 'telemetry') ?? 'Unavailable',
+      );
+      const previewFields = arrayAt(objectAt(snapshot.telemetry, 'payloadPreview'), 'fields');
+      cap(
+        'telemetry-preview',
+        'Telemetry payload preview',
+        previewFields.length > 0
+          ? previewFields.map((field) => (typeof field === 'string' ? field : '')).filter((field) => field.length > 0).join(', ')
+          : 'No upload schema is served; nothing is fabricated.',
+      );
       return rows;
     case 'S60':
       cap('revision', 'Current revision', stringAt(snapshot.config, 'revision'));

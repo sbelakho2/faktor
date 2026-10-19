@@ -140,19 +140,11 @@ mod tests {
     use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
     use faktor_core::WorkspaceIdentity;
 
-    fn python_available() -> bool {
-        std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_ok()
-    }
-
     /// A minimal Content-Length framed JSON-RPC MCP server: initialize,
-    /// tools/list (one echo tool), tools/call. Written to a temp file so
-    /// spawns stay deterministic.
-    /// Path of the checked-in JSON-RPC mock server fixture.
+    /// tools/list (one echo tool), tools/call. The Rust fixture is compiled
+    /// by faktor-test-mocks, so the suite has no interpreter dependency.
     fn mock_server_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_mock.py")
+        faktor_test_mocks::mcp_bin()
     }
 
     fn ctx() -> ToolRunCtx {
@@ -194,17 +186,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mcp_tool_invocation_end_to_end() {
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = faktor_terminal::ProcessSupervisor::new(cas);
         let cfg = faktor_mcp::McpConfig {
             name: "mock".into(),
-            command: "python3".into(),
-            args: vec![mock_server_path().to_str().unwrap().into()],
+            command: mock_server_path().to_string_lossy().into_owned(),
+            args: vec![],
             env: vec![],
         };
         let server = tokio::time::timeout(
@@ -241,16 +229,12 @@ mod tests {
         // Production wiring (spec §31): a faktor-plus.json mcp entry spawns
         // the supervised server at daemon build and its dynamic tool lands
         // in the agent registry next to the builtins.
-        if !python_available() {
-            eprintln!("python3 missing; skipping");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let cfg = crate::config::Config {
             mcp: vec![crate::config::McpEntry {
                 name: "mock".into(),
-                command: "python3".into(),
-                args: vec![mock_server_path().to_str().unwrap().into()],
+                command: mock_server_path().to_string_lossy().into_owned(),
+                args: vec![],
             }],
             ..Default::default()
         };

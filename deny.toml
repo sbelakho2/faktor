@@ -2,9 +2,9 @@
 #
 # Enforcement:
 #   * local and CI: `bash scripts/check-licenses.sh` evaluates the SAME
-#     policy against `cargo metadata` output with python3 (no tool install
-#     required), and additionally runs `cargo deny check licenses bans
-#     sources` when a cargo-deny binary is on PATH.
+#     policy against `cargo metadata` output with the Rust faktor-ci-tools
+#     binary (built in the lane), and additionally runs `cargo deny check
+#     licenses bans sources` when a cargo-deny binary is on PATH.
 #   * trusted CI static lane: the script is a required step, so a policy
 #     violation is a red lane, never a review nit.
 #

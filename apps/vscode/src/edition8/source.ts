@@ -266,6 +266,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
       ? skip(sources, 'tournaments', 'GET', '/native/session/{id}/tournaments', 'No conversation is bound; model comparisons are session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/tournaments`, null, sources, 'tournaments'),
     readJson(native, 'GET', '/native/terminals', null, sources, 'terminals'),
+    readJson(native, 'GET', '/native/telemetry', null, sources, 'telemetry'),
   ]);
 
   const r8 = await Promise.all([
@@ -413,6 +414,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     board: other[30],
     tournaments: other[31],
     terminals: other[32],
+    telemetry: other[33],
     search: sessionSearch,
     transcript,
   };
@@ -499,5 +501,6 @@ export function emptyEdition8Snapshot(now = 0, binding: E8Snapshot['binding'] = 
     board: null,
     tournaments: null,
     terminals: null,
+    telemetry: null,
   };
 }

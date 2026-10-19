@@ -375,6 +375,45 @@ impl WorkspaceIndex {
         self.files.get(&workspace).map(|f| f.len()).unwrap_or(0)
     }
 
+    /// Number of extracted symbols across the workspace (bounded by the
+    /// file/symbol caps; O(files) over the published snapshot).
+    pub fn symbol_count(&self, workspace: WorkspaceId) -> usize {
+        self.files
+            .get(&workspace)
+            .map(|files| files.values().map(|entry| entry.symbols.len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Test entities discovered by the parser, deterministically ordered by
+    /// (path, line, name) and bounded by `limit`.
+    pub fn test_symbols(&self, workspace: WorkspaceId, limit: usize) -> Vec<(String, Symbol)> {
+        let Some(files) = self.files.get(&workspace) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<&String> = files.keys().collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths {
+            if out.len() >= limit {
+                break;
+            }
+            let mut symbols: Vec<Symbol> = files[path]
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::Test)
+                .cloned()
+                .collect();
+            symbols.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
+            for symbol in symbols {
+                if out.len() >= limit {
+                    break;
+                }
+                out.push((path.clone(), symbol));
+            }
+        }
+        out
+    }
+
     /// Snapshot one indexed file's immutable identity, or `None` when the
     /// path is not currently indexed (removed/tombstoned). See
     /// [`FileRevision`]: semantic search re-checks this after provider calls
@@ -572,6 +611,14 @@ impl WorkspaceIndex {
             .unwrap_or_default();
         serde_json::json!({ "files": files })
     }
+}
+
+/// Extract symbols with tree-sitter for .rs/.py/.ts/.tsx/.js; other files
+/// get none (their text still feeds the lexical postings). Public so native
+/// semantic adapters can derive parser facts for one file without a second
+/// grammar stack.
+pub fn parse_symbols(rel: &Path, text: &str) -> Vec<Symbol> {
+    extract_symbols(rel, text)
 }
 
 /// Extract symbols with tree-sitter for .rs/.py/.ts/.tsx/.js; other files

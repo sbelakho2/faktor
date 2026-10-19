@@ -23,12 +23,11 @@
 // PR/untrusted behavior working with no hard failure while binding is not
 // configured.
 //
-// This file is the canonical implementation. The lane-facing entry point is
-// `scripts/certification/lane-marker.sh`, which runs this file with node when
-// available and otherwise the byte-for-byte parity implementation
-// `scripts/certification/lane-marker.py` (python3 is present in every lane
-// image class). `evidence.mjs` verifies with an independent implementation of
-// the same canonical signing form.
+// This file remains the readable reference implementation. The lane-facing
+// entry point is `scripts/certification/lane-marker.sh`, which runs the Rust
+// `target/release/faktor-ci-tools lane-marker` when built and otherwise this
+// file with node. `evidence.mjs` proves both produce byte-identical marker
+// JSON and the same canonical signing form.
 //
 // Usage (normally via lane-marker.sh):
 //   printf '%s' "$CMDS" | node scripts/certification/lane-marker.mjs write \

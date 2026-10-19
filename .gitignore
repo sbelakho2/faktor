@@ -34,8 +34,8 @@ core.*
 # compile the core test target.
 !crates/core/src/hostile_corpus_tests.rs
 
-# Python bytecode from test mock servers (never source; the .py source is the
-# committed fixture). Enforced by the repository-hygiene scan in
+# Legacy Python bytecode is never accepted; the repository has no Python
+# sources or runtime. Enforced by the repository-hygiene scan in
 # tests/static-authority.
 __pycache__/
 *.py[cod]
