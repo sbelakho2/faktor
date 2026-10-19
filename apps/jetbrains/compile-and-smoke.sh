@@ -240,6 +240,39 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
+# A checksum record beside a LOCAL cargo build output (target/...) is derived
+# state: the rebuild above invalidates it. Reconcile that local record so the
+# product trust gate (which still refuses any genuine mismatch at start) sees
+# the rebuilt bytes. Records next to operator-supplied binaries outside
+# target/ are never rewritten: their fail-closed refusal stands.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | sed 's/.*= //'
+  else
+    return 1
+  fi
+}
+case "$BIN" in
+  "$ROOT"/target/*)
+    if [ -f "$BIN.sha256" ]; then
+      expected="$(cut -d' ' -f1 "$BIN.sha256" 2>/dev/null || true)"
+      actual="$(sha256_of "$BIN" || true)"
+      if [ -z "$actual" ]; then
+        echo "FAIL: cannot hash $BIN to reconcile $BIN.sha256" >&2
+        exit 1
+      fi
+      if [ "$expected" != "$actual" ]; then
+        echo "[compile-and-smoke] refreshing local build checksum record $BIN.sha256 (stale for the rebuilt binary)"
+        printf '%s  %s\n' "$actual" "$(basename "$BIN")" > "$BIN.sha256"
+      fi
+    fi
+    ;;
+esac
+
 # ---- 2. kotlinc, or the Gradle smoke tasks when it is absent ---------------
 KOTLINC="${KOTLINC:-}"
 if [ -z "$KOTLINC" ]; then

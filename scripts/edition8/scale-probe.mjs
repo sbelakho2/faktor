@@ -22,7 +22,9 @@
 //   node scripts/edition8/scale-probe.mjs --turns 1000
 //   node scripts/edition8/scale-probe.mjs --quick        # small smoke
 //
-// Output: target/certification/edition8/scale.raw.json
+// Output: target/certification/edition8/scale.raw.json for the full default
+// probe only; --quick/--skip-turns/--direct-turns and non-report parameter
+// values write `scale.<mode>.raw.json` and are never gate evidence.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -57,6 +59,22 @@ const STREAM_SESSIONS = 16;
 const SKIP_TURNS = argv.includes('--skip-turns');
 const DIRECT_TURNS = argv.includes('--direct-turns');
 const RUN_ID = randomBytes(6).toString('hex');
+// The canonical gate artifact is reserved for the report's full scheduled
+// probe (real prompt turns, 1,000/100,000/5,000/2,000/500/10,000/16).
+// Reduced/diagnostic runs write a distinct file so they can never poison a
+// later `run.mjs` conversion with under-counted evidence.
+const FULL_COVERAGE =
+  !QUICK &&
+  !SKIP_TURNS &&
+  !DIRECT_TURNS &&
+  TURNS === 1000 &&
+  MESSAGES === 100000 &&
+  MEMORY_FACTS === 5000 &&
+  SESSIONS === 2000 &&
+  CHILDREN === 500 &&
+  CLAIMS === 10000;
+const MODE = QUICK ? 'quick' : SKIP_TURNS ? 'skip-turns' : DIRECT_TURNS ? 'direct-turns' : 'reduced';
+const OUT_NAME = FULL_COVERAGE ? 'scale.raw.json' : `scale.${MODE}.raw.json`;
 
 function sha(bytes) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -1227,6 +1245,7 @@ async function main() {
       run_id: RUN_ID,
       platform: process.platform,
       quick: QUICK,
+      gate_evidence: FULL_COVERAGE,
       daemon: { binary: store, pid: daemon.child.pid, log: log.replace(tmp, '<tmp>') },
       seed: ids,
       counts: {
@@ -1261,10 +1280,12 @@ async function main() {
       failures,
     };
     mkdirSync(OUT, { recursive: true });
-    const path = resolve(OUT, 'scale.raw.json');
+    const path = resolve(OUT, OUT_NAME);
     const payload = `${JSON.stringify(document, null, 2)}\n`;
     writeFileSync(path, payload);
-    console.log(`[scale] wrote ${path} (${sha(Buffer.from(payload))})`);
+    console.log(
+      `[scale] wrote ${path} (${sha(Buffer.from(payload))})${FULL_COVERAGE ? '' : ' [reduced run: not gate evidence]'}`,
+    );
     if (failures.length > 0) process.exit(1);
   } finally {
     if (sampler !== null) clearInterval(sampler);
