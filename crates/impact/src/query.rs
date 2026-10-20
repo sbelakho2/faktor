@@ -176,7 +176,7 @@ pub struct ImpactGraph {
     node_index: HashMap<String, usize>,
     out_edges: HashMap<String, Vec<usize>>,
     in_edges: HashMap<String, Vec<usize>>,
-    crate_by_dir: Vec<(String, String)>,
+    crate_by_dir: HashMap<String, String>,
     tests_by_crate: HashMap<String, Vec<String>>,
     defs_by_name: HashMap<String, Vec<String>>,
 }
@@ -187,7 +187,7 @@ impl ImpactGraph {
         let mut node_index = HashMap::with_capacity(graph.nodes.len());
         let mut out_edges: HashMap<String, Vec<usize>> = HashMap::new();
         let mut in_edges: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut crate_by_dir = Vec::new();
+        let mut crate_by_dir: HashMap<String, String> = HashMap::new();
         let mut tests_by_crate: HashMap<String, Vec<String>> = HashMap::new();
         let mut defs_by_name: HashMap<String, Vec<String>> = HashMap::new();
         for (index, node) in graph.nodes.iter().enumerate() {
@@ -195,7 +195,13 @@ impl ImpactGraph {
             match node.kind {
                 NodeKind::Crate => {
                     if let Some(dir) = &node.path {
-                        crate_by_dir.push((dir.clone(), node.name.clone()));
+                        // Normalize the one trailing slash the historical
+                        // matcher accepted; the longest matching ancestor
+                        // wins at lookup time (root "." is the fallback).
+                        let dir = dir.trim_end_matches('/');
+                        crate_by_dir
+                            .entry(dir.to_string())
+                            .or_insert_with(|| node.name.clone());
                     }
                 }
                 NodeKind::Test => {
@@ -215,7 +221,6 @@ impl ImpactGraph {
                 _ => {}
             }
         }
-        crate_by_dir.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         for tests in tests_by_crate.values_mut() {
             tests.sort();
             tests.dedup();
@@ -251,16 +256,21 @@ impl ImpactGraph {
 
     pub fn crate_for_path(&self, path: &str) -> Option<&str> {
         let path = path.trim_start_matches("./");
-        self.crate_by_dir
-            .iter()
-            .find(|(dir, _)| {
-                dir == "."
-                    || path == dir
-                    || path.starts_with(&format!("{dir}/"))
-                    || (!dir.is_empty()
-                        && path.starts_with(&format!("{}/", dir.trim_end_matches('/'))))
-            })
-            .map(|(_, name)| name.as_str())
+        // Longest-prefix lookup in O(path depth): the exact path (a crate
+        // dir may equal it) then every slash-delimited ancestor, deepest
+        // first. The historical vector scan allocated two `format!` strings
+        // per crate per changed path (O(files x crates) allocations on a
+        // whole-workspace seed); the map keeps the SAME winner without
+        // allocating.
+        if let Some(name) = self.crate_by_dir.get(path) {
+            return Some(name.as_str());
+        }
+        for (index, _) in path.match_indices('/').rev() {
+            if let Some(name) = self.crate_by_dir.get(&path[..index]) {
+                return Some(name.as_str());
+            }
+        }
+        self.crate_by_dir.get(".").map(String::as_str)
     }
 
     pub fn node(&self, id: &str) -> Option<&GraphNode> {
@@ -811,5 +821,106 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, GraphError::Malformed(_)));
+    }
+
+    #[test]
+    fn crate_lookup_prefers_the_longest_matching_ancestor() {
+        let crates = vec![
+            node("crate:alpha", "alpha", NodeKind::Crate, "."),
+            node("crate:beta", "beta", NodeKind::Crate, "beta"),
+            node("crate:nested", "nested", NodeKind::Crate, "beta/nested/"),
+        ];
+        let mut nodes = crates;
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut graph = Graph {
+            schema: GRAPH_SCHEMA.to_string(),
+            revision: Revision::default(),
+            workspace: faktor_core::id::WorkspaceId::new(1),
+            files: vec![],
+            nodes,
+            edges: vec![],
+            reverse_edges: vec![],
+            stats: GraphStats::default(),
+            digest: String::new(),
+        };
+        graph.seal().unwrap();
+        let graph = ImpactGraph::new(graph).unwrap();
+        assert_eq!(
+            graph.crate_for_path("beta/nested/src/lib.rs"),
+            Some("nested")
+        );
+        assert_eq!(graph.crate_for_path("./beta/src/lib.rs"), Some("beta"));
+        assert_eq!(graph.crate_for_path("README.md"), Some("alpha"));
+        assert_eq!(graph.crate_for_path("beta"), Some("beta"));
+    }
+
+    /// Bounded probe (no soak): 20k lookups across 500 crates. The historical
+    /// scan allocated two formatted prefixes per crate per lookup
+    /// (O(paths x crates) allocations); the map probes only the path's
+    /// ancestors. The ceiling is generous for a debug build but far below
+    /// the quadratic path.
+    #[test]
+    #[ignore = "[perf] impact crate lookup at 500 crates / 20k paths"]
+    fn perf_crate_lookup_is_linear_in_path_depth() {
+        let mut nodes: Vec<GraphNode> = (0..500)
+            .map(|i| {
+                node(
+                    &format!("crate:c{i:03}"),
+                    &format!("c{i:03}"),
+                    NodeKind::Crate,
+                    &format!("crates/c{i:03}"),
+                )
+            })
+            .collect();
+        nodes.push(node("crate:root", "root", NodeKind::Crate, "."));
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut graph = Graph {
+            schema: GRAPH_SCHEMA.to_string(),
+            revision: Revision::default(),
+            workspace: faktor_core::id::WorkspaceId::new(1),
+            files: vec![],
+            nodes,
+            edges: vec![],
+            reverse_edges: vec![],
+            stats: GraphStats::default(),
+            digest: String::new(),
+        };
+        graph.seal().unwrap();
+        let graph = ImpactGraph::new(graph).unwrap();
+        let paths: Vec<String> = (0..20_000)
+            .map(|i| format!("crates/c{:03}/src/f{}.rs", i % 500, i))
+            .collect();
+        let started = std::time::Instant::now();
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(
+                graph.crate_for_path(path),
+                Some(format!("c{:03}", i % 500).as_str())
+            );
+        }
+        let elapsed = started.elapsed();
+        // LEGACY: the sorted vector + two `format!` allocations per crate.
+        let mut legacy_dirs: Vec<(String, String)> = (0..500)
+            .map(|i| (format!("crates/c{i:03}"), format!("c{i:03}")))
+            .collect();
+        legacy_dirs.push((".".to_string(), "root".to_string()));
+        legacy_dirs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        let legacy_started = std::time::Instant::now();
+        for path in &paths {
+            let found = legacy_dirs
+                .iter()
+                .find(|(dir, _)| dir == "." || path == dir || path.starts_with(&format!("{dir}/")))
+                .map(|(_, name)| name.as_str());
+            assert!(found.is_some());
+        }
+        let legacy = legacy_started.elapsed();
+        println!("[perf] 20k crate lookups over 500 crates: map {elapsed:?} legacy {legacy:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "20k lookups took {elapsed:?}"
+        );
+        assert!(
+            elapsed * 5 < legacy,
+            "map lookup {elapsed:?} must beat the legacy scan {legacy:?} by 5x"
+        );
     }
 }

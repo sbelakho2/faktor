@@ -200,3 +200,68 @@ fn session_resolution_p95_under_64_way_concurrency() {
          (p50={p50:?} p99={p99:?} max={max:?})"
     );
 }
+
+/// Bounded probe (no soak): journal append + tail catch-up at 1k / 10k /
+/// 100k events in ONE session. Fails a quadratic append (e.g. a per-append
+/// full journal scan) or a tail read that degrades with history: the
+/// per-event cost at 100k must stay within 4x of 1k, and the catch-up read
+/// over the last 10 events must stay bounded.
+#[test]
+#[ignore = "[perf] journal append/catch-up at 1k/10k/100k events"]
+fn journal_append_and_tail_catch_up_are_linear_at_100k() {
+    fn pct(samples: &[Duration], p: f64) -> Duration {
+        if samples.is_empty() {
+            return Duration::ZERO;
+        }
+        let index = ((samples.len() as f64 - 1.0) * p).round() as usize;
+        samples[index.min(samples.len() - 1)]
+    }
+
+    fn measure(events: usize) -> (Duration, Vec<Duration>) {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = open(dir.path());
+        let handle = session(&manager, "scale");
+        let started = Instant::now();
+        for _ in 0..events {
+            handle
+                .force_append_event(EventKind::ModelChunkReceived, AgentState::Idle, None, None)
+                .unwrap();
+        }
+        let append = started.elapsed() / events as u32;
+        let last = handle.last_event_seq().unwrap().expect("events").raw();
+        let mut catch_ups = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let tail = handle
+                .events_range(last.saturating_sub(9), Some(10))
+                .unwrap();
+            catch_ups.push(started.elapsed());
+            assert_eq!(tail.len(), 10, "bounded tail page");
+            assert_eq!(tail.last().unwrap().seq.raw(), last);
+        }
+        (append, catch_ups)
+    }
+    let mut results = Vec::new();
+    for events in [1_000usize, 10_000, 100_000] {
+        let (append, mut catch_ups) = measure(events);
+        catch_ups.sort_unstable();
+        println!(
+            "[perf] events={events}: append/event={append:?} tail10 p50={:?} p95={:?} p99={:?}",
+            pct(&catch_ups, 0.50),
+            pct(&catch_ups, 0.95),
+            pct(&catch_ups, 0.99)
+        );
+        results.push((append, catch_ups));
+    }
+    let (one_k, _) = results[0];
+    let (hundred_k, catch_ups) = &results[2];
+    let catch_up = pct(catch_ups, 0.95);
+    assert!(
+        *hundred_k <= one_k.saturating_mul(4) + Duration::from_micros(100),
+        "per-event append cost grew from {one_k:?} (1k) to {hundred_k:?} (100k): quadratic shape"
+    );
+    assert!(
+        catch_up < Duration::from_millis(50),
+        "100k-history tail catch-up {catch_up:?} exceeds 50ms"
+    );
+}

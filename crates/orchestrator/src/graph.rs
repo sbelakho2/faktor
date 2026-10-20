@@ -37,7 +37,7 @@ use faktor_core::id::SessionId;
 use faktor_session::child::{ChildControl, ChildOwnership, PresentationState};
 
 use super::merge::{
-    merge_envelopes, parent_handle, read_part_conflicts, read_part_paths, scan_facts,
+    merge_envelopes, parent_handle, read_part_conflicts, read_part_paths, scan_facts_of_kind_prefix,
 };
 use super::*;
 
@@ -131,9 +131,13 @@ pub struct OpGraph {
 /// is ever a silent skip or a fabricated id.
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
-    #[error("run {run_id:?}: plan item {item_id:?} has no durable work-item assignment (identity is never fabricated from memory)")]
+    #[error(
+        "run {run_id:?}: plan item {item_id:?} has no durable work-item assignment (identity is never fabricated from memory)"
+    )]
     MissingAssignment { run_id: String, item_id: String },
-    #[error("run {run_id:?}: the assignment names child {child_id:?}, whose spawn is durable (its env binding exists) but whose child row is gone")]
+    #[error(
+        "run {run_id:?}: the assignment names child {child_id:?}, whose spawn is durable (its env binding exists) but whose child row is gone"
+    )]
     MissingChild { run_id: String, child_id: String },
     #[error("graph conflict: {0}")]
     Conflict(String),
@@ -409,11 +413,13 @@ fn env_snapshot_keys(
 ) -> Result<HashSet<String>, GraphError> {
     let handle = parent_handle(&manager, parent)?;
     let mut keys = HashSet::new();
-    for (kind, key, _value) in scan_facts(&handle)? {
-        if kind == crate::runtime::env::KIND_ENV_SNAPSHOT
-            && key
-                .strip_prefix(run_id)
-                .is_some_and(|rest| rest.starts_with("/env-"))
+    for (_kind, key, _value) in
+        scan_facts_of_kind_prefix(&handle, crate::runtime::env::KIND_ENV_SNAPSHOT, run_id)
+            .map_err(GraphError::from)?
+    {
+        if key
+            .strip_prefix(run_id)
+            .is_some_and(|rest| rest.starts_with("/env-"))
         {
             keys.insert(key);
         }
@@ -429,7 +435,21 @@ fn durable_runs(
 ) -> Result<BTreeSet<String>, ExecError> {
     let handle = parent_handle(&manager, parent)?;
     let mut runs = BTreeSet::new();
-    for (kind, key, _value) in scan_facts(&handle)? {
+    let (rows, has_more) = handle
+        .memory_facts_of_kinds(
+            &[
+                crate::runtime::PLAN_ROW_KIND,
+                crate::runtime::REGISTRY_ROW_KIND,
+            ],
+            super::merge::MAX_PREFIX_ROWS as u64,
+        )
+        .map_err(|e| ExecError::Internal(format!("run fact scan: {}", e.message)))?;
+    if has_more {
+        return Err(ExecError::Oversized(
+            "run fact scan exceeded its bounded page; refusing a partial view".into(),
+        ));
+    }
+    for (kind, key, _value) in rows {
         match kind.as_str() {
             crate::runtime::PLAN_ROW_KIND => {
                 runs.insert(key);

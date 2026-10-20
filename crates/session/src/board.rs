@@ -55,7 +55,7 @@ use crate::{map_store_err, SessionError};
 pub use crate::ledger::{
     BOARD_RECEIPT_ACK, BOARD_RECEIPT_BLOCKED, BOARD_RECEIPT_QUESTION, BOARD_RECEIPT_TASK_UPDATE,
     MAX_BOARD_BODY_BYTES, MAX_BOARD_RECEIPT_NOTE_BYTES, MAX_BOARD_REFS, MAX_BOARD_REF_BYTES,
-    MAX_BOARD_SUBJECT_BYTES,
+    MAX_BOARD_REVISIONS, MAX_BOARD_SUBJECT_BYTES,
 };
 
 /// Bounded page size of one `board_read` (paging is fundamental).
@@ -69,6 +69,37 @@ pub const MAX_BOARD_SCAN_ROWS: usize = 100_000;
 pub const MAX_BOARD_FAMILY_DEPTH: usize = 64;
 /// Hard cap on receipts returned for one `(child, post)` pair.
 pub const MAX_BOARD_RECEIPTS_PER_POST: usize = crate::ledger::MAX_BOARD_RECEIPTS_PER_POST;
+
+/// Every durable type tag the coordination board writes into the ROOT
+/// session's ledger. Board reads are TYPE-SCOPED at the store: the same
+/// ledger carries the run's typed history (decisions, verify runs, edit
+/// transactions, learning records), and decoding every one of those rows
+/// per board request is O(history) — quadratic in practice under a large
+/// child fan-out.
+const BOARD_ENTRY_TAGS: &[&str] = &[
+    crate::ledger::ENTRY_BOARD_POST,
+    crate::ledger::ENTRY_BOARD_READ,
+    crate::ledger::ENTRY_BOARD_RECEIPT,
+    crate::ledger::ENTRY_BOARD_RESET,
+];
+
+/// One bounded newest-first page of ONLY the board entry types (the
+/// `(session_id, entry_type, seq)` index serves each type backwards).
+fn board_ledger_page(
+    root: &SessionHandle,
+    cursor: Option<i64>,
+) -> faktor_core::Result<Vec<faktor_store::LedgerEntryRow>> {
+    root.manager
+        .store()
+        .ledger_entries_by_type_desc_page(
+            root.id(),
+            BOARD_ENTRY_TAGS,
+            cursor,
+            Some(crate::ledger::MAX_BOARD_SCAN_PAGE),
+        )
+        .map_err(map_store_err)
+        .map_err(Into::into)
+}
 
 // ---------------------------------------------------------------- model
 
@@ -643,11 +674,7 @@ impl SessionHandle {
         let mut cursor: Option<i64> = None;
         let mut scanned: usize = 0;
         'outer: loop {
-            let rows = root
-                .manager
-                .store()
-                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
-                .map_err(map_store_err)?;
+            let rows = board_ledger_page(root, cursor)?;
             if rows.is_empty() {
                 break;
             }
@@ -752,6 +779,11 @@ impl SessionHandle {
             action.as_str(),
             note,
         )?;
+        // The liveness check and the append are ONE command-lock critical
+        // section: a concurrent board reset between them could otherwise
+        // append an action receipt for a post that is no longer live (the
+        // caller would be told the receipt landed on a visible post).
+        let _guard = scope.root.command_guard();
         Self::live_post_seq(&scope.root, board_id, post_id)?;
         let created_ms = self.now_ms();
         scope.root.append_typed_entry(LedgerPayload::BoardReceipt {
@@ -796,11 +828,7 @@ impl SessionHandle {
         let mut seen_read = BTreeSet::new();
         let mut reset_revision = 0u64;
         loop {
-            let rows = root
-                .manager
-                .store()
-                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
-                .map_err(map_store_err)?;
+            let rows = board_ledger_page(root, cursor)?;
             if rows.is_empty() {
                 return Err(SessionError::NotFound(format!(
                     "board post {} on the live surface of {}",
@@ -926,11 +954,7 @@ impl SessionHandle {
         let mut cursor: Option<i64> = None;
         let mut scanned = 0usize;
         'outer: loop {
-            let rows = root
-                .manager
-                .store()
-                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
-                .map_err(map_store_err)?;
+            let rows = board_ledger_page(root, cursor)?;
             if rows.is_empty() {
                 break;
             }
@@ -1030,11 +1054,7 @@ impl SessionHandle {
         let mut cursor: Option<i64> = None;
         let mut scanned = 0usize;
         loop {
-            let rows = root
-                .manager
-                .store()
-                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
-                .map_err(map_store_err)?;
+            let rows = board_ledger_page(root, cursor)?;
             if rows.is_empty() {
                 break;
             }
@@ -1141,11 +1161,7 @@ impl SessionHandle {
         let mut scanned = 0usize;
         let mut reset_revision = 0u64;
         loop {
-            let rows = root
-                .manager
-                .store()
-                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
-                .map_err(map_store_err)?;
+            let rows = board_ledger_page(root, cursor)?;
             if rows.is_empty() {
                 break;
             }
@@ -1592,6 +1608,76 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Malformed, "{}", err.message);
     }
 
+    /// New-angle DoS probe: board rows are PINNED across compaction, so a
+    /// child flooding posts is unbounded durable growth and eventually makes
+    /// every scan-based read refuse. A board already at the revision cap must
+    /// refuse BOTH a new post and a reset (ids are never reused), typed, with
+    /// nothing appended.
+    #[test]
+    fn board_revision_cap_refuses_flood_posts_and_resets() {
+        let (_d, m) = manager();
+        let rt = root_session(&m);
+        let sid = rt.id().raw() as i64;
+        let payload = serde_json::json!({
+            "kind": "board_post",
+            "board_id": rt.id().raw(),
+            "post_id": MAX_BOARD_REVISIONS,
+            "author_child": null,
+            "author_session": rt.id().raw(),
+            "subject": "last slot",
+            "body": "at the cap",
+            "refs": [],
+            "revision": MAX_BOARD_REVISIONS
+        });
+        m.store()
+            .sql_execute(&format!(
+                "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
+                 SELECT {sid}, COALESCE(MAX(seq),0)+1, 'board_post', 1, '{}', 1
+                 FROM ledger_entry WHERE session_id = {sid};",
+                payload.to_string().replace('\'', "''")
+            ))
+            .unwrap();
+        // The at-cap row decodes and its revision is the live head.
+        assert_eq!(
+            rt.board_read_posts(None, None, 10, false).unwrap().revision,
+            MAX_BOARD_REVISIONS
+        );
+        let before = rt.ledger_entries_page(None, 500).unwrap().entries.len();
+        let err = rt.board_post("flood", "one more", &[]).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{}", err.message);
+        assert!(err.message.contains("MAX_BOARD_REVISIONS"));
+        let err = rt.board_reset(MAX_BOARD_REVISIONS).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{}", err.message);
+        let after = rt.ledger_entries_page(None, 500).unwrap().entries.len();
+        assert_eq!(
+            before, after,
+            "a refused flood/reset must never append a durable row"
+        );
+
+        // A raw row ABOVE the cap is corruption and fails decode loudly.
+        let payload = serde_json::json!({
+            "kind": "board_post",
+            "board_id": rt.id().raw(),
+            "post_id": MAX_BOARD_REVISIONS + 1,
+            "author_child": null,
+            "author_session": rt.id().raw(),
+            "subject": "over",
+            "body": "over the cap",
+            "refs": [],
+            "revision": MAX_BOARD_REVISIONS + 1
+        });
+        m.store()
+            .sql_execute(&format!(
+                "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
+                 SELECT {sid}, COALESCE(MAX(seq),0)+1, 'board_post', 1, '{}', 1
+                 FROM ledger_entry WHERE session_id = {sid};",
+                payload.to_string().replace('\'', "''")
+            ))
+            .unwrap();
+        let err = rt.board_read_posts(None, None, 10, false).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{}", err.message);
+    }
+
     #[test]
     fn terminal_child_cannot_post_or_act() {
         let (_d, m) = manager();
@@ -1863,5 +1949,143 @@ mod tests {
                 .kind,
             ErrorKind::NotFound
         );
+    }
+
+    /// Bounded probe (no soak): one board page over a root ledger carrying
+    /// 100k unrelated typed history rows must read only the board rows.
+    /// The historical scan decoded every ledger row (JSON) per request, so
+    /// a 200-child fan-out paid O(children × history) on the read path.
+    #[test]
+    #[ignore = "[perf] board read over 100k unrelated ledger rows"]
+    fn perf_board_read_is_type_scoped_at_100k_history_rows() {
+        let (_d, m) = manager();
+        let rt = root_session(&m);
+        let post = rt.board_post("subject", "body", &[]).unwrap();
+        let sid = rt.id().raw() as i64;
+        m.store()
+            .sql_execute(&format!(
+                "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
+                 SELECT {sid},
+                        (SELECT COALESCE(MAX(seq),0) FROM ledger_entry WHERE session_id = {sid}) + x,
+                        'decision', 1,
+                        '{{\"kind\":\"decision\",\"step\":\"s\",\"choice\":\"c\",\"rationale\":\"r\"}}',
+                        1
+                 FROM (WITH RECURSIVE cnt(x) AS (
+                         SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000
+                       ) SELECT x FROM cnt);"
+            ))
+            .unwrap();
+        // Warm the ledger head once (the rebuild folds the newly inserted
+        // rows; steady-state board reads must not pay it per request).
+        rt.board_read_posts(None, None, 20, false).unwrap();
+        // LEGACY: the historical scan walked every ledger row and decoded
+        // its JSON before discarding non-board payloads.
+        let mut legacy = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let mut cursor = None;
+            let mut scanned = 0usize;
+            loop {
+                let rows = rt
+                    .manager
+                    .store()
+                    .ledger_entries_desc(rt.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
+                    .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                cursor = rows.last().map(|r| r.seq);
+                for row in rows {
+                    scanned += 1;
+                    let entry = rt.decode_row(&row).unwrap();
+                    if let LedgerPayload::BoardPost { post_id, .. } = entry.payload {
+                        assert_eq!(post_id, post.id.raw());
+                    }
+                }
+            }
+            assert!(scanned > 100_000);
+            legacy.push(started.elapsed());
+        }
+        legacy.sort_unstable();
+        let mut samples = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let started = std::time::Instant::now();
+            let page = rt.board_read_posts(None, None, 20, false).unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(page.posts.len(), 1);
+            assert_eq!(page.posts[0].id, post.id);
+        }
+        samples.sort_unstable();
+        let pick = |p: f64| {
+            let index = ((samples.len() as f64 - 1.0) * p).round() as usize;
+            samples[index.min(samples.len() - 1)]
+        };
+        let p50 = pick(0.50);
+        let p95 = pick(0.95);
+        let p99 = pick(0.99);
+        println!(
+            "[perf] board read over 100k history rows: legacy p50={:?} new p50={p50:?} p95={p95:?} p99={p99:?}",
+            legacy[legacy.len() / 2]
+        );
+        assert!(
+            p95 * 10 < legacy[legacy.len() / 2],
+            "type-scoped board read {p95:?} must beat the full-ledger decode {:?} by 10x",
+            legacy[legacy.len() / 2]
+        );
+        assert!(
+            p95 < std::time::Duration::from_millis(50),
+            "board read p95 {p95:?} must stay bounded (type-scoped read)"
+        );
+    }
+
+    /// New-angle comms probe: an action receipt must never publish on a post
+    /// that a concurrent reset hid. The liveness check and the append are
+    /// ONE command-lock section; here the test holds that lock, proves the
+    /// receipt is blocked, hides the post with a reset marker, then releases
+    /// the lock: the receipt must be refused, not silently appended to
+    /// hidden history.
+    #[test]
+    fn fault_probe_board_receipt_is_serialized_against_reset() {
+        use std::sync::mpsc;
+        let (_d, m) = manager();
+        let rt = root_session(&m);
+        let c = child_session(&m, &rt, 2);
+        let post = rt.board_post("status", "before reset", &[]).unwrap();
+        let board = post.board_id;
+        let guard = rt.command_guard();
+        let (tx, rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let rt2 = rt.clone();
+        std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let result = rt2.board_receipt(post.id, BoardAction::Ack, "ack");
+            let _ = tx.send(result.is_ok());
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the receipt thread started");
+        // The receipt thread must be parked on the shared command lock.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            rx.try_recv().is_err(),
+            "the receipt must not publish while the board command lock is held"
+        );
+        rt.append_typed_entry(LedgerPayload::BoardReset {
+            board_id: board.root().raw(),
+            previous_revision: 1,
+            new_revision: 2,
+        })
+        .unwrap();
+        drop(guard);
+        let published = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the receipt thread finishes after the lock is released");
+        assert!(
+            !published,
+            "a receipt for a post hidden by the concurrent reset must be refused"
+        );
+        // No action receipt was durably appended.
+        let err = c.board_receipts(child_id(&c), post.id).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound, "{}", err.message);
     }
 }

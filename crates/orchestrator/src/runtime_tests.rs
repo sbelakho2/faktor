@@ -5210,6 +5210,10 @@ fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
         Err(ExecError::Oversized(_))
     ));
 }
+#[path = "runtime_comm_tests.rs"]
+mod runtime_comm_tests;
+#[path = "runtime_tests_collision.rs"]
+mod runtime_tests_collision;
 /// Perf-wave evidence tests for the orchestrator one-pass indexes (kept in
 /// their own file: `runtime_tests.rs` is under a recorded source ceiling).
 #[path = "runtime_tests_perf.rs"]

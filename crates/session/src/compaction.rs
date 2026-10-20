@@ -618,6 +618,96 @@ mod tests {
     use faktor_core::event::EventKind;
 
     #[test]
+    fn compaction_operation_order_is_monotonic_across_a_backward_clock_jump() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(faktor_core::time::TestClock::new(1_000_000));
+        let m = crate::SessionManager::open_with_clock(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            false,
+            clock.clone(),
+        )
+        .unwrap();
+        let s = session(&m);
+        let a = s
+            .begin_compaction_operation("clock-a", 100, 0.25, None, None)
+            .unwrap();
+        let b = s
+            .begin_compaction_operation("clock-b", 100, 0.25, None, None)
+            .unwrap();
+        assert!(
+            b.created_ms > a.created_ms,
+            "same-millisecond inserts must still order strictly"
+        );
+        for id in ["clock-a", "clock-b"] {
+            let done = s
+                .advance_compaction_operation(
+                    id,
+                    CompactionOperationState::Applied,
+                    "applied",
+                    1_000_000,
+                    Some(100),
+                    Some(40),
+                    Some(75),
+                    Some("deterministic_pruning"),
+                    Some(&serde_json::json!({"accepted": true})),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(done.is_terminal());
+        }
+        // Wall clock jumps 60s BACKWARD (NTP correction / VM restore).
+        clock.advance(-60_000);
+        let c = s
+            .begin_compaction_operation("clock-c", 100, 0.25, None, None)
+            .unwrap();
+        assert!(
+            c.created_ms > b.created_ms,
+            "a backward wall clock must not let a new operation sort older"
+        );
+        assert_eq!(
+            s.latest_compaction_operation()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "clock-c",
+            "the newest operation must remain the truthful UI state"
+        );
+        // Terminal prune must never evict the newest operation because the
+        // wall clock stepped backwards: keep the newest THREE first, then
+        // the newest ONE.
+        let c_done = s
+            .advance_compaction_operation(
+                "clock-c",
+                CompactionOperationState::Applied,
+                "applied",
+                1_000_000,
+                Some(100),
+                Some(40),
+                Some(75),
+                Some("deterministic_pruning"),
+                Some(&serde_json::json!({"accepted": true})),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(c_done.is_terminal());
+        assert_eq!(s.prune_compaction_operations_keep_newest(1).unwrap(), 2);
+        assert!(s.compaction_operation("clock-a").unwrap().is_none());
+        assert!(s.compaction_operation("clock-b").unwrap().is_none());
+        assert_eq!(
+            s.latest_compaction_operation()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "clock-c"
+        );
+    }
+
+    #[test]
     fn compaction_rejects_one_percent_reduction() {
         // The archetypal death-spiral case: 180k -> 178k is "done" by the
         // summarizer but saves ~1%. Reject.
@@ -750,6 +840,77 @@ mod tests {
             s.request_compaction_cancel("op-c").unwrap().unwrap(),
             cancelled
         );
+    }
+
+    #[test]
+    fn atomic_compaction_seams_reopen_checkpoint_and_event_together() {
+        // A crash at any seam of the ONE accepted-compaction transaction must
+        // expose either no replacement context AND no ContextCompacted event,
+        // or both. The historical two-step path could persist the checkpoint
+        // and die before the compaction record/event.
+        for seam in [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = session(&m);
+            let sid = s.id();
+            let payload = br#"[{"role":"user","text":"KEEP-ATOMIC"}]"#.to_vec();
+            let digest = blake3::hash(&payload).to_hex().to_string();
+            m.store().crash_arm(faktor_store::CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.commit_compaction_with_checkpoint(
+                    100,
+                    40,
+                    60,
+                    true,
+                    "deterministic_pruning",
+                    &CompactionPolicy::default(),
+                    17,
+                    &digest,
+                    &payload,
+                );
+            }));
+            assert!(
+                m.store().seam_crash_observed(&caught),
+                "seam {seam} must fire"
+            );
+            drop(s);
+            drop(m);
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = m.get_session(sid).unwrap().unwrap();
+            let checkpoint = s.context_checkpoint().unwrap();
+            let compacted = s
+                .events_range(1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EventKind::ContextCompacted)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    let checkpoint = checkpoint.expect("committed checkpoint survives");
+                    assert_eq!(checkpoint.through_seq, 17);
+                    assert_eq!(checkpoint.digest, digest);
+                    assert_eq!(compacted, 1, "committed event survives");
+                }
+                _ => {
+                    assert!(
+                        checkpoint.is_none(),
+                        "rolled-back checkpoint must not exist"
+                    );
+                    assert_eq!(compacted, 0, "rolled-back event must not exist");
+                }
+            }
+        }
     }
 
     #[test]

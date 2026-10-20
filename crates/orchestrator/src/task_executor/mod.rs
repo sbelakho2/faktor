@@ -1655,7 +1655,7 @@ impl TaskExecutor {
     /// assertions and is compiled OUT of release builds — production code
     /// cannot name it, and no runtime value can flip a production executor
     /// back to owner-direct. Never use it outside tests.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_owner_direct_for_test_harness(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,

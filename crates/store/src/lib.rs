@@ -235,3 +235,11 @@ mod query_plan_tests;
 #[cfg(test)]
 #[path = "hostile_corpus_tests.rs"]
 mod hostile_corpus_tests;
+
+#[cfg(test)]
+#[path = "extreme_longtask_tests.rs"]
+mod extreme_longtask_tests;
+
+#[cfg(test)]
+#[path = "extreme_scale_probes.rs"]
+mod extreme_scale_probes;

@@ -31,13 +31,6 @@ impl SessionHandle {
         if path.is_empty() || path.len() > MAX_CHECKPOINT_PATH_BYTES {
             return Err(SessionError::Malformed("invalid checkpoint path".into()).into());
         }
-        let existing = self.checkpoints_of()?;
-        if existing.iter().any(|c| c.sequence == sequence) {
-            return Err(SessionError::Conflict(format!(
-                "checkpoint sequence {sequence} already exists"
-            ))
-            .into());
-        }
         let _guard = self.command_guard();
         // Validate against the pre-state read ONCE; the atomic store command
         // re-verifies it inside the same transaction as the row insert, so a
@@ -85,6 +78,27 @@ impl SessionHandle {
         self.manager
             .store()
             .checkpoints_of(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// The newest checkpoint row, read through the indexed
+    /// `(session_id, sequence)` order. Session-detail projections use this
+    /// instead of materializing (and sorting) every checkpoint the session
+    /// ever recorded.
+    pub fn latest_checkpoint(&self) -> faktor_core::Result<Option<CheckpointRow>> {
+        self.manager
+            .store()
+            .latest_checkpoint(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// A bounded newest-first checkpoint page for list projections (the
+    /// display cap is applied by the store, never by loading the full
+    /// history first).
+    pub fn checkpoints_newest(&self, limit: u64) -> faktor_core::Result<Vec<CheckpointRow>> {
+        self.manager
+            .store()
+            .checkpoints_newest(self.id, limit)
             .map_err(|e| crate::map_store_err(e).into())
     }
 

@@ -25,6 +25,13 @@
 //! rendered, so a consumed handoff cannot be re-delivered by a replay; a
 //! re-record of the same child overwrites the row (latest state wins,
 //! idempotent across re-attach).
+//!
+//! Exactly-once under CONCURRENT parent turns: the value is re-read with its
+//! durable CAS stamp and claimed to the empty ack in ONE writer transaction.
+//! Two consumers that observed the same section can never both render it:
+//! the loser's CAS conflicts and skips the row (or, when a newer value won,
+//! leaves it for the next turn). A failed ack still renders (at-least-once —
+//! a store failure must never silently drop a child result).
 
 /// Durable fact kind of the pending-internal-context delivery arm.
 pub const PENDING_INTERNAL_CONTEXT_KIND: &str = "internal_context";
@@ -33,24 +40,65 @@ pub const PENDING_INTERNAL_CONTEXT_KIND: &str = "internal_context";
 /// `child-handoff/<child id>`; re-recording the same child overwrites.
 pub const PENDING_INTERNAL_CONTEXT_KEY_PREFIX: &str = "child-handoff/";
 
-/// Durable ack: rewrite the consumed entry to the empty value. Best-effort
-/// by contract — a failed ack only means the section stays pending and the
-/// parent's following turn re-receives it (at-least-once, never lost), so
-/// the failure is logged, never fatal to the turn.
-fn ack_internal_context_entry(handle: &faktor_session::SessionHandle, key: &str) {
-    if let Err(error) = handle.upsert_memory_fact(PENDING_INTERNAL_CONTEXT_KIND, key, "") {
-        tracing::warn!(
-            session = %handle.id(),
-            key,
-            "pending internal-context ack failed: {error}"
-        );
+/// Companion WATERMARK of the last delivered child state inside that kind:
+/// `child-handoff-delivered/<child id>` = the child registry row's
+/// `updated_ms`. It is written atomically WITH the section and survives the
+/// parent's ack, so re-attach can distinguish "this exact terminal state was
+/// delivered (pending or consumed)" from "a NEWER retry state was never
+/// delivered" without ever re-arming a consumed handoff.
+pub const PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX: &str = "child-handoff-delivered/";
+
+/// Claim ONE observed pending section for this consumer and durably ack it.
+/// `Some(section)` means THIS consumer exclusively owns the delivery (or a
+/// store failure left it unacked and it must still be shown, never lost);
+/// `None` means another consumer claimed it, a newer value replaced the one
+/// observed, or the row vanished — in every case it must not be rendered
+/// here.
+fn claim_pending_internal_context(
+    handle: &faktor_session::SessionHandle,
+    key: &str,
+    observed: &str,
+) -> Option<String> {
+    let (current, stamp) = match handle.memory_fact_get_stamped(PENDING_INTERNAL_CONTEXT_KIND, key)
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                session = %handle.id(),
+                key,
+                "pending internal-context claim read failed; leaving it pending: {error}"
+            );
+            return None;
+        }
+    };
+    if current.is_empty() || current != observed {
+        // Consumed or superseded between the page read and the claim: this
+        // consumer must not render the stale observation.
+        return None;
+    }
+    match handle.upsert_memory_fact_cas(PENDING_INTERNAL_CONTEXT_KIND, key, "", Some(stamp)) {
+        Ok(faktor_store::MemoryFactCas::Applied(_)) => Some(current),
+        Ok(faktor_store::MemoryFactCas::Conflict | faktor_store::MemoryFactCas::Missing) => None,
+        Err(error) => {
+            // The ack failed but the section was genuinely observed: show it
+            // (at-least-once) rather than lose the child's result.
+            tracing::warn!(
+                session = %handle.id(),
+                key,
+                "pending internal-context ack failed: {error}; delivering unacked"
+            );
+            Some(current)
+        }
     }
 }
 
 /// Take the pending internal-context sections recorded for the session of
-/// `handle`, in deterministic key order, acking each rendered entry once.
+/// `handle`, in deterministic key order, claiming each rendered entry once.
 /// Empty when the session carries none; a fact read failure yields empty
-/// and logs (the following drive re-reads the durable rows).
+/// and logs (the following drive re-reads the durable rows). Concurrent
+/// consumers partition the pending set: every section is rendered by
+/// exactly one of them (see [`claim_pending_internal_context`]).
 pub(crate) fn take_pending_internal_context(handle: &faktor_session::SessionHandle) -> String {
     // Bounded per-kind walk: the previous full fact-table scan got slower
     // with every turn's facts (O(n²) over a long task). 16 x 200 handoff
@@ -104,11 +152,126 @@ pub(crate) fn take_pending_internal_context(handle: &faktor_session::SessionHand
     pending.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::new();
     for (key, value) in pending {
-        ack_internal_context_entry(handle, &key);
+        let Some(claimed) = claim_pending_internal_context(handle, &key, &value) else {
+            continue;
+        };
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&value);
+        out.push_str(&claimed);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Barrier};
+
+    fn parent_session() -> (tempfile::TempDir, faktor_session::SessionHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = faktor_session::SessionManager::open(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+        )
+        .unwrap();
+        let ws = manager.create_workspace("/root").unwrap();
+        let session = manager.create_session(ws, "parent", "fake", "m").unwrap();
+        (dir, session)
+    }
+
+    /// New-angle handoff probe: two parent turns racing at the durable
+    /// delivery arm must partition the pending sections — every child
+    /// handoff is rendered exactly once across the consumers, never twice
+    /// and never lost. (The historical page-read + unconditional ack let
+    /// both consumers read the same value before either acked.)
+    #[test]
+    fn fault_probe_concurrent_handoff_consumers_deliver_exactly_once() {
+        let (_dir, handle) = parent_session();
+        let total = 64usize;
+        for i in 0..total {
+            handle
+                .upsert_memory_fact(
+                    PENDING_INTERNAL_CONTEXT_KIND,
+                    &format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{i:03}"),
+                    &format!("[[SECTION-{i:03}]]"),
+                )
+                .unwrap();
+        }
+        let threads = 4usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let outputs = std::thread::scope(|scope| {
+            let mut join = Vec::new();
+            for _ in 0..threads {
+                let handle = handle.clone();
+                let barrier = barrier.clone();
+                join.push(scope.spawn(move || {
+                    barrier.wait();
+                    take_pending_internal_context(&handle)
+                }));
+            }
+            join.into_iter()
+                .map(|j| j.join().expect("consumer thread"))
+                .collect::<Vec<_>>()
+        });
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for output in outputs {
+            for line in output.lines().filter(|line| !line.is_empty()) {
+                *counts.entry(line.to_string()).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(
+            counts.len(),
+            total,
+            "every handoff was delivered: {counts:?}"
+        );
+        for i in 0..total {
+            let key = format!("[[SECTION-{i:03}]]");
+            assert_eq!(
+                counts.get(&key),
+                Some(&1),
+                "handoff {key} must be delivered exactly once: {counts:?}"
+            );
+        }
+        // Every claimed section is durably acked; a later turn sees nothing.
+        for i in 0..total {
+            let value = handle
+                .memory_fact_get(
+                    PENDING_INTERNAL_CONTEXT_KIND,
+                    &format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{i:03}"),
+                )
+                .unwrap();
+            assert_eq!(value.as_deref(), Some(""), "row {i} is acked");
+        }
+        assert!(take_pending_internal_context(&handle).is_empty());
+    }
+
+    /// New-angle handoff probe: a consumer that observed a section which was
+    /// superseded before its claim must not render the stale value (the
+    /// newer child state belongs to the next turn).
+    #[test]
+    fn fault_probe_superseded_handoff_is_never_rendered_stale() {
+        let (_dir, handle) = parent_session();
+        let key = format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}child-7");
+        handle
+            .upsert_memory_fact(PENDING_INTERNAL_CONTEXT_KIND, &key, "OLD")
+            .unwrap();
+        // Simulate another turn claiming/re-recording between page read and
+        // claim: the helper compares the CURRENT row to the observed value.
+        handle
+            .upsert_memory_fact(PENDING_INTERNAL_CONTEXT_KIND, &key, "NEW")
+            .unwrap();
+        assert_eq!(
+            claim_pending_internal_context(&handle, &key, "OLD"),
+            None,
+            "a superseded observation is never rendered"
+        );
+        assert_eq!(
+            claim_pending_internal_context(&handle, &key, "NEW").as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(claim_pending_internal_context(&handle, &key, "NEW"), None);
+    }
 }

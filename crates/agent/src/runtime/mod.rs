@@ -196,3 +196,7 @@ mod longtask_probes;
 #[cfg(test)]
 #[path = "longtask_e2e_probes.rs"]
 mod longtask_e2e_probes;
+
+#[cfg(test)]
+#[path = "extreme_scale_probes.rs"]
+mod extreme_scale_probes;

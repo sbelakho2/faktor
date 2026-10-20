@@ -10,6 +10,9 @@ description = "Durable plan model, child control plane, and economic parallelism
 # Deterministic execution crash seams (CrashSeam / PrOperationCrashPoint).
 # OFF in production builds: the seams and their checks are cfg-compiled out.
 fault-injection = []
+# Test-only construction seams (owner-direct executor). Enabled by test/dev
+# dependencies, never by a production build.
+test-utils = []
 
 [dependencies]
 faktor-core.workspace = true

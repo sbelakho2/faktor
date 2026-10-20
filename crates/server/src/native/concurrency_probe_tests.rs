@@ -321,3 +321,213 @@ async fn sixty_four_sessions_thirty_two_streams_and_sixteen_readers_stay_bounded
     );
     handle.request_shutdown();
 }
+
+/// Bounded probe (no soak) at the stated target shape: 128 durable sessions,
+/// 200 child sessions, 64 live SSE streams, 32 parallel read workers. Same
+/// relative ceiling policy as the standing probe, but this one is NOT in the
+/// standing run (it seeds 5x the rows). Run with:
+/// `cargo test -p faktor-server --release native::concurrency_probe_tests::target_shape... -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "[perf] 128 sessions / 200 children / 64 SSE / 32 readers"]
+async fn target_shape_128sessions_200children_64streams_32readers() {
+    const SESSIONS: usize = 128;
+    const STREAMS: usize = 64;
+    const READ_WORKERS: usize = 32;
+    const REQUESTS_PER_WORKER: usize = 8;
+    const CHILDREN: usize = 200;
+    const DELTAS: usize = 10;
+
+    let dir = tempfile::tempdir().unwrap();
+    let deps = test_deps(dir.path());
+    let token = deps.auth_token.as_str().to_string();
+    let manager = deps.session.clone();
+    let store_root = manager.store().root().to_path_buf();
+    let workspace = manager.create_workspace("/w").unwrap();
+    let mut cursors: Vec<(u64, u64)> = Vec::with_capacity(SESSIONS);
+    let mut root = None;
+    for index in 0..SESSIONS {
+        let handle = manager
+            .create_session(workspace, &format!("probe-{index}"), "fake", "m")
+            .unwrap();
+        if index == 0 {
+            root = Some(handle.id());
+        }
+        for _ in 0..4 {
+            handle
+                .force_append_event(EventKind::ModelChunkReceived, AgentState::Idle, None, None)
+                .unwrap();
+        }
+        for seq in 1..=3i64 {
+            let message = handle
+                .put_message(seq, "user", serde_json::json!({"text": "turn"}))
+                .unwrap();
+            handle
+                .put_part(message, PartKind::Text, serde_json::json!({"text": "a"}))
+                .unwrap();
+        }
+        let after = handle.last_event_seq().unwrap().unwrap().raw();
+        cursors.push((handle.id().raw(), after));
+    }
+    // 200 durable children under the root session (child identity rows).
+    let root = root.expect("root session");
+    for child in 0..CHILDREN {
+        manager
+            .create_child_session(
+                root,
+                workspace,
+                faktor_core::id::WorktreeId::new(1_000 + child as u64),
+                faktor_core::id::TaskId::new(1),
+                "fake",
+                "m",
+                &format!("child-{child}"),
+                faktor_session::child::ChildOwnership::IsolatedWorktree,
+            )
+            .unwrap();
+    }
+    let handle = serve(deps, 0).await.unwrap();
+    let base = format!("http://{}", handle.addr);
+    let client = reqwest::Client::new();
+    let rss_before = rss_kib();
+
+    let baseline = {
+        let started = Instant::now();
+        let response = client
+            .get(format!(
+                "{base}/native/messages?session={}&limit=50",
+                cursors[0].0
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _: serde_json::Value = response.json().await.unwrap();
+        started.elapsed()
+    };
+
+    let ready = Arc::new(tokio::sync::Barrier::new(STREAMS + 1));
+    let mut streams = tokio::task::JoinSet::new();
+    for (session, after) in cursors.iter().copied().take(STREAMS) {
+        streams.spawn(read_stream(
+            client.clone(),
+            base.clone(),
+            token.clone(),
+            session,
+            after,
+            DELTAS,
+            Arc::clone(&ready),
+        ));
+    }
+    let mut workers = tokio::task::JoinSet::new();
+    for worker in 0..READ_WORKERS {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        let cursors = cursors.clone();
+        workers.spawn(async move {
+            let mut samples = Vec::with_capacity(REQUESTS_PER_WORKER);
+            for request in 0..REQUESTS_PER_WORKER {
+                let (session, _) = cursors[(worker * 11 + request) % cursors.len()];
+                let path = match request % 4 {
+                    0 => format!("{base}/native/events?session={session}&limit=20"),
+                    1 => format!("{base}/native/messages?session={session}&limit=50"),
+                    2 => format!("{base}/native/providers"),
+                    _ => format!("{base}/native/sessions"),
+                };
+                let started = Instant::now();
+                let response = client
+                    .get(path)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .expect("read request");
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let _: serde_json::Value = response.json().await.expect("json body");
+                samples.push(started.elapsed());
+            }
+            samples
+        });
+    }
+    ready.wait().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for (session, _) in cursors.iter().take(STREAMS) {
+        let handle = manager
+            .get_session(faktor_core::id::SessionId::new(*session))
+            .unwrap()
+            .unwrap();
+        for _ in 0..DELTAS {
+            handle
+                .force_append_event(EventKind::ModelChunkReceived, AgentState::Idle, None, None)
+                .unwrap();
+        }
+    }
+    let mut stream_ids = Vec::with_capacity(STREAMS);
+    let mut lags = Vec::with_capacity(STREAMS * DELTAS);
+    while let Some(result) = streams.join_next().await {
+        let (ids, lag) = result.unwrap();
+        stream_ids.push(ids);
+        lags.extend(lag);
+    }
+    let mut load = Vec::with_capacity(READ_WORKERS * REQUESTS_PER_WORKER);
+    while let Some(result) = workers.join_next().await {
+        load.extend(result.unwrap());
+    }
+    for ids in &stream_ids {
+        assert_eq!(ids.len(), DELTAS, "stream lost/duplicated frames: {ids:?}");
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "reordered: {ids:?}"
+        );
+    }
+    lags.sort_unstable();
+    let lag_p95 = lags
+        .get(((lags.len() as f64 - 1.0) * 0.95).round() as usize)
+        .copied()
+        .unwrap_or(0);
+    let p50 = percentile(&load, 0.50);
+    let p95 = percentile(&load, 0.95);
+    let p99 = percentile(&load, 0.99);
+    let rss_after = rss_kib();
+    let wal_bytes = std::fs::metadata(store_root.join("faktor-plus.db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let writer = manager.store().writer_telemetry();
+    println!(
+        "[perf] {SESSIONS} sessions / {CHILDREN} children / {STREAMS} SSE / {READ_WORKERS} readers: \
+         baseline={baseline:?} p50={p50:?} p95={p95:?} p99={p99:?}; lag p95={lag_p95}ms; \
+         rss {rss_before}->{rss_after} KiB; wal {} KiB; writer pending_max={} \
+         queue_full_refusals={} queue_wait_max_ns={} slow_tx={}",
+        wal_bytes / 1024,
+        writer.pending_max,
+        writer.queue_full_refusals,
+        writer.queue_wait_max_ns,
+        writer.slow_transactions
+    );
+    assert!(
+        writer.available,
+        "writer unavailable: {:?}",
+        writer.unavailable_reason
+    );
+    assert_eq!(
+        writer.queue_full_refusals, 0,
+        "the bounded writer queue refused a mutation under the target burst"
+    );
+    assert!(
+        writer.pending_max <= faktor_store::DEFAULT_WRITER_QUEUE_DEPTH,
+        "writer pending depth {} exceeds the hard bound",
+        writer.pending_max
+    );
+    assert!(lag_p95 < 2_000, "SSE lag p95 {lag_p95}ms");
+    let ceiling = baseline
+        .saturating_mul(40)
+        .max(Duration::from_millis(1_500));
+    assert!(p95 <= ceiling, "load p95 {p95:?} exceeds {ceiling:?}");
+    assert!(p99 <= ceiling.saturating_mul(2), "load p99 {p99:?}");
+    assert!(
+        rss_after.saturating_sub(rss_before) < 256 * 1024,
+        "RSS delta {} KiB",
+        rss_after.saturating_sub(rss_before)
+    );
+    assert!(wal_bytes < 64 * 1024 * 1024, "WAL {wal_bytes} bytes");
+    handle.request_shutdown();
+}

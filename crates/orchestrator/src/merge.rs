@@ -379,29 +379,45 @@ const MAX_HANDOFF_FACT_CHARS: usize = 160;
 
 // ------------------------------------------------------------------ rows
 
-/// All facts of a session via a bounded page walk; a scan that cannot end
-/// within MAX_FACT_PAGES refuses loudly (never a silently partial read).
-pub(crate) fn scan_facts(
+/// Hard cap of the rows one `kind + key prefix` read may materialize. A
+/// chunked row is bounded by the same total-fact budget the historical
+/// full-table scan used (MAX_FACT_PAGES * 200), so no legal row that was
+/// readable before is refused now; the difference is that unrelated kinds
+/// can no longer consume the budget.
+pub(crate) const MAX_PREFIX_ROWS: usize = MAX_FACT_PAGES * 200;
+
+/// Every fact of ONE kind whose key is `prefix` or inside `prefix/…`,
+/// ordered by key (the chunk namespace `put_chunks` writes: `prefix`,
+/// `prefix/c001`, …). Rides the `(session_id, kind, key)` index, so the
+/// read is O(rows of THIS row) instead of O(every fact of the session) —
+/// the old full-table scan made reading C children's base maps over F
+/// facts O(C·F) (quadratic in practice under fan-out). Exceeding the bound
+/// refuses loudly, never a silently partial merge read.
+pub(crate) fn scan_facts_of_kind_prefix(
     handle: &faktor_session::SessionHandle,
+    kind: &str,
+    prefix: &str,
 ) -> Result<Vec<(String, String, String)>, ExecError> {
-    let mut out = Vec::new();
-    let mut after: Option<(i64, String, String)> = None;
-    let mut pages = 0usize;
+    const PAGE: u64 = 512;
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut after: Option<String> = None;
     loop {
-        let page = handle
-            .memory_facts_page(after.as_ref(), 200)
-            .map_err(|e| ExecError::Internal(format!("fact page scan: {}", e.message)))?;
-        pages += 1;
-        out.extend(page.facts);
-        match page.cursor {
-            Some(c) => after = Some(c),
-            None => return Ok(out),
+        let (page, has_more) = handle
+            .memory_facts_by_kind_key_prefix(kind, prefix, after.as_deref(), PAGE)
+            .map_err(|e| ExecError::Internal(format!("fact prefix scan: {}", e.message)))?;
+        if page.is_empty() {
+            return Ok(out);
         }
-        if pages >= MAX_FACT_PAGES {
+        after = page.last().map(|(_, key, _)| key.clone());
+        out.extend(page);
+        if out.len() > MAX_PREFIX_ROWS {
             return Err(ExecError::Oversized(format!(
-                "memory-fact scan of session {} exceeded {MAX_FACT_PAGES} pages; refusing a partial merge read",
+                "memory-fact prefix scan of session {} exceeded {MAX_PREFIX_ROWS} rows; refusing a partial merge read",
                 handle.id()
             )));
+        }
+        if !has_more {
+            return Ok(out);
         }
     }
 }
@@ -451,10 +467,7 @@ pub(crate) fn read_chunks(
 ) -> Result<Option<(serde_json::Value, Vec<String>)>, ExecError> {
     let mut header: Option<serde_json::Value> = None;
     let mut chunks: Vec<(usize, String)> = Vec::new();
-    for (k, kk, v) in scan_facts(handle)? {
-        if k != kind {
-            continue;
-        }
+    for (_k, kk, v) in scan_facts_of_kind_prefix(handle, kind, key)? {
         if kk == key {
             header = Some(serde_json::from_str(&v).map_err(|e| {
                 ExecError::Internal(format!("row header decode {kind}/{key}: {e}"))
@@ -668,7 +681,7 @@ pub(crate) fn read_base_state_map(
                         return Err(ExecError::Internal(format!(
                             "base row of {child_id} has an unsupported shape ({} fields)",
                             row.len()
-                        )))
+                        )));
                     }
                 };
                 (path, state)
@@ -774,25 +787,44 @@ pub(crate) fn read_change_set_versioned(
         return Ok(cs);
     }
     let prefix = format!("{run}/{child_id}/cs/");
-    for (kind, key, value) in scan_facts(&handle)? {
-        if kind != KIND_CS {
-            continue;
-        }
-        let Some(rest) = key.strip_prefix(&prefix) else {
+    // The legacy `{base_id}-cs` alias is stable across restages, so SEVERAL
+    // rows can match. The historical full-fact scan was newest-first; a
+    // key-ascending prefix scan would instead return the OLDEST matching
+    // row and make `present_change_set` read a stale candidate (partial
+    // hunk acceptance then applied the pre-composition bytes). Keep the
+    // newest-first contract using the store's monotonic fact stamp.
+    let (rows, has_more) = manager
+        .store()
+        .memory_facts_by_kind_key_prefix(parent, KIND_CS, &prefix, None, MAX_PREFIX_ROWS as u64)
+        .map_err(|e| ExecError::Internal(format!("change-set prefix scan: {e}")))?;
+    if has_more {
+        return Err(ExecError::Oversized(format!(
+            "change-set prefix scan of session {parent} exceeded {MAX_PREFIX_ROWS} rows; refusing a partial read"
+        )));
+    }
+    let mut newest: Option<(i64, String)> = None;
+    for row in rows {
+        let Some(rest) = row.key.strip_prefix(&prefix) else {
             continue;
         };
         if rest.contains('/') {
             continue;
         }
-        let header: serde_json::Value = serde_json::from_str(&value)
-            .map_err(|e| ExecError::Internal(format!("change-set header decode {key}: {e}")))?;
+        let header: serde_json::Value = serde_json::from_str(&row.value).map_err(|e| {
+            ExecError::Internal(format!("change-set header decode {}: {e}", row.key))
+        })?;
         let stored_id = header.get("cs_id").and_then(|c| c.as_str()).unwrap_or("");
         let base_id = header.get("base_id").and_then(|c| c.as_str()).unwrap_or("");
         if stored_id == cs_id || format!("{base_id}-cs") == cs_id {
-            return read_change_set_at(&handle, child_id, &key)?.ok_or_else(|| {
-                ExecError::NotFound(format!("change set {cs_id} of child {child_id}"))
-            });
+            let rank = (row.updated_ms, row.key);
+            if newest.as_ref().is_none_or(|best| rank > *best) {
+                newest = Some(rank);
+            }
         }
+    }
+    if let Some((_, key)) = newest {
+        return read_change_set_at(&handle, child_id, &key)?
+            .ok_or_else(|| ExecError::NotFound(format!("change set {cs_id} of child {child_id}")));
     }
     Err(ExecError::NotFound(format!(
         "change set {cs_id} of child {child_id}"
@@ -1150,10 +1182,7 @@ pub(crate) fn merge_envelopes(
     let handle = parent_handle(manager, parent)?;
     let prefix = format!("{run}/{child_id}/merge/");
     let mut envs: Vec<(u64, MergeEnvelope)> = Vec::new();
-    for (kind, key, value) in scan_facts(&handle)? {
-        if kind != KIND_MERGE {
-            continue;
-        }
+    for (_kind, key, value) in scan_facts_of_kind_prefix(&handle, KIND_MERGE, &prefix)? {
         let Some(rest) = key.strip_prefix(&prefix) else {
             continue;
         };
@@ -1380,7 +1409,7 @@ pub(crate) fn read_literal_payload(
                 "{} is absent although the staged state is {}",
                 path.display(),
                 state.describe()
-            )))
+            )));
         }
         EntryState::Symlink { target, .. } => target.clone(),
         EntryState::Regular { .. } => {
@@ -1738,10 +1767,16 @@ impl OrchestratorRuntime {
         }
         let mut found: Vec<(SessionId, String, ChildRuntime)> = Vec::new();
         for handle in self.manager.list_sessions(None)? {
-            for (kind, key, value) in scan_facts(&handle)? {
-                if kind != REGISTRY_ROW_KIND {
-                    continue;
-                }
+            let (rows, has_more) = handle
+                .memory_facts_of_kinds(&[REGISTRY_ROW_KIND], MAX_PREFIX_ROWS as u64)
+                .map_err(|e| ExecError::Internal(format!("registry fact scan: {}", e.message)))?;
+            if has_more {
+                return Err(ExecError::Oversized(format!(
+                    "registry fact scan of session {} exceeded {MAX_PREFIX_ROWS} rows; refusing a partial lookup",
+                    handle.id()
+                )));
+            }
+            for (_kind, key, value) in rows {
                 let Some((run, id)) = key.rsplit_once('/') else {
                     continue;
                 };
@@ -1925,6 +1960,26 @@ impl OrchestratorRuntime {
             .filter_map(|c| c.outcome.clone())
             .next_back()
             .unwrap_or_default();
+        // The legacy ledger child fold above is written only by the legacy
+        // subagent surface; an ORCHESTRATED child records its terminal truth
+        // in the typed child-runtime row (`done`/`failed`/`cancelled`).
+        // Leaving the outcome blank there made every parent handoff claim no
+        // outcome at all — the child's result was silently unavailable. A
+        // corrupt projection row fails the WHOLE handoff typed (availability
+        // law), never a fabricated blank.
+        if handoff.outcome.is_empty() {
+            match handle.orchestrator_child_runtime_get() {
+                Ok(Some(row)) if matches!(row.state.as_str(), "done" | "failed" | "cancelled") => {
+                    handoff.outcome = row.state;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(ExecError::Internal(format!(
+                        "child handoff {child_id} terminal outcome read failed ({e}); refusing a blank outcome"
+                    )));
+                }
+            }
+        }
         // Decisions ride the SAME authoritative head read: a head that
         // cannot be read fails the whole handoff typed above, so this
         // component is Available by construction (never silently empty).
@@ -1971,8 +2026,8 @@ impl OrchestratorRuntime {
                                     Some(text) => out.push(text.to_string()),
                                     None => {
                                         return HandoffData::unavailable(format!(
-                                        "legacy task ledger field {key:?} holds a non-string entry"
-                                    ))
+                                            "legacy task ledger field {key:?} holds a non-string entry"
+                                        ));
                                     }
                                 }
                             }
@@ -2194,7 +2249,7 @@ impl OrchestratorRuntime {
                         return Err(ExecError::Internal(format!(
                             "staged deletion {:?} has no base anchor",
                             entry.path
-                        )))
+                        )));
                     }
                 },
             };

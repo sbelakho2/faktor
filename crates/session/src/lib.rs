@@ -372,3 +372,7 @@ pub(crate) fn json_bytes(v: &serde_json::Value) -> usize {
 #[cfg(test)]
 #[path = "hostile_corpus_tests.rs"]
 mod hostile_corpus_tests;
+
+#[cfg(test)]
+#[path = "extreme_scale_probes.rs"]
+mod extreme_scale_probes;

@@ -72,7 +72,7 @@ faktor-session = { path = "../session", features = ["test-utils"] }
 faktor-provider = { workspace = true, features = ["test-utils"] }
 # Router tests drive the deterministic crash seams: the orchestrator's
 # execution seam vocabulary and the store's crash-arm boundaries.
-faktor-orchestrator = { workspace = true, features = ["fault-injection"] }
+faktor-orchestrator = { workspace = true, features = ["fault-injection", "test-utils"] }
 faktor-store = { workspace = true, features = ["fault-injection"] }
 # The updater route tests sign manifests with a real ed25519 key and
 # implement the async artifact-fetcher seam.

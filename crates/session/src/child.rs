@@ -47,7 +47,8 @@ use crate::handle::SessionHandle;
 use crate::ledger::LedgerPayload;
 use crate::SessionError;
 
-/// Hard cap on the durable control queue per child (bounded everything).
+/// Hard cap on the UNAPPLIED control queue per child (bounded everything).
+/// Acknowledged rows are compacted history, never pending capacity.
 pub const MAX_CHILD_CONTROL_ROWS: usize = 128;
 /// Hard cap on the durable control note payload (chars), matching the
 /// orchestrator's steering-note bound.
@@ -655,8 +656,16 @@ impl SessionHandle {
     }
 
     /// Enqueue one durable control message. Bounded: at most
-    /// [`MAX_CHILD_CONTROL_ROWS`] rows exist per child; the queue is capped
-    /// (the executor is responsible for acking consumed rows).
+    /// [`MAX_CHILD_CONTROL_ROWS`] UNAPPLIED rows exist per child (the
+    /// executor is responsible for acking consumed rows). Acknowledged rows
+    /// are history, not capacity: the oldest applied rows are compacted once
+    /// the retained set exceeds the cap, so a child that consumed its queue
+    /// can always be steered again while the durable row count stays bounded.
+    ///
+    /// The read (pending count, seq head) and the write are ONE command-lock
+    /// critical section: two concurrent enqueues that observed the same head
+    /// used to allocate the same `seq-N` key and the later upsert silently
+    /// overwrote the earlier steering note.
     pub fn orchestrator_ctl_enqueue(
         &self,
         control: ChildControl,
@@ -678,12 +687,13 @@ impl SessionHandle {
             }
             _ => {}
         }
+        let _guard = self.command_guard();
         let existing = self.orchestrator_ctl_all()?;
-        if existing.len() >= MAX_CHILD_CONTROL_ROWS {
+        let pending = existing.iter().filter(|r| !r.applied()).count();
+        if pending >= MAX_CHILD_CONTROL_ROWS {
             return Err(SessionError::Conflict(format!(
-                "child control queue of session {} holds {} rows (cap {MAX_CHILD_CONTROL_ROWS}); ack before enqueueing more",
-                self.id(),
-                existing.len()
+                "child control queue of session {} holds {pending} unapplied rows (cap {MAX_CHILD_CONTROL_ROWS}); ack before enqueueing more",
+                self.id()
             ))
             .into());
         }
@@ -700,6 +710,18 @@ impl SessionHandle {
         let value = serde_json::to_string(&row)
             .map_err(|e| SessionError::Internal(format!("control row serialization: {e}")))?;
         self.upsert_memory_fact(ROW_KIND_CONTROL, &ctl_key(seq), &value)?;
+        // Compaction is on the ACKED tail only and happens after the new row
+        // lands. The newest row is always retained, so seq stays monotonic
+        // across compaction; a stale ack of a compacted seq is NotFound (it
+        // can never hit a newer control).
+        let retained = existing.len() + 1;
+        if retained > MAX_CHILD_CONTROL_ROWS {
+            let excess = retained - MAX_CHILD_CONTROL_ROWS;
+            for old in existing.iter().filter(|r| r.applied()).take(excess) {
+                let _deleted =
+                    self.delete_memory_fact_cas(ROW_KIND_CONTROL, &ctl_key(old.seq), None)?;
+            }
+        }
         Ok(row)
     }
 
@@ -707,6 +729,7 @@ impl SessionHandle {
     /// sticks — a re-ack after a crash never rewrites the timestamp, so a
     /// restart mid-queue applies each message exactly once.
     pub fn orchestrator_ctl_ack(&self, seq: u64) -> faktor_core::Result<()> {
+        let _guard = self.command_guard();
         let rows = self.orchestrator_ctl_all()?;
         let Some(mut row) = rows.into_iter().find(|r| r.seq == seq) else {
             return Err(SessionError::NotFound(format!(
@@ -1390,5 +1413,211 @@ mod tests {
                 .is_err());
         }
         assert!(s.child_presentation("").is_err());
+    }
+
+    /// New-angle comms probe: concurrent steers on ONE child used to be a
+    /// read-all + max-seq + unconditional upsert with no serialization. Two
+    /// enqueues that observed the same head both wrote `seq-N+1`; the second
+    /// silently overwrote the first, so the child never saw one guidance
+    /// note (and its ack targeted a row that no longer held that note).
+    #[test]
+    fn fault_probe_concurrent_control_enqueue_never_loses_a_steer() {
+        use std::sync::{Arc, Barrier};
+        let (_d, _m, s) = fixture();
+        let threads = 8usize;
+        let per_thread = 16usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut join = Vec::new();
+        for t in 0..threads {
+            let s = s.clone();
+            let barrier = barrier.clone();
+            join.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..per_thread {
+                    s.orchestrator_ctl_enqueue(ChildControl::Steer {
+                        note: format!("t{t}-i{i}"),
+                    })
+                    .expect("a steer inside the pending cap is accepted");
+                }
+            }));
+        }
+        for j in join {
+            j.join().expect("enqueue thread");
+        }
+        let rows = s.orchestrator_ctl_all().unwrap();
+        assert_eq!(
+            rows.len(),
+            threads * per_thread,
+            "every concurrent steer must own a durable row (lost update)"
+        );
+        let mut seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), rows.len(), "control seqs must be unique");
+        let mut notes: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match &r.control {
+                ChildControl::Steer { note } => Some(note.clone()),
+                _ => None,
+            })
+            .collect();
+        notes.sort();
+        notes.dedup();
+        assert_eq!(notes.len(), rows.len(), "a steered note was overwritten");
+        // The queue is applied in seq order: pending is sorted ascending.
+        let pending = s.orchestrator_ctl_pending().unwrap();
+        assert!(pending.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    /// New-angle comms probe: applied rows are history, not pending capacity.
+    /// The cap counted acked rows forever, so a child that consumed 128
+    /// controls could NEVER be steered again (permanent starvation).
+    #[test]
+    fn fault_probe_acknowledged_history_never_starves_new_controls() {
+        let (_d, _m, s) = fixture();
+        for _ in 0..MAX_CHILD_CONTROL_ROWS {
+            let row = s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap();
+            s.orchestrator_ctl_ack(row.seq).unwrap();
+        }
+        assert!(
+            s.orchestrator_ctl_pending().unwrap().is_empty(),
+            "the applied queue is empty"
+        );
+        let row = s
+            .orchestrator_ctl_enqueue(ChildControl::Steer {
+                note: "still steerable after history".into(),
+            })
+            .expect("acked history must not consume pending capacity");
+        assert_eq!(s.orchestrator_ctl_pending().unwrap().len(), 1);
+        s.orchestrator_ctl_ack(row.seq).unwrap();
+        // Sequence identity is never reused after history compaction: an
+        // in-flight ack of an old seq can never hit a newer control.
+        let next = s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap();
+        assert!(
+            next.seq > row.seq,
+            "seq must stay monotonic across history compaction ({} <= {})",
+            next.seq,
+            row.seq
+        );
+        assert!(s.orchestrator_ctl_all().unwrap().len() <= MAX_CHILD_CONTROL_ROWS);
+    }
+
+    /// New-angle comms probe: retries/restarts must not duplicate or reorder
+    /// the durable steering queue. Re-enqueueing the same logical control is
+    /// a SEPARATE row (at-least-once caller intent), while replaying acks is
+    /// idempotent and the applied history never moves an older row behind a
+    /// newer one (pending order is by seq, not by write/ack timestamps).
+    #[test]
+    fn fault_probe_reopen_ack_replay_keeps_seq_order_and_single_ack() {
+        let dir = tempdir().unwrap();
+        let (sid, first, second) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/root").unwrap();
+            let s = m.create_session(ws, "child", "fake", "m").unwrap();
+            let first = s
+                .orchestrator_ctl_enqueue(ChildControl::Steer { note: "a".into() })
+                .unwrap();
+            let second = s
+                .orchestrator_ctl_enqueue(ChildControl::Steer { note: "b".into() })
+                .unwrap();
+            // Ack the NEWER row first: applied history must not reorder the
+            // queued older row (pending is sorted by seq).
+            s.orchestrator_ctl_ack(second.seq).unwrap();
+            let applied = s.orchestrator_ctl_all().unwrap();
+            assert_eq!(applied[0].seq, first.seq);
+            assert!(applied[0].applied_ms.is_none());
+            let stamp = applied[1].applied_ms;
+            // Replay the same ack: the FIRST timestamp sticks.
+            s.orchestrator_ctl_ack(second.seq).unwrap();
+            assert_eq!(
+                s.orchestrator_ctl_all().unwrap()[1].applied_ms,
+                stamp,
+                "a replayed ack must never rewrite the applied stamp"
+            );
+            (s.id(), first, second)
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = m.get_session(sid).unwrap().unwrap();
+        let pending = s.orchestrator_ctl_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, first.seq, "seq order survives restart");
+        s.orchestrator_ctl_ack(first.seq).unwrap();
+        assert!(s.orchestrator_ctl_pending().unwrap().is_empty());
+        assert_eq!(
+            s.orchestrator_ctl_all().unwrap().len(),
+            2,
+            "restart/replay duplicates no control row"
+        );
+        assert!(second.seq > first.seq);
+    }
+
+    /// Measured fan-out probe (manual): 200 children × 50 steering controls
+    /// = 10,000 messages. Reports enqueue/pending-scan p50/p95 and the
+    /// bounded queue depth; asserts the per-child cap holds under
+    /// concurrency.
+    #[test]
+    #[ignore = "[fault] 200 children x 10k steering messages; run with --ignored --nocapture"]
+    fn fault_probe_200_children_10k_steering_messages() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+        let (_d, m, _s) = fixture();
+        let ws = m.create_workspace("/root").unwrap();
+        let children: Vec<SessionHandle> = (0..200)
+            .map(|i| {
+                m.create_session(ws, &format!("child-{i}"), "fake", "m")
+                    .unwrap()
+            })
+            .collect();
+        let barrier = Arc::new(Barrier::new(children.len()));
+        let mut join = Vec::new();
+        for (i, child) in children.into_iter().enumerate() {
+            let barrier = barrier.clone();
+            join.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut samples = Vec::with_capacity(50);
+                for j in 0..50 {
+                    let started = Instant::now();
+                    child
+                        .orchestrator_ctl_enqueue(ChildControl::Steer {
+                            note: format!("child-{i}-msg-{j}"),
+                        })
+                        .expect("50 controls are under the per-child cap");
+                    samples.push(started.elapsed());
+                }
+                let started = Instant::now();
+                let pending = child.orchestrator_ctl_pending().unwrap();
+                (samples, started.elapsed(), pending.len(), child)
+            }));
+        }
+        let mut all = Vec::with_capacity(10_000);
+        let mut scans = Vec::with_capacity(200);
+        let mut max_depth = 0usize;
+        let mut sessions = Vec::new();
+        for j in join {
+            let (samples, scan, depth, child) = j.join().expect("child probe");
+            all.extend(samples);
+            scans.push(scan);
+            max_depth = max_depth.max(depth);
+            sessions.push(child);
+        }
+        let pct = |mut v: Vec<std::time::Duration>, p: f64| -> u128 {
+            v.sort_unstable();
+            let idx = (((v.len() - 1) as f64) * p).round() as usize;
+            v[idx].as_micros()
+        };
+        println!(
+            "[perf] children=200 messages=10000 enqueue p50={}us p95={}us pending_scan p95={}us max_queue={} total_rows={}",
+            pct(all.clone(), 0.50),
+            pct(all, 0.95),
+            pct(scans, 0.95),
+            max_depth,
+            sessions
+                .iter()
+                .map(|s| s.orchestrator_ctl_all().unwrap().len())
+                .sum::<usize>()
+        );
+        assert_eq!(max_depth, 50, "the pending depth is exact");
     }
 }

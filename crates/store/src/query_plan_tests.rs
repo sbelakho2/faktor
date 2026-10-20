@@ -355,6 +355,17 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
             ],
         ),
         (
+            "memory chunk key-prefix page",
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1 AND kind = ?2
+               AND key >= ?3
+               AND (?4 IS NULL OR key < ?4)
+               AND key > ?5
+             ORDER BY key ASC LIMIT ?6",
+            &[1, 1, 1, 1, 1, 10],
+            &["SEARCH memory_fact USING INDEX sqlite_autoindex_memory_fact_1 (session_id=? AND kind=? AND key>?)"],
+        ),
+        (
             "memory V2 page",
             "SELECT kind, key, value, updated_ms FROM memory_fact
              INDEXED BY idx_memory_fact_v2_page
@@ -495,6 +506,22 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
             "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
             &[],
             &["SEARCH memory_fact USING COVERING INDEX idx_memory_fact_updated"],
+        ),
+        (
+            "long-task session fact page",
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1
+             ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?2",
+            &[1, 201],
+            &["SEARCH memory_fact USING INDEX idx_memory_fact_session_updated (session_id=?)"],
+        ),
+        (
+            "long-task kind fact page",
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1 AND kind = ?2
+             ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?3",
+            &[1, 0, 201],
+            &["SEARCH memory_fact USING INDEX idx_memory_fact_kind_updated (session_id=? AND kind=?)"],
         ),
         (
             "legacy import session scan",

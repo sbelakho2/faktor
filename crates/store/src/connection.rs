@@ -22,6 +22,19 @@ pub(crate) const MAX_ORCHESTRATOR_FACT_SCAN_ROWS: i64 = 250_000;
 /// waits behave consistently.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// On-disk WAL high-water bound (mirrors `PRAGMA journal_size_limit` in
+/// [`configure`]). A PASSIVE checkpoint folds frames but never shrinks the
+/// file; once the sidecar exceeds this bound the idle maintenance tick runs
+/// a NON-BLOCKING truncate checkpoint.
+pub const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+fn is_locked_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 /// A counting semaphore on stable std (there is no `std::sync::Semaphore` on
 /// stable Rust as of 1.98): `acquire_timeout` blocks on a condvar until a
 /// permit frees or the deadline passes. Readers hold a `Permit` for the
@@ -703,12 +716,20 @@ pub(crate) fn configure(conn: &Connection) -> StoreResult<()> {
     // scheduled explicitly instead: the session `DbActor` runs a PASSIVE
     // checkpoint from its idle flush tick via [`Store::wal_checkpoint_passive`],
     // outside every measured interactive segment.
+    //
+    // `journal_size_limit` bounds the WAL FILE's on-disk high-water mark:
+    // without it a long burst (100k durable rows) left a multi-gigabyte
+    // `-wal` sidecar even after every frame was folded (PASSIVE does not
+    // shrink the file). SQLite truncates back to this limit after a
+    // checkpoint whenever no reader pins an older frame; a pinned reader
+    // simply defers the truncation, never corrupts or drops frames.
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;
-         PRAGMA wal_autocheckpoint = 0;",
+         PRAGMA wal_autocheckpoint = 0;
+         PRAGMA journal_size_limit = 67108864;",
     )?;
     Ok(())
 }
@@ -837,6 +858,30 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Newest durable fact stamp across BOTH scoped fact tables. `memory_fact`
+/// and `workspace_memory_fact` share the monotone-stamp contract (a new row
+/// must sort strictly newer than every existing row), so a restart seeds the
+/// in-memory sequence above the maximum of both — seeding from the session
+/// table alone let a backward wall clock re-enter an existing workspace
+/// row's order position after a restart.
+fn durable_max_fact_stamp(conn: &Connection) -> i64 {
+    let session: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let workspace: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(updated_ms), 0) FROM workspace_memory_fact",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    session.max(workspace)
 }
 
 /// Mint the boot-instance identity of one store open (audit P1). Opaque,
@@ -1982,13 +2027,7 @@ impl Store {
                 return Err(StoreError::Corrupt(issues));
             }
         }
-        let max_ms: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        let max_ms = durable_max_fact_stamp(&conn);
         let writer = WriterService::spawn_with_limits(conn, queue_capacity, enqueue_timeout)?;
         Ok(Self::finish_open_with_writer(
             root,
@@ -2002,13 +2041,9 @@ impl Store {
         // crashed in the same millisecond as a write must not let the next
         // stamp tie an existing row) and above the wall clock (a machine
         // clock stepped backwards must not re-enter old order positions).
-        let max_ms: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // BOTH fact tables participate: workspace-scoped rows carry the same
+        // monotone stamp contract and are paged by it after a restart.
+        let max_ms = durable_max_fact_stamp(&conn);
         Ok(Self::finish_open_with_writer(
             root,
             WriterService::spawn(conn)?,
@@ -2492,6 +2527,43 @@ impl Store {
         self.writer.record_checkpoint(elapsed);
         result?;
         Ok(())
+    }
+
+    /// Bound the WAL FILE after an idle PASSIVE checkpoint folded its frames.
+    ///
+    /// PASSIVE never resets/truncates the WAL, so a long burst leaves the
+    /// on-disk `-wal` sidecar at its high-water mark (the 100k-fact probe
+    /// measured ~2.9 GB even though every frame was folded). When the file
+    /// exceeds [`WAL_TRUNCATE_THRESHOLD_BYTES`] this runs a TRUNCATE
+    /// checkpoint with `busy_timeout = 0`: if any reader pins an older frame
+    /// SQLite returns BUSY immediately and the file is left intact (the next
+    /// idle tick retries). The writer connection's normal 5 s timeout is
+    /// restored on every path, so an interactive batch can never inherit it.
+    ///
+    /// Returns `true` when a truncate attempt ran, `false` when the file is
+    /// below the bound or a reader is currently pinning frames.
+    pub fn wal_checkpoint_truncate_bounded(&self) -> StoreResult<bool> {
+        let wal = self.root.join("faktor-plus.db-wal");
+        let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        if size <= WAL_TRUNCATE_THRESHOLD_BYTES {
+            return Ok(false);
+        }
+        let outcome = self
+            .writer
+            .execute_raw("wal_checkpoint_truncate_bounded", move |conn| {
+                conn.execute_batch("PRAGMA busy_timeout = 0;")?;
+                let result = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                let restore = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+                restore?;
+                result
+            })?;
+        match outcome {
+            Ok(()) => Ok(true),
+            // A reader pinning frames is the documented non-blocking refusal:
+            // nothing was damaged, the file simply stays until the next tick.
+            Err(e) if is_locked_error(&e) => Ok(false),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
     }
 
     pub(crate) fn hot_write_on(

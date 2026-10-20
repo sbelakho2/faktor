@@ -1219,6 +1219,14 @@ impl WorkerPlane {
     ) -> Result<ResultOutcome, WorkerError> {
         check_protocol(protocol_version)?;
         validate_digest(digest)?;
+        // The claim's produced-tree digest is worker-controlled data that is
+        // durably stored and served back on every job status. Validate it at
+        // the boundary (64 hex) for the SAME reason the result digest is:
+        // never persist an unbounded/forged digest blob, and keep the origin
+        // completion gate's shape assumptions true at landing time.
+        if let Some(produced) = &verification.produced_digest {
+            validate_digest(produced)?;
+        }
         let worker = self.authenticate(worker_id, token)?;
         if worker.organization_id != organization.as_str() {
             return Err(WorkerError::UnknownWorker(worker_id.clone()));

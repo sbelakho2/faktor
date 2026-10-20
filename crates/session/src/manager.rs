@@ -158,6 +158,36 @@ pub(crate) struct OpIdLockProbeSnapshot {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, properly aligned `timespec`; the clock id is a
+    // constant valid for thread-CPU accounting on every unix target.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return None;
+    }
+    Some(std::time::Duration::new(
+        ts.tv_sec.max(0) as u64,
+        ts.tv_nsec.max(0) as u32,
+    ))
+}
+
+#[cfg(test)]
+fn cpu_hold_since(
+    start: Option<std::time::Duration>,
+    wall_start: std::time::Instant,
+) -> std::time::Duration {
+    match (start, thread_cpu_now()) {
+        (Some(start), Some(now)) => now.saturating_sub(start),
+        _ => wall_start.elapsed(),
+    }
+}
+
+#[cfg(test)]
 impl OpIdLockProbe {
     fn record_acquire(&self, wait: std::time::Duration) {
         use std::sync::atomic::Ordering;
@@ -848,9 +878,12 @@ impl SessionManager {
         self.op_id_probe.record_acquire(started.elapsed());
         #[cfg(test)]
         let hold_started = std::time::Instant::now();
+        #[cfg(test)]
+        let hold_cpu_started = thread_cpu_now();
         if cache.remaining == 0 {
             #[cfg(test)]
-            self.op_id_probe.record_hold(hold_started.elapsed());
+            self.op_id_probe
+                .record_hold(cpu_hold_since(hold_cpu_started, hold_started));
             return Ok(None);
         }
         let raw = cache.next;
@@ -858,7 +891,8 @@ impl SessionManager {
         cache.next += 1;
         cache.remaining -= 1;
         #[cfg(test)]
-        self.op_id_probe.record_hold(hold_started.elapsed());
+        self.op_id_probe
+            .record_hold(cpu_hold_since(hold_cpu_started, hold_started));
         Ok(Some(id))
     }
 

@@ -312,7 +312,7 @@ impl TaskExecutor {
             other => {
                 return Err(ExecError::Malformed(format!(
                     "unknown remote run kind {other:?}"
-                )))
+                )));
             }
         };
         Ok(RemoteCompletionOutcome::Settled { class, settlement })
@@ -349,7 +349,7 @@ impl TaskExecutor {
                 return Err(ExecError::from(classify_session_read(
                     "verification-attempt facts of the post-run settlement",
                     e,
-                )))
+                )));
             }
         };
         for run_id in runs {
@@ -383,7 +383,7 @@ impl TaskExecutor {
                     return Err(ExecError::from(classify_session_read(
                         "open verification jobs of the post-run settlement",
                         e.into(),
-                    )))
+                    )));
                 }
             };
             if !open.is_empty() {
@@ -468,13 +468,13 @@ impl TaskExecutor {
                         return Err(ExecError::from(DurableStateError::CorruptDurableState {
                             what,
                             detail,
-                        }))
+                        }));
                     }
                     Err(e) => {
                         return Err(ExecError::from(classify_session_read(
                             "completion contract of the in-session settlement",
                             e.into(),
-                        )))
+                        )));
                     }
                 };
                 if has_contract {

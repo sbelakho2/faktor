@@ -6897,6 +6897,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/fs/src/tree_manifest.rs", 3),
         ("crates/git/src/guard.rs", 3),
         ("crates/session/src/actor.rs", 1),
+        // Test-only thread-CPU accounting for the op-id lock probe
+        // (`CLOCK_THREAD_CPUTIME_ID`); one function-level allow with SAFETY.
+        ("crates/session/src/manager.rs", 1),
         // --- test-only locations ---
         ("crates/pty/tests/guardian.rs", 1),
         ("crates/pty/tests/windows_lifecycle.rs", 1),
@@ -8015,14 +8018,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/cli/src/tools_market.rs", 5555),
         ("crates/git/src/lib.rs", 4269),
         ("crates/ollama/src/lib.rs", 4107),
-        ("crates/orchestrator/src/completion_steps.rs", 4631),
         ("crates/orchestrator/src/runtime.rs", 4262),
         ("crates/orchestrator/src/runtime_tests.rs", 5259),
         ("crates/provider/src/egress.rs", 5699),
         ("crates/scheduler/src/lib.rs", 4176),
         // Rev8 History paging added the cursor/listing helpers and tests;
         // split deferred (the ceiling test documents the exact count).
-        ("crates/store/src/sessions.rs", 4035),
     ];
 
     /// Every Rust source in scope for the ceiling: `crates/**` plus

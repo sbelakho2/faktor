@@ -27,6 +27,56 @@ pub(crate) fn task_capability_budget(
     }
 }
 
+/// Whether an orchestrated child may run the generic shell with WRITE
+/// authority. `read_only` is a model-supplied argument, never authority: a
+/// read-only child shares the owner worktree, so letting it decide would let
+/// a hostile child write the live checkout (and, where no filesystem backend
+/// exists, outside its shadow) while bypassing staging/merge entirely.
+///
+/// Denied when the durable child ownership is `ReadOnlyShared` OR the durable
+/// capability budget lacks `WriteWorkspace` (defense in depth, and the
+/// fail-closed answer for an unreadable identity row). A root session is not
+/// narrowed.
+pub(crate) fn child_shell_write_denied(handle: &faktor_session::SessionHandle) -> bool {
+    match handle.orchestrator_child_identity_get() {
+        Ok(None) => false,
+        Ok(Some(identity)) => {
+            !identity
+                .permissions
+                .contains(faktor_core::capability::CapabilityKind::Write)
+                || matches!(
+                    identity.ownership,
+                    faktor_session::child::ChildOwnership::ReadOnlyShared
+                )
+        }
+        // Unreadable authority is never unrestricted authority; the
+        // capability gate refuses the whole call anyway.
+        Err(_) => true,
+    }
+}
+
+/// Force `read_only: true` on a generic-shell invocation a child may not run
+/// with write authority. Mutating the VALIDATED args (before the replay
+/// descriptor and change-budget observation are built) means the enforced
+/// mode is what executes, what a crash replays, and what the scheduler
+/// accounts — the model cannot opt out.
+pub(crate) fn enforce_child_shell_read_only(
+    handle: &faktor_session::SessionHandle,
+    capability: &faktor_core::capability::Capability,
+    args: &mut serde_json::Value,
+) {
+    if !matches!(
+        capability,
+        faktor_core::capability::Capability::ExecuteShell { .. }
+    ) || !child_shell_write_denied(handle)
+    {
+        return;
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("read_only".into(), serde_json::Value::Bool(true));
+    }
+}
+
 /// Artifact storage handed to tools (bounded writes to the CAS). The REAL
 /// sink carries the daemon's configured-secret registry (the SAME instance
 /// the egress scan uses), and every stored byte buffer is exact-redacted
@@ -701,12 +751,22 @@ impl AgentRuntime {
         let raw = row.replay_descriptor.as_ref().ok_or_else(|| {
             Error::malformed(format!("tool_run {} has no replay descriptor", row.op_id))
         })?;
-        let desc = self.validate_replay_descriptor(row, raw)?;
+        let mut desc = self.validate_replay_descriptor(row, raw)?;
         let tool = self
             .deps
             .tools
             .get(&desc.tool_name)
             .ok_or_else(|| Error::not_found(format!("tool {}", desc.tool_name)))?;
+        // A crash may have persisted a descriptor from before the shell
+        // authority gate, or the durable child row may have changed: replay
+        // re-derives the SAME enforced read-only mode, never the stored
+        // model-supplied argument.
+        let capability = tool.capability_for(&desc.validated_args).unwrap_or(
+            faktor_core::capability::Capability::ExecuteShell {
+                command: desc.tool_name.clone(),
+            },
+        );
+        enforce_child_shell_read_only(handle, &capability, &mut desc.validated_args);
         let state = handle.state()?;
         if state != AgentState::ExecutingTool {
             return Err(Error::conflict(format!(
@@ -971,7 +1031,7 @@ impl AgentRuntime {
         // the next wire request is built from never carries a dangling call.
         let mut denied: Vec<DeniedToolCall> = Vec::new();
 
-        for (call_id, name, input) in calls {
+        for (call_id, name, mut input) in calls {
             // Loop detection on the call itself (normalized).
             if detector.record_tool_call(&name, &input) {
                 return Ok(executed); // drive_turn stops the turn
@@ -1147,6 +1207,13 @@ impl AgentRuntime {
                     continue;
                 }
             }
+            // Shell write authority (typed, durable): a read-only child's
+            // `run_command` is forced read-only here — BEFORE the hook gate,
+            // secret scan, replay descriptor and change-budget observation —
+            // so a model-supplied `read_only: false` can never write the
+            // shared owner worktree. The spawn layer then installs kernel
+            // write denial (or refuses typed where the platform cannot).
+            enforce_child_shell_read_only(handle, &capability, &mut input);
             // Lifecycle hook gate (audit): PreTool hooks may deny the call
             // before anything executes; a deny is journaled and the tool is
             // skipped like a permission denial (never silently swallowed).

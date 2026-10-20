@@ -35,10 +35,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use faktor_agent::runtime::{
-    InternalContextItem, ParentTurnInput, DEFAULT_CHILD_HANDOFF_TOKENS,
-    PENDING_INTERNAL_CONTEXT_KEY_PREFIX, PENDING_INTERNAL_CONTEXT_KIND,
-};
 use faktor_agent::{AgentRuntime, TurnOutcome};
 use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
@@ -51,6 +47,9 @@ use faktor_scheduler::{OwnershipSet as SchOwnershipSet, ResourceRequest, Schedul
 use faktor_semantic::RiskLevel;
 use faktor_session::child::{ChildControl, ChildIdentity, ChildOwnership, ChildPhase};
 use faktor_session::{SessionManager, TaskBudget};
+
+#[path = "runtime_handoff.rs"]
+mod runtime_handoff;
 
 use crate::caps::{effective, CapabilitySet};
 use crate::{ChildState, OwnershipSpec, WorkItem, WorkKind, WorkState};
@@ -161,13 +160,17 @@ fn risk_severity(level: RiskLevel) -> u8 {
 /// Typed execution error of the orchestrator runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    #[error("ceiling exceeded: {class} children (limit {limit}, in use {used}); nothing was registered for this child")]
+    #[error(
+        "ceiling exceeded: {class} children (limit {limit}, in use {used}); nothing was registered for this child"
+    )]
     CeilingExceeded {
         class: &'static str,
         limit: usize,
         used: usize,
     },
-    #[error("ownership overlap: {0} (normalized path sets of concurrent mutating children must be disjoint)")]
+    #[error(
+        "ownership overlap: {0} (normalized path sets of concurrent mutating children must be disjoint)"
+    )]
     OverlappingExclusiveOwnership(String),
     /// A `Paths`-owned child's isolated overlay staged a change OUTSIDE its
     /// declared exclusive write set: the change set is refused entirely and
@@ -846,7 +849,7 @@ impl OrchestratorRuntime {
                     limit: "admission_gate_poisoned".to_string(),
                     message: "the admission gate lock is poisoned; refusing the boundary"
                         .to_string(),
-                })
+                });
             }
         };
         let Some(gate) = gate else {
@@ -1401,6 +1404,13 @@ impl OrchestratorRuntime {
                 if identity.parent_session_id != parent {
                     continue;
                 }
+                // A Closed tombstone is not a LIVE orphan: it is the
+                // explicit rollback of a spawn whose registry anchor could
+                // not be written (or a deliberately ended child). Only a
+                // child that can still act/own a worktree is an orphan.
+                if h.lifecycle().is_ok_and(|lifecycle| lifecycle.is_terminal()) {
+                    continue;
+                }
                 if !rows
                     .iter()
                     .any(|r| r.session_id == h.id().raw() && r.run_id == run_id)
@@ -1710,6 +1720,13 @@ impl OrchestratorRuntime {
         state.run_base_snapshot = run_base.as_ref().map(|rb| rb.snapshot_hash.clone());
         state.run_base_root = run_base.as_ref().map(|rb| PathBuf::from(&rb.root));
         self.reconcile_from_registry(&mut state)?;
+        // Crash-window healing (zero lost child results): a crash between a
+        // child's terminal persist and its parent handoff left the durable
+        // child row terminal with NO pending section. Re-attach reconciles
+        // that row and re-arms the handoff here; a consumed section (empty
+        // value) is never re-delivered, and a pending one is refreshed to the
+        // child's current terminal outcome.
+        self.heal_pending_child_handoffs(state.parent_session, &state.children);
         self.install_run(state)?;
         self.drive_to_outcome(run_id).await
     }
@@ -1724,15 +1741,37 @@ impl OrchestratorRuntime {
     }
 
     /// The mirror of the ONE run that owns `child_id` (mirrors are run
-    /// scoped; a child belongs to exactly one installed run).
-    fn child_mirror(&self, child_id: &str) -> Option<(String, ChildRuntime)> {
+    /// scoped). Child ids are minted PER RUN (`child-0` in every plan), so
+    /// two concurrently installed runs of different sessions legitimately
+    /// carry the same id. A first-match scan would silently target an
+    /// arbitrary child (HashMap order) — potentially another session's
+    /// child — for controls, budget/model changes and cancellation. An
+    /// ambiguous id is therefore a typed `Conflict`: callers must name the
+    /// run, never guess.
+    fn child_mirror(&self, child_id: &str) -> Result<Option<(String, ChildRuntime)>, ExecError> {
         let guard = recover_lock(&self.exec);
-        for (run_id, exec) in guard.iter() {
-            if let Some(row) = exec.children.get(child_id) {
-                return Some((run_id.clone(), row.clone()));
-            }
+        let mut found: Vec<(String, ChildRuntime)> = guard
+            .iter()
+            .filter_map(|(run_id, exec)| {
+                exec.children
+                    .get(child_id)
+                    .map(|row| (run_id.clone(), row.clone()))
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            _ => Err(ExecError::Conflict(format!(
+                "child id {child_id} is live in {} runs ({}); refusing an ambiguous target",
+                found.len(),
+                found
+                    .iter()
+                    .map(|(run, _)| run.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
         }
-        None
     }
 
     // ------------------------------------------------------------ steering
@@ -2014,11 +2053,11 @@ impl OrchestratorRuntime {
     /// The live mirror of one child (durable rows are the source of truth;
     /// this refreshes the mirror from the registry).
     pub fn child(&self, child_id: &str) -> Result<Option<ChildRuntime>, ExecError> {
-        Ok(self.child_mirror(child_id).map(|(_, row)| row))
+        Ok(self.child_mirror(child_id)?.map(|(_, row)| row))
     }
 
     fn durable_child(&self, child_id: &str) -> Result<ChildRuntime, ExecError> {
-        self.child_mirror(child_id)
+        self.child_mirror(child_id)?
             .map(|(_, row)| row)
             .ok_or_else(|| ExecError::NotFound(format!("unknown child {child_id}")))
     }
@@ -2558,16 +2597,10 @@ impl OrchestratorRuntime {
         let dependency_index = DependencyIndex::build(&exec.plan);
         let parent_session = exec.parent_session;
         drop(guard);
-        for (child_id, row) in done {
-            self.advance_item(run_id, &child_id, &row, &dependency_index)?;
-            // The parent continuation boundary (audit: typed child handoff
-            // consumption): a child that just reached its terminal state
-            // hands its BOUNDED typed handoff to the parent session as
-            // durable internal context for the parent's next logical turn.
-            // Best-effort by contract — never a reason to fail the run.
-            self.deliver_child_handoff(parent_session, &row);
-        }
-        // Crash seam: a child just reached terminal state.
+        // Crash seam: a child just reached terminal state, BEFORE its
+        // advance/handoff boundary. This is the documented degraded window:
+        // re-attach reconciles the terminal row and re-arms the parent
+        // handoff (see `reattach`), so the child's result is never lost.
         #[cfg(any(test, feature = "fault-injection"))]
         {
             let terminal_child = {
@@ -2597,101 +2630,16 @@ impl OrchestratorRuntime {
                 )));
             }
         }
+        for (child_id, row) in done {
+            self.advance_item(run_id, &child_id, &row, &dependency_index)?;
+            // The parent continuation boundary (audit: typed child handoff
+            // consumption): a child that just reached its terminal state
+            // hands its BOUNDED typed handoff to the parent session as
+            // durable internal context for the parent's next logical turn.
+            // Best-effort by contract — never a reason to fail the run.
+            self.deliver_child_handoff(parent_session, &row);
+        }
         Ok(())
-    }
-
-    /// The parent continuation boundary (audit: typed child handoff
-    /// consumption): hand ONE finished child's BOUNDED typed handoff to the
-    /// PARENT session as durable internal context for its next logical turn
-    /// — the child's transcript is NEVER inlined, never a user-role prompt.
-    /// The section is rendered ONCE here by the channel's own renderer (the
-    /// Faktor-controlled untrusted-DATA envelope) and recorded as a pending
-    /// fact the runtime consumes exactly once at the parent's next drive.
-    ///
-    /// Best-effort by contract — the run is already settled; an unavailable
-    /// component (typed refusal from [`Self::child_handoff`]), a vanished
-    /// parent session or a failed fact write is logged and skipped, and the
-    /// durable child rows remain the retrievable source of truth. Degraded
-    /// window (documented): a crash between the child's terminal persist and
-    /// this delivery skips the delivery — the child's registry/ledger rows
-    /// stay retrievable through the handoff's scoped refs, and the run's
-    /// settlement replay never re-arms a handoff the parent already
-    /// consumed (the ack is sticky).
-    fn deliver_child_handoff(&self, parent: SessionId, child: &ChildRuntime) {
-        if !matches!(child.state, ChildState::Done | ChildState::Failed) {
-            // A Cancelled child has no outcome to report to the parent.
-            return;
-        }
-        let child_session = match SessionId::try_from(child.session_id) {
-            Ok(session) => session,
-            Err(error) => {
-                tracing::warn!(
-                    child = %child.child_id,
-                    "child handoff delivery skipped: session id {}: {}",
-                    child.session_id,
-                    error.message
-                );
-                return;
-            }
-        };
-        let handoff = match self.child_handoff(
-            &child.child_id,
-            child_session,
-            DEFAULT_CHILD_HANDOFF_TOKENS,
-        ) {
-            Ok(handoff) => handoff,
-            Err(error) => {
-                tracing::warn!(
-                    child = %child.child_id,
-                    "child handoff delivery skipped (typed refusal): {error}"
-                );
-                return;
-            }
-        };
-        let input = ParentTurnInput {
-            user_message: None,
-            internal: vec![InternalContextItem::ChildHandoff {
-                provenance: "orchestrator:child-handoff".to_string(),
-                handoff,
-            }],
-        };
-        let section = match input.render_internal_bounded(DEFAULT_CHILD_HANDOFF_TOKENS) {
-            Ok(Some(section)) => section,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(
-                    child = %child.child_id,
-                    "child handoff delivery skipped (render refused): {error}"
-                );
-                return;
-            }
-        };
-        let handle = match self.manager.get_session(parent) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => {
-                tracing::warn!(
-                    session = parent.raw(),
-                    "child handoff delivery: parent session gone"
-                );
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    session = parent.raw(),
-                    "child handoff delivery: parent session read failed: {error}"
-                );
-                return;
-            }
-        };
-        let key = format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{}", child.child_id);
-        if let Err(error) = handle.upsert_memory_fact(PENDING_INTERNAL_CONTEXT_KIND, &key, &section)
-        {
-            tracing::warn!(
-                session = parent.raw(),
-                key,
-                "child handoff delivery write failed: {error}"
-            );
-        }
     }
 
     fn advance_item(
@@ -2908,6 +2856,7 @@ impl OrchestratorRuntime {
                     continue;
                 };
                 let mut should_drive = false;
+                let mut retry_acks: Vec<u64> = Vec::new();
                 match child.state {
                     ChildState::Waiting => {
                         should_drive = pending
@@ -2917,12 +2866,13 @@ impl OrchestratorRuntime {
                     ChildState::Failed => {
                         for r in &pending {
                             if matches!(r.control, ChildControl::Retry) {
-                                // The retry decision is durable BEFORE the
-                                // drive starts: an ack failure refuses the
-                                // admission (safe to retry the same call).
-                                session
-                                    .orchestrator_ctl_ack(r.seq)
-                                    .map_err(|e| ExecError::retriable("retry control ack", e))?;
+                                // The retry ROW is acked only AFTER the
+                                // durable Failed -> Running transition below.
+                                // Acking first lost the retry if the executor
+                                // crashed before persisting the row: on
+                                // re-attach the child stayed Failed with no
+                                // pending Retry and was never re-driven.
+                                retry_acks.push(r.seq);
                                 should_drive = true;
                                 break;
                             }
@@ -2967,6 +2917,16 @@ impl OrchestratorRuntime {
                         self.persist_row(exec, &row)
                             .map_err(|e| ExecError::retriable("re-drive registry persist", e))?;
                         self.persist_child_runtime_row(&row)?;
+                    }
+                    // The durable decision is the Running row; only now is
+                    // the Retry message consumed. A crash between the row
+                    // and the ack re-attaches as Running (re-driven above),
+                    // and the leftover Retry row is acked by the live drive
+                    // boundary — never a lost or duplicated retry.
+                    for seq in retry_acks {
+                        session
+                            .orchestrator_ctl_ack(seq)
+                            .map_err(|e| ExecError::retriable("retry control ack", e))?;
                     }
                     redrives.push(row);
                 }
@@ -3342,9 +3302,20 @@ impl OrchestratorRuntime {
             })?;
         }
         // The registry row is the durable anchor of the child session: a
-        // failed write is loud (never a silently unregistered child).
-        self.persist_row(exec, &row)
-            .map_err(|e| ExecError::retriable("spawn registry persist", e))?;
+        // failed write is loud (never a silently unregistered child). The
+        // just-created child is explicitly rolled back to a Closed
+        // tombstone, so a retry/re-attach never finds a LIVE orphan it did
+        // not own; a rollback failure is logged as loudly as the original.
+        if let Err(error) = self.persist_row(exec, &row) {
+            if let Err(cleanup) = self.manager.delete_session(session.id()) {
+                tracing::error!(
+                    child = %row.child_id,
+                    session = %session.id(),
+                    "spawn registry persist failed AND child rollback failed; a live orphan remains: {cleanup}"
+                );
+            }
+            return Err(ExecError::retriable("spawn registry persist", error));
+        }
         Ok(row)
     }
     /// Register one child drive with the scheduler. The scheduler op is the

@@ -1207,7 +1207,7 @@ impl SessionHandle {
         // some other message's tool_result references.
         let parts = store.parts_of(row.id).map_err(crate::map_store_err)?;
         let has_result = parts.iter().any(|p| p.kind == "tool_result");
-        let call_ids: Vec<String> = parts
+        let call_ids: std::collections::HashSet<String> = parts
             .iter()
             .filter(|p| p.kind == "tool_call")
             .filter_map(|p| {
@@ -1229,14 +1229,22 @@ impl SessionHandle {
                 if page.is_empty() {
                     break;
                 }
+                // ONE bounded batch parts read per page: the historical
+                // per-message `parts_of` loop issued one SQLite query per
+                // message, so a deleteMessage over a long transcript was
+                // O(messages) queries.
+                let ids: Vec<i64> = page.iter().map(|m| m.id).collect();
+                let mut parts_by_message = store
+                    .parts_for_messages(&ids)
+                    .map_err(crate::map_store_err)?;
                 for m in &page {
                     if m.id == row.id {
                         continue;
                     }
-                    for p in store.parts_of(m.id).map_err(crate::map_store_err)? {
+                    for p in parts_by_message.remove(&m.id).unwrap_or_default() {
                         if p.kind == "tool_result" {
                             if let Some(tc) = p.data.get("tool_call_id").and_then(|v| v.as_str()) {
-                                if call_ids.iter().any(|c| c == tc) {
+                                if call_ids.contains(tc) {
                                     referenced = true;
                                     break 'scan;
                                 }
@@ -2357,5 +2365,52 @@ pub(crate) mod tests {
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
         assert!(err.message.contains("no events"), "{err:?}");
         assert!(err.message.contains(&s.id().to_string()), "{err:?}");
+    }
+
+    /// Bounded probe (no soak): deleting an old message from a 5k-message
+    /// transcript. The historical reference scan ran `parts_of` once per
+    /// message (O(messages) SQLite round trips); the batched read uses one
+    /// query per 100-message page.
+    #[test]
+    #[ignore = "[perf] deleteMessage over a 5k-message transcript"]
+    fn perf_delete_message_batches_parts_reads() {
+        const MESSAGES: i64 = 5_000;
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        for seq in 1..=MESSAGES {
+            let mid = s
+                .put_message(seq, "user", serde_json::json!({"text": format!("m{seq}")}))
+                .unwrap();
+            s.put_text_part(mid, "x").unwrap();
+        }
+        let store = m.store();
+        // LEGACY: page the transcript and query parts per message.
+        let legacy_started = std::time::Instant::now();
+        let mut cursor: Option<i64> = None;
+        let mut scanned = 0usize;
+        loop {
+            let page = store.messages_before(s.id(), cursor, 100).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                scanned += 1;
+                let _ = store.parts_of(row.id).unwrap();
+            }
+            cursor = Some(page.last().unwrap().seq);
+        }
+        let legacy = legacy_started.elapsed();
+        assert_eq!(scanned, MESSAGES as usize);
+        let started = std::time::Instant::now();
+        s.delete_message(1).unwrap();
+        let current = started.elapsed();
+        println!(
+            "[perf] deleteMessage over {MESSAGES} messages: legacy parts scan {legacy:?}, batched delete {current:?}"
+        );
+        assert!(
+            current * 5 < legacy,
+            "batched delete {current:?} must beat per-message parts scans {legacy:?} by 5x"
+        );
+        assert_eq!(s.message_count().unwrap(), MESSAGES - 1);
     }
 }

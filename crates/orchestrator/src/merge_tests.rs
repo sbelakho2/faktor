@@ -1542,4 +1542,118 @@ mod preflight_integration {
             "the provider was actually called and awaited"
         );
     }
+
+    fn perf_percentile(mut samples: Vec<std::time::Duration>, p: f64) -> std::time::Duration {
+        samples.sort_unstable();
+        if samples.is_empty() {
+            return std::time::Duration::ZERO;
+        }
+        let index = ((samples.len() as f64 - 1.0) * p).round() as usize;
+        samples[index.min(samples.len() - 1)]
+    }
+
+    /// Bounded probe (no soak): reading C children's base maps must scale
+    /// with the rows of EACH row, not with the parent's whole fact table.
+    /// The legacy read is reproduced in-process (full `memory_facts_page`
+    /// walk per map), so the comparison runs on one binary and one fixture.
+    #[test]
+    #[ignore = "[perf] merge base-map reads over a 200-child fan-out"]
+    fn perf_base_map_reads_do_not_scan_the_fact_table() {
+        const CHILDREN: usize = 200;
+        const NOISE: usize = 8_000;
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let parent = m
+            .create_session(m.create_workspace("/w").unwrap(), "perf", "p", "m")
+            .unwrap();
+        let entries: Vec<(PathBuf, EntryState)> = (0..8)
+            .map(|i| (PathBuf::from(format!("src/f{i}.rs")), state(H)))
+            .collect();
+        for child in 0..CHILDREN {
+            put_base_map(
+                &m,
+                parent.id(),
+                "run",
+                &format!("child-{child}"),
+                "base",
+                &entries,
+            )
+            .unwrap();
+        }
+        let noise: Vec<(String, String, String)> = (0..NOISE)
+            .map(|i| {
+                (
+                    "perf_noise".to_string(),
+                    format!("noise/{i:06}"),
+                    "x".repeat(64),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = noise
+            .iter()
+            .map(|(k, key, v)| (k.as_str(), key.as_str(), v.as_str()))
+            .collect();
+        m.store().upsert_memory_facts(parent.id(), &refs).unwrap();
+
+        // LEGACY: page the whole fact table, then filter in Rust.
+        let legacy_read = |key: &str| {
+            let mut after: Option<(i64, String, String)> = None;
+            let mut header = None;
+            let mut chunks: Vec<String> = Vec::new();
+            loop {
+                let page = parent.memory_facts_page(after.as_ref(), 200).unwrap();
+                for (kind, kk, v) in page.facts {
+                    if kind != KIND_BASE {
+                        continue;
+                    }
+                    if kk == key {
+                        header = Some(serde_json::from_str::<serde_json::Value>(&v).unwrap());
+                    } else if kk.starts_with(key) {
+                        chunks.push(v);
+                    }
+                }
+                match page.cursor {
+                    Some(c) => after = Some(c),
+                    None => break,
+                }
+            }
+            assert!(header.is_some());
+            assert!(!chunks.is_empty());
+        };
+        let mut legacy = Vec::with_capacity(CHILDREN);
+        for child in 0..CHILDREN {
+            let key = base_key("run", &format!("child-{child}"), "base");
+            let started = std::time::Instant::now();
+            legacy_read(&key);
+            legacy.push(started.elapsed());
+        }
+        let mut current = Vec::with_capacity(CHILDREN);
+        for child in 0..CHILDREN {
+            let started = std::time::Instant::now();
+            let map =
+                read_base_state_map(&m, parent.id(), "run", &format!("child-{child}"), "base")
+                    .unwrap()
+                    .expect("base map");
+            assert_eq!(map.len(), 8);
+            current.push(started.elapsed());
+        }
+        let legacy_total: std::time::Duration = legacy.iter().sum();
+        let current_total: std::time::Duration = current.iter().sum();
+        println!(
+            "[perf] base-map reads over {CHILDREN} children / {NOISE} noise facts: legacy p50={:?} p95={:?} p99={:?} total={:?}; indexed p50={:?} p95={:?} p99={:?} total={:?}",
+            perf_percentile(legacy.clone(), 0.50),
+            perf_percentile(legacy.clone(), 0.95),
+            perf_percentile(legacy.clone(), 0.99),
+            legacy_total,
+            perf_percentile(current.clone(), 0.50),
+            perf_percentile(current.clone(), 0.95),
+            perf_percentile(current.clone(), 0.99),
+            current_total
+        );
+        assert!(
+            current_total * 4 < legacy_total,
+            "indexed reads {current_total:?} must beat the full-table legacy scan {legacy_total:?} by 4x"
+        );
+    }
 }

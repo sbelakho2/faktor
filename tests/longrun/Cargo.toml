@@ -16,6 +16,7 @@ faktor-fs.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+blake3.workspace = true
 
 [lints]
 workspace = true

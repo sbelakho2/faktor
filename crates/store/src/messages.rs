@@ -378,6 +378,48 @@ impl Store {
         Ok(out)
     }
 
+    /// Bounded BATCH part read for a set of message ids (one indexed `IN`
+    /// query per <=500 ids, preserving per-message id order). Callers that
+    /// inspect a transcript page must use this instead of one `parts_of`
+    /// round trip per message: the historical per-message loop made a
+    /// deleteMessage/reference scan O(messages) SQLite queries (quadratic
+    /// with transcript length). Ids not present are simply absent from the
+    /// map; the caller's per-message fallback is an empty Vec.
+    pub fn parts_for_messages(
+        &self,
+        message_ids: &[i64],
+    ) -> StoreResult<std::collections::HashMap<i64, Vec<PartRow>>> {
+        const ID_CHUNK: usize = 500;
+        let mut out: std::collections::HashMap<i64, Vec<PartRow>> =
+            std::collections::HashMap::with_capacity(message_ids.len());
+        if message_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.read()?;
+        for chunk in message_ids.chunks(ID_CHUNK) {
+            let mut placeholders = String::new();
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len());
+            for (i, id) in chunk.iter().enumerate() {
+                if i > 0 {
+                    placeholders.push(',');
+                }
+                placeholders.push('?');
+                params.push(rusqlite::types::Value::Integer(*id));
+            }
+            let sql = format!(
+                "SELECT id, message_id, kind, data, created_ms FROM part
+                 WHERE message_id IN ({placeholders}) ORDER BY message_id, id"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            while let Some(row) = rows.next()? {
+                let part = part_map(row)?;
+                out.entry(part.message_id).or_default().push(part);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn message_count(&self, session_id: SessionId) -> StoreResult<i64> {
         let conn = self.read()?;
         let out = conn.query_row(

@@ -585,8 +585,7 @@ impl ShadowRoots {
             if existing.state.is_live() {
                 return Err(ExecError::Conflict(format!(
                     "session {session} has a live shadow {} (root {}); resume its integration or discard() it before beginning a new one",
-                    existing.shadow_id,
-                    existing.root
+                    existing.shadow_id, existing.root
                 )));
             }
             // A retired shadow row: its directory must be gone already; a
@@ -889,7 +888,7 @@ impl ShadowRoots {
                         return Err(ExecError::Internal(format!(
                             "staged deletion {:?} has no base anchor",
                             path.display()
-                        )))
+                        )));
                     }
                 },
             }
@@ -956,7 +955,7 @@ impl ShadowRoots {
                     return Err(ExecError::Conflict(format!(
                         "hunk selection of non-regular candidate {} is refused",
                         entry.path.display()
-                    )))
+                    )));
                 }
                 None => Vec::new(),
             };
@@ -982,7 +981,7 @@ impl ShadowRoots {
                     return Err(ExecError::Conflict(format!(
                         "hunk selection of non-regular base {} is refused",
                         entry.path.display()
-                    )))
+                    )));
                 }
                 None => Vec::new(),
             };
@@ -1341,8 +1340,13 @@ impl ShadowRoots {
     /// only deterministic paths are discard (then begin again) or, when the
     /// manifest simply never got written, retrying begin after discard.
     fn base_manifest(&self, shadow: &Shadow) -> Result<Vec<(PathBuf, EntryState)>, ExecError> {
-        match read_base_state_map(&self.manager, shadow.session_id, &shadow.shadow_id, CHILD_ID, "base")
-        {
+        match read_base_state_map(
+            &self.manager,
+            shadow.session_id,
+            &shadow.shadow_id,
+            CHILD_ID,
+            "base",
+        ) {
             Ok(Some(map)) => Ok(map),
             Ok(None) => Err(ExecError::InvalidState(format!(
                 "shadow {} has no durable base manifest (crashed begin); discard() it and begin_shadow() again",

@@ -452,14 +452,10 @@ impl AgentRuntime {
         recent: &[RecentTurn],
         ledger: &TaskLedger,
         budget: &ContextBudget,
-        // The LOGICAL TURN's cancellation token: a user Stop during
-        // compaction must reach the compaction model's stream (P0 audit,
-        // round 11 — the summary request used to mint an orphan token and
-        // ran up to the full 90s after the turn was cancelled).
+        // The LOGICAL TURN's token reaches the summarizer stream: a Stop
+        // must cancel compaction (no orphan request after the turn; audit 11).
         cancel: &CancellationToken,
-        // Durable message-seq high-water mark of the window `recent` was
-        // loaded from. An accepted plan persists its replacement context
-        // against this seq (restart resumes from the checkpoint).
+        // Durable high-water mark of the window `recent` was loaded from.
         head_seq: Option<u64>,
     ) -> faktor_core::Result<Option<CompactionPlan>> {
         // Strip the PREVIOUS compaction's synthesized blocks before the
@@ -629,20 +625,10 @@ impl AgentRuntime {
                 &CompactionRequest::new(before, target),
             )
             .await;
-        // The compaction reservation's terminal state runs through its
-        // attempt machine (attempt-accounting audit): money moves exactly
-        // once per reservation and only through the machine's guarded
-        // transitions, which know whether the summarizer's stream truly
-        // dispatched:
-        //   - accepted LLM summary  => settle the exchanged transcript;
-        //   - dispatched but NOT settled (stream failure / timeout /
-        //     cancellation / rejected summary) => UNCERTAIN: the provider
-        //     may have billed, so the reserved amount keeps consuming until
-        //     a reconcile or the task-end finalize — never a refund;
-        //   - never dispatched (summarizer never ran / not stream-capable)
-        //     => refund the prediction.
-        // The provenance identity survives the attempt-machine block (which
-        // consumes `trace`): the real summarizer pair this call routed.
+        // Reservation terminal state moves through the attempt machine
+        // exactly once: accepted => settle; dispatched-but-unsettled =>
+        // UNCERTAIN (may have billed, never a refund); never dispatched =>
+        // refund. The provenance identity survives after `trace` is consumed.
         let compaction_identity: Option<(String, String)> = trace
             .as_ref()
             .map(|t| (t.provider.clone(), t.model.clone()));
@@ -787,11 +773,8 @@ impl AgentRuntime {
                 }
             }
         }
-        // A cancellation that landed while the summary stream ran discards
-        // the produced plan: no compaction is applied after the turn was
-        // stopped (the reservation above already reached its honest
-        // terminal state, so no money move is guessed). The summarizer's
-        // child token is bounded, so no compaction task outlives the turn.
+        // A cancellation during the stream discards the plan; the bounded
+        // summarizer token means no compaction task outlives the turn.
         if cancel.is_cancelled() {
             tracing::warn!(
                 session = %handle.id(),
@@ -861,46 +844,63 @@ impl AgentRuntime {
                 }
             }
         }
+        let strategy = match plan.strategy {
+            faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
+            faktor_context::CompactionStrategy::DeterministicPruning => "deterministic",
+            faktor_context::CompactionStrategy::Rejected => "rejected",
+        };
         // Durable replacement context (restart parity): the accepted plan's
-        // EXACT wire turns are persisted against the source high-water seq in
-        // ONE atomic chunk-group. A crash can expose the old checkpoint or
-        // the new one, never a half-written summary replacing context; a
-        // failed checkpoint write is logged and leaves the full durable
-        // transcript to be re-compacted on the next drive.
+        // EXACT wire turns, its compaction row and its ContextCompacted event
+        // commit in ONE transaction. The previous two-step (checkpoint write
+        // then compaction record) could crash between the two and leave a
+        // replacement context with no compaction authority; a crash at any
+        // seam now reopens on exactly the old world or exactly the new one.
         if accepted {
-            match (head_seq, serde_json::to_vec(&plan.kept_recent)) {
-                (Some(seq), Ok(payload)) => {
-                    let digest = faktor_context::history_digest(&plan.kept_recent);
-                    if let Err(error) = handle.put_context_checkpoint(seq, &digest, &payload) {
-                        tracing::error!(
-                            session = %handle.id(),
-                            error = %error,
-                            "durable context checkpoint write failed; the next drive re-compacts"
-                        );
-                    }
-                }
-                (None, _) => tracing::warn!(
+            let Some(through_seq) = head_seq else {
+                // No durable source window was supplied (direct callers and
+                // unit tests pass a synthetic history). There is nothing to
+                // anchor a replacement context to, so journal the compaction
+                // authority and leave the durable transcript untouched; the
+                // next drive re-compacts from durable rows.
+                tracing::warn!(
                     session = %handle.id(),
                     "compaction had no source high-water seq; durable checkpoint skipped"
-                ),
-                (_, Err(error)) => tracing::error!(
-                    session = %handle.id(),
-                    error = %error,
-                    "context checkpoint serialization failed; the next drive re-compacts"
-                ),
+                );
+                handle.record_compaction_defaults(
+                    plan.before_tokens as i64,
+                    plan.after_tokens as i64,
+                    plan.target_tokens as i64,
+                    strategy,
+                )?;
+                return Ok(Some(plan));
+            };
+            let payload = serde_json::to_vec(&plan.kept_recent)?;
+            let digest = faktor_context::history_digest(&plan.kept_recent);
+            let record = handle.commit_compaction_with_checkpoint(
+                plan.before_tokens as i64,
+                plan.after_tokens as i64,
+                plan.target_tokens as i64,
+                plan.accepted,
+                strategy,
+                &faktor_session::compaction::CompactionPolicy::default(),
+                through_seq,
+                &digest,
+                &payload,
+            )?;
+            if !record.accepted {
+                // The durable authority refused the numeric plan (target or
+                // minimum reduction): CompactRejected is journaled, no
+                // checkpoint was written, and the turn must not claim an
+                // applied compaction.
+                return Ok(None);
             }
-        }
-        handle.record_compaction_defaults(
-            plan.before_tokens as i64,
-            plan.after_tokens as i64,
-            plan.target_tokens as i64,
-            match plan.strategy {
-                faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
-                faktor_context::CompactionStrategy::DeterministicPruning => "deterministic",
-                faktor_context::CompactionStrategy::Rejected => "rejected",
-            },
-        )?;
-        if !accepted {
+        } else {
+            handle.record_compaction_defaults(
+                plan.before_tokens as i64,
+                plan.after_tokens as i64,
+                plan.target_tokens as i64,
+                strategy,
+            )?;
             // CompactRejected is journaled by record_compaction.
             return Ok(None);
         }

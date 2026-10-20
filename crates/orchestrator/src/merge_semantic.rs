@@ -9,7 +9,9 @@
 //! unavailable. Provider absence/failure stays ADVISORY unless the child's
 //! durable identity says otherwise.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use super::ChangeEntry;
 use std::path::{Path, PathBuf};
 
 use faktor_core::cancellation::CancellationToken;
@@ -348,6 +350,11 @@ pub fn semantic_delta_conflicts(
     approved: &[PathBuf],
 ) -> Vec<(PathBuf, String)> {
     let approved_set: HashSet<&Path> = approved.iter().map(|p| p.as_path()).collect();
+    // ONE path index for the whole delta. The historical per-change
+    // `cs.files.iter().find` made a provider delta over D changes and C
+    // staged files O(D·C) (quadratic in practice for a large fan-out).
+    let staged: HashMap<&Path, &ChangeEntry> =
+        cs.files.iter().map(|e| (e.path.as_path(), e)).collect();
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     for change in &delta.changes {
         let entity_path = change.entity.path.as_str();
@@ -355,7 +362,7 @@ pub fn semantic_delta_conflicts(
         if !approved_set.contains(path.as_path()) {
             continue;
         }
-        let Some(entry) = cs.files.iter().find(|e| e.path == path) else {
+        let Some(entry) = staged.get(path.as_path()).copied() else {
             continue;
         };
         let child = entry.child_state();

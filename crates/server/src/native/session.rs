@@ -99,18 +99,14 @@ pub(crate) fn build_native_projection(
     // Checkpoint presence requires the real snapshot service; the newest
     // durable checkpoint row is projected when one exists.
     let last_checkpoint = if deps.snapshots.is_some() {
-        handle
-            .checkpoints_of()?
-            .into_iter()
-            .max_by_key(|c| (c.sequence, c.id))
-            .map(|c| {
-                serde_json::json!({
-                    "sequence": c.sequence,
-                    "path": c.path,
-                    "createdMs": c.created_ms,
-                    "restoredMs": c.restored_ms,
-                })
+        handle.latest_checkpoint()?.map(|c| {
+            serde_json::json!({
+                "sequence": c.sequence,
+                "path": c.path,
+                "createdMs": c.created_ms,
+                "restoredMs": c.restored_ms,
             })
+        })
     } else {
         None
     };
@@ -440,13 +436,10 @@ pub(crate) async fn native_session_checkpoints(
     if state.deps.snapshots.is_none() {
         return Json(serde_json::json!([])).into_response();
     }
-    match handle.checkpoints_of() {
+    match handle.checkpoints_newest(MAX_NATIVE_LIST as u64) {
         Ok(rows) => {
-            let mut rows = rows;
-            rows.sort_by_key(|c| std::cmp::Reverse((c.sequence, c.id)));
             let out: Vec<serde_json::Value> = rows
                 .iter()
-                .take(MAX_NATIVE_LIST)
                 .map(|c| {
                     serde_json::json!({
                         "sequence": c.sequence,

@@ -15,8 +15,9 @@ use crate::error::{WorkerError, WORKER_PROTOCOL_VERSION};
 use crate::ids::{ExecutionJobId, JobGeneration, JobKey, WorkerId, WorkerLeaseId};
 use crate::model::{
     AttemptState, ExecutionJob, GenerationState, JobAttempt, JobGenerationRow, JobRequirements,
-    JobResultOutcome, JobState, JobStatus, JournalEntry, LeaseState, NetworkProfile, RequeuePolicy,
-    SandboxCapability, WorkerCapabilities, WorkerLease, WorkerRegistration,
+    JobResultOutcome, JobState, JobStatus, JobVerificationClaim, JournalEntry, LeaseState,
+    NetworkProfile, RequeuePolicy, SandboxCapability, WorkerCapabilities, WorkerLease,
+    WorkerRegistration,
 };
 use crate::service::{RecoveryReport, ResultOutcome, WorkerPlane};
 use crate::store::{MemoryWorkerStore, ResultAppend, SqliteWorkerStore, WorkerStore};
@@ -722,6 +723,76 @@ fn duplicate_result_replay_never_lands_twice() {
             matches!(err, WorkerError::DigestMismatch { .. }),
             "{label}: {err}"
         );
+    }
+}
+
+/// New-angle probe: the WORKER controls `verification.produced_digest`; an
+/// unbounded/flooding or path-like value would be persisted on the result
+/// and served back on every job status. The claim is shape-validated at the
+/// landing boundary exactly like the result digest: typed `Malformed`, and
+/// nothing durable is written.
+#[test]
+fn hostile_produced_digest_is_refused_typed_and_never_lands() {
+    for (label, h) in harnesses() {
+        let token = h.register("wrk_1", &["rust"]);
+        let job = h.schedule("produced-digest", &digest("c"));
+        let lease = job.lease.clone().unwrap();
+        for (case, produced) in [
+            ("oversized", "a".repeat(1024 * 1024)),
+            ("path-like", "../../etc/passwd".to_string()),
+            ("short-hex", "abc".to_string()),
+        ] {
+            let err = h
+                .plane
+                .submit_result_with_claim(
+                    &org("org_1"),
+                    &worker_id("wrk_1"),
+                    &token,
+                    WORKER_PROTOCOL_VERSION,
+                    &job.job.job_id,
+                    JobGeneration::FIRST,
+                    &lease.lease_id,
+                    &digest("c"),
+                    JobResultOutcome::Succeeded,
+                    JobVerificationClaim {
+                        self_verified: true,
+                        produced_digest: Some(produced),
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, WorkerError::Malformed(_)),
+                "{label}/{case}: {err}"
+            );
+            assert!(
+                h.store
+                    .result(&job.job.job_id, JobGeneration::FIRST)
+                    .unwrap()
+                    .is_none(),
+                "{label}/{case}: an invalid claim must never land a result"
+            );
+        }
+        // The valid shape still lands (the refusal is a shape gate, not a
+        // blanket rejection of produced trees).
+        let landed = h
+            .plane
+            .submit_result_with_claim(
+                &org("org_1"),
+                &worker_id("wrk_1"),
+                &token,
+                WORKER_PROTOCOL_VERSION,
+                &job.job.job_id,
+                JobGeneration::FIRST,
+                &lease.lease_id,
+                &digest("c"),
+                JobResultOutcome::Succeeded,
+                JobVerificationClaim {
+                    self_verified: true,
+                    produced_digest: Some(digest("f")),
+                },
+            )
+            .unwrap();
+        assert_eq!(landed, ResultOutcome::Landed, "{label}");
     }
 }
 

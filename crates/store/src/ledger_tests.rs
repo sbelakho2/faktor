@@ -1100,3 +1100,59 @@ fn memory_facts_of_kinds_is_indexed_and_bounded() {
     let (rows, has_more) = store.memory_facts_of_kinds(s.id, &["absent"], 10).unwrap();
     assert!(rows.is_empty() && !has_more);
 }
+
+#[test]
+fn memory_prefix_read_is_kind_scoped_and_honours_the_exact_prefix_range() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    for key in [
+        "row",
+        "row/c000",
+        "row/c001",
+        "row.other",
+        "row2",
+        "rox",
+        "rowzy",
+    ] {
+        store
+            .upsert_memory_fact(s.id, "orchestrator_base", key, key)
+            .unwrap();
+        store
+            .upsert_memory_fact(s.id, "orchestrator_cs", key, "other-kind")
+            .unwrap();
+    }
+    let (rows, has_more) = store
+        .memory_facts_by_kind_key_prefix(s.id, "orchestrator_base", "row", None, u64::MAX)
+        .unwrap();
+    assert!(!has_more);
+    let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    // `[row, rox)` exactly: every string starting with `row`, nothing from
+    // `rox`/later and nothing of the other kind.
+    assert_eq!(
+        keys,
+        vec!["row", "row.other", "row/c000", "row/c001", "row2", "rowzy"]
+    );
+    assert!(rows.iter().all(|r| r.kind == "orchestrator_base"));
+
+    // Keyset paging over the same range never duplicates or skips a row.
+    let mut paged = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let (page, more) = store
+            .memory_facts_by_kind_key_prefix(s.id, "orchestrator_base", "row", after.as_deref(), 2)
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|r| r.key.clone());
+        paged.extend(page.into_iter().map(|r| r.key));
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(
+        paged, keys,
+        "keyset walk must be gapless and duplicate-free"
+    );
+}

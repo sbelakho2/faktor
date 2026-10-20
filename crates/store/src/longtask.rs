@@ -549,9 +549,25 @@ impl Store {
 
     /// Insert the PREPARED row. Returns false when the operation already
     /// exists (idempotent replay), never a duplicate row.
+    ///
+    /// `created_ms` is normalized to a per-session MONOTONIC stamp: wall
+    /// clocks can jump backwards across restarts, and the newest-operation
+    /// read/prune order must never hand back (or evict) an older row after
+    /// such a jump. Each accepted insert is at least one millisecond newer
+    /// than the previous row of the session; a replay (INSERT OR IGNORE)
+    /// leaves the existing stamp untouched.
     pub fn insert_compaction_operation(&self, row: CompactionOperationRow) -> StoreResult<bool> {
         self.writer
             .execute("insert_compaction_operation", move |conn| {
+                let last: Option<i64> = conn
+                    .query_row(
+                        "SELECT MAX(created_ms) FROM compaction_operation WHERE session_id = ?1",
+                        params![row.session_id.raw() as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let created_ms = row.created_ms.max(last.unwrap_or(0).saturating_add(1));
                 let changed = conn.execute(
                     "INSERT OR IGNORE INTO compaction_operation(
                         session_id, operation_id, state, phase, progress_ppm,
@@ -576,8 +592,8 @@ impl Store {
                         row.result_json,
                         row.error_code,
                         row.error_message,
-                        row.created_ms,
-                        row.updated_ms
+                        created_ms,
+                        row.updated_ms.max(created_ms)
                     ],
                 )?;
                 Ok(changed == 1)
@@ -617,7 +633,7 @@ impl Store {
                     result_json, error_code, error_message, created_ms, updated_ms
              FROM compaction_operation
              WHERE session_id = ?1
-             ORDER BY created_ms DESC LIMIT 1",
+             ORDER BY created_ms DESC, rowid DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64])?;
         match rows.next()? {
@@ -757,7 +773,7 @@ impl Store {
                        AND operation_id NOT IN (
                          SELECT operation_id FROM compaction_operation
                          WHERE session_id = ?1
-                         ORDER BY created_ms DESC LIMIT ?2
+                         ORDER BY created_ms DESC, rowid DESC LIMIT ?2
                        )",
                     params![session_id.raw() as i64, keep],
                 )?;

@@ -981,7 +981,13 @@ fn run_maintenance(shared: &Arc<ActorShared>, cfg: &DbActorConfig) {
         Some(message) => Err(StoreError::Migration(format!(
             "wal checkpoint maintenance (test seam): {message}"
         ))),
-        None => shared.store.wal_checkpoint_passive(),
+        None => shared.store.wal_checkpoint_passive().map(|()| {
+            // Bound the FILE too: PASSIVE folds frames but leaves the WAL at
+            // its high-water mark. The truncate is non-blocking (busy_timeout
+            // 0) and skipped entirely below the bound, so a pinned reader
+            // costs one failed attempt, never a stalled actor.
+            let _ = shared.store.wal_checkpoint_truncate_bounded();
+        }),
     }));
     let elapsed = t0.elapsed();
     let (error, failed) = match result {

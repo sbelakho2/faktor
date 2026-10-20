@@ -1870,6 +1870,7 @@ dependencies = [
 name = "faktor-tests-longrun"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-agent",
  "faktor-cas",
  "faktor-context",

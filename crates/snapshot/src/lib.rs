@@ -734,12 +734,11 @@ impl CheckpointStore {
         session: SessionId,
     ) -> Result<Option<DiffResult>, Error> {
         workspace.verify_identity(identity)?;
-        let checkpoints = self.store.checkpoints_of(session).map_err(map_store)?;
-        let Some(row) = checkpoints.iter().max_by_key(|c| c.sequence) else {
+        let Some(row) = self.store.latest_checkpoint(session).map_err(map_store)? else {
             return Ok(None);
         };
-        let before_state = side_state(row, Side::Before)?;
-        let after_state = side_state(row, Side::After)?;
+        let before_state = side_state(&row, Side::Before)?;
+        let after_state = side_state(&row, Side::After)?;
         // Resolve the after side FIRST: an existing after state without its
         // CAS blob (pre-v3 rows) is refused honestly before any other work.
         let after_bytes = match after_state {
@@ -810,11 +809,9 @@ impl CheckpointStore {
         session: SessionId,
         checkpoint_id: i64,
     ) -> Result<faktor_store::CheckpointRow, Error> {
-        let checkpoints = self.store.checkpoints_of(session).map_err(map_store)?;
-        checkpoints
-            .iter()
-            .find(|c| c.id == checkpoint_id)
-            .cloned()
+        self.store
+            .checkpoint_by_id(session, checkpoint_id)
+            .map_err(map_store)?
             .ok_or_else(|| Error::not_found(format!("checkpoint {checkpoint_id}")))
     }
 }

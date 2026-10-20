@@ -23,6 +23,11 @@ pub const MAX_CONTEXT_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 /// One fact value must stay under [`MAX_FACT_VALUE_BYTES`]; chunks leave
 /// room for the JSON head/chunk-key envelope.
 const CONTEXT_CHECKPOINT_CHUNK_BYTES: usize = 3000;
+/// Hard bound of chunk rows one checkpoint may declare (or physically hold).
+/// Derived from the byte bound, so a hostile head can never make the reader
+/// walk a count unrelated to the payload it could ever describe.
+pub const MAX_CONTEXT_CHECKPOINT_CHUNKS: u64 =
+    (MAX_CONTEXT_CHECKPOINT_BYTES as u64 / CONTEXT_CHECKPOINT_CHUNK_BYTES as u64) + 1;
 
 /// One durable context checkpoint: the exact compacted turns plus the source
 /// message high-water seq they replace. `payload` is the serialized turn
@@ -212,6 +217,30 @@ impl SessionHandle {
         ))
     }
 
+    /// Bounded KEY-ORDERED page of one kind under a chunked-row key prefix
+    /// (the header plus `key/cNNN` chunks). The `(session, kind, key)` index
+    /// serves the read, so callers never page the session's whole fact table
+    /// to find one row's chunks.
+    pub fn memory_facts_by_kind_key_prefix(
+        &self,
+        kind: &str,
+        key_prefix: &str,
+        after_key: Option<&str>,
+        limit: u64,
+    ) -> faktor_core::Result<(Vec<FactTriple>, bool)> {
+        let (rows, has_more) = self
+            .manager
+            .store()
+            .memory_facts_by_kind_key_prefix(self.id, kind, key_prefix, after_key, limit)
+            .map_err(crate::map_store_err)?;
+        Ok((
+            rows.into_iter()
+                .map(|row| (row.kind, row.key, row.value))
+                .collect(),
+            has_more,
+        ))
+    }
+
     /// ONE exact fact value (indexed `(session, kind, key)` lookup). Hot
     /// paths that used to full-scan the fact table use this instead.
     pub fn memory_fact_get(&self, kind: &str, key: &str) -> faktor_core::Result<Option<String>> {
@@ -219,6 +248,24 @@ impl SessionHandle {
             .store()
             .memory_fact_get(self.id, kind, key)
             .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// ONE exact fact value plus its durable CAS stamp (`updated_ms`), from
+    /// the SAME store read. Callers that must condition a write on the value
+    /// they observed (exactly-once delivery/ack) pass the stamp to
+    /// [`Self::upsert_memory_fact_cas`]: the read/compare/write is then one
+    /// writer transaction, so two consumers can never both claim one row.
+    pub fn memory_fact_get_stamped(
+        &self,
+        kind: &str,
+        key: &str,
+    ) -> faktor_core::Result<Option<(String, i64)>> {
+        Ok(self
+            .manager
+            .store()
+            .get_memory_fact(self.id, kind, key)
+            .map_err(crate::map_store_err)?
+            .map(|row| (row.value, row.updated_ms)))
     }
 
     /// One deterministic newest-first page of ONE fact kind.
@@ -286,13 +333,39 @@ impl SessionHandle {
     /// back to the full transcript, but it must never mistake corruption for
     /// "no checkpoint" and silently change context).
     pub fn context_checkpoint(&self) -> faktor_core::Result<Option<ContextCheckpoint>> {
-        let Some(head_raw) = self
+        // ONE bounded range read over the `(session, kind, key)` index, in
+        // key order. The previous implementation issued one indexed query
+        // PER chunk (up to ~1_400 round trips for the maximum payload) on
+        // every turn's history assembly.
+        let rows = self
             .manager
             .store()
-            .memory_fact_get(self.id, CONTEXT_CHECKPOINT_KIND, "head")
-            .map_err(crate::map_store_err)?
-        else {
-            return Ok(None);
+            .memory_facts_by_kind_key_ordered(
+                self.id,
+                CONTEXT_CHECKPOINT_KIND,
+                MAX_CONTEXT_CHECKPOINT_CHUNKS.saturating_add(1),
+            )
+            .map_err(crate::map_store_err)?;
+        let mut head_raw: Option<String> = None;
+        // Rows arrive in key order (`c/000000`, ... , `head`), so chunks can
+        // be validated positionally without a per-chunk map allocation.
+        let mut stored_chunks: Vec<(String, String)> = Vec::new();
+        for (key, value) in rows {
+            if key == "head" {
+                head_raw = Some(value);
+            } else {
+                stored_chunks.push((key, value));
+            }
+        }
+        let Some(head_raw) = head_raw else {
+            if stored_chunks.is_empty() {
+                return Ok(None);
+            }
+            // Orphan chunks without their head can only be corruption: the
+            // replacement is atomic, so "no checkpoint" must not hide it.
+            return Err(
+                SessionError::Malformed("context checkpoint head is missing".into()).into(),
+            );
         };
         let head: serde_json::Value = serde_json::from_str(&head_raw)
             .map_err(|e| SessionError::Malformed(format!("context checkpoint head: {e}")))?;
@@ -320,26 +393,35 @@ impl SessionHandle {
             .get("chunks")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| SessionError::Malformed("checkpoint chunk count missing".into()))?;
-        if chunks == 0 || chunks > (MAX_CONTEXT_CHECKPOINT_BYTES as u64) {
+        if chunks == 0 || chunks > MAX_CONTEXT_CHECKPOINT_CHUNKS {
             return Err(SessionError::Malformed(
                 "context checkpoint chunk count is out of bounds".into(),
             )
             .into());
         }
-        let mut payload: Vec<u8> = Vec::new();
-        for index in 0..chunks {
-            let key = format!("c/{index:06}");
-            let Some(chunk) = self
-                .manager
-                .store()
-                .memory_fact_get(self.id, CONTEXT_CHECKPOINT_KIND, &key)
-                .map_err(crate::map_store_err)?
-            else {
+        if stored_chunks.len() < chunks as usize {
+            return Err(SessionError::Malformed(format!(
+                "context checkpoint chunk c/{:06} is missing",
+                stored_chunks.len()
+            ))
+            .into());
+        }
+        if stored_chunks.len() > chunks as usize {
+            return Err(SessionError::Malformed(
+                "context checkpoint has undeclared chunk rows".into(),
+            )
+            .into());
+        }
+        let mut payload: Vec<u8> =
+            Vec::with_capacity((chunks as usize).saturating_mul(CONTEXT_CHECKPOINT_CHUNK_BYTES));
+        for (index, (key, chunk)) in stored_chunks.into_iter().enumerate() {
+            let expected = format!("c/{index:06}");
+            if key != expected {
                 return Err(SessionError::Malformed(format!(
-                    "context checkpoint chunk {key} is missing"
+                    "context checkpoint chunk order is corrupt at {expected} (found {key})"
                 ))
                 .into());
-            };
+            }
             payload.extend_from_slice(chunk.as_bytes());
             if payload.len() > MAX_CONTEXT_CHECKPOINT_BYTES {
                 return Err(SessionError::Oversized(
@@ -707,6 +789,67 @@ mod tests {
             let again = s.memory_facts_page(probe.as_ref(), 6).unwrap();
             assert_eq!(replay, again, "cursor replay is deterministic");
         }
+    }
+
+    #[test]
+    fn large_context_checkpoint_is_one_bounded_read_and_rejects_orphans() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        // ~120 chunk rows: the old reader issued one query per chunk, this
+        // one reads the indexed key range once.
+        let payload: Vec<u8> = (0..120u8)
+            .flat_map(|b| vec![b; CONTEXT_CHECKPOINT_CHUNK_BYTES])
+            .take(120 * CONTEXT_CHECKPOINT_CHUNK_BYTES)
+            .collect();
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        s.put_context_checkpoint(9, &digest, &payload).unwrap();
+        let read = s.context_checkpoint().unwrap().unwrap();
+        assert_eq!(read.payload, payload);
+        assert_eq!(
+            read.payload.len() / CONTEXT_CHECKPOINT_CHUNK_BYTES,
+            120,
+            "the read must cover every declared chunk"
+        );
+
+        // A head that declares MORE chunks than the byte bound permits is a
+        // typed refusal, never a walk of an attacker-controlled count.
+        let head = serde_json::json!({
+            "version": 1,
+            "through_seq": 9,
+            "digest": digest,
+            "payload_hash": blake3::hash(&payload).to_hex().to_string(),
+            "chunks": MAX_CONTEXT_CHECKPOINT_CHUNKS + 1,
+        })
+        .to_string();
+        m.store()
+            .upsert_memory_fact(s.id(), CONTEXT_CHECKPOINT_KIND, "head", &head)
+            .unwrap();
+        assert!(s.context_checkpoint().is_err(), "bound must be enforced");
+
+        // Orphan chunks with no head are corruption, never "no checkpoint".
+        m.store()
+            .replace_memory_facts_kind(
+                s.id(),
+                CONTEXT_CHECKPOINT_KIND,
+                &[("c/000000".to_string(), "orphan".to_string())],
+            )
+            .unwrap();
+        assert!(
+            s.context_checkpoint().is_err(),
+            "orphan chunks must fail loudly"
+        );
+
+        // Undeclared extra rows next to a valid head are corruption too.
+        let payload = b"short".to_vec();
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        s.put_context_checkpoint(10, &digest, &payload).unwrap();
+        m.store()
+            .upsert_memory_fact(s.id(), CONTEXT_CHECKPOINT_KIND, "c/999999", "extra")
+            .unwrap();
+        assert!(
+            s.context_checkpoint().is_err(),
+            "undeclared chunks must fail loudly"
+        );
     }
 
     #[test]

@@ -358,12 +358,24 @@ impl SemanticCache {
         }
         let mut inner = crate::recover_lock(&self.inner);
         inner.stats.inserts += 1;
-        if let Some(previous) = inner.map.remove(&key) {
-            inner.bytes = inner.bytes.saturating_sub(previous.bytes);
-        }
+        // Re-inserting an existing key must NOT append a second FIFO slot:
+        // the eviction loop only pops when the MAP exceeds its cap, so a hot
+        // key refreshed forever used to grow `order` without bound (an
+        // unbounded queue behind a bounded map). One slot per live key
+        // keeps `order.len() <= map.len()` at all times and preserves the
+        // documented FIFO order of first insertion.
+        let existed = match inner.map.remove(&key) {
+            Some(previous) => {
+                inner.bytes = inner.bytes.saturating_sub(previous.bytes);
+                true
+            }
+            None => false,
+        };
         inner.bytes = inner.bytes.saturating_add(bytes);
         inner.map.insert(key.clone(), CacheEntry { value, bytes });
-        inner.order.push_back(key);
+        if !existed {
+            inner.order.push_back(key);
+        }
         while inner.map.len() > MAX_SEMANTIC_CACHE_ENTRIES || inner.bytes > MAX_SEMANTIC_CACHE_BYTES
         {
             let Some(oldest) = inner.order.pop_front() else {
@@ -1251,5 +1263,38 @@ mod tests {
             MAX_SEMANTIC_CACHE_BYTES + 1,
         );
         assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn cache_reinsert_keeps_one_fifo_slot_and_exact_bytes() {
+        let cache = SemanticCache::default();
+        let key = CacheKey::WorkspaceSymbols {
+            query: "hot".into(),
+        };
+        for _ in 0..10_000 {
+            cache.insert(
+                key.clone(),
+                CachedValue::WorkspaceSymbols(WorkspaceSymbols::empty()),
+                16,
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.bytes, 16, "reinsert must not double-count bytes");
+        {
+            let inner = crate::recover_lock(&cache.inner);
+            assert_eq!(
+                inner.order.len(),
+                inner.map.len(),
+                "the FIFO queue must stay bounded by the live map (was unbounded on refresh)"
+            );
+        }
+        cache.insert(
+            key,
+            CachedValue::WorkspaceSymbols(WorkspaceSymbols::empty()),
+            64,
+        );
+        assert_eq!(cache.stats().bytes, 64);
+        assert_eq!(cache.stats().entries, 1);
     }
 }

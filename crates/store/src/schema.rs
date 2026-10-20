@@ -1232,6 +1232,18 @@ pub(crate) const MIGRATIONS: &[&str] = &[
      DROP INDEX IF EXISTS idx_ledger_entry_session_type;
      CREATE INDEX IF NOT EXISTS idx_ledger_entry_session_type_seq
         ON ledger_entry(session_id, entry_type, seq);",
+    // v41 — long-task memory paging. The generic session fact pager and the
+    // kind-scoped pager both cut `(updated_ms DESC, kind DESC, key DESC)`.
+    // Without an index whose columns ARE that total order, SQLite built a
+    // temp b-tree over every fact of the session for EVERY page (the 100k
+    // fact probe measured ~33 ms/page and ~25 ms/page respectively, i.e.
+    // quadratic over a full walk). Both are plain (non-partial) indexes so
+    // they serve every kind, including the high-churn per-turn namespaces
+    // and the `context_checkpoint` chunks.
+    "CREATE INDEX IF NOT EXISTS idx_memory_fact_session_updated
+        ON memory_fact(session_id, updated_ms DESC, kind DESC, key DESC);
+     CREATE INDEX IF NOT EXISTS idx_memory_fact_kind_updated
+        ON memory_fact(session_id, kind, updated_ms DESC, key DESC);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

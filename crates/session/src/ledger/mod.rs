@@ -229,6 +229,14 @@ pub const MAX_BOARD_SCAN_PAGE: u64 = 500;
 /// the read refuses loudly instead of returning an unbounded list.
 pub const MAX_BOARD_RECEIPTS_PER_POST: usize = 256;
 
+/// Hard cap on the board's monotonic revision (posts + resets). Board rows
+/// are PINNED across compaction — the append-only stream IS the live surface
+/// — so an unbounded revision is unbounded durable growth. The cap leaves
+/// headroom above the supported 10k-post scale test while still refusing a
+/// hostile child's unbounded flood typed; a reset consumes a revision (ids
+/// are never reused) and cannot extend the budget.
+pub const MAX_BOARD_REVISIONS: u64 = 16_384;
+
 // Durable PR/CI-fix completion-contract rows (P2): `completion_contract_set`
 // records the accepted contract of ONE task run (keyed by the task revision
 // the run started at; immutable per revision) and `completion_step_status`

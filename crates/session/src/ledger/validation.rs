@@ -837,6 +837,12 @@ pub(crate) fn validate_board_post(
             "ledger board post revision must be >= 1".into(),
         ));
     }
+    if revision > MAX_BOARD_REVISIONS {
+        return Err(SessionError::Oversized(format!(
+            "ledger board revision {revision} exceeds MAX_BOARD_REVISIONS \
+             ({MAX_BOARD_REVISIONS}); the run-family board is full"
+        )));
+    }
     if post_id != revision {
         // The durable post identity IS the revision that created it:
         // revisions are never reused (a reset consumes one), so the id is
@@ -898,6 +904,12 @@ pub(crate) fn validate_board_reset(
         return Err(SessionError::Malformed(format!(
             "ledger board reset must bump the revision by exactly one \
              ({previous_revision} -> {new_revision})"
+        )));
+    }
+    if new_revision > MAX_BOARD_REVISIONS {
+        return Err(SessionError::Oversized(format!(
+            "ledger board revision {new_revision} exceeds MAX_BOARD_REVISIONS \
+             ({MAX_BOARD_REVISIONS}); the run-family board is full"
         )));
     }
     Ok(())

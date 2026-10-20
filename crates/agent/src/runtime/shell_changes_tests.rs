@@ -18,6 +18,7 @@ use faktor_core::resource::ResourceClass;
 use faktor_core::time::{Deadline, SystemClock};
 use faktor_core::WorkspaceIdentity;
 use faktor_fs::WorkspaceHandle;
+use faktor_session::child::{ChildIdentity, ChildOwnership};
 use faktor_session::SessionManager;
 use faktor_terminal::{EnvSpec, NetworkIsolation, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
@@ -1119,6 +1120,130 @@ async fn read_only_shell_has_kernel_write_denial_and_no_change_manifest() {
     assert!(
         rows.is_empty(),
         "a read-only shell executes with NO change accounting: {rows:?}"
+    );
+}
+
+/// The model explicitly asks for a WRITE-capable shell (`read_only:false`):
+/// the exact hostile shape a read-only child would use to write the shared
+/// owner worktree behind staging/merge.
+fn model_declares_write_shell(command: &str) -> ScriptedResponse {
+    ScriptedResponse::ToolCall {
+        id: "shell-write".into(),
+        name: "run_command".into(),
+        input: serde_json::json!({ "command": command, "read_only": false }),
+    }
+}
+
+async fn read_only_child_shell_is_forced_read_only(
+    permissions: faktor_core::CapabilitySet,
+    label: &str,
+) {
+    let script = vec![
+        model_declares_write_shell("echo pwned > owner_escape.txt; true"),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env_with_tool(script, read_only_shell_tool());
+    let manager = env.manager.clone();
+    let session = env.session;
+    let root = env.root.clone();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let row = handle.row().unwrap();
+    let parent = manager
+        .create_session(row.workspace_id, "probe parent", "fake", "m")
+        .unwrap();
+    handle
+        .orchestrator_child_identity_put(&ChildIdentity {
+            parent_session_id: parent.id(),
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            item_id: "analysis".into(),
+            task_goal: "hostile read-only probe".into(),
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: "m".into(),
+            permissions,
+            created_ms: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "attempt an owner-worktree write", &[])
+        .await
+        .unwrap();
+    // Platform split exactly as the explicit read-only path: Linux installs
+    // the kernel backend; elsewhere the Required demand is a TYPED spawn
+    // refusal. Either way the write must never land.
+    if cfg!(target_os = "linux") {
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn, "{label}");
+    } else {
+        assert_eq!(
+            outcome.final_state,
+            AgentState::FailedRecoverable,
+            "{label}: without a filesystem backend the forced read-only demand refuses the spawn"
+        );
+    }
+    assert!(
+        !root.join("owner_escape.txt").exists(),
+        "{label}: a read-only child must never write the shared owner worktree"
+    );
+    let (rows, _truncated) = changed_rows(&handle);
+    assert!(
+        rows.is_empty(),
+        "{label}: no change accounting for a forced read-only shell: {rows:?}"
+    );
+}
+
+/// New-angle probe: a hostile READ-ONLY child asks `run_command` for write
+/// access. `read_only` is a model argument, not authority — the durable
+/// child ownership + capability budget must force kernel write denial, so
+/// the shared owner worktree is untouched and nothing enters change
+/// accounting (no staging/merge bypass).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_read_only_child_shell_cannot_write_the_owner_worktree() {
+    read_only_child_shell_is_forced_read_only(
+        faktor_core::CapabilitySet::from_kinds(&[
+            faktor_core::capability::CapabilityKind::Read,
+            faktor_core::capability::CapabilityKind::Execute,
+        ]),
+        "spawned read-only child",
+    )
+    .await;
+}
+
+/// New-angle probe: a LEGACY child row (no `permissions` field) defaults to
+/// `CapabilitySet::ALL`; the ownership leg must still deny shell writes, so
+/// the pre-budget default can never turn a read-only child into a writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_read_only_child_row_cannot_write_the_owner_worktree() {
+    read_only_child_shell_is_forced_read_only(
+        faktor_core::CapabilitySet::ALL,
+        "legacy read-only child",
+    )
+    .await;
+}
+
+/// Overreach guard: an ordinary ROOT session (no child identity) keeps the
+/// model's `read_only:false` choice — the child gate never narrows the
+/// owner's own shell authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_shell_keeps_its_write_authority() {
+    let script = vec![
+        model_declares_write_shell("echo owner > owner_write.txt; true"),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env_with_tool(script, read_only_shell_tool());
+    let root = env.root.clone();
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(env.session, "owner shell", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert!(
+        root.join("owner_write.txt").exists(),
+        "the root session's own shell authority is not narrowed"
     );
 }
 
