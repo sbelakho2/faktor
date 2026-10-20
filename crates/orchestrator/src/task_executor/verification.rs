@@ -721,21 +721,54 @@ pub(crate) fn persist_root_verification_fact(
     checks: &[faktor_core::state::CheckExecution],
     changed: &[String],
 ) -> Result<(), ExecError> {
+    // One memory fact value is bounded (4 KiB). A real run can carry more
+    // checks/paths than fit: the fact is a compact OBSERVATION of the verdict,
+    // so the lists are capped and the dropped counts are named explicitly
+    // (`truncated`), never silently presented as the complete set. The final
+    // string is byte-bounded even for multi-byte paths.
+    const MAX_FACT_CHECKS: usize = 12;
+    const MAX_FACT_CHANGED: usize = 8;
+    const MAX_FACT_ID_BYTES: usize = 128;
+    const MAX_FACT_PATH_BYTES: usize = 160;
+    const MAX_FACT_BYTES: usize = 4096;
+    fn bounded(value: &str, cap: usize) -> &str {
+        if value.len() <= cap {
+            return value;
+        }
+        let mut end = cap;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    }
     let last = serde_json::json!({
         "status": status,
         "checks": checks
             .iter()
+            .take(MAX_FACT_CHECKS)
             .map(|c| {
                 serde_json::json!({
-                    "id": c.check,
+                    "id": bounded(&c.check, MAX_FACT_ID_BYTES),
                     "passed": c.status == VerificationStatus::Passed,
                 })
             })
             .collect::<Vec<_>>(),
-        "changed": changed,
+        "changed": changed
+            .iter()
+            .take(MAX_FACT_CHANGED)
+            .map(|path| bounded(path, MAX_FACT_PATH_BYTES))
+            .collect::<Vec<_>>(),
+        "truncated": checks.len() > MAX_FACT_CHECKS || changed.len() > MAX_FACT_CHANGED,
+        "checkCount": checks.len(),
+        "changeCount": changed.len(),
     });
+    let rendered = last.to_string();
     handle
-        .upsert_memory_fact("verification", "last", &last.to_string())
+        .upsert_memory_fact(
+            "verification",
+            "last",
+            &rendered[..bounded(&rendered, MAX_FACT_BYTES).len()],
+        )
         .map(|_| ())
         .map_err(|e| ExecError::Internal(format!("root verification fact write: {}", e.message)))
 }

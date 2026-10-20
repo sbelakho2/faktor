@@ -165,7 +165,9 @@ function groupControls(views: readonly E8ControlView[]): string {
 }
 
 function rowMarkup(row: E8ScreenView['rows'][number]): string {
-  return `<div class="e8-row" data-row-key="${esc(row.key)}" data-row-state="${row.state}">
+  const open =
+    row.openScreen === undefined ? '' : ` data-open-screen="${esc(row.openScreen)}" role="button" tabindex="0"`;
+  return `<div class="e8-row" data-row-key="${esc(row.key)}" data-row-state="${row.state}"${open}>
     <span class="e8-row-label">${esc(row.label)}</span>
     <span class="e8-row-value" data-state="${row.state}">${esc(row.value)}</span>
   </div>`;

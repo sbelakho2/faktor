@@ -741,7 +741,12 @@ impl BrowserManager {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| BrowserError::cdp("Target.attachToTarget returned no sessionId"))?
                 .to_string();
-            for method in ["Page.enable", "Network.enable", "Runtime.enable"] {
+            for method in [
+                "Page.enable",
+                "Network.enable",
+                "Runtime.enable",
+                "Log.enable",
+            ] {
                 client
                     .send(
                         Some(&session_id),

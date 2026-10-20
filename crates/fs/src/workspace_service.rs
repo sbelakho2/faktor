@@ -306,13 +306,26 @@ pub struct WorkspaceFileService {
     next_ephemeral_id: AtomicU64,
     /// Monotonic insertion order of cached roots (eviction tie-break).
     next_cache_sequence: AtomicU64,
+    /// Process-local SCOPED roots the daemon authorized for a durable
+    /// workspace id (the live shadow/candidate root of an isolated run).
+    /// These are not cached handles and create no watcher; the entry is an
+    /// exact-root authorization checked by write engines.
+    authorized_roots: Mutex<HashMap<(WorkspaceId, PathBuf), u64>>,
+    next_authorized_sequence: AtomicU64,
 }
+
+/// A durable workspace id may have at most this many authorized scoped roots
+/// alive at once (one live shadow plus bounded crash residue). The oldest is
+/// evicted, so a long-lived daemon cannot accumulate authorizations.
+pub(crate) const MAX_AUTHORIZED_ROOTS_PER_WORKSPACE: usize = 8;
 
 impl Default for WorkspaceFileService {
     fn default() -> Self {
         Self {
             workspaces: Mutex::new(HashMap::new()),
             cache_order: Mutex::new(std::collections::BTreeMap::new()),
+            authorized_roots: Mutex::new(HashMap::new()),
+            next_authorized_sequence: AtomicU64::new(1),
             watch_registration_deadline: DEFAULT_WATCH_REGISTRATION_DEADLINE,
             watch_preflight_entries: DEFAULT_WATCH_PREFLIGHT_ENTRIES,
             next_ephemeral_id: AtomicU64::new(EPHEMERAL_WORKSPACE_ID_BASE),
@@ -589,6 +602,63 @@ impl WorkspaceFileService {
             .collect();
         roots.sort_by_key(|(sequence, _, _)| *sequence);
         roots.into_iter().map(|(_, id, path)| (id, path)).collect()
+    }
+
+    /// Authorize ONE process-local scoped root for a durable workspace id
+    /// (the live shadow/candidate root an isolated run mutates). No handle
+    /// is cached and no watcher is created; the entry only lets a write
+    /// engine prove that a scoped handle's exact canonical root belongs to
+    /// this workspace id. Bounded per id: the oldest authorization is
+    /// evicted first.
+    pub fn authorize_scoped_root(
+        &self,
+        workspace_id: WorkspaceId,
+        root: PathBuf,
+    ) -> Result<(), Error> {
+        let root = root
+            .canonicalize()
+            .map_err(|e| Error::not_found(format!("workspace root {}: {e}", root.display())))?;
+        if !root.is_dir() {
+            return Err(Error::not_found(format!(
+                "workspace root {} is not a directory",
+                root.display()
+            )));
+        }
+        let mut authorized = recover_lock(&self.authorized_roots);
+        let sequence = self
+            .next_authorized_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        authorized.insert((workspace_id, root), sequence);
+        while authorized
+            .keys()
+            .filter(|(id, _)| *id == workspace_id)
+            .count()
+            > MAX_AUTHORIZED_ROOTS_PER_WORKSPACE
+        {
+            let oldest = authorized
+                .iter()
+                .filter(|((id, _), _)| *id == workspace_id)
+                .min_by_key(|(_, sequence)| **sequence)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            authorized.remove(&oldest);
+        }
+        Ok(())
+    }
+
+    /// True when `root` is the EXACT canonical root of `workspace_id`:
+    /// either a cached durable root or an explicitly authorized scoped root.
+    /// This is the write-engine containment check (a handle from a foreign
+    /// registry or an unauthorized root is refused).
+    pub fn owns_root(&self, workspace_id: WorkspaceId, root: &std::path::Path) -> bool {
+        let canonical = root.canonicalize().ok();
+        let Some(canonical) = canonical else {
+            return false;
+        };
+        if recover_lock(&self.workspaces).contains_key(&(workspace_id, canonical.clone())) {
+            return true;
+        }
+        recover_lock(&self.authorized_roots).contains_key(&(workspace_id, canonical))
     }
 
     /// The handle registered for `workspace_id`, if open (idle unload

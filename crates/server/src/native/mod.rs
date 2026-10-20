@@ -60,6 +60,7 @@ pub(crate) use foundation_r8 as r8;
 /// instruction precedence/editing) layered beside the foundation routes.
 pub(crate) mod instructions;
 pub(crate) mod longtask;
+pub(crate) mod lsp;
 pub(crate) mod models;
 /// The Engineering Outcome Ledger read surface (economic audit item 7,
 /// additive): `GET /native/outcomes` — durable completed-run metrics and a

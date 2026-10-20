@@ -101,6 +101,9 @@ internal val HOST_CONTROLS: Set<String> = setOf(
     "D-08", "D-09", "D-10", "D-11", "D-14"
 )
 
+/** Screens whose served proof receipts are rendered below the controls. */
+internal val PROOF_SCREENS: Set<String> = setOf("S45", "S46", "S48")
+
 internal object Edition8ScreenRegistry {
 
     val screenIds: List<String> = Edition8Registry.screens.map { it.id }
@@ -277,6 +280,7 @@ internal class Edition8ScreenPanel(
         a11y("${screen.id} native snapshot", "Bounded daemon response for ${screen.title}.")
     }
     private val detailScroll = insetScroll(detail)
+    private val receipts = pageColumn(gap = Spacing.XS, padding = 0)
     private val primary: JButton = primaryButton(screen.primaryAction.removeSuffix(" · JetBrains: OK / Apply"))
     private val apply: JButton = secondaryButton("Apply settings")
     private val back: JButton = secondaryButton("Back")
@@ -315,6 +319,7 @@ internal class Edition8ScreenPanel(
         back.addActionListener { host.navigate?.invoke("S01") ?: setStatus("Back is a host navigation action", SemanticState.DIM) }
         installEscape()
         loadConfigIfNeeded()
+        loadProofReceipts()
     }
 
     private fun buildHeader(): JComponent {
@@ -422,6 +427,11 @@ internal class Edition8ScreenPanel(
             "Every row names its apply timing and source. Read calls the exact served contract; " +
                 "a route absent from the daemon stays a typed contract gap, never a green state."
         ))
+        if (screen.id in PROOF_SCREENS) {
+            column.add(vSpace(Spacing.M))
+            column.add(sectionHeader("Served proof receipts"))
+            column.add(receipts)
+        }
         return column
     }
 
@@ -432,6 +442,110 @@ internal class Edition8ScreenPanel(
             add(wrapRow(apply, back), BorderLayout.WEST)
             add(mutedLabel("OK / Cancel / Apply: staging is local; Apply is atomic."), BorderLayout.EAST)
         }
+
+    /** F260/F261: render the SERVED proof receipts, never a fabricated one. */
+    private fun loadProofReceipts() {
+        if (screen.id !in PROOF_SCREENS) return
+        receipts.removeAll()
+        if (!daemon.hasTask()) {
+            receipts.add(mutedLabel("No task is bound; task proof receipts are task-scoped."))
+            receipts.revalidate()
+            receipts.repaint()
+            return
+        }
+        receipts.add(mutedLabel("Reading the task proof…"))
+        receipts.revalidate()
+        receipts.repaint()
+        daemon.taskProof { result ->
+            if (closed) return@taskProof
+            receipts.removeAll()
+            when (result) {
+                is Edition8Result.Ok -> {
+                    val proof = try {
+                        JsonCodec.parse(result.body).view("proof")
+                    } catch (failure: Throwable) {
+                        receipts.add(mutedLabel("Unavailable — malformed proof: ${Edition8Work.describe(failure)}"))
+                        receipts.revalidate()
+                        receipts.repaint()
+                        return@taskProof
+                    }
+                    var rendered = 0
+                    if (screen.id == "S45" || screen.id == "S46") {
+                        val criteria = proof.optionalField("criteria")
+                            ?.optionalField("items")?.array().orEmpty()
+                        for (item in criteria.take(40)) {
+                            val key = item.optionalField("criterionKey")?.string()
+                                ?: item.optionalField("criterionId")?.string() ?: "criterion"
+                            val verdict = item.optionalField("verdict")?.string() ?: "pending"
+                            val evidence = item.optionalField("evidence")?.string()
+                            if (screen.id == "S46" && evidence == null) continue
+                            val text = if (evidence == null) "$key · $verdict" else "$key · $verdict · $evidence"
+                            val button = secondaryButton(bound(text, 180))
+                            button.name = "edition8-proof-" + key.filter { it.isLetterOrDigit() || it == '-' }.take(40)
+                            button.a11y(
+                                "Open proof receipt for $key",
+                                "Shows the served evidence/provenance for $key; no value is invented."
+                            )
+                            button.addActionListener {
+                                detail.text = bound(item.rawJson(), 4000)
+                                setStatus("Receipt — $key · $verdict", SemanticState.POSITIVE)
+                                if (screen.id == "S45") host.navigate?.invoke("S46")
+                            }
+                            receipts.add(button)
+                            rendered += 1
+                        }
+                    }
+                    if (screen.id == "S46" || screen.id == "S48") {
+                        val completion = proof.optionalField("completion")
+                        val steps = completion?.optionalField("records")?.array().orEmpty()
+                        for (step in steps.take(40)) {
+                            val name = step.optionalField("step")?.string() ?: "step"
+                            val status = step.optionalField("status")?.string() ?: "missing"
+                            val snapshot = step.optionalField("snapshot")?.string()
+                            val button = secondaryButton(bound("$name · $status" + if (snapshot == null) "" else " · $snapshot", 180))
+                            button.name = "edition8-step-" + name.filter { it.isLetterOrDigit() || it == '-' }.take(40)
+                            button.a11y(
+                                "Open completion-step receipt $name",
+                                "Shows the durable step row; a missing row stays missing."
+                            )
+                            button.addActionListener {
+                                detail.text = bound(step.rawJson(), 4000)
+                                setStatus("Receipt — $name · $status", SemanticState.POSITIVE)
+                            }
+                            receipts.add(button)
+                            rendered += 1
+                        }
+                    }
+                    if (screen.id == "S48") {
+                        val publication = proof.optionalField("publication")
+                        val commit = publication?.optionalField("commitOid")?.string()
+                        val remote = publication?.optionalField("remoteRef")?.string()
+                        val local = publication?.optionalField("localRef")?.string()
+                        val pr = publication?.optionalField("pullRequest")
+                        for ((label, value) in listOf(
+                            "Finish receipt" to commit,
+                            "Local ref" to local,
+                            "SCM target" to remote,
+                            "Pull request" to (pr?.optionalField("state")?.string()?.let {
+                                (pr.optionalField("id")?.string() ?: "PR") + " · " + it
+                            })
+                        )) {
+                            if (value == null) continue
+                            receipts.add(mutedLabel("$label: $value"))
+                            rendered += 1
+                        }
+                    }
+                    if (rendered == 0) {
+                        receipts.add(mutedLabel("No required check or evidence receipt is served for this task."))
+                    }
+                }
+                is Edition8Result.Failed -> receipts.add(mutedLabel("Unavailable — ${result.reason}"))
+                is Edition8Result.Refused -> receipts.add(mutedLabel("Disabled — ${result.reason}"))
+            }
+            receipts.revalidate()
+            receipts.repaint()
+        }
+    }
 
     private fun installEscape() {
         val key = KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0)

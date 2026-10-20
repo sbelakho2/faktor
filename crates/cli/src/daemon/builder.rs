@@ -1418,6 +1418,7 @@ pub(crate) fn build_daemon_core(
         session: session.clone(),
         supervisor: supervisor.clone(),
         embedder: semantic_embedder,
+        lsp: Arc::new(faktor_lsp::LspManager::new(supervisor.clone())),
     };
     let semantic =
         graph::semantic_registry(&semantic, &supervisor, &transport, Some(&semantic_sources))?;
@@ -1679,6 +1680,7 @@ pub(crate) fn build_daemon_core(
         verification_providers: verification_providers.registry,
         kiwi_verification: verification_providers.kiwi,
         semantic,
+        lsp: semantic_sources.lsp.clone(),
         learning,
         memory,
         tokenizers,

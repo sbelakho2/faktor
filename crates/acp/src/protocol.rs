@@ -393,38 +393,39 @@ pub(crate) fn parse_frame_detailed(
             continue;
         }
         lines += 1;
+        // Every HEADER-level violation is fatal: without a trustworthy
+        // Content-Length the body boundary is unknown, so discarding only
+        // the header would desync the stream and misparse the next valid
+        // frame. A clean close is the only honest recovery.
         if lines > MAX_HEADER_LINES {
-            return Err(FrameError::recoverable(
-                format!("more than {MAX_HEADER_LINES} header lines"),
-                header_end,
-            ));
+            return Err(FrameError::fatal(format!(
+                "more than {MAX_HEADER_LINES} header lines"
+            )));
         }
         let colon = line.iter().position(|b| *b == b':').ok_or_else(|| {
-            FrameError::recoverable(
-                format!("malformed header line: {:?}", String::from_utf8_lossy(line)),
-                header_end,
-            )
+            FrameError::fatal(format!(
+                "malformed header line: {:?}",
+                String::from_utf8_lossy(line)
+            ))
         })?;
         let (name, value) = (&line[..colon], line[colon + 1..].trim_ascii());
         if name.eq_ignore_ascii_case(&b"content-length"[..]) {
             if content_length.is_some() {
-                return Err(FrameError::recoverable(
-                    "duplicate Content-Length header",
-                    header_end,
-                ));
+                return Err(FrameError::fatal("duplicate Content-Length header"));
             }
             let text = std::str::from_utf8(value)
-                .map_err(|_| FrameError::recoverable("Content-Length is not ASCII", header_end))?;
-            let n: u64 = text.trim().parse().map_err(|_| {
-                FrameError::recoverable(format!("invalid Content-Length: {text:?}"), header_end)
-            })?;
+                .map_err(|_| FrameError::fatal("Content-Length is not ASCII"))?;
+            let n: u64 = text
+                .trim()
+                .parse()
+                .map_err(|_| FrameError::fatal(format!("invalid Content-Length: {text:?}")))?;
             content_length = Some(n);
         }
         // Unknown headers are tolerated and ignored (LSP/MCP convention).
     }
 
-    let declared = content_length
-        .ok_or_else(|| FrameError::recoverable("missing Content-Length header", header_end))?;
+    let declared =
+        content_length.ok_or_else(|| FrameError::fatal("missing Content-Length header"))?;
     if declared > MAX_FRAME_BYTES as u64 {
         // Hostile declaration: refusing the connection is the only bounded
         // answer (the declared body may never actually arrive).

@@ -19,6 +19,7 @@ use crate::capture::{
     bound_bytes, bound_text, redact_url_query_values, CaptureLimits, CapturedBytes, CapturedText,
 };
 use crate::cdp::{CdpClient, CdpEvent, EventStreamError, SessionEvents};
+use crate::console::{ConsoleObservation, ConsoleTracker};
 use crate::download::{is_response_stage, DownloadManager, DownloadOutcome};
 use crate::error::{BrowserError, VerificationKind};
 use crate::interception::Interceptor;
@@ -123,6 +124,7 @@ pub(crate) struct PageInner {
     session_id: String,
     client: CdpClient,
     tracker: Mutex<NetworkTracker>,
+    console: Mutex<ConsoleTracker>,
     interceptor: Interceptor,
     downloads: Arc<DownloadManager>,
     capture: CaptureLimits,
@@ -134,6 +136,10 @@ pub(crate) struct PageInner {
     state: Mutex<PageState>,
     lifecycle: watch::Sender<Lifecycle>,
     last_navigation_error: Mutex<Option<String>>,
+    /// Explicit typed navigation failure (download denial, verification
+    /// signal). Preferred over the generic closed error when the watchdog
+    /// transitions the page to `Failed`.
+    navigation_failure: Mutex<Option<BrowserError>>,
     closed: AtomicBool,
     /// Set when the critical event stream failed: the page state is
     /// unknowable and every subsequent complete-history query refuses.
@@ -216,6 +222,7 @@ impl Page {
             session_id,
             client,
             tracker: Mutex::new(NetworkTracker::new(network)),
+            console: Mutex::new(ConsoleTracker::new(capture.max_console_records)),
             interceptor,
             downloads,
             capture,
@@ -223,6 +230,7 @@ impl Page {
             state: Mutex::new(PageState::Open),
             lifecycle,
             last_navigation_error: Mutex::new(None),
+            navigation_failure: Mutex::new(None),
             closed: AtomicBool::new(false),
             critical_failure: Mutex::new(None),
             host,
@@ -290,6 +298,14 @@ impl Page {
         Ok(faktor_core::lock::recover(&self.inner.tracker).requests())
     }
 
+    /// Bounded console snapshot in observation order. Refuses typed once
+    /// the observation stream lost events (same completeness contract as
+    /// [`Page::network`]).
+    pub fn console(&self) -> Result<Vec<ConsoleObservation>, BrowserError> {
+        self.ensure_history_complete()?;
+        Ok(faktor_core::lock::recover(&self.inner.console).records())
+    }
+
     /// The typed error to surface when this page's event history is
     /// incomplete (critical stream failure, or a lost observation event).
     fn history_error(&self) -> Option<BrowserError> {
@@ -317,6 +333,13 @@ impl Page {
         self.inner.downloads.last_error()
     }
 
+    /// Bounded profile-scoped download records (announcements, denials and
+    /// captures). This is the observation surface for default-deny: a
+    /// denied attachment is recorded with its sanitized filename.
+    pub fn download_records(&self) -> Vec<crate::download::DownloadRecord> {
+        self.inner.downloads.records()
+    }
+
     /// Navigate and wait for the load lifecycle. Cancellation stops loading,
     /// releases the page, and returns `Cancelled`; the browser process stays
     /// healthy.
@@ -329,6 +352,7 @@ impl Page {
         self.ensure_open()?;
         self.set_state(PageState::Navigating);
         *faktor_core::lock::recover(&self.inner.last_navigation_error) = None;
+        *faktor_core::lock::recover(&self.inner.navigation_failure) = None;
         // Reset the observable lifecycle for THIS navigation and hold a live
         // subscription across the command. `watch::Sender::send` silently
         // drops values whenever no receiver exists, and the browser may emit
@@ -673,6 +697,9 @@ impl Page {
     /// surfaced before the generic "closed" state so callers can distinguish
     /// unknowable state from an orderly close.
     fn failure_error(&self) -> BrowserError {
+        if let Some(error) = faktor_core::lock::recover(&self.inner.navigation_failure).clone() {
+            return error;
+        }
         self.history_error().unwrap_or_else(|| self.closed_error())
     }
 
@@ -753,6 +780,13 @@ impl PageInner {
             }
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Classify a probe JSON object. Priority: rate limit > captcha > slider >
@@ -866,6 +900,15 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
                 {
                     Ok(DownloadOutcome::Continued) => {}
                     Ok(DownloadOutcome::Denied { url }) => {
+                        // A denied attachment during a navigation is the
+                        // navigation's terminal outcome: the document never
+                        // loads, so waiting for `loadEventFired` would park
+                        // the caller until its deadline.
+                        if *faktor_core::lock::recover(&inner.state) == PageState::Navigating {
+                            *faktor_core::lock::recover(&inner.navigation_failure) =
+                                Some(BrowserError::DownloadBlocked { url: url.clone() });
+                            let _ = inner.lifecycle.send_replace(Lifecycle::Failed);
+                        }
                         tracing::info!(url = %crate::capture::redact_url(&url), "download denied at the response stage");
                     }
                     Ok(DownloadOutcome::Captured { path, bytes }) => {
@@ -889,6 +932,33 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
                 }
             }
         }
+        "Runtime.consoleAPICalled" | "Log.entryAdded" | "Runtime.exceptionThrown" => {
+            faktor_core::lock::recover(&inner.console).apply(&event, now_ms());
+        }
+        "Browser.downloadWillBegin" | "Browser.downloadProgress" => {
+            // Browser-domain events carry no session id; accept only the
+            // ones naming THIS page and only while a navigation is waiting,
+            // so a JS-triggered download of a settled page is never
+            // retroactively turned into a navigation failure.
+            let page_id = event
+                .params
+                .get("pageId")
+                .or_else(|| event.params.get("pageTargetId"))
+                .and_then(Value::as_str);
+            if page_id == Some(inner.target_id.as_str()) {
+                let url = event
+                    .params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if *faktor_core::lock::recover(&inner.state) == PageState::Navigating {
+                    *faktor_core::lock::recover(&inner.navigation_failure) =
+                        Some(BrowserError::DownloadBlocked { url });
+                    let _ = inner.lifecycle.send_replace(Lifecycle::Failed);
+                }
+            }
+        }
         "Page.frameNavigated" => {
             let is_main = event
                 .params
@@ -905,15 +975,6 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
         }
         "Page.loadEventFired" => {
             let _ = inner.lifecycle.send_replace(Lifecycle::Loaded);
-        }
-        "Runtime.exceptionThrown" => {
-            let text = event
-                .params
-                .get("exceptionDetails")
-                .and_then(|details| details.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or("uncaught exception");
-            tracing::debug!(text, "page javascript exception");
         }
         _ => {}
     }

@@ -2011,6 +2011,24 @@ fn detect_build_systems(files: &[&RepositoryFile]) -> Vec<String> {
     systems.into_iter().map(str::to_string).collect()
 }
 
+/// Discover the cargo test selectors authored inline in ONE Rust file, using
+/// the exact path layout rules the contract compiler applies (`tests/<name>`
+/// integration targets and `src/**` module trees). This is the shared
+/// authority for the compiler's test obligations and the verifier's derived
+/// test checks: a selector the contract can demand must be executable.
+pub fn rust_test_selectors_for_path(path: &str, content: &str) -> Vec<String> {
+    if !path.ends_with(".rs") || content.len() > MAX_FILE_CONTENT_BYTES {
+        return Vec::new();
+    }
+    let Some(module) = rust_module_path(path) else {
+        return Vec::new();
+    };
+    extract_test_selectors(&module, content)
+        .into_iter()
+        .filter(|selector| selector.len() <= MAX_SELECTOR_BYTES)
+        .collect()
+}
+
 /// One discovered test selector.
 struct DiscoveredTest {
     selector: String,

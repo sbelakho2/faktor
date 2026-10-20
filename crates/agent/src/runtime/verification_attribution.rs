@@ -2388,7 +2388,7 @@ impl AgentRuntime {
         let profile = faktor_verify::derive::detect_project_profile(root, &repo_files);
         let changed_paths: Vec<std::path::PathBuf> =
             changed.iter().map(std::path::PathBuf::from).collect();
-        let specs = faktor_verify::derive::derive_checks(&profile, &changed_paths)
+        let specs = faktor_verify::derive::derive_checks_at_root(&profile, &changed_paths, root)
             .map_err(|e| format!("verification derivation refused: {e}"))?;
         if specs.is_empty() {
             return Err("no derived checks apply to the integrated change".into());
@@ -2763,7 +2763,7 @@ impl AgentRuntime {
         let profile = faktor_verify::derive::detect_project_profile(root, repo_files);
         let changed_paths: Vec<std::path::PathBuf> =
             changed.iter().map(std::path::PathBuf::from).collect();
-        let specs = faktor_verify::derive::derive_checks(&profile, &changed_paths)
+        let specs = faktor_verify::derive::derive_checks_at_root(&profile, &changed_paths, root)
             .map_err(|e| format!("verification derivation refused: {e}"))?;
         if specs.is_empty() {
             return Err("no derived checks apply to the integrated change".into());
@@ -3579,49 +3579,25 @@ impl AgentRuntime {
         // decoded criterion TEXTS agree. The representation may legitimately
         // move (legacy plain text -> typed V2 JSON on migration) without
         // being a divergence; a tampered criterion text still refuses.
-        if criteria_texts_agree(&fact, &criteria_canonical_text(&row_criteria)) {
+        let canonical = criteria_canonical_text(&row_criteria);
+        if criteria_texts_agree(&fact, &canonical) {
             return Ok(None);
         }
-        let detail = format!(
-            "durable criteria rows disagree: memory fact criteria/0 is {:?}; the typed task row carries {:?} — refusing the completion claim",
-            truncate(&fact, 300),
-            truncate(&criteria_canonical_text(&row_criteria), 300),
+        // The TYPED row is the durable authority (it was written by the
+        // derivation transaction). A legacy client-criteria fact that the
+        // first mutating turn replaced, or a crash window between the row
+        // and fact writes, is HEALED here rather than deadlocking every
+        // later completion with CriteriaInconsistent. A hostile fact is
+        // overwritten by the same authority; the row itself is never
+        // rewritten from the fact.
+        handle.upsert_memory_fact("criteria", "0", &canonical)?;
+        tracing::warn!(
+            session = %handle.id(),
+            previous = %truncate(&fact, 300),
+            healed = %truncate(&canonical, 300),
+            "durable criteria row diverged from the typed task row; converged the fact to the typed row"
         );
-        if gate.is_none() {
-            tracing::warn!(
-                session = %handle.id(),
-                "durable criteria divergence without a completion claim; the next mutating derivation converges the row: {detail}"
-            );
-            return Ok(None);
-        }
-        tracing::error!(session = %handle.id(), "{detail}");
-        let criteria_reason = OutcomeReason::new(ReasonCode::CriteriaInconsistent, detail);
-        // Keep the gate kind the checks produced and ADD the divergence
-        // reason: a machine must see the check verdict AND the row
-        // corruption — never one silently overwriting the other.
-        match gate {
-            Some(CompletionGate::VerifiedComplete) | Some(CompletionGate::Unverified) => {
-                Ok(Some(CompletionGate::BlockedVerification {
-                    reasons: vec![criteria_reason],
-                }))
-            }
-            Some(CompletionGate::VerificationPending) => {
-                // Jobs are open and certify nothing yet: the pending gate
-                // stands (the settlement turn re-checks the divergence when
-                // the real gate lands — a completion can never certify over
-                // inconsistent durable criteria).
-                Ok(Some(CompletionGate::VerificationPending))
-            }
-            Some(CompletionGate::BlockedVerification { mut reasons }) => {
-                reasons.push(criteria_reason);
-                Ok(Some(CompletionGate::BlockedVerification { reasons }))
-            }
-            Some(CompletionGate::FailedVerification { mut reasons }) => {
-                reasons.push(criteria_reason);
-                Ok(Some(CompletionGate::FailedVerification { reasons }))
-            }
-            None => Ok(None),
-        }
+        Ok(gate)
     }
 }
 

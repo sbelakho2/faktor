@@ -70,6 +70,10 @@ pub struct ServerDeps {
     /// `/native/semantic/{status,capabilities}`. `None` = no provider is
     /// configured; the endpoints report the fallback registry shape.
     pub semantic: Option<Arc<faktor_semantic::registry::SemanticProviderRegistry>>,
+    /// The daemon's ONE workspace-scoped language-server manager. `None` in
+    /// embedded hosts without a supervisor: the native LSP diagnostics and
+    /// code-action routes answer a typed 409 `lsp_disabled`.
+    pub lsp: Option<Arc<faktor_lsp::LspManager>>,
     /// Live chunk stream from the agent (audit round 11). The native
     /// surface is durable and journal-driven (clients page
     /// `/native/events` and `/native/messages`), so no live subscriber
@@ -265,6 +269,7 @@ impl ServerDeps {
             snapshots: None,
             evidence: None,
             semantic: None,
+            lsp: None,
             chunk_rx: None,
             simulate_not_ready: false,
             control_plane: None,
@@ -343,6 +348,13 @@ impl ServerDeps {
         registry: Arc<faktor_semantic::registry::SemanticProviderRegistry>,
     ) -> Self {
         self.semantic = Some(registry);
+        self
+    }
+
+    /// Wire the daemon's ONE language-server manager. Additive: without it
+    /// `/native/lsp/*` answers a typed 409 `lsp_disabled`.
+    pub fn with_lsp(mut self, lsp: Arc<faktor_lsp::LspManager>) -> Self {
+        self.lsp = Some(lsp);
         self
     }
 

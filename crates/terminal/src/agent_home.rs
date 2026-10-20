@@ -200,9 +200,47 @@ impl ProcessSupervisor {
         };
         let home = ensure_agent_scratch_home(&settings.base, scratch)?;
         let mut env = cfg.env.resolve();
+        // Rustup resolves its default toolchain through `$RUSTUP_HOME` (or
+        // the real HOME). The scratch rewrite below would otherwise point an
+        // unset RUSTUP_HOME/CARGO_HOME at an empty scratch home, making every
+        // derived `cargo` check fail with "no default toolchain configured".
+        // Preserve the DAEMON's approved toolchain homes when the spec did
+        // not already carry them; credentials are not part of this anchor.
+        preserve_toolchain_homes(&mut env);
         faktor_core::command::apply_scratch_home(&mut env, &home);
         cfg.env = EnvSpec::Explicit(env);
         Ok(())
+    }
+}
+
+/// Preserve the daemon's approved Rust toolchain homes across the scratch
+/// HOME rewrite. Only real, existing directories are added, and an explicit
+/// value in the spec always wins.
+fn preserve_toolchain_homes(env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+    let looks_like = |name: &std::ffi::OsStr, expected: &str| {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+    };
+    let real_home = env
+        .iter()
+        .find(|(name, _)| looks_like(name, "HOME"))
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .or_else(|| {
+            env.iter()
+                .find(|(name, _)| looks_like(name, "USERPROFILE"))
+                .map(|(_, value)| std::path::PathBuf::from(value))
+        });
+    let Some(real_home) = real_home else {
+        return;
+    };
+    for (name, subpath) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+        if env.iter().any(|(existing, _)| looks_like(existing, name)) {
+            continue;
+        }
+        let candidate = real_home.join(subpath);
+        if candidate.is_dir() {
+            env.push((name.into(), candidate.into_os_string()));
+        }
     }
 }
 

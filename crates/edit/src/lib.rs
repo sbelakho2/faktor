@@ -393,8 +393,7 @@ impl EditEngine {
     fn require_owned_workspace(&self, workspace: &WorkspaceHandle) -> Result<(), Error> {
         let owned = self
             .fs
-            .registered_handle(workspace.workspace_id())
-            .is_some_and(|registered| registered.root() == workspace.root());
+            .owns_root(workspace.workspace_id(), workspace.root());
         if owned {
             Ok(())
         } else {
@@ -1456,6 +1455,48 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Permission, "{err}");
         assert!(err.message.contains("not registered"), "{err}");
         assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"one");
+    }
+
+    /// An ISOLATED run mutates a scoped candidate root. The daemon
+    /// authorizes that EXACT root for the durable workspace id before the
+    /// scoped handle exists, so the engine accepts it and the edit lands in
+    /// the candidate (never the owner checkout). A root the daemon did not
+    /// authorize is still refused.
+    #[test]
+    fn authorized_scoped_candidate_root_is_editable_but_unauthorized_is_not() {
+        let (dir, service, owner, identity) = fixture();
+        fs::write(owner.root().join("a.txt"), b"one").unwrap();
+        let candidate_root = dir.path().join("candidate");
+        fs::create_dir_all(&candidate_root).unwrap();
+        fs::write(candidate_root.join("a.txt"), b"one").unwrap();
+        let unauthorized =
+            faktor_fs::WorkspaceHandle::open_scoped(WorkspaceId::new(1), candidate_root.clone())
+                .unwrap();
+        let engine = EditEngine::new(service.clone());
+        let r = req(
+            "a.txt",
+            b"one",
+            vec![EditOp::SearchReplace {
+                before: "one".into(),
+                after: "two".into(),
+            }],
+        );
+        let err = engine
+            .apply(&unauthorized, &identity, &r, RepairMode::Rollback)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+
+        service
+            .authorize_scoped_root(WorkspaceId::new(1), candidate_root.clone())
+            .unwrap();
+        let candidate =
+            faktor_fs::WorkspaceHandle::open_scoped(WorkspaceId::new(1), candidate_root.clone())
+                .unwrap();
+        engine
+            .apply(&candidate, &identity, &r, RepairMode::Rollback)
+            .unwrap();
+        assert_eq!(fs::read(candidate_root.join("a.txt")).unwrap(), b"two");
+        assert_eq!(fs::read(owner.root().join("a.txt")).unwrap(), b"one");
     }
 
     /// Adversarial: an idle-unloaded workspace (the service removed the

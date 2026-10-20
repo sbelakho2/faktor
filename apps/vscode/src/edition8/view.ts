@@ -53,6 +53,8 @@ export interface E8Row {
   readonly label: string;
   readonly value: string;
   readonly state: 'served' | 'unavailable' | 'warning' | 'error' | 'pending' | 'verified' | 'waiting';
+  /** Optional exact screen this served receipt opens (F260/F261 drill-down). */
+  readonly openScreen?: string;
 }
 
 export interface E8ScreenView {
@@ -288,12 +290,19 @@ export function controlView(
 
 // --------------------------------------------------------------- screen rows
 
-function row(key: string, label: string, value: string | null, state: E8Row['state'] = 'served'): E8Row {
+function row(
+  key: string,
+  label: string,
+  value: string | null,
+  state: E8Row['state'] = 'served',
+  openScreen?: string,
+): E8Row {
   return {
     key,
     label,
     value: value === null || value.length === 0 ? 'Unavailable' : value,
     state: value === null || value.length === 0 ? 'unavailable' : state,
+    ...(openScreen === undefined ? {} : { openScreen }),
   };
 }
 
@@ -340,17 +349,25 @@ function proofText(snapshot: E8Snapshot): string | null {
   return `${state ?? 'pending'}${gate === null ? '' : ` · gate ${gate}`}`;
 }
 
-function criteriaRows(snapshot: E8Snapshot, prefix: string, cap: (key: string, label: string, value: string | null, state?: E8Row['state']) => void): void {
+function criteriaRows(
+  snapshot: E8Snapshot,
+  prefix: string,
+  cap: (key: string, label: string, value: string | null, state?: E8Row['state'], openScreen?: string) => void,
+): void {
   const criteria = list(objectAt(snapshot.proof, 'criteria'), 'criteria');
-  for (const [index, entry] of criteria.slice(0, 20).entries()) {
-    const id = text(entry, 'id', 'criterionId') ?? `AC-${String(index + 1).padStart(2, '0')}`;
+  for (const [index, entry] of criteria.slice(0, 40).entries()) {
+    const id =
+      text(entry, 'id', 'criterionId', 'criterionKey') ??
+      `AC-${String(index + 1).padStart(2, '0')}`;
     const verdict = text(entry, 'verdict', 'status') ?? 'pending';
-    const title = text(entry, 'title', 'text', 'description') ?? '';
+    const title = text(entry, 'title', 'text', 'requirement', 'description') ?? '';
+    const evidence = text(entry, 'evidence');
     cap(
       `${prefix}-criterion-${index}`,
       id,
-      `${title}${title.length > 0 ? ' · ' : ''}${verdict}`,
+      `${title}${title.length > 0 ? ' · ' : ''}${verdict}${evidence === null ? '' : ` · evidence ${evidence}`}`,
       verdict === 'pass' ? 'verified' : verdict === 'fail' ? 'error' : 'pending',
+      'S46',
     );
   }
 }
@@ -358,8 +375,14 @@ function criteriaRows(snapshot: E8Snapshot, prefix: string, cap: (key: string, l
 function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly E8Row[] {
   if (snapshot === null) return [];
   const rows: E8Row[] = [];
-  const cap = (key: string, label: string, value: string | null, state: E8Row['state'] = 'served') => {
-    if (rows.length < 140) rows.push(row(key, label, value, state));
+  const cap = (
+    key: string,
+    label: string,
+    value: string | null,
+    state: E8Row['state'] = 'served',
+    openScreen?: string,
+  ) => {
+    if (rows.length < 160) rows.push(row(key, label, value, state, openScreen));
   };
   const values = configValues(snapshot.config);
   const config = (key: string): string | null => {
@@ -506,10 +529,37 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
       criteriaRows(snapshot, 'required', cap);
       cap('gate', 'Gate', text(objectAt(snapshot.proof, 'gate'), 'status', 'reason'));
       return rows;
-    case 'S46':
-      cap('evidence', 'Evidence', text(objectAt(snapshot.proof, 'evidence'), 'id', 'digest') ?? 'No evidence detail is served.');
+    case 'S46': {
+      const criteria = list(objectAt(snapshot.proof, 'criteria'), 'criteria');
+      let receipts = 0;
+      for (const [index, entry] of criteria.slice(0, 40).entries()) {
+        const evidence = text(entry, 'evidence');
+        if (evidence === null) continue;
+        receipts += 1;
+        const verdict = text(entry, 'verdict', 'status') ?? 'pending';
+        const key = text(entry, 'criterionKey', 'criterionId', 'id') ?? `AC-${index + 1}`;
+        cap(
+          `receipt-${index}`,
+          key,
+          `${verdict} · ${evidence}`,
+          verdict === 'pass' ? 'verified' : verdict === 'fail' ? 'error' : 'pending',
+        );
+      }
+      const records = list(objectAt(snapshot.proof, 'completion'), 'records', 'steps');
+      for (const [index, entry] of records.slice(0, 40).entries()) {
+        receipts += 1;
+        cap(
+          `step-receipt-${index}`,
+          text(entry, 'step') ?? `Step ${index + 1}`,
+          `${text(entry, 'status') ?? 'missing'}${text(entry, 'detail') === null ? '' : ` · ${text(entry, 'detail')}`}${text(entry, 'snapshot') === null ? '' : ` · ${text(entry, 'snapshot')}`}`,
+          text(entry, 'status') === 'pass' ? 'verified' : 'pending',
+        );
+      }
+      cap('receipt-count', 'Receipts', String(receipts));
       cap('excerpt', 'Bounded excerpt', text(objectAt(snapshot.proof, 'evidence'), 'excerpt') ?? 'Open full output opens the bounded artifact.');
+      if (receipts === 0) cap('evidence-none', 'Evidence', 'No evidence receipt is served for this task.', 'unavailable');
       return rows;
+    }
     case 'S47':
       cap('proof', 'Proof identity', text(snapshot.proof, 'verifiedDigest', 'candidateDigest'));
       cap('current', 'Current candidate', text(snapshot.verification, 'candidateDigest', 'digest'));
@@ -520,12 +570,40 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
       cap('preconditions', 'Changed preconditions', text(objectAt(snapshot.verification, 'conflict'), 'path', 'precondition'));
       cap('edits', 'User edits', 'Preserved; restore/integration refuses changed preconditions.');
       return rows;
-    case 'S48':
-      cap('finish', 'Requested finish', config('faktor.completion.level') ?? text(objectAt(snapshot.proof, 'publication'), 'requested'));
-      cap('receipt', 'Finish receipt', text(objectAt(snapshot.proof, 'publication'), 'receipt', 'commit'));
-      cap('scm', 'SCM', text(objectAt(snapshot.proof, 'integration'), 'remote', 'repo') ?? 'Unavailable');
-      cap('blocked', 'Blocker', text(objectAt(snapshot.proof, 'gate'), 'reason'));
+    case 'S48': {
+      const publication = objectAt(snapshot.proof, 'publication');
+      const completion = objectAt(snapshot.proof, 'completion');
+      const steps = list(completion, 'steps');
+      const levels = ['local', 'commit', 'push', 'pull_request', 'pr'];
+      const seen = new Set<string>();
+      for (const [index, step] of steps.slice(0, 24).entries()) {
+        const name = (text(step, 'step') ?? `step-${index}`).toLowerCase();
+        if (!levels.some((level) => name.includes(level))) continue;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        cap(
+          `finish-${index}`,
+          text(step, 'step') ?? name,
+          `${text(step, 'status') ?? 'missing'}${text(step, 'detail') === null ? '' : ` · ${text(step, 'detail')}`}`,
+          text(step, 'status') === 'pass' ? 'verified' : 'pending',
+        );
+      }
+      if (seen.size === 0) {
+        cap('finish-local', 'Local', 'Requested finish is captured at admission; no completion step is served.', 'pending');
+        for (const level of ['commit', 'push', 'pr']) {
+          cap(`finish-${level}`, level, 'Not requested or not yet served', 'pending');
+        }
+      }
+      cap('finish', 'Requested finish', config('faktor.completion.level') ?? text(publication, 'requested'));
+      cap('receipt', 'Finish receipt', text(publication, 'commitOid', 'commit', 'receipt'));
+      cap('local-ref', 'Local ref', text(publication, 'localRef'));
+      const remote = text(publication, 'remoteRef');
+      cap('remote-ref', 'Remote target', remote);
+      const pr = objectAt(publication, 'pullRequest');
+      cap('pr', 'Pull request', text(pr, 'state') === null ? (remote === null ? 'Unavailable' : 'Commit/push only; no PR receipt') : `${text(pr, 'id') ?? 'PR'} · ${text(pr, 'state')} · draft ${text(pr, 'draft') ?? 'unreported'}`);
+      cap('blocked', 'Blocker', text(objectAt(completion, 'gate'), 'reason') ?? text(objectAt(snapshot.proof, 'gate'), 'reason'));
       return rows;
+    }
     case 'S32':
       cap('outcome', 'Outcome', proofText(snapshot));
       cap('required', 'Required checks', text(objectAt(snapshot.proof, 'requiredChecks'), 'passed') ?? null);

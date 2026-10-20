@@ -237,6 +237,50 @@ pub(crate) fn compose_no_op_verdict_requires_every_criterion() {
 /// The new explicit variant is a first-class durable value: a record written
 /// with `Unavailable` survives a real store reopen byte-for-byte, and the
 /// root verification fact carries its own durable tag.
+/// Adversarial: a real settlement can carry more checks/paths than one 4 KiB
+/// memory fact. The fact write must stay bounded and name the truncation
+/// instead of failing settlement (which left a run stuck in Verifying).
+#[tokio::test]
+pub(crate) async fn root_verification_fact_is_bounded_and_settlement_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+    );
+    let parent = env.parent;
+    let h = env.manager.get_session(parent).unwrap().unwrap();
+    let checks: Vec<faktor_core::state::CheckExecution> = (0..80)
+        .map(|index| {
+            verdict_check(
+                &format!("rust_test:{}", "x".repeat(200) + &index.to_string()),
+                true,
+                VerificationStatus::Passed,
+            )
+        })
+        .collect();
+    let changed: Vec<String> = (0..40)
+        .map(|index| format!("src/{}/lib.rs", "deep/".repeat(40) + &index.to_string()))
+        .collect();
+    crate::runtime::task_executor::persist_root_verification_fact(&h, "passed", &checks, &changed)
+        .expect("bounded fact write must not fail settlement");
+    let fact = h
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(kind, key, _)| kind == "verification" && key == "last")
+        .expect("the root verification fact");
+    assert!(fact.2.len() <= 4096, "fact is {} bytes", fact.2.len());
+    let value: serde_json::Value = serde_json::from_str(&fact.2).unwrap();
+    assert_eq!(value["checkCount"], 80);
+    assert_eq!(value["changeCount"], 40);
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["checks"].as_array().unwrap().len(), 12);
+    assert_eq!(value["changed"].as_array().unwrap().len(), 8);
+}
+
 #[tokio::test]
 pub(crate) async fn unavailable_verdict_round_trips_through_a_store_reopen() {
     let dir = tempfile::tempdir().unwrap();

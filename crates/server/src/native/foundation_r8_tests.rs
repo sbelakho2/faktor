@@ -996,3 +996,31 @@ async fn mcp_resources_for_an_unknown_server_is_typed_not_a_catalog() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], json!("not_found"));
 }
+
+#[tokio::test]
+async fn lsp_routes_are_typed_when_no_language_server_manager_is_wired() {
+    let rig = Rig::new().await;
+    let (status, body) = rig
+        .get(&format!(
+            "/native/lsp/diagnostics?session={}&path=src/lib.rs",
+            rig.session
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "lsp_disabled");
+    let (status, body) = rig
+        .post(
+            "/native/lsp/code-actions",
+            json!({
+                "session": rig.session.to_string(),
+                "path": "src/lib.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1}
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "lsp_disabled");
+}

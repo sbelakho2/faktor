@@ -44,9 +44,16 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
+pub mod diagnostics;
 pub mod semantic;
 pub mod types;
 
+pub use diagnostics::{
+    parse_code_actions, request_range, CodeAction, Diagnostic, DiagnosticSeverity, DiagnosticsHub,
+    DiagnosticsSnapshot, MAX_CODE_ACTIONS, MAX_CODE_ACTION_PAYLOAD_BYTES,
+    MAX_CODE_ACTION_TITLE_BYTES, MAX_DIAGNOSTICS_PER_DOCUMENT, MAX_DIAGNOSTIC_DOCUMENTS,
+    MAX_DIAGNOSTIC_FIELD_BYTES, MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_RELATED_INFORMATION,
+};
 pub use faktor_core::CancellationToken;
 pub use semantic::{
     DefinitionResult, IncomingCalls, OutgoingCalls, ReferencesResult, SemanticCacheStats,
@@ -70,6 +77,63 @@ pub use types::{
 pub use faktor_mcp::{
     delivery_unknown, is_delivery_unknown, DeliveryUnknown, FrameGuard, FrameState,
 };
+
+/// Resolve the default language server for a workspace root from the
+/// installed tools on PATH. This is the ONE detection policy every host
+/// (daemon semantic fallback, native diagnostics routes) shares; absent
+/// toolchains yield `None` (typed unavailable at the route), never a mock.
+pub fn config_for_root(root: &Path) -> Option<LspConfig> {
+    let root = root.to_path_buf();
+    if root.join("Cargo.toml").is_file() {
+        if let Some(command) = executable_on_path("rust-analyzer") {
+            return Some(LspConfig {
+                name: "rust-analyzer".to_string(),
+                command,
+                args: Vec::new(),
+                root,
+            });
+        }
+    }
+    if root.join("package.json").is_file() || root.join("tsconfig.json").is_file() {
+        if let Some(command) = executable_on_path("typescript-language-server") {
+            return Some(LspConfig {
+                name: "typescript-language-server".to_string(),
+                command,
+                args: vec!["--stdio".to_string()],
+                root,
+            });
+        }
+    }
+    if root.join("pyproject.toml").is_file() || root.join("setup.py").is_file() {
+        if let Some(command) = executable_on_path("pyright-langserver") {
+            return Some(LspConfig {
+                name: "pyright".to_string(),
+                command,
+                args: vec!["--stdio".to_string()],
+                root,
+            });
+        }
+    }
+    None
+}
+
+fn executable_on_path(name: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    let candidates = if cfg!(windows) {
+        vec![format!("{name}.exe"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    };
+    for dir in std::env::split_paths(&paths) {
+        for candidate in &candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Stable [`ErrorKind::Provider`] code for a capability-gated method on the
 /// raw (untyped) API surface.
@@ -415,6 +479,9 @@ pub struct LspClient {
     /// requests, updated by didOpen/didChange and dropped by didClose.
     documents: Mutex<HashMap<String, TrackedDocument>>,
     semantic_cache: semantic::SemanticCache,
+    /// Latest bounded publishDiagnostics snapshot per document (shared with
+    /// the stdout reader thread).
+    diagnostics: Arc<DiagnosticsHub>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -490,6 +557,7 @@ impl LspClient {
             pending: HashMap::new(),
         }));
         let exited = Arc::new(AtomicBool::new(false));
+        let diagnostics = Arc::new(DiagnosticsHub::new());
         // Reader thread (stdout): incremental Content-Length framing;
         // responses are dispatched by id. EOF marks the server exited and
         // fails every pending request.
@@ -497,7 +565,10 @@ impl LspClient {
             let conn2 = conn.clone();
             let exited2 = exited.clone();
             let writer2 = writer.clone();
-            std::thread::spawn(move || read_loop(conn2, exited2, spawned.stdout, writer2))
+            let diagnostics2 = diagnostics.clone();
+            std::thread::spawn(move || {
+                read_loop(conn2, exited2, spawned.stdout, writer2, diagnostics2)
+            })
         };
         // Stderr drain thread: a verbose server must never block itself on a
         // full stderr pipe; the bounded ring keeps the recent tail.
@@ -520,6 +591,7 @@ impl LspClient {
             capabilities: Mutex::new(ServerCapabilities::default()),
             documents: Mutex::new(HashMap::new()),
             semantic_cache: semantic::SemanticCache::default(),
+            diagnostics,
         }))
     }
 
@@ -745,7 +817,23 @@ impl LspClient {
                 serde_json::json!({
                     "processId": null,
                     "rootUri": file_uri(root),
-                    "capabilities": {},
+                    "capabilities": {
+                        "window": { "workDoneProgress": true },
+                        "textDocument": {
+                            "publishDiagnostics": {
+                                "versionSupport": true,
+                                "relatedInformation": true
+                            },
+                            "codeAction": {
+                                "codeActionLiteralSupport": {
+                                    "codeActionKind": {
+                                        "valueSet": ["quickfix", "refactor", "source"]
+                                    }
+                                }
+                            }
+                        },
+                        "workspace": { "configuration": true }
+                    },
                 }),
                 Duration::from_secs(30),
             )
@@ -835,6 +923,7 @@ impl LspClient {
     /// semantic caches.
     pub fn did_close(&self, uri: &str) -> Result<(), Error> {
         self.untrack_document(uri);
+        self.diagnostics.clear(uri);
         self.notify(
             "textDocument/didClose",
             serde_json::json!({ "textDocument": { "uri": uri } }),
@@ -875,6 +964,138 @@ impl LspClient {
             )
             .await?;
         Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Current bounded diagnostics for one document (`None` = the server
+    /// has not published for this URI since it was last closed).
+    pub fn diagnostics(&self, uri: &str) -> Option<DiagnosticsSnapshot> {
+        self.diagnostics.snapshot(uri)
+    }
+
+    /// Every retained document snapshot (bounded by the hub).
+    pub fn diagnostics_all(&self) -> Vec<DiagnosticsSnapshot> {
+        self.diagnostics.snapshot_all()
+    }
+
+    /// Current hub sequence; pass it to [`Self::wait_diagnostics`] as the
+    /// baseline so a pre-open publish can never satisfy the wait.
+    pub fn diagnostics_sequence(&self) -> u64 {
+        self.diagnostics.sequence()
+    }
+
+    /// Wait for a SETTLED publish after `after`: the first matching snapshot
+    /// is followed by a quiet window (servers publish an early empty snapshot
+    /// while analysis is still running). Bounded by `timeout`.
+    pub async fn wait_diagnostics_settled(
+        &self,
+        uri: &str,
+        after: u64,
+        min_version: Option<i64>,
+        settle: std::time::Duration,
+        timeout: std::time::Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<DiagnosticsSnapshot> {
+        self.diagnostics
+            .wait_settled(uri, after, min_version, settle, timeout, cancellation)
+            .await
+    }
+
+    /// Wait for a publish that arrives after `after` (and, when supplied,
+    /// carries a version at or above `min_version`). Bounded by `timeout`;
+    /// cancellation returns the latest snapshot available at that point.
+    pub async fn wait_diagnostics(
+        &self,
+        uri: &str,
+        after: u64,
+        min_version: Option<i64>,
+        timeout: std::time::Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<DiagnosticsSnapshot> {
+        self.diagnostics
+            .wait_after(uri, after, min_version, timeout, cancellation)
+            .await
+    }
+
+    /// `textDocument/codeAction` REQUEST. Capability-gated; results are
+    /// normalized and bounded. Applying the returned edit is the HOST's
+    /// explicit action — this method never mutates a document.
+    pub async fn code_actions(
+        &self,
+        uri: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+        timeout: std::time::Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<CodeAction>, Error> {
+        if !self.capabilities().code_action {
+            return Err(unsupported_error("textDocument/codeAction"));
+        }
+        let context: Vec<serde_json::Value> = diagnostics
+            .iter()
+            .take(64)
+            .map(Diagnostic::to_lsp_json)
+            .collect();
+        let result = self
+            .request_cancellable(
+                "textDocument/codeAction",
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": {"line": range.start.line, "character": range.start.character},
+                        "end": {"line": range.end.line, "character": range.end.character},
+                    },
+                    "context": {
+                        "diagnostics": context,
+                        "triggerKind": 1,
+                    }
+                }),
+                timeout,
+                cancellation,
+            )
+            .await?;
+        parse_code_actions(&result).map_err(|error| {
+            Error::new(
+                ErrorKind::Provider {
+                    code: "lsp".into(),
+                    retryable: false,
+                },
+                format!("malformed textDocument/codeAction response: {}", error.0),
+            )
+        })
+    }
+
+    /// Request path with an optional cancellation token (the same shared
+    /// engine as [`Self::request`]).
+    async fn request_cancellable(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: std::time::Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<serde_json::Value, Error> {
+        match self
+            .request_raw(method, params, deadline, cancellation)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(RequestFailure::Exited(message)) => Err(Error::new(ErrorKind::Network, message)),
+            Err(RequestFailure::Write(error)) => Err(error),
+            Err(RequestFailure::Dropped) => {
+                Err(Error::new(ErrorKind::Network, "lsp connection dropped"))
+            }
+            Err(RequestFailure::Timeout(deadline)) => Err(Error::timeout(format!(
+                "lsp {method} exceeded {}ms",
+                deadline.as_millis()
+            ))),
+            Err(RequestFailure::Cancelled) => Err(Error::cancelled()),
+            Err(RequestFailure::Rpc(error)) => Err(Error::new(
+                ErrorKind::Provider {
+                    code: "lsp".into(),
+                    retryable: false,
+                },
+                format!("lsp {method}: {error}"),
+            )),
+        }
     }
 
     /// Graceful LSP lifecycle: `shutdown` REQUEST (response awaited),
@@ -1213,6 +1434,7 @@ fn read_loop(
     exited: Arc<AtomicBool>,
     stdout: std::process::ChildStdout,
     writer: WriterHandle,
+    diagnostics: Arc<DiagnosticsHub>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -1238,6 +1460,18 @@ fn read_loop(
                     if value.get("method").is_some() {
                         if let Some(id) = value.get("id") {
                             queue_server_response(&writer, id, &value);
+                        } else if value.get("method").and_then(serde_json::Value::as_str)
+                            == Some("textDocument/publishDiagnostics")
+                        {
+                            diagnostics.apply_publish(
+                                value.get("params").unwrap_or(&serde_json::Value::Null),
+                            );
+                        } else if value.get("method").and_then(serde_json::Value::as_str)
+                            == Some("$/progress")
+                        {
+                            diagnostics.apply_progress(
+                                value.get("params").unwrap_or(&serde_json::Value::Null),
+                            );
                         }
                         continue;
                     }
@@ -1333,6 +1567,10 @@ fn stderr_drain(mut stderr: std::process::ChildStderr, ring: Arc<Mutex<StderrRin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        CallHierarchyItem, SymbolKind, MAX_CALL_HIERARCHY_ITEMS, MAX_LOCATIONS,
+        MAX_WORKSPACE_SYMBOLS,
+    };
     use tempfile::tempdir;
 
     /// A real language-server stand-in (compiled by faktor-test-mocks at

@@ -202,6 +202,10 @@ pub struct DaemonGraph {
     ///     supervisor + checked transport; handed to the agent and the
     ///     server surface as the SAME `Arc`.
     pub semantic: Arc<faktor_semantic::SemanticProviderRegistry>,
+    /// 13b. The daemon's ONE workspace-scoped language-server manager: the
+    /// same instance the semantic fallback uses and the native
+    /// diagnostics/code-action routes serve.
+    pub lsp: Arc<faktor_lsp::LspManager>,
     /// 14. The failure-learning prior handle (audit 68): `Some` ONLY when
     ///     `[efficiency] failure_learning` is on; the SAME `Arc` the agent
     ///     consults through `AgentDeps::context_prior`.

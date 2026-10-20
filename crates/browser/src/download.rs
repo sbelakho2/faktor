@@ -295,11 +295,15 @@ impl DownloadManager {
     /// when capture is enabled (downloads are identified at response time by
     /// `Content-Disposition: attachment`).
     pub fn fetch_patterns(&self) -> Value {
-        let mut patterns = vec![json!({ "urlPattern": "*", "requestStage": "Request" })];
-        if self.policy.enabled {
-            patterns.push(json!({ "urlPattern": "*", "requestStage": "Response" }));
-        }
-        Value::Array(patterns)
+        // Response stage is ALWAYS observed: a `Content-Disposition:
+        // attachment` document must be classified even while capture is
+        // disabled, otherwise Chromium starts a native download and the
+        // navigation has no terminal lifecycle event. The response handler
+        // denies (disabled policy) or captures (enabled policy) below.
+        Value::Array(vec![
+            json!({ "urlPattern": "*", "requestStage": "Request" }),
+            json!({ "urlPattern": "*", "requestStage": "Response" }),
+        ])
     }
 
     /// The latest download failure for this profile, if any.
@@ -445,10 +449,37 @@ impl DownloadManager {
             .as_deref()
             .map(is_attachment_disposition)
             .unwrap_or(false);
-        if !self.policy.enabled || !attachment {
+        if !attachment {
             self.continue_response(client, session, &request_id, deadline, cancel)
                 .await?;
             return Ok(DownloadOutcome::Continued);
+        }
+        if !self.policy.enabled {
+            // Default-deny: record the policy decision as an observation and
+            // fail the request so the navigation terminates typed instead of
+            // hanging until its deadline. The sanitized filename is computed
+            // and recorded too (never silently dropped).
+            let filename = download_filename(disposition.as_deref(), &url, &request_id);
+            self.record(DownloadRecord {
+                guid: request_id.clone(),
+                url: url.clone(),
+                suggested_filename: filename,
+                frame_id: None,
+                browser_context_id: None,
+                page_target_id: None,
+                received_bytes: None,
+                total_bytes: None,
+                state: DownloadState::Rejected,
+            });
+            {
+                let mut stats = faktor_core::lock::recover(&self.stats);
+                stats.blocked_total = stats.blocked_total.saturating_add(1);
+            }
+            *faktor_core::lock::recover(&self.last_error) = Some(self.policy.denied_error(&url));
+            let _ = self
+                .deny(client, session, &request_id, deadline, cancel)
+                .await;
+            return Ok(DownloadOutcome::Denied { url });
         }
         if let Err(error) = self.prepare() {
             *faktor_core::lock::recover(&self.last_error) = Some(error.clone());
@@ -1243,12 +1274,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_patterns_include_response_stage_only_when_enabled() {
+    fn fetch_patterns_always_observe_the_response_stage() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, base) = rooted(&tmp, "p1");
         let disabled =
             DownloadManager::new(DownloadPolicy::default(), root.clone(), &base).unwrap();
-        assert_eq!(disabled.fetch_patterns().as_array().unwrap().len(), 1);
+        // The response stage is observed even under default-deny so an
+        // attachment is classified (and the navigation terminated typed)
+        // instead of hanging on a load event that never fires.
+        assert_eq!(disabled.fetch_patterns().as_array().unwrap().len(), 2);
         let enabled = DownloadManager::new(
             DownloadPolicy {
                 enabled: true,

@@ -29,6 +29,7 @@ const ADAPTER_ID: &str = "chromium-local";
 const SOURCE: &str = "edition8";
 const NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 const MAX_OBSERVED_REQUESTS: usize = 500;
+const MAX_OBSERVED_CONSOLE: usize = 500;
 
 struct LivePage {
     page: Page,
@@ -212,9 +213,25 @@ impl BrowserSurface {
         let navigation = match page.navigate(url, deadline, &cancel).await {
             Ok(outcome) => outcome,
             Err(error) => {
+                let code = error.code();
                 let _ = foundation
                     .browser
                     .record_state(&session.id, BrowserSessionState::Failed);
+                if matches!(code, "download_blocked" | "download_rejected") {
+                    let _ = foundation.browser.append_observation(
+                        &session.id,
+                        "download",
+                        Some("error"),
+                        &serde_json::json!({
+                            "url": url,
+                            "policy": "default_deny",
+                            "blocked": true,
+                            "error": code,
+                            "detail": error.to_string(),
+                            "filename": title_or_url_filename(url),
+                        }),
+                    );
+                }
                 return Err(format!("browser navigation: {error}"));
             }
         };
@@ -259,7 +276,7 @@ impl BrowserSurface {
             return;
         };
         for request in requests.into_iter().take(MAX_OBSERVED_REQUESTS) {
-            if !seen.insert(request.request_id.clone()) {
+            if !seen.insert(format!("network:{}", request.request_id)) {
                 continue;
             }
             let severity = if request.failed.is_some() || request.blocked_reason.is_some() {
@@ -283,6 +300,34 @@ impl BrowserSurface {
                     "failed": request.failed,
                     "blockedReason": request.blocked_reason,
                     "truncated": request.truncated,
+                }),
+            );
+        }
+        let Ok(console) = page.console() else {
+            return;
+        };
+        for entry in console.into_iter().take(MAX_OBSERVED_CONSOLE) {
+            if !seen.insert(format!("console:{}", entry.sequence)) {
+                continue;
+            }
+            let severity = match entry.level.as_str() {
+                "error" | "assert" => "error",
+                "warning" => "warning",
+                _ => "info",
+            };
+            let _ = foundation.browser.append_observation(
+                browser_session_id,
+                "console",
+                Some(severity),
+                &serde_json::json!({
+                    "sequence": entry.sequence,
+                    "level": entry.level,
+                    "text": entry.text,
+                    "url": entry.url,
+                    "line": entry.line,
+                    "column": entry.column,
+                    "timestampMs": entry.timestamp_ms,
+                    "truncated": entry.truncated,
                 }),
             );
         }
@@ -329,6 +374,19 @@ impl BrowserSurface {
             .map(|captured| captured.bytes)
             .map_err(|error| format!("browser screenshot: {error}"))
     }
+}
+
+fn title_or_url_filename(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "download".to_string())
 }
 
 pub(crate) fn adapter_id() -> &'static str {

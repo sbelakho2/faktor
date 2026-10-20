@@ -1612,7 +1612,7 @@ pub(crate) async fn independent_completion_review(
         let profile = faktor_verify::derive::detect_project_profile(ws.root(), repo_files);
         let changed_paths: Vec<std::path::PathBuf> =
             changed.iter().map(std::path::PathBuf::from).collect();
-        faktor_verify::derive::derive_checks(&profile, &changed_paths)
+        faktor_verify::derive::derive_checks_at_root(&profile, &changed_paths, ws.root())
             .map(|specs| specs.iter().map(legacy_mirror_of_spec).collect())
             .unwrap_or_default()
     };
@@ -2152,6 +2152,17 @@ impl AgentRuntime {
             .flatten()
             .is_some();
         if shadow_active {
+            // The exact root is authorized for this durable workspace id
+            // BEFORE a scoped handle exists, so the edit engine's containment
+            // check accepts the candidate the drive actually mutates.
+            if self
+                .deps
+                .workspaces
+                .authorize_scoped_root(workspace_id, root.clone())
+                .is_err()
+            {
+                return None;
+            }
             faktor_fs::WorkspaceHandle::open_scoped(workspace_id, root).ok()
         } else {
             self.deps.workspaces.open(workspace_id, root).ok()

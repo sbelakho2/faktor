@@ -230,3 +230,49 @@ fn file_blocking_the_scratch_path_refuses_the_spawn() {
         .expect_err("a file blocking the scratch path must refuse the spawn");
     assert_eq!(err.kind, faktor_core::error::ErrorKind::Permission);
 }
+
+/// The scratch rewrite must not hide an unset toolchain home: rustup needs
+/// the daemon's RUSTUP_HOME (or real HOME) to resolve its default toolchain.
+/// Existing explicit values always win; only real directories are added.
+#[test]
+fn scratch_home_preserves_approved_toolchain_homes() {
+    use std::ffi::OsString;
+    let real = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(real.path().join(".rustup")).unwrap();
+    std::fs::create_dir_all(real.path().join(".cargo")).unwrap();
+    let mut env: Vec<(OsString, OsString)> = vec![
+        ("HOME".into(), real.path().as_os_str().to_os_string()),
+        ("RUSTUP_HOME".into(), "/explicit/rustup".into()),
+    ];
+    super::preserve_toolchain_homes(&mut env);
+    fn value(env: &[(std::ffi::OsString, std::ffi::OsString)], name: &str) -> Option<String> {
+        env.iter()
+            .find(|(key, _)| key == std::ffi::OsStr::new(name))
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    }
+    assert_eq!(
+        value(&env, "RUSTUP_HOME").as_deref(),
+        Some("/explicit/rustup")
+    );
+    assert_eq!(
+        value(&env, "CARGO_HOME"),
+        Some(real.path().join(".cargo").to_string_lossy().into_owned()),
+        "an unset CARGO_HOME is anchored to the approved real toolchain home"
+    );
+    let scratch = real.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    faktor_core::command::apply_scratch_home(&mut env, &scratch);
+    assert_eq!(
+        value(&env, "HOME"),
+        Some(scratch.to_string_lossy().into_owned()),
+        "credentials still discover nothing under the scratch HOME"
+    );
+    assert_eq!(
+        value(&env, "RUSTUP_HOME").as_deref(),
+        Some("/explicit/rustup")
+    );
+    assert_eq!(
+        value(&env, "CARGO_HOME"),
+        Some(real.path().join(".cargo").to_string_lossy().into_owned())
+    );
+}

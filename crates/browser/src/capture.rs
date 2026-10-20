@@ -24,6 +24,8 @@ pub struct CaptureLimits {
     pub max_screenshot_bytes: usize,
     /// Bounded network record ring per page.
     pub max_network_records: usize,
+    /// Bounded console/log/exception ring per page.
+    pub max_console_records: usize,
     /// Per-command CDP message cap.
     pub max_cdp_message_bytes: usize,
 }
@@ -37,6 +39,7 @@ impl Default for CaptureLimits {
             max_text_bytes: 512 * 1024,
             max_screenshot_bytes: 4 * 1024 * 1024,
             max_network_records: 1024,
+            max_console_records: 512,
             max_cdp_message_bytes: 8 * 1024 * 1024,
         }
     }
@@ -46,13 +49,14 @@ impl CaptureLimits {
     /// Bounds are explicit and finite: a zero or inverted cap is a typed
     /// refusal, never a silently unbounded capture.
     pub fn validate(&self) -> Result<(), crate::error::BrowserError> {
-        let checks: [(&str, usize); 7] = [
+        let checks: [(&str, usize); 8] = [
             ("max_body_bytes", self.max_body_bytes),
             ("hard_max_body_bytes", self.hard_max_body_bytes),
             ("max_dom_bytes", self.max_dom_bytes),
             ("max_text_bytes", self.max_text_bytes),
             ("max_screenshot_bytes", self.max_screenshot_bytes),
             ("max_network_records", self.max_network_records),
+            ("max_console_records", self.max_console_records),
             ("max_cdp_message_bytes", self.max_cdp_message_bytes),
         ];
         for (name, value) in checks {

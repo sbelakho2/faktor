@@ -1656,6 +1656,7 @@ dependencies = [
  "faktor-git",
  "faktor-hooks",
  "faktor-instructions",
+ "faktor-lsp",
  "faktor-mcp",
  "faktor-memory",
  "faktor-openai",

@@ -48,7 +48,8 @@
     "onCommand:faktor.openProviders8",
     "onCommand:faktor.openTools8",
     "onCommand:faktor.openContext8",
-    "onCommand:faktor.openDiagnostics8"
+    "onCommand:faktor.openDiagnostics8",
+    "onCommand:faktor.refreshLspDiagnostics8"
   ],
   "main": "out/extension.js",
   "contributes": {
@@ -90,6 +91,11 @@
         "category": "Faktor"
       },
       {
+        "command": "faktor.refreshLspDiagnostics8",
+        "title": "Diagnostics: Language Server for Active File",
+        "category": "Faktor"
+      },
+      {
         "command": "faktor.controlPlaneSignIn",
         "title": "Sign in to Control Plane",
         "category": "Faktor"
@@ -111,7 +117,7 @@
       },
       {
         "command": "faktor.locateDaemon",
-        "title": "Locate daemon…",
+        "title": "Locate daemon\u2026",
         "category": "Faktor"
       },
       {
@@ -192,7 +198,7 @@
       },
       {
         "command": "faktor.stopScoped8",
-        "title": "Faktor: Stop… (Revision 8)",
+        "title": "Faktor: Stop\u2026 (Revision 8)",
         "category": "Faktor"
       },
       {
@@ -244,7 +250,7 @@
         },
         {
           "id": "faktor.edition8",
-          "name": "Work · Inspect · History",
+          "name": "Work \u00b7 Inspect \u00b7 History",
           "type": "webview"
         }
       ]
@@ -297,7 +303,7 @@
             "type": "string",
             "default": "",
             "scope": "machine",
-            "description": "Machine/user-scoped path to the faktor-cli executable. Workspace-scoped values are ignored and refused; repository target/ builds are never resolved or executed. Empty (default) resolves through the signed install layout (~/.faktor/install or faktor.installRoot) and otherwise refuses with a \"Locate daemon…\" action."
+            "description": "Machine/user-scoped path to the faktor-cli executable. Workspace-scoped values are ignored and refused; repository target/ builds are never resolved or executed. Empty (default) resolves through the signed install layout (~/.faktor/install or faktor.installRoot) and otherwise refuses with a \"Locate daemon\u2026\" action."
           },
           "faktor.dataDir": {
             "type": "string",

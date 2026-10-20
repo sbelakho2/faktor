@@ -1252,6 +1252,7 @@ pub(crate) async fn serve_impl(
     // the agent holds — the native introspection endpoints inspect only
     // `deps.semantic` (no parallel registry exists anywhere).
     deps = deps.with_semantic_registry(graph.semantic.clone());
+    deps = deps.with_lsp(graph.lsp.clone());
     // The frontend generates the secret and passes it via env; the
     // daemon reads it here and never prints it. An explicitly supplied
     // value that is not the canonical 64-hex form fails startup loudly —
@@ -2382,9 +2383,45 @@ impl AcpBackend for DaemonAcpBackend {
                 settle_deadline,
             ))
         })?;
+        // The sync backend cannot stream, so hand the ACP engine the final
+        // assistant/reasoning text it must project as official chunk frames.
+        // Read the latest bounded page: never an unbounded transcript.
+        let handle = self
+            .session
+            .get_session(sid)
+            .map_err(|e| e.message)?
+            .ok_or_else(|| format!("session {sid} not found"))?;
+        let page = handle.latest_messages_page(8).map_err(|e| e.message)?;
+        let mut agent_text = String::new();
+        let mut agent_reasoning = String::new();
+        for message in page.messages.iter().rev() {
+            if message.role != "assistant" {
+                continue;
+            }
+            for part in &message.parts {
+                match part {
+                    faktor_protocol::native::Part::Text { text } if agent_text.is_empty() => {
+                        agent_text = text.clone()
+                    }
+                    faktor_protocol::native::Part::Reasoning { text }
+                        if agent_reasoning.is_empty() =>
+                    {
+                        agent_reasoning = text.clone()
+                    }
+                    _ => {}
+                }
+            }
+            if !agent_text.is_empty() || !agent_reasoning.is_empty() {
+                break;
+            }
+        }
         Ok(json!({
             "status": "completed",
             "finalState": state,
+            "_meta": {
+                "agentText": agent_text,
+                "agentReasoning": agent_reasoning,
+            },
         }))
     }
 

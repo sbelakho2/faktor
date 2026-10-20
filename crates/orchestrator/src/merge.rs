@@ -1237,6 +1237,17 @@ pub(crate) fn compute_change_entries(
     }
     paths.sort();
     for p in paths {
+        // Build outputs produced by a derived check are NOT candidate
+        // changes: `cargo check/test` creates `target/` (and other
+        // ecosystems create node_modules/dist/build caches) after the
+        // shadow copy. Integrating them would land artifacts the operator
+        // never authored, overflow the ledger row, and make the landed tree
+        // differ from the reviewed source change. The paths stay in the
+        // candidate SNAPSHOT (verification ran over them) but never enter
+        // the change set or the landing decision.
+        if is_build_output_path(&p) {
+            continue;
+        }
         let child = now_idx.get(&p).cloned();
         let base_start = start_idx.get(&p).cloned();
         let entry = match (child, base_start) {
@@ -1267,6 +1278,29 @@ pub(crate) fn compute_change_entries(
         }
     }
     Ok(entries)
+}
+
+/// Conventional build-output roots skipped by change-set staging. Conservative
+/// top-level names only: a source file named `build/plan.md` is not a cache.
+fn is_build_output_path(path: &std::path::Path) -> bool {
+    let mut first = path.components();
+    let Some(std::path::Component::Normal(name)) = first.next() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    matches!(
+        name.as_ref(),
+        "target"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".gradle"
+            | ".faktor-verify-target"
+            | ".faktor-target"
+    )
 }
 
 /// The first change entry of an `ExclusivePaths` child that falls OUTSIDE

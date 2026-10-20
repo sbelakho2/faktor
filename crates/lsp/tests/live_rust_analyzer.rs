@@ -22,7 +22,17 @@ use faktor_lsp::{
 use faktor_terminal::ProcessSupervisor;
 use tempfile::TempDir;
 
-const SAMPLE_LIB: &str = r#"pub fn add_one(value: i64) -> i64 {
+const BAD_SOURCE: &str = r#"use std::collections::HashMap;
+use std::collections::Hashmap;
+
+pub fn broken() -> i64 {
+    "not an integer"
+}
+"#;
+
+const SAMPLE_LIB: &str = r#"pub mod bad;
+
+pub fn add_one(value: i64) -> i64 {
     value + 1
 }
 
@@ -91,6 +101,7 @@ path = "src/lib.rs"
     .expect("Cargo.toml");
     let lib = root.join("src/lib.rs");
     std::fs::write(&lib, SAMPLE_LIB).expect("lib.rs");
+    std::fs::write(root.join("src/bad.rs"), BAD_SOURCE).expect("bad.rs");
     let uri = file_uri(&lib);
     (dir, root, lib, uri)
 }
@@ -445,6 +456,116 @@ async fn live_rust_analyzer_semantics() {
             .collect::<Vec<_>>()
     );
 
+    manager
+        .shutdown(WorkspaceId::new(77))
+        .await
+        .expect("shutdown");
+}
+
+/// F225/F226 live probe: the real rust-analyzer publishes a bounded
+/// diagnostic snapshot for a real type error, and `textDocument/codeAction`
+/// answers on the exact error range. The code-action call is PROPOSAL-only:
+/// the file on disk is byte-identical afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_rust_analyzer_diagnostics_and_code_actions() {
+    let Some(command) = rust_analyzer_command() else {
+        eprintln!("rust-analyzer not installed; skipping the live diagnostics probe");
+        return;
+    };
+    let (_dir, root, _lib, _uri) = write_sample_workspace();
+    let (_cas_dir, manager, client) = start(&root, command).await;
+    assert!(
+        client.capabilities().code_action,
+        "rust-analyzer advertises codeActionProvider"
+    );
+    let bad_path = root.join("src/bad.rs");
+    let bad_uri = file_uri(&bad_path);
+    let baseline = client.diagnostics_sequence();
+    client
+        .did_open_version(&bad_uri, BAD_SOURCE, 1)
+        .expect("didOpen bad.rs");
+    let snapshot = client
+        .wait_diagnostics_settled(
+            &bad_uri,
+            baseline,
+            Some(1),
+            Duration::from_millis(500),
+            Duration::from_secs(120),
+            None,
+        )
+        .await
+        .expect("rust-analyzer publishes diagnostics for the live type error");
+    if snapshot.diagnostics.is_empty() {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            eprintln!("live: snapshots = {:?}", client.diagnostics_all());
+        }
+    }
+    assert!(
+        !snapshot.diagnostics.is_empty(),
+        "the type error must produce at least one diagnostic"
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.range.start <= diagnostic.range.end),
+        "diagnostic ranges are ordered: {snapshot:?}"
+    );
+    let error = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unused import"))
+        .or_else(|| {
+            snapshot
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains("unresolved import"))
+        })
+        .or_else(|| snapshot.diagnostics.first())
+        .cloned()
+        .expect("one diagnostic");
+    eprintln!(
+        "live: diagnostics for bad.rs = {}; first = {}",
+        snapshot.diagnostics.len(),
+        error.message
+    );
+    let before = std::fs::read(&bad_path).unwrap();
+    let actions = client
+        .code_actions(
+            &bad_uri,
+            error.range,
+            &snapshot.diagnostics,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect("codeAction request succeeds on the real server");
+    eprintln!(
+        "live: code actions = {:?}",
+        actions
+            .iter()
+            .map(|action| action.title.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !actions.is_empty(),
+        "rust-analyzer must offer a quickfix for the live unused import"
+    );
+    for action in &actions {
+        if let Some(edit) = &action.edit {
+            let rendered = edit.to_string();
+            assert!(
+                rendered.len() <= faktor_lsp::MAX_CODE_ACTION_PAYLOAD_BYTES,
+                "bounded edit"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&bad_path).unwrap(),
+        before,
+        "the daemon never auto-applies a proposed edit"
+    );
     manager
         .shutdown(WorkspaceId::new(77))
         .await

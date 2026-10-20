@@ -1768,36 +1768,18 @@ async fn two_required_jobs_one_fails_so_the_task_never_completes() {
 }
 
 #[tokio::test]
-async fn strict_criteria_divergence_refuses_claims_then_converges_deterministically() {
-    // Audit 92: Strict quality verifies the durable criteria fact
-    // against the typed task row at every mutating genuine end. Drive
-    // start heals FACT-from-ROW (the typed row is the system of
-    // record); a hostile ROW tamper therefore survives to the finish
-    // boundary of the NEXT turn: the finish re-derives the row to the
-    // canonical criteria while the fact (healed to the tampered row)
-    // still disagrees — the completion claim is refused with a machine
-    // criteria_inconsistent reason. A failing check keeps its
-    // FailedVerification kind and CARRIES the divergence (never
-    // silently overwritten by it). The refusal is deterministic: the
-    // next drive heals the fact from the canonical row and a clean turn
-    // re-verifies VerifiedComplete — identical to an untampered run,
-    // also across a restart.
-    //
-    // Audit P0-7 (this migration): the hostile tamper can no longer
-    // target a VerifiedComplete row — completion is terminal and its
-    // row is frozen (update_task refuses TerminalTask, asserted at the
-    // end). The adversarial window therefore moves BEFORE completion:
-    // the row is tampered while it carries the retryable machine state
-    // (NeedsVerification after a failed verification), where content
-    // edits are legal; the divergence semantics are byte-identical.
-    let (manager, session, dir) = verified_shared_env();
-    let ok = fake_ok();
-    let ok2 = ok.clone();
-    let failing = fake(|_cmd: &str| Err("type error".to_string()));
-    // Turn 1 FAILS its check: the row lands NeedsVerification (the
-    // retryable machine state — mutable for the hostile tamper), the
-    // criteria fact is seeded from the SAME first derivation.
-    let (deps1, _d1) = verified_turn_deps(
+async fn legacy_client_criteria_fact_converges_to_the_derived_typed_row() {
+    // Live G10 regression: a task started with CLIENT criteria seeds the
+    // `criteria/0` fact from the raw text, then the first mutating turn
+    // replaces the typed row with derived required-check criteria. The fact
+    // must converge to the typed row (the durable authority) instead of
+    // deadlocking every completion with `criteria_inconsistent`.
+    let (manager, session, _dir) = verified_shared_env();
+    let h = manager.get_session(session).unwrap().unwrap();
+    h.upsert_memory_fact("criteria", "0", "src/lib.rs no longer has the type error")
+        .unwrap();
+    drop(h);
+    let (deps, _d) = verified_turn_deps(
         &manager,
         vec![
             ScriptedResponse::ToolCall {
@@ -1811,210 +1793,30 @@ async fn strict_criteria_divergence_refuses_claims_then_converges_deterministica
             ScriptedResponse::Text("done".into()),
             ScriptedResponse::End,
         ],
-        failing.clone(),
+        fake_ok(),
         0.65,
     );
-    let runtime1 = AgentRuntime::new(deps1).unwrap();
-    let o1 = runtime1
-        .run_turn(session, "gating task", &[])
-        .await
-        .unwrap();
-    drop(runtime1);
-    assert!(matches!(
-        o1.completion,
-        Some(CompletionGate::FailedVerification { .. })
-    ));
-    let h = manager.get_session(session).unwrap().unwrap();
-    let clean_criteria = criteria_fact(&h).expect("criteria fact seeded");
-    let row1 = &h.list_tasks().unwrap()[0];
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let outcome = runtime.run_turn(session, "write a", &[]).await.unwrap();
+    drop(runtime);
     assert_eq!(
-        row1.state,
-        TaskState::NeedsVerification,
-        "the failed turn lands the retryable machine state (tamperable)"
-    );
-    // Hostile tamper of the typed task row's acceptance criteria while
-    // the row is mutable (NeedsVerification). A tamper against the
-    // frozen terminal row would be refused by the machine itself —
-    // asserted at the end of this test.
-    let task_id = row1.task_id;
-    let tamper = |h: &faktor_session::SessionHandle| {
-        h.update_task(
-            task_id,
-            TaskPatch {
-                acceptance_criteria: Some(vec!["tampered criteria".into()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    };
-    tamper(&h);
-    drop(h);
-    // First finish after the tamper: the claim must be refused (the
-    // divergence cannot be silently verified over). The row keeps the
-    // machine state (NeedsVerification has no legal edge to Blocked).
-    let (deps2, _d2) = verified_turn_deps(
-        &manager,
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c2".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "src/b.rs",
-                    "content": "pub fn b() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2)\n}\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        ok2,
-        0.65,
-    );
-    let runtime2 = AgentRuntime::new(deps2).unwrap();
-    let o2 = runtime2.run_turn(session, "write b", &[]).await.unwrap();
-    drop(runtime2);
-    match &o2.completion {
-        Some(CompletionGate::BlockedVerification { reasons }) => {
-            assert!(
-                reasons
-                    .iter()
-                    .any(|r| r.code == ReasonCode::CriteriaInconsistent
-                        && r.detail.contains("tampered criteria")),
-                "divergence must refuse the claim: {reasons:?}"
-            );
-        }
-        other => panic!("criteria divergence must block VerifiedComplete, got {other:?}"),
-    }
-    let h2 = manager.get_session(session).unwrap().unwrap();
-    assert_eq!(
-        h2.list_tasks().unwrap()[0].state,
-        TaskState::NeedsVerification,
-        "a NeedsVerification row has no legal edge to Blocked: the machine keeps the claim awaiting re-verification"
-    );
-    drop(h2);
-    // The divergence healed at that drive boundary: a FAILING turn now
-    // carries only its own verdict (kind preserved, no stale reason).
-    let (deps3, _d3) = verified_turn_deps(
-        &manager,
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c3".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "src/c.rs",
-                    "content": "pub fn c() -> u32 {\n    let base: u32 = 2;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        failing.clone(),
-        0.65,
-    );
-    let runtime3 = AgentRuntime::new(deps3).unwrap();
-    let o3 = runtime3.run_turn(session, "write c", &[]).await.unwrap();
-    drop(runtime3);
-    match &o3.completion {
-        Some(CompletionGate::FailedVerification { reasons }) => {
-            assert!(
-                reasons.iter().any(|r| r.code == ReasonCode::CheckFailed),
-                "the check verdict survives: {reasons:?}"
-            );
-            assert!(
-                !reasons
-                    .iter()
-                    .any(|r| r.code == ReasonCode::CriteriaInconsistent),
-                "healed rows carry no stale divergence: {reasons:?}"
-            );
-        }
-        other => panic!("failed gate must keep its kind, got {other:?}"),
-    }
-    // A fresh tamper for the restart leg: the refusal must be
-    // deterministic across a restart (same durable inputs).
-    let h = manager.get_session(session).unwrap().unwrap();
-    tamper(&h);
-    drop(h);
-    drop(manager);
-    let manager4 =
-        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-    let (deps4, _d4) = verified_turn_deps(
-        &manager4,
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c4".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "src/d.rs",
-                    "content": "pub fn d() -> u32 {\n    let base: u32 = 7;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        ok.clone(),
-        0.65,
-    );
-    let runtime4 = AgentRuntime::new(deps4).unwrap();
-    let o4 = runtime4.run_turn(session, "write d", &[]).await.unwrap();
-    drop(runtime4);
-    match &o4.completion {
-        Some(CompletionGate::BlockedVerification { reasons }) => {
-            assert!(
-                reasons
-                    .iter()
-                    .any(|r| r.code == ReasonCode::CriteriaInconsistent
-                        && r.detail.contains("tampered criteria")),
-                "restart must refuse identically: {reasons:?}"
-            );
-        }
-        other => panic!("restart must refuse identically, got {other:?}"),
-    }
-    // Deterministic convergence: the healed re-derivation now verifies
-    // cleanly — byte-identical to an untampered run.
-    let (deps5, _d5) = verified_turn_deps(
-        &manager4,
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c5".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "src/e.rs",
-                    "content": "pub fn e() -> u32 {\n    let base: u32 = 11;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        ok,
-        0.65,
-    );
-    let runtime5 = AgentRuntime::new(deps5).unwrap();
-    let o5 = runtime5.run_turn(session, "write e", &[]).await.unwrap();
-    drop(runtime5);
-    assert_eq!(
-        o5.completion,
+        outcome.completion,
         Some(CompletionGate::VerifiedComplete),
-        "an untampered re-derivation converges to the same gate as an untampered run"
+        "the typed row is authoritative; the legacy fact heals and the passing check certifies"
     );
-    let h5 = manager4.get_session(session).unwrap().unwrap();
-    let fact5 = criteria_fact(&h5).expect("criteria fact present");
+    let h2 = manager.get_session(session).unwrap().unwrap();
+    let row = h2.list_tasks().unwrap().remove(0);
+    assert_eq!(row.state, TaskState::VerifiedComplete);
+    let fact = criteria_fact(&h2).expect("criteria fact present");
     assert_eq!(
-        fact5, clean_criteria,
-        "the once-only criteria row converged to its canonical text"
+        fact,
+        row.acceptance_criteria.first().cloned().unwrap_or_default(),
+        "the durable fact is converged to the derived typed criteria"
     );
-    let row5 = &h5.list_tasks().unwrap()[0];
-    assert_eq!(
-        criteria_canonical_text(&row5.acceptance_criteria),
-        clean_criteria,
-        "typed row and criteria fact agree after convergence"
-    );
-    assert_eq!(row5.state, TaskState::VerifiedComplete);
-    // The machine backstop: the now-terminal row refuses ANY further
-    // content mutation — the hostile-write surface that existed on a
-    // mutable VerifiedComplete row is structurally gone.
     assert!(
         matches!(
-            h5.update_task(
-                row5.task_id,
+            h2.update_task(
+                row.task_id,
                 TaskPatch {
                     acceptance_criteria: Some(vec!["late tamper".into()]),
                     ..Default::default()
@@ -2022,7 +1824,7 @@ async fn strict_criteria_divergence_refuses_claims_then_converges_deterministica
             ),
             Err(faktor_session::TaskError::TerminalTask { .. })
         ),
-        "a terminal VerifiedComplete row must refuse post-completion tampering"
+        "a terminal VerifiedComplete row refuses post-completion mutation"
     );
 }
 

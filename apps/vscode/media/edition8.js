@@ -315,6 +315,14 @@
   });
 
   document.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      var openRow = document.activeElement;
+      if (openRow && openRow.getAttribute && openRow.getAttribute('data-open-screen')) {
+        event.preventDefault();
+        var rowScreen = openRow.getAttribute('data-open-screen');
+        if (screens.has(rowScreen)) selectScreen(rowScreen);
+      }
+    }
     if (event.key === 'Escape') {
       var details = document.querySelector('details[open]');
       if (details) {

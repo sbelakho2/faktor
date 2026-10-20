@@ -255,6 +255,8 @@ use faktor_protocol::native::{MessagesPage, Part as NativePart};
 use crate::protocol::AcpMethod;
 
 pub mod protocol;
+mod sync_bridge;
+pub use sync_bridge::{agent_thought_chunk_update, text_chunk_update, user_message_chunk_update};
 
 /// Official ACP v1 protocol version accepted by the `initialize` handshake.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -527,34 +529,6 @@ pub fn agent_state_changed_update(status: AgentStateStatus, message: Option<&str
     update.insert("kind".into(), json!("agentStateChanged"));
     update.insert("agentState".into(), Value::Object(state));
     Value::Object(update)
-}
-
-/// `session/update` frame body: official `agent_message_chunk` content
-/// frame (`{sessionUpdate, content: {type: "text", text}}`).
-pub fn text_chunk_update(text: &str) -> Value {
-    json!({
-        "sessionUpdate": "agent_message_chunk",
-        "content": { "type": "text", "text": text },
-    })
-}
-
-/// `session/update` frame body: official `user_message_chunk` (used when
-/// replaying `session/load` history; live turns never echo user input).
-pub fn user_message_chunk_update(text: &str) -> Value {
-    json!({
-        "sessionUpdate": "user_message_chunk",
-        "content": { "type": "text", "text": text },
-    })
-}
-
-/// `session/update` frame body: official `agent_thought_chunk`. Reused for
-/// native reasoning/summary/system parts (the official schema has no
-/// separate kind for those; see [`history_updates`]).
-pub fn agent_thought_chunk_update(text: &str) -> Value {
-    json!({
-        "sessionUpdate": "agent_thought_chunk",
-        "content": { "type": "text", "text": text },
-    })
 }
 
 /// Official ACP tool-call status enum.
@@ -2343,6 +2317,15 @@ impl Engine {
                             if token.is_cancelled() {
                                 TurnOutcome::Cancelled
                             } else {
+                                // A synchronous backend returns its final
+                                // transcript in `_meta` (its prompt call
+                                // cannot stream). Project it as the SAME
+                                // official chunk frames a streaming backend
+                                // emits, so a conforming client always sees
+                                // the assistant output. Bounded chunks keep
+                                // one huge answer from exceeding the frame
+                                // cap.
+                                sync_bridge::emit_sync_meta_chunks(&main_tx, session_id, &value).await;
                                 TurnOutcome::Completed(value)
                             }
                         }

@@ -841,6 +841,11 @@ fn native_foundation_routes(router: Router<AppState>) -> Router<AppState> {
             "/native/diagnostics/export",
             post(foundation::native_diagnostics_export),
         )
+        .route("/native/lsp/diagnostics", get(lsp::native_lsp_diagnostics))
+        .route(
+            "/native/lsp/code-actions",
+            post(lsp::native_lsp_code_actions),
+        )
         // ---- Edition 5 lifecycle surfaces ----
         .route(
             "/native/sessions/parallel",

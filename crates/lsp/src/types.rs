@@ -571,7 +571,7 @@ impl DocumentRevision {
 
 /// Validation failure while converting one wire value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WireError(pub String);
+pub struct WireError(pub String);
 
 impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

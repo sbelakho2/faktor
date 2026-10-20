@@ -55,6 +55,10 @@ pub struct SemanticSources {
     pub session: Arc<SessionManager>,
     pub supervisor: Arc<ProcessSupervisor>,
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// The daemon's ONE workspace-scoped language-server manager. The
+    /// semantic fallback and the native diagnostics/code-action routes share
+    /// this instance, so one workspace never spawns two servers.
+    pub lsp: Arc<LspManager>,
 }
 
 impl SemanticSources {
@@ -70,7 +74,7 @@ impl SemanticSources {
                 .flatten()
         });
         let lsp = Arc::new(DaemonLspMetadata::new(
-            Arc::new(LspManager::new(self.supervisor.clone())),
+            self.lsp.clone(),
             self.session.clone(),
         ));
         let mut fallback = GenericSemanticFallback::default()
@@ -1142,56 +1146,7 @@ fn readiness_probes(probe: &str) -> Vec<String> {
 }
 
 fn lsp_config_for(root: &Path) -> Option<LspConfig> {
-    let root = root.to_path_buf();
-    if root.join("Cargo.toml").is_file() {
-        if let Some(command) = executable_on_path("rust-analyzer") {
-            return Some(LspConfig {
-                name: "rust-analyzer".to_string(),
-                command,
-                args: Vec::new(),
-                root,
-            });
-        }
-    }
-    if root.join("package.json").is_file() || root.join("tsconfig.json").is_file() {
-        if let Some(command) = executable_on_path("typescript-language-server") {
-            return Some(LspConfig {
-                name: "typescript-language-server".to_string(),
-                command,
-                args: vec!["--stdio".to_string()],
-                root,
-            });
-        }
-    }
-    if root.join("pyproject.toml").is_file() || root.join("setup.py").is_file() {
-        if let Some(command) = executable_on_path("pyright-langserver") {
-            return Some(LspConfig {
-                name: "pyright".to_string(),
-                command,
-                args: vec!["--stdio".to_string()],
-                root,
-            });
-        }
-    }
-    None
-}
-
-fn executable_on_path(name: &str) -> Option<String> {
-    let paths = std::env::var_os("PATH")?;
-    let candidates = if cfg!(windows) {
-        vec![format!("{name}.exe"), name.to_string()]
-    } else {
-        vec![name.to_string()]
-    };
-    for dir in std::env::split_paths(&paths) {
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
+    faktor_lsp::config_for_root(root)
 }
 
 fn file_uri(path: &Path) -> String {

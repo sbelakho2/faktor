@@ -92,9 +92,25 @@ pub const MAX_TREE_MANIFEST_ENTRIES: usize = 100_000;
 pub const MAX_TREE_MANIFEST_DEPTH: usize = 64;
 
 /// Directory names skipped at ANY depth by the canonical manifest: VCS
-/// bookkeeping the completion steps legitimately mutate (commits) and that
-/// is never working content. Everything else is manifested.
-pub const TREE_MANIFEST_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+/// bookkeeping the completion steps legitimately mutate (commits), and
+/// conventional build/output caches produced by a derived check AFTER the
+/// candidate was copied. Build caches are never working content: integrating
+/// or drift-comparing them would land gigabytes the operator never authored
+/// and make the landed tree differ from the verified source change.
+pub const TREE_MANIFEST_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".gradle",
+    ".faktor-verify-target",
+];
 
 /// Hard bound on one normalized entry path (UTF-8 bytes).
 pub const MAX_TREE_MANIFEST_PATH_BYTES: usize = 64 * 1024;
@@ -1340,6 +1356,29 @@ mod tests {
             .entries()
             .iter()
             .all(|e| !e.normalized_path.contains(".git")));
+    }
+
+    #[test]
+    fn build_caches_are_never_manifested_or_digest_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root, "src/main.rs", b"fn main() {}");
+        let before = digest(&root);
+        write(&root, "target/debug/huge.bin", b"build cache");
+        write(&root, "node_modules/pkg/index.js", b"dependency cache");
+        write(&root, ".venv/lib/python/site.py", b"virtualenv");
+        assert_eq!(
+            digest(&root),
+            before,
+            "a derived check's build outputs are not candidate content"
+        );
+        assert!(tree_manifest(&root, 100)
+            .unwrap()
+            .entries()
+            .iter()
+            .all(|e| !e.normalized_path.starts_with("target")
+                && !e.normalized_path.starts_with("node_modules")
+                && !e.normalized_path.starts_with(".venv")));
     }
 
     #[test]

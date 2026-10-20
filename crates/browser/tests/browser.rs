@@ -333,6 +333,61 @@ async fn navigation_and_network_records_flow_through_cdp() {
 }
 
 #[tokio::test]
+async fn console_observations_are_captured_bounded_and_ordered() {
+    let mut console = Vec::new();
+    for index in 0..80 {
+        console.push(json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": if index == 79 { "error" } else { "log" },
+                "args": [{"value": format!("line-{index}")}],
+                "stackTrace": {"callFrames": [{
+                    "url": "https://first.test/app.js?token=hidden",
+                    "lineNumber": 9,
+                    "columnNumber": 4
+                }]}
+            }
+        }));
+    }
+    console.push(json!({
+        "method": "Runtime.exceptionThrown",
+        "params": {"exceptionDetails": {"text": "Uncaught TypeError", "lineNumber": 2}}
+    }));
+    let harness = Harness::new(
+        json!({
+            "page_url": "https://first.test/product",
+            "console_events": console
+        }),
+        |config| {
+            config.capture.max_console_records = 25;
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    page.navigate(
+        "https://first.test/product",
+        deadline_in(10_000),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("navigate");
+    let rows = page.console().expect("complete console history");
+    assert_eq!(rows.len(), 25, "ring is bounded");
+    assert_eq!(rows.last().expect("last row").text, "Uncaught TypeError");
+    assert_eq!(rows.last().expect("last row").level, "error");
+    assert!(rows
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
+    if let Some(first) = rows.first() {
+        assert!(!first.url.as_deref().unwrap_or_default().contains("hidden"));
+        assert_eq!(first.line, Some(10));
+        assert_eq!(first.column, Some(5));
+    }
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn interception_drops_blocked_resource_types_and_tracking_hosts() {
     let harness = Harness::new(
         json!({
@@ -412,6 +467,47 @@ async fn body_capture_is_bounded_and_oversize_is_refused() {
         .capture_body("huge", 4096, deadline_in(10_000), &CancellationToken::new())
         .await;
     assert_eq!(refused.err().map(|e| e.code()), Some("response_too_large"));
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn attachment_navigation_is_default_denied_typed_without_deadline_hang() {
+    let harness = Harness::new(
+        json!({
+            "suppress_lifecycle": true,
+            "pause_response": true,
+            "network": [{
+                "request_id": "dl",
+                "url": "https://first.test/download",
+                "resource_type": "Document",
+                "content_disposition": "attachment; filename=\"../../evil.sh\"",
+                "content_length": 12
+            }]
+        }),
+        |_| {},
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let started = std::time::Instant::now();
+    let error = page
+        .navigate(
+            "https://first.test/download",
+            deadline_in(10_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a default-denied download must terminate the navigation typed");
+    assert_eq!(error.code(), "download_blocked", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the navigation must not wait for its deadline: {:?}",
+        started.elapsed()
+    );
+    let records = page.download_records();
+    let record = records.first().expect("one policy observation");
+    assert_eq!(record.suggested_filename, "evil.sh");
+    assert!(!record.suggested_filename.contains(".."));
     let _ = page.close().await;
     harness.manager.shutdown_all().await;
 }

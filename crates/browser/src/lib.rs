@@ -64,6 +64,7 @@
 
 pub mod capture;
 pub mod cdp;
+pub mod console;
 pub mod download;
 pub mod egress;
 pub mod error;

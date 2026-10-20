@@ -110,6 +110,7 @@ import { Edition5Panel } from './edition5/panel.ts';
 import { Edition8Client } from './edition8/client.ts';
 import { Edition8Panel, Edition8ViewProvider, type Edition8PanelDeps } from './edition8/panel.ts';
 import { registerEdition8 } from './edition8/commands.ts';
+import { registerLspDiagnostics } from './lspDiagnostics.ts';
 import { addContextDraft, toggleFavorite } from './edition8/hostDraft.ts';
 import type { PixelPresence } from './pixelAgents';
 import {
@@ -4045,6 +4046,11 @@ export function activate(context: vscode.ExtensionContext): void {
     // reads ONLY through the native client (never a workspace file), and a
     // typed refusal renders an explicit refusal document.
     registerEvidenceDocumentProvider(() => active.client),
+    registerLspDiagnostics(context, {
+      client: () => active.client,
+      session: () => active.sessionId,
+      workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+    }),
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),

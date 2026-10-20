@@ -243,6 +243,8 @@ internal class Edition8Daemon(
 
     fun hasClient(): Boolean = clientProvider() != null
 
+    fun hasTask(): Boolean = taskId() != null
+
     fun loadConfig(after: (Edition8Result) -> Unit) = call("GET", "/native/config/snapshot", null, after)
 
     fun readForControl(control: Edition8Control, after: (Edition8Result) -> Unit) {
@@ -455,6 +457,19 @@ internal class Edition8Daemon(
     }
 
     fun primaryRead(path: String, after: (Edition8Result) -> Unit) = call("GET", path, null, after)
+
+    /** The task's exact proof read (F260/F261): session-scoped, task-bound. */
+    fun taskProof(after: (Edition8Result) -> Unit) {
+        val task = taskId()
+        if (task == null) {
+            after(Edition8Result.Refused("no task is bound to this conversation", "task"))
+            return
+        }
+        val session = sessionId()
+        val path = "/native/tasks/" + java.net.URLEncoder.encode(task, "UTF-8") + "/proof" +
+            if (session == null) "" else "?session=" + java.net.URLEncoder.encode(session, "UTF-8")
+        call("GET", path, null, after)
+    }
 
     fun post(path: String, body: String, after: (Edition8Result) -> Unit) =
         call("POST", path, body, after)

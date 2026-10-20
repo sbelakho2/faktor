@@ -51,6 +51,8 @@ struct Scenario {
     omit_result_fields: HashMap<String, Vec<String>>,
     /// Browser-domain events emitted after a navigation (no session id).
     browser_events: Vec<Value>,
+    /// Session-scoped console/log events emitted after a navigation.
+    console_events: Vec<Value>,
     /// The scripted response-body stream served through
     /// `Fetch.takeResponseBodyAsStream` + `IO.read`.
     stream_body_bytes: usize,
@@ -155,6 +157,11 @@ impl Scenario {
                 .unwrap_or_default(),
             browser_events: value
                 .get("browser_events")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            console_events: value
+                .get("console_events")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
@@ -508,6 +515,7 @@ fn handle_command(
         "Page.enable"
         | "Network.enable"
         | "Runtime.enable"
+        | "Log.enable"
         | "Fetch.enable"
         | "Network.setCacheDisabled"
         | "Network.setBlockedURLs" => Ok(json!({})),
@@ -563,6 +571,14 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
         }
         events.push(event);
     };
+    for event in &server.scenario.console_events {
+        let method = event
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("Runtime.consoleAPICalled");
+        let params = event.get("params").cloned().unwrap_or(Value::Null);
+        push(session, method, params);
+    }
     if !server.scenario.suppress_lifecycle {
         push(
             session,

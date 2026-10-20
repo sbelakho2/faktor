@@ -1657,20 +1657,21 @@ impl AgentRuntime {
         let profile = faktor_verify::derive::detect_project_profile(&root, &repo_files);
         let changed_paths: Vec<std::path::PathBuf> =
             changed.iter().map(std::path::PathBuf::from).collect();
-        let specs = match faktor_verify::derive::derive_checks(&profile, &changed_paths) {
-            Ok(specs) => specs,
-            Err(e) => {
-                // A cap/ownership refusal can never certify completion: the
-                // required semantic coverage could not be derived without
-                // truncation, so the turn stays Unverified.
-                return self.unverified_verdict(
-                    handle,
-                    changed,
-                    review,
-                    &format!("verification derivation refused: {e}"),
-                );
-            }
-        };
+        let specs =
+            match faktor_verify::derive::derive_checks_at_root(&profile, &changed_paths, &root) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    // A cap/ownership refusal can never certify completion: the
+                    // required semantic coverage could not be derived without
+                    // truncation, so the turn stays Unverified.
+                    return self.unverified_verdict(
+                        handle,
+                        changed,
+                        review,
+                        &format!("verification derivation refused: {e}"),
+                    );
+                }
+            };
         if specs.is_empty() {
             // No check applies to this change: the objective mechanism
             // exists but confirms nothing — Unverified, never a claim of

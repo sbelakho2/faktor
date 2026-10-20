@@ -8793,6 +8793,7 @@ async function composerAttachmentTests() {
       'faktor.startServer': 'Diagnostics: Start Service',
       'faktor.stopServer': 'Diagnostics: Stop Service',
       'faktor.refresh': 'Diagnostics: Refresh State',
+      'faktor.refreshLspDiagnostics8': 'Diagnostics: Language Server for Active File',
       'faktor.reconnectStream': 'Diagnostics: Reconnect Event Stream',
       'faktor.switchSession': 'Switch Conversation',
       'faktor.locateDaemon': 'Locate daemon…',
@@ -15788,12 +15789,17 @@ async function capabilityMatrixTests() {
     new URL('../src/edition8/commands.ts', import.meta.url),
     'utf8',
   );
+  const lspDiagnosticsSource = readFileSync(
+    new URL('../src/lspDiagnostics.ts', import.meta.url),
+    'utf8',
+  );
 
   await test('capability matrix: every contributed command is activated, registered and reaches a real service path', () => {
     const contributed = pkg.contributes.commands.map((entry) => entry.command).sort();
     const registered = [
       ...[...extensionSource.matchAll(/vscode\.commands\.registerCommand\('([^']+)'/g)].map((match) => match[1]),
       ...[...edition8CommandsSource.matchAll(/register\('([^']+)'/g)].map((match) => match[1]),
+      ...[...lspDiagnosticsSource.matchAll(/registerCommand\('([^']+)'/g)].map((match) => match[1]),
     ].sort();
     assertDeepEqual(
       registered,
@@ -15855,8 +15861,9 @@ async function capabilityMatrixTests() {
         // Revision 8 native commands live in the Edition 8 registration
         // module; its `register(id, handler)` calls are the real wiring.
         assert(
-          edition8CommandsSource.includes(`register('${command}'`),
-          `${command} must be registered by the Edition 8 command module`,
+          edition8CommandsSource.includes(`register('${command}'`) ||
+            lspDiagnosticsSource.includes(`registerCommand('${command}'`),
+          `${command} must be registered by a native command module`,
         );
         continue;
       }

@@ -1119,7 +1119,12 @@ fn test_dir_files(files: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn derive_cargo(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: &[String]) {
+fn derive_cargo(
+    out: &mut Vec<CheckSpec>,
+    component: &ProjectComponent,
+    local: &[String],
+    workspace_root: Option<&Path>,
+) {
     let rust: Vec<String> = local
         .iter()
         .filter(|file| file.ends_with(".rs"))
@@ -1158,7 +1163,78 @@ fn derive_cargo(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: &
                 true,
             );
         }
+    } else if let Some(workspace_root) = workspace_root {
+        // INLINE tests in a non-test-named source file (the common
+        // `#[cfg(test)] mod tests` layout): the contract compiler discovers
+        // these selectors and binds required test-execution obligations to
+        // them. Without a derived `cargo test <selector>` the obligation can
+        // never be discharged and a correct change blocks forever. Read only
+        // the changed Rust files, bounded by count and bytes; the shared
+        // parser is the one the contract compiler uses, so demanded and
+        // executable selectors cannot drift.
+        const MAX_INLINE_TEST_FILES: usize = 64;
+        const MAX_INLINE_TEST_FILE_BYTES: u64 = 1024 * 1024;
+        const MAX_INLINE_TEST_CHECKS: usize = 16;
+        let mut selectors: Vec<String> = Vec::new();
+        let component_root = workspace_root.join(&component.root);
+        for file in rust.iter().take(MAX_INLINE_TEST_FILES) {
+            // Changed paths may arrive absolute (the shadow root of an
+            // isolated drive) or workspace-relative. Normalize to the
+            // component-relative spelling the selector parser understands.
+            let relative = std::path::Path::new(file)
+                .strip_prefix(&component_root)
+                .unwrap_or_else(|_| std::path::Path::new(file));
+            let path = component_root.join(relative);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() > MAX_INLINE_TEST_FILE_BYTES {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy();
+            for selector in
+                faktor_core::contract_compile::rust_test_selectors_for_path(&relative, &content)
+            {
+                if !selectors.contains(&selector) {
+                    selectors.push(selector);
+                }
+            }
+        }
+        selectors.sort();
+        selectors.dedup();
+        let discovered = !selectors.is_empty();
+        for selector in selectors.into_iter().take(MAX_INLINE_TEST_CHECKS) {
+            push_check(
+                out,
+                component,
+                &format!("rust_test:{selector}"),
+                CheckKind::Test,
+                CheckCategory::Unit,
+                "cargo",
+                &["test", selector.as_str()],
+                rust.clone(),
+                true,
+            );
+        }
+        if !discovered {
+            push_check(
+                out,
+                component,
+                "rust_test_lib",
+                CheckKind::Test,
+                CheckCategory::Unit,
+                "cargo",
+                &["test", "--lib"],
+                Vec::new(),
+                false,
+            );
+        }
     } else {
+        // Rootless callers (native `run_tests` operations over an unknown
+        // checkout) keep the historical optional library-test derivation.
         push_check(
             out,
             component,
@@ -1686,12 +1762,16 @@ fn derive_espidf(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: 
     );
 }
 
-fn derive_component_checks(component: &ProjectComponent, local: &[String]) -> Vec<CheckSpec> {
+fn derive_component_checks(
+    component: &ProjectComponent,
+    local: &[String],
+    workspace_root: Option<&Path>,
+) -> Vec<CheckSpec> {
     let mut out: Vec<CheckSpec> = Vec::new();
     let has = |build_system: BuildSystem| component.build_systems.contains(&build_system);
     let lang = |language: LanguageFamily| component.languages.contains(&language);
     if has(BuildSystem::Cargo) {
-        derive_cargo(&mut out, component, local);
+        derive_cargo(&mut out, component, local, workspace_root);
     }
     if has(BuildSystem::Npm) {
         derive_node(&mut out, component, local);
@@ -1751,12 +1831,33 @@ pub fn derive_checks(
     derive_checks_with_limits(profile, changed, DerivationLimits::default())
 }
 
+/// Derive checks against an EXPLICIT workspace root. The root is required to
+/// discover inline `#[cfg(test)]` selectors in changed source files; the
+/// rootless legacy entry point derives no inline test checks (tests using
+/// relative profiles keep their historical output).
+pub fn derive_checks_at_root(
+    profile: &ProjectProfile,
+    changed: &[PathBuf],
+    root: &Path,
+) -> Result<Vec<CheckSpec>, VerificationDerivationError> {
+    derive_checks_with_limits_and_root(profile, changed, DerivationLimits::default(), Some(root))
+}
+
 /// [`derive_checks`] under explicit caps (adversarial tests and callers with
 /// tighter execution budgets).
 pub fn derive_checks_with_limits(
     profile: &ProjectProfile,
     changed: &[PathBuf],
     limits: DerivationLimits,
+) -> Result<Vec<CheckSpec>, VerificationDerivationError> {
+    derive_checks_with_limits_and_root(profile, changed, limits, None)
+}
+
+fn derive_checks_with_limits_and_root(
+    profile: &ProjectProfile,
+    changed: &[PathBuf],
+    limits: DerivationLimits,
+    workspace_root: Option<&Path>,
 ) -> Result<Vec<CheckSpec>, VerificationDerivationError> {
     // A content-deciding manifest probe that could not certify its content
     // (unreadable/oversized/unstable) means the derived check set would be
@@ -1787,7 +1888,7 @@ pub fn derive_checks_with_limits(
         if local.is_empty() {
             continue;
         }
-        specs.extend(derive_component_checks(component, local));
+        specs.extend(derive_component_checks(component, local, workspace_root));
     }
     // Dedupe by id with ONE map lookup per spec (spec counts are attacker
     // influenced before the MAX_CHECKS cap check, so the old O(k^2)
@@ -2263,6 +2364,45 @@ mod tests {
         assert!(checks
             .iter()
             .all(|spec| spec.cwd_rel.as_os_str().is_empty()));
+    }
+
+    #[test]
+    fn inline_tests_in_a_plain_source_file_derive_executable_test_checks() {
+        let (dir, files) = fixture(&[
+            ("Cargo.toml", "[package]\nname = \"root\"\n"),
+            (
+                "src/lib.rs",
+                "pub fn f() -> i64 { 7 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::f(), 7); }\n}\n",
+            ),
+        ]);
+        let profile = detect_project_profile(dir.path(), &files);
+        let changed = vec![PathBuf::from("src/lib.rs")];
+        // The rootless legacy entry point preserves its historical output.
+        let rootless = derive_checks(&profile, &changed).unwrap();
+        assert!(required_ids(&rootless).contains(&"rust_check".into()));
+        assert!(
+            !rootless
+                .iter()
+                .any(|spec| spec.id.starts_with("rust_test:tests::")),
+            "no inline scan without an explicit root: {rootless:?}"
+        );
+        // The verifier's entry point discovers the contract compiler's exact
+        // selector and derives a real `cargo test tests::adds` check.
+        let rooted = derive_checks_at_root(&profile, &changed, dir.path()).unwrap();
+        let test = rooted
+            .iter()
+            .find(|spec| spec.id == "rust_test:tests::adds")
+            .unwrap_or_else(|| panic!("inline test check missing: {rooted:?}"));
+        assert_eq!(test.kind, CheckKind::Test);
+        assert!(test.required);
+        assert_eq!(test.program, PathBuf::from("cargo"));
+        assert_eq!(
+            test.args,
+            vec![
+                std::ffi::OsString::from("test"),
+                std::ffi::OsString::from("tests::adds")
+            ]
+        );
     }
 
     #[test]

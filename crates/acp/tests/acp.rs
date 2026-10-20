@@ -81,6 +81,35 @@ impl AcpBackend for EchoBackend {
     }
 }
 
+/// Sync backend that reports its final transcript in `_meta`: the engine
+/// must project it as official chunks so ACP clients see the assistant text.
+struct MetaBackend;
+
+impl AcpBackend for MetaBackend {
+    fn agent_info(&self) -> Value {
+        json!({ "name": "meta", "version": "0.0.0" })
+    }
+    fn create_session(&self, _params: &Value) -> Result<String, String> {
+        Ok("sess-meta".into())
+    }
+    fn prompt(&self, session_id: &str, _text: &str) -> Result<Value, String> {
+        Ok(json!({
+            "status": "completed",
+            "session": session_id,
+            "_meta": {
+                "agentText": "final answer",
+                "agentReasoning": "thought",
+            },
+        }))
+    }
+    fn abort(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn list_sessions(&self) -> Vec<String> {
+        vec!["sess-meta".into()]
+    }
+}
+
 /// Backend whose every call fails: failures must surface as official
 /// internal errors (`-32603` with the message in `data`).
 struct FailingBackend;
@@ -436,6 +465,77 @@ async fn malformed_json_body_is_32700_and_loop_survives() {
 
     let ok = client.request("agent_info", json!({})).await;
     assert_eq!(ok["result"]["name"], "faktor-test-agent");
+}
+
+#[tokio::test]
+async fn sync_backend_final_transcript_is_projected_as_official_chunks() {
+    let (mut client, _task) = start_server(MetaBackend);
+    client
+        .request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    client
+        .request("session/new", json!({"workspace": "/tmp"}))
+        .await;
+    let id = client.next_id;
+    let body = frame(
+        "session/prompt".to_string(),
+        id,
+        json!({"sessionId": "sess-meta", "prompt": [{"type": "text", "text": "hi"}]}),
+    );
+    client.send_bytes(&body).await;
+    let mut text = Vec::new();
+    let mut reasoning = Vec::new();
+    let response = loop {
+        let msg = client.expect_message().await;
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            let update = &msg["params"]["update"];
+            match update["sessionUpdate"].as_str() {
+                Some("agent_message_chunk") => text.push(
+                    update["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                Some("agent_thought_chunk") => reasoning.push(
+                    update["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                _ => {}
+            }
+            continue;
+        }
+        if msg["id"] == json!(id) {
+            break msg;
+        }
+    };
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(text, vec!["final answer".to_string()]);
+    assert_eq!(reasoning, vec!["thought".to_string()]);
+}
+
+#[tokio::test]
+async fn malformed_header_is_rejected_typed_and_never_desyncs_into_the_next_frame() {
+    let (mut client, task) = start_server(EchoBackend::new());
+    let valid = frame("initialize".to_string(), 7, json!({"protocolVersion": 1}));
+    let mut input = b"Content-Length: nope\r\n\r\n{}".to_vec();
+    input.extend_from_slice(&valid);
+    client.write.write_all(&input).await.unwrap();
+    client.write.flush().await.unwrap();
+
+    // The malformed header is a typed parse error (null id, canonical
+    // message), and because its body boundary is unknowable the connection
+    // closes cleanly instead of misparsing the following valid frame.
+    let err = client.expect_message().await;
+    assert!(err["id"].is_null());
+    assert_eq!(err["error"]["code"], -32700);
+    assert_eq!(err["error"]["message"], "Parse error");
+    client.expect_eof().await;
+    let result = timeout(Duration::from_secs(10), task)
+        .await
+        .expect("server must wind down");
+    assert!(result.is_ok(), "server errored while closing: {result:?}");
 }
 
 #[tokio::test]
