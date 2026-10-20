@@ -5,7 +5,7 @@
 //! daemon installs [`WorkspaceImpact`] on the semantic fallback, so the
 //! product API and the CI selector consume one authority.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,6 @@ pub type RootResolver = Arc<dyn Fn(u64) -> Option<PathBuf> + Send + Sync>;
 struct CachedGraph {
     root: PathBuf,
     session: ImpactSession,
-    refreshed: BTreeSet<String>,
 }
 
 /// Semantic seam implementation: lazily builds the workspace graph and
@@ -68,41 +67,41 @@ impl ImpactMetadata for WorkspaceImpact {
             .get(&workspace_key)
             .is_some_and(|entry| entry.root == root);
         if needs_build {
-            let session = ImpactSession::build_for_workspace(&root, Revision::default(), workspace)
-                .map_err(|error| SemanticError::Unavailable {
-                    subsystem: "graph".to_string(),
-                    reason: error.to_string(),
+            let session =
+                ImpactSession::build_material_for_workspace(&root, workspace).map_err(|error| {
+                    SemanticError::Unavailable {
+                        subsystem: "graph".to_string(),
+                        reason: error.to_string(),
+                    }
                 })?;
             cache.insert(
                 workspace_key,
                 CachedGraph {
                     root: root.clone(),
                     session,
-                    refreshed: BTreeSet::new(),
                 },
             );
         }
         let entry = cache
             .get_mut(&workspace_key)
             .expect("cached graph was just inserted");
-        let paths: Vec<String> = changed
+        // Always re-examine every changed path. The session compares per-path
+        // content digests, so a repeated consult for unchanged bytes is a
+        // cheap no-op, while a second real edit is never suppressed.
+        let mut paths: Vec<String> = changed
             .iter()
             .map(|entity| entity.path.as_str().to_string())
             .collect();
-        let refresh: Vec<String> = paths
-            .iter()
-            .filter(|path| !entry.refreshed.contains(*path))
-            .cloned()
-            .collect();
-        if !refresh.is_empty() {
+        paths.sort();
+        paths.dedup();
+        if !paths.is_empty() {
             entry
                 .session
-                .refresh(&refresh, Revision::default())
+                .refresh_material(&paths)
                 .map_err(|error| SemanticError::Unavailable {
                     subsystem: "graph".to_string(),
                     reason: error.to_string(),
                 })?;
-            entry.refreshed.extend(refresh);
         }
         let targets: Vec<ChangedTarget> = changed
             .iter()
@@ -546,6 +545,65 @@ mod tests {
             .provenance
             .iter()
             .any(|entry| entry.subsystem == faktor_semantic::types::SemanticSubsystem::Graph));
+    }
+
+    #[test]
+    fn workspace_impact_observes_a_second_edit_to_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\n");
+        write(
+            root,
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "a/src/lib.rs", "pub fn base() -> u32 { 1 }\n");
+        let root_path = root.to_path_buf();
+        let impact = WorkspaceImpact::new(Arc::new(move |_workspace| Some(root_path.clone())));
+        let workspace = WorkspaceId::new(1);
+        let changed = vec![SemanticEntityRef::heuristic(
+            workspace,
+            WorkspacePath::parse("a/src/lib.rs").unwrap(),
+            SemanticEntityId::parse("file:a/src/lib.rs").unwrap(),
+        )];
+
+        write(
+            root,
+            "a/src/lib.rs",
+            "pub fn base() -> u32 { 1 }\npub fn first_edit() -> u32 { base() }\n",
+        );
+        let first = impact.affected(workspace, &changed, 2, 100).unwrap();
+        assert!(
+            first.findings.iter().any(|finding| finding
+                .entity
+                .entity_id
+                .as_str()
+                .contains("first_edit")),
+            "first edit must be indexed: {first:?}"
+        );
+
+        write(
+            root,
+            "a/src/lib.rs",
+            "pub fn base() -> u32 { 1 }\npub fn second_edit() -> u32 { base() }\n",
+        );
+        let second = impact.affected(workspace, &changed, 2, 100).unwrap();
+        assert!(
+            second.findings.iter().any(|finding| finding
+                .entity
+                .entity_id
+                .as_str()
+                .contains("second_edit")),
+            "a second edit to the same path must be observed: {second:?}"
+        );
+        assert!(
+            !second.findings.iter().any(|finding| finding
+                .entity
+                .entity_id
+                .as_str()
+                .contains("first_edit")),
+            "the first edit must not survive the second refresh: {second:?}"
+        );
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

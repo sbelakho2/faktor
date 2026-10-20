@@ -135,6 +135,9 @@ steps:
     commands:
       - rustup show active-toolchain
       - cargo run -q -p faktor-cli -- impact graph --root . --selector --compact --out target/certification/impact/graph.json
+      # The Rust graph validator is the selector's ONLY structural authority;
+      # build it here so the node-only selection step can consume its verdict.
+      - cargo build -q -p faktor-ci-tools
 
   # ------------------------------------------------- programme selection --
   # Change-aware selection: maps the PR diff to affected crates/tests/suites,

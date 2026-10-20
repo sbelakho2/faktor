@@ -46,10 +46,10 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, SemanticCall, SemanticCapabilities,
     SemanticContextPack, SemanticContextRequest, SemanticDelta, SemanticDeltaRequest,
-    SemanticEnvelope, SemanticError, SemanticExplainRequest, SemanticExplanation, SemanticOp,
-    SemanticPayload, SemanticProvider, SemanticProviderDescriptor, SemanticProviderId,
-    SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotRequest, SemanticVerification,
-    SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
+    SemanticEnvelope, SemanticError, SemanticEvidenceSource, SemanticExplainRequest,
+    SemanticExplanation, SemanticOp, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
+    SemanticProviderId, SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotRequest,
+    SemanticVerification, SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// Bounds of the external-provider config surface (hostile configs are
@@ -314,13 +314,21 @@ impl<C: ExternalTransport> SemanticProvider for ExternalProvider<C> {
             return Box::pin(async move { Ok(descriptor) });
         }
         Box::pin(async move {
-            let descriptor = self.inner.handshake_json(cancel).await?;
+            let mut descriptor = self.inner.handshake_json(cancel).await?;
             if descriptor.id != self.inner.provider_id() {
                 return Err(SemanticError::ProviderMismatch {
                     expected: self.inner.provider_id(),
                     actual: descriptor.id,
                 });
             }
+            descriptor.validate()?;
+            // A legacy wire descriptor without per-operation quality still
+            // presents an honest per-operation profile: its provider-wide
+            // declaration is applied to every covered operation and tagged
+            // with the EXTERNAL evidence source (tier 5 is a ceiling, never
+            // inherited when the provider declared no tier). Explicit
+            // per-operation declarations are preserved verbatim.
+            descriptor.normalize_operation_quality(SemanticEvidenceSource::External);
             descriptor.validate()?;
             *self
                 .descriptor
@@ -1644,6 +1652,49 @@ mod tests {
             descriptor
         );
         assert_eq!(provider.capabilities(), advertised);
+    }
+
+    /// The Tangerine-style external adapter normalizes a LEGACY wire
+    /// descriptor (provider-wide fidelity/completeness/tier only) into an
+    /// honest per-operation quality profile tagged with `external`
+    /// provenance; explicit per-operation declarations are preserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_descriptor_normalizes_legacy_quality_per_operation() {
+        use crate::types::{SemanticCompleteness, SemanticFidelity};
+
+        let fake = FakeProcess::new("cat \"$2\"");
+        let env = client_env(fake.dir.path());
+        let provider = fake.config(5_000).build(&env).unwrap();
+        let mut descriptor = SemanticProviderDescriptor::new(
+            provider_id("fake-proc"),
+            7,
+            SEMANTIC_SCHEMA_VERSION,
+            SemanticCapabilities::CONTEXT.union(SemanticCapabilities::AFFECTED),
+        );
+        descriptor.fidelity = Some(SemanticFidelity::Structural);
+        descriptor.completeness = Some(SemanticCompleteness::Partial);
+        descriptor.tier = Some(5);
+        fake.respond_descriptor(&typed_frame(&serde_json::json!({
+            "v": WIRE_SCHEMA_VERSION,
+            "op": "describe",
+            "descriptor": descriptor,
+        })));
+        let validated = provider
+            .handshake(CancellationToken::new())
+            .await
+            .expect("legacy descriptor is accepted and normalized");
+        for op in [SemanticOp::Context, SemanticOp::Affected] {
+            let quality = validated
+                .operation_quality(op)
+                .unwrap_or_else(|| panic!("{op:?} must gain a normalized quality entry"));
+            assert_eq!(quality.fidelity, SemanticFidelity::Structural);
+            assert_eq!(quality.completeness, SemanticCompleteness::Partial);
+            assert_eq!(quality.tier, Some(5));
+            assert_eq!(quality.provenance, SemanticEvidenceSource::External);
+        }
+        // Uncovered operations gain NO claim.
+        assert!(validated.operation_quality(SemanticOp::Verify).is_none());
     }
 
     #[cfg(unix)]

@@ -36,14 +36,15 @@ use faktor_core::{CancellationToken, Clock, Deadline, SystemClock, WorkspaceId};
 use crate::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use crate::health::{ProviderHealthKey, SemanticHealthTracker};
 use crate::intelligence::IntelligenceCapability;
+use crate::quality::{effective_quality, SemanticQualityRequirement, SemanticQualitySelection};
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, EnvelopeIdentity, SemanticCall, SemanticCapabilities,
-    SemanticCompleteness, SemanticContextPack, SemanticContextRequest, SemanticDelta,
-    SemanticDeltaRequest, SemanticEnvelope, SemanticError, SemanticExpectation,
-    SemanticExplainRequest, SemanticExplanation, SemanticFidelity, SemanticOp,
-    SemanticOperationStatus, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
-    SemanticProviderId, SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotId,
-    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
+    SemanticContextPack, SemanticContextRequest, SemanticDelta, SemanticDeltaRequest,
+    SemanticEnvelope, SemanticError, SemanticExpectation, SemanticExplainRequest,
+    SemanticExplanation, SemanticOp, SemanticOperationQuality, SemanticOperationStatus,
+    SemanticPayload, SemanticProvider, SemanticProviderDescriptor, SemanticProviderId,
+    SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest,
+    SemanticVerification, SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// The provider chosen for one operation.
@@ -140,20 +141,10 @@ enum DispatchOutcome<T> {
 /// Registry of semantic providers plus the always-available generic
 /// fallback.
 /// The generic fallback's honest per-operation status (audit Tangerine-4).
+/// The default composition has no native seams wired, so its per-operation
+/// quality is the Tier-0 filesystem/lexical baseline.
 pub fn fallback_operation_status(op: SemanticOp) -> SemanticOperationStatus {
-    let fallback = GenericSemanticFallback::default();
-    SemanticOperationStatus {
-        available: fallback.capabilities().supports(op),
-        fidelity: SemanticFidelity::Heuristic,
-        completeness: match op {
-            // Degraded packs are bounded slices of the index/metadata, so
-            // they are PARTIAL; delta/affected are approximations whose
-            // coverage is genuinely unknown.
-            SemanticOp::Context | SemanticOp::Explain => SemanticCompleteness::Partial,
-            _ => SemanticCompleteness::Unknown,
-        },
-        source: GENERIC_FALLBACK_ID.to_string(),
-    }
+    GenericSemanticFallback::default().operation_status(op)
 }
 
 pub struct SemanticProviderRegistry {
@@ -218,15 +209,12 @@ impl SemanticProviderRegistry {
                 .capabilities
                 .covers(SemanticCapabilities::for_op(op))
             {
-                return SemanticOperationStatus {
-                    available: true,
-                    // Absent declarations are UNTRUSTED (audit P1-SEMANTIC).
-                    fidelity: descriptor.fidelity.unwrap_or(SemanticFidelity::None),
-                    completeness: descriptor
-                        .completeness
-                        .unwrap_or(SemanticCompleteness::Unknown),
-                    source: provider.id().as_str().to_string(),
-                };
+                let quality = effective_quality(provider.as_ref(), &descriptor, op);
+                return SemanticOperationStatus::from_quality(
+                    true,
+                    &quality,
+                    provider.id().as_str(),
+                );
             }
         }
         self.fallback.operation_status(op)
@@ -237,10 +225,11 @@ impl SemanticProviderRegistry {
     /// uses: a registered provider whose VALIDATED descriptor covers the
     /// operation reports its DECLARED tier (absent = `None`, never assumed
     /// high) and its declared evidence dimensions; otherwise the generic
-    /// fallback reports Tier 0 (filesystem + text search) with heuristic
-    /// fidelity. Confidence is computed from the orthogonal dimensions
-    /// only — never from the tier. Unavailable operations keep their true
-    /// tier and report zero confidence.
+    /// fallback reports its own per-operation quality (Tier 0 for the
+    /// unwired default; LSP/graph/runtime-backed tiers when those native
+    /// seams are wired). Confidence is computed from the orthogonal
+    /// dimensions only — never from the tier. Unavailable operations keep
+    /// their true tier and report zero confidence.
     pub fn intelligence_capability(&self, op: SemanticOp) -> IntelligenceCapability {
         for (index, provider) in self.providers.iter().enumerate() {
             let Some(descriptor) = self.cached_descriptor(index) else {
@@ -250,23 +239,13 @@ impl SemanticProviderRegistry {
                 .capabilities
                 .covers(SemanticCapabilities::for_op(op))
             {
-                return IntelligenceCapability {
+                let quality = effective_quality(provider.as_ref(), &descriptor, op);
+                return IntelligenceCapability::from_quality(
                     op,
-                    // The descriptor was validated at handshake, so an
-                    // out-of-range tier cannot appear here; a failed parse
-                    // conservatively degrades to `None` (capability metadata
-                    // only, never scored).
-                    tier: descriptor.intelligence_tier(),
-                    available: true,
-                    dimensions: crate::intelligence::ConfidenceDimensions::new(
-                        descriptor.fidelity.unwrap_or(SemanticFidelity::None),
-                        descriptor
-                            .completeness
-                            .unwrap_or(SemanticCompleteness::Unknown),
-                        descriptor.evidence,
-                    ),
-                    source: provider.id().as_str().to_string(),
-                };
+                    &quality,
+                    true,
+                    provider.id().as_str(),
+                );
             }
         }
         self.fallback.intelligence_capability(op)
@@ -304,11 +283,12 @@ impl SemanticProviderRegistry {
     /// appear. In-process providers validate immediately; an external
     /// provider counts only after its handshake.
     pub fn has_external_provider_for(&self, op: SemanticOp) -> bool {
-        let required = SemanticCapabilities::for_op(op);
+        let requirement = SemanticQualityRequirement::authoritative(op);
         self.providers.iter().any(|provider| {
-            provider
-                .validated_descriptor()
-                .is_some_and(|descriptor| descriptor.covers_validated(required))
+            provider.validated_descriptor().is_some_and(|descriptor| {
+                descriptor.covers_validated(requirement.capabilities)
+                    && requirement.accepts(&effective_quality(provider.as_ref(), &descriptor, op))
+            })
         })
     }
 
@@ -372,6 +352,88 @@ impl SemanticProviderRegistry {
             }
             SemanticSelection::Fallback(&self.fallback)
         })
+    }
+
+    /// THE authoritative quality gate. Fetches/validates any missing
+    /// descriptors, then walks registered providers in deterministic order:
+    /// a provider must cover the requirement's capabilities AND its
+    /// per-operation declared quality must satisfy the requirement. The
+    /// generic fallback is considered last and only when it both covers the
+    /// capabilities and declares the required quality. When nothing
+    /// satisfies the requirement the refusal is typed
+    /// ([`SemanticError::QualityBelowRequirement`] for a covering candidate
+    /// that declared too little, [`SemanticError::QualityUnavailable`] when
+    /// no candidate covered it at all).
+    ///
+    /// Authoritative consumers must use this method (or the sync
+    /// [`Self::select_quality_cached`] after a handshake) instead of
+    /// inspecting fidelity/completeness themselves.
+    pub fn select_quality<'a>(
+        &'a self,
+        requirement: SemanticQualityRequirement,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<SemanticQualitySelection<'a>, SemanticError>> {
+        Box::pin(async move {
+            self.fetch_descriptors(requirement.op, cancellation, None)
+                .await?;
+            self.select_quality_cached(requirement)
+        })
+    }
+
+    /// The same central gate over the descriptors already validated. Never
+    /// handshakes; an external provider without a validated descriptor is
+    /// invisible. O(1) quality lookup per candidate.
+    pub fn select_quality_cached(
+        &self,
+        requirement: SemanticQualityRequirement,
+    ) -> Result<SemanticQualitySelection<'_>, SemanticError> {
+        let mut best_rejection: Option<(String, SemanticOperationQuality)> = None;
+        for (index, provider) in self.providers.iter().enumerate() {
+            let Some(descriptor) = self.cached_descriptor(index) else {
+                continue;
+            };
+            if !descriptor.covers_validated(requirement.capabilities) {
+                continue;
+            }
+            let quality = effective_quality(provider.as_ref(), &descriptor, requirement.op);
+            if requirement.accepts(&quality) {
+                return Ok(SemanticQualitySelection::Provider {
+                    provider: provider.as_ref(),
+                    quality,
+                });
+            }
+            let source = provider.id().as_str().to_string();
+            let replace = best_rejection.as_ref().is_none_or(|(_, best)| {
+                (quality.fidelity, quality.completeness) > (best.fidelity, best.completeness)
+            });
+            if replace {
+                best_rejection = Some((source, quality));
+            }
+        }
+        if self
+            .fallback
+            .capabilities()
+            .covers(requirement.capabilities)
+        {
+            let descriptor = self.fallback.descriptor();
+            let quality = effective_quality(&self.fallback, &descriptor, requirement.op);
+            if requirement.accepts(&quality) {
+                return Ok(SemanticQualitySelection::Fallback { quality });
+            }
+            let replace = best_rejection.as_ref().is_none_or(|(_, best)| {
+                (quality.fidelity, quality.completeness) > (best.fidelity, best.completeness)
+            });
+            if replace {
+                best_rejection = Some((GENERIC_FALLBACK_ID.to_string(), quality));
+            }
+        }
+        match best_rejection {
+            Some((source, quality)) => Err(requirement.rejection(source, &quality)),
+            None => Err(requirement.unavailable(format!(
+                "no registered provider or the native fallback covers the {} capabilities",
+                requirement.op.as_str()
+            ))),
+        }
     }
 
     fn cached_descriptor(&self, index: usize) -> Option<SemanticProviderDescriptor> {
@@ -860,7 +922,8 @@ mod tests {
     use super::*;
     use crate::test_support::{block_on, call, entity, provider_id, snapshot};
     use crate::types::{
-        SemanticContextPack, SemanticEntityId, SemanticEntityRef, SemanticOp, WorkspacePath,
+        SemanticCompleteness, SemanticContextPack, SemanticEntityId, SemanticEntityRef,
+        SemanticFidelity, SemanticOp, SemanticOperationQualities, WorkspacePath,
         SEMANTIC_SCHEMA_VERSION,
     };
     use faktor_core::{TestClock, WorkspaceId};
@@ -1198,6 +1261,161 @@ mod tests {
             SemanticOp::Verify.minimum_fidelity(),
             SemanticFidelity::Proof
         );
+    }
+
+    /// Per-operation descriptor quality is the authoritative source: two
+    /// operations of the SAME provider report different fidelity/tier/
+    /// provenance, and the intelligence projection derives from them (never
+    /// from provider-wide scalars).
+    #[test]
+    fn per_operation_descriptor_quality_drives_status_and_intelligence() {
+        use crate::intelligence::native_evidence_dimensions;
+        use crate::types::{SemanticEvidenceSource, SemanticOperationQuality};
+
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        registry.register(Arc::new(
+            ScriptedProvider::new(
+                "per-op",
+                SemanticCapabilities::CONTEXT.union(SemanticCapabilities::AFFECTED),
+                ScriptedBehavior::Ready,
+            )
+            .quality(
+                SemanticOp::Context,
+                SemanticOperationQuality::new(
+                    SemanticFidelity::Heuristic,
+                    SemanticCompleteness::Partial,
+                    Some(0),
+                    native_evidence_dimensions(),
+                    SemanticEvidenceSource::Filesystem,
+                ),
+            )
+            .quality(
+                SemanticOp::Affected,
+                SemanticOperationQuality::new(
+                    SemanticFidelity::CompilerExact,
+                    SemanticCompleteness::ConservativeComplete,
+                    Some(5),
+                    native_evidence_dimensions(),
+                    SemanticEvidenceSource::External,
+                ),
+            ),
+        ));
+        assert!(block_on(registry.fetch_descriptors(
+            SemanticOp::Context,
+            &CancellationToken::new(),
+            None
+        ))
+        .is_ok());
+
+        let context = registry.operation_status(SemanticOp::Context);
+        assert_eq!(context.fidelity, SemanticFidelity::Heuristic);
+        assert_eq!(context.completeness, SemanticCompleteness::Partial);
+        assert_eq!(context.provenance, SemanticEvidenceSource::Filesystem);
+
+        let affected = registry.operation_status(SemanticOp::Affected);
+        assert_eq!(affected.fidelity, SemanticFidelity::CompilerExact);
+        assert_eq!(
+            affected.completeness,
+            SemanticCompleteness::ConservativeComplete
+        );
+        assert_eq!(affected.provenance, SemanticEvidenceSource::External);
+
+        let capability = registry.intelligence_capability(SemanticOp::Affected);
+        assert_eq!(
+            capability.tier,
+            Some(crate::intelligence::IntelligenceTier::ENRICHED)
+        );
+        assert_eq!(capability.provenance, SemanticEvidenceSource::External);
+        assert!(capability.confidence_bps() > 0);
+    }
+
+    /// THE central gate: a low-fidelity answer is rejected typed, a
+    /// high-fidelity answer is accepted, and the native fallback cannot
+    /// satisfy a compiler-exact obligation.
+    #[test]
+    fn central_quality_gate_rejects_low_fidelity_and_accepts_high_fidelity() {
+        use crate::intelligence::native_evidence_dimensions;
+        use crate::types::{SemanticEvidenceSource, SemanticOperationQuality};
+        let base = SemanticQualityRequirement::authoritative(SemanticOp::Delta);
+        let requirement = base.with_compose_delta(true);
+        assert_eq!(
+            requirement.capabilities,
+            SemanticCapabilities::DELTA.with_compose_delta(true)
+        );
+
+        let low = Arc::new(
+            ScriptedProvider::new(
+                "low-fidelity",
+                SemanticCapabilities::DELTA.with_compose_delta(true),
+                ScriptedBehavior::Ready,
+            )
+            .quality(
+                SemanticOp::Delta,
+                SemanticOperationQuality::new(
+                    SemanticFidelity::Structural,
+                    SemanticCompleteness::ConservativeComplete,
+                    Some(3),
+                    native_evidence_dimensions(),
+                    SemanticEvidenceSource::Graph,
+                ),
+            ),
+        );
+        let registry = registry_with(Arc::new(TestClock::new(0)), vec![low]);
+        match block_on(registry.select_quality(requirement, &CancellationToken::new())) {
+            Err(SemanticError::QualityBelowRequirement {
+                op,
+                source,
+                required_fidelity,
+                declared_fidelity,
+                ..
+            }) => {
+                assert_eq!(op, "delta");
+                assert_eq!(source, "low-fidelity");
+                assert_eq!(required_fidelity, SemanticFidelity::CompilerExact);
+                assert_eq!(declared_fidelity, SemanticFidelity::Structural);
+            }
+            other => panic!("low fidelity must be refused typed, got {other:?}"),
+        }
+
+        let high = Arc::new(
+            ScriptedProvider::new(
+                "high-fidelity",
+                SemanticCapabilities::DELTA.with_compose_delta(true),
+                ScriptedBehavior::Ready,
+            )
+            .quality(
+                SemanticOp::Delta,
+                SemanticOperationQuality::new(
+                    SemanticFidelity::CompilerExact,
+                    SemanticCompleteness::ConservativeComplete,
+                    Some(5),
+                    native_evidence_dimensions(),
+                    SemanticEvidenceSource::External,
+                ),
+            ),
+        );
+        let registry = registry_with(Arc::new(TestClock::new(0)), vec![high]);
+        match block_on(registry.select_quality(requirement, &CancellationToken::new())) {
+            Ok(SemanticQualitySelection::Provider { provider, quality }) => {
+                assert_eq!(provider.id().as_str(), "high-fidelity");
+                assert_eq!(quality.fidelity, SemanticFidelity::CompilerExact);
+                assert_eq!(
+                    quality.completeness,
+                    SemanticCompleteness::ConservativeComplete
+                );
+            }
+            other => panic!("high fidelity must be accepted, got {other:?}"),
+        }
+
+        // The native fallback is delta-capable but heuristic/unknown: a
+        // compiler-exact obligation can never be served by it.
+        let fallback = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        match block_on(fallback.select_quality(base, &CancellationToken::new())) {
+            Err(SemanticError::QualityBelowRequirement { source, .. }) => {
+                assert_eq!(source, GENERIC_FALLBACK_ID)
+            }
+            other => panic!("the fallback cannot satisfy a compiler-exact delta, got {other:?}"),
+        }
     }
 
     /// P1-SEMANTIC: an ABSENT fidelity/completeness declaration is UNTRUSTED
@@ -1579,6 +1797,7 @@ mod tests {
         completeness_declared: Option<SemanticCompleteness>,
         tier_declared: Option<u8>,
         evidence_declared: crate::intelligence::EvidenceDimensions,
+        qualities_declared: SemanticOperationQualities,
     }
 
     impl ScriptedProvider {
@@ -1595,6 +1814,7 @@ mod tests {
                 completeness_declared: None,
                 tier_declared: None,
                 evidence_declared: crate::intelligence::EvidenceDimensions::default(),
+                qualities_declared: SemanticOperationQualities::EMPTY,
             }
         }
 
@@ -1619,6 +1839,11 @@ mod tests {
 
         fn evidencing(mut self, evidence: crate::intelligence::EvidenceDimensions) -> Self {
             self.evidence_declared = evidence;
+            self
+        }
+
+        fn quality(mut self, op: SemanticOp, quality: SemanticOperationQuality) -> Self {
+            self.qualities_declared.set(op, quality);
             self
         }
 
@@ -1680,6 +1905,7 @@ mod tests {
             descriptor.completeness = self.completeness_declared;
             descriptor.tier = self.tier_declared;
             descriptor.evidence = self.evidence_declared;
+            descriptor.operations = self.qualities_declared.clone();
             descriptor
         }
 

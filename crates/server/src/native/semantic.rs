@@ -21,11 +21,12 @@
 use faktor_semantic::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use faktor_semantic::intelligence::{
     fallback_intelligence_capability, highest_available_tier, native_capabilities,
-    IntelligenceCapability,
+    native_capabilities_for, IntelligenceCapability,
 };
 use faktor_semantic::registry::SemanticProviderRegistry;
 use faktor_semantic::types::{
-    SemanticCapabilities, SemanticCompleteness, SemanticFidelity, SemanticOp, SemanticProvider,
+    SemanticCapabilities, SemanticCompleteness, SemanticFidelity, SemanticOp,
+    SemanticOperationQualities, SemanticOperationQuality, SemanticProvider,
 };
 
 use super::*;
@@ -39,16 +40,44 @@ fn intelligence_capability_json(capability: &IntelligenceCapability) -> serde_js
         "available": capability.available,
         "fidelity": capability.fidelity(),
         "completeness": capability.completeness(),
+        "provenance": capability.provenance,
         "source": capability.source,
         "tier": capability.tier,
         "confidence_bps": capability.confidence_bps(),
     })
 }
 
-/// The bounded native capability report (Tier 0: file discovery, text
-/// search, read-only pass) plus its per-op capability statuses. Data only.
-fn native_intelligence_json() -> serde_json::Value {
-    let report = native_capabilities();
+/// One per-operation declared quality, public shape. Fidelity/completeness/
+/// tier/provenance are the operation's own declaration (never a
+/// provider-wide scalar); absent = untrusted/unknown.
+fn operation_quality_json(quality: &SemanticOperationQuality) -> serde_json::Value {
+    serde_json::json!({
+        "fidelity": quality.fidelity,
+        "completeness": quality.completeness,
+        "tier": quality.tier,
+        "provenance": quality.provenance,
+        "evidence": quality.evidence,
+    })
+}
+
+fn operation_qualities_json(qualities: &SemanticOperationQualities) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for op in SemanticOp::ALL {
+        if let Some(quality) = qualities.get(op) {
+            out.insert(op_slug(op).to_string(), operation_quality_json(quality));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// The bounded native capability report plus its per-op capability statuses.
+/// With a wired registry the report follows the REAL fallback composition
+/// (LSP/graph/runtime sources raise their operations above Tier 0); without
+/// one it is the static Tier-0 baseline. Data only.
+fn native_intelligence_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value {
+    let report = registry
+        .map(|registry| native_capabilities_for(registry.fallback()))
+        .unwrap_or_else(native_capabilities);
     let services = report
         .services
         .iter()
@@ -73,6 +102,7 @@ fn native_intelligence_json() -> serde_json::Value {
                 "available": capability.available,
                 "fidelity": capability.fidelity(),
                 "completeness": capability.completeness(),
+                "provenance": capability.provenance,
                 "source": capability.source,
                 "confidence_bps": capability.confidence_bps(),
             })
@@ -121,6 +151,9 @@ fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
             // capability metadata only — never an input to confidence).
             "tier": descriptor.intelligence_tier(),
             "capabilities": capabilities_json(descriptor.capabilities),
+            // Per-operation declared quality (fidelity, completeness, tier,
+            // provenance, evidence) — the authoritative selection input.
+            "operations": operation_qualities_json(&descriptor.operations),
         }),
         None => serde_json::json!({
             "id": provider.id().as_str(),
@@ -132,6 +165,8 @@ fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
             // claim is indistinguishable from identity until handshake.
             "tier": serde_json::Value::Null,
             "capabilities": capabilities_json(SemanticCapabilities::NONE),
+            // An unvalidated descriptor contributes NO quality claim.
+            "operations": serde_json::json!({}),
         }),
     }
 }
@@ -149,6 +184,9 @@ fn fallback_json() -> serde_json::Value {
         "completeness": SemanticCompleteness::Partial,
         "tier": faktor_semantic::intelligence::IntelligenceTier::FILESYSTEM,
         "capabilities": capabilities_json(GenericSemanticFallback::default().capabilities()),
+        "operations": operation_qualities_json(
+            &GenericSemanticFallback::default().descriptor().operations,
+        ),
     })
 }
 
@@ -232,7 +270,7 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
         "intelligence": {
             "tier": highest_tier,
             "operations": per_op_tiers,
-            "native": native_intelligence_json(),
+            "native": native_intelligence_json(registry),
         },
     })
 }

@@ -6,12 +6,12 @@
 //! available locally and reports confidence honestly. No tier, capability or
 //! confidence value here ever depends on Tangerine or any other external
 //! provider — an external provider is at most ONE optional source of a
-//! declared tier and declared evidence dimensions, and its absence simply
-//! leaves the native Tier 0 truth in place.
+//! declared tier and declared evidence dimensions, and its absence leaves
+//! the native ladder (tiers 0–4) in place.
 //!
 //! | tier | what it is                              | honest example                       |
 //! |------|-----------------------------------------|--------------------------------------|
-//! | 0    | filesystem + text search                | native fallback (walks, greps)       |
+//! | 0    | filesystem + lexical search             | native fallback (walks, greps)       |
 //! | 1    | syntax parsing                          | tree-sitter outlines                 |
 //! | 2    | LSP / compiler semantics                | definitions/references from an LSP   |
 //! | 3    | static dependency / call graph          | whole-program static graph           |
@@ -40,10 +40,11 @@
 //!
 //! Honesty rules enforced here:
 //!
-//! - The generic fallback is Tier 0 for context/delta/affected/explain
-//!   (bounded searches plus heuristics); it never claims a tier or a
+//! - The generic fallback declares PER-OPERATION quality from the native
+//!   sources actually wired: filesystem/lexical 0, tree-sitter 1, LSP 2,
+//!   revision-bound graph 3, runtime/history 4. It never claims a tier or a
 //!   capability it cannot deliver, and unavailable operations still report
-//!   their true tier with zero confidence.
+//!   their true per-operation tier with zero confidence.
 //! - An UNDECLARED fidelity ([`SemanticFidelity::None`]) pins confidence to
 //!   zero: a tier can never create an evidence claim that was not made.
 //! - Every dimension has a conservative `Unknown` level: absent declarations
@@ -54,7 +55,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::fallback::GENERIC_FALLBACK_ID;
 use crate::types::{
-    SemanticCompleteness, SemanticError, SemanticFidelity, SemanticOp, SemanticOperationStatus,
+    SemanticCompleteness, SemanticError, SemanticEvidenceSource, SemanticFidelity, SemanticOp,
+    SemanticOperationQuality, SemanticOperationStatus,
 };
 
 /// The highest valid intelligence tier (tiers are `0..=5`).
@@ -429,6 +431,9 @@ pub struct IntelligenceCapability {
     /// fidelity/completeness axes mirror the operation status; the remaining
     /// axes come from the declared evidence dimensions (absent = unknown).
     pub dimensions: ConfidenceDimensions,
+    /// The evidence-source class the per-operation quality came from.
+    #[serde(default)]
+    pub provenance: SemanticEvidenceSource,
     pub source: String,
 }
 
@@ -447,7 +452,36 @@ impl IntelligenceCapability {
             tier,
             available: status.available,
             dimensions: ConfidenceDimensions::new(status.fidelity, status.completeness, evidence),
+            provenance: status.provenance,
             source: status.source,
+        }
+    }
+
+    /// Project ONE per-operation quality declaration. This is the single
+    /// quality-to-capability projection the registry and the native fallback
+    /// share; the tier is metadata and never scored.
+    pub fn from_quality(
+        op: SemanticOp,
+        quality: &SemanticOperationQuality,
+        available: bool,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            op,
+            // The descriptor is validated at handshake, so an out-of-range
+            // tier cannot appear here; a failed parse conservatively
+            // degrades to `None` (capability metadata only, never scored).
+            tier: quality
+                .tier
+                .and_then(|raw| IntelligenceTier::parse(raw).ok()),
+            available,
+            dimensions: ConfidenceDimensions::new(
+                quality.fidelity,
+                quality.completeness,
+                quality.evidence,
+            ),
+            provenance: quality.provenance,
+            source: source.into(),
         }
     }
 
@@ -554,51 +588,95 @@ impl NativeIntelligenceService {
     }
 }
 
-/// The bounded native capability report: Tier 0 services Faktor can deliver
-/// without any external provider, plus the fallback's per-op capability
-/// statuses. Data-only — it feeds status surfaces and is never an operation
-/// path itself.
+/// The bounded native capability report: the native services Faktor can
+/// deliver from its own machinery, plus the fallback's per-op capability
+/// statuses. `tier` is the highest tier among AVAILABLE native services (the
+/// empty composition honestly reports Tier 0). Data-only — it feeds status
+/// surfaces and is never an operation path itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeIntelligenceReport {
-    /// The native report is always Tier 0: filesystem + text search.
+    /// Highest AVAILABLE native tier. Tier 0 when no higher native source is
+    /// wired; never raised by an unavailable service.
     pub tier: IntelligenceTier,
     pub source: String,
     pub services: Vec<NativeIntelligenceService>,
     pub operations: Vec<IntelligenceCapability>,
 }
 
-/// The native capabilities Faktor can honestly provide using its existing
-/// machinery — file discovery, text search and the bounded read-only
-/// workspace pass — plus the fallback's capability-status entries for every
-/// semantic op. No symbol graph, type system or compiler identity is
-/// invented here; those require a higher tier and a provider that declares
-/// it.
+fn native_service(
+    name: &str,
+    tier: IntelligenceTier,
+    available: bool,
+    fidelity: SemanticFidelity,
+    completeness: SemanticCompleteness,
+) -> NativeIntelligenceService {
+    NativeIntelligenceService {
+        name: name.to_string(),
+        tier,
+        available,
+        fidelity,
+        completeness,
+        evidence: native_evidence_dimensions(),
+    }
+}
+
+/// The native capability ladder Faktor can honestly provide using its own
+/// machinery. Filesystem/lexical, tree-sitter, LSP/compiler, revision-bound
+/// graph and runtime/history evidence are distinct native sources; an
+/// unavailable source is reported as unavailable at its honest tier instead
+/// of being collapsed into a Tier-0 claim. No symbol graph, type system or
+/// compiler identity is invented here.
 pub fn native_capabilities() -> NativeIntelligenceReport {
     let services = vec![
-        NativeIntelligenceService {
-            name: "file_discovery".to_string(),
-            tier: IntelligenceTier::FILESYSTEM,
-            available: true,
-            fidelity: SemanticFidelity::Heuristic,
-            completeness: SemanticCompleteness::ConservativeComplete,
-            evidence: native_evidence_dimensions(),
-        },
-        NativeIntelligenceService {
-            name: "text_search".to_string(),
-            tier: IntelligenceTier::FILESYSTEM,
-            available: true,
-            fidelity: SemanticFidelity::Heuristic,
-            completeness: SemanticCompleteness::Partial,
-            evidence: native_evidence_dimensions(),
-        },
-        NativeIntelligenceService {
-            name: "read_only_pass".to_string(),
-            tier: IntelligenceTier::FILESYSTEM,
-            available: true,
-            fidelity: SemanticFidelity::Heuristic,
-            completeness: SemanticCompleteness::Partial,
-            evidence: native_evidence_dimensions(),
-        },
+        native_service(
+            "file_discovery",
+            IntelligenceTier::FILESYSTEM,
+            true,
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::ConservativeComplete,
+        ),
+        native_service(
+            "text_search",
+            IntelligenceTier::FILESYSTEM,
+            true,
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "read_only_pass",
+            IntelligenceTier::FILESYSTEM,
+            true,
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "syntax_outline",
+            IntelligenceTier::SYNTAX,
+            false,
+            SemanticFidelity::Structural,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "lsp_semantics",
+            IntelligenceTier::COMPILER,
+            false,
+            SemanticFidelity::CompilerExact,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "impact_graph",
+            IntelligenceTier::GRAPH,
+            false,
+            SemanticFidelity::Structural,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "runtime_history",
+            IntelligenceTier::RUNTIME,
+            false,
+            SemanticFidelity::Structural,
+            SemanticCompleteness::Partial,
+        ),
     ];
     debug_assert!(services.len() <= MAX_NATIVE_INTELLIGENCE_SERVICES);
     NativeIntelligenceReport {
@@ -606,6 +684,82 @@ pub fn native_capabilities() -> NativeIntelligenceReport {
         source: GENERIC_FALLBACK_ID.to_string(),
         services,
         operations: fallback_intelligence_capabilities(),
+    }
+}
+
+/// The native capability report of a REAL fallback composition: service
+/// availability (and therefore the report tier) follows the seams actually
+/// wired in the daemon, and per-operation capabilities come from the
+/// fallback's own per-operation quality declarations.
+pub fn native_capabilities_for(
+    fallback: &crate::fallback::GenericSemanticFallback,
+) -> NativeIntelligenceReport {
+    let wired = fallback.wired_backends();
+    let services = vec![
+        native_service(
+            "file_discovery",
+            IntelligenceTier::FILESYSTEM,
+            true,
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::ConservativeComplete,
+        ),
+        native_service(
+            "text_search",
+            IntelligenceTier::FILESYSTEM,
+            wired.index.is_some(),
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "read_only_pass",
+            IntelligenceTier::FILESYSTEM,
+            true,
+            SemanticFidelity::Heuristic,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "syntax_outline",
+            IntelligenceTier::SYNTAX,
+            wired.tree_sitter.is_some(),
+            SemanticFidelity::Structural,
+            SemanticCompleteness::Partial,
+        ),
+        native_service(
+            "lsp_semantics",
+            IntelligenceTier::COMPILER,
+            wired.lsp.is_some(),
+            SemanticFidelity::CompilerExact,
+            SemanticCompleteness::Partial,
+        ),
+        {
+            let mut service = native_service(
+                "impact_graph",
+                IntelligenceTier::GRAPH,
+                wired.impact.is_some(),
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            );
+            // The native graph is bound to the material revision it was
+            // refreshed from (the legitimate revision-bound local graph).
+            service.evidence.revision_binding = RevisionBinding::Exact;
+            service
+        },
+        native_service(
+            "runtime_history",
+            IntelligenceTier::RUNTIME,
+            wired.verification.is_some(),
+            SemanticFidelity::Structural,
+            SemanticCompleteness::Partial,
+        ),
+    ];
+    debug_assert!(services.len() <= MAX_NATIVE_INTELLIGENCE_SERVICES);
+    let operations = fallback.intelligence_capabilities();
+    let tier = highest_available_tier(&operations).unwrap_or(IntelligenceTier::FILESYSTEM);
+    NativeIntelligenceReport {
+        tier,
+        source: GENERIC_FALLBACK_ID.to_string(),
+        services,
+        operations,
     }
 }
 
@@ -663,6 +817,7 @@ mod tests {
                 SemanticCompleteness::Complete,
                 evidence,
             ),
+            provenance: SemanticEvidenceSource::Unknown,
             source: source.to_string(),
         }
     }
@@ -1067,6 +1222,7 @@ mod tests {
                     ..native_evidence_dimensions()
                 },
             ),
+            provenance: SemanticEvidenceSource::External,
             source: "external.corroborated".to_string(),
         };
 
@@ -1186,14 +1342,29 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["file_discovery", "text_search", "read_only_pass"]
+            vec![
+                "file_discovery",
+                "text_search",
+                "read_only_pass",
+                "syntax_outline",
+                "lsp_semantics",
+                "impact_graph",
+                "runtime_history",
+            ],
+            "the report names the whole native source ladder, not only Tier 0"
         );
         for service in &report.services {
-            assert!(service.available);
-            assert_eq!(service.tier, IntelligenceTier::FILESYSTEM);
-            assert_eq!(service.fidelity, SemanticFidelity::Heuristic);
+            // The static (unwired) report honestly marks higher native
+            // sources unavailable instead of claiming them.
+            assert_eq!(
+                service.available,
+                service.tier == IntelligenceTier::FILESYSTEM
+            );
             assert_eq!(service.evidence, native_evidence_dimensions());
             assert!(service.confidence_bps() <= 10_000);
+            if service.tier == IntelligenceTier::FILESYSTEM {
+                assert_eq!(service.fidelity, SemanticFidelity::Heuristic);
+            }
         }
         assert_eq!(
             report.services[0].confidence_bps(),

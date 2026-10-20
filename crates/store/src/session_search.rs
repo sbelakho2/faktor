@@ -17,9 +17,9 @@ impl Store {
         })?;
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms, listing_revision
              FROM session WHERE instr(lower(title), lower(?1)) > 0
-             ORDER BY updated_ms DESC LIMIT ?2",
+             ORDER BY listing_revision DESC, id DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(params![query, limit])?;
         let mut out = Vec::new();

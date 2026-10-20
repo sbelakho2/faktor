@@ -48,6 +48,7 @@ pub mod external;
 pub mod fallback;
 pub mod health;
 pub mod intelligence;
+pub mod quality;
 pub mod registry;
 pub mod risk;
 pub mod types;
@@ -80,6 +81,7 @@ pub use intelligence::{
     IntelligenceTier, NativeIntelligenceReport, NativeIntelligenceService, RevisionBinding,
     MAX_COUNTED_CORROBORATION, MAX_INTELLIGENCE_TIER, MAX_NATIVE_INTELLIGENCE_SERVICES,
 };
+pub use quality::{effective_quality, SemanticQualityRequirement, SemanticQualitySelection};
 pub use registry::{guard_call, GuardedCall, SemanticProviderRegistry, SemanticSelection};
 pub use risk::{capability_intersection, RiskPolicy};
 pub use types::{
@@ -87,7 +89,8 @@ pub use types::{
     SemanticCheck, SemanticCompleteness, SemanticContextItem, SemanticContextPack,
     SemanticContextRequest, SemanticDelta, SemanticDeltaChange, SemanticDeltaKind,
     SemanticDeltaRequest, SemanticEntityId, SemanticEntityRef, SemanticEnvelope, SemanticError,
-    SemanticExpectation, SemanticExplainRequest, SemanticExplanation, SemanticFidelity, SemanticOp,
+    SemanticEvidenceSource, SemanticExpectation, SemanticExplainRequest, SemanticExplanation,
+    SemanticFidelity, SemanticOp, SemanticOperationQualities, SemanticOperationQuality,
     SemanticOperationStatus, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
     SemanticProviderId, SemanticResponseCaps, SemanticRisk, SemanticSnapshot, SemanticSnapshotId,
     SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, WorkspacePath,

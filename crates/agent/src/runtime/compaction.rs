@@ -36,7 +36,9 @@ pub(crate) const MAX_CHILD_PARK_WAIT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const MAX_QUEUE_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// One bounded, guarded semantic consult of the turn (audits 54/58/77): ONLY
-/// a registered provider covering [`SemanticCapabilities::AFFECTED`] is
+/// a registered provider covering
+/// [`faktor_semantic::SemanticCapabilities::AFFECTED`] at the authoritative
+/// quality floor is
 /// consulted — the generic fallback is never asked, which is what keeps a
 /// provider-less runtime byte-identical (parity). The provider's affected
 /// set is rendered as provenance-tagged DATA and its entity paths become the
@@ -49,21 +51,22 @@ pub(crate) async fn semantic_turn_consult(
     changed: &[String],
     cancel: &CancellationToken,
 ) -> Option<SemanticTurnState> {
-    // Descriptor handshake + validated selection: an external provider is
-    // only consulted once its descriptor is fetched and validated, and a
+    // Descriptor handshake + THE authoritative quality gate: an external
+    // provider is only consulted once its per-operation affected quality
+    // satisfies the authoritative floor (structural / partial), and a
     // cooling (recently failing) provider is skipped rather than re-polled.
     let selection = deps
         .semantic
-        .select_validated(
-            &SemanticCapabilities::AFFECTED,
-            SemanticOp::Affected,
+        .select_quality(
+            faktor_semantic::SemanticQualityRequirement::authoritative(SemanticOp::Affected),
             cancel,
         )
         .await;
     let provider = match selection {
-        SemanticSelection::Provider(provider) => provider,
-        // No registered provider: today's behavior exactly (parity).
-        SemanticSelection::Fallback(_) => return None,
+        Ok(faktor_semantic::SemanticQualitySelection::Provider { provider, .. }) => provider,
+        // No registered provider at the required quality: parity with the
+        // provider-less runtime (no consult, risk stays Unknown).
+        Ok(faktor_semantic::SemanticQualitySelection::Fallback { .. }) | Err(_) => return None,
     };
     let provider_id = provider.id();
     let Ok(row) = handle.row() else {

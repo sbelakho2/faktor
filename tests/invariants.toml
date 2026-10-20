@@ -1550,7 +1550,7 @@ platforms = ["linux"]
 
 [[invariant]]
 id = "INV-SEMANTIC-FIDELITY-TRUTH"
-statement = "Semantic evidence fidelity (audit Tangerine-3/4): every operation reports available/fidelity/completeness/source truthfully, and authoritative consumers require the documented minimum fidelity."
+statement = "Semantic evidence quality (audit Tangerine-3/4): every operation reports per-operation available/fidelity/completeness/tier/provenance truthfully, and authoritative consumers require the documented minimum through the ONE registry quality gate."
 owner = "crates/semantic registry/fallback fidelity"
 authority = "planted mutation scripts/mutations/INV-SEMANTIC-FIDELITY-TRUTH.json"
 script_check = ""
@@ -1565,7 +1565,7 @@ platforms = ["linux"]
 
 [[invariant]]
 id = "INV-MERGE-SEMANTIC-FIDELITY-REQUIRED"
-statement = "Semantic evidence fidelity (audit Tangerine-3/4): every operation reports available/fidelity/completeness/source truthfully, and authoritative consumers require the documented minimum fidelity."
+statement = "Semantic evidence quality (audit Tangerine-3/4): every operation reports per-operation available/fidelity/completeness/tier/provenance truthfully, and authoritative consumers require the documented minimum through the ONE registry quality gate."
 owner = "crates/orchestrator merge preflight fidelity gate"
 authority = "planted mutation scripts/mutations/INV-MERGE-SEMANTIC-FIDELITY-REQUIRED.json"
 script_check = ""

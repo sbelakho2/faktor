@@ -13,13 +13,14 @@ use std::path::{Path, PathBuf};
 
 use faktor_core::id::WorkspaceId;
 
-use crate::manifest::{self, Workspace};
+use crate::manifest::{self, TopologyOptions, Workspace};
 use crate::model::{
-    crate_id, file_id, module_id, package_id, sort_graph, Graph, GraphEdge, GraphError, GraphFile,
-    GraphNode, GraphStats, Language, NodeKind, Provenance, Revision, GRAPH_SCHEMA, MAX_EDGES,
-    MAX_FILES, MAX_FILE_BYTES, MAX_NODES, MAX_PATH_BYTES,
+    crate_id, file_id, module_id, package_id, sort_graph, EdgeKind, Graph, GraphEdge, GraphError,
+    GraphFile, GraphNode, GraphStats, Language, NodeKind, Provenance, Revision, GRAPH_SCHEMA,
+    MAX_EDGES, MAX_FILES, MAX_FILE_BYTES, MAX_NODES, MAX_PATH_BYTES,
 };
 use crate::parse::{parse_file, ImportRef, NameRef, OwnerKind, ParsedFile, SymbolDef};
+use crate::topology::UnitKind;
 
 pub const MAX_WALK_DEPTH: usize = 48;
 /// Agent Manager state directory name, composed so the retired-token scan
@@ -51,15 +52,33 @@ pub struct BuildReport {
     pub bytes: u64,
     pub truncated: bool,
     pub skipped: Vec<String>,
+    /// True only when Cargo metadata was unavailable and the documented
+    /// bounded manifest fallback ran.
+    pub degraded: bool,
+    pub degraded_reason: Option<String>,
+    /// Adapters that contributed units (cargo, npm, gradle, maven, python,
+    /// generic-filesystem).
+    pub adapters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IncrementalStats {
     pub files_changed: usize,
+    /// Changed paths whose bytes are byte-identical to the indexed content;
+    /// they are not re-parsed (a same-content refresh is a no-op).
+    pub files_unchanged: usize,
     pub files_invalidated: usize,
     pub files_reparsed: usize,
     pub records: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChangeClassification {
+    /// Paths whose bytes differ from the indexed content (new, modified or
+    /// deleted) and therefore require a re-parse.
+    pub seeds: Vec<String>,
+    pub unchanged: usize,
 }
 
 pub struct GraphBuilder {
@@ -69,17 +88,42 @@ pub struct GraphBuilder {
     revision: Revision,
     records: BTreeMap<String, ParsedFile>,
     files: BTreeMap<String, GraphFile>,
+    /// Materialized path-level reverse dependency index from the last
+    /// assembled graph (dependency path -> dependent paths). Refresh uses it
+    /// so invalidation is O(changed + affected), never a full graph walk.
+    dependents: BTreeMap<String, BTreeSet<String>>,
     options: BuildOptions,
     report: BuildReport,
 }
 
 impl GraphBuilder {
     pub fn new(root: &Path, revision: Revision) -> Result<Self, GraphError> {
+        Self::new_with_topology(root, revision, TopologyOptions::default())
+    }
+
+    /// Build a workspace scanner with explicit topology options: the
+    /// supervisor used for `cargo metadata`, adapter composition and the
+    /// documented parser-only fallback. `cargo metadata` runs at most once
+    /// per (root, revision) and is cached.
+    pub fn new_with_topology(
+        root: &Path,
+        revision: Revision,
+        topology_options: TopologyOptions,
+    ) -> Result<Self, GraphError> {
         let root = root
             .canonicalize()
             .map_err(|e| GraphError::Malformed(format!("workspace root: {e}")))?;
-        let workspace = manifest::discover(&root)?;
-        let mut report = BuildReport::default();
+        let workspace = manifest::discover_with(&root, &revision, &topology_options)?;
+        let mut report = BuildReport {
+            degraded: workspace.degraded,
+            degraded_reason: workspace.degraded_reason.clone(),
+            adapters: workspace
+                .adapters
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            ..BuildReport::default()
+        };
         for skipped in &workspace.skipped {
             report.files_skipped += 1;
             report.skipped.push(skipped.clone());
@@ -91,6 +135,7 @@ impl GraphBuilder {
             revision,
             records: BTreeMap::new(),
             files: BTreeMap::new(),
+            dependents: BTreeMap::new(),
             options: BuildOptions::default(),
             report,
         })
@@ -108,6 +153,10 @@ impl GraphBuilder {
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    pub fn report(&self) -> &BuildReport {
+        &self.report
     }
 
     pub fn root(&self) -> &Path {
@@ -136,6 +185,26 @@ impl GraphBuilder {
                 self.root.clone()
             } else {
                 self.root.join(&info.dir)
+            };
+            // Defense in depth: no unit directory is walked before its
+            // canonical form is proven to remain inside the workspace root.
+            let dir = match dir.canonicalize() {
+                Ok(path) if path.starts_with(&self.root) => path,
+                Ok(_) => {
+                    self.report.files_skipped += 1;
+                    self.report.skipped.push(format!(
+                        "{}: unit directory resolves outside the workspace root",
+                        info.dir
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    self.report.files_skipped += 1;
+                    self.report
+                        .skipped
+                        .push(format!("{}: unit directory is missing", info.dir));
+                    continue;
+                }
             };
             let mut stack = vec![(dir, 0usize)];
             while let Some((dir, depth)) = stack.pop() {
@@ -185,14 +254,13 @@ impl GraphBuilder {
                     if Language::of_path(&relative).is_none() {
                         continue;
                     }
-                    // A root package must not swallow a sibling crate that is
-                    // not part of the workspace declaration.
-                    if info.dir.is_empty()
-                        && crate_dirs.iter().any(|d| {
-                            !d.is_empty()
-                                && (relative == *d || relative.starts_with(&format!("{d}/")))
-                        })
-                    {
+                    // A parent unit must not swallow a nested declared unit
+                    // (Cargo member, npm workspace, Gradle/Maven module).
+                    if crate_dirs.iter().any(|d| {
+                        !d.is_empty()
+                            && *d != info.dir
+                            && (relative == *d || relative.starts_with(&format!("{d}/")))
+                    }) {
                         continue;
                     }
                     candidates.push(relative);
@@ -208,7 +276,9 @@ impl GraphBuilder {
         for relative in candidates {
             self.parse_path(&relative)?;
         }
-        Ok(self.assemble())
+        let graph = self.assemble();
+        self.dependents = dependents_from(&graph);
+        Ok(graph)
     }
 
     fn parse_path(&mut self, relative: &str) -> Result<(), GraphError> {
@@ -226,6 +296,8 @@ impl GraphBuilder {
             }
         };
         if !meta.file_type().is_file() {
+            self.records.remove(relative);
+            self.files.remove(relative);
             self.report.files_skipped += 1;
             return Ok(());
         }
@@ -239,12 +311,14 @@ impl GraphBuilder {
         let bytes =
             fs::read(&absolute).map_err(|e| GraphError::Malformed(format!("{relative}: {e}")))?;
         let Ok(source) = std::str::from_utf8(&bytes) else {
+            self.records.remove(relative);
+            self.files.remove(relative);
             self.report.files_skipped += 1;
             return Ok(());
         };
         let language = Language::of_path(relative)
             .ok_or_else(|| GraphError::Malformed(format!("unsupported file {relative}")))?;
-        let test_target = is_test_target(&crate_info.dir, relative);
+        let test_target = is_test_target(crate_info, relative, &self.workspace);
         let parsed = parse_file(relative, language, source, test_target);
         self.report.files_scanned += 1;
         self.report.files_parsed += 1;
@@ -268,55 +342,105 @@ impl GraphBuilder {
         Ok(())
     }
 
+    /// Classify changed paths by content digest. Only paths whose bytes
+    /// differ from the indexed content (new, modified or deleted) become
+    /// seeds; byte-identical paths are counted as unchanged and never
+    /// re-parsed. This is what makes a repeated report for the same lifetime
+    /// cheap without suppressing a later real edit.
+    pub fn classify_changes(&self, changed: &[String]) -> Result<ChangeClassification, GraphError> {
+        let mut seeds = BTreeSet::new();
+        let mut unchanged = 0usize;
+        for raw in changed {
+            let path = crate::model::validate_rel_path(raw)?;
+            if self.workspace.crate_for_path(&path).is_none() || Language::of_path(&path).is_none()
+            {
+                continue;
+            }
+            match (self.files.get(&path), self.current_content(&path)?) {
+                (Some(file), CurrentContent::Hash(hash)) if file.hash == hash => {
+                    unchanged += 1;
+                }
+                (None, CurrentContent::Missing) => unchanged += 1,
+                _ => {
+                    seeds.insert(path);
+                }
+            }
+        }
+        Ok(ChangeClassification {
+            seeds: seeds.into_iter().collect(),
+            unchanged,
+        })
+    }
+
+    fn current_content(&self, path: &str) -> Result<CurrentContent, GraphError> {
+        let absolute = self.root.join(path);
+        let meta = match fs::symlink_metadata(&absolute) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(CurrentContent::Missing),
+        };
+        if !meta.file_type().is_file() {
+            return Ok(CurrentContent::Missing);
+        }
+        if meta.len() > self.options.max_file_bytes {
+            return Ok(CurrentContent::Changed);
+        }
+        let bytes =
+            fs::read(&absolute).map_err(|e| GraphError::Malformed(format!("{path}: {e}")))?;
+        Ok(CurrentContent::Hash(format!(
+            "blake3:{}",
+            blake3::hash(&bytes).to_hex()
+        )))
+    }
+
     /// Invalidate per changed file: re-parse the changed files and the files
     /// whose imports/references point at them, then re-assemble from cached
     /// records. Unchanged files are never read or parsed again.
     pub fn update(&mut self, changed: &[String]) -> Result<IncrementalStats, GraphError> {
-        let graph = self.assemble();
-        let mut seeds = BTreeSet::new();
-        for raw in changed {
-            let path = crate::model::validate_rel_path(raw)?;
-            if self.records.contains_key(&path) || self.workspace.crate_for_path(&path).is_some() {
-                seeds.insert(path);
-            }
+        let classification = self.classify_changes(changed)?;
+        if classification.seeds.is_empty() {
+            return Ok(IncrementalStats {
+                files_unchanged: classification.unchanged,
+                records: self.records.len(),
+                ..IncrementalStats::default()
+            });
         }
-        let mut invalidated: BTreeSet<String> = seeds.clone();
-        // Reverse closure over the CURRENT graph: importing files and
-        // referencing symbols are re-parsed because their resolution depends
-        // on the changed definitions.
-        let mut node_to_path: BTreeMap<&str, &str> = BTreeMap::new();
-        for node in &graph.nodes {
-            if let Some(path) = &node.path {
-                node_to_path.insert(node.id.as_str(), path.as_str());
-            }
-        }
-        let mut queue: VecDeque<&str> = seeds.iter().map(String::as_str).collect();
-        while let Some(path) = queue.pop_front() {
-            let node = file_id(path);
-            for edge in &graph.reverse_edges {
-                if edge.from != node {
+        let (mut stats, _) = self.apply_changes(&classification.seeds, None)?;
+        stats.files_unchanged = classification.unchanged;
+        Ok(stats)
+    }
+
+    /// Re-parse exactly the changed seeds plus their reverse dependency
+    /// closure and return the freshly assembled graph. `material_generation`
+    /// stamps a dirty-worktree revision derived from the scanned file
+    /// digests before assembly, so the graph carries a real material identity.
+    fn apply_changes(
+        &mut self,
+        seeds: &[String],
+        material_generation: Option<u64>,
+    ) -> Result<(IncrementalStats, Graph), GraphError> {
+        let mut invalidated: BTreeSet<String> = seeds.iter().cloned().collect();
+        let mut truncated = invalidated.len() >= MAX_INVALIDATION_FILES;
+        if !truncated {
+            // Reverse closure over the materialized dependency index from the
+            // last graph: importing files and referencing symbols are
+            // re-parsed because their resolution depends on the changed
+            // definitions. Cost is O(changed + affected), not O(workspace).
+            let mut queue: VecDeque<String> = seeds.iter().cloned().collect();
+            'closure: while let Some(path) = queue.pop_front() {
+                let Some(dependents) = self.dependents.get(&path) else {
                     continue;
-                }
-                if !matches!(
-                    edge.kind,
-                    crate::model::EdgeKind::Imports
-                        | crate::model::EdgeKind::References
-                        | crate::model::EdgeKind::Calls
-                        | crate::model::EdgeKind::Covers
-                ) {
-                    continue;
-                }
-                if let Some(dependent) = node_to_path.get(edge.to.as_str()) {
+                };
+                for dependent in dependents {
                     if invalidated.len() >= MAX_INVALIDATION_FILES {
-                        break;
+                        truncated = true;
+                        break 'closure;
                     }
-                    if invalidated.insert((*dependent).to_string()) {
-                        queue.push_back(dependent);
+                    if invalidated.insert(dependent.clone()) {
+                        queue.push_back(dependent.clone());
                     }
                 }
             }
         }
-        let truncated = invalidated.len() >= MAX_INVALIDATION_FILES;
         let mut reparsed = 0usize;
         for path in &invalidated {
             let existed = self.files.contains_key(path);
@@ -325,15 +449,22 @@ impl GraphBuilder {
                 reparsed += 1;
             }
         }
-        let records = self.records.len();
-        self.assemble();
-        Ok(IncrementalStats {
-            files_changed: seeds.len(),
-            files_invalidated: invalidated.len(),
-            files_reparsed: reparsed,
-            records,
-            truncated,
-        })
+        if let Some(generation) = material_generation {
+            self.revision = material_revision(self.files.values(), generation);
+        }
+        let graph = self.assemble();
+        self.dependents = dependents_from(&graph);
+        Ok((
+            IncrementalStats {
+                files_changed: seeds.len(),
+                files_unchanged: 0,
+                files_invalidated: invalidated.len(),
+                files_reparsed: reparsed,
+                records: self.records.len(),
+                truncated,
+            },
+            graph,
+        ))
     }
 
     pub fn assemble(&self) -> Graph {
@@ -351,11 +482,15 @@ impl GraphBuilder {
                 .or_insert(node);
         };
 
-        // Crates and package dependency edges.
+        // Local units (Cargo crates and non-Cargo packages) and dependency
+        // edges. Node ids keep the two namespaces distinct.
         for info in self.workspace.crates.values() {
             add_node(GraphNode {
-                id: crate_id(&info.name),
-                kind: NodeKind::Crate,
+                id: info.kind.node_id(&info.name),
+                kind: match info.kind {
+                    UnitKind::Crate => NodeKind::Crate,
+                    UnitKind::Package => NodeKind::Package,
+                },
                 name: info.name.clone(),
                 path: Some(if info.dir.is_empty() {
                     ".".to_string()
@@ -380,15 +515,19 @@ impl GraphBuilder {
         }
         for info in self.workspace.crates.values() {
             for dep in &info.deps {
-                let to = if self.workspace.crates.contains_key(dep) {
-                    crate_id(dep)
-                } else {
-                    package_id(dep)
+                let to = match self.workspace.local_unit(dep) {
+                    Some(name) => self
+                        .workspace
+                        .crates
+                        .get(name)
+                        .map(|unit| unit.kind.node_id(&unit.name))
+                        .unwrap_or_else(|| package_id(dep)),
+                    None => package_id(dep),
                 };
                 insert_edge(
                     &mut edges,
                     GraphEdge {
-                        from: crate_id(&info.name),
+                        from: info.kind.node_id(&info.name),
                         to,
                         kind: crate::model::EdgeKind::DependsOn,
                         provenance: Provenance::Manifest,
@@ -423,10 +562,16 @@ impl GraphBuilder {
                 line: None,
                 provenance: Provenance::Parser,
             });
+            let unit_id = self
+                .workspace
+                .crates
+                .get(&file.crate_name)
+                .map(|unit| unit.kind.node_id(&unit.name))
+                .unwrap_or_else(|| crate_id(&file.crate_name));
             insert_edge(
                 &mut edges,
                 GraphEdge {
-                    from: crate_id(&file.crate_name),
+                    from: unit_id.clone(),
                     to: fid.clone(),
                     kind: crate::model::EdgeKind::Includes,
                     provenance: Provenance::Manifest,
@@ -459,7 +604,7 @@ impl GraphBuilder {
                 insert_edge(
                     &mut edges,
                     GraphEdge {
-                        from: crate_id(&file.crate_name),
+                        from: unit_id.clone(),
                         to: fid.clone(),
                         kind: crate::model::EdgeKind::TestTarget,
                         provenance: Provenance::Coverage,
@@ -515,7 +660,7 @@ impl GraphBuilder {
                     &mut edges,
                     GraphEdge {
                         from: test.id.clone(),
-                        to: crate_id(&file.crate_name),
+                        to: unit_id.clone(),
                         kind: crate::model::EdgeKind::Tests,
                         provenance: Provenance::Coverage,
                         detail: None,
@@ -766,6 +911,16 @@ impl GraphBuilder {
             }
         }
 
+        self.finalize_graph(nodes, edges)
+    }
+
+    /// Deterministic serialization phase of [`Self::assemble`]: stable
+    /// vectors, reverse edges, bounded stats and the canonical seal.
+    fn finalize_graph(
+        &self,
+        nodes: BTreeMap<String, GraphNode>,
+        edges: BTreeMap<(String, crate::model::EdgeKind, String), GraphEdge>,
+    ) -> Graph {
         // Stable node/edge vectors.
         let mut nodes: Vec<GraphNode> = nodes.into_values().collect();
         let mut edges: Vec<GraphEdge> = edges.into_values().collect();
@@ -840,11 +995,27 @@ impl GraphBuilder {
 pub struct ImpactSession {
     builder: GraphBuilder,
     graph: crate::query::ImpactGraph,
+    /// Advances only when refresh observes different content, so an
+    /// unchanged refresh keeps the same material revision and graph digest.
+    material_generation: u64,
 }
 
 impl ImpactSession {
     pub fn build(root: &Path, revision: Revision) -> Result<Self, GraphError> {
         Self::build_for_workspace(root, revision, WorkspaceId::new(1))
+    }
+
+    /// Build a session whose revision is a dirty-worktree material identity
+    /// (scanned file digest + generation) rather than `Revision::default()`.
+    pub fn build_material(root: &Path) -> Result<Self, GraphError> {
+        Self::build_for_workspace(root, Revision::default(), WorkspaceId::new(1))
+    }
+
+    pub fn build_material_for_workspace(
+        root: &Path,
+        workspace_id: WorkspaceId,
+    ) -> Result<Self, GraphError> {
+        Self::build_for_workspace(root, Revision::default(), workspace_id)
     }
 
     pub fn build_for_workspace(
@@ -853,9 +1024,23 @@ impl ImpactSession {
         workspace_id: WorkspaceId,
     ) -> Result<Self, GraphError> {
         let mut builder = GraphBuilder::new(root, revision)?.with_workspace_id(workspace_id);
-        let graph = builder.build()?;
+        let mut graph = builder.build()?;
+        let material = graph.revision.is_unspecified();
+        let material_generation = if material {
+            let revision = material_revision(graph.files.iter(), 1);
+            graph.revision = revision.clone();
+            builder.set_revision(revision);
+            graph.seal()?;
+            1
+        } else {
+            0
+        };
         let graph = crate::query::ImpactGraph::new(graph)?;
-        Ok(Self { builder, graph })
+        Ok(Self {
+            builder,
+            graph,
+            material_generation,
+        })
     }
 
     pub fn with_options(mut self, options: BuildOptions) -> Self {
@@ -871,19 +1056,49 @@ impl ImpactSession {
         &self.builder
     }
 
-    /// Re-parse only changed files and their reverse dependents, then swap
-    /// in the re-assembled graph. `files_reparsed` is the incremental I/O
-    /// proof; it stays far below the workspace file count for a local edit.
+    /// Re-parse only changed files (by content digest) and their reverse
+    /// dependents, then swap in the re-assembled graph. Every changed path is
+    /// re-examined on every call; there is no per-path lifetime suppression,
+    /// so a second real edit is always observed. `files_reparsed` is the
+    /// incremental I/O proof and stays far below the workspace file count.
     pub fn refresh(
         &mut self,
         changed: &[String],
         revision: Revision,
     ) -> Result<IncrementalStats, GraphError> {
-        self.builder.set_revision(revision);
-        let stats = self.builder.update(changed)?;
-        let graph = self.builder.assemble();
+        let material = revision.is_unspecified();
+        let classification = self.builder.classify_changes(changed)?;
+        if classification.seeds.is_empty() {
+            if !material && revision != *self.builder.revision() {
+                self.builder.set_revision(revision);
+                let graph = self.builder.assemble();
+                self.graph = crate::query::ImpactGraph::new(graph)?;
+            }
+            return Ok(IncrementalStats {
+                files_unchanged: classification.unchanged,
+                records: self.builder.records.len(),
+                ..IncrementalStats::default()
+            });
+        }
+        let generation = if material {
+            self.material_generation = self.material_generation.saturating_add(1);
+            Some(self.material_generation)
+        } else {
+            self.builder.set_revision(revision);
+            None
+        };
+        let (mut stats, graph) = self
+            .builder
+            .apply_changes(&classification.seeds, generation)?;
+        stats.files_unchanged = classification.unchanged;
         self.graph = crate::query::ImpactGraph::new(graph)?;
         Ok(stats)
+    }
+
+    /// Refresh with a dirty-worktree material revision (see
+    /// [`Revision::material`]) instead of an unspecified revision.
+    pub fn refresh_material(&mut self, changed: &[String]) -> Result<IncrementalStats, GraphError> {
+        self.refresh(changed, Revision::default())
     }
 
     pub fn affected(
@@ -893,6 +1108,63 @@ impl ImpactSession {
     ) -> Result<crate::query::AffectedResult, GraphError> {
         self.graph.affected(changed, options)
     }
+}
+
+enum CurrentContent {
+    Missing,
+    /// Content is present but outside the per-file bound; it still requires a
+    /// re-parse so the stale record is removed.
+    Changed,
+    Hash(String),
+}
+
+/// Path-level reverse dependency index for incremental invalidation. Every
+/// import/reference/call/coverage edge contributes one dependency edge from
+/// the target file to the file that must be re-parsed when it changes.
+fn dependents_from(graph: &Graph) -> BTreeMap<String, BTreeSet<String>> {
+    let mut path_by_node: BTreeMap<&str, &str> = BTreeMap::new();
+    for node in &graph.nodes {
+        if let Some(path) = node.path.as_deref() {
+            path_by_node.insert(node.id.as_str(), path);
+        }
+    }
+    let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for edge in &graph.edges {
+        if !matches!(
+            edge.kind,
+            EdgeKind::Imports | EdgeKind::References | EdgeKind::Calls | EdgeKind::Covers
+        ) {
+            continue;
+        }
+        let (Some(from), Some(to)) = (
+            path_by_node.get(edge.from.as_str()),
+            path_by_node.get(edge.to.as_str()),
+        ) else {
+            continue;
+        };
+        if from == to {
+            continue;
+        }
+        dependents
+            .entry((*to).to_string())
+            .or_default()
+            .insert((*from).to_string());
+    }
+    dependents
+}
+
+fn material_revision<'a>(files: impl Iterator<Item = &'a GraphFile>, generation: u64) -> Revision {
+    let mut hasher = blake3::Hasher::new();
+    for file in files {
+        hasher.update(file.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file.hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Revision::material(
+        &format!("blake3:{}", hasher.finalize().to_hex()),
+        generation,
+    )
 }
 
 fn provenance_rank(provenance: Provenance) -> u8 {
@@ -923,18 +1195,49 @@ fn insert_edge(
     }
 }
 
-fn is_test_target(crate_dir: &str, path: &str) -> bool {
-    let relative = if crate_dir.is_empty() {
+fn is_test_target(unit: &crate::manifest::CrateInfo, path: &str, workspace: &Workspace) -> bool {
+    let relative = if unit.dir.is_empty() {
         path
     } else {
-        path.strip_prefix(&format!("{crate_dir}/")).unwrap_or(path)
+        path.strip_prefix(&format!("{}/", unit.dir)).unwrap_or(path)
     };
-    relative.starts_with("tests/") && relative.ends_with(".rs")
+    if unit.test_targets.iter().any(|target| {
+        relative == target
+            || relative.starts_with(&format!("{target}/"))
+            || path == target
+            || path.starts_with(&format!("{target}/"))
+    }) {
+        return true;
+    }
+    let lower = relative.to_ascii_lowercase();
+    match unit.kind {
+        UnitKind::Crate => relative.starts_with("tests/") && relative.ends_with(".rs"),
+        UnitKind::Package => {
+            lower.contains("/src/test/")
+                || lower.starts_with("src/test/")
+                || lower.contains("/__tests__/")
+                || lower.starts_with("__tests__/")
+                || lower.contains(".test.")
+                || lower.contains(".spec.")
+                || lower.starts_with("tests/")
+                || lower.starts_with("test/")
+                || lower
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with("test_") || name.ends_with("_test.py"))
+                || workspace.crates.values().any(|other| {
+                    other.kind == UnitKind::Crate && other.test_targets.contains(relative)
+                })
+        }
+    }
 }
 
 /// Module path of a source file inside its crate (`src/lib.rs` = []).
 pub fn module_path(crate_name: &str, path: &str, workspace: &Workspace) -> Option<Vec<String>> {
     let crate_info = workspace.crates.get(crate_name)?;
+    if crate_info.kind != UnitKind::Crate {
+        return None;
+    }
     let relative = if crate_info.dir.is_empty() {
         path
     } else {

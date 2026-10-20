@@ -76,7 +76,7 @@ faktor-provider = { workspace = true, features = ["test-utils"] }
 # Tests drive the deterministic crash seams: store crash-arm boundaries and
 # the orchestrator's resume/reattach seam vocabulary.
 faktor-store = { workspace = true, features = ["fault-injection"] }
-faktor-orchestrator = { workspace = true, features = ["fault-injection"] }
+faktor-orchestrator = { workspace = true, features = ["fault-injection", "test-utils"] }
 # Test-only: the GitHub App daemon e2e posts signed webhook deliveries to the
 # served webhook route and asserts the wire response.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }

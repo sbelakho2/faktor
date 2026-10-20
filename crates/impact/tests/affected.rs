@@ -310,7 +310,7 @@ fn graph_serialization_is_deterministic_and_digest_checked() {
         tampered = first.replace("alpha/src/lib.rs", "alpha/src/lib2.rs");
     }
     let error = faktor_impact::Graph::from_json(&tampered).unwrap_err();
-    assert!(matches!(error, GraphError::CorruptJson(_)));
+    assert!(matches!(error, GraphError::DigestMismatch { .. }));
 }
 
 #[test]
@@ -412,6 +412,9 @@ fn ten_thousand_files_build_and_query_are_linear() {
             &format!("{name}/Cargo.toml"),
             &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{dependency}"),
         );
+        // cargo metadata requires a target; the fixture measures scanning,
+        // so one empty library per crate is enough.
+        write(root, &format!("{name}/src/lib.rs"), "");
         for file_index in 0..files_per_crate {
             let next = (file_index + 1) % files_per_crate;
             let text = if crate_index == 0 {
@@ -435,10 +438,9 @@ fn ten_thousand_files_build_and_query_are_linear() {
         &format!("[workspace]\nmembers = [{}]\n", members.join(", ")),
     );
     let started = Instant::now();
-    let mut builder = GraphBuilder::new(root, Revision::default()).unwrap();
-    let graph = builder.build().unwrap();
+    let mut session = ImpactSession::build(root, Revision::default()).unwrap();
     let build_ms = started.elapsed().as_millis();
-    let graph = ImpactGraph::new(graph).unwrap();
+    let graph = session.graph();
     assert!(graph.graph().files.len() >= 10_000);
     assert!(graph.graph().stats.symbols >= 20_000);
     let query_started = Instant::now();
@@ -492,4 +494,47 @@ fn ten_thousand_files_build_and_query_are_linear() {
         "each reverse edge traversed at most once"
     );
     assert!(result.affected.iter().any(|node| node.name == "g99"));
+
+    // Incremental refresh at 10k files must be O(changed): one edited file
+    // plus its reverse dependency, never a rescan or reparse of the
+    // workspace, and never a full-graph invalidation walk.
+    let changed_path = "k000/src/f0.rs".to_string();
+    let original = fs::read_to_string(root.join(&changed_path)).unwrap();
+    fs::write(root.join(&changed_path), format!("// edited\n{original}")).unwrap();
+    let refresh_started = Instant::now();
+    let refresh_stats = session
+        .refresh_material(std::slice::from_ref(&changed_path))
+        .unwrap();
+    let refresh_ms = refresh_started.elapsed().as_millis();
+    assert_eq!(refresh_stats.files_changed, 1);
+    // The edited symbol is re-exported through the 100-crate chain, so the
+    // reverse closure is at most one file per crate — never the 10k-file
+    // workspace.
+    // The fixture chains every crate to the previous one, so the reverse
+    // closure reaches one file per crate (100), not the 10k-file workspace.
+    assert!(
+        refresh_stats.files_reparsed <= 128,
+        "refresh reparsed {} files at 10k files: {refresh_stats:?}",
+        refresh_stats.files_reparsed
+    );
+    assert!(
+        refresh_stats.files_reparsed < session.graph().graph().files.len() / 10,
+        "refresh must stay far below a full workspace parse: {refresh_stats:?}"
+    );
+    let rewritten = fs::read_to_string(root.join(&changed_path)).unwrap();
+    fs::write(root.join(&changed_path), &rewritten).unwrap();
+    let noop_started = Instant::now();
+    let noop = session.refresh_material(&[changed_path]).unwrap();
+    let noop_ms = noop_started.elapsed().as_millis();
+    assert_eq!(noop.files_changed, 0);
+    assert_eq!(noop.files_reparsed, 0);
+    println!(
+        "impact incremental: refresh_ms={refresh_ms} files_reparsed={} noop_ms={noop_ms} files_unchanged={}",
+        refresh_stats.files_reparsed, noop.files_unchanged
+    );
+    assert!(
+        refresh_ms < 30_000,
+        "incremental refresh took {refresh_ms}ms"
+    );
+    assert!(noop_ms < 2_000, "no-op refresh took {noop_ms}ms");
 }

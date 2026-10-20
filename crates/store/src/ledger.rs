@@ -820,9 +820,10 @@ impl Store {
                 payload_ver,
             ],
         )?;
+        let listing_revision = next_listing_revision(conn)?;
         conn.execute(
-            "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![session_id.raw() as i64, state_json, ts],
+            "UPDATE session SET state = ?2, updated_ms = ?3, listing_revision = ?4 WHERE id = ?1",
+            params![session_id.raw() as i64, state_json, ts, listing_revision],
         )?;
         Ok(seq)
     }
@@ -2679,9 +2680,10 @@ impl Store {
              VALUES (?1, ?2, 'user', json_object('text', ?3), ?4)",
                 params![session.raw() as i64, event_seq, prompt, now],
             )?;
+            let listing_revision = next_listing_revision(&tx)?;
             tx.execute(
-                "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![session.raw() as i64, state_json, now],
+                "UPDATE session SET state = ?2, updated_ms = ?3, listing_revision = ?4 WHERE id = ?1",
+                params![session.raw() as i64, state_json, now, listing_revision],
             )?;
             tx.commit()?;
             Ok(Some(RawAdmitOutcome::Claimed(RawAdmittedPrompt {

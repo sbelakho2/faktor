@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 
 import {
   IMPACT_GRAPH_SCHEMA,
+  loadImpactGraph,
+  sealImpactGraph,
   validateImpactGraph,
 } from '../../tests/programme/selector.mjs';
 
@@ -68,7 +70,7 @@ export function selftest() {
       console.error(`impact graph selftest FAIL: ${name}${detail ? ` (${detail})` : ''}`);
     }
   };
-  const base = {
+  const base = sealImpactGraph({
     schema: IMPACT_GRAPH_SCHEMA,
     revision: { commit: null, tree: null, dirty: false },
     workspace: 1,
@@ -80,19 +82,33 @@ export function selftest() {
     edges: [{ from: 'test:t.rs#t@1', to: 'crate:a', kind: 'tests', provenance: 'coverage' }],
     reverse_edges: [{ from: 'crate:a', to: 'test:t.rs#t@1', kind: 'tests', provenance: 'coverage' }],
     stats: {},
-    digest: 'fixture',
-  };
-  check('the generator schema validates', validateImpactGraph(base, null) === null);
+    digest: '',
+  });
+  check('the Rust validator accepts the sealed document', validateImpactGraph(base, null) === null);
   const unsorted = structuredClone(base);
   unsorted.nodes.reverse();
-  check('unsorted nodes are refused', /sorted/.test(validateImpactGraph(unsorted, null) ?? ''));
+  check('unsorted nodes are refused by the Rust validator', /ordered|sorted/.test(validateImpactGraph(unsorted, null) ?? ''));
   const dangling = structuredClone(base);
   dangling.edges[0].to = 'crate:missing';
-  check('dangling edges are refused', /unknown node/.test(validateImpactGraph(dangling, null) ?? ''));
-  const stale = structuredClone(base);
-  stale.revision.commit = 'old';
+  check('dangling edges are refused by the Rust validator', /unknown node/.test(validateImpactGraph(dangling, null) ?? ''));
+  const reverse = structuredClone(base);
+  reverse.reverse_edges = [];
   check(
-    'a stale revision is refused',
+    'a reverse-edge mismatch is refused by the Rust validator',
+    /reverse edge/.test(validateImpactGraph(reverse, null) ?? ''),
+  );
+  const digest = structuredClone(base);
+  digest.nodes[0].name = 'tampered';
+  check(
+    'a digest mismatch is refused by the Rust validator',
+    /digest mismatch/.test(validateImpactGraph(digest, null) ?? ''),
+  );
+  const stale = sealImpactGraph({
+    ...structuredClone(base),
+    revision: { commit: 'old', tree: null, dirty: false },
+  });
+  check(
+    'a stale revision is refused by the Rust validator',
     /stale/.test(validateImpactGraph(stale, 'new') ?? ''),
   );
   check('an unsupported schema is refused', /schema/.test(validateImpactGraph({ ...base, schema: 'x' }, null) ?? ''));
@@ -101,9 +117,21 @@ export function selftest() {
   try {
     const path = join(dir, 'graph.json');
     writeFileSync(path, `${JSON.stringify(base)}\n`);
+    const loaded = loadImpactGraph(dir, { path });
     check(
-      'the selector loader accepts the generated document',
-      validateImpactGraph(JSON.parse(readFileSync(path, 'utf8')), null) === null,
+      'the selector loader accepts the Rust-validated document',
+      loaded.error === null && loaded.document?.digest === base.digest,
+      loaded.error ?? '',
+    );
+    const invalidPath = join(dir, 'invalid.json');
+    writeFileSync(invalidPath, `${JSON.stringify(digest)}\n`);
+    const refused = loadImpactGraph(dir, { path: invalidPath });
+    check(
+      'validator and selector agree on refusal',
+      refused.error !== null &&
+        /digest mismatch/.test(refused.error) &&
+        /digest mismatch/.test(validateImpactGraph(digest, null) ?? ''),
+      JSON.stringify(refused.error),
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

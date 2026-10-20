@@ -23,7 +23,7 @@
 //   --mode weekly-live every workspace crate and live suites (full lane)
 //   --mode release    everything (full lane)
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
@@ -98,115 +98,185 @@ function readJson(path) {
   return JSON.parse(text);
 }
 
+const VALIDATOR_ENV = 'FAKTOR_IMPACT_VALIDATOR';
+const VERDICT_SCHEMA = 'faktor-impact-validation/v1';
+const VALIDATOR_TIMEOUT_MS = 120_000;
+const VALIDATOR_MAX_BUFFER = 4 * 1024 * 1024;
+let VALIDATOR = null;
+let VALIDATOR_RESOLVED = false;
+const VALIDATION_CACHE = new Map();
+const VALIDATION_CACHE_LIMIT = 16;
+
 /**
- * Load the ONE serialized repository graph. The document is structurally
- * validated here; a missing, stale (revision != HEAD), unsupported or
- * corrupt graph is a typed error and the caller falls back conservatively
- * (whole workspace), never to a second manifest heuristic.
+ * Resolve the Rust authority. Explicit env override, then a built
+ * `faktor-ci-tools` binary, then `cargo run`. Resolution is cached: the
+ * selector never reimplements graph validation in JavaScript.
+ */
+function validatorCommand() {
+  if (VALIDATOR_RESOLVED) return VALIDATOR;
+  VALIDATOR_RESOLVED = true;
+  const explicit = process.env[VALIDATOR_ENV];
+  if (explicit) {
+    VALIDATOR = { cmd: explicit, args: [], label: explicit };
+    return VALIDATOR;
+  }
+  for (const profile of ['debug', 'release']) {
+    const candidate = join(ROOT, 'target', profile, process.platform === 'win32' ? 'faktor-ci-tools.exe' : 'faktor-ci-tools');
+    if (existsSync(candidate)) {
+      VALIDATOR = { cmd: candidate, args: [], label: candidate };
+      return VALIDATOR;
+    }
+  }
+  try {
+    execFileSync('cargo', ['--version'], { stdio: ['ignore', 'ignore', 'ignore'] });
+    VALIDATOR = {
+      cmd: 'cargo',
+      args: ['run', '-q', '--manifest-path', join(ROOT, 'Cargo.toml'), '-p', 'faktor-ci-tools', '--'],
+      label: 'cargo run -p faktor-ci-tools',
+    };
+  } catch {
+    VALIDATOR = null;
+  }
+  return VALIDATOR;
+}
+
+function runValidator(args, input = null) {
+  const validator = validatorCommand();
+  if (validator === null) {
+    return {
+      ok: false,
+      unavailable: true,
+      code: 'validator_unavailable',
+      error: `impact graph validator unavailable: build faktor-ci-tools or set ${VALIDATOR_ENV}`,
+    };
+  }
+  const result = spawnSync(validator.cmd, [...validator.args, 'impact', 'validate', '--json', ...args], {
+    encoding: 'utf8',
+    input: input ?? undefined,
+    maxBuffer: VALIDATOR_MAX_BUFFER,
+    timeout: VALIDATOR_TIMEOUT_MS,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (result.error) {
+    return {
+      ok: false,
+      unavailable: true,
+      code: 'validator_unavailable',
+      error: `impact graph validator unavailable (${validator.label}): ${result.error.message ?? result.error}`,
+    };
+  }
+  let verdict;
+  try {
+    verdict = JSON.parse(String(result.stdout ?? '').trim());
+  } catch {
+    return {
+      ok: false,
+      unavailable: false,
+      code: 'validator_malformed',
+      error: `impact graph validator emitted no verdict (exit ${result.status}): ${String(result.stderr ?? '').trim().slice(0, 300)}`,
+    };
+  }
+  if (verdict.schema !== VERDICT_SCHEMA) {
+    return {
+      ok: false,
+      unavailable: false,
+      code: 'validator_malformed',
+      error: `impact graph validator verdict schema ${JSON.stringify(verdict.schema)} is unsupported`,
+    };
+  }
+  return verdict;
+}
+
+function validateGraphText(text, head = null, { root = ROOT } = {}) {
+  const args = ['--stdin', '--root', resolve(root)];
+  if (head) args.push('--head', String(head));
+  const key = `${resolve(root)}\0${head ?? ''}\0${sha256(text)}`;
+  const cached = VALIDATION_CACHE.get(key);
+  if (cached) return cached;
+  const verdict = runValidator(args, text);
+  if (VALIDATION_CACHE.size >= VALIDATION_CACHE_LIMIT) {
+    VALIDATION_CACHE.delete(VALIDATION_CACHE.keys().next().value);
+  }
+  if (!verdict.unavailable) VALIDATION_CACHE.set(key, verdict);
+  return verdict;
+}
+
+/** Compute a canonical Rust-authority seal (used only for fixtures). */
+export function sealImpactGraph(document) {
+  const validator = validatorCommand();
+  if (validator === null) {
+    throw new Error(`impact graph validator unavailable: build faktor-ci-tools or set ${VALIDATOR_ENV}`);
+  }
+  const sealed = spawnSync(validator.cmd, [...validator.args, 'impact', 'seal', '--stdin'], {
+    encoding: 'utf8',
+    input: `${JSON.stringify(document)}\n`,
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: VALIDATOR_TIMEOUT_MS,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (sealed.error || sealed.status !== 0) {
+    throw new Error(
+      `impact graph seal failed: ${sealed.error?.message ?? String(sealed.stderr ?? '').trim().slice(0, 300)}`,
+    );
+  }
+  return JSON.parse(String(sealed.stdout).trim());
+}
+
+/**
+ * Load the ONE serialized repository graph. The graph bytes are handed to
+ * the Rust authority (`faktor-ci-tools impact validate`); this module never
+ * reimplements schema/order/dangling/reverse/digest checks. A missing,
+ * stale, unsupported or corrupt graph is a typed error and the caller falls
+ * back conservatively (whole workspace), never to a second manifest
+ * heuristic.
  */
 export function loadImpactGraph(root = ROOT, { head = null, path = null } = {}) {
   const candidates = graphCandidates(root, path);
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
+    let text;
+    try {
+      text = read(candidate);
+    } catch (error) {
+      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate, code: 'io' };
+    }
+    const verdict = validateGraphText(text, head, { root });
+    if (!verdict.ok) {
+      return { document: null, error: verdict.error, code: verdict.code, path: candidate };
+    }
     let document;
     try {
-      document = readJson(candidate);
+      document = JSON.parse(text);
     } catch (error) {
-      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate };
+      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate, code: 'corrupt_json' };
     }
-    const error = validateImpactGraph(document, head, { root });
-    if (error) return { document: null, error, path: candidate };
-    return { document, error: null, path: candidate };
+    return { document, error: null, code: null, path: candidate };
   }
-  return { document: null, error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)', path: null };
+  return { document: null, error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)', code: 'missing', path: null };
 }
 
 const GRAPH_FILE = 'tests/programme/impact-graph.json';
 
 /**
- * Paths a serialized graph is derived from. The graph document is committed
- * inside the same commit it describes, so its recorded revision is the
- * parent commit; the binding is valid only while no graph input changed in
- * between. Non-input paths (docs, registry data, scripts, apps, CI) cannot
- * invalidate the Rust workspace projection.
+ * Validate a document through the Rust authority. Returns `null` when the
+ * authority accepts it, otherwise the typed error text. Exported for the
+ * generator/selftests and for callers that already hold a parsed document.
  */
-function graphInputPath(path, members) {
-  if (path === 'Cargo.toml' || path === 'Cargo.lock' || path === 'rust-toolchain.toml') return true;
-  if (path.endsWith('.rs') || path.endsWith('/Cargo.toml')) return true;
-  return members.some((member) => path === member || path.startsWith(`${member}/`));
-}
-
-function graphBindingError(root, revision, head) {
-  if (!head || !revision.commit || revision.commit === head) return null;
-  if (revision.dirty === true) {
-    return `impact graph is stale: revision ${revision.commit} was built from a dirty tree, not HEAD ${head}`;
-  }
-  if (!/^[0-9a-f]{7,64}$/i.test(String(revision.commit))) {
-    return `impact graph is stale: revision ${revision.commit} != HEAD ${head}`;
-  }
-  const changed = gitNames(
-    ['diff', '--name-only', '--no-renames', '--diff-filter=ACMRD', '-z', `${revision.commit}..${head}`, '--'],
-    root,
-  );
-  if (changed === null) {
-    return `impact graph is stale: revision ${revision.commit} != HEAD ${head} (diff unavailable)`;
-  }
-  const members = workspaceMembers(root);
-  const inputs = changed.filter((path) => path !== GRAPH_FILE && graphInputPath(path, members));
-  if (inputs.length > 0) {
-    return `impact graph is stale: revision ${revision.commit} != HEAD ${head} (graph inputs changed: ${inputs.slice(0, 3).join(', ')})`;
-  }
-  return null;
-}
-
 export function validateImpactGraph(document, head = null, { root = ROOT } = {}) {
-  if (document === null || typeof document !== 'object') return 'impact graph is not an object';
-  if (document.schema !== IMPACT_GRAPH_SCHEMA) return `unsupported impact graph schema ${JSON.stringify(document.schema)}`;
-  if (!Array.isArray(document.nodes) || !Array.isArray(document.edges) || !Array.isArray(document.reverse_edges)) {
-    return 'impact graph has no nodes/edges/reverse_edges arrays';
+  let text;
+  try {
+    text = JSON.stringify(document);
+  } catch (error) {
+    return `impact graph is unreadable: ${error.message ?? error}`;
   }
-  if (document.nodes.length > 2_000_000 || document.edges.length > 8_000_000) {
-    return 'impact graph exceeds the node/edge bound';
-  }
-  if (typeof document.digest !== 'string' || document.digest.length === 0) {
-    return 'impact graph carries no digest';
-  }
-  const revision = document.revision ?? {};
-  const binding = graphBindingError(root, revision, head);
-  if (binding) return binding;
-  const nodes = new Map();
-  let previous = null;
-  for (const node of document.nodes) {
-    if (!node || typeof node.id !== 'string' || typeof node.kind !== 'string') {
-      return 'impact graph contains a node without id/kind';
-    }
-    if (previous !== null && !(previous < node.id)) return `impact graph nodes are not sorted at ${node.id}`;
-    previous = node.id;
-    if (nodes.has(node.id)) return `impact graph contains duplicate node ${node.id}`;
-    nodes.set(node.id, node);
-  }
-  const edges = new Set();
-  previous = null;
-  for (const edge of document.edges) {
-    if (!edge || typeof edge.from !== 'string' || typeof edge.to !== 'string' || typeof edge.kind !== 'string') {
-      return 'impact graph contains an edge without from/to/kind';
-    }
-    if (!nodes.has(edge.from) || !nodes.has(edge.to)) return `impact graph edge references unknown node: ${edge.from} -> ${edge.to}`;
-    const key = `${edge.from}\0${edge.kind}\0${edge.to}`;
-    if (previous !== null && !(previous < key)) return `impact graph edges are not sorted at ${edge.from}`;
-    previous = key;
-    if (edges.has(key)) return `impact graph contains duplicate edge ${edge.from} -> ${edge.to}`;
-    edges.add(key);
-  }
-  for (const edge of document.reverse_edges) {
-    const forward = `${edge.to}\0${edge.kind}\0${edge.from}`;
-    if (!edges.has(forward)) return `impact reverse edge has no forward counterpart: ${edge.from} -> ${edge.to}`;
-  }
-  return null;
+  const verdict = validateGraphText(text, head, { root });
+  return verdict.ok ? null : verdict.error;
 }
 
 function authorityModel(document) {
   const crates = new Map();
+  const packages = new Map();
+  const units = new Map();
   const crateByDir = new Map();
   const dependents = new Map();
   const testsByCrate = new Map();
@@ -215,6 +285,7 @@ function authorityModel(document) {
   const files = new Map();
   const fileCrate = new Map();
   const byPath = new Map();
+  const unitIdByPath = new Map();
   for (const node of document.nodes) {
     nodesById.set(node.id, node);
     if (node.path) {
@@ -223,8 +294,25 @@ function authorityModel(document) {
     }
     if (node.kind === 'crate') {
       const dir = node.path === '.' || node.path === undefined ? '' : String(node.path).replace(/\/+$/, '');
-      crates.set(node.name, { name: node.name, dir, deps: new Set() });
-      if (dir.length > 0) crateByDir.set(dir, crates.get(node.name));
+      const unit = { name: node.name, dir, kind: 'crate', nodeId: node.id, deps: new Set() };
+      crates.set(node.name, unit);
+      units.set(node.name, unit);
+      if (dir.length > 0) {
+        crateByDir.set(dir, unit);
+        unitIdByPath.set(dir, node.id);
+      }
+    }
+    // A package node WITH a path is a local unit (npm/Gradle/Maven/Python);
+    // a package node without a path is an external dependency.
+    if (node.kind === 'package' && node.path) {
+      const dir = node.path === '.' ? '' : String(node.path).replace(/\/+$/, '');
+      const unit = { name: node.name, dir, kind: 'package', nodeId: node.id, deps: new Set() };
+      packages.set(node.name, unit);
+      units.set(node.name, unit);
+      if (dir.length > 0) {
+        crateByDir.set(dir, unit);
+        unitIdByPath.set(dir, node.id);
+      }
     }
     if (node.kind === 'file' && node.path) {
       files.set(node.path, node.id);
@@ -238,17 +326,22 @@ function authorityModel(document) {
       }
     }
   }
-  for (const crate of crates.values()) dependents.set(crate.name, new Set());
+  for (const unit of units.values()) dependents.set(unit.name, new Set());
   for (const edge of document.edges) {
     if (edge.kind === 'depends_on') {
       const from = nodesById.get(edge.from);
       const to = nodesById.get(edge.to);
-      if (from?.kind === 'crate' && to?.kind === 'crate') {
-        const crate = crates.get(from.name);
-        const dependency = crates.get(to.name);
-        if (crate && dependency) {
-          crate.deps.add(dependency.name);
-          dependents.get(dependency.name).add(crate.name);
+      if (
+        from &&
+        to &&
+        ['crate', 'package'].includes(from.kind) &&
+        ['crate', 'package'].includes(to.kind)
+      ) {
+        const unit = units.get(from.name);
+        const dependency = units.get(to.name);
+        if (unit && dependency && unit !== dependency) {
+          unit.deps.add(dependency.name);
+          dependents.get(dependency.name).add(unit.name);
         }
       }
     }
@@ -258,8 +351,23 @@ function authorityModel(document) {
     reverse.get(edge.from).push(edge);
   }
   for (const tests of testsByCrate.values()) tests.sort();
-  const byDir = [...crates.values()].sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
-  return { crates, byDir, crateByDir, dependents, testsByCrate, nodesById, reverse, files, fileCrate, byPath, document };
+  const byDir = [...units.values()].sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
+  return {
+    crates,
+    packages,
+    units,
+    byDir,
+    crateByDir,
+    unitIdByPath,
+    dependents,
+    testsByCrate,
+    nodesById,
+    reverse,
+    files,
+    fileCrate,
+    byPath,
+    document,
+  };
 }
 
 /**
@@ -276,8 +384,8 @@ export function impactFromAuthority(authority, changed, { maxDepth = 8, maxResul
     // Symbols/tests defined by the changed file are seeds too: coverage
     // edges then point from tests to exactly those declarations.
     for (const id of authority.byPath.get(path) ?? []) seeds.add(id);
-    const crate = crateForPath(path, authority);
-    if (crate) seeds.add(`crate:${crate.name}`);
+    const unit = crateForPath(path, authority);
+    if (unit) seeds.add(unit.nodeId ?? `${unit.kind}:${unit.name}`);
   }
   const best = new Map();
   const queue = [];
@@ -299,15 +407,15 @@ export function impactFromAuthority(authority, changed, { maxDepth = 8, maxResul
     if (!current || current.distance >= maxDepth) continue;
     const node = authority.nodesById.get(id);
     if (!node) continue;
-    if (node.kind === 'crate') {
-      crates.add(node.name);
+    if (node.kind === 'crate') crates.add(node.name);
+    if (['crate', 'package'].includes(node.kind)) {
       for (const test of authority.testsByCrate.get(node.name) ?? []) {
         push(test, current.distance + 1, `tests:${node.name}`);
       }
     }
     for (const edge of authority.reverse.get(id) ?? []) {
       visitedEdges += 1;
-      if (node.kind === 'crate' && !['depends_on', 'tests'].includes(edge.kind)) continue;
+      if (['crate', 'package'].includes(node.kind) && !['depends_on', 'tests'].includes(edge.kind)) continue;
       if (node.kind === 'file' && edge.kind === 'defines') continue;
       push(edge.to, current.distance + 1, `${edge.kind}:${id}`);
     }
@@ -356,8 +464,8 @@ export function workspaceGraph(root = ROOT, { head = null, refresh = false, path
     if (cached) return cached;
   }
   const graph = loaded.document
-    ? { ...authorityModel(loaded.document), authority: true, source: 'authority', error: null, revision: loaded.document.revision ?? null, digest: loaded.document.digest, path: loaded.path }
-    : { crates: new Map(), byDir: [], crateByDir: new Map(), dependents: new Map(), testsByCrate: new Map(), nodesById: new Map(), reverse: new Map(), files: new Map(), fileCrate: new Map(), byPath: new Map(), document: null, authority: false, source: 'conservative-fallback', error: loaded.error, revision: null, digest: null, path: null };
+    ? { ...authorityModel(loaded.document), authority: true, source: 'authority', error: null, code: null, revision: loaded.document.revision ?? null, digest: loaded.document.digest, path: loaded.path }
+    : { crates: new Map(), packages: new Map(), units: new Map(), byDir: [], crateByDir: new Map(), dependents: new Map(), testsByCrate: new Map(), nodesById: new Map(), reverse: new Map(), files: new Map(), fileCrate: new Map(), byPath: new Map(), document: null, authority: false, source: 'conservative-fallback', error: loaded.error, code: loaded.code ?? null, revision: null, digest: null, path: null };
   GRAPH_CACHE.set(key, graph);
   return graph;
 }
@@ -403,7 +511,7 @@ export function reverseClosure(names, graph) {
       if (!selected.has(dependent)) queue.push(dependent);
     }
   }
-  return [...selected].filter((name) => graph.crates.has(name)).sort();
+  return [...selected].filter((name) => graph.units?.has(name) ?? graph.crates.has(name)).sort();
 }
 
 const SUITE_PATHS = Object.freeze([
@@ -580,10 +688,13 @@ function manifestCrateNames(root) {
   return [...new Set(names)].sort();
 }
 
-function testCommandsFor(tests, limit = 256) {
+function testCommandsFor(tests, limit = 256, graph = null) {
   const commands = new Set();
   for (const test of tests.slice(0, limit)) {
     if (!test.crate || !test.name) continue;
+    // Only Cargo crates have `cargo test -p` commands; npm/Gradle/Maven/
+    // Python units are still reported in `tests` and select their surfaces.
+    if (graph && !graph.crates.has(test.crate)) continue;
     if (!/^[A-Za-z0-9_:.-]+$/.test(test.name)) continue;
     if (!/^[A-Za-z0-9_-]+$/.test(test.crate)) continue;
     const path = String(test.path ?? '');
@@ -614,6 +725,7 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
     ),
   ].sort();
   const crates = new Set();
+  const changedPackages = new Set();
   const suites = new Set();
   const unmapped = [];
   const notes = [];
@@ -633,7 +745,8 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
     }
     const crate = crateForPath(path, graph);
     if (crate !== null) {
-      crates.add(crate.name);
+      if (crate.kind === 'crate') crates.add(crate.name);
+      else changedPackages.add(crate.name);
       continue;
     }
     const suite = suiteForPath(path);
@@ -656,6 +769,7 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
 
   if (forceFull) {
     for (const crate of graph.crates.keys()) crates.add(crate);
+    for (const unit of graph.packages?.keys() ?? []) changedPackages.add(unit);
     for (const suite of Object.keys(SUITE_COMMANDS)) suites.add(suite);
   }
 
@@ -672,7 +786,11 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
   } else if (graphFallback) {
     selectedCrates = [];
   } else {
-    selectedCrates = reverseClosure([...crates], graph);
+    const closure = reverseClosure([...crates, ...changedPackages], graph);
+    selectedCrates = closure.filter((name) => graph.crates.has(name));
+    for (const name of closure) {
+      if (graph.packages?.has(name)) changedPackages.add(name);
+    }
     if (selectedCrates.length < crates.size) {
       notes.push('reverse-dependency closure applied to every changed crate');
     }
@@ -693,7 +811,7 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
   const impact = graph.authority && changed.length > 0
     ? impactFromAuthority(graph, changed, { maxDepth: 8, maxResults: 4096 })
     : { tests: [], crates: [], visited_edges: 0, truncated: false };
-  const testCommands = full || forceFull || graphFallback ? [] : testCommandsFor(impact.tests, 16);
+  const testCommands = full || forceFull || graphFallback ? [] : testCommandsFor(impact.tests, 16, graph);
   const commands = [];
   if (selectedCrates.length > 0) {
     commands.push(`cargo test -p ${selectedCrates.join(' -p ')} --all-features`);
@@ -753,6 +871,7 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
     head,
     changed,
     crates: selectedCrates,
+    packages: [...changedPackages].sort(),
     deferred_crates: deferredCrates,
     suites: [...suites].sort(),
     commands: [...new Set(commands)],
@@ -766,7 +885,9 @@ export function select(changedPaths, { mode = 'pull', base = null, root = ROOT, 
     graph_revision: graph.revision?.commit ?? null,
     graph_digest: graph.digest,
     impacted_crates: impact.crates,
-    ...(graph.error ? { graph_error: graph.error } : {}),
+    ...(graph.error
+      ? { graph_error: graph.error, graph_error_code: graph.code ?? null }
+      : {}),
     ...(loaded.error ? { registry_error: loaded.error } : {}),
     conservative: true,
     notes,
@@ -869,7 +990,7 @@ function writeImpactGraphFixture(root, { crateNames = [], testsPerCrate = 0 } = 
   const reverse_edges = edges
     .map((edge) => ({ ...edge, from: edge.to, to: edge.from }))
     .sort((a, b) => `${a.from}\0${a.kind}\0${a.to}`.localeCompare(`${b.from}\0${b.kind}\0${b.to}`));
-  const document = {
+  const document = sealImpactGraph({
     schema: IMPACT_GRAPH_SCHEMA,
     revision: { commit: null, tree: null, dirty: false },
     workspace: 1,
@@ -878,8 +999,8 @@ function writeImpactGraphFixture(root, { crateNames = [], testsPerCrate = 0 } = 
     edges,
     reverse_edges,
     stats: { nodes: nodes.length, edges: edges.length, reverse_edges: reverse_edges.length },
-    digest: 'fixture',
-  };
+    digest: '',
+  });
   mkdirSync(join(root, 'tests/programme'), { recursive: true });
   writeFileSync(join(root, 'tests/programme/impact-graph.json'), `${JSON.stringify(document)}\n`);
   clearWorkspaceGraphCache(root);
@@ -962,8 +1083,11 @@ function createBindingFixture() {
   git('add', '.');
   git('commit', '-qm', 'base');
   const base = git('rev-parse', 'HEAD').trim();
-  const document = writeImpactGraphFixture(root, { crateNames: ['a'] });
-  document.revision = { commit: base, tree: null, dirty: false };
+  const fixture = writeImpactGraphFixture(root, { crateNames: ['a'] });
+  const document = sealImpactGraph({
+    ...fixture,
+    revision: { commit: base, tree: null, dirty: false },
+  });
   writeFileSync(join(root, 'tests/programme/impact-graph.json'), `${JSON.stringify(document)}\n`);
   clearWorkspaceGraphCache(root);
   git('add', '.');
@@ -1124,8 +1248,10 @@ export function selftest() {
       /graph inputs changed/.test(rejected.error ?? ''),
       JSON.stringify(rejected.error),
     );
-    const dirty = structuredClone(binding.document);
-    dirty.revision = { ...dirty.revision, dirty: true };
+    const dirty = sealImpactGraph({
+      ...structuredClone(binding.document),
+      revision: { ...binding.document.revision, dirty: true },
+    });
     check(
       'a dirty graph bound to another revision is a typed refusal',
       /dirty tree/.test(validateImpactGraph(dirty, docsHead, { root: binding.root }) ?? ''),
@@ -1222,8 +1348,10 @@ export function selftest() {
 
   const stalePath = join(tmpdir(), `faktor-impact-stale-${process.pid}.json`);
   try {
-    const document = JSON.parse(readFileSync(join(ROOT, 'tests/programme/impact-graph.json'), 'utf8'));
-    document.revision = { commit: 'deadbeef', tree: null, dirty: false };
+    const document = sealImpactGraph({
+      ...JSON.parse(readFileSync(join(ROOT, 'tests/programme/impact-graph.json'), 'utf8')),
+      revision: { commit: 'deadbeef', tree: null, dirty: false },
+    });
     writeFileSync(stalePath, `${JSON.stringify(document)}\n`);
     clearWorkspaceGraphCache(ROOT);
     const stale = select(['crates/core/src/lib.rs'], { graphPath: stalePath });
@@ -1237,6 +1365,55 @@ export function selftest() {
   } finally {
     rmSync(stalePath, { force: true });
     clearWorkspaceGraphCache(ROOT);
+  }
+
+  // Single-validator agreement: every structural mutation is refused by
+  // the Rust authority, and the selector consumes that verdict verbatim.
+  const validatorRoot = mkdtempSync(join(tmpdir(), 'faktor-selector-validator-'));
+  try {
+    const base = sealImpactGraph({
+      schema: IMPACT_GRAPH_SCHEMA,
+      revision: { commit: null, tree: null, dirty: false },
+      workspace: 1,
+      files: [],
+      nodes: [
+        { id: 'crate:a', kind: 'crate', name: 'a', path: 'a', provenance: 'manifest' },
+        { id: 'test:t.rs#t@1', kind: 'test', name: 't', path: 't.rs', crate_name: 'a', provenance: 'coverage' },
+      ],
+      edges: [{ from: 'test:t.rs#t@1', to: 'crate:a', kind: 'tests', provenance: 'coverage' }],
+      reverse_edges: [{ from: 'crate:a', to: 'test:t.rs#t@1', kind: 'tests', provenance: 'coverage' }],
+      stats: {},
+      digest: '',
+    });
+    const path = join(validatorRoot, 'graph.json');
+    writeFileSync(path, `${JSON.stringify(base)}\n`);
+    const accepted = loadImpactGraph(validatorRoot, { path });
+    check('the selector accepts a Rust-validated graph', accepted.error === null, accepted.error ?? '');
+    const mutations = [];
+    const digest = structuredClone(base);
+    digest.nodes[0].name = 'tampered';
+    mutations.push(['invalid digest', digest, 'digest_mismatch']);
+    const dangling = structuredClone(base);
+    dangling.nodes.pop();
+    mutations.push(['dangling edge', dangling, 'dangling_edge']);
+    const reverse = structuredClone(base);
+    reverse.reverse_edges = [];
+    mutations.push(['reverse-edge mismatch', reverse, 'reverse_mismatch']);
+    const ordering = structuredClone(base);
+    ordering.nodes.reverse();
+    mutations.push(['unsorted nodes', ordering, 'unsorted']);
+    for (const [label, document, code] of mutations) {
+      writeFileSync(path, `${JSON.stringify(document)}\n`);
+      const refused = loadImpactGraph(validatorRoot, { path });
+      const direct = validateImpactGraph(document, null, { root: validatorRoot });
+      check(
+        `${label} is refused by the selector through the Rust validator`,
+        refused.error !== null && refused.code === code && direct === refused.error,
+        JSON.stringify({ refused, direct }),
+      );
+    }
+  } finally {
+    rmSync(validatorRoot, { recursive: true, force: true });
   }
 
   const first = JSON.stringify(select(['crates/core/src/lib.rs']));

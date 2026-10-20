@@ -2117,6 +2117,8 @@ impl Store {
         let new_status_json = serde_json::to_string(&new_status).unwrap();
         let running_status_json = serde_json::to_string(&VerificationStatus::Running).unwrap();
         let status_label = format!("verification_record {record_id} status");
+        let conflict_message =
+            format!("verification_record {record_id} changed during scoped finalize");
         let outcome = self
             .writer
             .execute("verification_record_finalize", move |conn| {
@@ -2171,9 +2173,7 @@ impl Store {
                     // IMMEDIATE transaction; a zero-row CAS means durable
                     // state moved underneath us. Surface it as a conflict
                     // rather than inventing a second status read.
-                    return Err(StoreError::Conflict(format!(
-                        "verification_record {record_id} changed during scoped finalize"
-                    )));
+                    return Err(StoreError::Conflict(conflict_message));
                 }
                 tx.commit()?;
                 Ok(Ok(()))

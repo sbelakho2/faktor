@@ -8,8 +8,10 @@
 //!
 //! Layers:
 //! * [`model`] — typed schema, deterministic ordering, digest validation.
-//! * [`manifest`] — Cargo workspace/package dependency adapter.
-//! * [`parse`] — bounded Rust/JS/TS lexical parser.
+//! * [`manifest`] — supervised `cargo metadata` topology plus the bounded
+//!   Cargo-unavailable fallback.
+//! * [`topology`] — neutral npm/Gradle/Maven/Python/generic adapters.
+//! * [`parse`] — bounded Rust/JS/TS/Python/JVM lexical parser.
 //! * [`build`] — workspace scanner, graph assembly, incremental invalidation.
 //! * [`query`] — O(V+E) impacted-set traversal with reasons/provenance.
 //! * `git` (feature) — revision identity and changed-file adapter through
@@ -22,6 +24,7 @@ pub mod manifest;
 pub mod model;
 pub mod parse;
 pub mod query;
+pub mod topology;
 
 #[cfg(feature = "git")]
 pub mod git;
@@ -31,7 +34,7 @@ pub mod lsp;
 pub use lsp::{enrich_graph, LspOptions, LspStats};
 
 pub use build::{BuildOptions, BuildReport, GraphBuilder, ImpactSession, IncrementalStats};
-pub use manifest::{CrateInfo, Workspace};
+pub use manifest::{CrateInfo, TopologyOptions, Workspace};
 pub use model::{
     crate_id, file_id, module_id, package_id, symbol_id, test_id, EdgeKind, Graph, GraphEdge,
     GraphError, GraphFile, GraphNode, GraphStats, Language, NodeKind, Provenance, Revision,
@@ -43,3 +46,4 @@ pub use query::{
     AffectedOptions, AffectedResult, ChangedTarget, ImpactGraph, ImpactReason, ImpactRelation,
     ImpactedNode, QueryStats, DEFAULT_MAX_DEPTH, DEFAULT_MAX_RESULTS,
 };
+pub use topology::{AdapterKind, Unit, UnitKind as TopologyUnitKind};

@@ -121,6 +121,20 @@ pub enum SemanticError {
     /// [`crate::intelligence::IntelligenceTier`]). Refused at handshake, so
     /// an out-of-range claim can never drive the status surface.
     InvalidIntelligenceTier { tier: u8 },
+    /// The central quality gate rejected a candidate whose DECLARED
+    /// per-operation quality is below the caller's requirement. A
+    /// low-fidelity answer can never satisfy a high-fidelity obligation.
+    QualityBelowRequirement {
+        op: String,
+        source: String,
+        required_fidelity: SemanticFidelity,
+        declared_fidelity: SemanticFidelity,
+        required_completeness: SemanticCompleteness,
+        declared_completeness: SemanticCompleteness,
+    },
+    /// The central quality gate found no candidate (provider or fallback)
+    /// that can serve the operation at the caller-required quality.
+    QualityUnavailable { op: String, detail: String },
     /// A metadata subsystem is absent or cannot serve this workspace. This is
     /// the typed UNAVAILABLE signal the production fallback records in its
     /// payloads; it is never converted into a fabricated empty success.
@@ -205,6 +219,21 @@ impl fmt::Display for SemanticError {
             Self::InvalidIntelligenceTier { tier } => write!(
                 f,
                 "semantic provider descriptor intelligence tier {tier} is outside 0..=5"
+            ),
+            Self::QualityBelowRequirement {
+                op,
+                source,
+                required_fidelity,
+                declared_fidelity,
+                required_completeness,
+                declared_completeness,
+            } => write!(
+                f,
+                "semantic operation {op} requires fidelity {required_fidelity:?} and completeness {required_completeness:?}, but {source} declares fidelity {declared_fidelity:?} and completeness {declared_completeness:?}"
+            ),
+            Self::QualityUnavailable { op, detail } => write!(
+                f,
+                "semantic operation {op} has no candidate satisfying the required fidelity/completeness quality: {detail}"
             ),
             Self::Unavailable { subsystem, reason } => {
                 write!(f, "semantic subsystem {subsystem} unavailable: {reason}")
@@ -683,6 +712,21 @@ impl SemanticOp {
         }
     }
 
+    /// The completeness an authoritative consumer must REQUIRE alongside
+    /// [`Self::minimum_fidelity`]: exploratory operations may be partial,
+    /// while identities, change sets and proofs must be at least
+    /// conservative-complete.
+    pub const fn minimum_completeness(self) -> SemanticCompleteness {
+        match self {
+            SemanticOp::Context | SemanticOp::Affected | SemanticOp::Explain => {
+                SemanticCompleteness::Partial
+            }
+            SemanticOp::Snapshot | SemanticOp::Delta | SemanticOp::Verify => {
+                SemanticCompleteness::ConservativeComplete
+            }
+        }
+    }
+
     pub const fn bit(self) -> u32 {
         match self {
             SemanticOp::Snapshot => 1 << 0,
@@ -835,9 +879,12 @@ impl Default for SemanticCapabilities {
 /// filename heuristics and parsed structure up to compiler-exact and an
 /// explicit proof obligation. `fallback` never impersonates Tangerine:
 /// every response and status carries its real fidelity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticFidelity {
+    #[default]
     None,
     Heuristic,
     Structural,
@@ -847,23 +894,264 @@ pub enum SemanticFidelity {
 
 /// How much of the semantic truth a response covers (audit Tangerine-4):
 /// boolean availability alone is not completeness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticCompleteness {
+    #[default]
     Unknown,
     Partial,
     ConservativeComplete,
     Complete,
 }
 
+/// The evidence SOURCE a per-operation quality claim describes. Ordered by
+/// the documented native ladder: filesystem/lexical (0), tree-sitter (1),
+/// LSP/compiler semantics (2), revision-bound graph (3), runtime/history (4),
+/// enriched external provider (5, optional).
+///
+/// Provenance names the CLASS of machinery that produced the evidence; the
+/// provider identity and exact seam identity stay in the operation status /
+/// per-finding provenance. `Unknown` never widens trust.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEvidenceSource {
+    /// No source was declared: conservative, never assumed native or external.
+    #[default]
+    Unknown,
+    /// Tier 0: filesystem + lexical/index search.
+    Filesystem,
+    /// Tier 1: syntax parsing (tree-sitter).
+    TreeSitter,
+    /// Tier 2: LSP / compiler semantics.
+    Lsp,
+    /// Tier 3: revision-bound static dependency / impact graph.
+    Graph,
+    /// Tier 4: runtime + historical evidence (execution, coverage, past checks).
+    RuntimeHistory,
+    /// Tier 5: enriched external provider (for example a configured Tangerine).
+    External,
+}
+
+impl SemanticEvidenceSource {
+    /// The intelligence tier this source class can honestly support.
+    pub const fn tier(self) -> Option<crate::intelligence::IntelligenceTier> {
+        match self {
+            Self::Unknown => None,
+            Self::Filesystem => Some(crate::intelligence::IntelligenceTier::FILESYSTEM),
+            Self::TreeSitter => Some(crate::intelligence::IntelligenceTier::SYNTAX),
+            Self::Lsp => Some(crate::intelligence::IntelligenceTier::COMPILER),
+            Self::Graph => Some(crate::intelligence::IntelligenceTier::GRAPH),
+            Self::RuntimeHistory => Some(crate::intelligence::IntelligenceTier::RUNTIME),
+            Self::External => Some(crate::intelligence::IntelligenceTier::ENRICHED),
+        }
+    }
+
+    /// The raw tier bound of this source, or `None` when unknown.
+    pub const fn tier_raw(self) -> Option<u8> {
+        match self {
+            Self::Unknown => None,
+            Self::Filesystem => Some(0),
+            Self::TreeSitter => Some(1),
+            Self::Lsp => Some(2),
+            Self::Graph => Some(3),
+            Self::RuntimeHistory => Some(4),
+            Self::External => Some(5),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Filesystem => "filesystem",
+            Self::TreeSitter => "tree_sitter",
+            Self::Lsp => "lsp",
+            Self::Graph => "graph",
+            Self::RuntimeHistory => "runtime_history",
+            Self::External => "external",
+        }
+    }
+}
+
+/// ONE operation's declared quality. This is the authoritative shape the
+/// selection gate reads: fidelity, completeness, tier, orthogonal evidence
+/// dimensions and the evidence-source provenance all belong to the
+/// operation, never to a provider-wide scalar.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticOperationQuality {
+    /// Absent = `none` (untrusted), never inherited from a provider scalar.
+    #[serde(default)]
+    pub fidelity: SemanticFidelity,
+    /// Absent = `unknown` coverage, never conservative-complete.
+    #[serde(default)]
+    pub completeness: SemanticCompleteness,
+    /// Declared tier (`0..=5`), validated at handshake. Absent = unknown.
+    #[serde(default)]
+    pub tier: Option<u8>,
+    /// Orthogonal evidence dimensions for THIS operation (absent axes stay
+    /// conservative `Unknown`).
+    #[serde(default)]
+    pub evidence: crate::intelligence::EvidenceDimensions,
+    /// The evidence-source class this quality claim comes from.
+    #[serde(default)]
+    pub provenance: SemanticEvidenceSource,
+}
+
+impl SemanticOperationQuality {
+    pub const fn new(
+        fidelity: SemanticFidelity,
+        completeness: SemanticCompleteness,
+        tier: Option<u8>,
+        evidence: crate::intelligence::EvidenceDimensions,
+        provenance: SemanticEvidenceSource,
+    ) -> Self {
+        Self {
+            fidelity,
+            completeness,
+            tier,
+            evidence,
+            provenance,
+        }
+    }
+
+    /// A native quality claim: the tier is derived from the evidence source
+    /// (filesystem/lexical 0, tree-sitter 1, LSP 2, graph 3, runtime/history
+    /// 4), so a native provider can never claim a tier its machinery does not
+    /// provide.
+    pub const fn native(
+        provenance: SemanticEvidenceSource,
+        fidelity: SemanticFidelity,
+        completeness: SemanticCompleteness,
+    ) -> Self {
+        Self {
+            fidelity,
+            completeness,
+            tier: provenance.tier_raw(),
+            evidence: crate::intelligence::native_evidence_dimensions(),
+            provenance,
+        }
+    }
+
+    /// The bounded confidence this quality supports (`0..=10_000`) under the
+    /// shared orthogonal-dimension mapping. The tier is never an input.
+    pub fn confidence_bps(&self) -> u16 {
+        crate::intelligence::confidence_bps_for(&crate::intelligence::ConfidenceDimensions::new(
+            self.fidelity,
+            self.completeness,
+            self.evidence,
+        ))
+    }
+}
+
+/// Per-operation declared quality for every [`SemanticOp`]. Fixed named
+/// fields (not a map) keep the lookup O(1) on the selection hot path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticOperationQualities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SemanticOperationQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<SemanticOperationQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<SemanticOperationQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected: Option<SemanticOperationQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<SemanticOperationQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<SemanticOperationQuality>,
+}
+
+impl SemanticOperationQualities {
+    /// The empty profile (no operation declared per-operation quality).
+    pub const EMPTY: Self = Self {
+        snapshot: None,
+        context: None,
+        delta: None,
+        affected: None,
+        verify: None,
+        explain: None,
+    };
+
+    /// O(1) per-operation lookup (one field access).
+    pub const fn get(&self, op: SemanticOp) -> Option<&SemanticOperationQuality> {
+        match op {
+            SemanticOp::Snapshot => self.snapshot.as_ref(),
+            SemanticOp::Context => self.context.as_ref(),
+            SemanticOp::Delta => self.delta.as_ref(),
+            SemanticOp::Affected => self.affected.as_ref(),
+            SemanticOp::Verify => self.verify.as_ref(),
+            SemanticOp::Explain => self.explain.as_ref(),
+        }
+    }
+
+    /// O(1) per-operation mutable lookup.
+    pub fn get_mut(&mut self, op: SemanticOp) -> Option<&mut SemanticOperationQuality> {
+        match op {
+            SemanticOp::Snapshot => self.snapshot.as_mut(),
+            SemanticOp::Context => self.context.as_mut(),
+            SemanticOp::Delta => self.delta.as_mut(),
+            SemanticOp::Affected => self.affected.as_mut(),
+            SemanticOp::Verify => self.verify.as_mut(),
+            SemanticOp::Explain => self.explain.as_mut(),
+        }
+    }
+
+    /// Set one operation's declared quality (O(1)).
+    pub fn set(&mut self, op: SemanticOp, quality: SemanticOperationQuality) {
+        match op {
+            SemanticOp::Snapshot => self.snapshot = Some(quality),
+            SemanticOp::Context => self.context = Some(quality),
+            SemanticOp::Delta => self.delta = Some(quality),
+            SemanticOp::Affected => self.affected = Some(quality),
+            SemanticOp::Verify => self.verify = Some(quality),
+            SemanticOp::Explain => self.explain = Some(quality),
+        }
+    }
+
+    /// TRUE when no operation declared per-operation quality (a legacy
+    /// provider descriptor that only carried provider-wide fields).
+    pub fn is_empty(&self) -> bool {
+        self.snapshot.is_none()
+            && self.context.is_none()
+            && self.delta.is_none()
+            && self.affected.is_none()
+            && self.verify.is_none()
+            && self.explain.is_none()
+    }
+}
+
 /// Per-operation status (audit Tangerine-4): consumers branch on fidelity and
-/// completeness, never on a bare `available` boolean.
+/// completeness, never on a bare `available` boolean. `provenance` names the
+/// evidence source class the per-operation declaration came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticOperationStatus {
     pub available: bool,
     pub fidelity: SemanticFidelity,
     pub completeness: SemanticCompleteness,
     pub source: String,
+    #[serde(default)]
+    pub provenance: SemanticEvidenceSource,
+}
+
+impl SemanticOperationStatus {
+    /// Project one declared per-operation quality into a status.
+    pub fn from_quality(
+        available: bool,
+        quality: &SemanticOperationQuality,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            available,
+            fidelity: quality.fidelity,
+            completeness: quality.completeness,
+            source: source.into(),
+            provenance: quality.provenance,
+        }
+    }
 }
 
 /// The identity + capability truth one provider stands behind. A descriptor
@@ -877,31 +1165,31 @@ pub struct SemanticProviderDescriptor {
     /// The envelope schema version this provider actually speaks.
     pub schema_version: u32,
     pub capabilities: SemanticCapabilities,
-    /// Declared evidence fidelity (absent = NO declared trust, audit
-    /// P1-SEMANTIC: providers must claim compiler-exact explicitly to be
-    /// trusted with compiler-exact obligations).
+    /// Provider-wide evidence fidelity kept for wire compatibility. It is
+    /// only the LEGACY fallback for an operation without a per-operation
+    /// declaration; authoritative selection reads [`Self::operations`]
+    /// (absent = NO declared trust, never inherited from silence).
     #[serde(default)]
     pub fidelity: Option<SemanticFidelity>,
-    /// Declared completeness (absent = `Unknown`, never conservative-
-    /// complete by default).
+    /// Provider-wide completeness kept for wire compatibility. Only the
+    /// legacy fallback when the operation has no per-operation declaration.
     #[serde(default)]
     pub completeness: Option<SemanticCompleteness>,
-    /// Declared intelligence tier (`0..=5`,
-    /// [`crate::intelligence::IntelligenceTier`]). Optional capability
-    /// METADATA: absent = UNKNOWN, never assumed high, and the tier is never
-    /// an input to confidence (tier describes capability, not truth).
-    /// Validated by [`SemanticProviderDescriptor::validate`] at handshake,
-    /// so an out-of-range claim is refused before it can drive selection or
-    /// status.
+    /// Provider-wide intelligence tier (`0..=5`) used only when an operation
+    /// has no per-operation declaration. Absent = UNKNOWN, never assumed
+    /// high; the tier is capability metadata, never an input to confidence.
     #[serde(default)]
     pub tier: Option<u8>,
-    /// Declared orthogonal evidence dimensions (freshness, determinism,
-    /// revision binding, provenance scope/uncertainty, measured
-    /// corroboration). Additive and optional per axis: an absent axis stays
-    /// `Unknown` (conservative) and never raises confidence — a declared
-    /// tier can never substitute for an evidence claim that was not made.
+    /// Provider-wide orthogonal evidence dimensions used only when an
+    /// operation has no per-operation declaration.
     #[serde(default)]
     pub evidence: crate::intelligence::EvidenceDimensions,
+    /// Per-operation quality: fidelity, completeness, tier, evidence and
+    /// provenance FOR EACH operation. This is the authoritative declaration
+    /// the selection gate reads. A missing operation entry falls back to the
+    /// provider-wide legacy fields above.
+    #[serde(default)]
+    pub operations: SemanticOperationQualities,
 }
 
 impl SemanticProviderDescriptor {
@@ -920,6 +1208,7 @@ impl SemanticProviderDescriptor {
             completeness: None,
             tier: None,
             evidence: crate::intelligence::EvidenceDimensions::UNKNOWN,
+            operations: SemanticOperationQualities::EMPTY,
         }
     }
 
@@ -936,6 +1225,68 @@ impl SemanticProviderDescriptor {
             completeness: None,
             tier: None,
             evidence: crate::intelligence::EvidenceDimensions::UNKNOWN,
+            operations: SemanticOperationQualities::EMPTY,
+        }
+    }
+
+    /// Build a descriptor with one operation's declared quality.
+    pub fn with_operation_quality(
+        mut self,
+        op: SemanticOp,
+        quality: SemanticOperationQuality,
+    ) -> Self {
+        self.operations.set(op, quality);
+        self
+    }
+
+    /// The operation's explicit per-operation declaration, when present.
+    pub const fn operation_quality(&self, op: SemanticOp) -> Option<&SemanticOperationQuality> {
+        self.operations.get(op)
+    }
+
+    /// The effective per-operation quality: the explicit per-operation
+    /// declaration when present, otherwise the provider-wide legacy fields
+    /// (with `Unknown` provenance, because silence never names a source).
+    pub fn declared_quality(&self, op: SemanticOp) -> SemanticOperationQuality {
+        match self.operation_quality(op) {
+            Some(quality) => quality.clone(),
+            None => SemanticOperationQuality::new(
+                self.fidelity.unwrap_or(SemanticFidelity::None),
+                self.completeness.unwrap_or(SemanticCompleteness::Unknown),
+                self.tier,
+                self.evidence,
+                SemanticEvidenceSource::Unknown,
+            ),
+        }
+    }
+
+    /// Fill missing per-operation declarations from the provider-wide legacy
+    /// fields for every covered operation, tagging them with the given
+    /// evidence source. Declared per-operation qualities are never
+    /// overwritten; only `Unknown` provenance is upgraded. Used by external
+    /// adapters (for example the Tangerine process/HTTP adapter) so a legacy
+    /// wire descriptor still presents honest per-operation quality.
+    pub fn normalize_operation_quality(&mut self, provenance: SemanticEvidenceSource) {
+        for op in SemanticOp::ALL {
+            if !self.capabilities.supports(op) {
+                continue;
+            }
+            if let Some(quality) = self.operations.get_mut(op) {
+                if quality.provenance == SemanticEvidenceSource::Unknown {
+                    quality.provenance = provenance;
+                }
+                continue;
+            }
+            self.operations.set(
+                op,
+                SemanticOperationQuality::new(
+                    self.fidelity.unwrap_or(SemanticFidelity::None),
+                    self.completeness.unwrap_or(SemanticCompleteness::Unknown),
+                    self.tier,
+                    self.evidence,
+                    provenance,
+                ),
+            );
         }
     }
 
@@ -957,6 +1308,25 @@ impl SemanticProviderDescriptor {
         }
         if let Some(tier) = self.tier {
             crate::intelligence::IntelligenceTier::parse(tier)?;
+        }
+        for op in SemanticOp::ALL {
+            let Some(quality) = self.operations.get(op) else {
+                continue;
+            };
+            if let Some(tier) = quality.tier {
+                let tier = crate::intelligence::IntelligenceTier::parse(tier)?;
+                if let Some(bound) = quality.provenance.tier_raw() {
+                    if tier.raw() > bound {
+                        return Err(SemanticError::Malformed(format!(
+                            "semantic operation {} declares tier {} above its {} evidence source bound {}",
+                            op.as_str(),
+                            tier.raw(),
+                            quality.provenance.as_str(),
+                            bound
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2439,6 +2809,109 @@ mod program_snapshot_tests {
         };
         assert!(matches!(
             snapshot.validate_identity(&matching, SEMANTIC_SCHEMA_VERSION),
+            Err(SemanticError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn per_operation_quality_round_trips_and_is_validated() {
+        let id = crate::test_support::provider_id("per-op");
+        let mut descriptor = SemanticProviderDescriptor::new(
+            id.clone(),
+            3,
+            SEMANTIC_SCHEMA_VERSION,
+            SemanticCapabilities::CONTEXT.union(SemanticCapabilities::AFFECTED),
+        );
+        descriptor.operations.set(
+            SemanticOp::Context,
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Lsp,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            ),
+        );
+        descriptor.operations.set(
+            SemanticOp::Affected,
+            SemanticOperationQuality::new(
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::ConservativeComplete,
+                Some(5),
+                crate::intelligence::native_evidence_dimensions(),
+                SemanticEvidenceSource::External,
+            ),
+        );
+        descriptor.validate().unwrap();
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let decoded: SemanticProviderDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, descriptor);
+        let context = decoded.operation_quality(SemanticOp::Context).unwrap();
+        assert_eq!(context.fidelity, SemanticFidelity::Structural);
+        assert_eq!(context.completeness, SemanticCompleteness::Partial);
+        assert_eq!(context.tier, Some(2));
+        assert_eq!(context.provenance, SemanticEvidenceSource::Lsp);
+        let affected = decoded.operation_quality(SemanticOp::Affected).unwrap();
+        assert_eq!(affected.provenance, SemanticEvidenceSource::External);
+        assert_eq!(affected.tier, Some(5));
+
+        // A legacy descriptor (no per-operation entries) derives the same
+        // conservative quality for every operation, with UNKNOWN provenance.
+        let mut legacy = SemanticProviderDescriptor::new(
+            id,
+            3,
+            SEMANTIC_SCHEMA_VERSION,
+            SemanticCapabilities::CONTEXT,
+        );
+        legacy.fidelity = Some(SemanticFidelity::Structural);
+        legacy.completeness = Some(SemanticCompleteness::Partial);
+        let quality = legacy.declared_quality(SemanticOp::Context);
+        assert_eq!(quality.fidelity, SemanticFidelity::Structural);
+        assert_eq!(quality.completeness, SemanticCompleteness::Partial);
+        assert_eq!(quality.provenance, SemanticEvidenceSource::Unknown);
+        // An undeclared legacy descriptor is untrusted, never strongest.
+        let undeclared = SemanticProviderDescriptor::new(
+            SemanticProviderId::parse("undeclared").unwrap(),
+            1,
+            SEMANTIC_SCHEMA_VERSION,
+            SemanticCapabilities::CONTEXT,
+        );
+        assert_eq!(
+            undeclared.declared_quality(SemanticOp::Context).fidelity,
+            SemanticFidelity::None
+        );
+        assert_eq!(
+            undeclared
+                .declared_quality(SemanticOp::Context)
+                .completeness,
+            SemanticCompleteness::Unknown
+        );
+
+        // A partial per-operation object never inherits trust: absent
+        // axes deserialize to `none`/`unknown`, not the strongest value.
+        let partial: SemanticOperationQuality = serde_json::from_str(r#"{"tier":2}"#).unwrap();
+        assert_eq!(partial.fidelity, SemanticFidelity::None);
+        assert_eq!(partial.completeness, SemanticCompleteness::Unknown);
+        assert_eq!(partial.provenance, SemanticEvidenceSource::Unknown);
+
+        // Out-of-range per-operation tiers and tiers above the declared
+        // evidence source are refused at validation/handshake.
+        let mut too_high = descriptor.clone();
+        too_high
+            .operations
+            .get_mut(SemanticOp::Context)
+            .unwrap()
+            .tier = Some(6);
+        assert!(matches!(
+            too_high.validate(),
+            Err(SemanticError::InvalidIntelligenceTier { tier: 6 })
+        ));
+        let mut above_source = descriptor;
+        above_source
+            .operations
+            .get_mut(SemanticOp::Context)
+            .unwrap()
+            .tier = Some(3);
+        assert!(matches!(
+            above_source.validate(),
             Err(SemanticError::Malformed(_))
         ));
     }

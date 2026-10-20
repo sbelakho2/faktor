@@ -4,7 +4,9 @@
 
 use super::*;
 
-const PREDECESSOR: i64 = SCHEMA_HEAD - 1;
+// v43's predecessor is v42. `SCHEMA_HEAD - 1` is no longer that step
+// once a later migration (v44 listing revisions) moved the head.
+const PREDECESSOR: i64 = 42;
 
 fn raw_record(conn: &Connection, task_id: i64, workspace_id: i64) {
     conn.execute(

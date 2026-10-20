@@ -64,9 +64,9 @@ use faktor_provider::{
 };
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_semantic::{
-    AffectedRequest, RiskLevel, RiskPolicy, SemanticCall, SemanticCapabilities, SemanticEntityId,
-    SemanticEntityRef, SemanticOp, SemanticRisk, SemanticSelection, SemanticSnapshotId,
-    WorkspacePath, GENERIC_FALLBACK_ID, MAX_ENTITY_ID_BYTES, SEMANTIC_SCHEMA_VERSION,
+    AffectedRequest, RiskLevel, RiskPolicy, SemanticCall, SemanticEntityId, SemanticEntityRef,
+    SemanticOp, SemanticRisk, SemanticSnapshotId, WorkspacePath, GENERIC_FALLBACK_ID,
+    MAX_ENTITY_ID_BYTES, SEMANTIC_SCHEMA_VERSION,
 };
 use faktor_session::ops::PermissionRequest as SessionPermission;
 use faktor_session::task::{

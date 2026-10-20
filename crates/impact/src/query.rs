@@ -176,7 +176,8 @@ pub struct ImpactGraph {
     node_index: HashMap<String, usize>,
     out_edges: HashMap<String, Vec<usize>>,
     in_edges: HashMap<String, Vec<usize>>,
-    crate_by_dir: HashMap<String, String>,
+    /// Workspace-relative unit dir -> (unit name, graph node id).
+    crate_by_dir: HashMap<String, (String, String)>,
     tests_by_crate: HashMap<String, Vec<String>>,
     defs_by_name: HashMap<String, Vec<String>>,
 }
@@ -187,13 +188,16 @@ impl ImpactGraph {
         let mut node_index = HashMap::with_capacity(graph.nodes.len());
         let mut out_edges: HashMap<String, Vec<usize>> = HashMap::new();
         let mut in_edges: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut crate_by_dir: HashMap<String, String> = HashMap::new();
+        let mut crate_by_dir: HashMap<String, (String, String)> = HashMap::new();
         let mut tests_by_crate: HashMap<String, Vec<String>> = HashMap::new();
         let mut defs_by_name: HashMap<String, Vec<String>> = HashMap::new();
         for (index, node) in graph.nodes.iter().enumerate() {
             node_index.insert(node.id.clone(), index);
             match node.kind {
-                NodeKind::Crate => {
+                // Cargo crates and local non-Cargo packages are both units:
+                // the graph keeps their node namespace (crate:/package:) but
+                // path ownership is identical.
+                NodeKind::Crate | NodeKind::Package => {
                     if let Some(dir) = &node.path {
                         // Normalize the one trailing slash the historical
                         // matcher accepted; the longest matching ancestor
@@ -201,7 +205,7 @@ impl ImpactGraph {
                         let dir = dir.trim_end_matches('/');
                         crate_by_dir
                             .entry(dir.to_string())
-                            .or_insert_with(|| node.name.clone());
+                            .or_insert_with(|| (node.name.clone(), node.id.clone()));
                     }
                 }
                 NodeKind::Test => {
@@ -255,6 +259,10 @@ impl ImpactGraph {
     }
 
     pub fn crate_for_path(&self, path: &str) -> Option<&str> {
+        self.unit_for_path(path).map(|(name, _)| name)
+    }
+
+    fn unit_for_path(&self, path: &str) -> Option<(&str, &str)> {
         let path = path.trim_start_matches("./");
         // Longest-prefix lookup in O(path depth): the exact path (a crate
         // dir may equal it) then every slash-delimited ancestor, deepest
@@ -262,15 +270,17 @@ impl ImpactGraph {
         // per crate per changed path (O(files x crates) allocations on a
         // whole-workspace seed); the map keeps the SAME winner without
         // allocating.
-        if let Some(name) = self.crate_by_dir.get(path) {
-            return Some(name.as_str());
+        if let Some((name, id)) = self.crate_by_dir.get(path) {
+            return Some((name.as_str(), id.as_str()));
         }
         for (index, _) in path.match_indices('/').rev() {
-            if let Some(name) = self.crate_by_dir.get(&path[..index]) {
-                return Some(name.as_str());
+            if let Some((name, id)) = self.crate_by_dir.get(&path[..index]) {
+                return Some((name.as_str(), id.as_str()));
             }
         }
-        self.crate_by_dir.get(".").map(String::as_str)
+        self.crate_by_dir
+            .get(".")
+            .map(|(name, id)| (name.as_str(), id.as_str()))
     }
 
     pub fn node(&self, id: &str) -> Option<&GraphNode> {
@@ -407,8 +417,8 @@ impl ImpactGraph {
                         }
                     }
                 }
-                if let Some(crate_name) = self.crate_for_path(&path) {
-                    let id = crate::model::crate_id(crate_name);
+                if let Some((_, unit_id)) = self.unit_for_path(&path) {
+                    let id = unit_id.to_string();
                     if self.node(&id).is_some() {
                         seed(
                             id,
@@ -430,8 +440,8 @@ impl ImpactGraph {
                 // result degraded so no caller mistakes the miss for "nothing
                 // is impacted".
                 degraded = true;
-                if let Some(crate_name) = self.crate_for_path(&path) {
-                    let id = crate::model::crate_id(crate_name);
+                if let Some((_, unit_id)) = self.unit_for_path(&path) {
+                    let id = unit_id.to_string();
                     if self.node(&id).is_some() {
                         seed(
                             id,
@@ -465,7 +475,8 @@ impl ImpactGraph {
                 continue;
             };
             max_frontier = max_frontier.max(queue.len());
-            let crate_expansion = node.kind == NodeKind::Crate && options.crate_tests;
+            let crate_expansion =
+                matches!(node.kind, NodeKind::Crate | NodeKind::Package) && options.crate_tests;
             if crate_expansion {
                 if let Some(tests) = self.tests_by_crate.get(&node.name) {
                     for test in tests {
@@ -490,7 +501,7 @@ impl ImpactGraph {
                     let edge = &self.graph.reverse_edges[*index];
                     // Reverse edge: edge.from == impacted node, edge.to ==
                     // the dependent/caller/importer to mark.
-                    if node.kind == NodeKind::Crate
+                    if matches!(node.kind, NodeKind::Crate | NodeKind::Package)
                         && !matches!(edge.kind, EdgeKind::DependsOn | EdgeKind::Tests)
                     {
                         // Crate impact propagates to dependent crates and

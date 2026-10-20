@@ -36,15 +36,18 @@ Faktor {
 }
 ```
 
-- **Native Intelligence** is always available: Faktor's own repository
-  evidence (filesystem, index, symbol, lexical search) at the intelligence
-  tier it can honestly declare — never a tier it cannot deliver.
+- **Native Intelligence** is always available and is **not limited to
+  Tier 0**: Faktor's own filesystem/lexical search, tree-sitter syntax,
+  LSP/compiler, revision-bound local graph and runtime/history evidence each
+  contribute at the tier they can honestly declare (0–4). No native source
+  may claim a tier its machinery cannot deliver.
 - **Native Verification** is always available: Faktor's own criterion
   proofs, checks, execution evidence and review.
 - **Tangerine** is an optional richer implementation of
   `SystemIntelligenceProvider`; **Kiwi** is an optional deeper implementation
   of `VerificationProvider`. Configuring neither leaves a complete, honest
-  product; configuring either enriches the same neutral surfaces.
+  product; configuring either enriches the same neutral surfaces. Neither is
+  ever required.
 
 ## Core responsibility
 
@@ -195,18 +198,59 @@ task.
 Declared intelligence tiers are bounded `0..=5`:
 
 ```text
-0  filesystem + text search (native baseline)
-1  syntax parsing
+0  filesystem + lexical search (native baseline)
+1  syntax parsing (tree-sitter)
 2  LSP / compiler semantics
-3  static dependency / call graph
-4  runtime + historical evidence
-5  enriched external model (for example a configured Tangerine)
+3  dependency / call graph (revision-bound native impact graph)
+4  runtime + historical evidence (execution, coverage, past checks)
+5  enriched external model (for example a configured Tangerine; optional)
 ```
 
 Tier alone never creates confidence: a provider that does not declare a
 fidelity is treated as unknown, and tier claims outside `0..=5` are refused.
-Faktor must not maintain a separate competing system model; provider output
-always enters as validated data through the neutral interface.
+A declared tier is additionally bounded by the evidence source that supports
+it: a filesystem/lexical source cannot claim above Tier 0, tree-sitter above
+Tier 1, LSP above Tier 2, the native graph above Tier 3, runtime/history
+above Tier 4, or an external provider above Tier 5.
+
+### Per-operation quality
+
+Quality is declared **per operation** (`snapshot`, `context`, `delta`,
+`affected`, `verify`, `explain`), never as one provider-wide scalar. For
+each operation a provider descriptor declares:
+
+- fidelity (how close the evidence is to compiler semantics);
+- completeness (how much of the truth the answer covers);
+- the orthogonal evidence dimensions (freshness, determinism, revision
+  binding, provenance scope/uncertainty, measured corroboration);
+- the intelligence tier; and
+- provenance (the evidence-source class: filesystem/lexical, tree-sitter,
+  LSP, graph, runtime/history, or external).
+
+An absent declaration is untrusted (`none`/`unknown`), never inherited from
+silence. The native fallback derives its per-operation quality from the
+sources actually wired: LSP-backed operations report higher fidelity/tier
+than lexical-only ones, the revision-bound impact graph reports Tier 3, and
+runtime/history evidence reports Tier 4.
+
+Authoritative consumers (merge/review preflight, planning context,
+affected-set risk, verification metadata) declare the minimum quality they
+require and pass it to **one selection gate**. The gate accepts or refuses
+with a typed result; a low-fidelity answer can never satisfy a high-fidelity
+requirement, and no consumer may hand-roll a separate fidelity check.
+Non-authoritative consults may use the same gate with a declared-trust or
+advisory floor.
+
+The revision-bound local graph is a legitimate native evidence source under
+this model. It is **not a competing authoritative system model**: it is one
+revision-bound source of semantic evidence consumed through the same neutral
+`SystemIntelligenceProvider` interface, its findings enter as validated
+DATA with provenance, and external providers may enrich or supersede it by
+declaring higher per-operation quality. Faktor does not maintain a second
+source of truth beside the program's own compiler/runtime evidence.
+
+Provider output always enters as validated data through the neutral
+interface.
 
 ### Bounded findings protocol
 
@@ -320,7 +364,9 @@ Simple code editing remains supported but does not define the product.
 
 Faktor must not:
 
-- own a competing repository knowledge graph
+- own a competing authoritative system model; the native graph is a
+  revision-bound evidence source under the neutral interface, not a second
+  source of truth
 - certify its own unverified claims
 - own CI infrastructure
 - hide uncertainty
@@ -352,11 +398,15 @@ certificates at the exact commit.
 
 - **System intelligence.** Shipped as the bounded provider abstraction in
   `crates/semantic`: the `SemanticProvider` contract and
-  `SemanticProviderRegistry` select providers by declared capabilities only,
-  and the native `GenericSemanticFallback` (Tier 0: filesystem + text
-  search) is always available. External providers are strictly config-gated
-  and execute through the daemon's own process supervisor / checked egress;
-  absence degrades honestly, and a call that demands provider proof
+  `SemanticProviderRegistry` select providers by validated capabilities and
+  per-operation declared quality, and the native `GenericSemanticFallback`
+  is always available. Its per-operation quality is derived from the wired
+  native sources (filesystem/lexical 0, tree-sitter 1, LSP 2, revision-bound
+  impact graph 3, runtime/verification 4); it is not a Tier-0-only claim.
+  External providers are strictly config-gated and execute through the
+  daemon's own process supervisor / checked egress; a legacy wire descriptor
+  is normalized to per-operation quality with `external` provenance.
+  Absence degrades honestly, and a call that demands provider proof
   (`require_provider`) is refused typed rather than served by the fallback.
   Tangerine is the intended rich implementation of this surface; none of the
   registry, contract, planner or completion code paths names it.

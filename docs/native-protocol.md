@@ -186,8 +186,15 @@ generated into both IDE clients (`ProtocolAttachmentId`,
 The create-session contract validates BOTH the provider and the model against the daemon's registered, priced catalog: an id the router cannot serve is a typed `not_found` refusal BEFORE any workspace/session row exists. A served session model may still be replaced by Economy routing (a priced equivalence among served candidates); the substitution is durable and loud, never silent.
   `{provider, model, workspace?, title?}` (strict DTO; `workspace`
   defaults to the daemon's own directory) → `{id, title, created_ms}`.
-- `GET /native/sessions` — the durable session listing (newest first,
-  capped at 1000): `{sessions: [{id, title, provider, model, state}]}`.
+- `GET /native/sessions` — the durable session listing (newest durable
+  `listing_revision` first, capped at 1000):
+  `{sessions: [{id, title, provider, model, state, created_ms, updated_ms,
+  listing_revision}], hasMore, nextBefore: {beforeRevision, beforeId,
+  beforeMs} | null, snapshotRevision, snapshotMs}`. Pages are bound to
+  `snapshotRevision` (returned by page 1 and passed back with
+  `beforeRevision` + `beforeId`); `snapshotMs`/`beforeMs`/`updated_ms` are
+  wall-clock presentation metadata only, so a same-millisecond update can
+  never move a conversation across a page cursor.
 - `POST /native/session/{id}/prompt` — run ONE ordinary prompt through the
   daemon's single executor entry: `{session_id, submission_id, prompt,
   files?}` (the body id must match the path) → `{op_id, run_id, accepted,

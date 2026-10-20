@@ -1439,6 +1439,26 @@ impl SemanticProvider for FakeSemanticProvider {
         self.capabilities
     }
 
+    fn descriptor(&self) -> faktor_semantic::SemanticProviderDescriptor {
+        let mut descriptor = faktor_semantic::SemanticProviderDescriptor::new(
+            self.id(),
+            self.version(),
+            faktor_semantic::SEMANTIC_SCHEMA_VERSION,
+            self.capabilities(),
+        );
+        descriptor.fidelity = Some(faktor_semantic::SemanticFidelity::Structural);
+        descriptor.completeness = Some(faktor_semantic::SemanticCompleteness::Partial);
+        descriptor.operations.set(
+            faktor_semantic::SemanticOp::Affected,
+            faktor_semantic::SemanticOperationQuality::native(
+                faktor_semantic::SemanticEvidenceSource::Graph,
+                faktor_semantic::SemanticFidelity::Structural,
+                faktor_semantic::SemanticCompleteness::Partial,
+            ),
+        );
+        descriptor
+    }
+
     fn affected(
         &self,
         request: faktor_semantic::AffectedRequest,

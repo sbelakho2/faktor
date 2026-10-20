@@ -11,19 +11,20 @@ faktor-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
+faktor-terminal.workspace = true
 faktor-git = { workspace = true, optional = true }
-faktor-terminal = { workspace = true, optional = true }
 faktor-cas = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [features]
 default = []
-git = ["dep:faktor-git", "dep:faktor-terminal", "dep:faktor-cas", "dep:tokio"]
-lsp = ["dep:faktor-terminal", "dep:faktor-cas", "dep:tokio"]
+git = ["dep:faktor-git", "dep:faktor-cas", "dep:tokio"]
+lsp = ["dep:faktor-cas", "dep:tokio"]
 runtime = ["git", "lsp"]
 
 [dev-dependencies]
 tempfile = "3"
+faktor-cas.workspace = true
 
 [lints]
 workspace = true

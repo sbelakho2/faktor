@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::id::{SessionId, WorkspaceId};
 use faktor_semantic::{
-    SemanticCall, SemanticCapabilities, SemanticDelta, SemanticDeltaKind, SemanticDeltaRequest,
-    SemanticOp, SemanticSelection, SemanticSnapshotId, SemanticSnapshotRequest,
-    GENERIC_FALLBACK_ID, SEMANTIC_SCHEMA_VERSION,
+    SemanticCall, SemanticDelta, SemanticDeltaKind, SemanticDeltaRequest, SemanticOp,
+    SemanticQualityRequirement, SemanticQualitySelection, SemanticSnapshotId,
+    SemanticSnapshotRequest, GENERIC_FALLBACK_ID, SEMANTIC_SCHEMA_VERSION,
 };
 
 use crate::runtime::{ExecError, OrchestratorRuntime};
@@ -112,50 +112,41 @@ impl OrchestratorRuntime {
         // provider is never silently skipped because an unrelated earlier
         // operation happened not to fetch its descriptor.
         let cancel = CancellationToken::new();
-        let selection = registry
-            .select_validated(&SemanticCapabilities::DELTA, SemanticOp::Delta, &cancel)
-            .await;
+        // ONE authoritative selection gate: the required quality for a
+        // merge-time delta (compiler-exact, conservative-complete, capable
+        // of composing the delta) is declared HERE and enforced by the
+        // registry. No consumer-local fidelity/completeness check exists.
+        let requirement = if required {
+            SemanticQualityRequirement::authoritative(SemanticOp::Delta).with_compose_delta(true)
+        } else {
+            SemanticQualityRequirement::advisory(SemanticOp::Delta).with_compose_delta(true)
+        };
+        let selection = registry.select_quality(requirement, &cancel).await;
         let provider = match selection {
-            SemanticSelection::Provider(provider) if provider.capabilities().compose_delta => {
-                // Fidelity requirement (audit Tangerine-3/4): a REQUIRED
-                // merge verification only trusts compiler-exact (or proof)
-                // evidence; a declared structural/heuristic provider blocks
-                // instead of pretending.
-                if required
-                    && provider.fidelity() < faktor_semantic::SemanticFidelity::CompilerExact
-                {
+            Ok(SemanticQualitySelection::Provider { provider, .. }) => provider,
+            Ok(SemanticQualitySelection::Fallback { .. }) => {
+                if required {
                     return Err(ExecError::SemanticRequired(format!(
-                        "run {run} requires compiler-exact semantic verification but provider {} declares fidelity {:?}",
-                        provider.id(),
-                        provider.fidelity()
+                        "run {run} requires a compiler-exact semantic delta for change set {} but only the generic fallback can answer (the handshake was awaited)",
+                        cs.id()
                     )));
                 }
-                // Completeness is part of the trust claim (audit
-                // P1-SEMANTIC): a provider that cannot state its coverage as
-                // at least conservative-complete must not satisfy a REQUIRED
-                // merge preflight.
-                if required
-                    && provider.completeness()
-                        < faktor_semantic::SemanticCompleteness::ConservativeComplete
-                {
-                    return Err(ExecError::SemanticRequired(format!(
-                        "run {run} requires conservative-complete semantic verification but provider {} declares completeness {:?}",
-                        provider.id(),
-                        provider.completeness()
-                    )));
-                }
-                provider
-            }
-            _ if required => {
-                return Err(ExecError::SemanticRequired(format!(
-                    "run {run} requires a compiler-exact semantic delta for change set {} but no delta-capable provider is registered (the handshake was awaited)",
-                    cs.id()
-                )));
-            }
-            _ => {
                 tracing::info!(
                     run = %run,
-                    "semantic merge preflight is ADVISORY: no delta-capable provider is registered; the fs/CAS merge stands"
+                    "semantic merge preflight is ADVISORY: only the generic fallback can answer; the fs/CAS merge stands"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                if required {
+                    return Err(ExecError::SemanticRequired(format!(
+                        "run {run} requires a compiler-exact conservative-complete semantic delta for change set {}: {err}",
+                        cs.id()
+                    )));
+                }
+                tracing::info!(
+                    run = %run,
+                    "semantic merge preflight is ADVISORY: {err}; the fs/CAS merge stands"
                 );
                 return Ok(());
             }

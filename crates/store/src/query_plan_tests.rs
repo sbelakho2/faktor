@@ -40,8 +40,8 @@ fn seed(store: &Store) {
         let mut st = conn
             .prepare(
                 "INSERT INTO session(id, workspace_id, title, provider, model, state, lifecycle,
-                    created_ms, updated_ms, worktree_id, task_id)
-                 VALUES (?1, 1, 't', 'p', 'm', '\"idle\"', 'open', ?1, ?1, 1, 1)",
+                    created_ms, updated_ms, worktree_id, task_id, listing_revision)
+                 VALUES (?1, 1, 't', 'p', 'm', '\"idle\"', 'open', ?1, ?1, 1, 1, ?1)",
             )
             .unwrap();
         for i in 1..=SESSIONS {
@@ -316,10 +316,10 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
         (
             "workspace session listing",
             "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state,
-                    lifecycle, created_ms, updated_ms
-             FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
+                    lifecycle, created_ms, updated_ms, listing_revision
+             FROM session WHERE workspace_id = ?1 ORDER BY listing_revision DESC, id DESC",
             &[1],
-            &["SEARCH session USING INDEX idx_session_workspace_updated_id (workspace_id=?)"],
+            &["SEARCH session USING INDEX idx_session_workspace_listing_revision_id (workspace_id=?)"],
         ),
         (
             "transcript search chunk",
@@ -401,12 +401,28 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
         (
             "workspace history page",
             "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state,
-                    lifecycle, created_ms, updated_ms
-             FROM session WHERE workspace_id = ?1 AND updated_ms <= ?2
-               AND (updated_ms < ?3 OR (updated_ms = ?3 AND id < ?4))
-             ORDER BY updated_ms DESC, id DESC LIMIT ?5",
+                    lifecycle, created_ms, updated_ms, listing_revision
+             FROM session WHERE workspace_id = ?1 AND listing_revision <= ?2
+               AND (listing_revision < ?3 OR (listing_revision = ?3 AND id < ?4))
+             ORDER BY listing_revision DESC, id DESC LIMIT ?5",
             &[1, 100, 50, 7, 21],
-            &["SEARCH session USING INDEX idx_session_workspace_updated_id (workspace_id=? AND updated_ms<?)"],
+            &["SEARCH session USING INDEX idx_session_workspace_listing_revision_id (workspace_id=? AND listing_revision<?)"],
+        ),
+        (
+            "global history page",
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state,
+                    lifecycle, created_ms, updated_ms, listing_revision
+             FROM session WHERE listing_revision <= ?1
+               AND (listing_revision < ?2 OR (listing_revision = ?2 AND id < ?3))
+             ORDER BY listing_revision DESC, id DESC LIMIT ?4",
+            &[100, 50, 7, 21],
+            &["SEARCH session USING INDEX idx_session_listing_revision_id (listing_revision<?)"],
+        ),
+        (
+            "session listing snapshot revision",
+            "SELECT COALESCE(MAX(listing_revision), 0) FROM session",
+            &[],
+            &["SEARCH session USING COVERING INDEX idx_session_listing_revision_id"],
         ),
         (
             "terminal ledger type page",
@@ -596,8 +612,8 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
         &conn,
         "session_list_workspace",
         "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state,
-                lifecycle, created_ms, updated_ms
-         FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
+                lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE workspace_id = ?1 ORDER BY listing_revision DESC, id DESC",
         &[1],
     );
     bench_sql(
@@ -725,8 +741,8 @@ fn read_path_before_after() {
          WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
          ORDER BY id ASC";
     let sessions = "SELECT id, workspace_id, worktree_id, task_id, title, provider, model,
-            state, lifecycle, created_ms, updated_ms
-         FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC";
+            state, lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE workspace_id = ?1 ORDER BY listing_revision DESC, id DESC";
     let ledger = "SELECT ledger FROM task_ledger WHERE session_id = ?1
          ORDER BY updated_ms DESC LIMIT 1";
     let evidence_new = "SELECT id, session_id, workspace_id, task_id, kind, revision,

@@ -2280,12 +2280,16 @@ mod scans {
         // take the daemon's ONE supervisor by injection; each `try_shared`
         // site below is a documented standalone entry point (a fallible
         // constructor that returns a typed error, never a panic), and the
-        // doctor site is the read-only diagnostic probe. The normal graph
-        // (`build_daemon*`) contains none.
+        // doctor site is the read-only diagnostic probe. The impact graph
+        // builder's `discover()`/`GraphBuilder::new()` library entry has no
+        // daemon to inject and uses the same fallible standalone supervisor;
+        // the CLI/daemon paths always pass their own supervisor instead.
+        // The normal graph (`build_daemon*`) contains none.
         (
             "ProcessSupervisor::try_shared",
             &[
                 ("crates/hooks/src/lib.rs", 1),
+                ("crates/impact/src/manifest.rs", 1),
                 ("crates/index/src/service/mod.rs", 1),
                 ("crates/verify/src/exec.rs", 1),
                 ("crates/verify/src/inventory.rs", 1),

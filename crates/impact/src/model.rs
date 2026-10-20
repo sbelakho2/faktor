@@ -35,6 +35,24 @@ impl Revision {
     pub fn is_bound(&self) -> bool {
         self.commit.as_deref().is_some_and(|c| !c.is_empty())
     }
+
+    /// No commit, tree or dirty flag: the caller did not observe a repository
+    /// revision. The impact authority replaces this with a material revision
+    /// derived from the scanned file digests.
+    pub fn is_unspecified(&self) -> bool {
+        self.commit.is_none() && self.tree.is_none() && !self.dirty
+    }
+
+    /// Identity of an uncommitted material state: the digest of every scanned
+    /// file plus a generation that advances only when content changes. This
+    /// is a real dirty-worktree revision, not `Revision::default()`.
+    pub fn material(digest: &str, generation: u64) -> Self {
+        Self {
+            commit: None,
+            tree: Some(format!("{digest}#generation:{generation}")),
+            dirty: true,
+        }
+    }
 }
 
 impl Revision {
@@ -119,6 +137,9 @@ pub enum Language {
     Rust,
     JavaScript,
     TypeScript,
+    Python,
+    Java,
+    Kotlin,
 }
 
 impl Language {
@@ -128,6 +149,9 @@ impl Language {
             "rs" => Some(Self::Rust),
             "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
             "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "py" | "pyi" => Some(Self::Python),
+            "java" => Some(Self::Java),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -240,7 +264,7 @@ pub struct GraphEdge {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct GraphStats {
     pub files: usize,
     pub nodes: usize,
@@ -288,6 +312,10 @@ pub enum GraphError {
     DanglingEdge(String),
     ReverseMismatch(String),
     Unsorted(String),
+    DigestMismatch {
+        expected: String,
+        actual: String,
+    },
     CorruptJson(String),
 }
 
@@ -304,6 +332,9 @@ impl std::fmt::Display for GraphError {
             Self::DanglingEdge(id) => write!(f, "impact edge references unknown node: {id}"),
             Self::ReverseMismatch(id) => write!(f, "impact reverse edge mismatch: {id}"),
             Self::Unsorted(id) => write!(f, "impact graph is not deterministically ordered: {id}"),
+            Self::DigestMismatch { expected, actual } => {
+                write!(f, "impact graph digest mismatch: document says {expected} but canonical bytes hash to {actual}")
+            }
             Self::CorruptJson(detail) => write!(f, "impact graph is unreadable: {detail}"),
         }
     }
@@ -489,10 +520,10 @@ impl Graph {
         graph.validate()?;
         let expected = graph.compute_digest()?;
         if graph.digest != expected {
-            return Err(GraphError::CorruptJson(format!(
-                "digest mismatch: document says {} but canonical bytes hash to {expected}",
-                graph.digest
-            )));
+            return Err(GraphError::DigestMismatch {
+                expected: graph.digest,
+                actual: expected,
+            });
         }
         Ok(graph)
     }

@@ -36,11 +36,10 @@ use faktor_core::contract_compile::{
     MAX_FINDING_TEXT_BYTES,
 };
 
-use crate::intelligence::{confidence_bps_for, ConfidenceDimensions};
+use crate::quality::{effective_quality, SemanticQualityRequirement};
 use crate::registry::SemanticProviderRegistry;
 use crate::types::{
-    SemanticCall, SemanticCapabilities, SemanticCompleteness, SemanticContextItem,
-    SemanticContextRequest, SemanticError, SemanticFidelity, SemanticProviderDescriptor,
+    SemanticCall, SemanticContextItem, SemanticContextRequest, SemanticError, SemanticOp,
     SemanticSnapshotId, SEMANTIC_SCHEMA_VERSION,
 };
 
@@ -149,15 +148,19 @@ impl SystemIntelligenceProvider for SemanticIntelligenceAdapter {
                 let Some(descriptor) = provider.validated_descriptor() else {
                     continue;
                 };
-                if !descriptor.covers_validated(SemanticCapabilities::CONTEXT) {
+                // The ONE quality gate: a single declared-trust requirement
+                // (no particular coverage floor) for the context operation.
+                // An undeclared fidelity is `None` and cannot pass.
+                let requirement = SemanticQualityRequirement::declared(SemanticOp::Context);
+                if !descriptor.covers_validated(requirement.capabilities) {
                     continue;
                 }
-                let ceiling = declared_confidence_ceiling(&descriptor);
-                if ceiling == 0 {
-                    // An undeclared fidelity pins confidence to zero: there
-                    // is no trustworthy answer to hand the compiler.
+                let quality =
+                    effective_quality(provider.as_ref(), &descriptor, SemanticOp::Context);
+                if !requirement.accepts(&quality) {
                     continue;
                 }
+                let ceiling = quality.confidence_bps();
                 let provider_id = provider.id();
                 let snapshot_id = SemanticSnapshotId::derive(
                     request.workspace,
@@ -214,19 +217,6 @@ impl SystemIntelligenceProvider for SemanticIntelligenceAdapter {
             Ok(response)
         })
     }
-}
-
-/// The confidence ceiling one provider's declared dimensions support. An
-/// absent fidelity/completeness declaration stays conservative (zero), so a
-/// finding can never claim more trust than the provider declared.
-fn declared_confidence_ceiling(descriptor: &SemanticProviderDescriptor) -> u16 {
-    confidence_bps_for(&ConfidenceDimensions::new(
-        descriptor.fidelity.unwrap_or(SemanticFidelity::None),
-        descriptor
-            .completeness
-            .unwrap_or(SemanticCompleteness::Unknown),
-        descriptor.evidence,
-    ))
 }
 
 /// Convert one retrieved context item into a bounded finding, or a typed
@@ -300,9 +290,10 @@ fn diagnostic_code_for(error: &SemanticError) -> FindingDiagnosticCode {
         SemanticError::DeadlineExceeded { .. } | SemanticError::ProviderTimeout { .. } => {
             FindingDiagnosticCode::ProviderTimedOut
         }
-        SemanticError::ProviderCrashed { .. } | SemanticError::ProviderFailed { .. } => {
-            FindingDiagnosticCode::ProviderRefused
-        }
+        SemanticError::ProviderCrashed { .. }
+        | SemanticError::ProviderFailed { .. }
+        | SemanticError::QualityBelowRequirement { .. }
+        | SemanticError::QualityUnavailable { .. } => FindingDiagnosticCode::ProviderRefused,
         SemanticError::Malformed(_)
         | SemanticError::WorkspaceMismatch { .. }
         | SemanticError::UnsupportedSchema { .. }
@@ -350,8 +341,9 @@ mod tests {
     use crate::fallback::GenericSemanticFallback;
     use crate::test_support::{block_on, provider_id};
     use crate::types::{
-        BoxFuture, SemanticContextPack, SemanticEntityId, SemanticEntityRef, SemanticEnvelope,
-        SemanticProvider, SemanticProviderDescriptor, SemanticProviderId, WorkspacePath,
+        BoxFuture, SemanticCapabilities, SemanticCompleteness, SemanticContextPack,
+        SemanticEntityId, SemanticEntityRef, SemanticEnvelope, SemanticFidelity, SemanticProvider,
+        SemanticProviderDescriptor, SemanticProviderId, WorkspacePath,
     };
 
     use faktor_core::contract::EngineeringContract;

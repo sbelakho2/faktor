@@ -1,9 +1,9 @@
 {
   "id": "INV-MERGE-SEMANTIC-FIDELITY-REQUIRED",
   "file": "crates/orchestrator/src/merge_semantic.rs",
-  "find": "                if required\n                    && provider.fidelity() < faktor_semantic::SemanticFidelity::CompilerExact\n                {",
-  "replace": "                if false\n                    && provider.fidelity() < faktor_semantic::SemanticFidelity::CompilerExact\n                {",
+  "find": "            SemanticQualityRequirement::authoritative(SemanticOp::Delta).with_compose_delta(true)",
+  "replace": "            SemanticQualityRequirement::advisory(SemanticOp::Delta).with_compose_delta(true)",
   "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_rejects_sub_compiler_fidelity",
   "expect": "FAILED",
-  "note": "Dropping the fidelity requirement lets a structural provider satisfy a compiler-exact merge obligation."
+  "note": "Dropping the authoritative quality requirement lets a structural provider satisfy a compiler-exact merge obligation."
 }

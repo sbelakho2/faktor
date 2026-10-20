@@ -3,6 +3,7 @@ mod fixtures;
 mod flake;
 mod github;
 mod iana;
+mod impact;
 mod json_cmd;
 mod lane_marker;
 mod license;
@@ -35,6 +36,8 @@ fn usage() {
            fixture pipeline-json|detail-json|details-json|state|logs-json|repo-json|status-json ...\n\
            sbom METADATA_JSON NOW_MS\n\
            license-policy ROOT METADATA_JSON\n\
+           impact validate <graph.json> [--head SHA --root DIR] [--json]\n\
+           impact seal <graph.json> [--out FILE] | --stdin\n\
            make-zip OUT FILE..."
     );
 }
@@ -91,6 +94,7 @@ fn main() {
         },
         "sbom" => sbom::run(rest),
         "license-policy" => license::run(rest),
+        "impact" => impact::run(rest),
         "make-zip" => zip::run(rest),
         other => {
             eprintln!("faktor-ci-tools: unknown command '{other}'");

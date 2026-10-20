@@ -27,12 +27,13 @@ use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, SemanticCall, SemanticCapabilities, SemanticCheck,
     SemanticCompleteness, SemanticContextItem, SemanticContextPack, SemanticContextRequest,
     SemanticDelta, SemanticDeltaChange, SemanticDeltaRequest, SemanticEntityId, SemanticEntityRef,
-    SemanticEnvelope, SemanticError, SemanticExpectation, SemanticExplainRequest,
-    SemanticExplanation, SemanticFidelity, SemanticFindingProvenance, SemanticPayload,
-    SemanticProvider, SemanticProviderDescriptor, SemanticProviderId, SemanticResponseCaps,
-    SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest, SemanticSubsystem,
-    SemanticUnavailable, SemanticVerification, SemanticVerifyRequest, WorkspacePath,
-    SEMANTIC_SCHEMA_VERSION,
+    SemanticEnvelope, SemanticError, SemanticEvidenceSource, SemanticExpectation,
+    SemanticExplainRequest, SemanticExplanation, SemanticFidelity, SemanticFindingProvenance,
+    SemanticOp, SemanticOperationQualities, SemanticOperationQuality, SemanticOperationStatus,
+    SemanticPayload, SemanticProvider, SemanticProviderDescriptor, SemanticProviderId,
+    SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest,
+    SemanticSubsystem, SemanticUnavailable, SemanticVerification, SemanticVerifyRequest,
+    WorkspacePath, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// The fallback's provider id. Not a language and not a vendor.
@@ -566,33 +567,158 @@ fn revision_tree_hash(workspace: WorkspaceId, revision: &str) -> FileHash {
 }
 
 impl GenericSemanticFallback {
-    pub fn operation_status(
-        &self,
-        op: crate::types::SemanticOp,
-    ) -> crate::types::SemanticOperationStatus {
-        crate::types::SemanticOperationStatus {
-            available: self.capabilities().supports(op),
-            fidelity: self.fidelity(),
-            completeness: match op {
-                crate::types::SemanticOp::Context | crate::types::SemanticOp::Explain => {
-                    SemanticCompleteness::Partial
-                }
-                _ => SemanticCompleteness::Unknown,
-            },
-            source: self.source_id(),
-        }
+    /// The honest per-operation quality of THIS composition, derived from
+    /// the native seams that are actually wired. A composed fallback with an
+    /// LSP, graph or verification seam declares a higher tier for the
+    /// operations that seam serves; an absent seam never inherits a stronger
+    /// claim. Lookup is O(1).
+    pub fn operation_qualities(&self) -> SemanticOperationQualities {
+        let mut qualities = SemanticOperationQualities::default();
+
+        // Context: LSP workspace symbols lift the operation from the
+        // lexical baseline; the pack can still contain index items, so the
+        // aggregate claim stays structural rather than compiler-exact.
+        let context = if self.lsp.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Lsp,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            )
+        } else {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Partial,
+            )
+        };
+        qualities.set(SemanticOp::Context, context);
+
+        // Delta is git/filesystem change identity: heuristic and its
+        // coverage is genuinely unknown.
+        qualities.set(
+            SemanticOp::Delta,
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Unknown,
+            ),
+        );
+
+        // Affected: the revision-bound impact graph is the strongest native
+        // source, then LSP references, tree-sitter structure, or lexical.
+        let affected = if self.impact.is_some() {
+            // The impact graph is bound to the material revision it was
+            // refreshed from, so its evidence is revision-exact.
+            let mut quality = SemanticOperationQuality::native(
+                SemanticEvidenceSource::Graph,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            );
+            quality.evidence.revision_binding = crate::intelligence::RevisionBinding::Exact;
+            quality
+        } else if self.lsp.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Lsp,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            )
+        } else if self.tree_sitter.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::TreeSitter,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            )
+        } else {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Unknown,
+            )
+        };
+        qualities.set(SemanticOp::Affected, affected);
+
+        // Verify reports DISCOVERED verification facts, never a proof:
+        // authoritative proof obligations therefore stay above it.
+        let verify = if self.verification.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::RuntimeHistory,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Unknown,
+            )
+        } else {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Unknown,
+            )
+        };
+        qualities.set(SemanticOp::Verify, verify);
+
+        // Explain uses compiler definitions/references when an LSP is
+        // wired; tree-sitter outlines are structural, the index lexical.
+        let explain = if self.lsp.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Lsp,
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::Partial,
+            )
+        } else if self.tree_sitter.is_some() {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::TreeSitter,
+                SemanticFidelity::Structural,
+                SemanticCompleteness::Partial,
+            )
+        } else {
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Partial,
+            )
+        };
+        qualities.set(SemanticOp::Explain, explain);
+
+        // The fallback never claims snapshot, but its honest status still
+        // reports the filesystem baseline for the uncovered operation.
+        qualities.set(
+            SemanticOp::Snapshot,
+            SemanticOperationQuality::native(
+                SemanticEvidenceSource::Filesystem,
+                SemanticFidelity::Heuristic,
+                SemanticCompleteness::Unknown,
+            ),
+        );
+
+        qualities
+    }
+
+    pub fn operation_status(&self, op: SemanticOp) -> SemanticOperationStatus {
+        let descriptor = self.descriptor();
+        SemanticOperationStatus::from_quality(
+            self.capabilities().supports(op),
+            &descriptor.declared_quality(op),
+            self.source_id(),
+        )
     }
 
     pub fn intelligence_capability(
         &self,
-        op: crate::types::SemanticOp,
+        op: SemanticOp,
     ) -> crate::intelligence::IntelligenceCapability {
-        crate::intelligence::IntelligenceCapability::from_status(
+        let descriptor = self.descriptor();
+        crate::intelligence::IntelligenceCapability::from_quality(
             op,
-            self.operation_status(op),
-            self.descriptor().intelligence_tier(),
-            crate::intelligence::native_evidence_dimensions(),
+            &descriptor.declared_quality(op),
+            self.capabilities().supports(op),
+            self.source_id(),
         )
+    }
+
+    /// Every semantic operation's capability, in [`SemanticOp::ALL`] order.
+    pub fn intelligence_capabilities(&self) -> Vec<crate::intelligence::IntelligenceCapability> {
+        SemanticOp::ALL
+            .iter()
+            .map(|op| self.intelligence_capability(*op))
+            .collect()
     }
 }
 
@@ -629,11 +755,12 @@ impl SemanticProvider for GenericSemanticFallback {
         SemanticCompleteness::Partial
     }
 
-    /// The fallback's honest self-description. The intelligence tier reports
-    /// the machinery the production composition actually carries: Tier 2
-    /// when a real LSP seam is wired (compiler semantics), Tier 1 when only
-    /// parser/index facts are wired, Tier 0 for the empty default. Snapshot
-    /// and constrained edits stay uncovered.
+    /// The fallback's honest self-description. The per-operation quality
+    /// profile is derived from the wired seams, so LSP-backed operations
+    /// report higher than heuristic ones and an absent seam never inherits a
+    /// stronger claim. The provider-wide scalar fields remain the honest
+    /// aggregate/legacy view; authoritative selection reads `operations`.
+    /// Snapshot and constrained edits stay uncovered.
     fn descriptor(&self) -> SemanticProviderDescriptor {
         let mut descriptor = SemanticProviderDescriptor::new(
             self.provider_id(),
@@ -643,7 +770,11 @@ impl SemanticProvider for GenericSemanticFallback {
         );
         descriptor.fidelity = Some(SemanticFidelity::Heuristic);
         descriptor.completeness = Some(SemanticCompleteness::Partial);
-        descriptor.tier = Some(if self.lsp.is_some() {
+        descriptor.tier = Some(if self.impact.is_some() {
+            crate::intelligence::IntelligenceTier::GRAPH.raw()
+        } else if self.verification.is_some() {
+            crate::intelligence::IntelligenceTier::RUNTIME.raw()
+        } else if self.lsp.is_some() {
             crate::intelligence::IntelligenceTier::COMPILER.raw()
         } else if self.index.is_some() || self.tree_sitter.is_some() {
             crate::intelligence::IntelligenceTier::SYNTAX.raw()
@@ -651,6 +782,7 @@ impl SemanticProvider for GenericSemanticFallback {
             crate::intelligence::IntelligenceTier::FILESYSTEM.raw()
         });
         descriptor.evidence = crate::intelligence::native_evidence_dimensions();
+        descriptor.operations = self.operation_qualities();
         descriptor
     }
 
@@ -2223,6 +2355,22 @@ mod tests {
         ));
     }
 
+    struct FakeTreeSitter;
+
+    impl TreeSitterMetadata for FakeTreeSitter {
+        fn identity(&self) -> String {
+            "tree-sitter:test".to_string()
+        }
+    }
+
+    struct FakeVerification;
+
+    impl VerificationMetadata for FakeVerification {
+        fn identity(&self) -> String {
+            "verification:test".to_string()
+        }
+    }
+
     struct FakeImpact;
 
     impl ImpactMetadata for FakeImpact {
@@ -2257,6 +2405,86 @@ mod tests {
                 degraded: false,
             })
         }
+    }
+
+    /// The native adapter declares REAL per-operation quality from the
+    /// wired sources: filesystem/lexical (tier 0), tree-sitter (1), LSP (2),
+    /// graph impact (3), runtime/verification (4). LSP-backed operations
+    /// report higher than heuristic ones; an absent seam never inherits a
+    /// stronger claim.
+    #[test]
+    fn native_operation_quality_tracks_wired_evidence_sources() {
+        use crate::types::SemanticEvidenceSource;
+
+        let bare = GenericSemanticFallback::default();
+        let descriptor = bare.descriptor();
+        let context = descriptor.operation_quality(SemanticOp::Context).unwrap();
+        assert_eq!(context.provenance, SemanticEvidenceSource::Filesystem);
+        assert_eq!(context.tier, Some(0));
+        assert_eq!(context.fidelity, SemanticFidelity::Heuristic);
+        let affected = descriptor.operation_quality(SemanticOp::Affected).unwrap();
+        assert_eq!(affected.fidelity, SemanticFidelity::Heuristic);
+        assert_eq!(affected.completeness, SemanticCompleteness::Unknown);
+
+        let with_lsp =
+            GenericSemanticFallback::default().with_lsp(Arc::new(CountingLsp::default()));
+        let descriptor = with_lsp.descriptor();
+        let context = descriptor.operation_quality(SemanticOp::Context).unwrap();
+        assert_eq!(context.provenance, SemanticEvidenceSource::Lsp);
+        assert_eq!(context.tier, Some(2));
+        assert_eq!(context.fidelity, SemanticFidelity::Structural);
+        assert_eq!(context.completeness, SemanticCompleteness::Partial);
+        let explain = descriptor.operation_quality(SemanticOp::Explain).unwrap();
+        assert_eq!(explain.fidelity, SemanticFidelity::CompilerExact);
+        assert_eq!(explain.tier, Some(2));
+
+        let with_graph = GenericSemanticFallback::default().with_impact(Arc::new(FakeImpact));
+        let graph_descriptor = with_graph.descriptor();
+        let affected = graph_descriptor
+            .operation_quality(SemanticOp::Affected)
+            .unwrap();
+        assert_eq!(affected.provenance, SemanticEvidenceSource::Graph);
+        assert_eq!(affected.tier, Some(3));
+        assert_eq!(affected.fidelity, SemanticFidelity::Structural);
+        assert_eq!(affected.completeness, SemanticCompleteness::Partial);
+        assert_eq!(
+            affected.evidence.revision_binding,
+            crate::intelligence::RevisionBinding::Exact,
+            "the native graph is revision-bound, not an inferred guess"
+        );
+
+        let with_syntax =
+            GenericSemanticFallback::default().with_tree_sitter(Arc::new(FakeTreeSitter));
+        let syntax_descriptor = with_syntax.descriptor();
+        let explain = syntax_descriptor
+            .operation_quality(SemanticOp::Explain)
+            .unwrap();
+        assert_eq!(explain.provenance, SemanticEvidenceSource::TreeSitter);
+        assert_eq!(explain.tier, Some(1));
+        assert_eq!(explain.fidelity, SemanticFidelity::Structural);
+
+        let with_verify =
+            GenericSemanticFallback::default().with_verification(Arc::new(FakeVerification));
+        let descriptor = with_verify.descriptor();
+        let verify = descriptor.operation_quality(SemanticOp::Verify).unwrap();
+        assert_eq!(verify.provenance, SemanticEvidenceSource::RuntimeHistory);
+        assert_eq!(verify.tier, Some(4));
+        assert_eq!(verify.fidelity, SemanticFidelity::Structural);
+        // Discovered checks are never a proof: the authoritative verify
+        // requirement stays above the native declaration.
+        assert!(with_verify.capabilities().supports(SemanticOp::Verify));
+        let status = with_verify.operation_status(SemanticOp::Verify);
+        let declared = SemanticOperationQuality::new(
+            status.fidelity,
+            status.completeness,
+            None,
+            crate::intelligence::EvidenceDimensions::UNKNOWN,
+            status.provenance,
+        );
+        assert!(
+            !crate::quality::SemanticQualityRequirement::authoritative(SemanticOp::Verify)
+                .accepts(&declared)
+        );
     }
 
     struct TruncatedImpact;

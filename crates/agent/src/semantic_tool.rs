@@ -15,9 +15,9 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::resource::ResourceClass;
 use faktor_core::time::{Clock, SystemClock};
 use faktor_semantic::{
-    SemanticCall, SemanticCapabilities, SemanticContextRequest, SemanticEnvelope, SemanticError,
-    SemanticOp, SemanticProviderRegistry, SemanticSelection, SemanticSnapshotId,
-    SEMANTIC_SCHEMA_VERSION,
+    SemanticCall, SemanticContextRequest, SemanticEnvelope, SemanticError, SemanticOp,
+    SemanticProviderRegistry, SemanticQualityRequirement, SemanticQualitySelection,
+    SemanticSnapshotId, SEMANTIC_SCHEMA_VERSION,
 };
 
 use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx, SEMANTIC_QUERY_TOOL};
@@ -156,18 +156,21 @@ pub fn tool(registry: Arc<SemanticProviderRegistry>) -> Arc<Tool> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(SEMANTIC_QUERY_DEFAULT_LIMIT as u64)
                     .clamp(1, SEMANTIC_QUERY_MAX_LIMIT as u64) as usize;
+                // THE authoritative quality gate: context must at least be
+                // heuristic and partially complete before a model-visible
+                // answer is trusted.
                 let selection = registry
-                    .select_validated(
-                        &SemanticCapabilities::CONTEXT,
-                        SemanticOp::Context,
+                    .select_quality(
+                        SemanticQualityRequirement::authoritative(SemanticOp::Context),
                         &ctx.cancellation,
                     )
                     .await;
                 let provider = match selection {
-                    SemanticSelection::Provider(provider) => provider,
-                    SemanticSelection::Fallback(_) => {
+                    Ok(SemanticQualitySelection::Provider { provider, .. }) => provider,
+                    Ok(SemanticQualitySelection::Fallback { .. }) => {
                         return Err(unavailable("no external semantic provider is registered"));
                     }
+                    Err(err) => return Err(unavailable(&err.to_string())),
                 };
                 let provider_id = provider.id().clone();
                 let provider_version = provider.version();
@@ -256,6 +259,24 @@ impl faktor_semantic::SemanticProvider for FakeContextProvider {
 
     fn capabilities(&self) -> faktor_semantic::SemanticCapabilities {
         faktor_semantic::SemanticCapabilities::CONTEXT
+    }
+
+    fn descriptor(&self) -> faktor_semantic::SemanticProviderDescriptor {
+        let mut descriptor = faktor_semantic::SemanticProviderDescriptor::new(
+            self.id(),
+            self.version(),
+            SEMANTIC_SCHEMA_VERSION,
+            self.capabilities(),
+        );
+        descriptor.operations.set(
+            SemanticOp::Context,
+            faktor_semantic::SemanticOperationQuality::native(
+                faktor_semantic::SemanticEvidenceSource::Lsp,
+                faktor_semantic::SemanticFidelity::CompilerExact,
+                faktor_semantic::SemanticCompleteness::Partial,
+            ),
+        );
+        descriptor
     }
 
     fn context(

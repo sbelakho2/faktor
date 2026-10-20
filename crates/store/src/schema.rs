@@ -1287,6 +1287,39 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON verification_record(session_id, task_id, id);
      CREATE INDEX IF NOT EXISTS idx_verification_record_workspace_task
         ON verification_record(workspace_id, task_id, id);",
+    // v44 — durable monotonic History listing revision. History paging used
+    // wall-clock `updated_ms` as its snapshot bound while every write stamped
+    // a fresh millisecond: a session updated in the SAME millisecond as the
+    // snapshot could move across the live cursor yet still satisfy
+    // `updated_ms <= snapshot`, so a page walk could skip it. The new
+    // `listing_revision` is assigned from one global sequence on EVERY
+    // ordering-relevant session mutation and is the paging order/bound;
+    // `updated_ms` remains presentation metadata.
+    //
+    // Existing rows are backfilled to dense revisions in stable id order
+    // (1..=N), then the sequence starts at N+1: a legacy database is
+    // deterministic and no backfilled revision can collide with a new write.
+    "ALTER TABLE session ADD COLUMN listing_revision INTEGER NOT NULL DEFAULT 0;
+     DROP TABLE IF EXISTS temp.session_listing_backfill;
+     CREATE TEMP TABLE session_listing_backfill(
+        id INTEGER PRIMARY KEY,
+        revision INTEGER NOT NULL
+     );
+     INSERT INTO session_listing_backfill(id, revision)
+        SELECT id, ROW_NUMBER() OVER (ORDER BY id ASC) FROM session;
+     UPDATE session SET listing_revision = (
+        SELECT revision FROM session_listing_backfill b WHERE b.id = session.id);
+     DROP TABLE session_listing_backfill;
+     CREATE TABLE IF NOT EXISTS listing_revision_seq (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        next_value INTEGER NOT NULL
+     );
+     INSERT OR IGNORE INTO listing_revision_seq(id, next_value)
+        VALUES (1, (SELECT COALESCE(MAX(listing_revision), 0) + 1 FROM session));
+     CREATE INDEX IF NOT EXISTS idx_session_listing_revision_id
+        ON session(listing_revision DESC, id DESC);
+     CREATE INDEX IF NOT EXISTS idx_session_workspace_listing_revision_id
+        ON session(workspace_id, listing_revision DESC, id DESC);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

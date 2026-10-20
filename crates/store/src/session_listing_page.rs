@@ -1,33 +1,65 @@
 //! Cursor-paged, snapshot-bounded History listing (split from `sessions` so
 //! the durable session module stays under the source-size ceiling).
+//!
+//! History orders and pages on the durable `session.listing_revision`
+//! sequence, never on wall-clock `updated_ms`: a same-millisecond update gets
+//! a strictly larger revision and therefore cannot pass a page walk's
+//! snapshot bound while silently moving across its cursor. `updated_ms`
+//! remains presentation metadata.
 
 use super::*;
 use crate::sessions::session_row_map;
 
+/// The coherent snapshot of one History walk. `revision` is the durable
+/// ordering bound; `wall_ms` is preserved as presentation metadata (the
+/// first page echoes it so clients can display the walk time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionListingSnapshot {
+    pub revision: i64,
+    pub wall_ms: i64,
+}
+
 impl Store {
-    /// The snapshot bound of a History walk: the newer of the wall clock and
-    /// the newest durable `updated_ms`. The first page returns it; every
-    /// later page passes it back so an update DURING the walk cannot move a
-    /// conversation above the cursor (re-surface it) or below a later page
-    /// (skip it). Under this rule a row updated after the snapshot is absent
-    /// from the rest of THAT walk and is re-listed by the next walk, which
-    /// starts from a fresh snapshot.
-    pub fn session_listing_snapshot_ms(&self) -> StoreResult<i64> {
+    /// Capture the snapshot of a new History walk: the newest durable
+    /// `listing_revision` plus the wall clock for presentation. A mutation
+    /// that commits after this read receives a strictly larger revision, so
+    /// the page walk never re-lists it above the cursor and never serves it
+    /// below a later page; the next walk (fresh snapshot) lists it.
+    pub fn session_listing_snapshot(&self) -> StoreResult<SessionListingSnapshot> {
         let conn = self.read()?;
-        let newest: Option<i64> =
-            conn.query_row("SELECT MAX(updated_ms) FROM session", [], |row| row.get(0))?;
-        Ok(newest.unwrap_or(0).max(crate::connection::now_ms()))
+        let revision: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(listing_revision), 0) FROM session",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(SessionListingSnapshot {
+            revision,
+            wall_ms: crate::connection::now_ms(),
+        })
     }
 
-    /// [`Self::list_sessions_page`] bound to a History-walk snapshot. A
-    /// `None` snapshot keeps the legacy live-cursor behavior (used only by
-    /// callers that opt out of a coherent walk).
+    /// The durable ordering bound alone (the correctness contract).
+    pub fn session_listing_snapshot_revision(&self) -> StoreResult<i64> {
+        Ok(self.session_listing_snapshot()?.revision)
+    }
+
+    /// Presentation metadata only. Retained for callers that still want the
+    /// walk's wall-clock reading; it is never an ordering/paging bound.
+    pub fn session_listing_snapshot_ms(&self) -> StoreResult<i64> {
+        Ok(self.session_listing_snapshot()?.wall_ms)
+    }
+
+    /// [`Self::list_sessions_page`] bound to a History-walk snapshot
+    /// revision. `before` is the `(listing_revision, id)` cursor of the LAST
+    /// row of the previous page. A `None` snapshot revision keeps the legacy
+    /// live-cursor behavior (used only by callers that opt out of a coherent
+    /// walk).
     pub fn list_sessions_page_at(
         &self,
         workspace_id: Option<WorkspaceId>,
         before: Option<(i64, i64)>,
         limit: u64,
-        snapshot_ms: Option<i64>,
+        snapshot_revision: Option<i64>,
     ) -> StoreResult<Vec<SessionRow>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -37,7 +69,7 @@ impl Store {
         })?;
         let conn = self.read()?;
         let mut sql = String::from(
-            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms, listing_revision
              FROM session",
         );
         let mut clauses: Vec<&str> = Vec::new();
@@ -46,21 +78,21 @@ impl Store {
             clauses.push("workspace_id = ?");
             params.push(rusqlite::types::Value::Integer(workspace.raw() as i64));
         }
-        if let Some(snapshot_ms) = snapshot_ms {
-            clauses.push("updated_ms <= ?");
-            params.push(rusqlite::types::Value::Integer(snapshot_ms));
+        if let Some(snapshot_revision) = snapshot_revision {
+            clauses.push("listing_revision <= ?");
+            params.push(rusqlite::types::Value::Integer(snapshot_revision));
         }
-        if let Some((updated_ms, id)) = before {
-            clauses.push("(updated_ms < ? OR (updated_ms = ? AND id < ?))");
-            params.push(rusqlite::types::Value::Integer(updated_ms));
-            params.push(rusqlite::types::Value::Integer(updated_ms));
+        if let Some((listing_revision, id)) = before {
+            clauses.push("(listing_revision < ? OR (listing_revision = ? AND id < ?))");
+            params.push(rusqlite::types::Value::Integer(listing_revision));
+            params.push(rusqlite::types::Value::Integer(listing_revision));
             params.push(rusqlite::types::Value::Integer(id));
         }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
-        sql.push_str(" ORDER BY updated_ms DESC, id DESC LIMIT ?");
+        sql.push_str(" ORDER BY listing_revision DESC, id DESC LIMIT ?");
         params.push(rusqlite::types::Value::Integer(bound));
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params))?;

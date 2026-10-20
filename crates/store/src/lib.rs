@@ -202,6 +202,7 @@ pub(crate) use schema::*;
 mod migration;
 pub use migration::*;
 mod session_listing_page;
+pub use session_listing_page::SessionListingSnapshot;
 mod sessions;
 pub use sessions::*;
 mod messages;
@@ -229,10 +230,11 @@ mod outcome_ledger;
 pub use outcome_ledger::*;
 
 /// Test-only rewind helper: remove the v43 verification-record scope column
-/// and its indexes before a test sets `PRAGMA user_version` BELOW the v43
-/// step. Every tolerant statement keeps a fixture that never reached v43
-/// working unchanged; a fixture that did reach it rewinds to the exact
-/// predecessor shape the real v41 binary would have left.
+/// and the v44 History-listing revision objects before a test sets
+/// `PRAGMA user_version` BELOW those steps. Every tolerant statement keeps a
+/// fixture that never reached them working unchanged; a fixture that did
+/// reach them rewinds to the exact predecessor shape the real binary would
+/// have left.
 #[cfg(test)]
 pub(crate) fn drop_verification_scope_for_rewind(conn: &rusqlite::Connection) {
     let _ = conn.execute_batch(
@@ -240,6 +242,12 @@ pub(crate) fn drop_verification_scope_for_rewind(conn: &rusqlite::Connection) {
          DROP INDEX IF EXISTS idx_verification_record_workspace_task;",
     );
     let _ = conn.execute("ALTER TABLE verification_record DROP COLUMN session_id", []);
+    let _ = conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_session_listing_revision_id;
+         DROP INDEX IF EXISTS idx_session_workspace_listing_revision_id;",
+    );
+    let _ = conn.execute("ALTER TABLE session DROP COLUMN listing_revision", []);
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS listing_revision_seq;");
 }
 
 #[cfg(test)]

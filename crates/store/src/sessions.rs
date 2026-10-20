@@ -19,7 +19,16 @@ pub struct SessionRow {
     pub state: AgentState,
     pub lifecycle: faktor_core::state::SessionLifecycle,
     pub created_ms: i64,
+    /// Presentation-only wall clock: the last durable write time. History
+    /// ordering and paging use [`Self::listing_revision`], never this value
+    /// (a same-millisecond update cannot be ordered by it).
     pub updated_ms: i64,
+    /// Durable, globally strictly increasing History listing revision. It is
+    /// reassigned from the store sequence on every ordering-relevant session
+    /// mutation (create/title/lifecycle/state/identity/journal transition), so
+    /// a page walk bound to a snapshot revision can never see a row move
+    /// across the cursor, even when the write lands in the same millisecond.
+    pub listing_revision: i64,
 }
 
 /// Bound on pending-permission rows materialized by
@@ -406,6 +415,31 @@ pub(crate) fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> 
         lifecycle: parse_lifecycle(&format!("session {id} lifecycle"), &r.get::<_, String>(8)?)?,
         created_ms: r.get(9)?,
         updated_ms: r.get(10)?,
+        listing_revision: r.get(11)?,
+    })
+}
+
+/// Allocate the next durable History listing revision from the global
+/// sequence. Runs inside the caller's writer transaction (or autocommit on
+/// the single-owner writer), so allocation and the row mutation commit
+/// together; a rolled-back mutation also rolls the counter back. At most one
+/// allocation is in flight by construction (single writer), and the WHERE
+/// guard turns sequence exhaustion into typed corruption instead of a wrap.
+pub(crate) fn next_listing_revision(conn: &Connection) -> StoreResult<i64> {
+    let allocated: Option<i64> = conn
+        .query_row(
+            "UPDATE listing_revision_seq
+                SET next_value = next_value + 1
+              WHERE id = 1 AND next_value < 9223372036854775807
+              RETURNING next_value - 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    allocated.ok_or_else(|| {
+        StoreError::Corrupt(vec![
+            "session listing revision sequence is missing or exhausted".into(),
+        ])
     })
 }
 
@@ -528,7 +562,7 @@ impl Store {
         id: SessionId,
     ) -> StoreResult<Option<SessionRow>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms, listing_revision
              FROM session WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.raw() as i64])?;
@@ -538,23 +572,24 @@ impl Store {
         }
     }
 
-    /// The durable session listing, newest-updated first. This is the page
-    /// routes' single read (perf-wave follow-up): `/native/sessions` serves
-    /// its DTO directly from ONE call's result — the historical handler ran
-    /// the manager listing AND a second listing join, reading the whole
-    /// table twice per page — so the contract is exactly one statement per
-    /// call. `workspace_id = Some` filters to one workspace; `None` lists
-    /// every session.
+    /// The durable session listing, newest listing revision first (`id DESC`
+    /// is the stable tie-break). `updated_ms` is presentation metadata only.
+    /// This is the page routes' single read (perf-wave follow-up):
+    /// `/native/sessions` serves its DTO directly from ONE call's result — the
+    /// historical handler ran the manager listing AND a second listing join,
+    /// reading the whole table twice per page — so the contract is exactly one
+    /// statement per call. `workspace_id = Some` filters to one workspace;
+    /// `None` lists every session.
     pub fn list_sessions(&self, workspace_id: Option<WorkspaceId>) -> StoreResult<Vec<SessionRow>> {
         let conn = self.read()?;
         let mut stmt = match workspace_id {
             Some(_) => conn.prepare(
-                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
-                 FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
+                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms, listing_revision
+                 FROM session WHERE workspace_id = ?1 ORDER BY listing_revision DESC, id DESC",
             )?,
             None => conn.prepare(
-                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
-                 FROM session ORDER BY updated_ms DESC",
+                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms, listing_revision
+                 FROM session ORDER BY listing_revision DESC, id DESC",
             )?,
         };
         let mut rows = match workspace_id {
@@ -569,12 +604,13 @@ impl Store {
     }
 
     /// One bounded, cursor-paged History listing. `before` is the
-    /// `(updated_ms, id)` cursor of the LAST row of the previous page; the
-    /// next page is strictly older (or the same millisecond with a smaller
-    /// id, matching the stable `updated_ms DESC, id DESC` order). At most
-    /// `limit + 1` rows are read so the caller can report `hasMore` exactly
-    /// without scanning the table. No workspace filter is applied when
-    /// `workspace_id` is `None` (the global History listing).
+    /// `(listing_revision, id)` cursor of the LAST row of the previous page;
+    /// the next page is strictly older in the stable
+    /// `listing_revision DESC, id DESC` order. Revisions are globally unique,
+    /// so the id half is a defensive tie-break only. At most `limit + 1` rows
+    /// are read so the caller can report `hasMore` exactly without scanning
+    /// the table. No workspace filter is applied when `workspace_id` is
+    /// `None` (the global History listing).
     pub fn list_sessions_page(
         &self,
         workspace_id: Option<WorkspaceId>,
@@ -606,13 +642,15 @@ impl Store {
         let missing_session = format!("adopt_session_identity: session {id} does not exist");
         let now = now_ms();
         self.writer.execute("adopt_session_identity", move |conn| {
+            let revision = next_listing_revision(conn)?;
             let n = conn.execute(
-                "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4 WHERE id = ?1",
+                "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4, listing_revision = ?5 WHERE id = ?1",
                 params![
                     id.raw() as i64,
                     worktree_id.raw() as i64,
                     task_id.raw() as i64,
-                    now
+                    now,
+                    revision
                 ],
             )?;
             if n == 0 {
@@ -633,9 +671,10 @@ impl Store {
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("set_session_lifecycle", move |conn| {
+            let revision = next_listing_revision(conn)?;
             conn.execute(
-                "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, lifecycle_json, now],
+                "UPDATE session SET lifecycle = ?2, updated_ms = ?3, listing_revision = ?4 WHERE id = ?1",
+                params![id.raw() as i64, lifecycle_json, now, revision],
             )?;
             Ok(())
         })
@@ -648,9 +687,10 @@ impl Store {
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("set_session_state", move |conn| {
+            let revision = next_listing_revision(conn)?;
             conn.execute(
-                "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, state_json, now],
+                "UPDATE session SET state = ?2, updated_ms = ?3, listing_revision = ?4 WHERE id = ?1",
+                params![id.raw() as i64, state_json, now, revision],
             )?;
             Ok(())
         })
@@ -673,29 +713,33 @@ impl Store {
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("set_lifecycle_if", move |conn| {
+            let revision = next_listing_revision(conn)?;
             let n = conn.execute(
-                "UPDATE session SET lifecycle = ?3, updated_ms = ?4
+                "UPDATE session SET lifecycle = ?3, updated_ms = ?4, listing_revision = ?5
              WHERE id = ?1 AND lifecycle = ?2",
-                params![id.raw() as i64, expected_json, new_json, now],
+                params![id.raw() as i64, expected_json, new_json, now, revision],
             )?;
             Ok(n > 0)
         })
     }
 
-    /// Durable session-title update (session.update, P1). Bumps
-    /// `updated_ms` so list ordering reflects the rename. Returns whether a
-    /// row was updated (callers check existence first for a clean
-    /// NotFound). The journal is intentionally untouched: the title is
-    /// session metadata, not a state-machine transition.
+    /// Durable session-title update (session.update, P1). Bumps both the
+    /// presentation wall clock (`updated_ms`) and the durable History
+    /// `listing_revision` so the rename moves the row in list order even when
+    /// it lands in the same millisecond as the previous write. Returns whether
+    /// a row was updated (callers check existence first for a clean NotFound).
+    /// The journal is intentionally untouched: the title is session metadata,
+    /// not a state-machine transition.
     pub fn update_session_title(&self, id: SessionId, title: &str) -> StoreResult<bool> {
         let title = title.to_owned();
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("update_session_title", move |conn| {
+            let revision = next_listing_revision(conn)?;
             let n = conn.execute(
-                "UPDATE session SET title = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, title, now],
+                "UPDATE session SET title = ?2, updated_ms = ?3, listing_revision = ?4 WHERE id = ?1",
+                params![id.raw() as i64, title, now, revision],
             )?;
             Ok(n > 0)
         })

@@ -1161,12 +1161,14 @@ fn doctor_deep_flags_a_passed_record_for_a_missing_task() {
     // task that never existed. Deep doctor must FAIL the wave-16
     // section with the exact kind and counts.
     let dir = tempfile::tempdir().unwrap();
+    let session_id;
     {
         let m =
             SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
         let s = m
             .create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
             .unwrap();
+        session_id = s.id();
         let row = faktor_store::VerificationRecordRow {
             id: faktor_core::id::VerificationRecordId::new(1), // ignored
             session_id: Some(s.id()),
@@ -1191,7 +1193,9 @@ fn doctor_deep_flags_a_passed_record_for_a_missing_task() {
     let text = report.lines.join("\n");
     assert!(
         report.lines.iter().any(|l| {
-            l.contains("verification inconsistency [record_without_task]") && l.contains("task 777")
+            l.contains("verification inconsistency [record_without_task]")
+                && l.contains(&format!("task {}/777", session_id.raw()))
+                && l.contains("which has no task row")
         }),
         "{text}"
     );

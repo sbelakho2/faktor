@@ -908,7 +908,10 @@ pub fn parse_javascript(path: &str, source: &str, is_test_file: bool) -> ParsedF
 fn js_call_name(source: &str, tokens: &[Tok<'_>], index: usize) -> Option<String> {
     let token = tokens.get(index)?;
     if token.text.starts_with('\'') || token.text.starts_with('"') {
-        return Some(token.text.trim_matches(['\'', '"']).to_string());
+        let name = token.text.trim_matches(['\'', '"']);
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
     }
     // Strings are scrubbed in the token stream; recover the first quoted
     // literal on the same line from the original source.
@@ -1036,5 +1039,190 @@ pub fn parse_file(path: &str, language: Language, source: &str, is_test_file: bo
     match language {
         Language::Rust => parse_rust(path, source, is_test_file),
         Language::JavaScript | Language::TypeScript => parse_javascript(path, source, is_test_file),
+        Language::Python => parse_python(path, source, is_test_file),
+        Language::Java | Language::Kotlin => parse_jvm(path, source, language, is_test_file),
     }
+}
+
+/// Bounded Python structural parser: functions/classes, imports and test
+/// definitions (`def test_*` plus unittest/pytest class methods).
+pub fn parse_python(path: &str, source: &str, is_test_file: bool) -> ParsedFile {
+    let mut out = ParsedFile::empty(path, Language::Python, is_test_file);
+    for (index, line) in source.lines().enumerate() {
+        if index >= 200_000 {
+            out.truncated = true;
+            break;
+        }
+        let line_no = (index + 1) as u32;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for name in rest.split(',').take(MAX_IMPORTS_PER_FILE) {
+                let name = name.trim().split(" as ").next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    out.imports.push(ImportRef {
+                        segments: name.split('.').map(str::to_string).collect(),
+                        names: Vec::new(),
+                        glob: false,
+                        line: line_no,
+                    });
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("from ") {
+            let mut parts = rest.splitn(2, " import ");
+            let module = parts.next().unwrap_or("").trim();
+            let names = parts.next().unwrap_or("");
+            if !module.is_empty() && !module.starts_with('.') {
+                let mut segments: Vec<String> = module.split('.').map(str::to_string).collect();
+                let mut imported = Vec::new();
+                for name in names.trim_matches(|c| c == '(' || c == ')').split(',') {
+                    let name = name.trim();
+                    if name.is_empty() || name == "*" {
+                        continue;
+                    }
+                    let name = name.split(" as ").next().unwrap_or(name).trim();
+                    if !name.is_empty() {
+                        imported.push(ImportName {
+                            local: name.to_string(),
+                            original: name.to_string(),
+                        });
+                    }
+                }
+                if imported.is_empty() {
+                    segments = segments.into_iter().take(1).collect();
+                }
+                out.imports.push(ImportRef {
+                    segments,
+                    names: imported,
+                    glob: names.contains('*'),
+                    line: line_no,
+                });
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("def ") {
+            let name = rest
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("async ");
+            if is_ident_name(name) {
+                let is_test = name.starts_with("test") || is_test_file;
+                if is_test {
+                    out.tests.push(TestDef {
+                        id: crate::model::test_id(path, name, line_no),
+                        name: name.to_string(),
+                        line: line_no,
+                    });
+                } else {
+                    out.symbols.push(SymbolDef {
+                        id: crate::model::symbol_id(path, name, line_no),
+                        name: name.to_string(),
+                        line: line_no,
+                        kind: DefKind::Function,
+                        is_public: !name.starts_with('_'),
+                    });
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("class ") {
+            let name = rest.split(['(', ':']).next().unwrap_or("").trim();
+            if is_ident_name(name) {
+                out.symbols.push(SymbolDef {
+                    id: crate::model::symbol_id(path, name, line_no),
+                    name: name.to_string(),
+                    line: line_no,
+                    kind: DefKind::Struct,
+                    is_public: !name.starts_with('_'),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn is_ident_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SYMBOL_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        && !name.as_bytes()[0].is_ascii_digit()
+}
+
+/// Bounded JVM structural parser: imports plus JUnit-style `@Test`
+/// annotated methods and their owning classes.
+pub fn parse_jvm(path: &str, source: &str, language: Language, is_test_file: bool) -> ParsedFile {
+    let mut out = ParsedFile::empty(path, language, is_test_file);
+    let lines: Vec<&str> = source.lines().take(200_000).collect();
+    if source.lines().count() > 200_000 {
+        out.truncated = true;
+    }
+    let mut pending_test = false;
+    for (index, line) in lines.iter().enumerate() {
+        let line_no = (index + 1) as u32;
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            let module = rest.trim_end_matches(';').trim();
+            if !module.is_empty() && !module.starts_with("java.") {
+                let segments: Vec<String> = module.split('.').map(str::to_string).collect();
+                out.imports.push(ImportRef {
+                    segments,
+                    names: Vec::new(),
+                    glob: false,
+                    line: line_no,
+                });
+            }
+            continue;
+        }
+        if trimmed.starts_with("@Test")
+            || trimmed.contains(" @Test")
+            || trimmed.starts_with("@org.junit.Test")
+        {
+            pending_test = true;
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("class ")
+            .or_else(|| trimmed.strip_prefix("public class "))
+            .or_else(|| trimmed.strip_prefix("internal class "))
+        {
+            let name = rest.split(['(', ' ', '{', ':']).next().unwrap_or("").trim();
+            if is_ident_name(name) {
+                out.symbols.push(SymbolDef {
+                    id: crate::model::symbol_id(path, name, line_no),
+                    name: name.to_string(),
+                    line: line_no,
+                    kind: DefKind::Struct,
+                    is_public: true,
+                });
+            }
+            continue;
+        }
+        if pending_test || is_test_file {
+            let candidate = trimmed
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('{')
+                .trim();
+            let name = candidate.split_whitespace().last().unwrap_or(candidate);
+            if is_ident_name(name) && name != "void" && name != "fun" {
+                out.tests.push(TestDef {
+                    id: crate::model::test_id(path, name, line_no),
+                    name: name.to_string(),
+                    line: line_no,
+                });
+                pending_test = false;
+            }
+        }
+    }
+    out
 }

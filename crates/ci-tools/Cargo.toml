@@ -10,6 +10,7 @@ name = "faktor-ci-tools"
 path = "src/main.rs"
 
 [dependencies]
+faktor-impact.workspace = true
 base64 = "0.22"
 chrono = { workspace = true }
 hmac = "0.12"
