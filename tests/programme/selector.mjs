@@ -114,14 +114,52 @@ export function loadImpactGraph(root = ROOT, { head = null, path = null } = {}) 
     } catch (error) {
       return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate };
     }
-    const error = validateImpactGraph(document, head);
+    const error = validateImpactGraph(document, head, { root });
     if (error) return { document: null, error, path: candidate };
     return { document, error: null, path: candidate };
   }
   return { document: null, error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)', path: null };
 }
 
-export function validateImpactGraph(document, head = null) {
+const GRAPH_FILE = 'tests/programme/impact-graph.json';
+
+/**
+ * Paths a serialized graph is derived from. The graph document is committed
+ * inside the same commit it describes, so its recorded revision is the
+ * parent commit; the binding is valid only while no graph input changed in
+ * between. Non-input paths (docs, registry data, scripts, apps, CI) cannot
+ * invalidate the Rust workspace projection.
+ */
+function graphInputPath(path, members) {
+  if (path === 'Cargo.toml' || path === 'Cargo.lock' || path === 'rust-toolchain.toml') return true;
+  if (path.endsWith('.rs') || path.endsWith('/Cargo.toml')) return true;
+  return members.some((member) => path === member || path.startsWith(`${member}/`));
+}
+
+function graphBindingError(root, revision, head) {
+  if (!head || !revision.commit || revision.commit === head) return null;
+  if (revision.dirty === true) {
+    return `impact graph is stale: revision ${revision.commit} was built from a dirty tree, not HEAD ${head}`;
+  }
+  if (!/^[0-9a-f]{7,64}$/i.test(String(revision.commit))) {
+    return `impact graph is stale: revision ${revision.commit} != HEAD ${head}`;
+  }
+  const changed = gitNames(
+    ['diff', '--name-only', '--no-renames', '--diff-filter=ACMRD', '-z', `${revision.commit}..${head}`, '--'],
+    root,
+  );
+  if (changed === null) {
+    return `impact graph is stale: revision ${revision.commit} != HEAD ${head} (diff unavailable)`;
+  }
+  const members = workspaceMembers(root);
+  const inputs = changed.filter((path) => path !== GRAPH_FILE && graphInputPath(path, members));
+  if (inputs.length > 0) {
+    return `impact graph is stale: revision ${revision.commit} != HEAD ${head} (graph inputs changed: ${inputs.slice(0, 3).join(', ')})`;
+  }
+  return null;
+}
+
+export function validateImpactGraph(document, head = null, { root = ROOT } = {}) {
   if (document === null || typeof document !== 'object') return 'impact graph is not an object';
   if (document.schema !== IMPACT_GRAPH_SCHEMA) return `unsupported impact graph schema ${JSON.stringify(document.schema)}`;
   if (!Array.isArray(document.nodes) || !Array.isArray(document.edges) || !Array.isArray(document.reverse_edges)) {
@@ -134,9 +172,8 @@ export function validateImpactGraph(document, head = null) {
     return 'impact graph carries no digest';
   }
   const revision = document.revision ?? {};
-  if (head && revision.commit && revision.commit !== head) {
-    return `impact graph is stale: revision ${revision.commit} != HEAD ${head}`;
-  }
+  const binding = graphBindingError(root, revision, head);
+  if (binding) return binding;
   const nodes = new Map();
   let previous = null;
   for (const node of document.nodes) {
@@ -911,6 +948,29 @@ function createScaleFixture({ crates = 50, rows = 10_000, changedPerCrate = 10 }
   return { root, members, names, rows: registryRows, changed };
 }
 
+function createBindingFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'faktor-selector-binding-'));
+  mkdirSync(join(root, 'crates/a/src'), { recursive: true });
+  writeFileSync(join(root, 'Cargo.toml'), '[workspace]\nmembers = ["crates/a"]\n');
+  writeFileSync(join(root, 'crates/a/Cargo.toml'), '[package]\nname = "a"\nversion = "0.1.0"\n');
+  writeFileSync(join(root, 'crates/a/src/lib.rs'), '');
+  const git = (...args) =>
+    execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  git('init', '-q');
+  git('config', 'user.email', 'selector@example.invalid');
+  git('config', 'user.name', 'selector');
+  git('add', '.');
+  git('commit', '-qm', 'base');
+  const base = git('rev-parse', 'HEAD').trim();
+  const document = writeImpactGraphFixture(root, { crateNames: ['a'] });
+  document.revision = { commit: base, tree: null, dirty: false };
+  writeFileSync(join(root, 'tests/programme/impact-graph.json'), `${JSON.stringify(document)}\n`);
+  clearWorkspaceGraphCache(root);
+  git('add', '.');
+  git('commit', '-qm', 'graph at base');
+  return { root, base, git, document };
+}
+
 function createWorktreeFixture() {
   const root = mkdtempSync(join(tmpdir(), 'faktor-selector-worktree-'));
   const git = (...args) =>
@@ -1036,6 +1096,43 @@ export function selftest() {
     );
   } finally {
     rmSync(worktreeRoot, { recursive: true, force: true });
+  }
+
+  // The graph is committed in the same commit it describes, so its revision
+  // binding is the parent commit. It stays valid while non-input commits land
+  // on top; any graph input change makes it a typed refusal.
+  const binding = createBindingFixture();
+  try {
+    mkdirSync(join(binding.root, 'docs'), { recursive: true });
+    writeFileSync(join(binding.root, 'docs/note.md'), 'docs\n');
+    binding.git('add', '.');
+    binding.git('commit', '-qm', 'docs only');
+    const docsHead = binding.git('rev-parse', 'HEAD').trim();
+    const accepted = loadImpactGraph(binding.root, { head: docsHead });
+    check(
+      'a clean graph committed with its revision is accepted after non-input commits',
+      accepted.error === null,
+      accepted.error ?? '',
+    );
+    writeFileSync(join(binding.root, 'crates/a/src/lib.rs'), '// changed\n');
+    binding.git('add', '.');
+    binding.git('commit', '-qm', 'rust input');
+    const codeHead = binding.git('rev-parse', 'HEAD').trim();
+    const rejected = loadImpactGraph(binding.root, { head: codeHead });
+    check(
+      'a graph whose revision diff touches graph inputs is a typed refusal',
+      /graph inputs changed/.test(rejected.error ?? ''),
+      JSON.stringify(rejected.error),
+    );
+    const dirty = structuredClone(binding.document);
+    dirty.revision = { ...dirty.revision, dirty: true };
+    check(
+      'a dirty graph bound to another revision is a typed refusal',
+      /dirty tree/.test(validateImpactGraph(dirty, docsHead, { root: binding.root }) ?? ''),
+    );
+  } finally {
+    rmSync(binding.root, { recursive: true, force: true });
+    clearWorkspaceGraphCache(binding.root);
   }
 
   // Scale fixture: 500 changed files across 50 crates and 10k registry rows.
