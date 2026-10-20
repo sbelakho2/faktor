@@ -1,0 +1,1 @@
+{"code":"unsupported_parameter","errors":["temperature: 9 is outside the served range 0..=2"],"message":"the requested parameters are not supported by this model"}

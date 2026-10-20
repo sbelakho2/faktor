@@ -309,6 +309,7 @@ async fn native_bootstrap_strict_dtos_and_cursor_stream() {
             &faktor_session::ops::PermissionRequest {
                 id: 4242,
                 op_id: faktor_core::id::OpId::new(1),
+                tool_id: String::new(),
                 capability: faktor_core::capability::Capability::ExecuteShell {
                     command: "ls".into(),
                 },
@@ -2029,5 +2030,466 @@ async fn session_scoped_reads_reject_unknown_sessions() {
         );
         assert_ne!(response.status(), 401, "{path}");
     }
+    let _ = handle.request_shutdown();
+}
+
+/// F205/F206/F207 regression: the native surface creates and discovers a
+/// linked worktree through the ONE manager, validates it, and serializes
+/// same-repository mutation leases (the second acquisition waits for the
+/// first release; a pristine owner checkout is never mutated by discovery).
+#[tokio::test]
+async fn native_worktrees_create_discover_validate_and_serialize_repo_leases() {
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let mut deps = test_deps(dir.path());
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let supervisor = faktor_terminal::ProcessSupervisor::new(cas);
+    deps.worktrees = Some(Arc::new(faktor_git::WorktreeManager::new(supervisor)));
+    let token = deps.auth_token.clone();
+    let manager = deps.session.clone();
+    let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
+    let sid = manager
+        .create_session(ws, "wt-e2e", "fake", "m")
+        .unwrap()
+        .id()
+        .to_string();
+    let sid2 = manager
+        .create_session(ws, "wt-e2e-2", "fake", "m")
+        .unwrap()
+        .id()
+        .to_string();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/worktrees"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"branch": "feature/wt-e2e", "name": "wt-e2e"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worktree_id = created["worktree"]["id"]
+        .as_str()
+        .expect("created worktree id")
+        .to_string();
+    let path = repo.join(".worktrees/wt-e2e");
+    assert!(path.is_dir(), "worktree path materialized");
+
+    let listed = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/worktrees"),
+    )
+    .await;
+    assert_eq!(listed.status(), 200);
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert!(
+        listed["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|wt| wt["id"] == worktree_id.as_str() && wt["branch"] == "feature/wt-e2e"),
+        "{listed}"
+    );
+    let validated: serde_json::Value = client
+        .post(format!(
+            "{base}/native/session/{sid}/worktrees/{worktree_id}/validate"
+        ))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(validated["valid"], true, "{validated}");
+
+    // Per-repository mutation lease: the second acquisition cannot complete
+    // while the first is held, and completes once it is released.
+    let first: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/repo/lock"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lock_token = first["lease"]["token"].as_str().unwrap().to_string();
+    let second = {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            let response = client
+                .post(format!("{base}/native/session/{sid}/repo/lock"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (status, body)
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!second.is_finished(), "the same-repo lease serializes");
+    let released = client
+        .delete(format!(
+            "{base}/native/session/{sid}/repo/lock/{lock_token}"
+        ))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(released.status(), 200);
+    let (status, second_body) = second.await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let second_token = second_body["lease"]["token"].as_str().unwrap().to_string();
+    let released = client
+        .delete(format!(
+            "{base}/native/session/{sid}/repo/lock/{second_token}"
+        ))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(released.status(), 200);
+
+    // F206: deliberate ownership transfer to another session.
+    let transferred: serde_json::Value = client
+        .post(format!(
+            "{base}/native/session/{sid}/worktrees/{worktree_id}/transfer"
+        ))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"sessionId": sid2.parse::<u64>().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(transferred["transferred"], true, "{transferred}");
+    let listed = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/worktrees"),
+    )
+    .await;
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(
+        listed["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wt| wt["id"] == worktree_id.as_str())
+            .unwrap()["ownerSession"],
+        sid2.parse::<u64>().unwrap(),
+        "{listed}"
+    );
+    // Repair prunes/validates metadata without fabricating a live path.
+    let repaired: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/worktrees/repair"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repaired["repaired"], true, "{repaired}");
+
+    let removed = client
+        .delete(format!(
+            "{base}/native/session/{sid}/worktrees/{worktree_id}"
+        ))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    assert!(!path.exists(), "worktree removed");
+    let _ = handle.request_shutdown();
+}
+
+/// F064/F071/F073/F087/F200 regression over the native protocol: queue
+/// listing, revision-fenced settings, durable fork lineage, the frozen plan
+/// artifact/approval and the checkpoint coverage report all answer real
+/// durable state (no placeholder route).
+#[tokio::test]
+async fn native_extended_surfaces_queue_settings_lineage_plan_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deps = test_deps(dir.path());
+    deps.foundation = Some(Arc::new(
+        faktor_foundation::Foundation::open(dir.path()).unwrap(),
+    ));
+    let token = deps.auth_token.clone();
+    let manager = deps.session.clone();
+    let ws = manager
+        .create_workspace(dir.path().to_str().unwrap())
+        .unwrap();
+    let sid = manager
+        .create_session(ws, "extended", "fake", "m")
+        .unwrap()
+        .id()
+        .to_string();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    // F064: the durable queue projects FIFO order (empty here) explicitly.
+    let queue = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/queue"),
+    )
+    .await;
+    assert_eq!(queue.status(), 200);
+    let queue: serde_json::Value = queue.json().await.unwrap();
+    assert_eq!(queue["queue"].as_array().unwrap().len(), 0);
+    assert!(queue["nextStepTiming"]
+        .as_str()
+        .unwrap()
+        .contains("queue order"));
+
+    // F071: revision 0 -> 1; a stale expected revision is a typed 409 and
+    // applies nothing.
+    let updated: serde_json::Value = client
+        .put(format!("{base}/native/session/{sid}/settings"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"contextWindow": 8192, "expectedRevision": 0}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["revision"], 1, "{updated}");
+    let stale = client
+        .put(format!("{base}/native/session/{sid}/settings"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"maxTurns": 3, "expectedRevision": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409);
+    let settings = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/settings"),
+    )
+    .await;
+    let settings: serde_json::Value = settings.json().await.unwrap();
+    assert_eq!(settings["contextWindow"], 8192, "{settings}");
+    assert_eq!(settings["maxTurns"], serde_json::Value::Null, "{settings}");
+
+    // F073: a fork writes a durable parent edge; the source has none.
+    let source_lineage = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/lineage"),
+    )
+    .await;
+    let source_lineage: serde_json::Value = source_lineage.json().await.unwrap();
+    assert_eq!(source_lineage["isFork"], false, "{source_lineage}");
+    let fork: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/fork"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"title": "fork"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_id = fork["sessionId"].as_str().unwrap();
+    assert_eq!(fork["lineageDurable"], true, "{fork}");
+    let fork_lineage = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{fork_id}/lineage"),
+    )
+    .await;
+    let fork_lineage: serde_json::Value = fork_lineage.json().await.unwrap();
+    assert_eq!(fork_lineage["isFork"], true, "{fork_lineage}");
+    assert_eq!(
+        fork_lineage["parentSessionId"],
+        sid.as_str(),
+        "{fork_lineage}"
+    );
+
+    // F087: only the computed named artifact is written; the version is
+    // frozen and approval is a receipt (authority unchanged).
+    let plan: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/plan"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"title": "plan", "content": "# Plan\n\n1. do it\n"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plan["artifact"]["version"], 1, "{plan}");
+    assert_eq!(plan["authorityUnchanged"], true, "{plan}");
+    let artifact_path = plan["artifact"]["path"].as_str().unwrap().to_string();
+    assert!(std::path::Path::new(&artifact_path).is_file(), "{plan}");
+    let second: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/plan"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"content": "# Plan v2\n"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["artifact"]["version"], 2, "{second}");
+    let stale_approval = client
+        .post(format!("{base}/native/session/{sid}/plan/1/approve"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_approval.status(), 409, "only the frozen version");
+    let approved: serde_json::Value = client
+        .post(format!("{base}/native/session/{sid}/plan/2/approve"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(approved["authorityUnchanged"], true, "{approved}");
+
+    // F200: the coverage report names shell effects as uncovered and does
+    // not claim checkpoint coverage for them.
+    let coverage = native_get(
+        &client,
+        &base,
+        &token,
+        &format!("/native/session/{sid}/checkpoints/coverage"),
+    )
+    .await;
+    assert_eq!(coverage.status(), 200);
+    let coverage: serde_json::Value = coverage.json().await.unwrap();
+    assert!(
+        coverage["policy"].as_str().unwrap().contains("shell"),
+        "{coverage}"
+    );
+    assert!(coverage["uncovered"].as_array().is_some(), "{coverage}");
+    let _ = handle.request_shutdown();
+}
+
+/// F045 regression: compare starts each candidate in its OWN session/task
+/// scope with an exact served route and a split durable budget; the context
+/// session's own run is untouched (`mainRunUnchanged`).
+#[tokio::test]
+async fn native_models_compare_starts_isolated_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let second = Arc::new(faktor_provider::FakeProvider::with_script(
+        "fake2",
+        faktor_core::model::ModelCapabilities {
+            tools: true,
+            ..Default::default()
+        },
+        vec![
+            faktor_provider::ScriptedResponse::Text("second".into()),
+            faktor_provider::ScriptedResponse::End,
+        ],
+    ));
+    let deps = test_deps_with(dir.path(), vec![second]);
+    let token = deps.auth_token.clone();
+    let manager = deps.session.clone();
+    let ws = manager
+        .create_workspace(dir.path().to_str().unwrap())
+        .unwrap();
+    let sid = manager
+        .create_session(ws, "compare-context", "fake", "m")
+        .unwrap()
+        .id()
+        .to_string();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let response = client
+        .post(format!("{base}/native/models/compare"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "sessionId": sid,
+            "prompt": "compare this",
+            "candidates": [
+                {"provider": "fake", "model": "m"},
+                {"provider": "fake2", "model": "m"}
+            ],
+            "maxCostMicro": 1000,
+            "maxTokens": 100,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let raw = response.text().await.unwrap();
+    assert_eq!(status, 200, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["mainRunUnchanged"], true, "{body}");
+    let candidates = body["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{body}");
+    assert_ne!(
+        candidates[0]["sessionId"], candidates[1]["sessionId"],
+        "each candidate has its own session scope"
+    );
+    assert_eq!(body["budget"]["perCandidateCostMicro"], 500);
+    assert_eq!(body["budget"]["perCandidateTokens"], 50);
+    for candidate in candidates {
+        assert_eq!(candidate["maxCostMicro"], 500, "{candidate}");
+        assert!(candidate["actualModel"].as_str().unwrap().contains('/'));
+    }
+    // Unserved candidates are refused typed before any session is created.
+    let refused = client
+        .post(format!("{base}/native/models/compare"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "sessionId": sid,
+            "prompt": "compare this",
+            "candidates": [
+                {"provider": "fake", "model": "m"},
+                {"provider": "absent", "model": "m"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 409);
     let _ = handle.request_shutdown();
 }

@@ -251,6 +251,27 @@ impl ProviderService {
         })
     }
 
+    /// Acknowledge at boot that this connection's adapter was materialized
+    /// into the runtime provider graph. The row stays durable; its apply
+    /// state becomes `applied` (F037/F042). Unknown ids are a typed NotFound.
+    pub fn mark_applied(&self, id: &str) -> Result<(), FoundationError> {
+        self.db.write("provider apply", |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE provider_connection SET apply_state = 'applied', updated_ms = ?2
+                     WHERE id = ?1",
+                    params![id, now_ms()],
+                )
+                .map_err(|e| FoundationError::Store(e.to_string()))?;
+            if changed == 0 {
+                return Err(FoundationError::NotFound(format!(
+                    "provider connection {id}"
+                )));
+            }
+            Ok(())
+        })
+    }
+
     /// Save one validated connection. Saving NEVER starts a probe and NEVER
     /// claims `Ready`: the apply state is `restart_required` because this
     /// daemon's provider graph is built at boot.

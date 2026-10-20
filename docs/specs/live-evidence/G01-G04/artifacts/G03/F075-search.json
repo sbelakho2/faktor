@@ -1,0 +1,1 @@
+{"hasMore":false,"matches":[{"createdMs":1792457063652,"matchOffset":47,"messageId":21,"role":"assistant","seq":3,"snippet":"The user is asking me to respond with exactly \"OK\".","textLength":51},{"createdMs":1792457062962,"matchOffset":19,"messageId":20,"role":"user","seq":2,"snippet":"Reply with exactly OK.","textLength":22}],"query":"OK","sessionId":"11"}

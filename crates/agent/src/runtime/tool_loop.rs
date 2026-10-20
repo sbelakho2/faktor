@@ -430,6 +430,45 @@ pub(crate) fn fingerprint_tool_versions() -> Vec<ToolVersion> {
     tools
 }
 
+/// Durable tool-enablement fact written by the daemon's admission authority
+/// (config `faktor.permissions.allowedTools` refined by a bound preset's
+/// allow/deny lists). The runtime is the CONSUMER: a tool absent from the
+/// turn's active bundle is never offered to the model, and a stale call is
+/// refused by the bundle-membership guard before any permission hop.
+pub const TOOL_ENABLEMENT_FACT_KIND: &str = "tool_enablement";
+/// Key of the single tool-enablement fact in the session's fact space.
+pub const TOOL_ENABLEMENT_FACT_KEY: &str = "allowed";
+
+/// The effective tool enablement of one turn: `allow` empty means "every
+/// registered tool" (minus `deny`); a non-empty `allow` is the complete
+/// offered set. Denies always win.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ToolEnablement {
+    #[serde(default)]
+    pub(crate) allow: Vec<String>,
+    #[serde(default)]
+    pub(crate) deny: Vec<String>,
+}
+
+impl ToolEnablement {
+    pub(crate) fn permits(&self, name: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|denied| denied == "*" || denied == name)
+        {
+            return false;
+        }
+        self.allow.is_empty() || self.allow.iter().any(|allowed| allowed == name)
+    }
+
+    /// Fail-closed policy for an unreadable/corrupt fact: no tool is offered.
+    fn deny_all(mut self) -> Self {
+        self.deny = vec!["*".to_string()];
+        self
+    }
+}
+
 /// Typed verdict of the bounded durable activation-fact scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolActivationScan {
@@ -456,6 +495,32 @@ impl ToolActivationLoad {
     /// counts: it is the explicit deactivation fact).
     pub(crate) fn found(&self) -> bool {
         self.scan == ToolActivationScan::Found
+    }
+}
+
+/// The scheduler's failure message for ONE aborted tool call. Kept out of
+/// the batch loop so the loop stays below the function-length authority.
+fn scheduler_failure_message(
+    name: &str,
+    scheduler_failure: Option<&faktor_core::error::Error>,
+    status: Option<faktor_scheduler::TaskStatus>,
+    task_error: Option<&str>,
+) -> String {
+    match (scheduler_failure, status) {
+        (Some(err), Some(faktor_scheduler::TaskStatus::Failed)) => match task_error {
+            Some(reason) => format!(
+                "tool {name} failed: {} (scheduler aborted the batch: {err})",
+                truncate(reason, 500)
+            ),
+            None => format!("tool {name} failed (scheduler aborted the batch: {err})"),
+        },
+        (Some(err), _) => {
+            format!("scheduler aborted the batch before tool {name} completed: {err}")
+        }
+        (None, _) => match task_error {
+            Some(reason) => format!("tool {name} failed: {}", truncate(reason, 500)),
+            None => format!("tool {name} failed"),
+        },
     }
 }
 
@@ -988,10 +1053,12 @@ impl AgentRuntime {
             }
 
             // Permission hop (journals ToolRequested).
-            let capability = tool.capability.clone().unwrap_or(Capability::ExecuteShell {
-                command: name.clone(),
-            });
-            let permission = handle.request_permission(turn_op, &capability)?;
+            let capability = tool
+                .capability_for(&input)
+                .unwrap_or(Capability::ExecuteShell {
+                    command: name.clone(),
+                });
+            let permission = handle.request_permission_for_tool(turn_op, &name, &capability)?;
             let decision = self
                 .deps
                 .permission_requester
@@ -1442,7 +1509,8 @@ impl AgentRuntime {
                     Some(op_id),
                     serde_json::json!({ "tool": name, "exit_code": outcome.exit_code }),
                 );
-                collect_tool_summary(turn_summary, &name, &input, &outcome);
+                let mutating = self.tool_is_mutating(&name);
+                collect_tool_summary(turn_summary, &name, &input, &outcome, mutating);
                 // P0-2 remainder: the generic shell's actual change set feeds
                 // the SAME accounting path write_file uses — checkpoint rows
                 // through the session's CheckpointStore, the turn summary's
@@ -1545,15 +1613,12 @@ impl AgentRuntime {
             // batch-level failure as context); every still-open op
             // (Pending/Running/Blocked/Cancelled) records the scheduler
             // failure that abandoned it.
-            let tool_error = match (&scheduler_failure, scheduler.status(op_id)) {
-                (Some(err), Some(faktor_scheduler::TaskStatus::Failed)) => {
-                    format!("tool {name} failed (scheduler aborted the batch: {err})")
-                }
-                (Some(err), _) => {
-                    format!("scheduler aborted the batch before tool {name} completed: {err}")
-                }
-                (None, _) => format!("tool {name} failed"),
-            };
+            let tool_error = scheduler_failure_message(
+                &name,
+                scheduler_failure.as_ref(),
+                scheduler.status(op_id),
+                scheduler.task_error(op_id).as_deref(),
+            );
             // The scheduler's typed failure is the batch outcome and must
             // survive a failed resolution: a lost finish is loud (the row
             // stays durably open for recovery) instead of replacing the
@@ -1825,6 +1890,75 @@ impl AgentRuntime {
                 .tools
                 .retain(|tool| tool.name != crate::tool::SEMANTIC_QUERY_TOOL);
         }
+        self.apply_tool_enablement(&mut bundle, handle);
         bundle
+    }
+
+    /// Runtime tool-enablement authority (F165): remove every disabled tool
+    /// from the OFFERED schema. A corrupt/unreadable fact is fail-closed.
+    fn apply_tool_enablement(
+        &self,
+        bundle: &mut ToolBundle,
+        handle: &faktor_session::SessionHandle,
+    ) {
+        let enablement = self.load_tool_enablement(handle);
+        bundle
+            .tools
+            .retain(|tool| enablement.permits(tool.name.as_str()));
+    }
+
+    /// Conservative mutation classification for summary accounting: unknown
+    /// tools are treated as mutating (a path arg is added only when applied).
+    fn tool_is_mutating(&self, name: &str) -> bool {
+        self.deps
+            .tools
+            .get(name)
+            .map(|tool| {
+                matches!(
+                    tool.resource_class,
+                    faktor_core::resource::ResourceClass::DiskWrite
+                        | faktor_core::resource::ResourceClass::Terminal
+                )
+            })
+            .unwrap_or(true)
+    }
+
+    /// Load the session's durable tool-enablement fact. A missing fact is
+    /// the documented unrestricted default (every previous wave); an
+    /// unreadable/corrupt fact denies every tool.
+    pub(crate) fn load_tool_enablement(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> ToolEnablement {
+        match handle.memory_fact_get(TOOL_ENABLEMENT_FACT_KIND, TOOL_ENABLEMENT_FACT_KEY) {
+            Ok(None) => ToolEnablement::default(),
+            Ok(Some(value)) => match serde_json::from_str::<ToolEnablement>(&value) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        %error,
+                        "tool enablement fact is corrupt; refusing every tool for this turn"
+                    );
+                    ToolEnablement {
+                        allow: Vec::new(),
+                        deny: Vec::new(),
+                    }
+                    .deny_all()
+                }
+            },
+            Err(error) => {
+                tracing::error!(
+                    session = %handle.id(),
+                    %error,
+                    "tool enablement read failed; refusing every tool for this turn"
+                );
+                ToolEnablement {
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                }
+                .deny_all()
+            }
+        }
     }
 }

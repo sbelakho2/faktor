@@ -685,6 +685,40 @@ impl SessionHandle {
         }))
     }
 
+    /// Bounded visible queue rows (F064): the durable FIFO the UI shows.
+    pub fn queue_rows(&self, limit: usize) -> faktor_core::Result<Vec<faktor_store::QueuedPrompt>> {
+        self.manager
+            .store()
+            .queue_rows(self.id, limit)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// One queue row by operation id.
+    pub fn queue_row_by_op(
+        &self,
+        op: OpId,
+    ) -> faktor_core::Result<Option<faktor_store::QueuedPrompt>> {
+        self.manager
+            .store()
+            .queue_row_by_op(self.id, op)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Edit a PENDING queued prompt (steering). Returns false when the row is
+    /// no longer pending (claimed/running): the caller turns that into a
+    /// typed conflict, never a second effect.
+    pub fn edit_queued_prompt(
+        &self,
+        op: OpId,
+        prompt: &str,
+        files: &[String],
+    ) -> faktor_core::Result<bool> {
+        self.manager
+            .store()
+            .edit_queued_prompt(self.id, op, prompt, files)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     pub fn mark_queued_status(&self, queue_seq: i64, status: &str) -> faktor_core::Result<()> {
         Ok(self
             .manager

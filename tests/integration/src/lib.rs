@@ -99,6 +99,7 @@ fn agent_with_registry(
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
         secret_registry: None,
+        receipt_sink: None,
         efficiency: Default::default(),
     })
     .unwrap()
@@ -430,6 +431,7 @@ fn test_agent_deps(
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
         secret_registry: None,
+        receipt_sink: None,
         efficiency: Default::default(),
     }
 }

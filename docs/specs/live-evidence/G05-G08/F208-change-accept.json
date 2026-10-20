@@ -1,0 +1,1 @@
+{"accepted":true,"alreadyCurrent":[],"applied":["live2.txt"],"changeSetId":"base-sh-1a156990d5a0141f-cs","idempotent":true,"integrated":true,"proof":{"note":"partial acceptance is a NEW candidate state; prior full-candidate verification does not certify this subset","requiresReverification":true},"rejected":[]}

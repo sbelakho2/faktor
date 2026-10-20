@@ -1,0 +1,74 @@
+worker plane: disabled state=disabled enabled=false ([worker_plane] not enabled)
+value entitlements: state=disabled enabled=false plans=0 (billing disabled: value features are denied typed; the local product is unaffected)
+sandbox shell execution (agent shell tool): network-capable shell GRANTED BY USER (app-level gates only; NOT equivalent to OS isolation and NOT a network guarantee) (mode=network_capable_user_granted, network_guarantee=none)
+sandbox shell execution (interactive session terminals): network-capable shell GRANTED BY USER (app-level gates only; NOT equivalent to OS isolation and NOT a network guarantee) (mode=network_capable_user_granted, network_guarantee=none)
+sandbox first-run choice: decision=explicit_config platform=macos network_backend=absent record=fail_closed
+sandbox shell contract comes from the explicit [sandbox] shell config key (config wins over any durable first-run record)
+sandbox agent home: policy=scratch scratch_root=/tmp/faktor-live/data/agent-home
+sandbox credential dirs: honest limitation: no OS confinement backend on macos — the per-session scratch HOME keeps $HOME-relative credential discovery empty, but absolute-path reads are not OS-denied
+sandbox network isolation: backend=unavailable (typed platform boundary: no per-process network-isolation backend on macos; DenyAll and BrokerOnly spawns are refused typed, proxy flags are application configuration only) runtime_proof=unavailable
+browser network isolation: app-level proxy only (raw Chromium sockets are NOT OS-confined): platform macos has no OS-level BrokerOnly backend; the browser is proxy-only at the application level and BrokerOnly requests are refused typed
+tokenizers: certified 17 row(s) exact=6 upper_bound=11 unsupported=0
+tokenizer: openai gpt-4o tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-4o-mini tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai o3 tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai o4-mini tokenizer=generic_estimator@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: openai gpt-5 tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-5-mini tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-5-nano tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: anthropic claude-opus-4 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-opus-4-1 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-sonnet-4-5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-haiku-4-5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-sonnet-4 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-haiku-3.5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: google gemini-2.0-flash tokenizer=gemini@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: google gemini-2.5-flash tokenizer=gemini@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: deepseek deepseek-chat tokenizer=generic_estimator@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: ollama default tokenizer=generic_estimator@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+capability authority: ollama default authority=declared_generic gated=false
+capability authority: 0 known, 1 declared_generic, 0 unknown (an unknown row runs with tools/vision/context gated off until the id is declared in the provider's `models` list or a probe establishes it)
+engineering-contract compiler: native baseline OK state=verified obligations=2 selectors_bound=true tokens=race,refresh,token determinism=byte_identical
+live-canary mouser: absent
+live-canary digikey: absent
+live-canary lcsc: absent
+live-canary 1688: absent
+live-canary alibaba: absent
+store: ok
+{
+  "events": 73,
+  "integrity": [],
+  "journal_mode": "wal",
+  "messages": 19,
+  "sessions": 10
+}
+unfinished tool runs across sessions: 0
+deep store integrity scan: ok
+cas blob verification: ok
+cas references: 0 hash(es) all verified
+running tool runs across all sessions: 0
+active logical turns across all sessions: 0
+journal consistency: ok
+cost reservations: 10 (open 0, settled 8, refunded 0, uncertain 2)
+dangling cost reservations: none
+verification records: 0 record(s), 1 completion-relevant task(s), 0 VerifiedComplete task(s)
+verification consistency: ok
+active turns with recoverable owners: 0 of 0 (a live daemon owns the rest in memory)
+session wedges: 0 active turn(s) without a drive (of 0 active), 1 ownerless pending permission(s) (of 1 pending), 0 applied run(s) without verification/integration (of 0 applied-write candidate(s))
+session wedge [ownerless_pending_permission]: pending permission 1 of session 9 (op 1879524506893033472, expires_ms 1792455994837) has no live waiter in this process; the waiter is process-local, so a reader that is not the daemon that parked it (doctor, or a restarted daemon) can never resolve it — the session stays parked until the row is expired or denied
+orphan children: 0 child identity row(s), 0 registry row(s) scanned
+orphan children: none
+process ownership: 0 durable session-owned process row(s) (ownership is in-memory only); daemon-level live children in this process: 0 alive (0 registered, 0 session-owned)
+index embeddings: 2 workspace(s) with persisted index generations
+index embeddings: workspace 1: unconfigured (generation 1, no embedding source was configured at build time)
+index coverage: workspace 1: generation 1: coverage=complete files_seen=8 files_indexed=8 bytes_indexed=1148; fingerprint=complete
+index embeddings: workspace 2: no published generation (machine state failed)
+outcomes: no completed runs recorded
+cloud-db: 2 local commercial database(s) (top-level and nested); LOCAL commercial deployment authority — hosted deployments must move identity/auth/billing/credits/audit/retention to a transactional service
+cloud-db foundation.db: journal_mode=wal synchronous=unrecorded policy=unrecorded integrity=ok tables=31 rows=10 digest=28581dc0fad42b91
+cloud-db foundation.db: no rotating backup
+cloud-db foundation.db: migration restore point: none recorded
+cloud-db store/faktor-plus.db: journal_mode=wal synchronous=unrecorded policy=unrecorded integrity=ok tables=45 rows=297 digest=4c239754c9d09617
+cloud-db store/faktor-plus.db: no rotating backup
+cloud-db store/faktor-plus.db: migration restore point: none recorded
+doctor: 1 issue(s)

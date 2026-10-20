@@ -1,0 +1,1 @@
+{"code":"validation","fieldErrors":[{"code":"unknown_key","key":"faktor.ghost","message":"Unknown setting","scope":"user"}],"message":"validation: [FieldError { key: \"faktor.ghost\", scope: Some(User), code: \"unknown_key\", message: \"Unknown setting\" }]","retryable":false}

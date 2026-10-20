@@ -1,9 +1,11 @@
 # CI enforcement runbook
 
 Status of the release/toolchain enforcement surfaces for
-`sbelakho2/faktor` (GitHub remote `origin`), as of 2026-09-23. "Applied"
-means the action was executed from this checkout via `gh`; "Operator" means
-it needs credentials or a server this checkout does not have.
+`sbelakho2/faktor` (GitHub remote `origin`), as of 2026-10-19 (operator
+state verified against the local Woodpecker 3.18.1 instance and the GitHub
+API at 2026-10-19T23:57Z). "Applied" means the action was executed from this
+checkout via `gh`/the local Woodpecker API; "Operator" means it needs
+credentials or a server this checkout does not have.
 
 | Surface | State | Where |
 | --- | --- | --- |
@@ -14,40 +16,47 @@ it needs credentials or a server this checkout does not have.
 | Committed-artifact hygiene scan (bytecode / build artifacts / opaque extensionless binaries ≥ 64 KiB) with justified load-bearing allowlist and planted-fixture proof | Applied | `tests/static-authority/src/lib.rs` (scan 13), `.gitignore`, `docs/repo-hygiene.md` |
 | Container images pinned by multi-arch index digest (non-Rust) | Applied | `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml`, `.woodpecker/trusted/nightly.yaml`, `scripts/woodpecker/docker-compose.yml` |
 | VS Code E2E toolchain pinned by release version + commit + sha256 in the lane script (verified before extraction; `code --version` must print both) | Applied | `scripts/vscode-e2e.sh`, `.woodpecker/trusted/trusted.yaml` |
-| Lane-bound marker auth: per-lane HMAC `auth` over the canonical unsigned marker, one shared generator, `unattested` (not silent pass) without a token | Applied | `scripts/certification/lane-marker.{sh,mjs,py}`, `scripts/certification/evidence.mjs`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/trusted/nightly.yaml` |
+| Lane-bound marker auth: per-lane HMAC `auth` over the canonical unsigned marker, one shared generator, `unattested` (not silent pass) without a token | Applied | `scripts/certification/lane-marker.{sh,mjs}`, `scripts/certification/evidence.mjs`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/trusted/nightly.yaml` |
 | Invariant criticality + planted-mutation proof: every entry is release-critical by default (its `authority` names the production gate) and must ship a planted `mutation_command`; non-empty `mutation_debt` fails both checker modes, downgrades require `criticality_reason` | Applied | `tests/invariants.toml`, `scripts/check-invariants.mjs`, `scripts/mutation-run.mjs`, `scripts/mutations/*.json`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
-| Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict) and the PR path | Applied | GitHub API |
-| Woodpecker webhook for this repo | Applied (local tunnel) | hook `685914438`, ping `200` |
-| `ci/woodpecker/pr/pr` publication | Applied via single-project switch (upstream 3.18/3.19 has no two-projects-per-repo selector) | Woodpecker server |
-| Commit signature shows `verified:true` on GitHub | Applied (repo-local account noreply identity) | GitHub account + SSH signing key |
-| Release-signing role `faktor-release-signing` | Provisioned (secret matches allowlist) | Woodpecker secret + `scripts/certification/attestation-keys.json` |
+| Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict); the admin bypass is currently **open** (`enforce_admins: false`) | Applied (exact state below) | GitHub API |
+| Woodpecker webhook for this repo | Applied (local tunnel) | hook `685914438`, events push/PR/review/deployment, latest ping `200` at 2026-10-19T23:57Z |
+| `ci/woodpecker/pr/pr` publication | Applied via single-project switch (upstream 3.18/3.19 has no two-projects-per-repo selector) | Woodpecker server, project id 2 |
+| Commit signature shows `verified:true` on GitHub | Applied (repo-local account noreply identity; HEAD `56d415e0`) | GitHub account + SSH signing key |
+| Release-signing role `faktor-release-signing` | Provisioned; secret `faktor_release_signing_key` (events push/tag) public half equals the allowlist entry; fingerprint `SHA256:jp4xtwnKtRAq7PEzI4wGYxHoSTgLJKFQRYZOiC0yYA4` | Woodpecker secret + `scripts/certification/attestation-keys.json` |
 
-## 1. Branch protection (applied)
+## 1. Branch protection (applied; verified 2026-10-19)
 
-`main` now has (verified with
-`gh api repos/sbelakho2/faktor/branches/main`):
+`main` currently has (verified with
+`gh api repos/sbelakho2/faktor/branches/main/protection`):
 
 - required status checks: `["ci/woodpecker/pr/pr"]`, `strict: true`
   (branch must be up to date before merge);
 - a pull request is required before merging (`required_approving_review_count: 0`);
 - force pushes and branch deletion disabled;
-- `enforce_admins: true` after the first exact-SHA `ci/woodpecker/pr/pr`
-  green run. Before that run the bypass stays available (the required context
-  had no publisher); it is closed immediately afterwards:
+- `enforce_admins: false`: the repository-admin bypass is **open**. This is
+  deliberate while the single-project Woodpecker instance is in the
+  untrusted PR shape and can publish only `ci/woodpecker/pr/pr`; the trusted
+  `ci/woodpecker/push/trusted` context is not currently a required check
+  (requiring it with no publisher would block every main push). Close the
+  bypass after the first exact-SHA `ci/woodpecker/pr/pr` green run:
 
   ```sh
+  gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
   gh api --method POST repos/sbelakho2/faktor/branches/main/protection/enforce_admins
   gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
   ```
 
-To re-apply the exact configuration (idempotent PUT):
+  Add `ci/woodpecker/push/trusted` only in the same change that makes the
+  trusted push shape actually publish for `main` (setup.md §2/§7).
+
+To re-apply the exact current configuration (idempotent PUT):
 
 ```sh
 cat > /tmp/protection.json <<'JSON'
 {
   "required_status_checks": { "strict": true, "contexts": ["ci/woodpecker/pr/pr"] },
-  "enforce_admins": true,
+  "enforce_admins": false,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": false,
     "require_code_owner_reviews": false,
@@ -67,15 +76,40 @@ To remove it entirely (only if the Woodpecker project is abandoned):
 ## 2. Woodpecker webhook and PR publication (local, applied)
 
 The local operator instance is Woodpecker 3.18.1 on
-`http://localhost:8010` (container `faktor-woodpecker-server`; SQLite in
-`~/.woodpecker/data`, admin API token in `~/.woodpecker/api-token`, never
-committed). Two agents are registered: `darwin/arm64` (local backend) and
-`linux/amd64` (docker backend). The repository webhook exists and is active:
+`http://localhost:8010` (container `faktor-woodpecker-server`, healthy;
+SQLite in `~/.woodpecker/data`, admin API token in
+`~/.woodpecker/api-token`, never committed). Registered agents include
+`linux/amd64` (docker backend, custom labels) and `darwin/arm64` (local
+backend); they connect to the server's agent port `127.0.0.1:19000`.
+The repository is connected by a **repository webhook, not a GitHub App**,
+and it is active:
+
+- hook `685914438`, events `deployment,pull_request,pull_request_review,push`;
+- current URL origin `https://used-consist-barrier-andy.trycloudflare.com`
+  with the `?access_token=` value masked as `***`;
+- latest ping delivery: `event=ping, status_code=200` at
+  `2026-10-19T23:57:57Z`;
+- latest forge deliveries before the ping: `pull_request 200` and `push 204`.
+
+The current `gh` token cannot enumerate GitHub App installations (those
+endpoints require an App JWT / installation token), so no App state is
+claimed. Woodpecker's forge integration here is the webhook; if an App is
+added later, keep the webhook path as the fail-closed fallback.
+
+Verify the connection without printing the token:
 
 ```sh
-gh api repos/sbelakho2/faktor/hooks --jq '.[] | {id,active,events}'
-gh api --method POST repos/sbelakho2/faktor/hooks/<id>/pings
-gh api 'repos/sbelakho2/faktor/hooks/<id>/deliveries?per_page=1' --jq '.[0] | {event,status_code}'
+gh api repos/sbelakho2/faktor/hooks --jq '.[] | {id,active,events,url:(.config.url|sub("access_token=.*";"access_token=***"))}'
+gh api --method POST repos/sbelakho2/faktor/hooks/685914438/pings
+gh api 'repos/sbelakho2/faktor/hooks/685914438/deliveries?per_page=1' --jq '.[0] | {event,status_code,delivered_at}'
+```
+
+Current project shape (Woodpecker project id 2, verified via
+`GET /api/repos/2`):
+
+```json
+{"config_file":".woodpecker/untrusted/","allow_pr":true,
+ "trusted":{"volumes":false},"timeout":1560,"active":true}
 ```
 
 The hook URL must point at the live tunnel origin and keep its
@@ -87,6 +121,15 @@ it):
 URL=$(grep -o 'https://[a-z-]*\.trycloudflare\.com' ~/.woodpecker/tunnel.log | tail -1)
 # PATCH config.url to "$URL/api/hook?access_token=<existing token>"
 ```
+
+If the webhook/App cannot be created or repaired with the available
+credentials, the exact operator runbook is: obtain a repository-admin token
+(`gh auth refresh -h github.com -s repo,admin:repo_hook`), re-run the hook
+PATCH with the tunnel origin above, POST a ping, and require a `200` before
+touching branch protection. If no `200` is observed, stop fail-closed: do not
+weaken or remove the required context and do not substitute a parent/merge
+SHA. The typed stop condition is `webhook-delivery-not-200`; certify.sh
+`--verify-ci-evidence` only accepts an observed pipeline for the exact SHA.
 
 **Upstream limitation (verified in 3.18.1 and 3.19.0 source):** the server
 has no `?project=` selector and stores one project per forge repository.
@@ -115,12 +158,12 @@ The applied fail-closed sequence for one project (repo id 2) is:
 Never leave `allow_pr=true` on a project that has `trusted.volumes=true`,
 and never point the trusted project at `.woodpecker/untrusted/`.
 
-If no webhook or App can be created with the available credentials, the
-fail-closed stop condition is: do not weaken or remove the required context,
-do not substitute a parent/merge SHA, and record the local trusted run by
-triggering the exact commit on the local server via the API (`POST
-/api/repos/<id>/pipelines` with a manual event is not a release lane; use the
-forge webhook path or a `push`/`pull_request` payload). `certify.sh
+If the tunnel origin cannot be repaired and no webhook/App can be created
+with the available credentials, stop fail-closed: do not weaken or remove the
+required context, do not substitute a parent/merge SHA, and record the local
+trusted run by triggering the exact commit on the local server via the API
+(`POST /api/repos/<id>/pipelines` with a manual event is not a release lane;
+use the forge webhook path or a `push`/`pull_request` payload). `certify.sh
 --verify-ci-evidence` only accepts an observed pipeline for the exact SHA.
 
 If the instance runs elsewhere (hosted CI), the required context string is
@@ -142,11 +185,17 @@ git config user.name "sabelakhoua"
 The signing key is already registered on the account
 (`gh api user/ssh_signing_keys`; ED25519
 `SHA256:aE3x/e/26DPnlX19RR6P3foOCCPaNaL9iNEhH5Ar3s8`, title
-`kiwicaptcha-commit-signing`). The previous `verified:false, reason:no_user`
-came from `belakhoua.s@northeastern.edu` not being an associated account
-email; that address remains unverified because the current `gh` token lacks
-the `user` scope. If the northeastern address must verify instead, the
-operator step is interactive and cannot be automated here:
+`kiwicaptcha-commit-signing`). HEAD `56d415e0` was re-checked with
+`gh api repos/sbelakho2/faktor/commits/56d415e0... --jq
+.commit.verification` and reports `{"verified":true,"reason":"valid"}`
+(`verified_at: 2026-10-19T18:53:59Z`); local
+`git log -1 --show-signature` reports `G` from the same key. The previous
+`verified:false, reason:no_user` came from `belakhoua.s@northeastern.edu` not
+being an associated account email; that address remains unverified because
+the current `gh` token lacks the `user` scope (`gh api user/emails` returns
+HTTP 404). The noreply address is auto-associated, so no email mutation is
+needed. If the northeastern address must verify instead, the operator step is
+interactive and cannot be automated here:
 
 ```sh
 gh auth refresh -h github.com -s user     # interactive browser flow
@@ -280,16 +329,28 @@ CI change is pushed.
   `FAKTOR_ATTEST_SIGN_KEY_PEM`, while the separate `release-signature` step
   signs `faktor-release-signature/v1` with the release role
   `faktor-release-signing` / `release-signing` from
-  `faktor_release_signing_key` / `FAKTOR_RELEASE_SIGN_KEY_PEM` (a
-  `from_secret` to a missing secret is a Woodpecker config error, so those
-  mappings are documented, not hardcoded). Provision the release role on the
-  operator machine with `node scripts/certification/attestation.mjs keygen
-  --role release-signing --out-key release.pem --out-keys release-keys.json`
-  and paste ONLY the public key into the allowlist; until then every
-  release-class verification fails closed with the typed
-  `signature-role-key-missing`, and a verifier asked for one role refuses a
-  signature bound to the other with the typed `signature-role-mismatch`
-  (`scripts/woodpecker/setup.md` §4.2). Operators receive the allowlist as
+  `faktor_release_signing_key` / `FAKTOR_RELEASE_SIGN_KEY_PEM`. That mapping
+  is hardcoded because the trusted project carries the secret (events
+  `push,tag`); a `from_secret` to a missing secret is a Woodpecker config
+  compile error, so the mapping and the secret must always change together.
+  Provisioned state (verified non-interactively): the secret's derived
+  public key equals the allowlist identity `faktor-release-signing` (role
+  `release-signing`, status `active`, `valid_from: 2026-10-19`, public
+  fingerprint `SHA256:jp4xtwnKtRAq7PEzI4wGYxHoSTgLJKFQRYZOiC0yYA4`); the
+  private key exists only in the Woodpecker secret and is never printed,
+  committed, or copied into a log. The tool was exercised against the real
+  secret: `create-release` succeeded and `verify-release --require-signed
+  --role release-signing` passed; with `FAKTOR_RELEASE_SIGN_KEY_PEM` unset it
+  exits 3 with `signing-key-missing` and writes no artifact. Rotation is
+  `keygen --role release-signing` + secret PATCH + public-key-only allowlist
+  update in one change. A verifier asked for one role refuses a signature
+  bound to the other with the typed `signature-role-mismatch`
+  (`scripts/woodpecker/setup.md` §4.2). Exact-SHA binding: the
+  `release-artifacts` marker is written with `--commit $CI_COMMIT_SHA --tree
+  HEAD^{tree}`, the attestation is created with `--source-sha
+  $CI_COMMIT_SHA`, and `release-signature` refuses a build attestation whose
+  source/tree differs from the pipeline before signing, then re-checks the
+  written signature — no release lane can bind a parent/merge SHA. Operators receive the allowlist as
   `FAKTOR_ATTEST_KEYS`. WITHOUT the secret the step exits 3 with the typed
   `signing-key-missing` error and writes NO artifact — there is no unsigned
   code path. The documented alternative is Sigstore/keyless
@@ -329,3 +390,25 @@ values. `--verify-ci-evidence` (renamed from `--ci-only`, which is now
 rejected) always terminates with `CI EVIDENCE: PASS — NOT A RELEASE
 CERTIFICATE`; a release certificate additionally requires the full local
   gates plus a trusted context or a verified signed attestation.
+
+## 7. Setup verification (2026-10-19; no certification/soak lane run)
+
+The operational setup above was verified with configuration/selftest gates
+only. No release certification, trusted pipeline, or soak/fault campaign was
+triggered:
+
+| Gate | Result |
+| --- | --- |
+| `woodpecker-cli lint .woodpecker/` (3 workflows) | PASS |
+| PyYAML parse of all 6 workflow files | PASS |
+| `node scripts/certification/check-workflow-graph.mjs selftest && --check` | PASS |
+| `sh scripts/check-ci-image-pins.sh --selftest && check` | PASS |
+| `bash scripts/certification/tests/selftests.sh` (12 suites) | PASS |
+| `bash scripts/certify.sh --check-gate-parity` | PASS |
+| `bash scripts/check-docs-sync.sh` | PASS |
+| `bash scripts/woodpecker/verify-boundary.sh` (repository layout; server settings not re-asserted) | PASS |
+
+The release-signing secret was exercised only through the local signing tool
+(accept + `verify-release`, and fail-closed without the secret), not through a
+CI lane. The local Woodpecker project remains in the untrusted PR shape; the
+trusted push/tag lanes are configured but were not executed.

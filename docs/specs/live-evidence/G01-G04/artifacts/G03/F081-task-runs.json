@@ -1,0 +1,1 @@
+[{"goal":"Reply with exactly OK.","item_ids":["main"],"mode":"in_session","model":"qwen3.8:latest","run_id":"tx-1a156994b4002800","state":"Verifying","task_id":2},{"goal":"Count from 1 to 40 slowly, one number per line.","item_ids":["main"],"mode":"in_session","model":"qwen3.8:latest","run_id":"tx-1a156994b4002806","state":"Verifying","task_id":2}]

@@ -411,6 +411,7 @@ fn test_agent(
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
         secret_registry: None,
+        receipt_sink: None,
         efficiency: Default::default(),
     })
     .unwrap()

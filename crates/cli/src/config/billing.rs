@@ -38,6 +38,16 @@ use super::*;
 ///   `enterprise_governance` plus the `governance_sso`/`governance_scim`
 ///   capability flags) — so a 100% local deployment with no inference
 ///   limits still maps paid value entitlements;
+/// - `subscription` (optional): provision ONE durable organization
+///   subscription at startup (idempotent `put_subscription`). Without a
+///   subscription row the plan table still resolves (`plan_found`), but
+///   every gated admission and value entitlement is refused
+///   `subscription_inactive`; the local operator therefore needs an
+///   explicit way to record the entitlement they configured. The subsection
+///   names the plan (must exist in `plans`), the status (`active`,
+///   `expired` or `canceled`; default `active`) and an optional derived
+///   expiry (`expires_ms`). The row is provisioned only for the configured
+///   billing organization and never invents an invoice or a vendor event;
 /// - unknown keys, duplicates, non-object shapes and wrong value types are
 ///   parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
@@ -66,11 +76,71 @@ pub struct BillingCfg {
     /// BYOK. Empty = all providers are BYOK.
     #[serde(default)]
     pub managed_providers: Vec<String>,
+    /// The additive `[billing.subscription]` subsection: provision the
+    /// configured plan as an explicit organization subscription at startup.
+    /// Absent = no subscription row is written (admissions stay
+    /// `subscription_inactive`, never silently granted).
+    #[serde(default)]
+    pub subscription: Option<BillingSubscriptionCfg>,
     /// The additive `[billing.report]` schedule: periodically reports the
     /// durable usage fold through the vendor adapter. Absent/disabled = no
     /// schedule rows are written and no vendor call is ever made.
     #[serde(default)]
     pub report: Option<BillingReportCfg>,
+}
+
+/// The `[billing.subscription]` subsection: the explicit local subscription
+/// the operator records for the configured billing organization. It is a
+/// CONFIG statement (no vendor call, no invoice): the durable row is the
+/// same one the entitlement reads consume, so the value gate and the
+/// admission gate agree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingSubscriptionCfg {
+    /// The plan id; it must name one of the `[billing.plans]` entries.
+    pub plan_id: String,
+    /// `active` (default), `expired` or `canceled`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Optional derived expiry (milliseconds since the Unix epoch). An
+    /// `active` row past this instant is inactive, never silently renewed.
+    #[serde(default)]
+    pub expires_ms: Option<i64>,
+}
+
+impl BillingSubscriptionCfg {
+    pub fn status(&self) -> Result<faktor_cloud::SubscriptionStatus, String> {
+        match self.status.as_deref().unwrap_or("active") {
+            "active" => Ok(faktor_cloud::SubscriptionStatus::Active),
+            "expired" => Ok(faktor_cloud::SubscriptionStatus::Expired),
+            "canceled" => Ok(faktor_cloud::SubscriptionStatus::Canceled),
+            other => Err(format!(
+                "billing subscription: unknown status {other:?} (active|expired|canceled)"
+            )),
+        }
+    }
+
+    fn validate(
+        &self,
+        plans: &std::collections::BTreeMap<String, faktor_cloud::PlanConfig>,
+    ) -> Result<(), String> {
+        if self.plan_id.trim().is_empty() {
+            return Err("billing subscription: plan_id must not be empty".into());
+        }
+        if !plans.contains_key(&self.plan_id) {
+            return Err(format!(
+                "billing subscription: plan {:?} is not in the plans table",
+                self.plan_id
+            ));
+        }
+        let _ = self.status()?;
+        if let Some(expires_ms) = self.expires_ms {
+            if expires_ms < 0 {
+                return Err("billing subscription: expires_ms must be >= 0".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The `[billing.report]` section: the durable report schedule over the
@@ -134,6 +204,7 @@ pub const BILLING_FIELDS: &[&str] = &[
     "default_plan",
     "plans",
     "managed_providers",
+    "subscription",
     "report",
 ];
 
@@ -174,7 +245,8 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                         "default_plan" => (64, "default_plan"),
                         "plans" => (128, "plans"),
                         "managed_providers" => (256, "managed_providers"),
-                        "report" => (512, "report"),
+                        "subscription" => (512, "subscription"),
+                        "report" => (1024, "report"),
                         other => return Err(A::Error::unknown_field(other, BILLING_FIELDS)),
                     };
                     if seen & bit != 0 {
@@ -196,6 +268,10 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                             >>()?
                         }
                         256 => out.managed_providers = map.next_value::<Vec<String>>()?,
+                        512 => {
+                            out.subscription =
+                                map.next_value::<Option<BillingSubscriptionCfg>>()?
+                        }
                         _ => out.report = map.next_value::<Option<BillingReportCfg>>()?,
                     }
                 }
@@ -290,6 +366,9 @@ impl BillingCfg {
                 );
             }
             self.build_service_config()?;
+            if let Some(subscription) = &self.subscription {
+                subscription.validate(&self.plans)?;
+            }
         }
         Ok(())
     }
@@ -420,5 +499,95 @@ impl BillingReportCfg {
             max_backoff_ms: max_backoff,
             max_catch_up,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled(body: &str) -> BillingCfg {
+        serde_json::from_str::<BillingCfg>(body).expect("billing section parses")
+    }
+
+    const PLAN: &str = r#""plans":{"p":{"plan_id":"p","features":["credits"],"limits":{}}}"#;
+
+    #[test]
+    fn subscription_is_optional_and_disabled_parity_is_unchanged() {
+        let absent = enabled(r#"{"enabled":false}"#);
+        let explicitly_disabled = enabled(r#"{"enabled":false,"subscription":null}"#);
+        assert_eq!(absent, explicitly_disabled);
+        assert!(absent.subscription.is_none());
+        absent.validate().unwrap();
+    }
+
+    #[test]
+    fn subscription_defaults_to_active_and_validates_its_plan() {
+        let cfg = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p"}}}}"#
+        ));
+        let subscription = cfg.subscription.as_ref().expect("subscription");
+        assert_eq!(
+            subscription.status().unwrap(),
+            faktor_cloud::SubscriptionStatus::Active
+        );
+        cfg.validate().unwrap();
+
+        let unknown_plan = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"missing"}}}}"#
+        ));
+        assert!(unknown_plan
+            .validate()
+            .unwrap_err()
+            .contains("is not in the plans table"));
+
+        let bad_status = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"trialing"}}}}"#
+        ));
+        assert!(bad_status
+            .validate()
+            .unwrap_err()
+            .contains("unknown status"));
+
+        let negative_expiry = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","expires_ms":-1}}}}"#
+        ));
+        assert!(negative_expiry
+            .validate()
+            .unwrap_err()
+            .contains("expires_ms must be >= 0"));
+    }
+
+    #[test]
+    fn hostile_subscription_shapes_are_strict_parse_errors() {
+        for body in [
+            r#"{"subscription":{"plan_id":"p","bogus":true}}"#,
+            r#"{"subscription":{"plan_id":"p"},"subscription":{"plan_id":"p"}}"#,
+            r#"{"subscription":"p"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<BillingCfg>(body).is_err(),
+                "must refuse {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_subscription_parses_and_is_not_renewed() {
+        let cfg = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"expired","expires_ms":1}}}}"#
+        ));
+        cfg.validate().unwrap();
+        let subscription = cfg.subscription.as_ref().unwrap();
+        assert_eq!(
+            subscription.status().unwrap(),
+            faktor_cloud::SubscriptionStatus::Expired
+        );
+    }
+
+    #[test]
+    fn disabled_section_with_subscription_still_validates_shape_only() {
+        let cfg = enabled(r#"{"enabled":false,"subscription":{"plan_id":"absent"}}"#);
+        cfg.validate().unwrap();
     }
 }

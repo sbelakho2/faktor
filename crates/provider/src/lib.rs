@@ -1220,6 +1220,16 @@ pub trait Provider: Send + Sync {
         CapabilityResolution::unknown(self.capabilities(model))
     }
 
+    /// The CONCRETE served model id this provider will put on the wire for a
+    /// requested id. Adapters with synthetic aliases (the Ollama `default`
+    /// id) resolve them here; every other adapter returns the request id
+    /// unchanged. The runtime records the resolved id in the durable turn
+    /// envelope, provider-call rows and receipts, so an alias can never be
+    /// reported as the actual model.
+    fn resolved_model(&self, model: &str) -> String {
+        model.to_string()
+    }
+
     /// A live runtime context bound for `model` in tokens, when the provider
     /// can report one (e.g. an Ollama `/api/ps` allocation clamped by the
     /// probed model maximum — the window actually loaded for the model can
@@ -1392,6 +1402,10 @@ impl Provider for InstanceProvider {
         // (the trait default of ["default"] would collapse every custom
         // endpoint's real catalog on the daemon's routing graph).
         self.inner.known_models()
+    }
+
+    fn resolved_model(&self, model: &str) -> String {
+        self.inner.resolved_model(model)
     }
 
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {

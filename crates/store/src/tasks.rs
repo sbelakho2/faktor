@@ -2936,6 +2936,30 @@ impl Store {
         Ok(out)
     }
 
+    /// Bounded newest-first completed tool runs of one session, INCLUDING
+    /// effects that are `unknown` (shell commands). The checkpoint coverage
+    /// report names those uncovered effects explicitly (F200).
+    pub fn session_completed_tool_runs(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> StoreResult<Vec<ToolRunRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, op_id, tool, args, status, started_ms, ended_ms, effect_status, recovery, expected_hash, replay_descriptor, attempt, postcondition, pre_manifest
+             FROM tool_run
+             WHERE session_id = ?1 AND status != 'running'
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = stmt.query(params![session_id.raw() as i64, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(tool_run_map(row)?);
+        }
+        Ok(out)
+    }
+
     /// Every ACTIVE logical-turn record across ALL sessions (`doctor
     /// --deep`): at most one active turn may exist per session while a
     /// daemon is live, so several active rows after a crash are the durable

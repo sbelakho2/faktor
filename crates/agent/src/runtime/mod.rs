@@ -15,6 +15,12 @@
 //! 24h deadline anywhere: a task that spans days does so across many turns,
 //! restarts and compaction cycles — each one a bounded future.
 
+/// Overall wall-clock bound of ONE model call (streaming included). Large
+/// enough for a local model to finish a long generation (and for a second
+/// child queued behind one local runtime), small enough to stay bounded.
+/// Tool calls keep their own, much smaller `tool_deadline_ms`.
+pub const MODEL_CALL_DEADLINE_MS: u64 = 600_000;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

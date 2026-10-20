@@ -1706,11 +1706,12 @@ fn recovery_terminalization_refusals_are_typed_and_traceless() {
     );
 }
 
-/// A state whose machine has no edge to the failure landing state (here
-/// `WaitingForPermission` with a raw running row) refuses through the
-/// sweep's landing move — typed, before any row transaction.
+/// Startup recovery expires the ownerless permission (no waiter survives a
+/// restart) and then settles the raw running row as Unknown. The old
+/// "no landing edge" refusal can no longer occur for this shape: the
+/// permission expiry is what restores a legal landing edge.
 #[test]
-fn recovery_sweep_refuses_a_state_with_no_landing_edge() {
+fn recovery_sweep_expires_ownerless_permission_and_settles_orphan_row() {
     let dir = fresh_store_dir();
     let session: SessionId;
     let op: OpId;
@@ -1753,22 +1754,30 @@ fn recovery_sweep_refuses_a_state_with_no_landing_edge() {
     let handle = manager.get_session(session).unwrap().unwrap();
     assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
     let (runtime, _keep) = recovery_seam_runtime(manager.clone());
-    let err = runtime.recover().unwrap_err();
-    assert_eq!(
-        err.kind,
-        ErrorKind::InvalidState {
-            from: AgentState::WaitingForPermission,
-            to: AgentState::FailedRecoverable,
-        },
-        "{err}"
-    );
-    assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
-    assert!(handle
-        .pending_tool_runs()
-        .unwrap()
+    let reports = runtime.recover().unwrap();
+    let report = reports
         .iter()
-        .any(|r| r.op_id == op));
-    assert!(!handle.events_range(1, None).unwrap().iter().any(|e| {
+        .find(|report| report.session_id == session)
+        .expect("the parked session is swept");
+    assert_eq!(report.state, AgentState::FailedRecoverable);
+    assert_eq!(report.crashed_ops.len(), 1, "{report:?}");
+    assert_eq!(report.crashed_ops[0].op_id, op);
+    assert_eq!(report.crashed_ops[0].tool, "read_file");
+    assert_eq!(
+        report.crashed_ops[0].effect,
+        faktor_core::op::EffectStatus::Unknown
+    );
+    assert!(report.applied, "the crash row settlement is durable");
+    assert_eq!(handle.state().unwrap(), AgentState::FailedRecoverable);
+    assert!(
+        handle
+            .pending_tool_runs()
+            .unwrap()
+            .iter()
+            .all(|r| r.op_id != op),
+        "the orphan row is settled, never left running"
+    );
+    assert!(handle.events_range(1, None).unwrap().iter().any(|e| {
         e.kind == faktor_core::event::EventKind::RecoveryApplied && e.op_id == Some(op)
     }));
 }

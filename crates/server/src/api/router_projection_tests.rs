@@ -188,6 +188,7 @@ async fn native_projection_after_driven_turn_reports_ledger_files() {
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let manager = session.clone();
@@ -324,6 +325,7 @@ async fn native_projection_prefix_stability_reflects_recorded_observations() {
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let driver = agent.clone();

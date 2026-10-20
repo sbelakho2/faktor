@@ -1,0 +1,11 @@
+touched tests (2026-10-20)
+foundation instructions: 5 passed
+session fork: 4 passed
+session-scoped root: 1 passed
+orchestrator shadow-discard: 1 passed
+server permission: 17 passed
+server create-session binding: 1 passed
+server workspace-drift mapping: 1 passed
+agent capability_for: 1 passed
+agent ownerless recovery: 1 passed
+hooks malformed verdict: 1 passed

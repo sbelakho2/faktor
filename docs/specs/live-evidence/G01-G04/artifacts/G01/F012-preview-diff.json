@@ -1,0 +1,1 @@
+{"affectedScopes":["project"],"changed":1,"changes":[{"applyTiming":"next_task","changed":true,"current":"","currentSource":"default","key":"faktor.defaultModel","next":"default","scope":"project","secretReferenceOnly":false,"writable":true}],"expectedRevision":6,"valid":true}

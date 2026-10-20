@@ -58,9 +58,11 @@ pub use outcome_ledger::{
     OUTCOME_RECORD_SCHEMA_V, SETTLEMENT_SCHEMA_V, TERMINAL_FACTS_SCHEMA_V,
 };
 pub use runtime::{
-    review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,
-    CompletionGate, EvidenceProvider, EvidenceQuery, IntegratedRootVerification, NoEvidence,
-    PermissionRequester, ReviewModelIdentity, ToolArtifactSink, TurnOutcome, VerificationQuality,
+    review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, CallReceiptRecord,
+    CallReceiptSink, ChunkEvent, ChunkSink, CompletionGate, EvidenceProvider, EvidenceQuery,
+    IntegratedRootVerification, NoEvidence, PermissionRequester, ReviewModelIdentity,
+    ToolArtifactSink, TurnOutcome, VerificationQuality, TOOL_ENABLEMENT_FACT_KEY,
+    TOOL_ENABLEMENT_FACT_KIND,
 };
 pub use stall::{StallTracker, DEFAULT_STALL_SILENCE_MS};
 pub use tool::{

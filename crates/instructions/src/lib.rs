@@ -1265,6 +1265,18 @@ pub trait WorkspaceRootProvider: Send + Sync {
         &self,
         workspace_id: u64,
     ) -> Result<Option<PathBuf>, faktor_core::error::Error>;
+
+    /// Session-scoped root resolution. A workspace can legitimately host
+    /// several sessions whose live shadow roots differ; only the requesting
+    /// session's own root is authoritative. The default keeps existing
+    /// workspace-only providers byte-identical.
+    fn workspace_root_for_session(
+        &self,
+        _session_id: u64,
+        workspace_id: u64,
+    ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+        self.workspace_root(workspace_id)
+    }
 }
 
 /// Default bound on cached loaded instruction sets per resolver.
@@ -1373,10 +1385,36 @@ impl InstructionResolver {
         workspace_id: u64,
         pinned_epoch: Option<InstructionEpoch>,
     ) -> Result<LoadedInstructions, RulesLoadError> {
+        let root = self.provider.workspace_root(workspace_id);
+        self.resolve_from_root(workspace_id, root, pinned_epoch)
+    }
+
+    /// Resolve the SAME rule tree the requesting session mutates. Two live
+    /// shadows on one workspace are normal (two sessions); the workspace-only
+    /// probe cannot choose between them, so authority paths use the session's
+    /// own root instead of treating legitimate concurrency as corruption.
+    pub fn resolve_for_session(
+        &self,
+        session_id: u64,
+        workspace_id: u64,
+        pinned_epoch: Option<InstructionEpoch>,
+    ) -> Result<LoadedInstructions, RulesLoadError> {
+        let root = self
+            .provider
+            .workspace_root_for_session(session_id, workspace_id);
+        self.resolve_from_root(workspace_id, root, pinned_epoch)
+    }
+
+    fn resolve_from_root(
+        &self,
+        workspace_id: u64,
+        root: Result<Option<PathBuf>, faktor_core::error::Error>,
+        pinned_epoch: Option<InstructionEpoch>,
+    ) -> Result<LoadedInstructions, RulesLoadError> {
         // Authority law (audit P0/P1): only a LEGITIMATE absence is Empty; an
         // unreadable/ambiguous root authority is a typed refusal, never a
         // silent degradation to "no instructions".
-        let Some(root) = self.provider.workspace_root(workspace_id).map_err(|e| {
+        let Some(root) = root.map_err(|e| {
             RulesLoadError::Unreadable(format!(
                 "workspace root of workspace {workspace_id} is unavailable: {e}"
             ))
@@ -2955,6 +2993,40 @@ mod tests {
         }
     }
 
+    /// Session-scoped provider: two sessions of ONE workspace each carry
+    /// their own live shadow. The workspace-only probe is ambiguous (the
+    /// exact shape two concurrent shadowed drives produce); the session
+    /// path must resolve each drive's OWN world.
+    struct SessionRoots {
+        workspace: PathBuf,
+        by_session: HashMap<u64, PathBuf>,
+    }
+
+    impl WorkspaceRootProvider for SessionRoots {
+        fn workspace_root(
+            &self,
+            _workspace_id: u64,
+        ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+            Err(faktor_core::error::Error::new(
+                faktor_core::ErrorKind::Conflict,
+                "workspace carries more than one live shadow",
+            ))
+        }
+
+        fn workspace_root_for_session(
+            &self,
+            session_id: u64,
+            _workspace_id: u64,
+        ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+            Ok(Some(
+                self.by_session
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.workspace.clone()),
+            ))
+        }
+    }
+
     /// A provider whose durable-root read FAILS (store/IO error): the
     /// resolver must surface a typed refusal, never `Empty` (audit P0/P1
     /// authority law: unreadable ≠ absent).
@@ -2974,6 +3046,37 @@ mod tests {
 
     fn resolver_with(roots: HashMap<u64, PathBuf>, cap: usize) -> InstructionResolver {
         InstructionResolver::new(Arc::new(MapRoots(roots)), cap)
+    }
+
+    #[test]
+    fn resolve_for_session_is_unambiguous_with_two_live_shadows() {
+        // Regression for the parallel-session refusal: two sessions on one
+        // workspace each have a live shadow with DIFFERENT AGENTS.md. The
+        // workspace-only resolve is a typed ambiguity; the session-scoped
+        // resolve loads each session's own rules and epochs.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write(a.path(), "AGENTS.md", "rule: from shadow A\n");
+        write(b.path(), "AGENTS.md", "rule: from shadow B\n");
+        let provider = Arc::new(SessionRoots {
+            workspace: a.path().to_path_buf(),
+            by_session: HashMap::from([(7, a.path().to_path_buf()), (8, b.path().to_path_buf())]),
+        });
+        let resolver = InstructionResolver::new(provider, 8);
+        assert!(matches!(
+            resolver.resolve(1, None),
+            Err(RulesLoadError::Unreadable(_))
+        ));
+        let la = resolver.resolve_for_session(7, 1, None).unwrap();
+        let lb = resolver.resolve_for_session(8, 1, None).unwrap();
+        assert!(la.has_rules() && lb.has_rules());
+        assert_ne!(
+            la.epoch(),
+            lb.epoch(),
+            "each session must see its own shadow's rules"
+        );
+        assert!(la.active_for("rule", &[])[0].content.contains("shadow A"));
+        assert!(lb.active_for("rule", &[])[0].content.contains("shadow B"));
     }
 
     #[test]

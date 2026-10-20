@@ -22,14 +22,14 @@
       "role": "build-attestation",
       "status": "active",
       "valid_from": "2025-09-25",
-      "notes": "Build role only. This is the pre-existing build key migrated off the shared `faktor-ci`/`faktor` identity names; it MUST NOT sign release signatures or be reused as the release key. Rotated by replacing the `faktor_attest_signing_key` secret and this public key in one commit (scripts/woodpecker/setup.md \u00a74.3)."
+      "notes": "Build role only. This is the pre-existing build key migrated off the shared `faktor-ci`/`faktor` identity names; it MUST NOT sign release signatures or be reused as the release key. Rotated by replacing the `faktor_attest_signing_key` secret and this public key in one commit (scripts/woodpecker/setup.md §4.3)."
     },
     "faktor-release-signing": {
-      "ed25519_public_key": "u21V9kXELq4dWnseEjuObOpSfVp0m9yMW68DAnMxf4k=",
+      "ed25519_public_key": "urt1Awt8uT2GAfJQxGa6orZuSDff13hBB89DfwbXncs=",
       "role": "release-signing",
       "status": "active",
-      "valid_from": "2026-10-12",
-      "notes": "Operator-provisioned release role. No private key exists in the repository; generate it on the operator machine with `node scripts/certification/attestation.mjs keygen --role release-signing --out-key release.pem --out-keys release-keys.json`, register the private key as the trusted-project secret `faktor_release_signing_key`, and paste ONLY the public key here per scripts/woodpecker/setup.md \u00a74.2. Until then every release-class verification fails closed with the typed `signature-role-key-missing` refusal."
+      "valid_from": "2026-10-19",
+      "notes": "Operator-provisioned release role (rotated at setup; private key only in the trusted-project Woodpecker secret faktor_release_signing_key). Public fingerprint SHA256:jp4xtwnKtRAq7PEzI4wGYxHoSTgLJKFQRYZOiC0yYA4. This key MUST NOT sign build attestations; verifiers enforce the role split via signature-role-mismatch."
     }
   }
 }

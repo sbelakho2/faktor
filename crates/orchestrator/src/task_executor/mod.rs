@@ -387,6 +387,26 @@ fn run_no_op_disposition(
         .unwrap_or_else(NoOpDisposition::default_for_mutating_task))
 }
 
+/// True when the run's durable policy row carries an EXPLICIT no-op
+/// disposition (as opposed to the mutating-task default). An explicit
+/// `RequiresCriterionProof` run with no reviewer is parked at
+/// `NeedsVerification`; an ordinary empty run keeps `Verifying`.
+fn run_no_op_policy_is_explicit(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<bool, ExecError> {
+    let Some(value) = handle.memory_fact_get(RUN_POLICY_ROW_KIND, run_id)? else {
+        return Ok(false);
+    };
+    let row: RunPolicyRow = serde_json::from_str(&value).map_err(|e| {
+        ExecError::from(DurableStateError::CorruptDurableState {
+            what: format!("run policy row of run {run_id}"),
+            detail: e.to_string(),
+        })
+    })?;
+    Ok(row.no_op_disposition.is_some())
+}
+
 /// Bound and shape of a client submission id (the idempotency key of ONE
 /// logical task start): 1..=64 ASCII bytes of `[0-9a-f-]` (UUID-shaped,
 /// lowercase hex only). The native wire validates this at the DTO boundary;
@@ -3727,6 +3747,7 @@ mod drive_ownership_tests {
             context_prior: None,
             secret_registry: None,
             efficiency: Default::default(),
+            receipt_sink: None,
         })
         .unwrap();
         let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());

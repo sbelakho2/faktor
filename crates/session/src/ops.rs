@@ -85,6 +85,9 @@ pub struct ToolRunHandle {
 pub struct PermissionRequest {
     pub id: i64,
     pub op_id: OpId,
+    /// The concrete tool name (`write_file`, `mcp:rig:echo`, ...). Per-tool
+    /// rules are matched against this, never against a capability class.
+    pub tool_id: String,
     pub capability: Capability,
     pub event_seq: faktor_core::id::EventSeq,
     /// The durable deadline (`permission.expires_ms`). The live requester
@@ -293,6 +296,16 @@ impl SessionHandle {
         self.manager
             .store()
             .record_tool_pre_manifest(self.id, op, pre_manifest)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Bounded newest-first completed tool runs of this session, including
+    /// `unknown` shell effects (the checkpoint coverage report's uncovered
+    /// set).
+    pub fn completed_tool_runs(&self, limit: usize) -> faktor_core::Result<Vec<ToolRunRow>> {
+        self.manager
+            .store()
+            .session_completed_tool_runs(self.id, limit)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
@@ -674,6 +687,19 @@ impl SessionHandle {
         op: OpId,
         capability: &Capability,
     ) -> faktor_core::Result<PermissionRequest> {
+        self.request_permission_for_tool(op, "", capability)
+    }
+
+    /// Permission hop for a CONCRETE tool. `tool_id` is the dispatch name the
+    /// policy window/rules see (`write_file`, `run_command`, `mcp:rig:echo`),
+    /// so per-tool Allow/Ask/Deny rules are enforceable instead of being
+    /// silently collapsed into a capability class.
+    pub fn request_permission_for_tool(
+        &self,
+        op: OpId,
+        tool_id: &str,
+        capability: &Capability,
+    ) -> faktor_core::Result<PermissionRequest> {
         let _guard = self.command_guard();
         if self.ops().tracked(op).is_none() {
             return Err(SessionError::NotFound(format!("operation {op} is not tracked")).into());
@@ -712,6 +738,7 @@ impl SessionHandle {
         Ok(PermissionRequest {
             id,
             op_id: op,
+            tool_id: tool_id.to_string(),
             capability: capability.clone(),
             event_seq,
             expires_ms,
@@ -941,6 +968,22 @@ impl SessionHandle {
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         let _guard = self.command_guard();
         self.expire_pending_permissions_locked()
+    }
+
+    /// Startup recovery: every still-pending permission row is OWNERLESS —
+    /// the live waiter is process-local and the daemon that parked it is
+    /// gone, so no resolver can ever answer it. Terminalize them as
+    /// `expired` (never a fake Deny) regardless of the deadline; otherwise a
+    /// crash mid-permission parks the session until a deadline that no UI
+    /// can shorten. Distinct from [`Self::expire_pending_permissions`],
+    /// which preserves the bounded "deadline in the future" contract for
+    /// recovery inside a live daemon.
+    pub fn expire_ownerless_pending_permissions(
+        &self,
+        reason: &str,
+    ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
+        let _guard = self.command_guard();
+        self.expire_pending_permissions_locked_until(i64::MAX, reason)
     }
 
     /// [`Self::expire_pending_permissions`] without taking the command guard
@@ -1667,6 +1710,57 @@ mod tests {
         assert!(s.expire_pending_permissions().unwrap().is_empty());
         assert_eq!(s.last_event_seq().unwrap().unwrap(), seq_after);
         assert!(seq_after > seq_before);
+    }
+
+    #[test]
+    fn startup_expiry_terminalizes_an_ownerless_permission_before_its_deadline() {
+        // Regression: a SIGKILL mid-permission leaves a pending row whose
+        // in-process waiter is gone. The deadline can be hours away, but no
+        // resolver can ever own the row after restart; startup must expire
+        // it (typed as PermissionExpired) instead of parking the session.
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (_d, _clock, m) = clocked_manager(t0);
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ExecuteShell {
+                    command: "board_read".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::WaitingForPermission);
+        let resolution = s
+            .expire_ownerless_pending_permissions("daemon restart: waiter process is gone")
+            .unwrap();
+        assert_eq!(resolution.expired, vec![(req.id, op)]);
+        assert!(s.pending_permission(req.id).unwrap().is_none());
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+        assert_eq!(
+            m.store().permission_decision(req.id).unwrap().as_deref(),
+            Some("expired")
+        );
+        let expiry: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EventKind::PermissionExpired)
+            .collect();
+        assert_eq!(expiry.len(), 1);
+        assert_eq!(
+            expiry[0].payload.as_ref().unwrap()["reason"],
+            "daemon restart: waiter process is gone"
+        );
+        // Idempotent: the next startup sweep finds nothing.
+        assert!(s
+            .expire_ownerless_pending_permissions("daemon restart: waiter process is gone")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2881,5 +2975,74 @@ mod tests {
                 "deny"
             })
         );
+    }
+    /// F200: the checkpoint coverage report's data source exposes completed
+    /// shell runs with `unknown` effects (never dropped by the applied-only
+    /// query).
+    #[test]
+    fn completed_tool_runs_include_unknown_shell_effects() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_waiting(&s);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
+        let op = meta.operation_id;
+        s.start_tool_run(
+            meta,
+            "run_command",
+            serde_json::json!({"command": "touch x"}),
+        )
+        .unwrap();
+        s.finish_tool_run(op, "completed", EffectStatus::Unknown)
+            .unwrap();
+        let rows = s.completed_tool_runs(10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].tool, "run_command");
+        assert_eq!(rows[0].effect_status, "unknown");
+        assert_eq!(rows[0].op_id, op);
+    }
+    /// F064/F084: the durable queue projection/order, pending-only edit and
+    /// removal are real store semantics (an edit of a claimed row is false;
+    /// a removed row can never be re-claimed).
+    #[test]
+    fn queue_rows_edit_and_remove_are_durable_and_pending_only() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let store = m.store();
+        let first = faktor_core::id::OpId::new(101);
+        let second = faktor_core::id::OpId::new(102);
+        store
+            .enqueue_prompt(
+                s.id(),
+                first,
+                "first prompt",
+                &["a.rs".into()],
+                Some("m"),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        store
+            .enqueue_prompt(s.id(), second, "second prompt", &[], None, None, None, 2)
+            .unwrap();
+        let rows = s.queue_rows(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].op_id, first);
+        assert_eq!(rows[0].prompt, "first prompt");
+        assert_eq!(rows[0].status, "pending");
+        assert_eq!(rows[1].op_id, second);
+        assert!(s.edit_queued_prompt(first, "edited", &[]).unwrap());
+        let row = s.queue_row_by_op(first).unwrap().unwrap();
+        assert_eq!(row.prompt, "edited");
+        assert!(row.files.is_empty());
+        // Removal is the durable cancel: the row can never be claimed.
+        assert_eq!(s.cancel_queued_ops(&[second]).unwrap(), 1);
+        assert_eq!(
+            s.queue_row_by_op(second).unwrap().unwrap().status,
+            "cancelled"
+        );
+        // A non-pending row is refused by the edit authority.
+        s.mark_queued_status(row.queue_seq, "claimed").unwrap();
+        assert!(!s.edit_queued_prompt(first, "again", &[]).unwrap());
     }
 }

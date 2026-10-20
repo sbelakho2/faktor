@@ -19,6 +19,7 @@ faktor-scheduler.workspace = true
 faktor-semantic.workspace = true
 tracing.workspace = true
 faktor-fs.workspace = true
+faktor-edit.workspace = true
 faktor-git.workspace = true
 faktor-instructions.workspace = true
 faktor-terminal.workspace = true

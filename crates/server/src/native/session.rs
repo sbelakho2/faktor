@@ -1484,6 +1484,14 @@ pub(crate) async fn native_create_session(
         .create_session(ws, &title, &provider, &model)
     {
         Ok(handle) => {
+            // Bind the fresh session to the workspace's real owner worktree
+            // before it can run. A fresh row carries the standalone default
+            // worktree 1; when any other worktree row already exists the
+            // first shadowed mutating run refused "no registered worktree
+            // row". The adoption is idempotent.
+            if let Err(e) = state.deps.session.ensure_owner_worktree(handle.id()) {
+                return api_err(&e);
+            }
             // SessionStart lifecycle hook (audit): the durable row exists
             // now, and the session has not been used yet — the SAME
             // ordering as the ACP daemon entry. Best-effort: the registry
@@ -1684,7 +1692,7 @@ fn prompt_admission_digest(
 /// the durable turn facts.
 pub(crate) fn prompt_receipt_json(receipt: &PromptReceipt) -> String {
     serde_json::json!({
-        "op_id": receipt.op_id.to_string(),
+        "op_id": receipt.op_id.map(|op| op.to_string()),
         "run_id": receipt.run_id,
         "accepted": receipt.accepted,
         "queued": receipt.queued,
@@ -1773,6 +1781,9 @@ pub(crate) async fn native_prompt(
     // execution journals; startup recovery then rebuilds the receipt from
     // the durable turn/queue facts instead of guessing.
     let files = req.files.unwrap_or_default();
+    if let Err(response) = super::task::write_tool_enablement(&state, &_handle, None) {
+        return response;
+    }
     let store = state.deps.session.store();
     let digest = prompt_admission_digest(sid, &req.prompt, &files);
     let reserved_op = match state.deps.session.try_next_op_id() {
@@ -1875,6 +1886,7 @@ pub(crate) async fn native_prompt(
         submission_id: None,
         reserved_op_id: Some(reserved_op),
         admission_digest: Some(digest),
+        max_turns: super::task::session_turn_cap(&state, sid),
         ..Default::default()
     };
     match service.prompt(sid, request).await {
@@ -2223,6 +2235,53 @@ mod tests {
         let (status, body) = json_body(response).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!body["id"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_binds_the_workspace_owner_worktree() {
+        // Regression: sessions created over HTTP carried the standalone
+        // default worktree id 1. With any earlier worktree row on the daemon,
+        // their first shadowed mutating run refused "no registered worktree
+        // row"; creation must adopt the workspace's real owner worktree.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = test_state(dir.path(), "seed");
+        let mut headers = authed_headers(&state);
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let workspace = dir.path().join("live-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let response = super::native_create_session(
+            State(state.clone()),
+            headers,
+            Ok(Json(NativeCreateSessionRequest {
+                provider: "fake".into(),
+                model: "m".into(),
+                workspace: Some(workspace.to_string_lossy().into_owned()),
+                title: Some("owned".into()),
+            })),
+        )
+        .await;
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sid: u64 = body["id"].as_str().unwrap().parse().unwrap();
+        let handle = state
+            .deps
+            .session
+            .get_session(faktor_core::id::SessionId::new(sid))
+            .unwrap()
+            .unwrap();
+        let row = handle.row().unwrap();
+        let worktrees = state.deps.session.worktrees_of(row.workspace_id).unwrap();
+        assert!(
+            worktrees
+                .iter()
+                .any(|w| w.id as u64 == row.worktree_id.raw()),
+            "session {} must own a registered worktree row, got {:?}",
+            sid,
+            worktrees
+        );
     }
 
     fn authed_headers(state: &AppState) -> HeaderMap {
@@ -3489,7 +3548,8 @@ mod tests {
             .unwrap();
         let expected = prompt_receipt_json(&PromptReceipt {
             run_id: reservation,
-            op_id: op,
+            op_id: Some(op),
+            mode: faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession,
             queued: submitted.queued,
             accepted: true,
         });

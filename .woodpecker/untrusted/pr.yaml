@@ -186,8 +186,9 @@ steps:
         node scripts/programme/run-selection.mjs --selection target/certification/programme/selection.json
         CMDS
         )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+        sh scripts/certification/lane-marker.sh write \
           --lane programme-selection --status passed \
+          --commands "$CMDS" \
           --artifact target/certification/programme/selection.json \
           --artifact target/certification/programme/selection-run.json \
           --artifact target/certification/programme/selected-cargo.sh \
@@ -580,8 +581,9 @@ steps:
         node scripts/edition5/run.mjs --no-verify
         CMDS
         )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+        sh scripts/certification/lane-marker.sh write \
           --lane edition5 --status passed \
+          --commands "$CMDS" \
           --artifact target/certification/edition5-summary.json \
           --out target/certification/lanes/edition5.json
   # ---------------------------- Edition 8 gates (both hosts, linux) -----
@@ -634,8 +636,9 @@ steps:
         node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
         CMDS
         )"
-        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+        sh scripts/certification/lane-marker.sh write \
           --lane edition8 --status passed \
+          --commands "$CMDS" \
           --artifact target/certification/edition8-summary.json \
           --artifact target/certification/edition8/registry.json \
           --artifact target/certification/edition8/control-exercise-vscode.json \

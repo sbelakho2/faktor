@@ -1020,11 +1020,26 @@ fn git_plumbing_never_copied_git_or_plain_root() {
         .expect("the copy skips .git, so the byte cap is not hit");
     let row = shadow_row_of(&fix);
     assert_eq!(row.base_entries, 3, "only the three content files copied");
+    // The shadow carries a LOCAL git VIEW (HEAD/config/refs/alternates), never
+    // a copy of the owner's object database or plumbing.
     assert!(
-        !shadow.root.join(".git").exists(),
-        "no plumbing in the shadow"
+        shadow.root.join(".git/config").is_file(),
+        "the shadow git view is materialized"
+    );
+    assert!(
+        shadow.root.join(".git/objects/info/alternates").is_file(),
+        "objects resolve through the owner's object dir"
+    );
+    assert!(
+        !shadow.root.join(".git/objects/aa/bb").exists(),
+        "no object bytes are copied into the shadow"
     );
     assert!(fix.user.join(".git/HEAD").exists(), "user .git untouched");
+    assert_eq!(
+        fs::read(fix.user.join(".git/HEAD")).unwrap(),
+        b"ref: refs/heads/main",
+        "the shadow view never rewrites the owner's HEAD"
+    );
     drive_write(&fix, "a.txt", b"alpha via git-root shadow");
     // Staging after the write yields only content entries (never .git).
     let manifest = fix.shadows.present_change_set(fix.session).unwrap();
@@ -1455,4 +1470,106 @@ fn accept_change_set_refuses_an_incomplete_decision_without_writing() {
     assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
     assert_eq!(user_bytes(&fix, "sub/b.txt"), b"beta");
     assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Active);
+}
+
+/// F195 regression: the agent shell's shadow root resolves `.git` and can
+/// run the real read/diff commands against the CANDIDATE tree, while the
+/// owner checkout's index/HEAD stay byte-identical.
+#[test]
+fn shadow_git_view_runs_status_and_diff_against_the_candidate_only() {
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs")
+    }
+    let fix = open_fix(default_limits());
+    assert!(git(&fix.user, &["init", "-q", "-b", "main"])
+        .status
+        .success());
+    assert!(git(&fix.user, &["add", "."]).status.success());
+    assert!(git(&fix.user, &["commit", "-q", "-m", "base"])
+        .status
+        .success());
+    let owner_head = git(&fix.user, &["rev-parse", "HEAD"]).stdout;
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    // Read-only git works in the shadow at all (the live failure was 128).
+    let inside = git(&shadow.root, &["rev-parse", "--is-inside-work-tree"]);
+    assert!(inside.status.success(), "{inside:?}");
+    assert_eq!(String::from_utf8_lossy(&inside.stdout).trim(), "true");
+    let status = git(&shadow.root, &["status", "--porcelain"]);
+    assert!(status.status.success(), "{status:?}");
+    assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    // A candidate edit is visible to the shadow's git diff/status.
+    fs::write(shadow.root.join("a.txt"), b"alpha candidate edit").unwrap();
+    let diff = git(&shadow.root, &["diff", "--stat"]);
+    assert!(diff.status.success(), "{diff:?}");
+    assert!(
+        String::from_utf8_lossy(&diff.stdout).contains("a.txt"),
+        "{}",
+        String::from_utf8_lossy(&diff.stdout)
+    );
+    let status = git(&shadow.root, &["status", "--porcelain"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("a.txt"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    // The owner never sees the candidate and its HEAD/index are unchanged.
+    assert_eq!(
+        fs::read(fix.user.join("a.txt")).unwrap(),
+        b"alpha",
+        "owner content untouched"
+    );
+    let owner_status = git(&fix.user, &["status", "--porcelain"]);
+    assert!(String::from_utf8_lossy(&owner_status.stdout)
+        .trim()
+        .is_empty());
+    assert_eq!(git(&fix.user, &["rev-parse", "HEAD"]).stdout, owner_head);
+}
+
+/// F201/F202 regression: per-hunk acceptance rewrites ONLY the selected
+/// hunks, re-stages a new candidate identity, and lands through the same
+/// transactional acceptance path. The unselected hunk never reaches the
+/// owner.
+#[test]
+fn selected_hunks_land_alone_and_change_the_candidate_identity() {
+    let fix = open_fix(default_limits());
+    let base: String = (1..=12)
+        .map(|i| format!("line {i}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    fs::write(fix.user.join("a.txt"), &base).unwrap();
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let candidate = base
+        .replace("line 2\n", "LINE TWO SELECTED\n")
+        .replace("line 10\n", "LINE TEN REJECTED\n");
+    fs::write(shadow.root.join("a.txt"), &candidate).unwrap();
+    let before = fix.shadows.present_change_set(fix.session).unwrap();
+    let outcome = fix
+        .shadows
+        .accept_selected_hunks(
+            fix.session,
+            &std::collections::BTreeMap::from([(PathBuf::from("a.txt"), vec![0usize])]),
+            &[],
+        )
+        .expect("the first hunk is accepted");
+    let owner = fs::read_to_string(fix.user.join("a.txt")).unwrap();
+    assert!(owner.contains("LINE TWO SELECTED"), "{owner}");
+    assert!(owner.contains("line 10\n"), "unselected hunk kept: {owner}");
+    assert!(!owner.contains("LINE TEN REJECTED"), "{owner}");
+    assert!(outcome.integrated);
+    assert_eq!(outcome.selected, vec![PathBuf::from("a.txt")]);
+    assert_ne!(
+        outcome.candidate_identity,
+        before.id(),
+        "partial acceptance is a NEW candidate identity"
+    );
+    assert_eq!(outcome.candidate_files, 1);
 }

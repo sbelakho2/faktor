@@ -662,3 +662,32 @@ async fn structured_handoff_availability_states_reach_the_parent_prompt() {
     assert!(system.contains("approach: bounded"));
     assert!(system.contains("src/lib.rs"));
 }
+
+/// Regression: the model-call request reused the 30 s TOOL deadline as its
+/// overall stream bound. A local generation (and the second of two
+/// concurrent children queueing on one Ollama runtime) hit "stream exceeded
+/// its 30000 ms overall deadline" mid-answer. The durable request must carry
+/// the model-call bound; tool calls keep their own much smaller deadline.
+#[test]
+fn model_request_deadline_is_the_model_bound_not_the_tool_bound() {
+    let src = include_str!("request.rs");
+    let at = src
+        .find("pub(crate) fn build_request")
+        .expect("build_request present");
+    let body = &src[at..];
+    let end = body
+        .find("GenericAgentRequest {")
+        .and_then(|i| body[i..].find('}'))
+        .map(|i| i + 400)
+        .unwrap_or(body.len().min(4000));
+    let request = &body[..end.min(body.len())];
+    assert!(
+        request.contains("deadline_ms: crate::runtime::MODEL_CALL_DEADLINE_MS"),
+        "the model request must use the model bound"
+    );
+    assert!(
+        !request.contains("deadline_ms: self.deps.tool_deadline_ms"),
+        "the model request must never inherit the tool deadline"
+    );
+    const { assert!(crate::runtime::MODEL_CALL_DEADLINE_MS >= 60_000) };
+}

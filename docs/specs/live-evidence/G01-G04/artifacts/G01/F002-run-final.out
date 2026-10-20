@@ -1,0 +1,6 @@
+- **Root** — `README.md` describes a live multi-language test workspace; three sub-projects live under `rust/`, `js/`, and `py/`.
+- **Rust** — `rust/calc` is a small crate (`Cargo.toml`, `src/lib.rs`) with a failing test.
+- **JS / Python** — `js/` is a Node ESM package (`package.json`, `src/sum.js`, `test/sum.test.js`) with a failing test, and `py/` is a Python package (`calc.py`, `test_calc.py`) with a failing unittest.
+
+Note: the goal reads only `cli run` and the three projects each carry a failing test — want me to run the test suites and get them passing?
+final state: ready

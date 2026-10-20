@@ -88,7 +88,7 @@ fn load_instructions(
     let row = handle.row().map_err(|e| api_err(&e))?;
     let resolver = &state.deps.agent.deps().instructions_resolver;
     let loaded = resolver
-        .resolve(row.workspace_id.raw(), None)
+        .resolve_for_session(handle.id().raw(), row.workspace_id.raw(), None)
         .map_err(|e| conflict("instructions_unavailable", e.to_string()))?;
     let epoch = loaded.epoch().map(|epoch| epoch.to_string());
     let bundle_hash = match loaded.instructions() {

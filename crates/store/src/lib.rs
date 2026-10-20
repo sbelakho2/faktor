@@ -211,6 +211,7 @@ mod tasks;
 pub use tasks::*;
 mod ledger;
 mod longtask;
+mod queue_store;
 mod task_completion_guard;
 pub use ledger::*;
 pub use longtask::*;

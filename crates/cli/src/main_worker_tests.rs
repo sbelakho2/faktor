@@ -94,6 +94,7 @@ pub(crate) fn test_agent(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     AgentRuntime::new(deps).unwrap()
 }

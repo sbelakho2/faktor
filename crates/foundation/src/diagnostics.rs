@@ -42,6 +42,10 @@ pub struct ToolSummary {
     pub name: String,
     pub source: String,
     pub health: String,
+    /// The tool's declared input schema (compact JSON). Secrets are redacted
+    /// by the bundle pass; the whole bundle stays bounded and schema-tagged.
+    #[serde(default)]
+    pub schema: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +177,7 @@ pub fn export(
                 name: redact(&t.name, &policy),
                 source: redact(&t.source, &policy),
                 health: redact(&t.health, &policy),
+                schema: redact(&t.schema, &policy),
             })
             .collect(),
         settings: facts
@@ -273,6 +278,7 @@ mod tests {
                 name: "read_file".into(),
                 source: "builtin".into(),
                 health: "ready".into(),
+                schema: "{\"type\":\"object\"}".into(),
             }],
             settings: vec![SettingSummary {
                 key: "faktor.retry.maxAttempts".into(),

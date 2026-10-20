@@ -126,6 +126,7 @@ pub(crate) fn deps_with(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     (deps, dir)
 }
@@ -182,6 +183,7 @@ pub(crate) fn deps_sharing_session(
             context_prior: None,
             secret_registry: None,
             efficiency: Default::default(),
+            receipt_sink: None,
         },
         dir,
     )
@@ -934,6 +936,7 @@ pub(crate) fn verified_rust_env(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     (deps, dir, root)
 }
@@ -1308,6 +1311,7 @@ pub(crate) fn review_env(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     (deps, dir, root)
 }

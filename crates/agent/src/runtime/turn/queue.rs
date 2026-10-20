@@ -600,9 +600,83 @@ impl AgentRuntime {
     pub fn recover(&self) -> faktor_core::Result<Vec<RecoveryReport>> {
         let mut reports = Vec::new();
         for h in self.deps.session.list_sessions(None)? {
+            // Startup: no live driver exists in this process. A pending
+            // permission from the previous generation has no waiter that can
+            // ever resolve it; expire it NOW (never a fake Deny), otherwise a
+            // crash mid-permission parks the session until a deadline no UI
+            // can shorten. A live in-process driver (tests, re-recover) keeps
+            // the bounded deadline contract.
+            let live = h
+                .active_turn_record()?
+                .map(|rec| h.turn_cancellation(rec.turn_op_id).is_some())
+                .unwrap_or(false);
+            if !live {
+                if let Err(e) = h.expire_ownerless_pending_permissions(
+                    "daemon startup: the waiter process that parked this permission is gone",
+                ) {
+                    tracing::warn!(
+                        session = %h.id(),
+                        error = %e,
+                        "ownerless permission expiry failed; the session sweep continues"
+                    );
+                }
+            }
             reports.push(self.recover_session(&h)?);
         }
         Ok(reports)
+    }
+
+    /// Resume interrupted logical turns after a restart: every durable ACTIVE
+    /// turn record with no live in-process driver is re-driven on its
+    /// recorded identity (same op, provider, model, journal). Bounded to
+    /// `max` concurrent resumes; returns how many were kicked. A resume
+    /// failure is logged and leaves the durable record for a later explicit
+    /// resume — never a silent re-run of a completed turn.
+    pub fn kick_interrupted_turns(self: &Arc<Self>, max: usize) -> usize {
+        let mut kicked = 0;
+        let sessions = match self.deps.session.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!(error = %e, "interrupted-turn resume: session list unreadable");
+                return 0;
+            }
+        };
+        for h in sessions {
+            if kicked >= max {
+                break;
+            }
+            let record = match h.active_turn_record() {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(session = %h.id(), error = %e, "interrupted-turn resume: record unreadable");
+                    continue;
+                }
+            };
+            if h.turn_cancellation(record.turn_op_id).is_some() {
+                continue;
+            }
+            let this = self.clone();
+            let handle = h.clone();
+            tokio::spawn(async move {
+                if let Err(e) = this.continue_record(&handle, &record).await {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        turn = %record.turn_op_id,
+                        error = %e,
+                        "interrupted turn resume failed; the durable record stays for an explicit retry"
+                    );
+                }
+            });
+            kicked += 1;
+        }
+        if kicked > 0 {
+            tracing::warn!(
+                resumed = kicked,
+                "resuming interrupted turn(s) after restart"
+            );
+        }
+        kicked
     }
 
     /// Compensation surface for callers outside this file that must preserve

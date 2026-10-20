@@ -179,10 +179,26 @@ on the trusted project only:
 
 The local operator instance is Woodpecker 3.18.1 on
 `http://localhost:8010` with a SQLite store under `~/.woodpecker/data`, an
-admin token in `~/.woodpecker/api-token` (never committed) and two live
-agents (`darwin/arm64` local backend, `linux/amd64` docker backend). The
-repository webhook is active and answered a GitHub ping with HTTP 200; repo
-id 2 is the single Woodpecker project for `sbelakho2/faktor`.
+admin token in `~/.woodpecker/api-token` (never committed) and registered
+agents for `darwin/arm64` (local backend) and `linux/amd64` (docker backend,
+custom labels; the agent channel is `127.0.0.1:19000`). Repo id 2 is the
+single Woodpecker project for `sbelakho2/faktor`, currently in the untrusted
+shape `config_file=.woodpecker/untrusted/`, `allow_pr=true`,
+`trusted.volumes=false`, `timeout=1560`.
+
+The repository is connected through a **repository webhook**, not a GitHub
+App (the current `gh` token cannot enumerate App installations; those
+endpoints require an App JWT/installation token). Hook `685914438` is active
+with events `deployment,pull_request,pull_request_review,push`; its URL
+origin is the live tunnel and its query token is never printed. A ping was
+delivered with HTTP `200` at `2026-10-19T23:57:57Z`, and the preceding forge
+deliveries were `pull_request 200` / `push 204`. Verify with:
+
+```sh
+gh api repos/sbelakho2/faktor/hooks --jq '.[] | {id,active,events,url:(.config.url|sub("access_token=.*";"access_token=***"))}'
+gh api --method POST repos/sbelakho2/faktor/hooks/685914438/pings
+gh api 'repos/sbelakho2/faktor/hooks/685914438/deliveries?per_page=1' --jq '.[0] | {event,status_code,delivered_at}'
+```
 
 **Verified upstream limitation:** Woodpecker 3.18.1 and 3.19.0 have no
 `?project=` selector and store one project per forge repository (checked in
@@ -294,24 +310,41 @@ secret before the workflow is compiled. Provision it in order:
 node scripts/certification/attestation.mjs keygen \
   --role release-signing --out-key release.pem \
   --out-keys release-keys.json --key-id faktor-release-signing
-# 2. register the private key as its OWN trusted-project secret
-bash scripts/woodpecker/activate.sh <owner/repo> \
-  --secret "faktor_release_signing_key=$(cat release.pem)"
+# 2. register the private key as its OWN trusted-project secret (never print it).
+#    Single-project server (this checkout, repo id 2): PATCH the secret directly
+#    with events push/tag. Do NOT run activate.sh's trusted step here.
+jq -Rs '{value:.,events:["push","tag"]}' release.pem > secret.json
+curl -sS -X PATCH \
+  -H "Authorization: Bearer $WOODPECKER_TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @secret.json \
+  "$WOODPECKER_HOST/api/repos/2/secrets/faktor_release_signing_key"
+rm -f secret.json release.pem
+#    Two-project server: bash scripts/woodpecker/activate.sh <owner/repo> \
+#      --secret "faktor_release_signing_key=$(cat release.pem)"
 # 3. paste only the PUBLIC key from release-keys.json into
 #    scripts/certification/attestation-keys.json under identity
-#    `faktor-release-signing`, and uncomment the
-#    FAKTOR_RELEASE_SIGN_KEY_PEM mapping in .woodpecker/trusted/trusted.yaml
+#    `faktor-release-signing` (the FAKTOR_RELEASE_SIGN_KEY_PEM mapping in
+#    .woodpecker/trusted/trusted.yaml is enabled for the registered secret)
 # 4. re-run the trusted pipeline; certify.sh then fetches the
 #    release-signature log block and verifies it with the release role
 ```
 
-PROVISIONED STATE (this checkout, verified non-interactively): the trusted
-project secret `faktor_release_signing_key` holds an ed25519 PKCS#8 key
-whose derived public key equals the allowlist entry
-`faktor-release-signing` (`status: active`, `valid_from: 2026-10-12`;
-public fingerprint `SHA256:q1RKo31uh1NPHRPKCCGMQkUk5YOtBGtmgOu3jVOeivo`).
-The private key is never printed, committed or copied into a log. Verify the
-binding without exposing it:
+PROVISIONED STATE (this checkout, rotated and verified non-interactively on
+2026-10-19): the trusted project secret `faktor_release_signing_key` holds an
+ed25519 PKCS#8 key whose derived public key equals the allowlist entry
+`faktor-release-signing` (`role: release-signing`, `status: active`,
+`valid_from: 2026-10-19`; public fingerprint
+`SHA256:jp4xtwnKtRAq7PEzI4wGYxHoSTgLJKFQRYZOiC0yYA4`). The secret event
+filter is `push,tag`. The separate build identity `faktor-ci-build` was also
+re-verified (`role: build-attestation`, secret `faktor_attest_signing_key`,
+fingerprint `SHA256:bRTF8Co9xzyC2ijmbp7tkx6OBXWM+GWM5xaCQ5S3rI0`); the two
+roles/keys are not interchangeable. The private keys are never printed,
+committed or copied into a log. The signing tool was exercised against the
+real release secret: `create-release` succeeded and
+`verify-release --require-signed --role release-signing` passed; with
+`FAKTOR_RELEASE_SIGN_KEY_PEM` unset it exits 3 with the typed
+`signing-key-missing` refusal and writes no artifact. Verify the binding
+without exposing it:
 
 ```sh
 val=$(sqlite3 -readonly ~/.woodpecker/data/woodpecker.sqlite \
@@ -328,6 +361,16 @@ published, and certification refuses the release class (`release-signing
 role (release-signing) signature: absent`) — a build attestation alone can
 never print a RELEASE CERTIFICATE. Never reuse `faktor_attest_signing_key`
 for this role.
+
+Exact-SHA binding (configured, not executed by this setup): the
+`release-artifacts` marker is written with explicit
+`--commit "$CI_COMMIT_SHA" --tree "$(git rev-parse 'HEAD^{tree}')"`, the
+build attestation is created with `--source-sha "$CI_COMMIT_SHA"`, and the
+`release-signature` step refuses to use an attestation whose source/tree
+differs from the pipeline before signing, then re-checks the written
+signature. A stale/foreign attestation exits non-zero with
+`release-source-sha-mismatch` / `release-tree-sha-mismatch` /
+`release-binding-mismatch` instead of signing.
 
 The same `attestation` step resolves the OBSERVED Woodpecker pipeline id
 before signing: certification binds `pipeline_id` to the API's own id for
@@ -481,8 +524,25 @@ campaign lanes are cut off at the cap) until that changes.
 
 ## 7. Branch protection / required status checks
 
-Woodpecker reports one commit status per workflow, so branch protection
-must require BOTH the PR context and the main-push context:
+**Current operator state (verified 2026-10-19):** `main` requires only
+`ci/woodpecker/pr/pr` with `strict: true`; `enforce_admins` is **false**, so
+the repository-admin bypass is open. This is the truthful state while the
+single-project server runs the untrusted PR shape and therefore cannot
+publish `ci/woodpecker/push/trusted`. Close the bypass after the first
+exact-SHA `ci/woodpecker/pr/pr` green run:
+
+```sh
+gh api --method POST repos/sbelakho2/faktor/branches/main/protection/enforce_admins
+gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
+```
+
+Do not add the push context to branch protection until the trusted shape
+actually publishes for `main`; a required context with no publisher blocks
+every merge.
+
+For a full two-project or hosted instance, Woodpecker reports one commit
+status per workflow, so branch protection must require BOTH the PR context
+and the main-push context:
 
 - the PR check `ci/woodpecker/pr/pr` (untrusted project), and
 - the main-push check `ci/woodpecker/push/trusted` (trusted project).

@@ -1,0 +1,12 @@
+URL: http://127.0.0.1:11434/api/tags
+{"allowed":null,"reason":"loopback requires an explicit opt-in","origin":null,"destination":null,"class":"loopback","status":null}
+URL: http://192.168.1.10/admin
+{"allowed":null,"reason":"the destination class is not permitted by the network boundary","origin":null,"destination":null,"class":"private","status":null}
+URL: http://169.254.169.254/latest/meta-data
+{"allowed":null,"reason":"the destination class is not permitted by the network boundary","origin":null,"destination":null,"class":"link_local","status":null}
+URL: http://[::1]:11434/
+{"allowed":null,"reason":"loopback requires an explicit opt-in","origin":null,"destination":null,"class":"loopback","status":null}
+URL: http://localhost:11434/
+{"allowed":null,"reason":"loopback requires an explicit opt-in","origin":null,"destination":null,"class":"loopback","status":null}
+URL: http://user:pass@127.0.0.1:11434/
+{"allowed":null,"reason":null,"origin":null,"destination":null,"class":null,"status":null}

@@ -176,6 +176,7 @@ fn deps_on_manager_with_tool(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     }
 }
 

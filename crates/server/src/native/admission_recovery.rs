@@ -33,15 +33,20 @@ pub use faktor_orchestrator::runtime::task_executor::AdmissionRecoverySummary;
 /// receipt shape (the table's stored value). A missing op id cannot happen
 /// for an in-session fact; it is refused typed rather than guessed.
 fn prompt_receipt_json_from_task(receipt: &TaskRunReceipt) -> Result<String, ExecError> {
-    let op_id = receipt.op_id.ok_or_else(|| {
-        ExecError::Internal(format!(
-            "recovered in-session prompt fact {} carries no op id",
+    // A remote placement has no local turn op; every other mode must carry
+    // one (a missing op id on an in-session/orchestrated fact is corrupt).
+    if receipt.op_id.is_none()
+        && receipt.mode != faktor_orchestrator::runtime::task_executor::TaskRunMode::Remote
+    {
+        return Err(ExecError::Internal(format!(
+            "recovered prompt fact {} carries no op id",
             receipt.run_id
-        ))
-    })?;
+        )));
+    }
     Ok(prompt_receipt_json(&PromptReceipt {
         run_id: receipt.run_id.clone(),
-        op_id,
+        op_id: receipt.op_id,
+        mode: receipt.mode,
         queued: receipt.queued,
         accepted: true,
     }))
@@ -162,4 +167,36 @@ pub fn recover_pending_admissions(sessions: &Arc<SessionManager>) -> AdmissionRe
     };
     summary.merge(&recover_pending_prompt_admissions(sessions));
     summary
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use faktor_orchestrator::runtime::task_executor::{TaskRunMode, TaskRunReceipt};
+
+    #[test]
+    fn remote_prompt_receipt_serializes_without_a_local_op_id() {
+        let receipt = TaskRunReceipt {
+            run_id: "job_remote_1".into(),
+            mode: TaskRunMode::Remote,
+            op_id: None,
+            queued: true,
+        };
+        let json = prompt_receipt_json_from_task(&receipt).expect("remote receipt is valid");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["op_id"], serde_json::Value::Null);
+        assert_eq!(parsed["run_id"], "job_remote_1");
+        assert_eq!(parsed["queued"], true);
+    }
+
+    #[test]
+    fn in_session_prompt_receipt_without_op_id_stays_loud() {
+        let receipt = TaskRunReceipt {
+            run_id: "run_1".into(),
+            mode: TaskRunMode::InSession,
+            op_id: None,
+            queued: false,
+        };
+        assert!(prompt_receipt_json_from_task(&receipt).is_err());
+    }
 }

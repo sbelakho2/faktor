@@ -939,14 +939,152 @@ impl IndexService {
         Ok(found)
     }
 
+    /// The root this workspace's index should build from RIGHT NOW: a LIVE
+    /// shadow only while its directory still exists, otherwise the stored
+    /// durable workspace root. A shadow root is a TRANSIENT view — it is
+    /// deleted at turn settlement, and a build bound to it would fail with
+    /// `build_started`/0 bytes and could never serve the durable workspace
+    /// again (F123/F130).
+    fn resolved_root(&self, workspace: WorkspaceId) -> Result<PathBuf, IndexError> {
+        if let Some(shadow) = self.workspace_live_shadow_root(workspace)? {
+            if shadow.is_dir() {
+                return Ok(shadow);
+            }
+            tracing::info!(
+                workspace = workspace.raw(),
+                shadow = %shadow.display(),
+                "live shadow root is gone (settled); the index rebinds to the durable workspace root"
+            );
+        }
+        Ok(PathBuf::from(
+            self.inner
+                .store
+                .workspace_root(workspace)?
+                .ok_or_else(|| IndexError::UnknownWorkspace(workspace.raw(), "no row".into()))?,
+        ))
+    }
+
+    /// Point the live entry at `root`, restarting the watcher handle. The
+    /// caller owns the lock-state reset (a rebuild must not resume cursors
+    /// from the OLD tree).
+    fn adopt_root(&self, live: &mut LiveWs, workspace: WorkspaceId, root: &Path) {
+        live.root = Some(root.to_path_buf());
+        live.handle = match self.inner.fs.open(workspace, root.to_path_buf()) {
+            Ok(h) => Some(Arc::new(h)),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = workspace.raw(),
+                    root = %root.display(),
+                    "index root re-open failed ({}); fingerprint reconciliation only",
+                    e
+                );
+                None
+            }
+        };
+    }
+
+    /// Re-resolve the build root when the previously bound root vanished
+    /// (a shadow deleted at settlement): reset the in-memory accumulation
+    /// and drop the stale partial generation so the next pass scans the
+    /// durable root from the beginning. Returns false when the root did not
+    /// change (a genuinely unreadable root keeps its honest failure).
+    fn rebind_lost_root(
+        &self,
+        workspace: WorkspaceId,
+        target: u64,
+        stale_root: &Path,
+    ) -> Result<bool, IndexError> {
+        if stale_root.is_dir() {
+            return Ok(false);
+        }
+        let resolved = self.resolved_root(workspace)?;
+        if resolved == stale_root {
+            return Ok(false);
+        }
+        let stale_generation = generation_file_path(&self.inner.data_root, workspace, target);
+        let _ = std::fs::remove_file(stale_generation);
+        let mut live = lock_recover(&self.inner.live);
+        let Some(l) = live.get_mut(&workspace) else {
+            return Ok(false);
+        };
+        self.adopt_root(l, workspace, &resolved);
+        l.coverage = None;
+        l.fingerprint_coverage = None;
+        l.pending_load = false;
+        l.building = false;
+        l.building_since = None;
+        l.pending = true;
+        tracing::warn!(
+            workspace = workspace.raw(),
+            target,
+            stale = %stale_root.display(),
+            rebound = %resolved.display(),
+            "index build root vanished mid-generation; rebinding to the durable root and restarting the batch"
+        );
+        Ok(true)
+    }
+
+    /// Re-point an ALREADY-ATTACHED workspace whose bound root vanished
+    /// (normally a shadow deleted at settlement). Unlike [`Self::rebind_lost_root`]
+    /// this runs at a machine-step boundary and invalidates the published
+    /// content/coverage: the old generation was scanned from the transient
+    /// tree and must be rebuilt from the durable root.
+    fn ensure_bound_root_current(&self, workspace: WorkspaceId) -> Result<bool, IndexError> {
+        let (bound, generation) = {
+            let live = lock_recover(&self.inner.live);
+            let Some(l) = live.get(&workspace) else {
+                return Ok(false);
+            };
+            let Some(bound) = l.root.clone() else {
+                return Ok(false);
+            };
+            if bound.is_dir() {
+                return Ok(false);
+            }
+            (bound, l.state.generation().unwrap_or(l.row_generation))
+        };
+        let resolved = self.resolved_root(workspace)?;
+        if resolved == bound {
+            return Ok(false);
+        }
+        let stale_generation = generation_file_path(&self.inner.data_root, workspace, generation);
+        let _ = std::fs::remove_file(stale_generation);
+        let mut live = lock_recover(&self.inner.live);
+        let Some(l) = live.get_mut(&workspace) else {
+            return Ok(false);
+        };
+        self.adopt_root(l, workspace, &resolved);
+        l.coverage = None;
+        l.fingerprint_coverage = None;
+        l.pending_load = false;
+        l.building = false;
+        l.building_since = None;
+        l.dirty_now = true;
+        l.pending = true;
+        tracing::warn!(
+            workspace = workspace.raw(),
+            stale = %bound.display(),
+            rebound = %resolved.display(),
+            "index root vanished after attach; rebuilding from the durable workspace root"
+        );
+        Ok(true)
+    }
+
     /// Register a workspace: mirror its durable state row, open its watcher
     /// handle, and kick the reconciliation worker. Idempotent and cheap;
     /// NEVER blocks on a build. Failures (unknown/unresolvable workspace)
     /// are errors the caller turns into fallback behavior.
     pub fn attach(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         {
-            let live = lock_recover(&self.inner.live);
-            if live.contains_key(&workspace) {
+            let mut live = lock_recover(&self.inner.live);
+            if let Some(l) = live.get_mut(&workspace) {
+                // A settled shadow can leave an existing attachment bound to
+                // a root that no longer exists. Re-arm the machine so the
+                // next pass rebinds instead of idling on Failed/partial
+                // coverage forever (F130).
+                if l.root.as_ref().is_none_or(|root| !root.is_dir()) {
+                    l.pending = true;
+                }
                 drop(live);
                 self.inner.notify.notify_one();
                 self.spawn_worker_if_possible();
@@ -965,14 +1103,7 @@ impl IndexService {
         // from the SHADOW root (evidence/watch reflect the mutated world).
         // Zero shadows keep the stored root; ambiguity or a corrupt registry
         // degrades to the stored root loudly (never a guessed root).
-        let root = match self.workspace_live_shadow_root(workspace)? {
-            Some(shadow) => shadow,
-            None => {
-                PathBuf::from(self.inner.store.workspace_root(workspace)?.ok_or_else(|| {
-                    IndexError::UnknownWorkspace(workspace.raw(), "no row".into())
-                })?)
-            }
-        };
+        let root = self.resolved_root(workspace)?;
         let handle = match self.inner.fs.open(workspace, root.clone()) {
             Ok(h) => Some(Arc::new(h)),
             Err(e) => {
@@ -1353,6 +1484,12 @@ impl IndexService {
                     }
                 }
             }
+        }
+        // A bound shadow root deleted since the previous pass invalidates
+        // the published generation BEFORE any fingerprint round can declare
+        // the (now empty) tree clean against it.
+        if self.ensure_bound_root_current(workspace)? {
+            // MarkDirty/claim happen through the normal machine steps below.
         }
         // 2. Machine steps (bounded loop; at most one build per call).
         for _ in 0..8 {
@@ -1870,6 +2007,15 @@ impl IndexService {
             )?;
             return Ok(BuildOutcome::Ran);
         };
+        // A shadow root deleted since the claim is rebound BEFORE any scan:
+        // the generation was claimed against a transient root.
+        if self.rebind_lost_root(workspace, target, &root)? {
+            // The stale partial generation was dropped and the mirror is
+            // pending against the durable root: the next pass scans it from
+            // the beginning. Never journal a durable failure for a root that
+            // merely settled.
+            return Ok(BuildOutcome::Ran);
+        }
         // Build-time embedding is configured per service (additive API); the
         // source snapshot is read once so an in-flight build is stable.
         let source_config = self.embedding_config();
@@ -2003,6 +2149,12 @@ impl IndexService {
             let batch = match scan_content_batch(&root, &cursor, &cfg, pace, cancel) {
                 Ok(batch) => batch,
                 Err(e) => {
+                    // The shadow root can be deleted WHILE this batch scans
+                    // (turn settlement). That is not a build failure: rebind
+                    // to the durable root and let the next pass restart.
+                    if self.rebind_lost_root(workspace, target, &root)? {
+                        return Ok(BuildOutcome::Ran);
+                    }
                     self.fail_build(workspace, target, &expected_json, e)?;
                     return Ok(BuildOutcome::Ran);
                 }
@@ -2097,6 +2249,9 @@ impl IndexService {
                         pass
                     }
                     Err(e) => {
+                        if self.rebind_lost_root(workspace, target, &root)? {
+                            return Ok(BuildOutcome::Ran);
+                        }
                         // A fingerprint that cannot be read can never be
                         // declared clean: the generation is superseded
                         // through the Dirty hop, and the rebuild will surface

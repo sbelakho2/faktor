@@ -357,6 +357,37 @@ fn contract_refusal(code: &'static str, message: String) -> ApiError {
     }
 }
 
+/// The model selector a saved preset contributes to a task start. The task
+/// executor carries ONE model id; the PROVIDER is the session's own routing
+/// authority. A preset that names a DIFFERENT provider therefore cannot be
+/// applied silently (the old code joined it into `provider/model`, which
+/// reached Ollama as a nonexistent model id and failed the turn with a 404).
+/// Same-provider presets contribute their exact model id; a different
+/// provider is a typed refusal until the executor can switch providers.
+fn preset_model_selector(
+    preset_provider: &str,
+    preset_model: &str,
+    session_provider: &str,
+) -> Result<Option<String>, ApiError> {
+    if preset_model.is_empty() {
+        return Err(contract_refusal(
+            "malformed",
+            "the bound preset names an empty model id".into(),
+        ));
+    }
+    if preset_provider != session_provider {
+        return Err(ApiError {
+            code: "preset_provider_unsupported",
+            message: format!(
+                "the bound preset selects provider {preset_provider:?} but this session runs on {session_provider:?}; a preset cannot switch the session provider"
+            ),
+            http_status: 409,
+            retryable: false,
+        });
+    }
+    Ok(Some(preset_model.to_string()))
+}
+
 /// Validate one user-authored contract string list: bounded count, every
 /// entry non-empty (after trimming) and bounded in bytes. `what` names the
 /// list in the refusal message.
@@ -543,6 +574,7 @@ pub(crate) async fn native_task_run_start(
     // captured durably BEFORE any plan validation, so even a refused start
     // leaves a replay-proof binding. A read-only preset refuses mutating
     // plans; a plan-less mutating admission is refused explicitly.
+    let mut bound_envelope: Option<faktor_foundation::presets::PresetEnvelope> = None;
     if let Some(preset_id) = req.preset_id.as_deref() {
         let foundation = match state.deps.foundation.as_deref() {
             Some(foundation) => foundation,
@@ -593,13 +625,31 @@ pub(crate) async fn native_task_run_start(
                 });
             }
         }
+        bound_envelope = Some(envelope.clone());
         if req.model.is_none() {
-            if let Some(binding) = envelope.role_models.get("coder") {
-                req.model = Some(format!("{}/{}", binding.provider, binding.model));
+            let session_provider = match handle.row() {
+                Ok(row) => row.provider,
+                Err(e) => {
+                    return wire_status(ApiError {
+                        code: "internal",
+                        message: format!("session row unreadable: {e}"),
+                        http_status: 500,
+                        retryable: false,
+                    })
+                }
+            };
+            let selector = if let Some(binding) = envelope.role_models.get("coder") {
+                preset_model_selector(&binding.provider, &binding.model, &session_provider)
             } else if let (Some(provider), Some(model)) =
                 (envelope.model_provider.as_ref(), envelope.model_id.as_ref())
             {
-                req.model = Some(format!("{provider}/{model}"));
+                preset_model_selector(provider, model, &session_provider)
+            } else {
+                Ok(None)
+            };
+            match selector {
+                Ok(selector) => req.model = selector,
+                Err(e) => return wire_status(e),
             }
         }
     }
@@ -629,6 +679,9 @@ pub(crate) async fn native_task_run_start(
     // workspace holds NO worktree row at all, so a workspace with rows
     // left the session unbound and shadowed runs refused with a 409. The
     // registration is idempotent and self-healing for older sessions.
+    if let Err(response) = write_tool_enablement(&state, &handle, bound_envelope.as_ref()) {
+        return response;
+    }
     if let Err(e) = state.deps.session.ensure_owner_worktree(sid) {
         return api_err(&e);
     }
@@ -727,6 +780,7 @@ pub(crate) async fn native_task_run_start(
                 model: req.model,
                 max_tokens: req.max_tokens,
                 max_cost_micro: req.max_cost_micro,
+                max_turns: session_turn_cap(&state, sid),
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
             };
@@ -736,8 +790,8 @@ pub(crate) async fn native_task_run_start(
             };
             faktor_orchestrator::runtime::task_executor::TaskRunReceipt {
                 run_id: prompt_receipt.run_id,
-                mode: faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession,
-                op_id: Some(prompt_receipt.op_id),
+                mode: prompt_receipt.mode,
+                op_id: prompt_receipt.op_id,
                 queued: prompt_receipt.queued,
             }
         }
@@ -1994,7 +2048,10 @@ mod engineering_contract_dto_tests {
 
 /// The resolved B-09 turn bound: the per-session setting wins, else the
 /// served workspace descriptor; an absent value leaves the daemon default.
-fn session_turn_cap(state: &AppState, session: faktor_core::id::SessionId) -> Option<u32> {
+pub(crate) fn session_turn_cap(
+    state: &AppState,
+    session: faktor_core::id::SessionId,
+) -> Option<u32> {
     let foundation = state.deps.foundation.as_deref()?;
     if let Ok(Some(value)) = foundation.session_settings.get(
         session.raw(),
@@ -2010,4 +2067,275 @@ fn session_turn_cap(state: &AppState, session: faktor_core::id::SessionId) -> Op
         .ok()
         .flatten()
         .and_then(|turns| u32::try_from(turns).ok())
+}
+
+#[cfg(test)]
+mod preset_model_selector_tests {
+    use super::*;
+
+    /// Regression: a preset's model provider was joined into the model id
+    /// (`ollama/qwen3.8:latest`) and sent verbatim to the adapter, which
+    /// failed the first tool-less turn with an HTTP 404 "model not found".
+    #[test]
+    fn same_provider_preset_contributes_the_exact_model_id() {
+        assert_eq!(
+            preset_model_selector("ollama", "qwen3.8:latest", "ollama").unwrap(),
+            Some("qwen3.8:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn different_provider_preset_is_a_typed_refusal_not_a_joined_model() {
+        let err = preset_model_selector("openai", "gpt-4o", "ollama").unwrap_err();
+        assert_eq!(err.code, "preset_provider_unsupported");
+        assert_eq!(err.http_status, 409);
+        assert!(
+            err.message.contains("cannot switch the session provider"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_preset_model_is_malformed() {
+        let err = preset_model_selector("ollama", "", "ollama").unwrap_err();
+        assert_eq!(err.code, "malformed");
+    }
+}
+
+/// Compute and durably record the EFFECTIVE tool enablement of this session
+/// before a run starts (F165). Authority inputs:
+///
+/// - `faktor.permissions.allowedTools` (config, NextTask) — a non-empty list
+///   is the baseline allow set;
+/// - the bound preset's `tool_allow`/`tool_deny` — an allow list INTERSECTS
+///   the config baseline, denies always win.
+///
+/// The runtime consumes the fact when it builds the turn's tool bundle, so a
+/// disabled tool is absent from the offered schema AND refused by the
+/// bundle-membership guard if a stale model call names it.
+#[allow(clippy::result_large_err)]
+pub(crate) fn write_tool_enablement(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+    envelope: Option<&faktor_foundation::presets::PresetEnvelope>,
+) -> Result<(), Response> {
+    let mut config_allow: Vec<String> = state
+        .deps
+        .foundation
+        .as_ref()
+        .and_then(|foundation| {
+            foundation
+                .config
+                .value("faktor.permissions.allowedTools")
+                .ok()
+                .flatten()
+        })
+        .and_then(|value| value.as_array().cloned())
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    config_allow.sort();
+    config_allow.dedup();
+    let preset_allow: Vec<String> = envelope
+        .map(|envelope| envelope.tools.allow.clone())
+        .unwrap_or_default();
+    let mut deny: Vec<String> = envelope
+        .map(|envelope| envelope.tools.deny.clone())
+        .unwrap_or_default();
+    deny.sort();
+    deny.dedup();
+    let allow = match (config_allow.is_empty(), preset_allow.is_empty()) {
+        // No restriction at either authority: the documented all-tools
+        // default (denies still apply).
+        (true, true) => Vec::new(),
+        (false, true) => config_allow,
+        (true, false) => preset_allow,
+        (false, false) => {
+            let preset: std::collections::BTreeSet<&str> =
+                preset_allow.iter().map(String::as_str).collect();
+            let mut narrowed: Vec<String> = config_allow
+                .into_iter()
+                .filter(|name| preset.contains(name.as_str()))
+                .collect();
+            narrowed.sort();
+            narrowed.dedup();
+            narrowed
+        }
+    };
+    let value = serde_json::json!({ "allow": allow, "deny": deny }).to_string();
+    handle
+        .upsert_memory_fact(
+            faktor_agent::TOOL_ENABLEMENT_FACT_KIND,
+            faktor_agent::TOOL_ENABLEMENT_FACT_KEY,
+            &value,
+        )
+        .map_err(|e| {
+            wire_status(ApiError {
+                code: "internal",
+                message: format!("tool enablement authority write failed: {e}"),
+                http_status: 500,
+                retryable: false,
+            })
+        })?;
+    Ok(())
+}
+
+const MAX_COMPARE_CANDIDATES: usize = 4;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeCompareBody {
+    /// The session supplying the WORKSPACE context (the comparison never
+    /// reads or mutates this session's run).
+    pub session_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub submission_id: Option<String>,
+    pub candidates: Vec<NativeCompareCandidate>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_cost_micro: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeCompareCandidate {
+    pub provider: String,
+    pub model: String,
+}
+
+/// `POST /native/models/compare` — bounded side-by-side comparison of exact
+/// served models on the SAME captured prompt (F045). Each candidate runs in
+/// its OWN session/task scope with its own durable route/budget; the calling
+/// session and its run are never touched. The candidates share the requested
+/// budget (split evenly) and are capped at [`MAX_COMPARE_CANDIDATES`].
+pub(crate) async fn native_models_compare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<NativeCompareBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid model comparison body")),
+    };
+    if body.prompt.trim().is_empty() {
+        return wire_status(malformed_body("comparison prompt is empty"));
+    }
+    if body.candidates.len() < 2 || body.candidates.len() > MAX_COMPARE_CANDIDATES {
+        return wire_status(ApiError {
+            code: "malformed",
+            message: format!("comparison needs 2..={MAX_COMPARE_CANDIDATES} candidates"),
+            http_status: 400,
+            retryable: false,
+        });
+    }
+    let context = match state
+        .deps
+        .session
+        .get_session(match body.session_id.parse::<u64>() {
+            Ok(id) => faktor_core::id::SessionId::new(id),
+            Err(_) => {
+                return wire_status(malformed_body("sessionId must be a u64"));
+            }
+        }) {
+        Ok(Some(handle)) => handle,
+        Ok(None) => return wire_status(not_found("session")),
+        Err(e) => return api_err(&e),
+    };
+    let workspace = match context.row() {
+        Ok(row) => row.workspace_id,
+        Err(e) => return api_err(&e),
+    };
+    for candidate in &body.candidates {
+        if state
+            .deps
+            .agent
+            .deps()
+            .providers
+            .capabilities(&candidate.provider, &candidate.model)
+            .is_none()
+        {
+            return crate::native::foundation_ext::conflict(
+                "unserved_comparison_model",
+                format!(
+                    "candidate {}/{} is not served by this daemon",
+                    candidate.provider, candidate.model
+                ),
+            );
+        }
+    }
+    let count = body.candidates.len() as u64;
+    let per_candidate_cost = body.max_cost_micro.map(|cap| cap / count);
+    let per_candidate_tokens = body.max_tokens.map(|cap| cap / count);
+    let submission = body
+        .submission_id
+        .unwrap_or_else(|| format!("{:x}-{:x}", context.id().raw(), state.deps.started_ms));
+    let prompts = PromptExecutionService::from_state(&state);
+    let mut candidates = Vec::with_capacity(body.candidates.len());
+    for (index, candidate) in body.candidates.iter().enumerate() {
+        let title = format!("compare: {}/{}", candidate.provider, candidate.model);
+        let fork = match state.deps.session.create_session(
+            workspace,
+            &title,
+            &candidate.provider,
+            &candidate.model,
+        ) {
+            Ok(handle) => handle,
+            Err(e) => return api_err(&e),
+        };
+        let run = PromptExecutionService::comparison_candidate_run(
+            body.prompt.clone(),
+            format!("{submission}-{index}"),
+            candidate.model.clone(),
+            body.prompt.clone(),
+            body.files.clone(),
+            body.criteria.clone(),
+            per_candidate_tokens,
+            per_candidate_cost,
+            native_run_parent_caps(),
+        );
+        let receipt = match prompts.start_comparison_candidate(
+            fork.id(),
+            run,
+            session_turn_cap(&state, fork.id()),
+        ) {
+            Ok(receipt) => receipt,
+            Err(e) => return exec_error_response(&e),
+        };
+        candidates.push(serde_json::json!({
+            "provider": candidate.provider,
+            "model": candidate.model,
+            "sessionId": fork.id().to_string(),
+            "runId": receipt.run_id,
+            "opId": receipt.op_id.map(|op| op.raw().to_string()),
+            "actualModel": format!("{}/{}", candidate.provider, candidate.model),
+            "maxCostMicro": per_candidate_cost,
+            "maxTokens": per_candidate_tokens,
+        }));
+    }
+    Json(serde_json::json!({
+        "comparisonId": submission,
+        "workspaceId": workspace.raw().to_string(),
+        "mainRunUnchanged": true,
+        "budget": {
+            "maxCostMicro": body.max_cost_micro,
+            "maxTokens": body.max_tokens,
+            "perCandidateCostMicro": per_candidate_cost,
+            "perCandidateTokens": per_candidate_tokens,
+        },
+        "candidates": candidates,
+    }))
+    .into_response()
 }

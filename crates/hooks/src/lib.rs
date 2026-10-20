@@ -335,6 +335,17 @@ fn verdict_tag(v: &HookVerdict) -> String {
     }
 }
 
+/// Does stdout contain a JSON-object-shaped line that is NOT a valid
+/// verdict? Observational hooks may print arbitrary text (or nothing); a
+/// line that claims to be a verdict object but cannot be decoded must never
+/// authorize an effect — it is a protocol failure handled by the spec's
+/// failure policy.
+fn malformed_verdict_line(out: &str) -> bool {
+    out.lines()
+        .take(64)
+        .any(|line| line.trim().starts_with('{'))
+}
+
 /// Parse the first `{"verdict":...}` object line (bounded).
 fn parse_verdict(out: &str) -> Option<HookVerdict> {
     for line in out.lines().take(64) {
@@ -748,6 +759,16 @@ impl HookRegistry {
                                 reason: format!(
                                     "hook {} exited {:?} without a verdict",
                                     spec.id, out.exit_code
+                                ),
+                            },
+                        )
+                    } else if malformed_verdict_line(&out.stdout_head) {
+                        self.policy_outcome(
+                            spec,
+                            HookVerdict::Warn {
+                                reason: format!(
+                                    "hook {} emitted a malformed verdict object",
+                                    spec.id
                                 ),
                             },
                         )
@@ -1256,6 +1277,47 @@ mod tests {
             r2.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Warn { .. }
         ));
+    }
+
+    #[test]
+    fn malformed_verdict_object_fails_closed_but_observational_output_allows() {
+        let r = HookRegistry::try_new().unwrap();
+        r.register(HookSpec {
+            id: "bad".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo '{\"verdict\":\"bogus\"}'".into()],
+            events: vec![HookEvent::PreTool],
+            failure_policy: FailurePolicy::FailClosed,
+            ..Default::default()
+        })
+        .unwrap();
+        r.register(HookSpec {
+            id: "talkative".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo 'observing tool call'".into()],
+            events: vec![HookEvent::PreTool],
+            ..Default::default()
+        })
+        .unwrap();
+        // Both hooks run on one event: the malformed one must deny.
+        assert!(matches!(
+            r.run(HookEvent::PreTool, &rooted_input()),
+            HookVerdict::Deny { .. }
+        ));
+        // A purely observational hook (no verdict object) still allows.
+        let only = HookRegistry::try_new().unwrap();
+        only.register(HookSpec {
+            id: "talkative".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo 'observing tool call'".into()],
+            events: vec![HookEvent::PreTool],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            only.run(HookEvent::PreTool, &rooted_input()),
+            HookVerdict::Allow
+        );
     }
 
     #[test]

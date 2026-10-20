@@ -1,0 +1,1 @@
+{"schema":"faktor-config-bundle/v1","revision":1,"values":[{"key":"faktor.defaultModel","scope":"user","value":"qwen3.8:latest"}],"omitted_secrets":[]}

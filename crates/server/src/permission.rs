@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use faktor_agent::PermissionRequester;
-use faktor_core::capability::PermissionDecision;
+use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::id::SessionId;
 use faktor_session::ops::PermissionRequest;
 use tokio::sync::oneshot;
@@ -130,6 +130,10 @@ pub struct ChannelPermissionRequester {
     /// `ask` falls through to the live waiter. A gate/storage failure falls
     /// through to the waiter (never an implicit allow).
     gate: Arc<std::sync::RwLock<Option<Arc<faktor_foundation::policy::PolicyService>>>>,
+    /// The durable configuration authority for `faktor.permissions.preset`.
+    /// The preset is a real dispatch policy: it only refines a policy `ask`
+    /// (explicit/managed `deny` always wins). Storage failure keeps `ask`.
+    config: Arc<std::sync::RwLock<Option<Arc<faktor_foundation::config::ConfigService>>>>,
 }
 
 impl ChannelPermissionRequester {
@@ -139,6 +143,7 @@ impl ChannelPermissionRequester {
             next_generation: Arc::new(AtomicU64::new(1)),
             timeout,
             gate: Arc::new(std::sync::RwLock::new(None)),
+            config: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -154,6 +159,51 @@ impl ChannelPermissionRequester {
             .map_err(|_| "permission policy gate lock is poisoned".to_string())?;
         *gate = Some(policy);
         Ok(())
+    }
+
+    /// Attach the durable configuration service so the advertised
+    /// `faktor.permissions.preset` actually decides dispatch (it was a
+    /// write-only setting: every tool asked even with `full_auto`).
+    pub fn set_config_gate(
+        &self,
+        config: Arc<faktor_foundation::config::ConfigService>,
+    ) -> Result<(), String> {
+        let mut gate = self
+            .config
+            .write()
+            .map_err(|_| "permission config gate lock is poisoned".to_string())?;
+        *gate = Some(config);
+        Ok(())
+    }
+
+    /// The configured preset's refinement of a policy `ask`. Reads are
+    /// allowed for `plan` and `code`; workspace writes are allowed for
+    /// `code`; `full_auto` allows everything the policy did not deny.
+    fn preset_decision(&self, capability: &Capability) -> PermissionDecision {
+        let preset = self
+            .config
+            .read()
+            .ok()
+            .and_then(|gate| gate.as_ref().cloned())
+            .and_then(|config| config.value("faktor.permissions.preset").ok().flatten())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "ask".to_string());
+        match preset.as_str() {
+            "full_auto" => PermissionDecision::Allow,
+            "plan" => match capability {
+                Capability::ReadWorkspace { .. } | Capability::ReadExternal { .. } => {
+                    PermissionDecision::Allow
+                }
+                _ => PermissionDecision::Ask,
+            },
+            "code" => match capability {
+                Capability::ReadWorkspace { .. }
+                | Capability::ReadExternal { .. }
+                | Capability::WriteWorkspace { .. } => PermissionDecision::Allow,
+                _ => PermissionDecision::Ask,
+            },
+            _ => PermissionDecision::Ask,
+        }
     }
 
     /// The authority map with classified recovery: every entry is owned by a
@@ -251,8 +301,13 @@ impl PermissionRequester for ChannelPermissionRequester {
         // allow (the live waiter still decides).
         if let Ok(gate) = self.gate.read() {
             if let Some(policy) = gate.as_ref() {
-                let action =
+                let mut action =
                     faktor_foundation::policy::action_for_capability(&permission.capability);
+                // Per-tool rules are keyed by the dispatch name; the legacy
+                // capability-class mapping stays only for tool-less callers.
+                if !permission.tool_id.is_empty() {
+                    action.tool_id = permission.tool_id.clone();
+                }
                 match policy.evaluate_recorded(&action, "dispatch") {
                     Ok(verdict) if verdict.decision == faktor_foundation::Decision::Allow => {
                         return Box::pin(async move { Ok(PermissionDecision::Allow) });
@@ -260,7 +315,12 @@ impl PermissionRequester for ChannelPermissionRequester {
                     Ok(verdict) if verdict.decision == faktor_foundation::Decision::Deny => {
                         return Box::pin(async move { Ok(PermissionDecision::Deny) });
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        let refined = self.preset_decision(&permission.capability);
+                        if refined != PermissionDecision::Ask {
+                            return Box::pin(async move { Ok(refined) });
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "permission policy evaluation failed for {id}: {e}; asking the live window"
@@ -343,6 +403,7 @@ mod tests {
         PermissionRequest {
             id,
             op_id: OpId::new(1),
+            tool_id: String::new(),
             capability: Capability::ExecuteShell {
                 command: "ls".into(),
             },
@@ -662,6 +723,84 @@ mod tests {
         );
         // Double resolve: no second view, decision wins.
         assert!(!r.resolve(s1, 1, PermissionDecision::Deny).unwrap());
+        assert!(r.pending_views().is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_tool_rules_match_the_dispatch_tool_id_not_the_capability_class() {
+        use faktor_foundation::{Decision, PolicyService, RuleDraft, RuleScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = faktor_foundation::FoundationDb::open(dir.path().join("f.db")).unwrap();
+        let policy = Arc::new(PolicyService::new(db));
+        policy
+            .upsert_rule(
+                &RuleDraft {
+                    id: Some("allow-write-file".into()),
+                    scope: RuleScope::Project,
+                    tool_id: "write_file".into(),
+                    target: "/w/x".into(),
+                    decision: Decision::Allow,
+                    expires_ms: None,
+                },
+                0,
+            )
+            .unwrap();
+        let r = ChannelPermissionRequester::new(Duration::from_secs(5));
+        r.set_policy_gate(policy).unwrap();
+        let sid = SessionId::new(1);
+        let mut allowed = permission(51);
+        allowed.tool_id = "write_file".into();
+        allowed.capability = Capability::WriteWorkspace {
+            path: "/w/x".into(),
+        };
+        assert_eq!(
+            r.request(sid, &allowed).await.unwrap(),
+            PermissionDecision::Allow,
+            "the write_file rule must gate the write_file dispatch"
+        );
+        // The same capability through a tool-less/other tool id still asks;
+        // the durable deadline ends the wait so the assertion stays bounded.
+        let mut other = permission_with_deadline(52, now_ms() + 30);
+        other.tool_id = String::new();
+        other.capability = Capability::WriteWorkspace {
+            path: "/w/x".into(),
+        };
+        let err = r.request(sid, &other).await.unwrap_err();
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Timeout);
+        assert!(r.pending_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_permission_preset_is_a_real_dispatch_policy() {
+        use faktor_foundation::config::{Change, ConfigService, Patch, Scope};
+        use faktor_foundation::PolicyService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = faktor_foundation::FoundationDb::open(dir.path().join("f.db")).unwrap();
+        let policy = Arc::new(PolicyService::new(db.clone()));
+        let config = Arc::new(ConfigService::new(db));
+        config
+            .commit(&Patch {
+                expected_revision: 0,
+                changes: vec![Change {
+                    key: "faktor.permissions.preset".into(),
+                    scope: Scope::User,
+                    value: Some(serde_json::json!("full_auto")),
+                }],
+            })
+            .unwrap();
+        let r = ChannelPermissionRequester::new(Duration::from_secs(5));
+        r.set_policy_gate(policy).unwrap();
+        r.set_config_gate(config).unwrap();
+        let sid = SessionId::new(1);
+        let mut shell = permission(61);
+        shell.tool_id = "run_command".into();
+        assert_eq!(
+            r.request(sid, &shell).await.unwrap(),
+            PermissionDecision::Allow,
+            "full_auto must stop asking for an ordinary shell call"
+        );
         assert!(r.pending_views().is_empty());
     }
 }

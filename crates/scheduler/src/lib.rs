@@ -1600,6 +1600,16 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The terminal error recorded for one task (bounded by the recorder).
+    /// Read-only diagnostics: the scheduler's status alone hid every tool
+    /// refusal behind "tool X failed".
+    pub fn task_error(&self, id: OpId) -> Option<String> {
+        faktor_core::lock::recover(&self.inner)
+            .tasks
+            .get(&id)
+            .and_then(|task| task.error.clone())
+    }
+
     pub fn statuses(&self) -> Vec<(OpId, TaskStatus)> {
         let mut v: Vec<_> = faktor_core::lock::recover(&self.inner)
             .tasks

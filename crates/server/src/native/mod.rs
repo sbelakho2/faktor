@@ -28,12 +28,14 @@ pub(crate) mod board;
 /// Revision 8 daemon contract routes (instructions/presets/trust/browser/
 /// context pins/export/efficiency/budget/provenance).
 pub(crate) mod browser_surface;
+pub(crate) mod changes_api;
 #[cfg(test)]
 #[path = "concurrency_probe_tests.rs"]
 mod concurrency_probe_tests;
 /// The control-plane surface (identity/orgs/members/repositories/approvals;
 /// absent unless the `[cloud]` section is enabled).
 pub(crate) mod control_plane;
+pub(crate) mod coverage_api;
 /// The enterprise plane routes (retention/GC, audit export, deletion jobs,
 /// admin settings, effective-config; absent unless `[enterprise]` is on).
 /// Public: the CLI's local-parity command and daemon wiring build the
@@ -42,6 +44,11 @@ pub mod enterprise;
 pub(crate) mod evidence;
 /// Edition 5 foundation surfaces (config/providers/models/context/policy/diagnostics).
 pub(crate) mod foundation;
+pub(crate) mod plan_api;
+pub(crate) mod queue_api;
+pub(crate) mod settings_api;
+pub(crate) mod worktrees_api;
+pub use foundation::install_call_receipt_sink;
 /// Edition 5 lifecycle surfaces (MCP/skills/hooks/memory/session ops).
 pub(crate) mod foundation_ext;
 pub(crate) mod foundation_r8;

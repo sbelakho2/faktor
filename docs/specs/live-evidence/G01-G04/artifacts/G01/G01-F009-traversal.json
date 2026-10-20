@@ -1,0 +1,1 @@
+{"executablePath":"../../etc/passwd","state":"unrecorded","startAllowed":false,"recorded":null,"observedChecksum":null,"observedBytes":null,"signatureState":"unverified","reason":"the executable cannot be read at this exact path: malformed: executablePath must be absolute; a project-relative path can never identify a machine executable"}

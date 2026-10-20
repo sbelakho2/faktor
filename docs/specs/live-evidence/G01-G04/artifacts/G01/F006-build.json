@@ -1,0 +1,10 @@
+{
+  "exe": "/Users/sabelakhoua/IdeaProjects/faktor+/target/release/faktor-cli",
+  "install_root": null,
+  "release_digest": null,
+  "release_id": null,
+  "schema": "faktor-build-report/v1",
+  "self_digest_matches_release": null,
+  "self_sha256": "6b83204372bbab59d6cc1060b2ae8db3a4642e7935dd9afec3af7620c5030980",
+  "version": "0.1.0"
+}

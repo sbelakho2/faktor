@@ -734,6 +734,10 @@ impl Provider for OllamaProvider {
         "ollama"
     }
 
+    fn resolved_model(&self, model: &str) -> String {
+        self.resolved_model_name(model)
+    }
+
     fn known_models(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for k in self.config.model_overrides.keys() {
@@ -1637,6 +1641,10 @@ fn effort_or_boolean_knob(effort: &str, caps: &ModelCapabilities) -> Option<serd
 }
 
 #[cfg(test)]
+#[path = "resolved_model_tests.rs"]
+mod resolved_model_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
@@ -1831,14 +1839,6 @@ mod tests {
             }
         }
         // AssertThenRespond proved the wire body carried the concrete id.
-    }
-
-    #[tokio::test]
-    async fn unresolved_default_is_kept_when_nothing_is_probed() {
-        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(
-            "http://127.0.0.1:1".into(),
-        )));
-        assert_eq!(provider.resolved_model_name("default"), "default");
     }
 
     #[tokio::test]

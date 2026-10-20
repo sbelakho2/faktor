@@ -3,8 +3,13 @@
 //! handler seam. Adversarial cases cover hostile bodies, foreign scopes,
 //! idempotent replay and typed refusals instead of fake ready states.
 
+use std::sync::Arc;
+
+use faktor_foundation::Foundation;
 use reqwest::StatusCode;
-use serde_json::json;
+
+use crate::serve_arc;
+use serde_json::{json, Value};
 
 use super::foundation_r8::foundation_r8_tests::Rig;
 
@@ -466,4 +471,107 @@ fn decision_paths_refuse_traversal_on_both_separators() {
         crate::native::foundation_ext::agent_paths(&["src/lib.rs".into()]).is_ok(),
         "workspace-relative paths stay accepted"
     );
+}
+
+/// F201/F202 regression over HTTP: the changes surface exposes line hunks and
+/// the hunk-accept route rewrites only the selected composition, returns a
+/// new candidate identity and marks prior verification stale.
+
+#[tokio::test]
+async fn changes_diff_and_per_hunk_acceptance_are_real_native_surfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let shadows_dir = tempfile::tempdir().unwrap();
+    let mut deps = crate::api::tests::test_deps(dir.path());
+    let foundation = Arc::new(Foundation::open(dir.path().join("foundation.db")).unwrap());
+    deps.foundation = Some(foundation);
+    let manager = deps.session.clone();
+    let agent = deps.agent.clone();
+    let ws = manager
+        .create_workspace(workspace.path().to_str().unwrap())
+        .unwrap();
+    let session = manager.create_session(ws, "hunks", "fake", "m").unwrap();
+    let orchestrator =
+        faktor_orchestrator::runtime::OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+        manager.clone(),
+        shadows_dir.path().join("shadows"),
+    )
+    .unwrap();
+    deps.tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+        &orchestrator,
+        manager,
+        agent,
+        shadows.clone(),
+    );
+    let token = deps.auth_token.clone();
+    let handle = serve_arc(Arc::new(deps), 0).await.unwrap();
+    let base = workspace.path().join("a.txt");
+    std::fs::write(
+        &base,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+    )
+    .unwrap();
+    let session = session.id();
+    let shadow = shadows
+        .begin_shadow(session, workspace.path())
+        .expect("shadow begins");
+    std::fs::write(
+        shadow.root.join("a.txt"),
+        "one\nTWO SELECTED\nthree\nfour\nfive\nsix\nseven\neight\nNINE REJECTED\n",
+    )
+    .unwrap();
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{}", handle.addr);
+    let path = format!("/native/session/{}/changes", session.raw());
+    let response = client
+        .get(format!("{base_url}{path}"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changes: Value = response.json().await.unwrap();
+    assert_eq!(changes["files"][0]["path"], "a.txt", "{changes}");
+    assert_eq!(
+        changes["files"][0]["hunks"].as_array().unwrap().len(),
+        2,
+        "{changes}"
+    );
+    let identity = changes["candidateIdentity"].as_str().unwrap().to_string();
+    let accept = format!("/native/session/{}/changes/accept-hunks", session.raw());
+    let response = client
+        .post(format!("{base_url}{accept}"))
+        .bearer_auth(token.as_str())
+        .json(&json!({
+            "candidateIdentity": identity,
+            "hunks": {"a.txt": [0]},
+            "rejected": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: Value = response.json().await.unwrap();
+    assert_eq!(
+        accepted["proof"]["requiresReverification"], true,
+        "{accepted}"
+    );
+    assert_eq!(accepted["integrated"], true, "{accepted}");
+    let landed = std::fs::read_to_string(&base).unwrap();
+    assert!(landed.contains("TWO SELECTED"), "{landed}");
+    assert!(
+        landed.contains("nine\n"),
+        "unselected hunk stays base: {landed}"
+    );
+    assert!(!landed.contains("NINE REJECTED"), "{landed}");
+    let response = client
+        .post(format!("{base_url}{accept}"))
+        .bearer_auth(token.as_str())
+        .json(&json!({"candidateIdentity": identity, "hunks": {"a.txt": [0]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let _ = handle.request_shutdown();
 }

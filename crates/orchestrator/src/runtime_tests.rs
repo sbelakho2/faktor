@@ -355,6 +355,7 @@ fn open_env_with_routing(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     let agent = AgentRuntime::new(deps).unwrap();
     // The owner session + its workspace (a real directory under the temp
@@ -2056,6 +2057,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             context_prior: None,
             secret_registry: None,
             efficiency: Default::default(),
+            receipt_sink: None,
         };
         let agent = AgentRuntime::new(deps).unwrap();
         let owner_dir = dir.path().join("owner");

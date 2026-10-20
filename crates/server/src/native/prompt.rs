@@ -68,6 +68,9 @@ pub struct PromptRequest {
     pub max_tokens: Option<u64>,
     /// Per-run monetary cap (micro-USD), enforced like `max_tokens`.
     pub max_cost_micro: Option<u64>,
+    /// Session-selected turn bound applied to the run's durable task row
+    /// (F108). `None` keeps the executor default.
+    pub max_turns: Option<u32>,
     /// Acceptance criteria ridden onto the run's durable task row.
     pub criteria: Vec<String>,
     /// The run's mutation policy. Legacy vocabulary only: the sole
@@ -82,9 +85,15 @@ pub struct PromptRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptReceipt {
     pub run_id: String,
-    /// The session's durable turn op id (ordinary prompts are single-item
-    /// in-session runs, so this is always present).
-    pub op_id: OpId,
+    /// The session's durable turn op id. Present for every local
+    /// in-session run; `None` when the worker plane placed the prompt
+    /// remotely (the receipt then names the remote job and no local turn
+    /// exists).
+    pub op_id: Option<OpId>,
+    /// The run's durable mode (in-session, orchestrated or remote). The
+    /// receipt JSON keeps its historical four fields; adapters use this to
+    /// project the remote state without inventing a local turn.
+    pub mode: faktor_orchestrator::runtime::task_executor::TaskRunMode,
     pub queued: bool,
     pub accepted: bool,
 }
@@ -194,6 +203,48 @@ impl PromptExecutionService {
     /// Run ONE ordinary chat prompt as an in-session task run. The prompt
     /// becomes a single MUTATING work item so the daemon's mutation policy
     /// (shadow by default) gates every write the turn performs.
+    /// Build one comparison candidate's durable run request. Kept here (the
+    /// executor-facing service) so the native handler has exactly ONE
+    /// TaskRunRequest start site, the same static authority as a prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn comparison_candidate_run(
+        goal: String,
+        submission_id: String,
+        model: String,
+        prompt: String,
+        files: Vec<String>,
+        criteria: Vec<String>,
+        max_tokens: Option<u64>,
+        max_cost_micro: Option<u64>,
+        parent_caps: faktor_orchestrator::caps::CapabilitySet,
+    ) -> TaskRunRequest {
+        let item = WorkItem::new("candidate", prompt, WorkKind::Analysis);
+        TaskRunRequest {
+            goal,
+            work_items: vec![item],
+            submission_id: Some(submission_id),
+            model: Some(model),
+            max_tokens,
+            max_cost_micro,
+            criteria,
+            files,
+            parent_caps,
+            ..Default::default()
+        }
+    }
+
+    /// Start one comparison candidate through the SAME executor authority
+    /// as a prompt/task start (used by the model-comparison route; the
+    /// candidate is an ordinary in-session task with its own session row).
+    pub fn start_comparison_candidate(
+        &self,
+        session: SessionId,
+        run: TaskRunRequest,
+        max_turns: Option<u32>,
+    ) -> Result<TaskRunReceipt, ExecError> {
+        self.tasks.start_task_with_turn_cap(session, run, max_turns)
+    }
+
     pub async fn prompt(
         &self,
         session: SessionId,
@@ -218,14 +269,17 @@ impl PromptExecutionService {
             mutation_mode: request.mutation_mode,
             ..Default::default()
         };
-        let receipt = self.tasks.start_task(session, run)?;
+        let receipt = if request.max_turns.is_some() {
+            self.tasks
+                .start_task_with_turn_cap(session, run, request.max_turns)?
+        } else {
+            self.tasks.start_task(session, run)?
+        };
         observe(self, PromptCallKind::Prompt, session);
-        let op_id = receipt.op_id.ok_or_else(|| {
-            ExecError::Internal("ordinary prompt did not yield an in-session op id".into())
-        })?;
         Ok(PromptReceipt {
             run_id: receipt.run_id,
-            op_id,
+            op_id: receipt.op_id,
+            mode: receipt.mode,
             queued: receipt.queued,
             accepted: true,
         })

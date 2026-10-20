@@ -710,6 +710,7 @@ mod preflight_integration {
             context_prior: None,
             secret_registry: None,
             efficiency: Default::default(),
+            receipt_sink: None,
         };
         let agent = AgentRuntime::new(deps).unwrap();
         let orch = OrchestratorRuntime::new(manager.clone(), agent);

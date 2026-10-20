@@ -2199,3 +2199,56 @@ fn turn_capability_resolution_gates_unknown_and_keeps_declared_usable() {
     assert_eq!(authority, CapabilityAuthority::Known);
     assert_eq!(effective, claimed);
 }
+
+/// F046 regression: a durable context-window override clamps the effective
+/// caps DOWN only; an oversized value can never raise the model limit, and
+/// an absent/cleared fact leaves the model window intact.
+#[tokio::test]
+async fn context_window_override_only_lowers_the_effective_cap() {
+    let (deps, _dir) = super::tests::deps(
+        faktor_provider::FakeProvider::with_script(
+            "fake",
+            faktor_core::model::ModelCapabilities {
+                context: 1_000,
+                ..Default::default()
+            },
+            vec![faktor_provider::ScriptedResponse::End],
+        ),
+        vec![],
+    );
+    let runtime = crate::AgentRuntime::new(deps).unwrap();
+    let session = super::tests::new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    let caps = faktor_core::model::ModelCapabilities {
+        context: 1_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        apply_context_window_override(&handle, caps.clone()).context,
+        1_000
+    );
+    handle
+        .upsert_memory_fact("session_settings", "contextWindow", "256")
+        .unwrap();
+    assert_eq!(
+        apply_context_window_override(&handle, caps.clone()).context,
+        256
+    );
+    handle
+        .upsert_memory_fact("session_settings", "contextWindow", "999999")
+        .unwrap();
+    assert_eq!(
+        apply_context_window_override(&handle, caps.clone()).context,
+        1_000,
+        "an override above the model window is clamped, never trusted"
+    );
+    handle
+        .upsert_memory_fact("session_settings", "contextWindow", "")
+        .unwrap();
+    assert_eq!(apply_context_window_override(&handle, caps).context, 1_000);
+}

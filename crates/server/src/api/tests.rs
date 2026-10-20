@@ -109,6 +109,7 @@ pub(crate) fn test_agent_over(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap()
 }
@@ -196,6 +197,9 @@ pub(crate) fn test_deps_with_hooks(
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
         browser: Arc::new(crate::native::browser_surface::BrowserSurface::detached()),
+        worktrees: None,
+        repo_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
@@ -577,6 +581,7 @@ pub(crate) fn paced_test_deps(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -610,6 +615,9 @@ pub(crate) fn paced_test_deps(
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
         browser: Arc::new(crate::native::browser_surface::BrowserSurface::detached()),
+        worktrees: None,
+        repo_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
@@ -912,6 +920,7 @@ pub(crate) fn test_deps_full(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -945,6 +954,9 @@ pub(crate) fn test_deps_full(
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
         browser: Arc::new(crate::native::browser_surface::BrowserSurface::detached()),
+        worktrees: None,
+        repo_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),
@@ -1193,6 +1205,7 @@ pub(crate) fn native_task_rig_with_provider_and_verification(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let owner_root = root.join("owner");
@@ -1263,6 +1276,9 @@ pub(crate) fn native_task_rig_with_provider_and_verification(
         foundation: None,
         mcp_runtime: Arc::new(crate::native::foundation_ext::McpRuntime::new(None)),
         browser: Arc::new(crate::native::browser_surface::BrowserSurface::detached()),
+        worktrees: None,
+        repo_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
         started_ms: 1,
         terminal_policy: granted_terminal_policy(),

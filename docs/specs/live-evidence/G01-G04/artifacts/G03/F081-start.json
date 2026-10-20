@@ -1,0 +1,1 @@
+{"error":{"code":"malformed","message":"plan validation failed: mutating work item \"main\" (Implementation) requires write ownership (Paths with paths, IsolatedWorktree, or SemanticEntities); missing ownership is never defaulted","retryable":false}}

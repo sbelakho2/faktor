@@ -77,6 +77,7 @@ pub(crate) fn test_agent(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     AgentRuntime::new(deps).unwrap()
 }
@@ -152,6 +153,7 @@ fn semantic_registry_arc_is_the_one_authority_for_agent_and_server() {
         None,
         None,
         GithubAppSeams::default(),
+        None,
     )
     .expect("daemon core builds with a configured semantic provider");
     assert_eq!(graph.semantic.providers().len(), 1);

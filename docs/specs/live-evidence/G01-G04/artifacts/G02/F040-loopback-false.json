@@ -1,0 +1,1 @@
+{"code":"malformed","message":"malformed: endpoint 127.0.0.1 is loopback; provider ollama-noloop must opt in with allow_loopback","retryable":false}

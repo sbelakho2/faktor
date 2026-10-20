@@ -529,6 +529,35 @@ pub(crate) fn reservation_link(
     (reservation.raw() != 0).then_some(reservation)
 }
 
+/// One production model-call receipt, emitted at physical-attempt
+/// settlement. The daemon's foundation adapter persists it immutably; the
+/// agent never touches foundation storage directly (Commandment 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallReceiptRecord {
+    pub session_id: u64,
+    pub op_id: String,
+    pub call_id: String,
+    pub provider: String,
+    pub model: String,
+    pub route: String,
+    pub requested: std::collections::BTreeMap<String, serde_json::Value>,
+    pub effective: std::collections::BTreeMap<String, serde_json::Value>,
+    pub inherited: Vec<String>,
+    pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub status: String,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Durable receipt sink injected by the daemon (the foundation call-receipt
+/// store). A write failure is logged by the runtime and never fails the
+/// model turn, but the receipt is what the actual-model surface reads.
+pub trait CallReceiptSink: Send + Sync {
+    fn record(&self, receipt: &CallReceiptRecord);
+}
+
 pub struct AgentDeps {
     pub session: Arc<SessionManager>,
     /// Optional live-chunk sink (see [`ChunkEvent`]): bounded + coalescing
@@ -643,6 +672,9 @@ pub struct AgentDeps {
     /// can neither reach durable storage nor block the next provider request
     /// at the egress scan. `None` in test graphs (pattern-only behavior).
     pub secret_registry: Option<Arc<faktor_security::registry::SecretRegistry>>,
+    /// Production call-receipt sink (F048/F050/F090): `None` in embedded/test
+    /// hosts, `Some(foundation adapter)` in the daemon.
+    pub receipt_sink: Option<Arc<dyn CallReceiptSink>>,
 }
 
 impl AgentDeps {
@@ -782,6 +814,9 @@ pub struct AgentRuntime {
     /// (oldest operation evicted), so a queue that never runs cannot grow
     /// memory without bound.
     pub(crate) internal_context: std::sync::Mutex<std::collections::HashMap<OpId, String>>,
+    /// Production receipt sink, installable after construction (the daemon
+    /// opens foundation after building the agent graph).
+    pub(crate) receipt_sink: std::sync::RwLock<Option<Arc<dyn CallReceiptSink>>>,
 }
 
 /// Hard bound of in-flight internal-context blocks (bounded everything): a
@@ -2134,6 +2169,7 @@ impl AgentRuntime {
             deps.session.store(),
             EVIDENCE_BACKING_CAP_BYTES,
         ));
+        let receipt_sink = deps.receipt_sink.clone();
         Ok(Arc::new(Self {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2150,7 +2186,25 @@ impl AgentRuntime {
             system_intelligence: std::sync::Mutex::new(None),
             value_gate: std::sync::Mutex::new(faktor_core::entitlement::ValueGate::absent()),
             internal_context: std::sync::Mutex::new(std::collections::HashMap::new()),
+            receipt_sink: std::sync::RwLock::new(receipt_sink),
         }))
+    }
+
+    /// Install the production call-receipt sink (the daemon's foundation
+    /// store). Additive: tests/embedded hosts leave it absent.
+    pub fn set_receipt_sink(&self, sink: Arc<dyn CallReceiptSink>) {
+        *self
+            .receipt_sink
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(sink);
+    }
+
+    /// The installed receipt sink, when one was wired.
+    pub(crate) fn receipt_sink(&self) -> Option<Arc<dyn CallReceiptSink>> {
+        self.receipt_sink
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Install the neutral verification provider registry (the completion
@@ -2572,11 +2626,11 @@ impl AgentRuntime {
                 "session row unresolvable while resolving the workspace instruction root: {e}"
             ))
         })?;
-        match self
-            .deps
-            .instructions_resolver
-            .resolve(row.workspace_id.raw(), None)
-        {
+        match self.deps.instructions_resolver.resolve_for_session(
+            handle.id().raw(),
+            row.workspace_id.raw(),
+            None,
+        ) {
             Ok(loaded) => Ok(loaded.epoch().map(|e| (e.as_u64(), loaded.has_rules()))),
             Err(e) => Err(e),
         }

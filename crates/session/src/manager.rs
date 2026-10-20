@@ -1522,12 +1522,32 @@ impl SessionManager {
                 return Err(SessionError::NotFound(format!("session {source}")).into());
             }
         };
+        // A live turn is still appending messages: paging it while copying
+        // can duplicate a seq (UNIQUE) or produce a torn history. Refuse the
+        // fork typed instead; the caller retries after the turn settles.
+        if self
+            .store
+            .active_turn_record(source)
+            .map_err(crate::map_store_err)?
+            .is_some()
+        {
+            return Err(SessionError::Conflict(format!(
+                "session {source} is mid-turn; settle the turn before forking"
+            ))
+            .into());
+        }
         let fork = self.create_session(
             src_row.workspace_id,
             title,
             &src_row.provider,
             &src_row.model,
         )?;
+        // A fresh session row carries the standalone default worktree id 1.
+        // A forked session must be immediately runnable, so adopt the
+        // workspace's real owner worktree here (idempotent: an existing row is
+        // reused). Without this, the first shadowed mutating run of a fork
+        // refuses with "no registered worktree row".
+        self.ensure_owner_worktree(fork.id())?;
         // Walk the source history newest-first in bounded pages (paging is
         // fundamental), then copy ascending so the fork's seqs stay
         // contiguous and its `proposed_message_seq` keeps working.
@@ -1561,6 +1581,18 @@ impl SessionManager {
                     .map_err(crate::map_store_err)?;
             }
         }
+        // Durable lineage (F073): the fork row itself is a plain session;
+        // this immutable fact is the durable parent/branch edge every
+        // projection reads after a reopen. A failed write is loud (the
+        // fork is already durable, but a fork without lineage would be a
+        // silent history rewrite).
+        let lineage = serde_json::json!({
+            "parentSessionId": source.raw().to_string(),
+            "forkedAt": "head",
+            "sourceHeadSeq": fork.proposed_message_seq().unwrap_or(1).saturating_sub(1),
+            "sourceTitle": src_row.title,
+        });
+        fork.upsert_memory_fact("session_lineage", "parent", &lineage.to_string())?;
         Ok(fork)
     }
 
@@ -2093,6 +2125,40 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_root_resolution_is_unambiguous_with_two_live_shadows() {
+        // Two sessions on one workspace are normal. The workspace-only probe
+        // refuses (it cannot choose), but each session resolves its OWN live
+        // shadow, so instruction/runtime consumers never guess or fail.
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/user/checkout").unwrap();
+        let a = m.create_session(ws, "a", "p", "m").unwrap().id();
+        let b = m.create_session(ws, "b", "p", "m").unwrap().id();
+        let row_of = |session: SessionId, root: &str| ShadowRow {
+            session_id: session.raw(),
+            shadow_id: format!("sh-{:016x}", session.raw()),
+            base_root: "/user/checkout".into(),
+            root: root.into(),
+            state: ShadowRowState::Active,
+            base_entries: 1,
+            base_bytes: 1,
+            created_ms: 1,
+        };
+        m.put_shadow_row(a, &row_of(a, "/data/shadows/1/sh-a"))
+            .unwrap();
+        m.put_shadow_row(b, &row_of(b, "/data/shadows/2/sh-b"))
+            .unwrap();
+        assert!(m.live_workspace_shadow_root(ws).is_err());
+        assert_eq!(
+            m.resolve_workspace_root(a).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-a"))
+        );
+        assert_eq!(
+            m.resolve_workspace_root(b).unwrap(),
+            Some(PathBuf::from("/data/shadows/2/sh-b"))
+        );
+    }
+
+    #[test]
     fn workspace_root_resolves_only_durable_rows() {
         // P0-32: root resolution reads the durable workspace table only —
         // an unknown workspace carries no root (None, never an error) and
@@ -2266,6 +2332,57 @@ mod tests {
         assert!(m
             .fork_session(faktor_core::id::SessionId::new(9999), "x")
             .is_err());
+    }
+
+    #[test]
+    fn fork_session_adopts_the_workspace_owner_worktree() {
+        // Regression: a fresh fork row carried standalone worktree id 1. With
+        // any earlier worktree row on the daemon, the fork's first shadowed
+        // mutating run refused "no registered worktree row". Fork must adopt
+        // the workspace's real owner worktree before copying history.
+        let (_d, m) = tmp_manager();
+        let decoy = m.create_workspace("/decoy").unwrap();
+        let decoy_wt = m.put_worktree(decoy, "/decoy", "main").unwrap();
+        assert_eq!(decoy_wt, 1);
+        let ws = m.create_workspace("/root").unwrap();
+        let owner = m.put_worktree(ws, "/root", "main").unwrap();
+        assert_ne!(owner, 1, "owner worktree deliberately not the default id");
+        let s = m.create_session(ws, "orig", "p", "m").unwrap();
+        m.adopt_identity(
+            s.id(),
+            faktor_core::WorktreeId::new(owner as u64),
+            TaskId::new(7),
+        )
+        .unwrap();
+        let fork = m.fork_session(s.id(), "fork").unwrap();
+        let row = fork.row().unwrap();
+        assert_eq!(row.worktree_id.raw(), owner as u64);
+        assert_eq!(
+            row.task_id.raw(),
+            1,
+            "the fork keeps its own fresh task identity"
+        );
+        assert!(m.worktrees_of(ws).unwrap().iter().any(|w| w.id == owner));
+    }
+
+    #[test]
+    fn fork_refuses_a_mid_turn_session_before_copying_any_message() {
+        // A live turn appends messages while fork pages history; copying it
+        // produced duplicate seqs (UNIQUE) and a torn fork. The fork must
+        // refuse typed before creating a session or copying a row.
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/root").unwrap();
+        let s = m.create_session(ws, "orig", "p", "m").unwrap();
+        s.submit_prompt("go", &[]).unwrap();
+        let before = m.list_sessions(None).unwrap().len();
+        let err = m.fork_session(s.id(), "fork").unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict);
+        assert!(err.message.contains("mid-turn"), "{err}");
+        assert_eq!(
+            m.list_sessions(None).unwrap().len(),
+            before,
+            "a refused fork creates no session row"
+        );
     }
 
     #[test]

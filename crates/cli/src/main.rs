@@ -728,6 +728,32 @@ pub(crate) fn create_run_session(
     Ok(row)
 }
 
+/// The assistant's durable text output for the newest completed turn, in
+/// part order. Only `text` parts are assistant output: reasoning parts are
+/// the model's private thinking and tool parts are activity, never the
+/// answer. Used by the headless `run` command (the result must be printed,
+/// not only its state).
+pub(crate) fn assistant_text(
+    handle: &faktor_session::SessionHandle,
+) -> faktor_core::Result<String> {
+    let rows = handle.messages_before(None, 16)?;
+    for row in rows {
+        if row.role != "assistant" {
+            continue;
+        }
+        let mut out = String::new();
+        for part in handle.parts_of(row.id)? {
+            if part.kind == "text" {
+                if let Some(text) = part.data.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(text);
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Ok(String::new())
+}
+
 pub(crate) async fn run(
     prompt: String,
     provider: Option<&str>,
@@ -770,7 +796,11 @@ pub(crate) async fn run(
             std::process::exit(1);
         }
     };
-    match build_daemon(&data_dir, Some(config)) {
+    match build_daemon_with_permission(
+        &data_dir,
+        Some(config),
+        std::sync::Arc::new(HeadlessPermissionRequester),
+    ) {
         Ok(graph) => {
             let (session, agent) = (graph.session, graph.agent);
             let ws = match session.create_workspace(workspace.to_str().unwrap_or(".")) {
@@ -799,6 +829,14 @@ pub(crate) async fn run(
                         // continuation-ready state is a non-zero exit.
                         eprintln!("run: turn ended in state '{label}'");
                         std::process::exit(1);
+                    }
+                    // Headless contract: the assistant's durable text is the
+                    // command's output. The turn used to exit 0 after printing
+                    // only its state, so a caller saw no model answer at all.
+                    match assistant_text(&row) {
+                        Ok(text) if !text.is_empty() => println!("{text}"),
+                        Ok(_) => eprintln!("run: the turn completed with no assistant text"),
+                        Err(e) => eprintln!("run: cannot read assistant output: {e}"),
                     }
                     println!("final state: {label}");
                 }

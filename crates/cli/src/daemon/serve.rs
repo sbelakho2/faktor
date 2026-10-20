@@ -1045,6 +1045,18 @@ pub(crate) async fn serve_impl(
     // operation store, the content-addressed install layout and the checked
     // download transport (the `[sandbox]` destination policy) are built
     // here; artifacts download through the daemon's own egress policy.
+    // Edition 5 foundation is opened BEFORE the provider graph so saved
+    // connections are materialized as runtime providers at boot (F037/F042):
+    // a saved connection whose credential lives in the vault becomes a real
+    // registry entry, not a metadata-only row. The SAME handle is later
+    // wired into ServerDeps; no second foundation is opened.
+    let foundation = Arc::new(faktor_foundation::Foundation::open(&data_dir).map_err(|e| {
+        format!(
+            "opening the Edition 5 foundation under {}: {e}",
+            data_dir.display()
+        )
+    })?);
+    let config = apply_saved_provider_connections(&config, &foundation)?;
     let updater = build_daemon_updater(&config, &data_dir)?;
     let graph =
         build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)
@@ -1058,6 +1070,11 @@ pub(crate) async fn serve_impl(
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // Restart resumption: a crash mid-turn leaves the SAME logical turn
+    // active with no driver. Re-drive it on its recorded identity (bounded)
+    // instead of leaving a session wedged in Streaming forever. The kick is
+    // detached so readiness is not delayed by a provider call.
+    agent.kick_interrupted_turns(4);
     // Durable admission recovery (audit P1): every pending admission claim of
     // a previous daemon generation is classified against its durable facts
     // and landed as a replay, a safe reclaim or a typed conflict BEFORE the
@@ -1108,18 +1125,19 @@ pub(crate) async fn serve_impl(
     // data directory for configuration revisions, the credential vault,
     // provider lifecycle, receipts, context manifests, permission policy,
     // customization metadata and diagnostics. The SAME policy service gates
-    // dispatch through the daemon's permission channel.
-    let foundation = Arc::new(faktor_foundation::Foundation::open(&data_dir).map_err(|e| {
-        format!(
-            "opening the Edition 5 foundation under {}: {e}",
-            data_dir.display()
-        )
-    })?);
+    // dispatch through the daemon's permission channel. (Opened before the
+    // provider graph above so boot materializes saved connections.)
     deps = deps.with_foundation(foundation.clone());
+    deps = deps.with_worktrees(graph.worktrees.clone());
+    faktor_server::native::install_call_receipt_sink(&deps.agent, &foundation);
     graph
         .permissions
         .set_policy_gate(foundation.policy.clone())
         .map_err(|e| format!("wiring the persistent permission policy: {e}"))?;
+    graph
+        .permissions
+        .set_config_gate(foundation.config.clone())
+        .map_err(|e| format!("wiring the permission preset configuration: {e}"))?;
     // Explicit dependency injection: the daemon's terminal authority is
     // constructed under the configured shell contract resolved above (the
     // same source doctor reads), never under a hardcoded grant.
@@ -1414,6 +1432,139 @@ pub(crate) async fn serve_impl(
 /// stays byte-identical to the pre-updater daemon. When enabled, the durable
 /// operation store, the content-addressed install layout and the checked
 /// download transport (the `[sandbox]` destination policy) are built here.
+/// Materialize every durable saved provider connection as a runtime provider
+/// config entry for THIS boot (F037/F042). A connection already declared in
+/// the file config keeps the file's entry (single registration by id); a
+/// saved-only connection is appended and marked `applied` after the graph
+/// registers it. `vault://` credentials are revealed into a daemon-private
+/// environment variable (children run with a cleared allowlisted env, so the
+/// value never reaches a tool/verification process).
+fn apply_saved_provider_connections(
+    config: &config::Config,
+    foundation: &faktor_foundation::Foundation,
+) -> Result<config::Config, String> {
+    use faktor_foundation::providers::ProviderFamily;
+    let mut config = config.clone();
+    let connections = foundation
+        .providers
+        .list()
+        .map_err(|e| format!("provider connections: {e}"))?;
+    for connection in connections {
+        if config
+            .providers
+            .iter()
+            .any(|entry| entry.id() == connection.id)
+        {
+            foundation
+                .providers
+                .mark_applied(&connection.id)
+                .map_err(|e| format!("provider apply state: {e}"))?;
+            continue;
+        }
+        let api_key_env = match connection.credential_ref.as_deref() {
+            None => None,
+            Some(reference) if reference.starts_with("env:") => {
+                Some(reference.trim_start_matches("env:").to_string())
+            }
+            Some(reference) if reference.starts_with("vault://") => {
+                let secret = foundation
+                    .vault
+                    .reveal(reference)
+                    .map_err(|e| format!("vault credential for {}: {e}", connection.id))?;
+                let name = format!(
+                    "FAKTOR_CONNECTION_KEY_{}",
+                    connection
+                        .id
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            '_'
+                        })
+                        .collect::<String>()
+                );
+                // SAFETY: the daemon is single-threaded here (before any
+                // worker or request); the value is never logged and child
+                // processes receive a cleared allowlisted environment.
+                std::env::set_var(&name, String::from_utf8_lossy(&secret).as_ref());
+                Some(name)
+            }
+            Some(_) => None,
+        };
+        let endpoint = connection.endpoint.clone();
+        let entry = match connection.family {
+            ProviderFamily::Ollama => config::ProviderCfg::Ollama {
+                id: connection.id.clone(),
+                base_url: endpoint,
+                allow_loopback: connection.allow_loopback,
+                pricing: None,
+                quality: None,
+            },
+            ProviderFamily::OpenAi => config::ProviderCfg::OpenAi {
+                id: connection.id.clone(),
+                base_url: endpoint.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                api_key_env,
+                api: None,
+                allow_loopback: connection.allow_loopback,
+                models: connection.models.clone(),
+                pricing: None,
+                quality: None,
+            },
+            ProviderFamily::Anthropic => config::ProviderCfg::Anthropic {
+                id: connection.id.clone(),
+                api_key_env,
+                allow_loopback: connection.allow_loopback,
+                pricing: None,
+                quality: None,
+            },
+            ProviderFamily::Google => config::ProviderCfg::Google {
+                id: connection.id.clone(),
+                api_key_env,
+                allow_loopback: connection.allow_loopback,
+                pricing: None,
+                quality: None,
+            },
+            ProviderFamily::DeepSeek => config::ProviderCfg::DeepSeek {
+                id: connection.id.clone(),
+                profile: "direct".into(),
+                base_url: endpoint,
+                api_key_env,
+                allow_loopback: connection.allow_loopback,
+                pricing: None,
+                quality: None,
+            },
+            ProviderFamily::Gateway => {
+                let Some(endpoint) = endpoint else {
+                    tracing::warn!(
+                        connection = %connection.id,
+                        "saved gateway connection has no endpoint; not materialized"
+                    );
+                    continue;
+                };
+                config::ProviderCfg::Gateway {
+                    id: connection.id.clone(),
+                    base_url: endpoint,
+                    api_key_env,
+                    allow_loopback: connection.allow_loopback,
+                    pricing: None,
+                    quality: None,
+                }
+            }
+        };
+        config.providers.push(entry);
+        foundation
+            .providers
+            .mark_applied(&connection.id)
+            .map_err(|e| format!("provider apply state: {e}"))?;
+        tracing::info!(
+            connection = %connection.id,
+            family = connection.family.as_str(),
+            "saved provider connection materialized at boot"
+        );
+    }
+    Ok(config)
+}
+
 fn build_daemon_updater(
     config: &crate::config::Config,
     data_dir: &std::path::Path,
@@ -1484,6 +1635,43 @@ fn build_daemon_updater(
 /// an in-flight integration/rollback/completion transaction). Returns the
 /// deps carrying the service, the value gate the worker plane reuses, and
 /// the optional post-readiness report schedule.
+/// Provision the operator's explicit local subscription. The plan table is
+/// validated at config load; this writes the ONE durable subscription row the
+/// entitlement reads and the admission gate consume, so a configured plan is
+/// either active with a recorded status/expiry or honestly inactive.
+pub(crate) fn provision_billing_subscription(
+    service: &faktor_cloud::EntitlementService,
+    organization: &faktor_cloud::OrganizationId,
+    subscription: &crate::config::BillingSubscriptionCfg,
+) -> Result<(), String> {
+    let status = subscription
+        .status()
+        .map_err(|e| format!("billing subscription: {e}"))?;
+    let now = service.now_ms();
+    let id = faktor_cloud::SubscriptionId::try_new(format!(
+        "sub_{}",
+        organization.as_str().replace(['/', ' '], "_")
+    ))
+    .map_err(|e| format!("billing subscription: {e}"))?;
+    service
+        .set_subscription(&faktor_cloud::Subscription {
+            id,
+            organization: organization.clone(),
+            plan_id: subscription.plan_id.clone(),
+            status,
+            started_ms: now,
+            expires_ms: subscription.expires_ms,
+            updated_ms: now,
+        })
+        .map_err(|e| format!("billing subscription provisioning: {e}"))?;
+    tracing::info!(
+        plan = %subscription.plan_id,
+        status = status.as_str(),
+        "billing subscription provisioned"
+    );
+    Ok(())
+}
+
 fn wire_billing_plane(
     mut deps: ServerDeps,
     config_billing: &crate::config::BillingCfg,
@@ -1579,6 +1767,14 @@ fn wire_billing_plane(
     service
         .ensure_account(&organization, &account, &account_name, managed)
         .map_err(|e| format!("billing account provisioning: {e}"))?;
+    // The optional explicit local subscription: without a durable row the
+    // plan table still resolves, but every gated admission and value
+    // entitlement refuses `subscription_inactive`. Writing the operator's
+    // configured row here keeps the entitlement reads and the admission gate
+    // on the SAME durable statement (idempotent put, never an invoice).
+    if let Some(subscription) = &config_billing.subscription {
+        provision_billing_subscription(&service, &organization, subscription)?;
+    }
     // Wave 5 residual: install the agent-side debit authority, so a
     // Faktor-managed provider attempt opens its durable credit hold BEFORE
     // dispatch (record-before-call) and settles/refunds with the reservation
@@ -2373,5 +2569,129 @@ impl faktor_acp::TerminalHandle for DaemonTerminalHandle {
     }
     fn kill(&self) -> Result<(), faktor_acp::TerminalError> {
         self.handle.kill().map_err(map_terminal_registry_error)
+    }
+}
+
+#[cfg(test)]
+mod billing_subscription_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn service(dir: &std::path::Path) -> std::sync::Arc<faktor_cloud::EntitlementService> {
+        let store = faktor_cloud::SqliteControlPlaneStore::open(&dir.join("billing.db"))
+            .expect("billing store");
+        let mut plans = BTreeMap::new();
+        plans.insert(
+            "live-plan".to_string(),
+            faktor_cloud::PlanConfig {
+                plan_id: "live-plan".to_string(),
+                features: ["credits".to_string()].into_iter().collect(),
+                limits: BTreeMap::new(),
+            },
+        );
+        faktor_cloud::EntitlementService::with_system_clock_for_organization(
+            std::sync::Arc::new(store),
+            faktor_cloud::BillingConfig {
+                default_plan: Some("live-plan".to_string()),
+                plans,
+                managed_providers: Default::default(),
+            },
+            faktor_cloud::OrganizationId::try_new("org_subscription_test").unwrap(),
+        )
+        .expect("entitlement service")
+    }
+
+    #[test]
+    fn configured_subscription_is_provisioned_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let organization = faktor_cloud::OrganizationId::try_new("org_subscription_test").unwrap();
+        let cfg = crate::config::BillingSubscriptionCfg {
+            plan_id: "live-plan".into(),
+            status: Some("active".into()),
+            expires_ms: None,
+        };
+        provision_billing_subscription(&service, &organization, &cfg).unwrap();
+        let snapshot = service.entitlement_snapshot(&organization).unwrap();
+        assert!(snapshot.subscription_active);
+        assert_eq!(snapshot.plan_id.as_deref(), Some("live-plan"));
+        assert!(snapshot.has_feature(faktor_cloud::FEATURE_CREDITS));
+        // Re-provisioning is an idempotent put, never a second row.
+        provision_billing_subscription(&service, &organization, &cfg).unwrap();
+        assert!(
+            service
+                .entitlement_snapshot(&organization)
+                .unwrap()
+                .subscription_active
+        );
+
+        let expired = crate::config::BillingSubscriptionCfg {
+            plan_id: "live-plan".into(),
+            status: Some("expired".into()),
+            expires_ms: Some(1),
+        };
+        provision_billing_subscription(&service, &organization, &expired).unwrap();
+        let snapshot = service.entitlement_snapshot(&organization).unwrap();
+        assert!(!snapshot.subscription_active);
+    }
+}
+
+#[cfg(test)]
+mod saved_provider_boot_tests {
+    use super::*;
+
+    /// F037/F042 regression: a durable saved connection is materialized as a
+    /// real runtime provider entry at boot and its apply state flips to
+    /// `applied`; a file-config entry with the same id wins (one
+    /// registration).
+    #[test]
+    fn saved_connections_materialize_at_boot_and_mark_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let foundation = faktor_foundation::Foundation::open(dir.path()).unwrap();
+        foundation
+            .providers
+            .save(
+                &faktor_foundation::providers::ConnectionDraft {
+                    id: "saved-local".into(),
+                    family: "ollama".into(),
+                    label: "Saved local".into(),
+                    endpoint: Some("http://127.0.0.1:11434".into()),
+                    credential_ref: None,
+                    models: vec!["qwen3".into()],
+                    allow_loopback: Some(true),
+                    api_flavor: None,
+                    trust_origin: None,
+                    connect_timeout_ms: None,
+                    first_byte_timeout_ms: None,
+                    total_timeout_ms: None,
+                    keep_alive: None,
+                    proxy_url: None,
+                    tls_mode: None,
+                    ca_cert_ref: None,
+                },
+                None,
+            )
+            .unwrap();
+        let config = apply_saved_provider_connections(&config::Config::default(), &foundation)
+            .expect("boot apply");
+        assert!(
+            config
+                .providers
+                .iter()
+                .any(|entry| entry.id() == "saved-local"),
+            "saved connection became a runtime config entry"
+        );
+        let row = foundation.providers.get("saved-local").unwrap().unwrap();
+        assert_eq!(row.apply_state, "applied");
+        // A second apply is idempotent and keeps exactly one entry.
+        let again = apply_saved_provider_connections(&config, &foundation).unwrap();
+        assert_eq!(
+            again
+                .providers
+                .iter()
+                .filter(|entry| entry.id() == "saved-local")
+                .count(),
+            1
+        );
     }
 }

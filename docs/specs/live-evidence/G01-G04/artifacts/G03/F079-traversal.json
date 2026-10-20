@@ -1,0 +1,1 @@
+{"error":{"code":"malformed","message":"attachment filename \"../../evil.png\" contains a path separator; filenames are labels, not paths","retryable":false}}

@@ -1,0 +1,1 @@
+{"code":"validation","fieldErrors":[{"code":"invalid_value","key":"faktor.defaultModel","message":"faktor.defaultModel: expected a string","scope":"user"}],"message":"the patch is not applicable as written","valid":false}

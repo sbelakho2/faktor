@@ -1,0 +1,1 @@
+{"audit":{"duration_ms":4,"event":"pre_tool","exit_code":0,"failure_policy":"fail_closed","hook_id":"badjson","started_ms":1792462638584,"stderr_head":"","stdout_head":"{\"verdict\":\"bogus\"}\n","verdict":"deny"},"event":"pre_tool","hookId":"badjson","matched":true,"verdict":{"reason":"hook badjson failed closed","verdict":"deny"}}

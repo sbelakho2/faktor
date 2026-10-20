@@ -117,6 +117,27 @@ impl Tool {
         }
     }
 
+    /// The capability THIS invocation must be authorized for. Tools whose
+    /// capability carries request detail (a shell command) must fill it from
+    /// the same args the executor consumes; the historical static empty
+    /// `ExecuteShell` capability made every run_command permission hop a
+    /// malformed action, so policy denied it before spawn.
+    pub fn capability_for(&self, args: &serde_json::Value) -> Option<Capability> {
+        match (
+            &self.capability,
+            args.get("command").and_then(|v| v.as_str()),
+        ) {
+            (Some(Capability::ExecuteShell { command }), Some(actual))
+                if command.is_empty() && !actual.is_empty() =>
+            {
+                Some(Capability::ExecuteShell {
+                    command: actual.to_string(),
+                })
+            }
+            (capability, _) => capability.clone(),
+        }
+    }
+
     /// Derive the reads/writes this invocation touches from the declared
     /// path args. Non-string arg values are skipped (never trusted).
     pub fn ownership(&self, args: &serde_json::Value) -> Ownership {
@@ -1765,6 +1786,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "");
+    }
+
+    #[test]
+    fn capability_for_fills_a_shell_command_from_the_same_args_the_executor_reads() {
+        // Regression: run_command declared `ExecuteShell { command: "" }`.
+        // The permission hop authorized that EMPTY action, which the policy
+        // correctly refuses as malformed, so every shell call was denied
+        // before spawn and no per-command rule could ever match.
+        let mut tool = bundle_tool(
+            "run_command",
+            ResourceClass::Terminal,
+            serde_json::json!({"type": "object"}),
+        );
+        tool.capability = Some(Capability::ExecuteShell {
+            command: String::new(),
+        });
+        assert_eq!(
+            tool.capability_for(&serde_json::json!({"command": "git status"})),
+            Some(Capability::ExecuteShell {
+                command: "git status".into()
+            })
+        );
+        // Missing/empty args keep the static capability (still fail closed
+        // at the malformed-action gate).
+        assert_eq!(
+            tool.capability_for(&serde_json::json!({})),
+            Some(Capability::ExecuteShell {
+                command: String::new()
+            })
+        );
+        // A concrete static capability is never overwritten by args.
+        tool.capability = Some(Capability::ReadWorkspace { path: ".".into() });
+        assert_eq!(
+            tool.capability_for(&serde_json::json!({"command": "rm -rf /"})),
+            Some(Capability::ReadWorkspace { path: ".".into() })
+        );
     }
 
     #[test]

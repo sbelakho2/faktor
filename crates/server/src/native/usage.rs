@@ -569,6 +569,14 @@ pub(crate) fn native_session_usage_view(
             .map_err(store_err_to_core)?;
         let reservations = native_task_reservation_view(&store, sid, task.task_id)?;
         let open_micro = money::from_json(&reservations["open"]["predictedMicro"]).unwrap_or(0);
+        let max_cost_micro = cost.as_ref().and_then(|c| c.max_cost_micro);
+        let spent_micro = cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0);
+        let uncertain_micro =
+            money::from_json(&reservations["uncertain"]["predictedMicro"]).unwrap_or(0);
+        let committed = spent_micro
+            .saturating_add(open_micro)
+            .saturating_add(uncertain_micro);
+        let (percent, warning, exhausted) = cap_state(max_cost_micro, committed);
         tasks.push(serde_json::json!({
             "taskId": task.task_id.to_string(),
             "budget": {
@@ -576,9 +584,16 @@ pub(crate) fn native_session_usage_view(
                 "maxTurns": task.budget.max_turns,
                 "spentTokens": task.budget.spent_tokens,
                 "spentTurns": task.budget.spent_turns,
-                "maxCostMicro": money::json_opt(cost.as_ref().and_then(|c| c.max_cost_micro)),
-                "spentCostMicro": money::json(cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0)),
+                "maxCostMicro": money::json_opt(max_cost_micro),
+                "spentCostMicro": money::json(spent_micro),
                 "openReservedMicro": money::json(open_micro),
+                "uncertainReservedMicro": money::json(uncertain_micro),
+                "capState": {
+                    "committedMicro": money::json(committed),
+                    "percent": percent,
+                    "warning": warning,
+                    "exhausted": exhausted,
+                },
             },
             "reservations": reservations,
         }));
@@ -592,6 +607,27 @@ pub(crate) fn native_session_usage_view(
         "prefixStability": stability,
         "tasks": tasks,
     }))
+}
+
+/// The durable cap projection (F106): a warning is induced at >=80% of the
+/// committed cap, exhaustion at >=100%. `None` is unlimited (never a fake
+/// warning), and a zero cap is immediately exhausted.
+fn cap_state(max_cost_micro: Option<u64>, committed: u64) -> (u32, bool, bool) {
+    match max_cost_micro {
+        Some(cap) if cap > 0 => {
+            let percent = u32::try_from(
+                (u128::from(committed).saturating_mul(100) / u128::from(cap)).min(999),
+            )
+            .unwrap_or(999);
+            (
+                percent,
+                committed.saturating_mul(5) >= cap.saturating_mul(4),
+                committed >= cap,
+            )
+        }
+        Some(_) => (0, false, true),
+        None => (0, false, false),
+    }
 }
 
 /// `GET /native/session/{id}/usage` — the authoritative usage of ONE
@@ -613,5 +649,21 @@ pub(crate) async fn native_session_usage(
     match native_session_usage_view(&state, &handle) {
         Ok(v) => money_json(v),
         Err(e) => api_err(&e),
+    }
+}
+
+#[cfg(test)]
+mod cap_state_tests {
+    use super::cap_state;
+
+    #[test]
+    fn cap_warning_is_induced_at_eighty_percent_and_exhaustion_at_the_cap() {
+        assert_eq!(cap_state(None, u64::MAX), (0, false, false));
+        assert_eq!(cap_state(Some(0), 0), (0, false, true));
+        assert_eq!(cap_state(Some(1000), 799), (79, false, false));
+        assert_eq!(cap_state(Some(1000), 800), (80, true, false));
+        assert_eq!(cap_state(Some(1000), 999), (99, true, false));
+        assert_eq!(cap_state(Some(1000), 1000), (100, true, true));
+        assert_eq!(cap_state(Some(1000), 5000), (500, true, true));
     }
 }

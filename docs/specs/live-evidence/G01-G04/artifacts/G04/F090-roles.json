@@ -1,0 +1,1 @@
+{"applied":true,"applyTiming":"next_child_or_model_call","presetId":"live-code","revision":2,"roleModels":{"coder":{"model":"qwen3.8:latest","provider":"ollama","reasoningEffort":null},"planner":{"model":"qwen3.8:latest","provider":"ollama","reasoningEffort":"high"}},"version":2}

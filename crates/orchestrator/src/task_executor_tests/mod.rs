@@ -492,6 +492,7 @@ pub(crate) fn build_agent_with_verification(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap()
 }
@@ -558,6 +559,8 @@ pub(crate) fn done_script() -> Vec<Vec<ScriptedResponse>> {
 // ------------------------------------------------------------------- tests
 #[cfg(test)]
 mod tests_admission;
+#[cfg(test)]
+mod tests_cancel_f068;
 #[cfg(test)]
 mod tests_control;
 #[cfg(test)]

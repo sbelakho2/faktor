@@ -106,6 +106,149 @@ pub const SHADOW_COPY_ATTEMPTS: usize = 3;
 /// content (a dropped tree would change what the run may observe and land).
 const SHADOW_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
+/// Result of a per-hunk acceptance: the new candidate identity (content
+/// digest of the selected composition) plus the landed paths. Every prior
+/// full-candidate verification is stale by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkAcceptOutcome {
+    pub change_set_id: String,
+    pub candidate_identity: String,
+    pub candidate_files: usize,
+    pub selected: Vec<PathBuf>,
+    pub applied: Vec<PathBuf>,
+    pub already_current: Vec<PathBuf>,
+    pub integrated: bool,
+}
+
+fn checked_relative(path: &Path) -> Result<(), ExecError> {
+    use std::path::Component;
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(ExecError::InvalidApproval(format!(
+            "change-set path {} is not a plain relative path",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_candidate_file(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), ExecError> {
+    checked_relative(path)?;
+    let target = root.join(path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ExecError::Internal(format!("candidate mkdir {}: {e}", parent.display()))
+        })?;
+    }
+    std::fs::write(&target, bytes)
+        .map_err(|e| ExecError::Internal(format!("candidate write {}: {e}", target.display())))
+}
+
+fn remove_candidate_file(root: &Path, path: &Path) -> Result<(), ExecError> {
+    checked_relative(path)?;
+    let target = root.join(path);
+    match std::fs::remove_file(&target) {
+        Ok(()) => {
+            // Remove now-empty parent directories, bounded by the path depth
+            // and never above the candidate root.
+            let mut parent = target.parent();
+            while let Some(dir) = parent {
+                if dir == root || std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                parent = dir.parent();
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ExecError::Internal(format!(
+            "candidate remove {}: {e}",
+            target.display()
+        ))),
+    }
+}
+
+fn restore_candidate_file(
+    root: &Path,
+    path: &Path,
+    base_bytes: &[u8],
+    base_exists: bool,
+) -> Result<(), ExecError> {
+    if base_exists {
+        write_candidate_file(root, path, base_bytes)
+    } else {
+        remove_candidate_file(root, path)
+    }
+}
+
+/// Compose `base` plus the SELECTED hunks of `base -> candidate`. Unselected
+/// hunks keep the base lines. Only valid UTF-8 regular files are accepted;
+/// binary content is refused rather than corrupted by a lossy round-trip.
+fn compose_selected_hunks(
+    base: &[u8],
+    candidate: &[u8],
+    selected: &[usize],
+) -> Result<Vec<u8>, String> {
+    let before = std::str::from_utf8(base)
+        .map_err(|_| "hunk selection requires a UTF-8 base file".to_string())?;
+    if std::str::from_utf8(candidate).is_err() {
+        return Err("hunk selection requires a UTF-8 candidate file".into());
+    }
+    let mut base_lines: Vec<&str> = before.split('\n').collect();
+    if base_lines.last() == Some(&"") {
+        base_lines.pop();
+    }
+    let outcome = faktor_edit::diff::diff_hunks(base, candidate);
+    let mut out: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    for (index, hunk) in outcome.hunks.iter().enumerate() {
+        let start = hunk.old_start.saturating_sub(1);
+        if start > base_lines.len() || start < pos {
+            return Err("hunk ranges are not ordered".into());
+        }
+        out.extend(base_lines[pos..start].iter().map(|line| line.to_string()));
+        let take = selected.binary_search(&index).is_ok();
+        if take {
+            for line in &hunk.lines {
+                match line {
+                    faktor_edit::diff::DiffLine::Context(text)
+                    | faktor_edit::diff::DiffLine::Added(text) => out.push(text.clone()),
+                    faktor_edit::diff::DiffLine::Removed(_) => {}
+                }
+            }
+        } else {
+            out.extend(
+                base_lines[start..start + hunk.old_count]
+                    .iter()
+                    .map(|line| line.to_string()),
+            );
+        }
+        pos = start + hunk.old_count;
+    }
+    if pos > base_lines.len() {
+        return Err("hunk ranges exceed the base file".into());
+    }
+    out.extend(base_lines[pos..].iter().map(|line| line.to_string()));
+    let mut composed = out.join("\n");
+    // Preserve the candidate's trailing newline when the selected set reaches
+    // the end of the file; otherwise preserve the base's.
+    let end_edit_selected = outcome.hunks.iter().enumerate().any(|(i, h)| {
+        selected.binary_search(&i).is_ok() && h.old_start + h.old_count > base_lines.len()
+    });
+    let trailing = if end_edit_selected {
+        candidate.ends_with(b"\n")
+    } else {
+        base.ends_with(b"\n")
+    };
+    if trailing && !composed.is_empty() && !composed.ends_with('\n') {
+        composed.push('\n');
+    }
+    Ok(composed.into_bytes())
+}
+
 /// A stored shadow base copy: the daemon-owned work root of a shadowed
 /// drive plus the generation anchors recorded at begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +259,115 @@ pub struct Shadow {
     pub base_root: PathBuf,
     /// The shadow's own root (daemon data dir; never inside the checkout).
     pub root: PathBuf,
+}
+
+/// Materialize a SHADOW-LOCAL git view inside the copied shadow root so the
+/// agent's shell can run `git status/diff/rev-parse` against the candidate
+/// (F195). This is NOT a copy of the repository's object database and never
+/// points at the user's index/refs: a small git dir is created with the
+/// owner's HEAD/refs/index copied read-only from the owner and an
+/// `objects/info/alternates` link for object reads. Mutations performed
+/// inside the shadow (add/commit/branch) therefore change only the shadow's
+/// own metadata and are discarded with it; the owner checkout is never
+/// written. A non-git base is a no-op.
+fn materialize_shadow_git_view(base: &Path, shadow: &Path) -> std::io::Result<()> {
+    let marker = base.join(".git");
+    if !marker.exists() {
+        return Ok(());
+    }
+    let (git_dir, common_dir) = if marker.is_dir() {
+        (marker.clone(), marker.clone())
+    } else {
+        let raw = std::fs::read_to_string(&marker)?;
+        let Some(rest) = raw.strip_prefix("gitdir:") else {
+            return Ok(());
+        };
+        let target = PathBuf::from(rest.trim());
+        let git_dir = if target.is_absolute() {
+            target
+        } else {
+            base.join(target)
+        };
+        let git_dir = git_dir.canonicalize()?;
+        let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(raw) => {
+                let rel = PathBuf::from(raw.trim());
+                if rel.is_absolute() {
+                    rel
+                } else {
+                    git_dir.join(rel)
+                }
+                .canonicalize()?
+            }
+            Err(_) => git_dir.clone(),
+        };
+        (git_dir, common)
+    };
+    if !git_dir.is_dir() || !common_dir.is_dir() {
+        return Ok(());
+    }
+    let view = shadow.join(".git");
+    if view.exists() {
+        std::fs::remove_dir_all(&view)?;
+    }
+    std::fs::create_dir_all(view.join("objects/info"))?;
+    std::fs::create_dir_all(view.join("refs"))?;
+    // Small metadata files: the per-worktree HEAD/index first, then the
+    // shared config/refs. Objects are NEVER copied.
+    for rel in ["HEAD", "index", "packed-refs", "shallow", "MERGE_HEAD"] {
+        let source = git_dir.join(rel);
+        if source.is_file() {
+            let _ = std::fs::copy(&source, view.join(rel));
+        }
+        let common = common_dir.join(rel);
+        if common.is_file() && !view.join(rel).exists() {
+            let _ = std::fs::copy(&common, view.join(rel));
+        }
+    }
+    let owner_config = common_dir.join("config");
+    let mut config = std::fs::read_to_string(&owner_config).unwrap_or_default();
+    config.push_str(&format!("\n[core]\n\tworktree = {}\n", shadow.display()));
+    std::fs::write(view.join("config"), config)?;
+    let mut copied = 0usize;
+    copy_git_refs(&common_dir.join("refs"), &view.join("refs"), &mut copied)?;
+    // Object reads resolve through the owner's object directory; writes a
+    // shadow-side command may make land in the shadow's own objects dir.
+    let alternates = common_dir.join("objects");
+    std::fs::write(
+        view.join("objects/info/alternates"),
+        format!("{}\n", alternates.display()),
+    )?;
+    std::fs::create_dir_all(view.join("objects/pack"))?;
+    Ok(())
+}
+
+/// Bounded recursive copy of git ref files (never symlinks, never locks).
+fn copy_git_refs(from: &Path, to: &Path, copied: &mut usize) -> std::io::Result<()> {
+    const MAX_REF_FILES: usize = 20_000;
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    for entry in entries {
+        if *copied >= MAX_REF_FILES {
+            break;
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        let source = entry.path();
+        let target = to.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_git_refs(&source, &target, copied)?;
+        } else if kind.is_file() {
+            std::fs::copy(&source, &target)?;
+            *copied += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Copy caps of one shadow base (bounded everything: caps are typed
@@ -417,6 +669,16 @@ impl ShadowRoots {
                     e,
                 ));
             }
+            // The git view is materialized AFTER the content copy: its
+            // `.git` is excluded from the canonical manifest (exactly like
+            // the owner's), so it can never change the candidate identity.
+            if let Err(e) = materialize_shadow_git_view(&base, &dir) {
+                tracing::warn!(
+                    base = %base.display(),
+                    error = %e,
+                    "shadow git view unavailable; the agent shell will not resolve .git"
+                );
+            }
             let after = digest(&base)?;
             let copied = digest(&dir)?;
             if before == after && after == copied {
@@ -589,6 +851,15 @@ impl ShadowRoots {
             .accept_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.accept_change_set_locked(session, approved, rejected)
+    }
+
+    fn accept_change_set_locked(
+        &self,
+        session: SessionId,
+        approved: &[PathBuf],
+        rejected: &[PathBuf],
+    ) -> Result<ChangeAcceptOutcome, ExecError> {
         let row = self.live_row(session)?;
         let change_set = self.present_change_set(session)?;
         let (approved, rejected) = validate_decision(&change_set, approved, rejected)?;
@@ -637,6 +908,140 @@ impl ShadowRoots {
             already_current,
             rejected,
             integrated: true,
+        })
+    }
+
+    // ---------------------------------------------------- hunk acceptance
+
+    /// Accept a SELECTED subset of the staged line hunks (F201/F202). The
+    /// candidate is rewritten to the selected composition FIRST, re-staged
+    /// (so its content identity changes and every prior full-candidate
+    /// proof is stale), then landed through the ordinary transactional
+    /// acceptance path. Paths without a selection are reverted to their
+    /// base (unselected = rejected). Files are whole-selected only when the
+    /// selection names every hunk, preserving exact bytes.
+    pub fn accept_selected_hunks(
+        &self,
+        session: SessionId,
+        selections: &std::collections::BTreeMap<PathBuf, Vec<usize>>,
+        rejected: &[PathBuf],
+    ) -> Result<HunkAcceptOutcome, ExecError> {
+        let _guard = self
+            .accept_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let row = self.live_row(session)?;
+        let change_set = self.present_change_set(session)?;
+        let base_root = PathBuf::from(&row.base_root);
+        let child_root = PathBuf::from(&row.root);
+        let known: std::collections::BTreeSet<&PathBuf> =
+            change_set.files.iter().map(|entry| &entry.path).collect();
+        for path in selections.keys().chain(rejected.iter()) {
+            if !known.contains(path) {
+                return Err(ExecError::InvalidApproval(format!(
+                    "path {} is not part of the change set",
+                    path.display()
+                )));
+            }
+        }
+        let mut selected_paths: Vec<PathBuf> = Vec::new();
+        for entry in &change_set.files {
+            let indices = selections.get(&entry.path);
+            let child_bytes = match entry.child_state().as_ref() {
+                Some(state) if state.is_regular() => std::fs::read(child_root.join(&entry.path))
+                    .map_err(|e| {
+                        ExecError::Internal(format!("read candidate {}: {e}", entry.path.display()))
+                    })?,
+                Some(_) => {
+                    return Err(ExecError::Conflict(format!(
+                        "hunk selection of non-regular candidate {} is refused",
+                        entry.path.display()
+                    )))
+                }
+                None => Vec::new(),
+            };
+            let base_bytes = match entry.base_state().as_ref() {
+                Some(state) if state.is_regular() => {
+                    let bytes = std::fs::read(base_root.join(&entry.path)).map_err(|e| {
+                        ExecError::WorkspaceDrift(format!(
+                            "base file {} cannot be read for hunk selection: {e}",
+                            entry.path.display()
+                        ))
+                    })?;
+                    let digest =
+                        faktor_core::hash::FileHash::from(*blake3::hash(&bytes).as_bytes());
+                    if Some(digest) != entry.base_state().and_then(|s| s.payload_digest()) {
+                        return Err(ExecError::WorkspaceDrift(format!(
+                            "base file {} drifted since the change set was staged",
+                            entry.path.display()
+                        )));
+                    }
+                    bytes
+                }
+                Some(_) => {
+                    return Err(ExecError::Conflict(format!(
+                        "hunk selection of non-regular base {} is refused",
+                        entry.path.display()
+                    )))
+                }
+                None => Vec::new(),
+            };
+            let Some(indices) = indices else {
+                // Unselected file: restore its base state in the candidate.
+                restore_candidate_file(
+                    &child_root,
+                    &entry.path,
+                    &base_bytes,
+                    entry.base_state().is_some(),
+                )?;
+                continue;
+            };
+            if entry.child_state().is_none() && indices.is_empty() {
+                restore_candidate_file(&child_root, &entry.path, &base_bytes, true)?;
+                continue;
+            }
+            let outcome = faktor_edit::diff::diff_hunks(&base_bytes, &child_bytes);
+            let hunk_count = outcome.hunks.len();
+            let mut sorted = indices.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.iter().any(|index| *index >= hunk_count) {
+                return Err(ExecError::InvalidApproval(format!(
+                    "hunk index out of range for {}: {indices:?} (change set has {hunk_count} hunks)",
+                    entry.path.display()
+                )));
+            }
+            let composed = if sorted.len() == hunk_count {
+                // Whole-file selection: preserve the candidate bytes exactly.
+                child_bytes
+            } else {
+                compose_selected_hunks(&base_bytes, &child_bytes, &sorted).map_err(|message| {
+                    ExecError::Conflict(format!("{}: {message}", entry.path.display()))
+                })?
+            };
+            if entry.child_state().is_none() && composed.is_empty() {
+                remove_candidate_file(&child_root, &entry.path)?;
+            } else {
+                write_candidate_file(&child_root, &entry.path, &composed)?;
+            }
+            selected_paths.push(entry.path.clone());
+        }
+        // Re-stage: the candidate identity is now the SELECTED composition,
+        // never the previously verified full candidate.
+        let restaged = self.stage_change_set(session)?;
+        let candidate_identity = restaged.id();
+        let candidate_file_count = restaged.files.len();
+        let approved: Vec<PathBuf> = restaged.files.iter().map(|e| e.path.clone()).collect();
+        let rejected_all: Vec<PathBuf> = rejected.to_vec();
+        let outcome = self.accept_change_set_locked(session, &approved, &rejected_all)?;
+        Ok(HunkAcceptOutcome {
+            change_set_id: outcome.change_set_id,
+            candidate_identity,
+            candidate_files: candidate_file_count,
+            selected: selected_paths,
+            applied: outcome.applied,
+            already_current: outcome.already_current,
+            integrated: outcome.integrated,
         })
     }
 

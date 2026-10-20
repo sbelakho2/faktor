@@ -1229,6 +1229,7 @@ impl AcpStreamBackend for NativePermissionBackend {
             let permission = PermissionRequest {
                 id,
                 op_id: OpId::new(1),
+                tool_id: String::new(),
                 capability: Capability::ExecuteShell {
                     command: "echo hi".into(),
                 },

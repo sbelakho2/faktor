@@ -33,6 +33,41 @@ pub(crate) fn settlement_task_id(
 }
 
 impl TaskExecutor {
+    /// A NO-OP run whose criterion proof is unavailable is parked at
+    /// `NeedsVerification`, never left in `Verifying`: the empty change set
+    /// has no landing step to wait for, so `Verifying` would be a lie (F068
+    /// sibling residual). A run WITH changed paths keeps `Verifying` — its
+    /// verifier attempt can still be superseded/resumed.
+    fn park_unverified_no_op(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: faktor_core::TaskId,
+        changed_empty: bool,
+    ) -> Result<(), ExecError> {
+        if !changed_empty {
+            return Ok(());
+        }
+        let Some(task) = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?
+        else {
+            return Ok(());
+        };
+        if task.state != TaskState::Verifying {
+            return Ok(());
+        }
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+        handle
+            .transition_task(task_id, revision, TaskTransition::Reverify, None)
+            .map_err(|e| {
+                ExecError::Internal(format!(
+                    "parking unverified no-op task {task_id} at NeedsVerification: {e}"
+                ))
+            })?;
+        Ok(())
+    }
     // ------------------------------------------------- post-run settlement (P1)
 
     /// The ONE post-run settlement, shared by the single-session shadowed
@@ -1408,6 +1443,12 @@ impl TaskExecutor {
         no_op: NoOpDisposition,
     ) -> Result<Option<VerifiedRunIntegration>, ExecError> {
         let token = CancellationToken::new();
+        // An explicitly-no-op run with a CONFIGURED verifier that produced
+        // no verdict is parked at NeedsVerification. A deployment with NO
+        // verifier at all keeps the historical explicit Verifying state
+        // (there is nothing to re-request).
+        let explicit_no_op = run_no_op_policy_is_explicit(handle, &prepared.run_id)?
+            && !self.orchestrator.agent().deps().verification.is_disabled();
         let run = if prepared.changed.is_empty() && no_op == NoOpDisposition::Refused {
             persist_root_verification_fact(handle, "pending", &[], &[])?;
             self.note_root_verification_unavailable(
@@ -1417,6 +1458,11 @@ impl TaskExecutor {
                     prepared.run_id
                 ),
             );
+            self.park_unverified_no_op(
+                handle,
+                task_id,
+                explicit_no_op && prepared.changed.is_empty(),
+            )?;
             return Ok(None);
         } else if prepared.changed.is_empty() && no_op == NoOpDisposition::Allowed {
             faktor_agent::IntegratedRootVerification {
@@ -1498,6 +1544,11 @@ impl TaskExecutor {
                                 &[],
                                 &prepared.changed,
                             )?;
+                            self.park_unverified_no_op(
+                                handle,
+                                task_id,
+                                explicit_no_op && prepared.changed.is_empty(),
+                            )?;
                             return Ok(None);
                         }
                     }
@@ -1511,6 +1562,11 @@ impl TaskExecutor {
                             prepared.run_id
                         ),
                     );
+                    self.park_unverified_no_op(
+                        handle,
+                        task_id,
+                        explicit_no_op && prepared.changed.is_empty(),
+                    )?;
                     return Ok(None);
                 }
             }
@@ -1537,6 +1593,11 @@ impl TaskExecutor {
                             prepared.run_id
                         ),
                     );
+                    self.park_unverified_no_op(
+                        handle,
+                        task_id,
+                        explicit_no_op && prepared.changed.is_empty(),
+                    )?;
                     return Ok(None);
                 }
             }

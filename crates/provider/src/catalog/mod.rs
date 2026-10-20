@@ -700,6 +700,10 @@ impl Provider for PricingOverrideProvider {
         self.inner.known_models()
     }
 
+    fn resolved_model(&self, model: &str) -> String {
+        self.inner.resolved_model(model)
+    }
+
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {
         self.inner.runtime_context_limit(model)
     }
@@ -858,6 +862,10 @@ impl Provider for QualityOverrideProvider {
         self.inner.known_models()
     }
 
+    fn resolved_model(&self, model: &str) -> String {
+        self.inner.resolved_model(model)
+    }
+
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {
         self.inner.runtime_context_limit(model)
     }
@@ -991,6 +999,10 @@ impl Provider for BillingOriginProvider {
 
     fn known_models(&self) -> Vec<String> {
         self.inner.known_models()
+    }
+
+    fn resolved_model(&self, model: &str) -> String {
+        self.inner.resolved_model(model)
     }
 
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {

@@ -47,6 +47,29 @@ pub(crate) fn resolve_turn_caps(
     (resolution.caps, resolution.authority, effective)
 }
 
+/// Apply the durable per-session context-window override (F046). It can only
+/// LOWER the effective budget below the model/runtime window; a value above
+/// the window is clamped, never trusted to raise it.
+pub(crate) fn apply_context_window_override(
+    handle: &faktor_session::SessionHandle,
+    mut effective: faktor_core::model::ModelCapabilities,
+) -> faktor_core::model::ModelCapabilities {
+    let Ok(Some(raw)) = handle.memory_fact_get("session_settings", "contextWindow") else {
+        return effective;
+    };
+    let Ok(tokens) = raw.trim().parse::<u64>() else {
+        return effective;
+    };
+    if tokens == 0 {
+        return effective;
+    }
+    let Ok(tokens) = usize::try_from(tokens) else {
+        return effective;
+    };
+    effective.context = effective.context.min(tokens);
+    effective
+}
+
 /// Loop-carried state of ONE logical turn (the locals `drive_turn_inner`
 /// kept across its iterations, lifted into one owner).
 pub(crate) struct TurnDriveState<'a> {
@@ -220,6 +243,7 @@ impl<'a> TurnDriveState<'a> {
         // logical turn, so the compaction trigger, try_compact's target, and
         // every post-compaction re-plan all share the SAME effective budget.
         let (caps, cap_authority, effective_caps) = resolve_turn_caps(&provider, &model);
+        let effective_caps = apply_context_window_override(handle, effective_caps);
         let budget = ContextBudget::for_capabilities(&effective_caps);
         // P0-79 site d: the hash of the evidence set the last retrieval
         // admitted into this drive's context (drive-local; the tracker's
@@ -373,6 +397,7 @@ impl AgentRuntime {
         }
         if model_changed {
             let (caps, cap_authority, effective_caps) = resolve_turn_caps(&st.provider, &st.model);
+            let effective_caps = apply_context_window_override(st.handle, effective_caps);
             st.caps = caps;
             st.cap_authority = cap_authority;
             st.effective_caps = effective_caps;
@@ -1038,10 +1063,13 @@ impl AgentRuntime {
                 }
                 st.model = if st.override_active {
                     // A per-message override pins the MODEL; the routed
-                    // decision still resolved the execution provider.
-                    st.model.clone()
+                    // decision still resolved the execution provider. An
+                    // adapter alias (Ollama `default`) is resolved to the
+                    // CONCRETE wire id so every durable record names what
+                    // was actually called.
+                    st.provider.resolved_model(&st.model)
                 } else {
-                    let routed_model = decision.model.clone();
+                    let routed_model = st.provider.resolved_model(&decision.model);
                     if routed_model != st.model {
                         // Economy may choose among SERVED candidates, but
                         // never silently: the session surface names both
@@ -1094,6 +1122,7 @@ impl AgentRuntime {
             // iteration's plan (this iteration's plan already fits the
             // routed window — the router's fit axis qualified it).
             let (caps, cap_authority, effective_caps) = resolve_turn_caps(&st.provider, &st.model);
+            let effective_caps = apply_context_window_override(st.handle, effective_caps);
             st.caps = caps;
             st.cap_authority = cap_authority;
             st.effective_caps = effective_caps;

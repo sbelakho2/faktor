@@ -1,0 +1,1 @@
+{"session_id":11,"revision":1,"operation_id":"op-live-3","call_id":null,"model":"qwen3.8:latest","capacity":100000,"input":null,"output_reserve":4096,"safety_reserve":2048,"basis":{"kind":"estimated","method":"wire-plan-estimator","version":"1"},"sources":[],"created_ms":1792457888799}

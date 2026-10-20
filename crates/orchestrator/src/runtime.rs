@@ -1927,9 +1927,22 @@ impl OrchestratorRuntime {
                 // promptable. A failed abort is loud (the control row is
                 // already acked, so the caller retries the whole call).
                 if let Ok(Some(record)) = session.active_turn_record() {
-                    session
-                        .abort(Some(record.turn_op_id))
-                        .map_err(|e| ExecError::retriable("cancel abort", e))?;
+                    match session.abort(Some(record.turn_op_id)) {
+                        Ok(_) => {}
+                        // Idempotent stop: the turn finished between the
+                        // record read and the abort. A NotFound for an op
+                        // that is no longer tracked/queued AND has no active
+                        // turn record left is the documented already-stopped
+                        // case — the durable Cancel row was already acked and
+                        // the caller must not see a 500. Any other failure
+                        // stays loud (the control row can be retried).
+                        Err(e)
+                            if e.kind == faktor_core::error::ErrorKind::NotFound
+                                && session.active_turn_record().ok().flatten().is_none() => {}
+                        Err(e) => {
+                            return Err(ExecError::retriable("cancel abort", e));
+                        }
+                    }
                 }
                 Ok(ControlAck {
                     queued_seq: msg.seq,

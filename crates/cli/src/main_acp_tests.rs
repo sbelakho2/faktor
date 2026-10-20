@@ -72,6 +72,7 @@ pub(crate) fn test_agent(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     AgentRuntime::new(deps).unwrap()
 }
@@ -175,6 +176,7 @@ pub(crate) fn acp_shadow_rig(scripts: Vec<ScriptedResponse>) -> AcpShadowRig {
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     let agent = AgentRuntime::new(deps).unwrap();
     let orchestrator =

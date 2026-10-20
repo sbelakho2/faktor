@@ -678,6 +678,13 @@ async fn edition5_foundation_surfaces_are_wired_over_http() {
     });
     let (status, preview) = rig.post("/native/config/preview", patch.clone()).await;
     assert_eq!(status, StatusCode::OK, "{preview}");
+    // A preview carries the validated DIFF (key/scope/current/next/timing),
+    // not merely a count: the Settings screen renders it before committing.
+    assert_eq!(preview["changes"][0]["key"], "faktor.retry.maxAttempts");
+    assert_eq!(preview["changes"][0]["scope"], "user");
+    assert_eq!(preview["changes"][0]["next"], 3);
+    assert!(preview["changes"][0]["applyTiming"].is_string());
+    assert_eq!(preview["affectedScopes"], json!(["user"]));
     let (status, receipt) = rig.post("/native/config/commit", patch).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["changed"], 1);

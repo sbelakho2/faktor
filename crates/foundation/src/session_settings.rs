@@ -11,7 +11,13 @@ use crate::{FoundationDb, FoundationError};
 pub const COMPACTION_MODEL_KEY: &str = "compactionModel";
 pub const MAX_TURNS_KEY: &str = "maxTurns";
 pub const MAX_CONSECUTIVE_FAILURES_KEY: &str = "maxConsecutiveFailures";
+/// Per-session context-window override in tokens (F046). It can only LOWER
+/// the effective budget below the model/runtime limit, never raise it.
+pub const CONTEXT_WINDOW_KEY: &str = "contextWindow";
 pub const MAX_SESSION_SETTINGS: usize = 32;
+/// Bounds of the per-session context-window override (tokens).
+pub const MIN_CONTEXT_WINDOW_TOKENS: u64 = 256;
+pub const MAX_CONTEXT_WINDOW_TOKENS: u64 = 10_000_000;
 pub const MAX_SETTING_BYTES: usize = 1_024;
 
 pub struct SessionSettingsService {
@@ -193,6 +199,16 @@ fn validate_setting(key: &str, value: &Value) -> Result<(), FoundationError> {
                 return Err(FoundationError::Malformed(
                     "maxConsecutiveFailures must be 2..=1000".into(),
                 ));
+            }
+        }
+        CONTEXT_WINDOW_KEY => {
+            let tokens = value.as_u64().ok_or_else(|| {
+                FoundationError::Malformed("contextWindow must be an integer".into())
+            })?;
+            if !(MIN_CONTEXT_WINDOW_TOKENS..=MAX_CONTEXT_WINDOW_TOKENS).contains(&tokens) {
+                return Err(FoundationError::Malformed(format!(
+                    "contextWindow must be {MIN_CONTEXT_WINDOW_TOKENS}..={MAX_CONTEXT_WINDOW_TOKENS} tokens"
+                )));
             }
         }
         _ => {

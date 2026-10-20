@@ -2258,6 +2258,7 @@ pub(crate) fn open_real_tool_env_inner_with_resolver(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     })
     .unwrap();
     let owner_root = root.join("owner");

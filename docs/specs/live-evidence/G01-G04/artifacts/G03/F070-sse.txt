@@ -1,0 +1,31 @@
+id: 1
+event: session_created
+data: {"kind":"session_created","opId":null,"payload":{"model":"qwen3.8:latest","provider":"ollama","title":"Count slowly from 1 to 100, one number per line, in two independent children. — Count slowly."},"seq":1,"state":"idle","tsMs":1792461688268}
+
+id: 2
+event: prompt_received
+data: {"kind":"prompt_received","opId":"1879524506893042693","payload":{"queued":false},"seq":2,"state":"preparing","tsMs":1792461688272}
+
+id: 3
+event: context_prepared
+data: {"kind":"context_prepared","opId":"1879524506893042693","payload":null,"seq":3,"state":"building_context","tsMs":1792461688277}
+
+id: 4
+event: model_started
+data: {"kind":"model_started","opId":"1879524506893042693","payload":null,"seq":4,"state":"waiting_for_model","tsMs":1792461688287}
+
+id: 5
+event: model_started
+data: {"kind":"model_started","opId":"1879524506893042693","payload":null,"seq":5,"state":"streaming","tsMs":1792461688291}
+
+id: 6
+event: failed
+data: {"kind":"failed","opId":"1879524506893042693","payload":{"error":"aborted","op_id":1879524506893042693},"seq":6,"state":"cancelled","tsMs":1792461690434}
+
+id: 7
+event: turn_completed
+data: {"kind":"turn_completed","opId":"1879524506893042693","payload":{"aborted":true},"seq":7,"state":"ready_for_next_turn","tsMs":1792461690434}
+
+event: heartbeat
+data: {}
+

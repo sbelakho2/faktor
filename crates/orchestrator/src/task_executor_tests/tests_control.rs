@@ -2425,9 +2425,10 @@ pub(crate) async fn no_op_run_without_a_reviewer_verdict_refuses_completion() {
     assert_eq!(owner_digest(&env), before);
     let h = env.manager.get_session(env.parent).unwrap().unwrap();
     let task_id = h.task_id().unwrap();
-    assert_ne!(
+    assert_eq!(
         h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete
+        TaskState::NeedsVerification,
+        "an unavailable root verification settles the row at NeedsVerification, never a parked Verifying"
     );
     assert!(
         h.list_verification_records(task_id)

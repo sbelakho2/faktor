@@ -1,0 +1,1 @@
+{"code":"malformed","message":"malformed: endpoint 192.168.1.5 is a private destination; current provider policy refuses it (allow_loopback is not a LAN/metadata bypass)","retryable":false}

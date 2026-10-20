@@ -180,6 +180,38 @@ impl AgentRuntime {
                 None,
             )?;
         }
+        // Production call receipt (F048/F090): ONE immutable normalized
+        // requested-vs-effective record per settled physical attempt. The
+        // sink is the daemon's foundation store; absent in tests/embedded.
+        if let (Some(sink), Some(identity)) = (self.receipt_sink(), st.settled_attempt_identity) {
+            let ended_ms = self.deps.clock.now_ms();
+            let started_ms =
+                ended_ms.saturating_sub(st.attempt_started.elapsed().as_millis() as i64);
+            let mut requested = std::collections::BTreeMap::new();
+            requested.insert(
+                "provider".into(),
+                serde_json::Value::String(st.provider.id().to_string()),
+            );
+            requested.insert("model".into(), serde_json::Value::String(st.model.clone()));
+            let effective = requested.clone();
+            sink.record(&crate::CallReceiptRecord {
+                session_id: st.handle.id().raw(),
+                op_id: identity.logical_op_id.raw().to_string(),
+                call_id: format!("attempt-{}", identity.attempt_op_id.raw()),
+                provider: st.provider.id().to_string(),
+                model: st.model.clone(),
+                route: format!("{}/{}", st.provider.id(), st.model),
+                requested,
+                effective,
+                inherited: Vec::new(),
+                started_ms,
+                ended_ms: Some(ended_ms),
+                status: "completed".into(),
+                tokens_in: Some(st.tokens_in),
+                tokens_out: Some(st.tokens_out),
+                error: None,
+            });
+        }
         // Prefix-cache observation (audits 45/65-66 fill site,
         // architecture §8.4): the completed call additionally lands the
         // digest of the EXACT cacheable-prefix bytes the wire request

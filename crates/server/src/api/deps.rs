@@ -148,6 +148,19 @@ pub struct ServerDeps {
     /// manager; dropping `ServerDeps` drops the manager and kills every
     /// browser tree (no process outlives the daemon).
     pub(crate) browser: Arc<crate::native::browser_surface::BrowserSurface>,
+    /// The daemon's ONE git worktree authority (F205/F206/F207). `None` in
+    /// embedded hosts without a supervisor; the worktree routes then answer
+    /// a typed 503 instead of fabricating a manager.
+    pub worktrees: Option<Arc<faktor_git::WorktreeManager>>,
+    /// Held repository mutation leases (F207) keyed by the lease token the
+    /// lock route returned. Dropping the entry releases the same guard.
+    pub repo_locks: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, faktor_git::RepositoryMutationGuard>>,
+    >,
+    /// Serializes the read-check-apply-bump of one session-settings update so
+    /// two concurrent editors cannot both pass the same expected revision
+    /// (F071). The durable revision fact is the cross-request fence.
+    pub settings_lock: Arc<tokio::sync::Mutex<()>>,
     /// Single-flight cache of the Engineering Outcome Ledger metrics fold
     /// (`/native/outcomes`). Keyed by the store's monotonic outcome
     /// revision; a new terminal run or settlement correction invalidates it.
@@ -267,6 +280,9 @@ impl ServerDeps {
             foundation: None,
             mcp_runtime,
             browser,
+            worktrees: None,
+            repo_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
             outcomes_cache: Arc::new(crate::native::outcomes::OutcomesMetricsCache::default()),
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -290,6 +306,12 @@ impl ServerDeps {
     /// always wires it; embedded hosts may leave it `None`.
     pub fn with_foundation(mut self, foundation: Arc<faktor_foundation::Foundation>) -> Self {
         self.foundation = Some(foundation);
+        self
+    }
+
+    /// Wire the daemon's single git worktree authority (F205/F206/F207).
+    pub fn with_worktrees(mut self, worktrees: Arc<faktor_git::WorktreeManager>) -> Self {
+        self.worktrees = Some(worktrees);
         self
     }
 

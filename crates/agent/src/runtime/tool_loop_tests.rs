@@ -2740,8 +2740,10 @@ async fn tool_error_hook_fires_and_a_post_hoc_deny_is_audit_only() {
         written.contains("\"tool\":\"boom\""),
         "payload tool: {written}"
     );
+    // The typed tool reason rides the snippet (a sibling contract change):
+    // assert the bounded prefix, not an exact string that discards it.
     assert!(
-        written.contains("\"error\":\"tool boom failed\""),
+        written.contains("\"error\":\"tool boom failed"),
         "bounded error snippet: {written}"
     );
     // Every run is audit-logged, the deny included.
@@ -3172,4 +3174,167 @@ async fn cancelled_turn_abort_loss_is_marked_and_replayed() {
         "the abort was not reconstructed: {events:?}"
     );
     assert!(marker_files(&root).is_empty());
+}
+
+/// F165 regression: the durable tool-enablement fact is a real runtime
+/// authority. A disabled tool is ABSENT from the model-visible bundle, and a
+/// stale model call naming it is refused by the membership guard before any
+/// permission hop or execution.
+#[tokio::test]
+async fn durable_tool_enablement_removes_disabled_tools_from_the_bundle_and_dispatch() {
+    fn counting_tool(name: &str, executions: Arc<std::sync::atomic::AtomicUsize>) -> Tool {
+        let name_owned = name.to_string();
+        Tool {
+            name: name.to_string(),
+            description: format!("{name} test tool"),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: if name == "write_file" {
+                faktor_core::resource::ResourceClass::DiskWrite
+            } else {
+                faktor_core::resource::ResourceClass::DiskRead
+            },
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = name_owned;
+                    Ok(ToolOutcome::default())
+                })
+            }),
+        }
+    }
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "blocked".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({}),
+            },
+            ScriptedResponse::End,
+        ]),
+        vec![
+            counting_tool("read_file", executions.clone()),
+            counting_tool("write_file", executions.clone()),
+        ],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            TOOL_ENABLEMENT_FACT_KIND,
+            TOOL_ENABLEMENT_FACT_KEY,
+            &serde_json::json!({"allow": ["read_file"], "deny": []}).to_string(),
+        )
+        .unwrap();
+    let caps = ModelCapabilities::default();
+    let bundle = runtime.tools_bundle_for_turn(&handle, &[], &caps);
+    let names: Vec<&str> = bundle.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["read_file"], "{names:?}");
+    let outcome = runtime
+        .run_turn(session, "write something", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the disabled write tool must never execute"
+    );
+    let events = handle.events_range(1, None).unwrap();
+    assert!(
+        events.iter().any(|e| {
+            e.kind == faktor_core::event::EventKind::PermissionDenied
+                && e.payload
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|r| r.contains("write_file"))
+        }),
+        "the refusal is durable and names the disabled tool"
+    );
+}
+
+/// A corrupt/unreadable enablement fact fails closed (no tool offered),
+/// never silently allow-all.
+#[tokio::test]
+async fn corrupt_tool_enablement_fact_offers_no_tools() {
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (deps, _dir) = deps(
+        scripted_provider(vec![ScriptedResponse::End]),
+        vec![Tool {
+            name: "read_file".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskRead,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome::default())
+                })
+            }),
+        }],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            TOOL_ENABLEMENT_FACT_KIND,
+            TOOL_ENABLEMENT_FACT_KEY,
+            "{not json",
+        )
+        .unwrap();
+    let bundle = runtime.tools_bundle_for_turn(&handle, &[], &ModelCapabilities::default());
+    assert!(bundle.tools.is_empty(), "{:?}", bundle.tools);
+}
+
+/// F048/F090 regression: a settled model call emits ONE production receipt
+/// into the injected sink with the actual provider/model and usage counters.
+#[tokio::test]
+async fn settled_model_call_emits_a_call_receipt() {
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<crate::CallReceiptRecord>>);
+    impl crate::CallReceiptSink for RecordingSink {
+        fn record(&self, receipt: &crate::CallReceiptRecord) {
+            self.0.lock().unwrap().push(receipt.clone());
+        }
+    }
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::Text("hello".into()),
+            ScriptedResponse::End,
+        ]),
+        vec![],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    runtime.set_receipt_sink(sink.clone());
+    let session = new_session(runtime.deps());
+    runtime.run_turn(session, "say hello", &[]).await.unwrap();
+    let recorded = sink.0.lock().unwrap();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].session_id, session.raw());
+    assert_eq!(recorded[0].status, "completed");
+    assert_eq!(recorded[0].model, "m");
+    assert!(recorded[0].call_id.starts_with("attempt-"));
+    assert!(recorded[0].ended_ms.is_some());
 }

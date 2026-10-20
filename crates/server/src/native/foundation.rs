@@ -153,12 +153,62 @@ pub(crate) async fn native_config_preview(
         Err(r) => return r,
     };
     match foundation.config.validate(&patch) {
-        Ok(()) => Json(serde_json::json!({
-            "valid": true,
-            "changed": patch.changes.len(),
-            "expectedRevision": patch.expected_revision,
-        }))
-        .into_response(),
+        Ok(()) => {
+            // A preview is a DIFF, not just a count: every change names the
+            // effective current value, the proposed value (or the default
+            // when the change removes an override), the scope it writes and
+            // the descriptor's apply timing. Read-only (no write).
+            let snapshot = match foundation.config.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(e) => return foundation_error(e),
+            };
+            let mut changes = Vec::with_capacity(patch.changes.len());
+            let mut scopes: Vec<String> = Vec::new();
+            for change in &patch.changes {
+                let descriptor = foundation.config.descriptors().get(&change.key);
+                let current = snapshot.values.get(&change.key);
+                let next = change
+                    .value
+                    .clone()
+                    .or_else(|| descriptor.map(|descriptor| descriptor.default.clone()));
+                let redact = descriptor.is_some_and(|d| d.secret_reference_only);
+                let mask = |value: Option<&serde_json::Value>| {
+                    if redact {
+                        serde_json::Value::String("[secret-reference]".into())
+                    } else {
+                        value.cloned().unwrap_or(serde_json::Value::Null)
+                    }
+                };
+                let scope = match serde_json::to_value(change.scope) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::Value::Null,
+                };
+                if let Some(name) = scope.as_str() {
+                    if !scopes.iter().any(|s| s == name) {
+                        scopes.push(name.to_string());
+                    }
+                }
+                changes.push(serde_json::json!({
+                    "key": change.key,
+                    "scope": scope,
+                    "current": mask(current.map(|value| &value.value)),
+                    "next": mask(next.as_ref()),
+                    "currentSource": current.map(|value| value.source.clone()),
+                    "changed": current.map(|value| Some(&value.value)) != Some(change.value.as_ref()),
+                    "applyTiming": descriptor.map(|d| serde_json::json!(d.apply_timing)),
+                    "writable": descriptor.map(|d| d.writable),
+                    "secretReferenceOnly": redact,
+                }));
+            }
+            Json(serde_json::json!({
+                "valid": true,
+                "changed": patch.changes.len(),
+                "expectedRevision": patch.expected_revision,
+                "affectedScopes": scopes,
+                "changes": changes,
+            }))
+            .into_response()
+        }
         Err(errors) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1491,10 +1541,17 @@ fn diagnostics_facts(
         .names()
         .into_iter()
         .take(500)
-        .map(|name| ToolSummary {
-            name,
-            source: "builtin".into(),
-            health: "ready".into(),
+        .map(|name| {
+            let schema = registry
+                .get(&name)
+                .and_then(|tool| serde_json::to_string(&tool.input_schema).ok())
+                .unwrap_or_else(|| "{}".into());
+            ToolSummary {
+                name,
+                source: "builtin".into(),
+                health: "ready".into(),
+                schema,
+            }
         })
         .collect();
     let data_dir = state
@@ -1689,6 +1746,54 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         previous = current;
     }
     previous[text.len()]
+}
+
+/// Production receipt sink: persists every settled model call into the
+/// foundation `call_receipt` authority (F048/F050/F090). The agent emits the
+/// normalized requested/effective record; this adapter only maps it, so no
+/// provider semantics leak into the runtime.
+struct FoundationCallReceiptSink {
+    receipts: std::sync::Arc<faktor_foundation::models::CallReceiptStore>,
+}
+
+impl faktor_agent::CallReceiptSink for FoundationCallReceiptSink {
+    fn record(&self, record: &faktor_agent::CallReceiptRecord) {
+        let receipt = faktor_foundation::models::CallReceipt {
+            session_id: record.session_id,
+            call_id: record.call_id.clone(),
+            op_id: record.op_id.clone(),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            route: record.route.clone(),
+            capability_revision: 0,
+            requested: record.requested.clone(),
+            effective: record.effective.clone(),
+            inherited: record.inherited.clone(),
+            started_ms: record.started_ms,
+            ended_ms: record.ended_ms,
+            status: record.status.clone(),
+            tokens_in: record.tokens_in,
+            tokens_out: record.tokens_out,
+            error: record.error.clone(),
+        };
+        if let Err(e) = self.receipts.record(&receipt) {
+            tracing::warn!(
+                session = record.session_id,
+                call = %record.call_id,
+                "call receipt write failed: {e}"
+            );
+        }
+    }
+}
+
+/// Install the foundation-backed receipt writer on the daemon's ONE runtime.
+pub fn install_call_receipt_sink(
+    agent: &std::sync::Arc<faktor_agent::AgentRuntime>,
+    foundation: &faktor_foundation::Foundation,
+) {
+    agent.set_receipt_sink(std::sync::Arc::new(FoundationCallReceiptSink {
+        receipts: foundation.receipts.clone(),
+    }));
 }
 
 #[cfg(test)]

@@ -63,6 +63,50 @@ pub fn build_daemon(
     build_daemon_with_scm_seams(data_dir, config, GithubAppSeams::default())
 }
 
+/// [`build_daemon`] for the headless `run` entry, with an explicit
+/// permission requester. A one-prompt run has no host to answer a permission
+/// dialog: the CLI supplies [`HeadlessPermissionRequester`], which denies
+/// every capability request immediately (typed, never a silent allow and
+/// never a stall until the durable deadline). Read-only tools declare no
+/// capability, so investigation still works; a denied write/shell is
+/// reported to the model as a refused tool result.
+pub(crate) fn build_daemon_with_permission(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    permission_requester: Arc<dyn faktor_agent::PermissionRequester>,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_seams_and_planner(
+        data_dir,
+        config,
+        GithubAppSeams::default(),
+        None,
+        None,
+        Some(permission_requester),
+    )
+}
+
+/// The headless permission policy: every request is DENIED immediately.
+/// Denying is the only honest answer without a human in the loop; allowing
+/// would silently widen the session envelope, and waiting would spend the
+/// whole permission deadline before failing.
+pub(crate) struct HeadlessPermissionRequester;
+
+impl faktor_agent::PermissionRequester for HeadlessPermissionRequester {
+    fn request(
+        &self,
+        _session: faktor_core::id::SessionId,
+        _permission: &faktor_session::ops::PermissionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = faktor_core::Result<faktor_core::capability::PermissionDecision>,
+                > + Send,
+        >,
+    > {
+        Box::pin(async { Ok(faktor_core::capability::PermissionDecision::Deny) })
+    }
+}
+
 /// [`build_daemon`] with the explicit GitHub App EXTERNAL seams (transport
 /// / token source / clock). The daemon's real `build_daemon_core` assembly
 /// still transforms `[cloud.github_app]` into the completion SCM provider;
@@ -74,7 +118,7 @@ pub fn build_daemon_with_scm_seams(
     config: Option<config::Config>,
     scm_seams: GithubAppSeams,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_seams_and_planner(data_dir, config, scm_seams, None, None)
+    build_daemon_with_seams_and_planner(data_dir, config, scm_seams, None, None, None)
 }
 
 /// [`build_daemon`] with an explicit Faktor Acquire planner seam. Every
@@ -90,7 +134,14 @@ pub fn build_daemon_with_acquisition_planner(
     config: Option<config::Config>,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_seams_and_planner(data_dir, config, GithubAppSeams::default(), planner, None)
+    build_daemon_with_seams_and_planner(
+        data_dir,
+        config,
+        GithubAppSeams::default(),
+        planner,
+        None,
+        None,
+    )
 }
 
 /// [`build_daemon`] with an explicit system-intelligence provider seam (the
@@ -111,6 +162,7 @@ pub fn build_daemon_with_system_intelligence(
         GithubAppSeams::default(),
         None,
         system_intelligence,
+        None,
     )
 }
 
@@ -123,6 +175,7 @@ pub(crate) fn build_daemon_with_seams_and_planner(
     scm_seams: GithubAppSeams,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
     system_intelligence: Option<SystemIntelligenceHandle>,
+    permission_requester: Option<Arc<dyn faktor_agent::PermissionRequester>>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     // PURE preflight BEFORE the data dir/store/CAS exist: a refused config
@@ -146,6 +199,7 @@ pub(crate) fn build_daemon_with_seams_and_planner(
         planner,
         system_intelligence,
         scm_seams,
+        permission_requester,
     )
 }
 
@@ -309,6 +363,7 @@ pub(crate) async fn build_daemon_with_mcp_inner(
         None,
         None,
         GithubAppSeams::default(),
+        None,
     )?;
     graph.mcp_servers = servers;
     Ok(graph)
@@ -441,6 +496,33 @@ pub(crate) fn hook_registry(
 pub(crate) struct SessionWorkspaceRoots(pub(crate) Arc<SessionManager>);
 
 impl SessionWorkspaceRoots {
+    /// Session-scoped resolution: the requesting session's own live shadow
+    /// (or its durable workspace root). Two sessions on one workspace each
+    /// resolve their own world instead of failing on workspace ambiguity.
+    pub(crate) fn resolve_for_session(
+        &self,
+        session_id: u64,
+        workspace_id: u64,
+    ) -> Result<Option<PathBuf>, faktor_core::Error> {
+        if workspace_id == 0 {
+            return Ok(None);
+        }
+        if session_id == 0 {
+            return self.resolve(workspace_id);
+        }
+        let sid = faktor_core::id::SessionId::new(session_id);
+        match self.0.resolve_workspace_root(sid) {
+            Ok(Some(root)) => Ok(Some(root)),
+            Ok(None) => self.0.workspace_root(faktor_core::id::WorkspaceId::new(workspace_id)),
+            Err(e) => Err(faktor_core::Error::new(
+                faktor_core::ErrorKind::Conflict,
+                format!(
+                    "session {session_id} workspace {workspace_id} root is unavailable; refusing a guessed root: {e}"
+                ),
+            )),
+        }
+    }
+
     pub(crate) fn resolve(&self, workspace_id: u64) -> Result<Option<PathBuf>, faktor_core::Error> {
         if workspace_id == 0 {
             return Ok(None);
@@ -470,6 +552,14 @@ impl SessionWorkspaceRoots {
 impl faktor_instructions::WorkspaceRootProvider for SessionWorkspaceRoots {
     fn workspace_root(&self, workspace_id: u64) -> Result<Option<PathBuf>, faktor_core::Error> {
         self.resolve(workspace_id)
+    }
+
+    fn workspace_root_for_session(
+        &self,
+        session_id: u64,
+        workspace_id: u64,
+    ) -> Result<Option<PathBuf>, faktor_core::Error> {
+        self.resolve_for_session(session_id, workspace_id)
     }
 }
 
@@ -1114,6 +1204,7 @@ pub(crate) fn build_daemon_core(
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
     system_intelligence: Option<SystemIntelligenceHandle>,
     scm_seams: GithubAppSeams,
+    permission_requester: Option<Arc<dyn faktor_agent::PermissionRequester>>,
 ) -> Result<DaemonGraph, String> {
     // ONE policy instance for every provider call of this daemon (chat turns
     // and the semantic embedder): the additive [retry] section, class-aware.
@@ -1424,6 +1515,11 @@ pub(crate) fn build_daemon_core(
     let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(cas.clone(), store));
     let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(sandbox_policy, None));
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
+    // The agent reaches permissions through the trait; an explicit headless
+    // requester replaces only that arm. The native server's resolver keeps
+    // its concrete channel (serve always passes `None`).
+    let agent_permissions: Arc<dyn faktor_agent::PermissionRequester> =
+        permission_requester.unwrap_or_else(|| permissions.clone());
     // Always wire ONE hook registry over the daemon supervisor, even with
     // zero configured specs: the Edition 5 hook lifecycle endpoints register
     // managed hooks into this SAME registry, so a hook created at runtime
@@ -1442,7 +1538,7 @@ pub(crate) fn build_daemon_core(
         session: session.clone(),
         providers: providers.clone(),
         chunk_sink: chunk_tx,
-        permission_requester: permissions.clone(),
+        permission_requester: agent_permissions,
         evidence: repo_evidence.clone(),
         tools: Arc::new(tools),
         cas: Some(cas),
@@ -1472,6 +1568,7 @@ pub(crate) fn build_daemon_core(
         // the graph holds the SAME Arc.
         context_prior: learning.clone(),
         efficiency: efficiency_flags(&config.efficiency),
+        receipt_sink: None,
         // The SAME configured-secret registry the egress scan and the
         // supervisor artifact filter use (built once at step 4 above).
         secret_registry: Some(secret_registry.clone()),
@@ -1502,21 +1599,15 @@ pub(crate) fn build_daemon_core(
     for ollama in ollama_warmers {
         warm_ollama(ollama);
     }
-    // Steps 14-16 — the orchestration authorities (audits P0-20/21/23/61,
-    // P0-48 + P0 isolation): OrchestratorRuntime + ShadowRoots + the ONE
-    // TaskExecutor over the SAME orchestrator. The executor ALWAYS carries
-    // the shadow service — the production constructor requires it — so every
-    // mutating run executes in an isolated candidate; no config key, DTO
-    // field or mode value can disable isolation.
+    // Steps 14-16 — orchestration authorities (P0-20/21/23/61, P0-48):
+    // OrchestratorRuntime + ShadowRoots + the ONE shadow-isolated executor.
     let orchestrator =
         faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-    // Shadow mutation roots: rooted at `<data dir>/shadows`. reconcile()
-    // at boot handles crash residue; the service's Drop removes every
-    // shadow on graceful daemon shutdown.
-    let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
-    let shadows =
-        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root)
-            .map_err(|e| e.to_string())?;
+    let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+        session.clone(),
+        data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME),
+    )
+    .map_err(|e| e.to_string())?;
     if let Err(e) = shadows.reconcile() {
         tracing::warn!(error = %e, "shadow reconcile after daemon start");
     }
@@ -1538,17 +1629,12 @@ pub(crate) fn build_daemon_core(
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-    // Step 21 (continued) — the daemon's ONE durable SCM store and the
-    // completion-step SCM provider: an enabled `[cloud]` section opens the
-    // `scm.db` store HERE (the same allocation serve hands to the native
-    // control-plane/SCM surface — no second store authority), and an enabled
-    // `[cloud.github_app]` section is TRANSFORMED into the canonical
-    // `faktor_scm::GitHubCompletionScm` adapter of THIS executor at
-    // construction time. Disabled sections construct nothing (fail-closed
-    // parity: a contracted PR step then records the explicit
-    // `native_pr_scm_not_configured` blocker). Only the token source and
-    // clock may arrive through the external seams; API base, app id and
-    // organization are config.
+    // Step 21 (continued) — the ONE durable SCM store and completion SCM
+    // provider: enabled `[cloud]` opens `scm.db` HERE (the same allocation
+    // serve hands to the native surface) and `[cloud.github_app]` becomes the
+    // canonical completion adapter. Disabled sections construct nothing
+    // (a contracted PR step records `native_pr_scm_not_configured`). Only
+    // token source and clock may arrive through the external seams.
     let scm_store: Option<Arc<dyn faktor_scm::ScmStore>> = if config.cloud.enabled {
         let path = config
             .cloud
@@ -1575,9 +1661,11 @@ pub(crate) fn build_daemon_core(
     // is constructed, so ids/scope/backing can never disagree between the
     // runtime and the server.
     let evidence = agent.evidence_authority().clone();
+    let worktrees = Arc::new(faktor_git::WorktreeManager::new(supervisor.clone()));
     Ok(DaemonGraph {
         session,
         supervisor,
+        worktrees,
         transport,
         providers,
         permissions,

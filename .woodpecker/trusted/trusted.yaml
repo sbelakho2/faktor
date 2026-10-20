@@ -560,8 +560,6 @@ steps:
     when:
       matrix:
         platform: linux/amd64
-    environment:
-      RUST_BACKTRACE: "1"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -858,6 +856,7 @@ steps:
       - |
         set -eu
         mkdir -p target/certification/lanes /release-artifacts
+        tree="$(git rev-parse 'HEAD^{tree}')"
         cli_sha="$(sha256sum target/release/faktor-cli | cut -d' ' -f1)"
         vsix_path="$(ls apps/vscode/*.vsix | head -n 1)"
         zip_path="$(find apps/jetbrains -type f -path '*/build/distributions/*.zip' | head -n 1)"
@@ -873,6 +872,7 @@ steps:
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane release-artifacts --status passed \
+          --commit "$CI_COMMIT_SHA" --tree "$tree" \
           --artifact target/release/faktor-cli \
           --out target/certification/lanes/release-artifacts.json
   # ---------------------------- Edition 8 gates (linux, both hosts) ------
@@ -1240,23 +1240,28 @@ steps:
   # typed (`signature-role-mismatch`), and without a verified release
   # signature no RELEASE CERTIFICATE can be printed (source class only).
   #
-  # OPERATOR RUNBOOK (scripts/woodpecker/setup.md §4, release-signing role):
+  # OPERATOR RUNBOOK (scripts/woodpecker/setup.md §4.2, release-signing role):
   #   1. node scripts/certification/attestation.mjs keygen \
   #        --role release-signing --out-key release.pem \
   #        --out-keys release-keys.json --key-id faktor-release-signing
-  #   2. bash scripts/woodpecker/activate.sh <owner/repo> \
-  #        --secret "faktor_release_signing_key=$(cat release.pem)"
-  #   3. paste release-keys.json's public key into the allowlist
+  #   2. register the private key as the trusted-project secret
+  #        faktor_release_signing_key (never in the repository or a log)
+  #   3. paste ONLY the public key into the allowlist
   #      `scripts/certification/attestation-keys.json` under identity
-  #      `faktor-release-signing`, and UNCOMMENT the mapping below.
+  #      `faktor-release-signing` (provisioned in this checkout).
   #
-  # FAIL-CLOSED: the mapping ships commented because a `from_secret` to a
-  # not-yet-registered secret is a Woodpecker config compile error; until the
-  # operator completes steps 1-3 this step exits 3 with the typed
-  # `signing-key-missing` refusal, publishes NO release signature, and
-  # certify.sh refuses the release class (the build/test lanes and the build
-  # attestation are unaffected). Never store the release private key in the
-  # `faktor_attest_signing_key` secret.
+  # FAIL-CLOSED: the mapping below is enabled ONLY because the trusted project
+  # carries `faktor_release_signing_key`; a `from_secret` to a missing secret
+  # is a Woodpecker config compile error. Without the secret this step exits 3
+  # with the typed `signing-key-missing` refusal, publishes NO release
+  # signature, and certify.sh refuses the release class (the build/test lanes
+  # and the build attestation are unaffected). Never store the release private
+  # key in the `faktor_attest_signing_key` secret.
+  #
+  # EXACT-SHA BINDING: the build attestation must name the pipeline's own
+  # CI_COMMIT_SHA and HEAD tree before the release key is used, and the
+  # written release signature is re-checked against the same pair. A stale or
+  # foreign attestation is refused typed and no release signature is emitted.
   - name: release-signature
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -1275,12 +1280,36 @@ steps:
           echo "signing-key-missing: the release-signing role key is not configured (FAKTOR_RELEASE_SIGN_KEY_PEM from the trusted-project secret faktor_release_signing_key); releasing is refused fail-closed. Register the secret and enable the mapping per scripts/woodpecker/setup.md §4 (release-signing role)." >&2
           exit 3
         fi
+        attestation_file=target/certification/attestation/trusted-build-attestation.json
+        expected_tree="$(git rev-parse 'HEAD^{tree}')"
+        node - "$attestation_file" "$CI_COMMIT_SHA" "$expected_tree" <<'CHECK'
+        const fs = require('node:fs');
+        const [file, sha, tree] = process.argv.slice(2);
+        const attestation = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (attestation.source_sha !== sha) {
+          console.error(`release-source-sha-mismatch: attestation ${attestation.source_sha} != CI_COMMIT_SHA ${sha}`);
+          process.exit(1);
+        }
+        if (attestation.tree_sha !== tree) {
+          console.error(`release-tree-sha-mismatch: attestation ${attestation.tree_sha} != HEAD tree ${tree}`);
+          process.exit(1);
+        }
+        CHECK
         node scripts/certification/attestation.mjs create-release \
           --out target/certification/release-signature.json \
-          --attestation target/certification/attestation/trusted-build-attestation.json \
+          --attestation "$attestation_file" \
           --repo "$CI_REPO" \
           --key-id "$FAKTOR_RELEASE_SIGN_KEY_ID" \
           --emit-log-block
+        node - target/certification/release-signature.json "$CI_COMMIT_SHA" "$expected_tree" <<'CHECK'
+        const fs = require('node:fs');
+        const [file, sha, tree] = process.argv.slice(2);
+        const release = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (release.source_sha !== sha || release.tree_sha !== tree) {
+          console.error(`release-binding-mismatch: signature ${release.source_sha}/${release.tree_sha} != ${sha}/${tree}`);
+          process.exit(1);
+        }
+        CHECK
   - name: certificate-darwin
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     depends_on: [darwin-check, darwin-test, darwin-doctor]

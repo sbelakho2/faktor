@@ -1,0 +1,6 @@
+{"operationId":"op-preview-2","model":"qwen3.8:latest","capacity":32768,"input":7500,
+ "basis":{"kind":"estimated","method":"wire-plan-estimator","version":"1"},
+ "sources":[
+  {"id":"src-file","uri":"file:///tmp/faktor-rig/ws-rust/src/lib.rs","range":"1:10","version":"git:def","content_hash":"4444","category":"file","tokens":4000,"bytes":20000,"inclusion_reason":"mentioned"},
+  {"id":"src-url","uri":"https://example.test/spec","version":"etag:v1","content_hash":"2222","category":"web","tokens":3000,"bytes":12000,"inclusion_reason":"url"},
+  {"id":"src-diag","uri":"file:///tmp/faktor-rig/ws-rust/src/lib.rs#diagnostic","version":"1","content_hash":"3333","category":"diagnostic","tokens":500,"bytes":900,"inclusion_reason":"diagnostic"}]}

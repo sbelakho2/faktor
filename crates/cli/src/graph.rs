@@ -149,6 +149,10 @@ pub struct DaemonGraph {
     ///    every MCP server child, hook child, tool/terminal child and
     ///    verification child of the daemon.
     pub supervisor: Arc<ProcessSupervisor>,
+    /// The ONE git worktree authority (F205/F206/F207): create/discover,
+    /// validate/repair/remove/transfer over the same supervisor, with the
+    /// per-repository mutation lease that serializes git mutations.
+    pub worktrees: Arc<faktor_git::WorktreeManager>,
     /// 4. The policy-checked + whole-payload secret-scanned egress
     ///    transport (P0-36/37/38): every configured adapter executes through
     ///    this single checked transport.

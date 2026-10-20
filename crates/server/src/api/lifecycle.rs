@@ -593,6 +593,10 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
             get(native_session_checkpoints),
         )
         .route(
+            "/native/session/{id}/checkpoints/coverage",
+            get(coverage_api::native_checkpoint_coverage),
+        )
+        .route(
             "/native/session/{id}/verification",
             get(native_session_verification),
         )
@@ -609,6 +613,16 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
             get(native_session_terminal),
         )
         .route("/native/session/{id}/abort", post(native_session_abort))
+        // F064/F084: the durable steering queue (list/edit/remove).
+        .route(
+            "/native/session/{id}/queue",
+            get(queue_api::native_session_queue),
+        )
+        .route(
+            "/native/session/{id}/queue/{op}",
+            axum::routing::patch(queue_api::native_session_queue_edit)
+                .delete(queue_api::native_session_queue_remove),
+        )
         // Native coordination board (additive): one bounded newest-first
         // page of the path session's run-family board (GET) and one bounded
         // post AS that session (POST). Strict DTOs; family scoping and
@@ -1043,6 +1057,8 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
             post(r8::native_runtime_trust_check),
         )
         .route("/native/runtime/status", get(r8::native_runtime_status))
+        // F045: bounded same-task comparison of exact served models.
+        .route("/native/models/compare", post(native_models_compare))
         // Explicit opt-in telemetry settings and the exact local payload
         // preview (S29/O-10); no upload endpoint is invented.
         .route("/native/telemetry", get(r8::native_telemetry_preview))
@@ -1093,6 +1109,19 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
             post(foundation_ext::native_session_fork),
         )
         .route(
+            "/native/session/{id}/lineage",
+            get(plan_api::native_session_lineage),
+        )
+        // F087: the named/versioned plan artifact + approval receipt.
+        .route(
+            "/native/session/{id}/plan",
+            get(plan_api::native_plan_artifact_get).post(plan_api::native_plan_artifact_write),
+        )
+        .route(
+            "/native/session/{id}/plan/{version}/approve",
+            post(plan_api::native_plan_artifact_approve),
+        )
+        .route(
             "/native/session/{id}/checkpoints/{sequence}/restore",
             post(foundation_ext::native_checkpoint_restore),
         )
@@ -1112,8 +1141,48 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
                 .delete(foundation_ext::native_review_comment_delete),
         )
         .route(
+            "/native/session/{id}/changes",
+            get(changes_api::native_changes),
+        )
+        .route(
             "/native/session/{id}/changes/accept",
             post(foundation_ext::native_change_accept),
+        )
+        .route(
+            "/native/session/{id}/changes/accept-hunks",
+            post(changes_api::native_change_accept_hunks),
+        )
+        // F205/F206: linked-worktree create/discover, validate/repair/
+        // remove/transfer through the ONE WorktreeManager.
+        .route(
+            "/native/session/{id}/worktrees",
+            get(worktrees_api::native_worktrees_list).post(worktrees_api::native_worktrees),
+        )
+        .route(
+            "/native/session/{id}/worktrees/repair",
+            post(worktrees_api::native_worktrees_repair),
+        )
+        .route(
+            "/native/session/{id}/worktrees/{worktree_id}",
+            axum::routing::delete(worktrees_api::native_worktree_delete),
+        )
+        .route(
+            "/native/session/{id}/worktrees/{worktree_id}/validate",
+            post(worktrees_api::native_worktree_validate),
+        )
+        .route(
+            "/native/session/{id}/worktrees/{worktree_id}/transfer",
+            post(worktrees_api::native_worktree_transfer),
+        )
+        // F207: the per-repository mutation lease is an explicit, held
+        // authority (acquire/release), not a hidden side effect.
+        .route(
+            "/native/session/{id}/repo/lock",
+            post(worktrees_api::native_repo_lock),
+        )
+        .route(
+            "/native/session/{id}/repo/lock/{token}",
+            axum::routing::delete(worktrees_api::native_repo_unlock),
         )
         // Session delete/export (D-06) and selectable session settings
         // (K-02/B-09).
@@ -1127,8 +1196,8 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/native/session/{id}/settings",
-            get(foundation_ext::native_session_settings_get)
-                .put(foundation_ext::native_session_settings_put),
+            get(settings_api::native_session_settings_get)
+                .put(settings_api::native_session_settings_put),
         )
         .route(
             "/native/agents/{child_id}/stage",

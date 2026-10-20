@@ -1596,11 +1596,11 @@ impl AgentRuntime {
                     .flatten()
             });
         let mut captured_epoch = None;
-        match self
-            .deps
-            .instructions_resolver
-            .resolve(row.workspace_id.raw(), pinned)
-        {
+        match self.deps.instructions_resolver.resolve_for_session(
+            handle.id().raw(),
+            row.workspace_id.raw(),
+            pinned,
+        ) {
             Ok(loaded) => {
                 if pinned.is_none() {
                     captured_epoch = loaded.epoch().map(|epoch| epoch.to_string());
@@ -1636,11 +1636,11 @@ impl AgentRuntime {
             // The SAME material hash the instruction inspector exposes:
             // ordered (path, file hash) pairs, each NUL-terminated.
             let mut material = Vec::new();
-            if let Ok(loaded) = self
-                .deps
-                .instructions_resolver
-                .resolve(row.workspace_id.raw(), None)
-            {
+            if let Ok(loaded) = self.deps.instructions_resolver.resolve_for_session(
+                handle.id().raw(),
+                row.workspace_id.raw(),
+                None,
+            ) {
                 if let Some(instructions) = loaded.instructions() {
                     for instruction in instructions.all() {
                         material.extend_from_slice(instruction.path.as_bytes());

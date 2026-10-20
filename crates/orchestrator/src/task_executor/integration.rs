@@ -694,6 +694,32 @@ impl TaskExecutor {
                         row.shadow_id
                     )));
                 }
+                // Applied workspace writes are NOT garbage either (the
+                // verification-fact probe above only sees verification
+                // journals). Discarding a shadow whose tool ledger says
+                // `applied` silently destroyed user-visible edits, so retain
+                // it for review/acceptance and refuse the new run typed.
+                let runs = self
+                    .session
+                    .store()
+                    .session_applied_tool_runs(parent, 64)
+                    .map_err(|e| {
+                        ExecError::Internal(format!(
+                            "applied tool runs of shadowed session {parent}: {e}"
+                        ))
+                    })?;
+                if runs.iter().any(|run| {
+                    run_is_workspace_write(
+                        &run.tool,
+                        run.postcondition.is_some(),
+                        run.pre_manifest.is_some(),
+                    )
+                }) {
+                    return Err(ExecError::Conflict(format!(
+                        "session {parent} carries applied workspace changes in shadow {}; review and accept or discard the change set before a new run",
+                        row.shadow_id
+                    )));
+                }
                 shadows.discard(parent)?;
             }
             None => {
@@ -1063,34 +1089,6 @@ impl TaskExecutor {
         run_id: &str,
         children: &[crate::runtime::ChildRuntime],
     ) -> Result<(), ExecError> {
-        if !children
-            .iter()
-            .any(|c| !matches!(c.state, ChildState::Done | ChildState::Cancelled))
-        {
-            return Err(ExecError::Conflict(format!(
-                "task run {run_id} has no non-terminal children; nothing to cancel"
-            )));
-        }
-        for c in children {
-            if matches!(c.state, ChildState::Done | ChildState::Cancelled) {
-                continue;
-            }
-            self.orchestrator
-                .control_child(&c.child_id, faktor_session::child::ChildControl::Cancel)
-                .map_err(|e| match e {
-                    ExecError::NotFound(m) => ExecError::Internal(format!(
-                        "child {} of the cancelled run {run_id} is unknown to the runtime: {m}",
-                        c.child_id
-                    )),
-                    ExecError::Conflict(m) => {
-                        ExecError::Conflict(format!("child cancel of {}: {m}", c.child_id))
-                    }
-                    other => ExecError::Internal(format!(
-                        "child cancel of {} failed: {other}",
-                        c.child_id
-                    )),
-                })?;
-        }
         let task_id = self
             .orchestrator
             .plan_row(handle.id(), run_id)?
@@ -1104,19 +1102,57 @@ impl TaskExecutor {
         let task = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
-        if let Some(t) = task {
-            if !t.state.is_terminal() {
-                let rev = handle
-                    .task_revision(task_id)
-                    .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
-                handle
-                    .transition_task(task_id, rev, TaskTransition::Cancel, None)
-                    .map_err(|e| {
-                        ExecError::Conflict(format!(
-                            "root task-row cancel of run {run_id}: {e} (a concurrent verifier may have won; retry the cancel)"
-                        ))
-                    })?;
+        let root_terminal = task.as_ref().is_some_and(|t| t.state.is_terminal());
+        let live_children = children
+            .iter()
+            .filter(|c| !matches!(c.state, ChildState::Done | ChildState::Cancelled))
+            .collect::<Vec<_>>();
+        // A fully settled run refuses a second cancel (typed). A run whose
+        // children all stopped but whose ROOT row is still live is NOT
+        // settled: the whole-run cancel must still cancel the run scope.
+        if live_children.is_empty() && root_terminal {
+            return Err(ExecError::Conflict(format!(
+                "task run {run_id} has no non-terminal children; nothing to cancel"
+            )));
+        }
+        for c in live_children {
+            // A child that reached a terminal state between the registry
+            // snapshot and this control is already stopped: the cancel
+            // semantic is idempotent and skips it (never a bogus refusal).
+            match self
+                .orchestrator
+                .control_child(&c.child_id, faktor_session::child::ChildControl::Cancel)
+            {
+                Ok(_) => {}
+                Err(ExecError::InvalidState(m)) if m.contains("terminal") => {}
+                Err(e) => {
+                    return Err(match e {
+                        ExecError::NotFound(m) => ExecError::Internal(format!(
+                            "child {} of the cancelled run {run_id} is unknown to the runtime: {m}",
+                            c.child_id
+                        )),
+                        ExecError::Conflict(m) => {
+                            ExecError::Conflict(format!("child cancel of {}: {m}", c.child_id))
+                        }
+                        other => ExecError::Internal(format!(
+                            "child cancel of {} failed: {other}",
+                            c.child_id
+                        )),
+                    });
+                }
             }
+        }
+        if task.as_ref().is_some_and(|t| !t.state.is_terminal()) {
+            let rev = handle
+                .task_revision(task_id)
+                .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+            handle
+                .transition_task(task_id, rev, TaskTransition::Cancel, None)
+                .map_err(|e| {
+                    ExecError::Conflict(format!(
+                        "root task-row cancel of run {run_id}: {e} (a concurrent verifier may have won; retry the cancel)"
+                    ))
+                })?;
         }
         // The root task row is terminal: the run's ONE engineering-outcome
         // row is recorded now (a later settlement pass re-uses it verbatim).
@@ -1486,5 +1522,28 @@ impl TaskExecutor {
             .map_err(tournament_exec_error)?;
         }
         Ok(tournament)
+    }
+}
+
+/// Whether one terminal tool-run row represents a workspace mutation that a
+/// shadow discard would destroy. Read-only `applied` effects (read_file's
+/// default) never qualify; a write postcondition or a shell pre-manifest does.
+fn run_is_workspace_write(tool: &str, has_postcondition: bool, has_pre_manifest: bool) -> bool {
+    has_postcondition || has_pre_manifest || matches!(tool, "write_file" | "edit_file")
+}
+
+#[cfg(test)]
+mod shadow_discard_tests {
+    use super::run_is_workspace_write;
+
+    #[test]
+    fn only_workspace_mutations_are_retained_from_a_shadow_discard() {
+        assert!(run_is_workspace_write("write_file", true, false));
+        assert!(run_is_workspace_write("edit_file", false, false));
+        assert!(run_is_workspace_write("run_command", false, true));
+        assert!(run_is_workspace_write("mcp:fs:write", true, false));
+        // Read-only effects carry no write marker and are safe to discard.
+        assert!(!run_is_workspace_write("read_file", false, false));
+        assert!(!run_is_workspace_write("search", false, false));
     }
 }

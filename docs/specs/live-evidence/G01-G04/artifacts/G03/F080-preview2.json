@@ -1,0 +1,1 @@
+{"revision":0,"call_id":null,"model":"qwen3.8:latest","capacity":100000,"input":null,"output_reserve":4096,"safety_reserve":2048,"headroom":null,"basis":{"kind":"estimated","method":"wire-plan-estimator","version":"1"},"estimated":true,"measured":false,"categories":[],"sources":[],"overflow":false,"overflow_reason":null,"created_ms":0}

@@ -1,0 +1,1 @@
+{"hasMore":true,"messages":[{"createdMs":1792457063652,"data":{"parts":[]},"id":21,"parts":[{"createdMs":1792457064746,"data":{"text":"The user is asking me to respond with exactly \"OK\"."},"kind":"reasoning"},{"createdMs":1792457064750,"data":{"text":"OK"},"kind":"text"}],"role":"assistant","seq":3}],"nextBefore":3,"sessionId":"11"}

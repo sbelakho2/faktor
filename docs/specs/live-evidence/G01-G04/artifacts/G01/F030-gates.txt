@@ -1,0 +1,14 @@
+$ cargo fmt --check
+PASS
+$ cargo check --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
+$ cargo test (touched crates)
+PASS: agent 600, server 374, cli/ollama/session/provider/instructions green
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
+$ faktor-cli doctor --data-dir /tmp/faktor-live/data
+cloud-db store/faktor-plus.db: migration restore point: none recorded
+doctor: all checks passed
+$ faktor-cli doctor --deep
+cloud-db store/faktor-plus.db: migration restore point: none recorded
+doctor: all checks passed

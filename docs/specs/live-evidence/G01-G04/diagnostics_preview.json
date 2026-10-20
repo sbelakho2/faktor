@@ -1,0 +1,1 @@
+{"categories":["runtime_version","runtime_paths","binary_checksum","component_health","provider_health","tool_catalog","effective_setting_keys"],"maxBytes":262144,"omittedCategories":["secret_material","prompt_and_completion_text","file_and_tool_payloads","unbounded_logs","environment"],"providersCount":0,"settingsCount":53,"toolsCount":7}

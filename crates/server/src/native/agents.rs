@@ -1119,7 +1119,8 @@ pub(crate) fn exec_error_response(e: &faktor_orchestrator::runtime::ExecError) -
     let (code, status, retryable) = match e {
         faktor_orchestrator::runtime::ExecError::NotFound(_) => ("not_found", 404, false),
         faktor_orchestrator::runtime::ExecError::Conflict(_) => ("conflict", 409, false),
-        faktor_orchestrator::runtime::ExecError::InvalidState(_) => ("conflict", 409, false),
+        faktor_orchestrator::runtime::ExecError::InvalidState(_)
+        | faktor_orchestrator::runtime::ExecError::WorkspaceDrift(_) => ("conflict", 409, false),
         faktor_orchestrator::runtime::ExecError::CeilingExceeded { .. } => {
             ("ceiling_exceeded", 429, false)
         }
@@ -1823,5 +1824,13 @@ mod tests {
             new_elapsed < old_elapsed,
             "the one-pass index must beat per-item scans: old {old_elapsed:?} new {new_elapsed:?}"
         );
+    }
+
+    #[test]
+    fn workspace_drift_is_a_typed_conflict_not_an_internal_error() {
+        let resp = exec_error_response(&faktor_orchestrator::runtime::ExecError::WorkspaceDrift(
+            "symlink escape rejected".into(),
+        ));
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
     }
 }

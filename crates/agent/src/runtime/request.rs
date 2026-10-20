@@ -451,7 +451,13 @@ impl AgentRuntime {
                 session_id: handle.id(),
                 provider: handle.provider()?,
                 attempt,
-                deadline_ms: self.deps.tool_deadline_ms,
+                // A model stream is NOT a tool call: the 30 s tool-call
+                // deadline killed local generations (and the second of two
+                // concurrent children) mid-stream. The model call has its
+                // own generous overall bound; provider adapters enforce
+                // their stricter first-byte/metadata deadlines, and the
+                // turn token still cancels immediately.
+                deadline_ms: crate::runtime::MODEL_CALL_DEADLINE_MS,
                 cancellation: cancel.child(),
             },
         })

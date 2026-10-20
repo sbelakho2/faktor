@@ -91,6 +91,7 @@ pub(crate) fn test_agent_with_hooks(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     AgentRuntime::new(deps).unwrap()
 }
@@ -218,6 +219,7 @@ pub(crate) fn test_agent_with_evidence(
         context_prior: None,
         secret_registry: None,
         efficiency: Default::default(),
+        receipt_sink: None,
     };
     AgentRuntime::new(deps).unwrap()
 }
@@ -910,6 +912,85 @@ fn startup_verification_recovery_reports_unreadable_rows() {
     assert_eq!(summary.unreadable, 1, "{summary:?}");
     assert!(!summary.scan_failed, "{summary:?}");
     assert_eq!(summary.requeued, 0, "{summary:?}");
+}
+
+/// Regression for the headless run contract: the assistant's durable `text`
+/// parts are the command's output. The projection used to read only the
+/// message row's empty `parts` array, so a completed run printed nothing at
+/// all. Reasoning parts must never leak into stdout, and the newest
+/// assistant message wins.
+#[test]
+fn assistant_text_projects_newest_text_parts_only_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = build_daemon(dir.path(), None).unwrap();
+    let ws = graph.session.create_workspace("/w").unwrap();
+    let handle = graph.session.create_session(ws, "t", "fake", "m").unwrap();
+    // Old assistant turn: must be superseded.
+    let old = handle
+        .put_message(1, "assistant", serde_json::json!({ "parts": [] }))
+        .unwrap();
+    handle.put_text_part(old, "stale").unwrap();
+    let user = handle
+        .put_message(2, "user", serde_json::json!({ "text": "again" }))
+        .unwrap();
+    assert!(user > old);
+    let assistant = handle
+        .put_message(3, "assistant", serde_json::json!({ "parts": [] }))
+        .unwrap();
+    handle
+        .put_reasoning_part(assistant, "private thinking")
+        .unwrap();
+    handle.put_text_part(assistant, "OK").unwrap();
+    handle.put_text_part(assistant, " done").unwrap();
+    assert_eq!(assistant_text(&handle).unwrap(), "OK done");
+    // No assistant row at all (a freshly created session) projects empty.
+    let fresh = graph.session.create_workspace("/w2").unwrap();
+    let bare = graph
+        .session
+        .create_session(fresh, "t2", "fake", "m")
+        .unwrap();
+    assert_eq!(assistant_text(&bare).unwrap(), "");
+}
+
+/// The headless `run` entry has no host to answer a permission dialog: a
+/// capability request must be denied immediately (typed), never left to
+/// burn the durable permission deadline and fail the run. Read-only tools
+/// carry no capability and still work.
+#[tokio::test]
+async fn headless_daemon_denies_capability_requests_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph =
+        build_daemon_with_permission(dir.path(), None, Arc::new(HeadlessPermissionRequester))
+            .unwrap();
+    let request = faktor_session::ops::PermissionRequest {
+        id: 1,
+        op_id: faktor_core::id::OpId::new(1),
+        tool_id: String::new(),
+        capability: faktor_core::capability::Capability::ExecuteShell {
+            command: "board_read".into(),
+        },
+        event_seq: faktor_core::id::EventSeq::new(1),
+        // A long durable deadline: the headless answer must not wait at all.
+        expires_ms: faktor_core::model::unix_now_ms() as i64 + 300_000,
+    };
+    let started = std::time::Instant::now();
+    let decision = graph
+        .agent
+        .deps()
+        .permission_requester
+        .request(SessionId::new(1), &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        faktor_core::capability::PermissionDecision::Deny,
+        "headless runs never silently grant a capability"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a headless denial is immediate, got {:?}",
+        started.elapsed()
+    );
 }
 
 /// F10 (adversarial): the startup queue-head sweep never classifies an

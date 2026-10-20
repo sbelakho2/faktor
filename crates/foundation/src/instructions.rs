@@ -31,6 +31,10 @@ pub const MAX_GLOB_BYTES: usize = 512;
 pub const MAX_BUNDLE_SOURCES: usize = 2_000;
 pub const MAX_BINDING_PAGE: usize = 200;
 pub const INSTRUCTION_IMPORT_FORMAT: &str = "faktor-instructions/v1";
+/// Cap on reported unresolved template variables in one preview refusal.
+pub const MAX_TEMPLATE_VARIABLES: usize = 16;
+/// Cap on one template variable name.
+pub const MAX_TEMPLATE_VARIABLE_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,6 +280,35 @@ fn validate_content(kind: InstructionKind, content: &str) -> Result<(), Foundati
         ));
     }
     Ok(())
+}
+
+/// The unresolved `{{variable}}` placeholders of a prompt template, in
+/// first-occurrence order (bounded: at most [`MAX_TEMPLATE_VARIABLES`] are
+/// reported). A template is INSERTION content: a placeholder that no
+/// variable resolution supplied must block insertion, never ride the
+/// composed prompt as literal `{{target}}` text.
+fn unresolved_template_placeholders(content: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        let name = after[..end].trim();
+        if !name.is_empty()
+            && name.len() <= MAX_TEMPLATE_VARIABLE_BYTES
+            && !name.chars().any(char::is_control)
+            && !found.iter().any(|existing| existing == name)
+        {
+            found.push(name.to_string());
+            if found.len() >= MAX_TEMPLATE_VARIABLES {
+                break;
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    found
 }
 
 fn validate_draft(draft: &InstructionDraft) -> Result<(), FoundationError> {
@@ -665,6 +698,23 @@ impl InstructionService {
                 }
             };
             active.push((record, is_active, reason));
+        }
+
+        // A template with no supplied resolution is INSERTION-BLOCKED: the
+        // preview never returns literal `{{target}}` content for a caller to
+        // paste. This is the documented F132 refusal (skills already block
+        // unresolved variables the same way).
+        for (record, is_active, _) in &active {
+            if *is_active && record.kind == InstructionKind::Template {
+                let unresolved = unresolved_template_placeholders(&record.content);
+                if !unresolved.is_empty() {
+                    return Err(FoundationError::Malformed(format!(
+                        "prompt template {:?} has unresolved template variable(s): {}; insertion is blocked until every variable is resolved",
+                        record.title,
+                        unresolved.join(", ")
+                    )));
+                }
+            }
         }
 
         // Precedence is deterministic: managed > project > user > imported,
@@ -1089,32 +1139,68 @@ fn map_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstructionBinding> 
     })
 }
 
-/// Whole-string glob matching: `*` matches any byte sequence, `?` one byte.
-/// There is no prefix/substring matching. Byte-wise is deliberate: globs
-/// match UTF-8 path bytes deterministically.
+/// Whole-string glob matching: `*` matches any byte sequence, `?` one byte,
+/// and `**/` matches zero or more complete path segments (so `src/**/*.rs`
+/// includes files directly under `src/`). There is no prefix/substring
+/// matching. Byte-wise is deliberate: globs match UTF-8 path bytes
+/// deterministically.
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    let (mut p, mut t) = (0usize, 0usize);
-    let (mut star, mut mark) = (None, 0usize);
-    while t < text.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+    let n = pattern.len();
+    let m = text.len();
+    // DP row over text positions. Each pattern token is applied once, so the
+    // whole match is O(pattern * text) with no backtracking blowup on hostile
+    // `**/` combinations.
+    let mut dp = vec![false; m + 1];
+    dp[0] = true;
+    let mut p = 0usize;
+    while p < n {
+        let mut next = vec![false; m + 1];
+        if pattern[p] == b'*' && p + 2 < n && pattern[p + 1] == b'*' && pattern[p + 2] == b'/' {
+            // `**/`: zero segments, or consume whole segments ending at a
+            // path separator. A single forward scan keeps this linear.
+            let mut reachable = false;
+            for t in 0..=m {
+                if dp[t] {
+                    reachable = true;
+                    next[t] = true;
+                }
+                if reachable && t > 0 && text[t - 1] == b'/' {
+                    next[t] = true;
+                }
+            }
+            p += 3;
+        } else if pattern[p] == b'*' {
+            // A single star matches any byte sequence (including separators).
+            let mut reachable = false;
+            for t in 0..=m {
+                reachable |= dp[t];
+                if reachable {
+                    next[t] = true;
+                }
+            }
             p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star = Some(p);
+        } else if pattern[p] == b'?' {
+            for t in 0..m {
+                if dp[t] {
+                    next[t + 1] = true;
+                }
+            }
             p += 1;
-            mark = t;
-        } else if let Some(star_pos) = star {
-            p = star_pos + 1;
-            mark += 1;
-            t = mark;
         } else {
+            let literal = pattern[p];
+            for t in 0..m {
+                if dp[t] && text[t] == literal {
+                    next[t + 1] = true;
+                }
+            }
+            p += 1;
+        }
+        dp = next;
+        if !dp.iter().any(|matched| *matched) {
             return false;
         }
     }
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-    p == pattern.len()
+    dp[m]
 }
 
 #[cfg(test)]
@@ -1185,6 +1271,15 @@ mod tests {
         // Whole-string glob: a substring is not a match.
         assert!(!glob_match(b"src/*.rs", b"prefix/src/lib.rs"));
         assert!(glob_match(b"src/**/*.rs", b"src/runtime/loop.rs"));
+        // `**/` matches ZERO or more complete segments: the direct child is
+        // included, not only nested files.
+        assert!(glob_match(b"src/**/*.rs", b"src/lib.rs"));
+        assert!(glob_match(b"**/*.rs", b"lib.rs"));
+        assert!(glob_match(b"**/*.rs", b"a/b.rs"));
+        assert!(glob_match(b"a/**/b", b"a/b"));
+        assert!(glob_match(b"a/**/b", b"a/x/y/b"));
+        assert!(!glob_match(b"a/**/b", b"a/xb"));
+        assert!(!glob_match(b"src/**/*.rs", b"src/lib.py"));
     }
 
     #[test]
@@ -1341,5 +1436,37 @@ mod tests {
             preview_two_k <= preview_one_k.saturating_mul(3) + std::time::Duration::from_millis(20),
             "preview scaled super-linearly: 1k={preview_one_k:?} 2k={preview_two_k:?}"
         );
+    }
+    /// F132 regression: a named template containing `{{target}}` is refused
+    /// by preview (insertion blocked) instead of returning the literal
+    /// placeholder; a fully resolved template still composes.
+    #[test]
+    fn unresolved_template_variables_block_insertion() {
+        let (_dir, svc) = service();
+        let mut template = draft(
+            "Release note",
+            InstructionOrigin::User,
+            "Write a release note for {{target}}.",
+        );
+        template.kind = InstructionKind::Template;
+        let template = svc.upsert(&template, None).unwrap();
+        let err = svc.preview("", &[], &[]).unwrap_err();
+        assert!(matches!(err, FoundationError::Malformed(_)), "{err}");
+        assert!(err.to_string().contains("target"), "{err}");
+        assert!(err.to_string().contains("insertion is blocked"), "{err}");
+        // A template without placeholders is ordinary insertion content.
+        let mut resolved = draft("Tone", InstructionOrigin::User, "Be concise.");
+        resolved.kind = InstructionKind::Template;
+        svc.upsert(&resolved, None).unwrap();
+        let err = svc.preview("", &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("Release note"), "{err}");
+        assert!(!err.to_string().contains("Tone"), "{err}");
+        // Replacing the placeholder unblocks the whole bundle.
+        let mut fixed = draft("Release note", InstructionOrigin::User, "Be concise.");
+        fixed.kind = InstructionKind::Template;
+        let fixed = svc.upsert(&fixed, Some(template.revision)).unwrap();
+        assert_eq!(fixed.id, template.id);
+        let bundle = svc.preview("", &[], &[]).unwrap();
+        assert!(bundle.content.contains("Be concise."));
     }
 }

@@ -319,6 +319,11 @@ pub(crate) fn collect_tool_summary(
     name: &str,
     input: &serde_json::Value,
     outcome: &ToolOutcome,
+    // Only DiskWrite/Terminal tools can change the tree. A read-only tool's
+    // path argument is NOT a changed file: treating it as one made every read
+    // look like an edit, triggered required checks (and child verification
+    // failure) for files the turn never touched.
+    mutating: bool,
 ) {
     // Step description: name + the primary path/command argument.
     let path = input
@@ -337,8 +342,9 @@ pub(crate) fn collect_tool_summary(
     }
     // Changed files: a write tool's target (from its input) when the tool
     // completed — real paths, never the tool name.
-    if outcome.effect_status == faktor_core::op::EffectStatus::Applied
-        || outcome.exit_code == Some(0)
+    if mutating
+        && (outcome.effect_status == faktor_core::op::EffectStatus::Applied
+            || outcome.exit_code == Some(0))
     {
         if let Some(p) = path.filter(|p| !p.is_empty()) {
             let p = truncate(p, 300);
@@ -1204,5 +1210,78 @@ impl AgentRuntime {
             Some(machine),
             Some(trace),
         ))
+    }
+}
+
+#[cfg(test)]
+mod collect_tool_summary_tests {
+    use super::*;
+
+    fn applied() -> ToolOutcome {
+        ToolOutcome {
+            text: "ok".into(),
+            exit_code: Some(0),
+            effect_status: faktor_core::op::EffectStatus::Applied,
+            ..Default::default()
+        }
+    }
+
+    /// Regression: a completed `read_file` (DiskRead) added its path to
+    /// `TurnSummary::files_changed`. The projection then listed read files as
+    /// changed, end-of-turn verification ran required checks for untouched
+    /// files, and a read-only child was settled Failed despite a completed
+    /// turn. Reads are NOT edits.
+    #[test]
+    fn read_only_tools_never_contribute_changed_files() {
+        let mut summary = faktor_context::ledger::TurnSummary::default();
+        collect_tool_summary(
+            &mut summary,
+            "read_file",
+            &serde_json::json!({"path": "README.md"}),
+            &applied(),
+            false,
+        );
+        assert!(summary.files_changed.is_empty(), "{summary:?}");
+        assert_eq!(summary.steps_completed, vec!["read_file (README.md)"]);
+    }
+
+    #[test]
+    fn write_and_terminal_tools_still_contribute_changed_files() {
+        let mut summary = faktor_context::ledger::TurnSummary::default();
+        collect_tool_summary(
+            &mut summary,
+            "write_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &applied(),
+            true,
+        );
+        assert_eq!(summary.files_changed, vec!["src/lib.rs"]);
+        collect_tool_summary(
+            &mut summary,
+            "apply_patch",
+            &serde_json::json!({"path": "a.rs"}),
+            &applied(),
+            true,
+        );
+        assert_eq!(summary.files_changed, vec!["src/lib.rs", "a.rs"]);
+    }
+
+    #[test]
+    fn failed_mutating_tool_does_not_claim_a_change() {
+        let mut summary = faktor_context::ledger::TurnSummary::default();
+        collect_tool_summary(
+            &mut summary,
+            "write_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &ToolOutcome {
+                text: "denied".into(),
+                exit_code: Some(1),
+                effect_status: faktor_core::op::EffectStatus::Failed,
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(summary.files_changed.is_empty());
+        assert_eq!(summary.failures.len(), 1);
     }
 }

@@ -3090,3 +3090,77 @@ fn store_writer_panic_keeps_index_surface_total() {
     // Mutations that need the store fail typed; nothing panics.
     assert!(svc.reconcile_now(ws).is_err() || !svc.inner.worker_started.load(Ordering::Acquire));
 }
+
+/// F123/F130 regression: an index generation claimed while ONE live shadow
+/// exists must NOT die when that shadow is deleted at turn settlement. The
+/// service rebinds to the durable workspace root, drops the stale partial
+/// generation and publishes a real generation with non-zero coverage.
+#[test]
+fn index_rebinds_to_the_durable_root_when_the_live_shadow_is_deleted() {
+    let _serial = serial();
+    let env = env();
+    write(
+        &env.repo,
+        "useronly.rs",
+        "pub fn durable_marker_fn() -> u32 { 7 }\n",
+    );
+    let shadow = env._dir.path().join("shadows").join("1").join("sh-1");
+    std::fs::create_dir_all(&shadow).unwrap();
+    write(
+        &shadow,
+        "shadowonly.rs",
+        "pub fn transient_marker_fn() -> u32 { 9 }\n",
+    );
+    let store = Arc::new(Store::open(&env.store_root, true).unwrap());
+    let ws = store.create_workspace(env.repo.to_str().unwrap()).unwrap();
+    let session = store.create_session(ws, "shadowed", "p", "m").unwrap();
+    let fact = serde_json::json!({
+        "session_id": session.id.raw(),
+        "shadow_id": "sh-1",
+        "base_root": env.repo.to_str().unwrap(),
+        "root": shadow.to_str().unwrap(),
+        "state": "active",
+        "base_entries": 1,
+        "base_bytes": 1,
+        "created_ms": 1,
+    })
+    .to_string();
+    store
+        .upsert_memory_fact(session.id, "shadow_root", "active", &fact)
+        .unwrap();
+    let svc = IndexService::open(
+        store.clone(),
+        env.data_root.clone(),
+        faktor_fs::WorkspaceFileService::new(),
+    )
+    .unwrap();
+    svc.set_config(fast_cfg());
+    svc.attach(ws).unwrap();
+    // The live shadow is indexed while it exists (P0-48 root re-pointing).
+    let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+    assert!(view.coverage().files_indexed >= 1, "{:?}", view.coverage());
+    // Turn settlement deletes the shadow and retires its durable row. The
+    // index must not stay Failed/build_started against the deleted path.
+    std::fs::remove_dir_all(&shadow).unwrap();
+    store
+        .upsert_memory_fact(
+            session.id,
+            "shadow_root",
+            "active",
+            &fact.replace("\"active\"", "\"discarded\""),
+        )
+        .unwrap();
+    svc.request_build(ws).unwrap();
+    let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+    assert!(view.coverage().complete, "{:?}", view.coverage());
+    assert!(view.coverage().files_indexed >= 1, "{:?}", view.coverage());
+    let snapshot = svc.coverage_snapshot(ws).unwrap();
+    assert_ne!(snapshot.state, "failed", "{snapshot:?}");
+    assert!(snapshot.serving, "{snapshot:?}");
+    let hits = view
+        .index()
+        .lock()
+        .unwrap()
+        .files_for_token(ws, "durable", 10);
+    assert!(!hits.is_empty(), "the durable root is indexed after rebind");
+}
