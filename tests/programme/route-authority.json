@@ -4,8 +4,12 @@
     "rule": "authorize-before-feature-state",
     "assertion": "tests/programme/checks/auth-order.mjs",
     "exceptions": {
-      "public": ["/native/scm/webhook"],
-      "bootstrap": ["/native/orgs"]
+      "public": [
+        "/native/scm/webhook"
+      ],
+      "bootstrap": [
+        "/native/orgs"
+      ]
     }
   },
   "entries": [
@@ -98,9 +102,33 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
+      "id": "native.delete.native.session.id.queue.op",
+      "method": "delete",
+      "path": "/native/session/{id}/queue/{op}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.session.id.repo.lock.token",
+      "method": "delete",
+      "path": "/native/session/{id}/repo/lock/{token}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.delete.native.session.id.review.comments.comment",
       "method": "delete",
       "path": "/native/session/{id}/review/comments/{comment}",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.delete.native.session.id.worktrees.worktree-id",
+      "method": "delete",
+      "path": "/native/session/{id}/worktrees/{worktree_id}",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -198,6 +226,14 @@
       "id": "native.get.native.call-receipts",
       "method": "get",
       "path": "/native/call-receipts",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.capabilities",
+      "method": "get",
+      "path": "/native/capabilities",
       "principal": "daemon",
       "scope": "global",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -453,11 +489,11 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
-      "id": "native.get.native.capabilities",
+      "id": "native.get.native.lsp.diagnostics",
       "method": "get",
-      "path": "/native/capabilities",
+      "path": "/native/lsp/diagnostics",
       "principal": "daemon",
-      "scope": "global",
+      "scope": "session_query",
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
@@ -785,9 +821,25 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
+      "id": "native.get.native.session.id.changes",
+      "method": "get",
+      "path": "/native/session/{id}/changes",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.get.native.session.id.checkpoints",
       "method": "get",
       "path": "/native/session/{id}/checkpoints",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.checkpoints.coverage",
+      "method": "get",
+      "path": "/native/session/{id}/checkpoints/coverage",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -828,6 +880,30 @@
       "id": "native.get.native.session.id.events",
       "method": "get",
       "path": "/native/session/{id}/events",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.lineage",
+      "method": "get",
+      "path": "/native/session/{id}/lineage",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.plan",
+      "method": "get",
+      "path": "/native/session/{id}/plan",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.queue",
+      "method": "get",
+      "path": "/native/session/{id}/queue",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -940,6 +1016,14 @@
       "id": "native.get.native.session.id.verification",
       "method": "get",
       "path": "/native/session/{id}/verification",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.get.native.session.id.worktrees",
+      "method": "get",
+      "path": "/native/session/{id}/worktrees",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -1072,6 +1156,14 @@
       "id": "native.get.session.id.projection",
       "method": "get",
       "path": "/session/{id}/projection",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.patch.native.session.id.queue.op",
+      "method": "patch",
+      "path": "/native/session/{id}/queue/{op}",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -1407,6 +1499,14 @@
       "source": "crates/server/src/worker_plane.rs"
     },
     {
+      "id": "native.post.native.lsp.code-actions",
+      "method": "post",
+      "path": "/native/lsp/code-actions",
+      "principal": "daemon",
+      "scope": "session_query",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.post.native.mcp.servers",
       "method": "post",
       "path": "/native/mcp/servers",
@@ -1498,6 +1598,14 @@
       "id": "native.post.native.model-parameters.compile",
       "method": "post",
       "path": "/native/model-parameters/compile",
+      "principal": "daemon",
+      "scope": "global",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.models.compare",
+      "method": "post",
+      "path": "/native/models/compare",
       "principal": "daemon",
       "scope": "global",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -1673,6 +1781,14 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
+      "id": "native.post.native.session.id.changes.accept-hunks",
+      "method": "post",
+      "path": "/native/session/{id}/changes/accept-hunks",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.post.native.session.id.checkpoints.sequence.restore",
       "method": "post",
       "path": "/native/session/{id}/checkpoints/{sequence}/restore",
@@ -1753,9 +1869,33 @@
       "source": "crates/server/src/api/lifecycle.rs"
     },
     {
+      "id": "native.post.native.session.id.plan",
+      "method": "post",
+      "path": "/native/session/{id}/plan",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.plan.version.approve",
+      "method": "post",
+      "path": "/native/session/{id}/plan/{version}/approve",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
       "id": "native.post.native.session.id.prompt",
       "method": "post",
       "path": "/native/session/{id}/prompt",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.repo.lock",
+      "method": "post",
+      "path": "/native/session/{id}/repo/lock",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"
@@ -1844,6 +1984,38 @@
       "id": "native.post.native.session.id.tournaments.tournament-id.decide",
       "method": "post",
       "path": "/native/session/{id}/tournaments/{tournament_id}/decide",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.worktrees",
+      "method": "post",
+      "path": "/native/session/{id}/worktrees",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.worktrees.repair",
+      "method": "post",
+      "path": "/native/session/{id}/worktrees/repair",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.worktrees.worktree-id.transfer",
+      "method": "post",
+      "path": "/native/session/{id}/worktrees/{worktree_id}/transfer",
+      "principal": "daemon",
+      "scope": "session_path",
+      "source": "crates/server/src/api/lifecycle.rs"
+    },
+    {
+      "id": "native.post.native.session.id.worktrees.worktree-id.validate",
+      "method": "post",
+      "path": "/native/session/{id}/worktrees/{worktree_id}/validate",
       "principal": "daemon",
       "scope": "session_path",
       "source": "crates/server/src/api/lifecycle.rs"

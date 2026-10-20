@@ -39,6 +39,25 @@ const MALFORMED_LEASE_TTL: Duration = Duration::from_secs(600);
 /// Retry interval while the lease is held by a provably live owner.
 const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Wait at most `budget` for the process-local repository write lock. The
+/// disk lease already has a budget; the in-process gate must be bounded by
+/// the same number, or a second guard of one manager waits forever and never
+/// reaches the typed lease conflict. Cancelling `write_owned` is safe (Tokio
+/// leaves the lock untouched), so a loser never steals the held guard.
+pub(crate) async fn write_owned_bounded(
+    lock: std::sync::Arc<tokio::sync::RwLock<()>>,
+    budget: Duration,
+    repo: &Path,
+) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, Error> {
+    match tokio::time::timeout(budget, lock.write_owned()).await {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(Error::conflict(format!(
+            "repository mutation lock for {} is held by another operation; the {budget:?} wait budget elapsed",
+            repo.display()
+        ))),
+    }
+}
+
 /// The durable lease record: process identity + purpose + start time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseRecord {

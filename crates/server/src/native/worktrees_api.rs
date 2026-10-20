@@ -9,12 +9,26 @@ use super::*;
 // mutation lease; no route spawns git directly.
 
 pub(crate) fn git_error(e: faktor_core::error::Error) -> Response {
-    let (code, status) = match e.kind {
-        faktor_core::error::ErrorKind::NotFound => ("not_found", StatusCode::NOT_FOUND),
-        faktor_core::error::ErrorKind::Conflict => ("conflict", StatusCode::CONFLICT),
-        faktor_core::error::ErrorKind::Permission => ("permission_denied", StatusCode::FORBIDDEN),
-        faktor_core::error::ErrorKind::Malformed => ("malformed", StatusCode::BAD_REQUEST),
-        _ => ("git_error", StatusCode::INTERNAL_SERVER_ERROR),
+    // A workspace that simply is not a git repository is a client-visible
+    // state refusal, not an internal daemon failure: the worktree/lease
+    // routes must answer 409 `workspace_not_git` with the same shape for
+    // every session, never a 500 that looks like a daemon outage.
+    let not_git = e
+        .message
+        .to_ascii_lowercase()
+        .contains("not a git repository");
+    let (code, status) = if not_git {
+        ("workspace_not_git", StatusCode::CONFLICT)
+    } else {
+        match e.kind {
+            faktor_core::error::ErrorKind::NotFound => ("not_found", StatusCode::NOT_FOUND),
+            faktor_core::error::ErrorKind::Conflict => ("conflict", StatusCode::CONFLICT),
+            faktor_core::error::ErrorKind::Permission => {
+                ("permission_denied", StatusCode::FORBIDDEN)
+            }
+            faktor_core::error::ErrorKind::Malformed => ("malformed", StatusCode::BAD_REQUEST),
+            _ => ("git_error", StatusCode::INTERNAL_SERVER_ERROR),
+        }
     };
     wire_status(ApiError {
         code,
@@ -435,5 +449,20 @@ pub(crate) async fn native_repo_unlock(
             http_status: 404,
             retryable: false,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_git_workspace_is_a_typed_conflict_not_an_internal_error() {
+        let error = faktor_core::error::Error::new(
+            faktor_core::error::ErrorKind::Internal,
+            "git worktree list --porcelain failed (128): fatal: not a git repository (or any of the parent directories): .git",
+        );
+        let response = git_error(error);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

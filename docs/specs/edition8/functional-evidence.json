@@ -81,7 +81,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -150,7 +150,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -189,7 +189,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3918,
+            "line": 3919,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'M-03': {"
           },
@@ -219,7 +219,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3918,
+            "line": 3919,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'M-03': {"
           },
@@ -357,7 +357,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1023,
+            "line": 1042,
             "note": "Daemon route POST /native/presets/:id/roles.",
             "line_text": "        .route("
           },
@@ -426,7 +426,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1027,
+            "line": 1046,
             "note": "Daemon route POST /native/presets/:id/fallback.",
             "line_text": "        .route("
           },
@@ -564,7 +564,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1032,
+            "line": 1051,
             "note": "Daemon route POST /native/catalog/probe.",
             "line_text": "        .route("
           },
@@ -633,7 +633,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -771,7 +771,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 764,
+            "line": 778,
             "note": "Daemon route GET /native/call-receipts?session=:session&limit=50.",
             "line_text": "        .route("
           },
@@ -840,7 +840,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 981,
+            "line": 1000,
             "note": "Daemon route GET /native/config/provenance?limit=500.",
             "line_text": "        .route("
           },
@@ -978,7 +978,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1209,
+            "line": 1283,
             "note": "Daemon route POST /native/session/:session/tournament.",
             "line_text": "        .route("
           },
@@ -1047,7 +1047,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1117,7 +1117,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1187,7 +1187,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1257,7 +1257,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1327,7 +1327,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1397,7 +1397,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1467,7 +1467,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1537,7 +1537,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -1607,7 +1607,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -1677,7 +1677,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 735,
+            "line": 749,
             "note": "Daemon route POST /native/providers/connections/:id/test.",
             "line_text": "        .route("
           },
@@ -1747,7 +1747,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1817,7 +1817,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1887,7 +1887,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1045,
+            "line": 1064,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -1957,7 +1957,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 748,
+            "line": 762,
             "note": "Daemon route POST /native/providers/credentials/rotate.",
             "line_text": "        .route("
           },
@@ -2027,7 +2027,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 726,
+            "line": 740,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -2097,7 +2097,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2164,7 +2164,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2231,7 +2231,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2298,7 +2298,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2365,7 +2365,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2432,7 +2432,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2499,7 +2499,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2566,7 +2566,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2633,7 +2633,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2700,7 +2700,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2767,7 +2767,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2834,7 +2834,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2901,7 +2901,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2968,7 +2968,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 760,
+            "line": 774,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -3035,7 +3035,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "        .route("
           },
@@ -3103,7 +3103,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3171,7 +3171,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3239,7 +3239,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3307,7 +3307,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3375,7 +3375,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "        .route("
           },
@@ -3443,7 +3443,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3511,7 +3511,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route POST /native/presets.",
             "line_text": "        .route("
           },
@@ -3579,7 +3579,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 638,
+            "line": 652,
             "note": "Daemon route POST /native/agents/:child/budget.",
             "line_text": "        .route("
           },
@@ -3647,7 +3647,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 626,
+            "line": 640,
             "note": "Daemon route POST /native/agents/:child/pause.",
             "line_text": "        .route(\"/native/agents/{child_id}/pause\", post(native_agent_pause))"
           },
@@ -3715,7 +3715,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 625,
+            "line": 639,
             "note": "Daemon route GET /native/agents.",
             "line_text": "        .route(\"/native/agents\", get(native_agents))"
           },
@@ -3783,7 +3783,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1011,
+            "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "        .route("
           },
@@ -3851,7 +3851,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 780,
+            "line": 794,
             "note": "Daemon route GET /native/context/manifests?session=:session.",
             "line_text": "        .route("
           },
@@ -3916,7 +3916,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 780,
+            "line": 794,
             "note": "Daemon route GET /native/context/manifests?session=:session.",
             "line_text": "        .route("
           },
@@ -3981,7 +3981,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 768,
+            "line": 782,
             "note": "Daemon route POST /native/session/:session/context/preview.",
             "line_text": "        .route("
           },
@@ -4015,7 +4015,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3923,
+            "line": 3924,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'C-04': {"
           },
@@ -4045,7 +4045,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3923,
+            "line": 3924,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'C-04': {"
           },
@@ -4109,7 +4109,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1185,
+            "line": 1259,
             "note": "Daemon route POST /native/session/:session/attachments.",
             "line_text": "        .route("
           },
@@ -4174,7 +4174,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1185,
+            "line": 1259,
             "note": "Daemon route POST /native/session/:session/attachments.",
             "line_text": "        .route("
           },
@@ -4238,7 +4238,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1074,
+            "line": 1095,
             "note": "Daemon route POST /native/session/:session/context/pins.",
             "line_text": "        .route("
           },
@@ -4259,12 +4259,7 @@
         "A15",
         "A38"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "C-08",
@@ -4313,7 +4308,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4383,7 +4378,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4453,7 +4448,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4523,7 +4518,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1247,
+            "line": 1321,
             "note": "Daemon route GET /native/index/coverage?session=:session.",
             "line_text": "        .route(\"/native/index/coverage\", get(native_index_coverage))"
           },
@@ -4593,7 +4588,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 768,
+            "line": 782,
             "note": "Daemon route POST /native/session/:session/context/preview.",
             "line_text": "        .route("
           },
@@ -4663,7 +4658,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 776,
+            "line": 790,
             "note": "Daemon route GET /native/context/manifest?session=:session.",
             "line_text": "        .route("
           },
@@ -4733,7 +4728,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1080,
+            "line": 1101,
             "note": "Daemon route GET /native/context/export?session=:session.",
             "line_text": "        .route(\"/native/context/export\", get(r8::native_context_export))"
           },
@@ -4754,12 +4749,7 @@
         "A15",
         "A38"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "K-01",
@@ -4808,7 +4798,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4876,7 +4866,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 790,
+            "line": 804,
             "note": "Daemon route POST /native/session/:session/context/compaction.",
             "line_text": "        .route("
           },
@@ -4944,7 +4934,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 790,
+            "line": 804,
             "note": "Daemon route POST /native/session/:session/context/compaction.",
             "line_text": "        .route("
           },
@@ -5008,7 +4998,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 790,
+            "line": 804,
             "note": "Daemon route GET /native/session/:session/context/compaction.",
             "line_text": "        .route("
           },
@@ -5072,7 +5062,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5140,7 +5130,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5208,7 +5198,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5276,7 +5266,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5344,7 +5334,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5412,7 +5402,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5476,7 +5466,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 858,
+            "line": 877,
             "note": "Daemon route DELETE /native/memory/records/:record?session=:session&expectedVersion=:version.",
             "line_text": "        .route("
           },
@@ -5540,7 +5530,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1083,
+            "line": 1104,
             "note": "Daemon route GET /native/session/:session/efficiency.",
             "line_text": "        .route("
           },
@@ -5559,12 +5549,7 @@
         "A31",
         "A36"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "I-01",
@@ -5613,7 +5598,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -5680,7 +5665,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -5747,7 +5732,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -5814,7 +5799,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route GET /native/instructions/records?limit=200.",
             "line_text": "        .route("
           },
@@ -5881,7 +5866,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -5948,7 +5933,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route GET /native/instructions/records?kind=template&limit=200.",
             "line_text": "        .route("
           },
@@ -6015,7 +6000,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 993,
+            "line": 1012,
             "note": "Daemon route GET /native/instructions/records/preview.",
             "line_text": "        .route("
           },
@@ -6082,7 +6067,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1001,
+            "line": 1020,
             "note": "Daemon route POST /native/instructions/import.",
             "line_text": "        .route("
           },
@@ -6149,7 +6134,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 876,
+            "line": 895,
             "note": "Daemon route GET /native/instructions/preview.",
             "line_text": "        .route("
           },
@@ -6216,7 +6201,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -6283,7 +6268,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1005,
+            "line": 1024,
             "note": "Daemon route GET /native/instructions/bindings.",
             "line_text": "        .route("
           },
@@ -6350,7 +6335,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6420,7 +6405,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6490,7 +6475,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6560,7 +6545,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6630,7 +6615,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6700,7 +6685,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 681,
+            "line": 695,
             "note": "Daemon route POST /native/permission/reply.",
             "line_text": "        .route(\"/native/permission/reply\", post(native_permission_reply))"
           },
@@ -6764,7 +6749,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 806,
+            "line": 820,
             "note": "Daemon route POST /native/permissions/rules.",
             "line_text": "        .route("
           },
@@ -6828,7 +6813,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 814,
+            "line": 828,
             "note": "Daemon route POST /native/permissions/preview.",
             "line_text": "        .route("
           },
@@ -6892,7 +6877,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 810,
+            "line": 824,
             "note": "Daemon route DELETE /native/permissions/rules/:rule.",
             "line_text": "        .route("
           },
@@ -6957,7 +6942,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 802,
+            "line": 816,
             "note": "Daemon route GET /native/permissions/policy.",
             "line_text": "        .route("
           },
@@ -6997,7 +6982,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3884,
+            "line": 3885,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "          case 'Q-11':"
           },
@@ -7027,7 +7012,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3884,
+            "line": 3885,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "          case 'Q-11':"
           },
@@ -7097,7 +7082,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1367,
+            "line": 1441,
             "note": "Daemon route POST /native/enterprise/effective-config.",
             "line_text": "        .route("
           },
@@ -7167,7 +7152,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 818,
+            "line": 832,
             "note": "Daemon route GET /native/permissions/audit?limit=50.",
             "line_text": "        .route("
           },
@@ -7237,7 +7222,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 802,
+            "line": 816,
             "note": "Daemon route GET /native/permissions/policy.",
             "line_text": "        .route("
           },
@@ -7307,7 +7292,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 966,
+            "line": 985,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -7375,7 +7360,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -7443,7 +7428,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7507,7 +7492,7 @@
           "status": "partial",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7571,7 +7556,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7639,7 +7624,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 920,
+            "line": 939,
             "note": "Daemon route POST /native/mcp/servers/:mcp/auth.",
             "line_text": "        .route("
           },
@@ -7703,7 +7688,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route GET /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7771,7 +7756,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -7839,7 +7824,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 908,
+            "line": 927,
             "note": "Daemon route GET /native/mcp/servers/:mcp/tools.",
             "line_text": "        .route("
           },
@@ -7907,7 +7892,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7975,7 +7960,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 966,
+            "line": 985,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -8043,7 +8028,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 916,
+            "line": 935,
             "note": "Daemon route GET /native/mcp/servers/:mcp/resources.",
             "line_text": "        .route("
           },
@@ -8062,12 +8047,7 @@
         "A23",
         "A28"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "T-13",
@@ -8116,7 +8096,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 900,
+            "line": 919,
             "note": "Daemon route POST /native/mcp/servers/:mcp/start.",
             "line_text": "        .route("
           },
@@ -8184,7 +8164,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 892,
+            "line": 911,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -8252,7 +8232,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 822,
+            "line": 836,
             "note": "Daemon route GET /native/diagnostics/preview.",
             "line_text": "        .route("
           },
@@ -8320,7 +8300,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 929,
+            "line": 948,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -8387,7 +8367,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 942,
+            "line": 961,
             "note": "Daemon route POST /native/skills/:id/invocation.",
             "line_text": "        .route("
           },
@@ -8454,7 +8434,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 934,
+            "line": 953,
             "note": "Daemon route GET /native/skills/:skill.",
             "line_text": "        .route("
           },
@@ -8521,7 +8501,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 930,
+            "line": 949,
             "note": "Daemon route POST /native/skills/install.",
             "line_text": "        .route("
           },
@@ -8558,7 +8538,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3971,
+            "line": 3972,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'S-05':"
           },
@@ -8588,7 +8568,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3971,
+            "line": 3972,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'S-05':"
           },
@@ -8655,7 +8635,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 989,
+            "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "        .route("
           },
@@ -8722,7 +8702,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -8786,7 +8766,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -8850,7 +8830,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -8868,12 +8848,7 @@
         "A23",
         "A24"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "S-10",
@@ -8922,7 +8897,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -8989,7 +8964,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -9056,7 +9031,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 950,
+            "line": 969,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "        .route("
           },
@@ -9123,7 +9098,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 962,
+            "line": 981,
             "note": "Daemon route POST /native/hooks/:hook/test.",
             "line_text": "        .route("
           },
@@ -9187,7 +9162,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 929,
+            "line": 948,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -9254,7 +9229,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 648,
+            "line": 662,
             "note": "Daemon route GET /native/terminals.",
             "line_text": "        .route(\"/native/terminals\", get(native_terminals))"
           },
@@ -9318,7 +9293,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -9389,7 +9364,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 673,
+            "line": 687,
             "note": "Daemon route GET /native/session/:session/terminals/:terminal/output.",
             "line_text": "        .route("
           },
@@ -9460,7 +9435,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 653,
+            "line": 667,
             "note": "Daemon route POST /native/session/:session/terminal.",
             "line_text": "        .route(\"/native/session/{id}/terminal\", post(native_terminal_spawn))"
           },
@@ -9531,7 +9506,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 665,
+            "line": 679,
             "note": "Daemon route POST /native/session/:session/terminals/:terminal/kill.",
             "line_text": "        .route("
           },
@@ -9595,7 +9570,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1053,
+            "line": 1074,
             "note": "Daemon route POST /native/browser/sessions.",
             "line_text": "        .route("
           },
@@ -9617,12 +9592,7 @@
         "A38",
         "A40"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "X-07",
@@ -9671,7 +9641,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 971,
+            "line": 990,
             "note": "Daemon route POST /native/browser/validate-url.",
             "line_text": "        .route("
           },
@@ -9742,7 +9712,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1061,
+            "line": 1082,
             "note": "Daemon route POST /native/browser/sessions/:browser/screenshot.",
             "line_text": "        .route("
           },
@@ -9764,12 +9734,7 @@
         "A38",
         "A40"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "X-09",
@@ -9818,7 +9783,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1057,
+            "line": 1078,
             "note": "Daemon route GET /native/browser/sessions/:browser/observations.",
             "line_text": "        .route("
           },
@@ -9840,12 +9805,7 @@
         "A38",
         "A40"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "X-10",
@@ -9864,7 +9824,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3937,
+            "line": 3938,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-10': {"
           },
@@ -9894,7 +9854,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3937,
+            "line": 3938,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-10': {"
           },
@@ -9935,7 +9895,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3951,
+            "line": 3952,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-11': {"
           },
@@ -9965,7 +9925,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3951,
+            "line": 3952,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-11': {"
           },
@@ -10036,7 +9996,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10107,7 +10067,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1045,
+            "line": 1064,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -10178,7 +10138,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10242,7 +10202,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10306,7 +10266,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10371,7 +10331,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1141,
+            "line": 1215,
             "note": "Daemon route GET /native/session/:session/usage.",
             "line_text": "        .route(\"/native/session/{id}/usage\", get(native_session_usage))"
           },
@@ -10442,7 +10402,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1087,
+            "line": 1108,
             "note": "Daemon route PUT /native/session/:session/budget.",
             "line_text": "        .route("
           },
@@ -10513,7 +10473,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10584,7 +10544,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10655,7 +10615,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1083,
+            "line": 1104,
             "note": "Daemon route GET /native/session/:session/efficiency.",
             "line_text": "        .route("
           },
@@ -10726,7 +10686,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10797,7 +10757,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 690,
+            "line": 704,
             "note": "Daemon route GET /native/config/descriptors.",
             "line_text": "        .route("
           },
@@ -11004,7 +10964,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 595,
+            "line": 599,
             "note": "Daemon route GET /native/session/:session/verification.",
             "line_text": "        .route("
           },
@@ -11075,7 +11035,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1104,
+            "line": 1138,
             "note": "Daemon route POST /native/session/:session/review/comments.",
             "line_text": "        .route("
           },
@@ -11146,7 +11106,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1114,
+            "line": 1152,
             "note": "Daemon route POST /native/session/:session/changes/accept.",
             "line_text": "        .route("
           },
@@ -11281,7 +11241,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1099,
+            "line": 1133,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore/preview.",
             "line_text": "        .route("
           },
@@ -11345,7 +11305,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1091,
+            "line": 1112,
             "note": "Daemon route POST /native/session/:session/fork.",
             "line_text": "        .route("
           },
@@ -11410,7 +11370,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1161,
+            "line": 1235,
             "note": "Daemon route POST /native/session/:session/task-runs.",
             "line_text": "        .route("
           },
@@ -11474,7 +11434,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 595,
+            "line": 599,
             "note": "Daemon route GET /native/session/:session/verification.",
             "line_text": "        .route("
           },
@@ -11545,7 +11505,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1151,
+            "line": 1225,
             "note": "Daemon route GET /native/tasks/:task/proof?session=:session.",
             "line_text": "        .route(\"/native/tasks/{id}/proof\", get(native_task_proof))"
           },
@@ -11610,7 +11570,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1161,
+            "line": 1235,
             "note": "Daemon route POST /native/session/:session/task-runs.",
             "line_text": "        .route("
           },
@@ -11674,7 +11634,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1271,
+            "line": 1345,
             "note": "Daemon route GET /native/repositories.",
             "line_text": "        .route(\"/native/repositories\", get(native_repositories))"
           },
@@ -11745,7 +11705,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1095,
+            "line": 1129,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore.",
             "line_text": "        .route("
           },
@@ -11945,7 +11905,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 840,
+            "line": 859,
             "note": "Daemon route GET /native/transcript/search?session=:session&q=:query&regex=false&case=false.",
             "line_text": "        .route("
           },
@@ -12009,7 +11969,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 835,
+            "line": 854,
             "note": "Daemon route POST /native/sessions/:session/meta.",
             "line_text": "        .route("
           },
@@ -12145,7 +12105,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1124,
+            "line": 1198,
             "note": "Daemon route POST /native/session/:session/export.",
             "line_text": "        .route("
           },
@@ -12251,7 +12211,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3974,
+            "line": 3975,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-08':"
           },
@@ -12281,7 +12241,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3974,
+            "line": 3975,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-08':"
           },
@@ -12319,7 +12279,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3976,
+            "line": 3977,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-09':"
           },
@@ -12349,7 +12309,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3976,
+            "line": 3977,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-09':"
           },
@@ -12387,7 +12347,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3979,
+            "line": 3980,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-10':"
           },
@@ -12417,7 +12377,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3979,
+            "line": 3980,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-10':"
           },
@@ -12455,7 +12415,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3982,
+            "line": 3983,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-11':"
           },
@@ -12485,7 +12445,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3982,
+            "line": 3983,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-11':"
           },
@@ -12553,7 +12513,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -12655,7 +12615,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3985,
+            "line": 3986,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-14':"
           },
@@ -12685,7 +12645,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3985,
+            "line": 3986,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-14':"
           },
@@ -12749,7 +12709,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 831,
+            "line": 850,
             "note": "Daemon route GET /native/sessions/parallel.",
             "line_text": "        .route("
           },
@@ -12817,7 +12777,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 714,
+            "line": 728,
             "note": "Daemon route GET /native/config/search?q=:query.",
             "line_text": "        .route("
           },
@@ -12887,7 +12847,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1045,
+            "line": 1064,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -12957,7 +12917,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 826,
+            "line": 840,
             "note": "Daemon route POST /native/diagnostics/export.",
             "line_text": "        .route("
           },
@@ -13027,7 +12987,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1045,
+            "line": 1064,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -13097,7 +13057,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1293,
+            "line": 1367,
             "note": "Daemon route POST /native/updater/check.",
             "line_text": "        .route(\"/native/updater/check\", post(native_updater_check))"
           },
@@ -13237,7 +13197,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1257,
+            "line": 1331,
             "note": "Daemon route GET /native/identity.",
             "line_text": "        .route(\"/native/identity\", get(native_identity))"
           },
@@ -13307,7 +13267,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1367,
+            "line": 1441,
             "note": "Daemon route POST /native/enterprise/effective-config.",
             "line_text": "        .route("
           },
@@ -13377,7 +13337,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 854,
+            "line": 873,
             "note": "Daemon route POST /native/memory/records/retention.",
             "line_text": "        .route("
           },
@@ -13447,7 +13407,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 702,
+            "line": 716,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -13468,12 +13428,7 @@
         "A37",
         "A38"
       ],
-      "dogfood": {
-        "test_id": "dogfood.rev8-field-contracts",
-        "evidence": "target/certification/edition8/dogfood-vscode.raw.json#rev8-field-contracts",
-        "passed": true,
-        "observed": "33 contract checks: connection:200, probe:200, preset:200, roles:200, fallback:200, config:200, context-preview:200, settings:200, mcp:200, mcp-auth:200, mcp-revoke:200, pin:200, pins:200, context-export:200, efficiency:200, hook-matcher:200, hook-miss:200, hook-hit:200, mcp-resources:409, browser-config:200, browser-adapters:200, browser-session:200, browser-observations:200, browser-screenshot:200, telemetry:200, review:200, review-list:200, review-delete:200, accept:409, restore-preview:404, export:200, delete:200, delete-replay:200"
-      }
+      "dogfood": null
     },
     {
       "id": "O-11",
@@ -13522,7 +13477,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1304,
+            "line": 1378,
             "note": "Daemon route GET /native/workers.",
             "line_text": "        .route(\"/native/workers\", get(native_workers_list))"
           },
@@ -13592,7 +13547,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 722,
+            "line": 736,
             "note": "Daemon route POST /native/config/import.",
             "line_text": "        .route("
           },
@@ -13662,7 +13617,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1241,
+            "line": 1315,
             "note": "Daemon route GET /native/semantic/capabilities.",
             "line_text": "        .route("
           },

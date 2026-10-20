@@ -625,6 +625,7 @@ impl BrokerOnlyBridge {
     }
 }
 
+mod browser_reap;
 /// Per-spawn daemon-death guardian (Linux): a forked helper owns a control
 /// pipe's read end and the child's start-time-verified group identity, so a
 /// daemon SIGKILL (which bypasses every destructor) still ends the whole

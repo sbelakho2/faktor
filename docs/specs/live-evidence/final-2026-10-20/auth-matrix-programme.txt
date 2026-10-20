@@ -1,0 +1,2 @@
+auth matrix: proven (270 routes, 1838 cases, 0 failed)
+auth cost: p50 1571.3us p95 1833.1us over 120 requests

@@ -1,0 +1,297 @@
+
+> faktor@0.1.0 build
+> tsc -p .
+
+
+> faktor@0.1.0 selftest
+> node scripts/selftest.mjs
+
+(node:38171) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file://<repo>/apps/vscode/src/nativeClient.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to <repo>/apps/vscode/package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS  validators accept the documented shapes
+PASS  validators reject missing fields and bad known-field types
+PASS  epoch-ms validation is bounded to the JS Date range
+PASS  client speaks every native endpoint with strict validation
+PASS  session create/list speak ONLY the daemon router contract
+PASS  billing reads carry the control-plane token only when configured
+PASS  client accepts additive response fields and rejects known-field type drift
+PASS  client maps API error envelopes and rejects malformed ones
+PASS  client bounds response bodies and request time
+PASS  client deadline covers the whole bounded body read (headers are not completion)
+PASS  client routes match the daemon router (no /session/* fallback)
+PASS  client event vocabulary matches the frozen compiled EventKind contract
+PASS  eventStream tolerates heartbeats, suppresses replay, reports non-durable bad frames
+PASS  EventStream connects to the native journal route with the after= cursor
+PASS  eventStream resumes from the cursor with backoff
+PASS  a non-retryable HTTP answer is a terminal configuration failure, not a retry loop
+PASS  eventStream surfaces transport rejection and bounds frames
+PASS  frame budget: exactly max cumulative bytes is accepted, one line above is refused
+PASS  frame budget counts comments, event and id lines cumulatively
+PASS  frame budget is UTF-8 byte-accurate at a multibyte boundary
+PASS  one hundred thousand tiny data lines are refused early with bounded retention
+PASS  endless short lines never allocate unboundedly and the reader is cancelled
+PASS  every chunk boundary produces an identical frame-budget result
+PASS  an oversized durable frame blocks and a following valid frame is never delivered
+PASS  an oversized non-durable frame fails typed and reconnects with backoff
+PASS  durable malformed JSON blocks at the offending sequence and never reconnects
+PASS  stop() during the maximum backoff is prompt with no later fetch
+PASS  abortableDelay resolves on abort and never rejects
+PASS  store notifies subscribers exactly once per change
+PASS  index coverage never bleeds across a session switch or daemon stop
+PASS  transcript renders durable message pages (no foreign SSE vocabulary)
+PASS  transcript is bounded to MAX_TRANSCRIPT_ENTRIES
+PASS  transcript content digest detects same-length text and tool edits
+PASS  daemon resolves an explicit binary path
+PASS  100 concurrent startDaemon callers spawn exactly one process (single-flight)
+PASS  daemon refuses to start without a binary (actionable, machine-scoped escapes only)
+PASS  a workspace target/ build is never resolved or executed
+PASS  workspace-scoped daemon settings are ignored and refused with a typed message
+PASS  resolved-binary trust: checksum records verify, mismatches refuse, absence warns
+PASS  daemon resolves through the bootstrap launcher when an install layout exists
+PASS  health release digests parse from the version and absence stays null
+PASS  launcher-exits-early-still-alive: the release pid is tracked, launcher exit is not daemon death
+PASS  launcher-exits-early-daemon-dies-detected: release death is reported once the launcher is gone
+PASS  stop-terminates-release-not-launcher: stop kills the release, not just a resident launcher
+PASS  launcher release-pid handshake line is parsed before the startup line
+PASS  release handshake digest mismatch: announced pid is refused, never signalled
+PASS  release handshake with no health digest is refused, never adopted
+PASS  handshake pid disagreeing with the port probe is refused; the probed release wins
+PASS  recycled resolved pid: a dead daemon refuses to signal the cached pid
+PASS  cancel startup aborts the attempt, kills the spawned child and leaves no orphan
+PASS  an already-aborted signal refuses before any spawn
+PASS  the machine-scoped write adapter refuses workspace values and writes exactly once otherwise
+PASS  the T00-T05 preflight matrix renders its exact label, copy and actions in both surfaces
+PASS  ready requires readiness success; a running but not-ready service stays T05
+PASS  a refused trust state offers ONLY Locate daemon and never a start action
+PASS  unverified shows the exact resolved path, the D10 wording and both Start anyway / Cancel
+PASS  D10: the bare checksum check never claims a signature; launcher wording stays scoped
+PASS  T27/T28 stream recovery renders verbatim copy with Wait/Refresh and Reconnect/Refresh from snapshot
+PASS  T32 sandbox guidance is guidance-only: exact copy, copyable command, no write control
+PASS  evidence rows carry list semantics and new approvals announce once without stealing focus
+PASS  T32 ships guidance only: no sandbox write/execute route exists in the extension
+PASS  host wiring: locateDaemon, cancellable startup and the readiness gate are pinned
+PASS  T06 ready composer strip renders the exact label and copy from the served ready preflight
+PASS  T07 starting strip renders during the single-flight admission and never twice
+PASS  T08 start response unavailable keeps the kept draft strip until the next submission
+PASS  T11 needs your input renders only from the served needs_user_input machine state
+PASS  T12 checking renders only from the proof body embedded task state
+PASS  T25/T26/T09 render from the newest durable task-run row, and T12 outranks a running row
+PASS  negative: the collapsed session tag alone can never render T12/T25/T26
+PASS  T19 workspace changed renders the exact label and copy beside the pinned Conflict facts
+PASS  T21 finish action pending renders only when a requested step lacks a succeeded durable result
+PASS  readiness never succeeds before ready:true; the deadline is a typed timeout
+PASS  a served but absent readiness route is a terminal typed failure; ready:true succeeds
+PASS  an abort unwinds the readiness wait typed and promptly
+PASS  P0 shadow-only: the setting vocabulary is shadow/empty and the removed mode never forwards
+PASS  removed direct_compat is a typed strict-parse refusal before any request
+PASS  409 shadow refusal is typed/actionable and attempted exactly once (no downgrade)
+PASS  start failures classify 4xx/5xx/transport and never start; success acks once
+PASS  completion contract parsing is strict; all-false is the default path
+PASS  a non-default contract starts an explicit work item; the default stays byte-identical
+PASS  the task view parses the additive durable completion block and rejects malformed shapes
+PASS  cockpit renders the completion contract with explicit provenance
+PASS  T22: a requested PR step blocked by SCM config renders the exact copy and the guidance action
+PASS  the built-in Task composer posts the checked contract and displays its statuses
+PASS  the finish choice is ONE ordered radio group: later levels imply earlier steps
+PASS  the error projection demotes typed codes and keeps one human shape per kind
+PASS  attachment-refusal projection bounds reasons and never promotes raw text
+PASS  pending permissions project bounded list entries for the approval card
+PASS  typed attachments ride the task start beside workspace paths
+PASS  admission uploads bytes first and starts with the durable ids
+PASS  every start failure restores the pending identity and never leaves a partial admission
+PASS  an upload failure restores the draft and never issues a task start
+PASS  image submissions upload their bytes and start with the durable ids
+PASS  undeliverable images are refused before any upload (mime allowlist + per-image bound)
+PASS  the advertised model contract drives attachment gates; the emergency ceiling is only the fallback
+PASS  advertised image bounds gate before upload (tighter AND looser than the emergency ceiling)
+PASS  documents ride the advertised capability contract (legacy daemons keep deciding)
+PASS  pending envelopes are re-validated strictly at the host boundary
+PASS  a host-validated envelope with binary attachments uploads bytes first and starts with the durable ids
+PASS  a failed start keeps the uploaded id in local pending state and the retry uploads nothing
+PASS  an upload retained for one session is never reused by another session
+PASS  a partial upload failure retries only the absent attachments
+PASS  hostile already-uploaded records are refused at the envelope boundary
+PASS  an upload keeps its ref_id through admission and the ref routes retrieve per-reference metadata
+PASS  the retainer bounds retry state and merges uploads only by content identity
+PASS  retry reuse matches content identity, never array index
+PASS  retry identity includes filename and size and ignores array position
+PASS  documents upload as durable attachments when the advertised model supports them
+PASS  an advertised-unavailable document refuses before any upload
+PASS  workspace source files stay on the repository-context path and are never uploaded
+PASS  attachment byte routes use the 7 MiB HTTP contract, not the 4 MiB generic cap
+PASS  blob metadata route: 1 resolves, 0 is a 404, several are the typed 409 conflict
+PASS  board pages project posts, unread and the read watermark
+PASS  the client refuses empty board posts locally (no request is made)
+PASS  the webview board policy mirrors the host bounds and never fabricates
+PASS  the board DOM renders bounded rows, gates the draft and clears on ack
+PASS  unchanged agent and board deltas never rebuild their lists
+PASS  display bounds are byte-accurate, surrogate-safe and control-free
+PASS  composer files are bounded per-entry and forwarded to the native task-run
+PASS  a malformed completion contract is refused with a typed reason
+PASS  a dismissed completion-contract picker aborts instead of starting a task
+PASS  pending permissions parse with the OWNING session and free-form detail text
+PASS  permission reply sends the strict session-scoped body and accepts {ok:true}
+PASS  unknown/expired id: the typed 409 conflict is surfaced and never retried
+PASS  foreign session: the typed 409 permission_session_mismatch is surfaced and never retried
+PASS  unrelated API errors are never classified as permission-reply refusals
+PASS  composer clears the draft only after a successful start
+PASS  busy/activeRunId derive from run STATE (terminal => not busy)
+PASS  cancel targets only active runs; terminal runs are never attempted
+PASS  a server 409 on cancel surfaces as a typed NativeApiError
+PASS  session binding uses the canonical workspace identity, never sessions[0]
+PASS  child summaries surface identity/worktree/ownership/capabilities/progress/result/budget/model metadata
+PASS  same model two providers: the catalog join is (provider, model), never model alone
+PASS  background presentation survives the summary and defaults to foreground
+PASS  presentation transitions use the session-scoped route and surface typed 409s
+PASS  child summary fields are bounded and blocker fields surface when present
+PASS  agent Retry uses the server guard: a typed 409 surfaces, never a silent no-op
+PASS  pixel avatars are deterministic per ChildId with per-state animation
+PASS  pixel presence transitions over native mock frames and survives gaps
+PASS  validateTaskViews surfaces additive criteria/plan/blockers/evidence/phase fields
+PASS  task cockpit renders every section from a mock native payload
+PASS  cockpit tucks background children last and marks them dimmed
+PASS  cockpit tournament block is state-gated: decide waits, abort is open-only
+PASS  native client decodes the additive contract and tolerates a legacy daemon
+PASS  contract decode is per-entry: malformed rows are disclosed, never rendered as claims
+PASS  needs-disclosure follows the core rule: high/unknown risks and unsatisfied claims
+PASS  the cockpit renders the Contract section and leads with Needs disclosure
+PASS  composer contract rows are strict, bounded and ride the task-start request
+PASS  webview: contract rows render with state/confidence/provenance and the disclosure block leads
+PASS  native client parses the additive proof payload and degrades hostile annotations
+PASS  every binding kind renders per criterion with its exact reference
+PASS  binding kinds are derived from typed evidence refs only when unambiguous
+PASS  missing and hostile proof payloads degrade to honest unavailable rows
+PASS  proof rows carry the proven snapshots and verification timestamps
+PASS  fallback webview renders distinct pass/fail/unavailable proof rows with retrieval
+PASS  out-of-range epoch stamps degrade to unavailable, never a RangeError
+PASS  a cockpit projection failure is isolated from the rest of the snapshot patch
+PASS  strict proof validator accepts the served payload and refuses unknown verdicts
+PASS  cockpit renders the daemon VERIFIED view with drill-down, never fabricating one
+PASS  a passing record is candidate evidence and never VERIFIED without the strict proof gate
+PASS  integration is its own section: served states render distinct facts, absence is unavailable
+PASS  a missing spend never renders as zero: the unavailable wording is preserved
+PASS  a failed proof refresh drops the previously verified presentation
+PASS  usage panel renders populated aggregates, credits and the exact limits
+PASS  billing_disabled renders "billing disabled locally", never zeros
+PASS  expired / canceled / lapsed subscriptions render explicit banners
+PASS  quota-exceeded styling names the exact breached limit
+PASS  grant-credits affordance follows the credits_grant capability
+PASS  cursor pagination controls wire next/prev from the served cursors
+PASS  malformed or refused payloads render honest unavailable states
+PASS  money parses decimal strings exactly at 0, 2^53-1, 2^53 and i64::MAX
+PASS  money: legacy numbers <= 2^53-1 convert exactly; larger numbers are flagged
+PASS  money display is exact: no precision loss, no scientific notation
+PASS  money aggregation is exact in bigint (sums, saturating balance, quota compare)
+PASS  money request projection: number while lossless, else the exact string
+PASS  the secret key is the endpoint plus organization, never the token
+PASS  SecretStorage wins and a leftover plaintext copy is deleted, never kept alongside
+PASS  a plaintext credential migrates once: secret stored, setting deleted
+PASS  a declined migration refuses the plaintext for cloud calls
+PASS  a plaintext credential without scope coordinates is refused
+PASS  sign-in stores the secret and deletes the plaintext; blank input is refused
+PASS  logout sends the real route shape and revokes the exact token; a network error still deletes locally
+PASS  an external rotation during the in-flight revoke is compare-and-deleted, never erased
+PASS  the client sends the credentialed header only after a secure resolution
+PASS  revokeControlSession refuses a body the daemon would reject, and a 404 is a typed not-found
+PASS  an external SecretStorage change reaches the running client; removal clears the old token
+PASS  background children render dimmed+grouped and the toggle posts the next state
+PASS  Work / Inspect / History is a tablist shell with Work as the default view
+PASS  a pending permission renders the approval card decision-first and posts typed replies
+PASS  approval copy: the authority reason is verbatim and a bare entry fabricates none
+PASS  a double click on Allow posts exactly one permissionReply
+PASS  an empty pending set hides the approval card; hostile entries stay bounded
+PASS  a structured userError renders summary, action and a demoted technical disclosure
+PASS  the snapshot lastError fallback surfaces once through the same renderer
+PASS  tablist Arrow/Home/End move the active subview exactly once and post nothing
+PASS  History round-trip preserves the Inspect subview, scope breadcrumb and composer draft
+PASS  an unavailable conversation list renders the exact T31 surface and no rows
+PASS  a history row renders real title/date/state and never a verification verdict
+PASS  a History row Open posts exactly one openSession with the row id
+PASS  an unchanged snapshot delta never rebuilds the changes list (bounded render count)
+PASS  an unchanged snapshot delta never rebuilds the history list (bounded render count)
+PASS  content guards cannot over-suppress: selection, session framing and review deltas all render
+PASS  the served session listing parses the additive created_ms tolerantly
+PASS  switchSession is idempotent for the already-active conversation
+PASS  no view-open or History message path launches the daemon
+PASS  durable acceptance clears ONLY the accepted attachment ids (next-task attachment survives)
+PASS  task-start snapshots retain the accepted ids across a transport retry
+PASS  the real composer markup ships the attachment surface, the a11y log and recovery affordances
+PASS  every contributed setting is declared with its pinned type and description
+PASS  the palette taxonomy and the onboarding walkthrough are pinned
+PASS  the webview markup and canonical DOM identity are pinned against drift
+PASS  host attachment metadata renders filename/MIME/size with refusal, remove and clear
+PASS  attach opens the host picker; paste/drop ingest bounded bytes exactly once
+PASS  DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)
+PASS  a failed start keeps the visible attachments and the retry reuses the durable uploads
+PASS  attachment order is preserved; a changed body or session drops the stale identity
+PASS  the retry identity is content+metadata: renamed or re-mimed bytes upload fresh
+PASS  over-limit, wrong-MIME and vision-less attachments refuse typed before any upload
+PASS  a vision-less model refuses an attached image at admission and keeps it visible
+PASS  the transcript live region appends only new entries
+PASS  the extension host reads picked files, resolves host ids and exposes stream recovery
+PASS  a protocol-blocked snapshot surfaces recovery affordances wired to the host
+PASS  Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns
+PASS  lifecycle fence: a bump invalidates every captured generation
+PASS  lifecycle fence: 2,000 randomized interleavings never apply a stale generation
+PASS  double click / Enter+click / triple submit admit exactly ONE start
+PASS  lost HTTP response + same-body retry reuses the id and the daemon returns one receipt
+PASS  a changed completion contract after a transport failure mints a new id and starts fresh
+PASS  success and typed refusal clear the logical submission; transport keeps it retryable
+PASS  text typed and attachment changes while pending never join the pending body
+PASS  a transport retry reuses the retained uploads under the same submission id
+PASS  the request builder forwards only a canonical submission_id
+PASS  failed fetch / key helpers: verification authority is identity, never counts
+PASS  a failed fetch after an authority change never returns the previous view
+PASS  architectural: no proof-like cache returns data after its authority key changed
+PASS  per-run budget: strict parse, exact bounds, typed refusals
+PASS  per-run budget: the override wins over the settings and rides the start request
+PASS  per-run budget: captured per submission, reused on retry, cleared after acceptance
+PASS  webview: per-run budget fields ride sendGoal and clear only on durable acceptance
+PASS  changes: rows derive from served paths and only served relationships attach refs
+PASS  changes: the source-diff evidence id is read from the served records only
+PASS  changes basis: exact resolution order and immutable titles
+PASS  changes: unavailable projection drops rows and names the reason
+PASS  evidence documents: URI round-trip and typed refusals for hostile ids
+PASS  evidence documents: content equals served bytes exactly and truncation is the first line
+PASS  evidence documents: unknown, cross-session, malformed and oversized payloads refuse typed
+PASS  webview changes: rows, bounded Previous/Next, toolbar actions and focus preservation
+PASS  webview changes: empty and unavailable states are exact, with no stale rows
+PASS  outcomes client: validated page, cursor query, hostile payload refused typed
+PASS  value entitlements client: strict report parse, hostile payload refused typed
+PASS  outcomes entitlement surfacing: org guard and typed status lines
+PASS  outcomes: ppm percents are exact floor values, never rounded or scientific
+PASS  outcomes metrics: exact names, served counts and the honesty rules
+PASS  outcomes runs: newest-first rows, advanced run id, composite cursor paging
+PASS  outcomes cursor requests are strict (both members or neither)
+PASS  webview outcomes: exact names, cohorts, T29 unavailable and lazy reads
+PASS  webview outcomes: T29 read failure renders no money and never touches conversations
+PASS  webview outcomes: typed 403/409 refusals and the value-entitlements status line
+PASS  transcript scroll ownership: pinned follows, initial pins, no delta is a no-op
+PASS  streaming preserves delivered evidence occurrences and focus on the last entry
+PASS  a replaced tool row keeps its open disclosure and delivered evidence without focus
+PASS  a same-length content change updates the DOM; streaming patches only the last entry
+PASS  a colliding or stale transcript digest never skips different content
+PASS  an unpinned reader keeps the first visible entry and pixel offset
+PASS  background refresh with no transcript delta mutates zero scroll and keeps evidence
+PASS  own submission explicitly pins the transcript
+PASS  transcript-only deltas never rebuild the task, cockpit or permission surfaces
+PASS  stream snapshots coalesce to one render per frame and preserve the latest order
+PASS  the stream refresh scheduler coalesces without starving and never drops a trailing frame
+PASS  a 500-entry transcript is windowed, follows the bottom and never rebuilds offscreen deltas
+PASS  the composer is single-flight: submit locks controls and only an explicit result releases
+PASS  500 streaming deltas rebuild the transcript exactly once (bounded render count)
+PASS  cockpit Decide/Abort are state-gated and post only when enabled
+PASS  prefers-reduced-motion disables every .pixel-* animation with static cues
+PASS  every acceptance-verdict pair meets WCAG AA 4.5:1 in chat.css
+PASS  the verdict checker rejects the historical white-on-accent colors
+PASS  verdict chips never take their pair from theme variables
+PASS  webview verdict styling is class-driven (no inline color overrides)
+PASS  capability matrix: every contributed command is activated, registered and reaches a real service path
+PASS  capability matrix: every contributed setting is consumed by a production path
+PASS  capability matrix: every webview control and message round-trips to a host handler
+PASS  edition8: inline state serialization cannot terminate the script element
+
+282 passed, 0 failed
+SELFTEST OK

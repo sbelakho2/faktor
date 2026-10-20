@@ -757,6 +757,106 @@ async fn force_signal_reports_the_force_exit_code() {
     assert_eq!(probe_rx.await.unwrap(), FORCE_EXIT_CODE);
 }
 
+/// Poll a pid until it is gone (bounded). Used by the browser-orphan tests:
+/// the supervisor's reaper may take a moment to consume the leader.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+async fn wait_until_gone(pid: u32) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // SAFETY: kill(pid, 0) only probes existence; no signal is delivered.
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if !alive {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "process {pid} survived the daemon shutdown"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn spawn_browser_owned_sleeper(
+    supervisor: &std::sync::Arc<faktor_terminal::ProcessSupervisor>,
+) -> faktor_terminal::ChildHandle {
+    supervisor
+        .spawn(faktor_terminal::SpawnConfig {
+            cmd: "sleep".into(),
+            args: vec!["300".into()],
+            owner: faktor_terminal::ProcessOwner::Browser {
+                source: "force-exit-test".into(),
+                profile: "force-exit-test".into(),
+            },
+            capture: false,
+            ..Default::default()
+        })
+        .expect("spawn a browser-owned sleeper")
+}
+
+/// A real SIGTERM to the daemon must leave no browser-owned child behind:
+/// the graceful drain drops the manager/supervisor, whose owner-scoped kill
+/// reaps the child. This is the zero-orphans invariant at the signal path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_to_the_daemon_leaves_no_browser_process() {
+    let _guard = SIGNAL_TEST_GUARD.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let baseline = SIGNAL_WAITERS_ARMED.load(std::sync::atomic::Ordering::SeqCst);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let dir2 = dir.path().to_path_buf();
+    let daemon =
+        tokio::task::spawn(async move { serve_impl(0, dir2, None, Some(ready_tx), None).await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx)
+        .await
+        .expect("serve must reach the startup line")
+        .expect("ready signal");
+    wait_for_armed_signal_waiters(baseline + 1).await;
+    let supervisor = FORCE_KILL_SUPERVISOR
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .expect("serve registers its supervisor for the force path");
+    let child = spawn_browser_owned_sleeper(&supervisor);
+    // The test must not keep the supervisor alive: production hold-outs are
+    // the shutdown bug under test, and a leaked Arc here would mask Drop.
+    drop(supervisor);
+    send_self_signal(libc::SIGTERM);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+        .await
+        .expect("SIGTERM must trigger the bounded drain")
+        .expect("the serve task must not panic");
+    assert!(
+        result.is_ok(),
+        "the drained daemon returns cleanly: {result:?}"
+    );
+    wait_until_gone(child.pid).await;
+}
+
+/// The FORCE-exit path (`process::exit`) runs no destructors, so it must
+/// kill browser children through the supervisor BEFORE exiting. The test
+/// probe replaces the exit; the browser-owned child must already be gone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_exit_kills_browser_children_before_process_exit() {
+    let _guard = SIGNAL_TEST_GUARD.lock().await;
+    let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+    *FORCE_EXIT_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe_tx);
+    let supervisor = faktor_terminal::ProcessSupervisor::try_shared().unwrap();
+    *FORCE_KILL_SUPERVISOR
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(std::sync::Arc::downgrade(&supervisor));
+    let child = spawn_browser_owned_sleeper(&supervisor);
+    on_force_signal("SIGTERM").await;
+    assert_eq!(probe_rx.await.unwrap(), FORCE_EXIT_CODE);
+    wait_until_gone(child.pid).await;
+}
+
 /// Serve startup queue recovery: a durable pending queue head left by a
 /// killed process (active turn already aborted, no live runner anywhere)
 /// is claimed by EXACTLY ONE runner as part of the serve startup

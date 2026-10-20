@@ -163,6 +163,7 @@ function resolvePath(template, session) {
     if (name === 'operation') return 'absent-operation';
     if (name === 'handle') return 'absent-handle';
     if (name === 'scope_key') return 'absent-scope';
+    if (name === 'worktree_id' || name === 'version') return '1';
     return 'absent';
   });
 }

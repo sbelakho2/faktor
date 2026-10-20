@@ -1,0 +1,1 @@
+{"count":1,"observations":[{"browserSessionId":"browser-session-4d12148d1eaabb5af12abb9f","capturedMs":1792489283429,"id":31,"kind":"download","payload":{"blocked":true,"detail":"download blocked by policy: http://127.0.0.1:18080/download","error":"download_blocked","filename":"download","policy":"default_deny","url":"http://127.0.0.1:18080/download"},"severity":"error"}]}

@@ -938,7 +938,7 @@ impl WorktreeManager {
             .canonicalize()
             .map_err(|e| Error::not_found(format!("repository {}: {e}", repo.display())))?;
         let lock = self.lock_for(&repo);
-        let local = lock.write_owned().await;
+        let local = crate::guard::write_owned_bounded(lock, budget, &repo).await?;
         // UNLOCKED: the caller already holds this repository's write lock,
         // so a read-locked helper here would self-deadlock.
         let out = self

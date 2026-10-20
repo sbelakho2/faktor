@@ -1,0 +1,107 @@
+{
+  "scenario": "framing",
+  "frames": [
+    {
+      "id": 1,
+      "jsonrpc": "2.0",
+      "result": {
+        "agentCapabilities": {
+          "loadSession": false,
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": false,
+            "image": false
+          }
+        },
+        "authMethods": [],
+        "extensions": [
+          "faktor.terminal"
+        ],
+        "protocolVersion": 1
+      }
+    },
+    {
+      "id": 2,
+      "jsonrpc": "2.0",
+      "result": {
+        "sessionId": "4"
+      }
+    },
+    {
+      "error": {
+        "code": -32700,
+        "message": "Parse error"
+      },
+      "id": null,
+      "jsonrpc": "2.0"
+    }
+  ],
+  "stderrTail": "\u001b[2m2026-10-20T09:45:53.452068Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mgoogle \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mgemini-2.0-flash \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgemini@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:45:53.452070Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mgoogle \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mgemini-2.5-flash \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgemini@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:45:53.452071Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mdeepseek \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mdeepseek-chat \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgeneric_estimator@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:45:53.452072Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mollama \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mdefault \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgeneric_estimator@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:45:53.452074Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mollama \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mqwen3.8:latest \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mllama@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:45:53.602471Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m ollama: probed 1 model(s) from live discovery\n\u001b[2m2026-10-20T09:45:53.684501Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mfaktor_acp\u001b[0m\u001b[2m:\u001b[0m acp: frame-level parse error \u001b[3merror\u001b[0m\u001b[2m=\u001b[0minvalid Content-Length: \"nope\" \u001b[3mfatal\u001b[0m\u001b[2m=\u001b[0mtrue\n",
+  "initialize": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "agentCapabilities": {
+        "loadSession": false,
+        "promptCapabilities": {
+          "audio": false,
+          "embeddedContext": false,
+          "image": false
+        }
+      },
+      "authMethods": [],
+      "extensions": [
+        "faktor.terminal"
+      ],
+      "protocolVersion": 1
+    }
+  },
+  "sessionNew": {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "result": {
+      "sessionId": "4"
+    }
+  },
+  "sessionId": "4",
+  "afterMalformed": {
+    "alive": false,
+    "frames": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "loadSession": false,
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            }
+          },
+          "authMethods": [],
+          "extensions": [
+            "faktor.terminal"
+          ],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "4"
+        }
+      },
+      {
+        "error": {
+          "code": -32700,
+          "message": "Parse error"
+        },
+        "id": null,
+        "jsonrpc": "2.0"
+      }
+    ]
+  },
+  "error": "Error: timeout waiting bad version frames=[{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"audio\":false,\"embeddedContext\":false,\"image\":false}},\"authMethods\":[],\"extensions\":[\"faktor.terminal\"],\"protocolVersion\":1}},{\"id\":2,\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"4\"}},{\"error\":{\"code\":-32700,\"message\":\"Parse error\"},\"id\":null,\"jsonrpc\":\"2.0\"}]"
+}

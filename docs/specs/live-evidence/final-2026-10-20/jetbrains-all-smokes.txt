@@ -1,0 +1,579 @@
+> Task :backend:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :shared:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :shared:compileKotlin UP-TO-DATE
+> Task :shared:compileJava NO-SOURCE
+> Task :shared:processResources NO-SOURCE
+> Task :shared:classes UP-TO-DATE
+> Task :shared:jar UP-TO-DATE
+> Task :backend:compileKotlin UP-TO-DATE
+> Task :backend:compileJava NO-SOURCE
+> Task :backend:processResources NO-SOURCE
+> Task :backend:classes UP-TO-DATE
+> Task :backend:jar UP-TO-DATE
+> Task :backend:compileTestKotlin UP-TO-DATE
+> Task :backend:compileTestJava NO-SOURCE
+> Task :backend:processTestResources NO-SOURCE
+> Task :backend:testClasses UP-TO-DATE
+
+> Task :backend:smokeBackend
+  daemon resolution: machine-scoped only; workspace target/ is never an input
+  daemon trust: checksum records verify, mismatches refuse before spawn
+  command drain: 4 MiB concurrent emit finished, retained 65536 bytes, truncated=true
+  command drain: quiet stall exited 0 without a timeout
+  command drain: timeout killed+reaped pid 45742 in 4008ms (host control 60ms, ceiling 15000ms)
+PASS all unit assertions
+PASS unit assertions
+[2m2026-10-20T11:06:29.803290Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:06:29.810790Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694/store/backups/faktor-plus.db.pre-migration-v0-1792494389809-45876-0.db [3mfrom_version[0m[2m=[0m0
+[2m2026-10-20T11:06:29.820760Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama prefetch failed (conservative defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:06:29.821266Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:06:29.821757Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:06:29.900406Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900421Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900433Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900436Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900439Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900443Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900446Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900448Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900451Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900454Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.900456Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdefault [3mmodel[0m[2m=[0mdefault [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:29.973404Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up failed (defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:06:29.973774Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:06:29.974610Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:62431
+  port=62431 pid=45876
+PASS start daemon (startup line + port)
+PASS native health (GET /native/health)
+PASS native readiness (GET /native/ready)
+PASS create session (POST /native/session)
+PASS prompt (POST /native/session/{id}/prompt)
+[2m2026-10-20T11:06:31.264063Z[0m [32m INFO[0m [2mfaktor_agent::runtime::contract_compiler[0m[2m:[0m baseline engineering contract compiled from intent + repository state [3msession[0m[2m=[0m1 [3mtask_id[0m[2m=[0m1 [3mobligations[0m[2m=[0m0 [3mconstraints[0m[2m=[0m0 [3minvariants[0m[2m=[0m0 [3mrisks[0m[2m=[0m2 [3muncertainties[0m[2m=[0m2 [3mbuild_systems[0m[2m=[0m [3macquisition[0m[2m=[0m"complete" [3mrepository[0m[2m=[0mrepo2:5ef953d13bcee26cdb62b843acd202f9baf63ca0331abf07334809d5faa31ad2
+[2m2026-10-20T11:06:31.268324Z[0m [32m INFO[0m [2mfaktor_agent::runtime::retrieval[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:06:31.294044Z[0m [32m INFO[0m [2mfaktor_index::service[0m[2m:[0m index generation published [3mworkspace[0m[2m=[0m1 [3mgeneration[0m[2m=[0m1
+[2m2026-10-20T11:06:31.300975Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m automatic backup written to /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-smoke-10934699508339189694/backups/faktor-plus-1792494391261.db
+root verification unavailable for orchestrated run tx-session-1: a no-op root carries no acceptance criterion to prove; no reviewer proof is possible; run stays unverified
+  state=failed_recoverable
+PASS session state settles (ready_for_next_turn | failed_*)
+  messages=1
+PASS list messages (GET /native/messages)
+[2m2026-10-20T11:06:31.470909Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:06:31.471153Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:06:31.471224Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m runtime index worker: stopped (bounded graceful join) [3melapsed_ms[0m[2m=[0m0
+PASS stop daemon
+  releasePid=46047 launcherPid=46042
+PASS launcher exits early: release pid tracked, launcher exit is not death
+PASS launcher handshake pid line names the RELEASE without a probe
+PASS launcher exits early: RELEASE death is detected once the launcher is gone
+PASS stop terminates the RELEASE, not just a resident launcher
+PASS mismatched handshake digest refuses the announced pid, never signals it
+PASS absent health digest refuses the announcement, never signals the release
+PASS probe disagreement refuses the announced pid; the probed release wins
+PASS liveness falls back to health when no release pid is resolved
+PASS recycled resolved pid: a dead daemon refuses to signal the cached pid
+SMOKE PASS
+
+> Task :backend:smokeNativeBridge
+  body deadline: JSON dribble -> timeout after 905ms
+  body deadline: raw bytes dribble -> timeout after 904ms
+  body deadline: header-only stall -> timeout
+  sse heartbeat: hostile id 99 ignored, cursor stayed 2
+  sse blocked: blk-json -> MALFORMED_FRAME at cursor 0, requests=1, events=0
+  sse blocked: blk-disc -> DISCRIMINATOR_MISMATCH at cursor 0, requests=1, events=0
+  sse blocked: blk-cursor -> IMPOSSIBLE_CURSOR at cursor 0, requests=1, events=0
+  sse blocked: blk-version -> UNSUPPORTED_VERSION at cursor 0, requests=1, events=0
+  sse blocked: blk-journal -> JOURNAL_UNREADABLE at cursor 0, requests=1, events=0
+  sse blocked: blk-big -> OVERSIZED_FRAME at cursor 0, requests=1, events=0
+  sse blocked: non-retryable 404 -> STREAM_REJECTED, requests=1
+  json depth: 5000 nested arrays -> typed refusal
+  sse blocked: explicit recoverFrom(cursor=5) resumed and delivered id 6
+PASS all native client unit assertions
+PASS native protocol unit assertions
+[2m2026-10-20T11:06:47.668295Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:06:47.673898Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643/store/backups/faktor-plus.db.pre-migration-v0-1792494407673-46562-0.db [3mfrom_version[0m[2m=[0m0
+[2m2026-10-20T11:06:47.682795Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama prefetch failed (conservative defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:06:47.683073Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:06:47.683449Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:06:47.768098Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768133Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768138Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768142Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768146Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768149Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768154Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768157Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768160Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768170Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.768173Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdefault [3mmodel[0m[2m=[0mdefault [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:06:47.855541Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:06:47.855642Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up failed (defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:06:47.856184Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:62563
+  port=62563 pid=46562
+PASS start daemon (startup line + port)
+  version=0.1.0
+PASS native health via bearer auth
+PASS native readiness
+  session=1
+PASS create native session (POST /native/session)
+PASS open SSE journal stream (cursor 0)
+  op=1879566616021172224 queued=false
+PASS prompt (POST /native/session/{id}/prompt)
+[2m2026-10-20T11:06:49.015325Z[0m [32m INFO[0m [2mfaktor_agent::runtime::contract_compiler[0m[2m:[0m baseline engineering contract compiled from intent + repository state [3msession[0m[2m=[0m1 [3mtask_id[0m[2m=[0m1 [3mobligations[0m[2m=[0m0 [3mconstraints[0m[2m=[0m0 [3minvariants[0m[2m=[0m0 [3mrisks[0m[2m=[0m2 [3muncertainties[0m[2m=[0m2 [3mbuild_systems[0m[2m=[0m [3macquisition[0m[2m=[0m"complete" [3mrepository[0m[2m=[0mrepo2:5ef953d13bcee26cdb62b843acd202f9baf63ca0331abf07334809d5faa31ad2
+[2m2026-10-20T11:06:49.018576Z[0m [32m INFO[0m [2mfaktor_agent::runtime::retrieval[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:06:49.049901Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m automatic backup written to /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-native-smoke-16460623293269065643/backups/faktor-plus-1792494409010.db
+[2m2026-10-20T11:06:49.056979Z[0m [32m INFO[0m [2mfaktor_index::service[0m[2m:[0m index generation published [3mworkspace[0m[2m=[0m1 [3mgeneration[0m[2m=[0m1
+root verification unavailable for orchestrated run tx-session-1: a no-op root carries no acceptance criterion to prove; no reviewer proof is possible; run stays unverified
+  machine=failed_recoverable
+PASS projection settles (ready | failed_*)
+PASS messages page carries the prompt
+  frames=4 cursor=4
+PASS SSE delivered frames and advanced the cursor
+PASS journal event page (cursor twin)
+  runs=1
+PASS task-run listing (GET task-runs)
+  attachment=87da8eea1705... size=4
+PASS binary attachment upload (image parity)
+  agents=1
+PASS agent listing (GET native agents)
+  sessions=1 durableTokens=0
+PASS global usage (GET /native/usage)
+PASS session usage (GET session usage)
+  owed=0 failed=1
+PASS verification view
+  tasks=0
+PASS task views (GET session tasks)
+PASS evidence access is typed (404 unknown / 503 unwired)
+[2m2026-10-20T11:06:49.238073Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:06:49.371223Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:06:49.371262Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m runtime index worker: stopped (bounded graceful join) [3melapsed_ms[0m[2m=[0m0
+PASS stop daemon
+NATIVE SMOKE PASS
+
+> Task :backend:smoke
+> Task :frontend:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :frontend:compileKotlin UP-TO-DATE
+> Task :frontend:compileJava NO-SOURCE
+> Task :frontend:initializeIntellijPlatformPlugin
+> Task :frontend:patchPluginXml UP-TO-DATE
+> Task :frontend:processResources UP-TO-DATE
+> Task :frontend:classes UP-TO-DATE
+> Task :frontend:generateManifest UP-TO-DATE
+> Task :frontend:jar UP-TO-DATE
+> Task :frontend:compileTestKotlin UP-TO-DATE
+> Task :frontend:compileTestJava NO-SOURCE
+> Task :frontend:processTestResources UP-TO-DATE
+> Task :frontend:testClasses UP-TO-DATE
+
+> Task :frontend:smokeAcceptance
+jetbrains acceptance probe: overlays written for 40 scenarios -> target/certification/edition5/acceptance-jetbrains.overlays.json
+
+> Task :frontend:smokeControlExercise
+EDITION5 CONTROL EXERCISE: screens=32/32 controls=200/200 staged=162 patchKeys=162 applies=1 screenControls=2953 httpCalls=57
+
+> Task :frontend:smokeControlPlaneCredential
+PASS store writes ONE PasswordSafe row keyed by endpoint+organization
+PASS resolve returns null without a scope or a matching row
+PASS endpoint and organization are separate rows; delete is exact
+PASS Settings panel writes through the credential store and clears the token field
+PASS panel sign-in stores in the vault, persists scope + session, sign-out removes the row
+PASS an external PasswordSafe change reaches the client; removal clears the old token
+PASS production construction path supplies the vault token to the client
+  fake control-plane daemon on 63348
+PASS sign-out compare-and-delete: a rotation during the in-flight revoke keeps the NEW credential
+[2m2026-10-20T11:08:19.905078Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:08:19.917874Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793/store/backups/faktor-plus.db.pre-migration-v0-1792494499916-53492-0.db [3mfrom_version[0m[2m=[0m0
+[2m2026-10-20T11:08:19.934172Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:08:19.934788Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:08:20.072059Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072094Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072110Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072116Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072120Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072124Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072129Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072134Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072138Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.072142Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:08:20.193443Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:08:20.194228Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:63353
+[2m2026-10-20T11:08:20.210909Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:08:20.211150Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:08:20.519873Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m automatic backup written to /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-credential-daemon-16818945337512587793/backups/faktor-plus-1792494500496.db
+PASS panel sign-out hits /native/sso/logout on the real daemon and clears the credential
+CONTROL PLANE CREDENTIAL SMOKE PASS
+
+> Task :frontend:smokeEdition8Acceptance
+EDITION8 ACCEPTANCE: scenarios=40/40 host=jetbrains overlays=40
+
+> Task :frontend:smokeEdition8ControlExercise
+EDITION8 CONTROL EXERCISE: screens=72/72 controls=200/200 activated=200/200 runs=405 applies=57 typedRefusals=3 missingContracts=0 edges=405 edtHttp=0 maxEdtMs=6.0
+
+> Task :frontend:smokeEdition8DaemonDogfood
+EDITION8 JB DOGFOOD SKIPPED: no FAKTOR_E8_BASE_URL/TOKEN
+
+> Task :frontend:smokeEdition8Evidence
+EDITION8 EVIDENCE: a11y=200/200 optical=3 themes contrastPairs=81
+
+> Task :frontend:smokeEdition8LiveAcceptance
+EDITION8 LIVE ACCEPTANCE SKIPPED: no FAKTOR_E8_BASE_URL/TOKEN
+
+> Task :frontend:smokeEdition8Workflow
+EDITION8 WORKFLOWS: workflows=16 cells=80/80 passed=80
+
+> Task :frontend:smokeEdtWork
+EDT HARNESS PASS (headless, 10k tokens / 200 deltas/s / 500 messages / 1k rows)
+before: 10000 EDT tasks, 10000 doc inserts, 10000 refresh triggers (per delta)
+after:  1250 EDT flushes, 1250 doc inserts, 200 slow refreshes (250ms cadence); burst 40 tasks x <=256; 500-message tx 1 insert; 1k-row no-op 0 events; pump 200/s -> 22 flushes
+stream.before.edtTasks=10000
+stream.before.docInserts=10000
+stream.before.refreshTriggers=10000
+stream.after.edtFlushes=1250
+stream.after.docInserts=1250
+stream.after.refreshTriggers=1250
+stream.after.slowRefreshes=200
+stream.after.coalescingFactor=8.0x
+burst.edtTasks=40
+burst.maxBatch=256
+burst.offered=10000
+queue.boundedWindow=100 of 150, order preserved
+pump.burstFrames=10000
+pump.burstFlushes=40
+pump.burstMaxBatch=256
+pump.burstDropped=0
+transcript.before.docInserts=500
+transcript.after.docInserts=1
+table.before.resetEvents=1001
+table.after.noopEvents=0
+table.after.oneRowEvents=1
+queue.concurrent=2000 items, no loss
+history.noopEvents=0
+history.oneRowEvents=1
+scale.messages=100000
+scale.pages=500
+scale.pageMs=3581
+scale.maxDocumentChars=231942
+scale.newestRetained=message-99999
+scale.concurrentSessions=16
+scale.concurrentDeltas=16000
+scale.concurrentMs=6
+scale.historySessions=2000
+scale.historyNoopEvents=0
+scale.historyOneRowEvents=1
+scale.historyMs=0
+money.firstMisses=1000
+money.secondHits=1000
+money.entries=1000
+scroll.transitions=detach/follow/resume/jump OK
+pump.offered=200
+pump.edtFlushes=22
+pump.coalescingFactor=9.1x
+panel.replayDuplicatesDropped=5
+panel.offered=10000
+panel.edtFlushes=40
+panel.transcriptInserts=0
+
+
+> Task :frontend:smokeFrontend
+PASS I03 rows derive only served relationships (path + kind + attached refs)
+PASS I03 basis resolution follows the exact order a -> b -> c
+PASS I03 adapter seam opens the served bytes exactly (unicode + truncated header)
+PASS I03 large bounded artifact opens byte-exact
+PASS I03 invalid/unknown/foreign evidence refused typed and nothing opens
+PASS I03 no workspace file path is ever opened (adapter seam)
+PASS I03 diff-unavailable state carries the exact copy; no apply/rebase control
+PASS I03 previous/next are bounded and selection survives refreshes
+PASS I03 recheck re-derives conflict facts (no rebase control)
+PASS I07 parse validity: additive fields ignored, malformed typed, exact money
+PASS I07 exact metric names + Successful-Run Cost vs VCSC + local cohorts stay distinct
+PASS I07 empty verified denominator uses the exact copy; zero avoided is not measured
+PASS I07 truncation is shown explicitly and big money renders exactly
+PASS I07 read failure is the T29 state with no monetary value and View details
+PASS I07 paging is bounded newest-first and reports exhaustion
+PASS I07 typed entitlement refusals render with the value-entitlements status line
+PASS I08 apply validates first and persists valid values exactly once
+PASS I08 invalid input raises a typed refusal and writes nothing
+PASS I08 reset restores defaults and keeps the PasswordSafe credential
+PASS I08 the credential never appears in any settings value
+PASS I08 endpoint default stays empty (no vendor substitution)
+PASS capability matrix: every panel action reaches its service symbol
+PASS capability matrix: every contributed platform extension has its handler class
+PASS capability matrix: control-plane coordinates use the shared application store
+PASS canned native parsing: blocker/progress/result/capabilities
+PASS canned native parsing: task view additive fields
+PASS canned native parsing: index coverage names partial state honestly
+PASS canned native parsing: verification criteria/check summaries
+PASS canned native parsing: tournament + tournament start receipt
+PASS tournament panel gates decide on all candidates settled
+PASS canned native parsing: provider/reasoning catalog join + permissions
+PASS attachment limits: advertised contract consumed, emergency ceiling from the shared fixture
+PASS permission reply: typed 409 refusals classify and render explicitly
+PASS approval renderer: authority reason only when present, exact fallback + payload
+PASS approval gating: one reply per request id, refusal keeps the card, rebuild keeps pending
+PASS approval announcement: once per new request, no focus jump
+PASS utilities toolbar wraps at 240px with no horizontal scrollbar
+PASS I06: opening the tool window never starts the daemon implicitly
+PASS diagnostics: trust wording, readiness and T27/T28 copy pins
+PASS diagnostics setup: T32 copy + exact sandbox guidance command
+PASS T22: served SCM-not-configured PR block surfaces the exact copy
+PASS run-state copy: T06-T26 exact labels render only under their served conditions
+PASS history unavailable renders the T31 copy with its refresh action
+PASS attachments ride the task-run/tournament requests
+PASS engineering contract decodes additively and rides task starts
+PASS attachment reads are canonicalized and symlink escapes refuse
+PASS attachment retrieval: 7 MiB HTTP contract bound; blob metadata 404/1/409
+PASS completion contract: strict request, strict parse, durable provenance
+PASS Task-mode contract controls are checked only in the Work composer
+PASS canned native parsing: durable board page + post + request body
+PASS board panel records availability truthfully and gates the composer
+PASS display bounds strip invisible controls and never split surrogate pairs
+PASS evidence ref parsing mirrors the cockpit vocabulary
+PASS pixel identity is deterministic and every state animates
+PASS task tree model surfaces every section from mock payloads
+PASS acceptance-criterion proof rows render every wire-served fact
+PASS a missing verification payload degrades every criterion to unavailable, never pass
+PASS verification summary renders VERIFIED only under the strict verified proof
+PASS verification panel keeps every served evidence ref as its own button
+PASS overview keeps proof, spend and completed states honest
+PASS task tree spend and child rows keep missing values missing
+PASS same model two providers: each child joins its OWN provider metadata
+PASS strict proof summary renders VERIFIED only from the daemon verdict
+PASS commercial metering parses: usage fold, entitlements, identity
+PASS usage panel renders populated aggregates, credits and exact limits
+PASS billing_disabled renders "billing disabled locally", never zeros
+PASS expired subscription banner and quota-exceeded limit naming
+PASS grant-credits affordance and cursor controls are role- and cursor-gated
+PASS malformed billing payloads are loud protocol violations
+PASS money is exact: string forms, unsafe-number refusal, display, aggregation
+PASS every new UI section is constructible from the mock payload
+PASS pending attachment retry retains the full reference and only uploads absent entries
+PASS path attachment identity is kind+mime+filename+size+byte digest, never path or mtime
+PASS paste shortcut binds the platform menu-shortcut mask
+PASS clipboard image: BufferedImage converts to bounded in-memory PNG (never a file)
+PASS attachment plan: documents upload when advertised, source files stay workspace-relative
+PASS compact area typography follows the IDE font; monospace is opt-in
+PASS blockers panel: each item carries its own inline controls, no shared bar
+PASS terminal composer: spaces stay inside one argv element; shell mode is explicit
+PASS task tree update preserves expansion, selection and detail by stable node ids
+PASS evidence navigator session reset clears message rows and every per-session atom
+PASS board panel pages older posts through a bounded Load older control
+PASS Work is the default cluster and the composer is one plane at 240px
+PASS Task options sheet: bounded scrollable surface, trigger and Back preserve the draft
+[2m2026-10-20T11:09:34.495627Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:09:34.522111Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421/store/backups/faktor-plus.db.pre-migration-v0-1792494574520-61731-0.db [3mfrom_version[0m[2m=[0m0
+[2m2026-10-20T11:09:34.544217Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama prefetch failed (conservative defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:09:34.546493Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:09:34.549222Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:09:34.720365Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720401Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720408Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720413Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720417Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720423Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720427Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720430Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720448Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720451Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.720455Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdefault [3mmodel[0m[2m=[0mdefault [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:09:34.857906Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up failed (defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:09:34.861025Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:09:34.865599Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:63437
+  port=63437 pid=61731
+PASS start daemon for frontend smoke
+PASS native health + readiness
+PASS real: /models advertises the attachment contract the client consumes
+PASS create session
+  run=tx-1a159009bbb00000 state=Running
+PASS task-run accepts the planned workspace-relative `files` (real daemon)
+[2m2026-10-20T11:09:34.929364Z[0m [32m INFO[0m [2mfaktor_agent::runtime::contract_compiler[0m[2m:[0m baseline engineering contract compiled from intent + repository state [3msession[0m[2m=[0m1 [3mtask_id[0m[2m=[0m1 [3mobligations[0m[2m=[0m0 [3mconstraints[0m[2m=[0m0 [3minvariants[0m[2m=[0m0 [3mrisks[0m[2m=[0m2 [3muncertainties[0m[2m=[0m2 [3mbuild_systems[0m[2m=[0m [3macquisition[0m[2m=[0m"complete" [3mrepository[0m[2m=[0mrepo2:bdb78d3e11480ca8db04a85d7035dae28e5d8c1d14c738312af7b6fd92bebde8
+[2m2026-10-20T11:09:34.941833Z[0m [32m INFO[0m [2mfaktor_agent::runtime::retrieval[0m[2m:[0m repository IndexService hosted
+  ref=1 digest=efee7a09658e...
+PASS binary attachment upload keeps ref_id and serves ref-addressed metadata/bytes
+  pending permissions=0
+PASS permission list is served (reply route reachable)
+PASS unknown permission id is a typed 409 conflict (never a blind retry)
+PASS unknown tournament is a typed 404
+  tournaments=0
+[2m2026-10-20T11:09:34.958108Z[0m [32m INFO[0m [2mfaktor_index::service[0m[2m:[0m index generation published [3mworkspace[0m[2m=[0m1 [3mgeneration[0m[2m=[0m1
+PASS tournament listing + decide/abort are typed
+root verification unavailable for orchestrated run tx-session-1: a no-op root carries no acceptance criterion to prove; no reviewer proof is possible; run stays unverified
+  board rev=0 posts=0
+PASS board GET/POST round-trips on the real daemon
+PASS hostile board post is a typed 4xx (never a silent write)
+PASS presentation transition on an unknown child is a typed 404
+PASS orchestrator graph is typed (graph | 404 | 409)
+PASS evidence access stays typed (404 unknown / 503 unwired)
+  outcomes runs=0 verified=0 truncated=false
+PASS outcomes ledger reads with strict bounds (bounds never fabricated)
+[2m2026-10-20T11:09:34.978437Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:09:34.979463Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:09:34.979645Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m runtime index worker: stopped (bounded graceful join) [3melapsed_ms[0m[2m=[0m0
+[2m2026-10-20T11:09:35.190760Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m automatic backup written to /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-frontend-smoke-6017242348319132421/backups/faktor-plus-1792494575168.db
+PASS stop daemon
+FRONTEND SMOKE PASS
+
+> Task :frontend:smokeHostMatrix
+JETBRAINS HOST MATRIX screenshots: apps/jetbrains/frontend/build/screenshots/task,task-options,task-tree,plan,overview,changes,verification,blockers,tournament,permissions,terminal,evidence,board,agents,diagnostics,context,checkpoints,usage,settings,history,conversations,outcomes,edition5-s01,edition5-s02,edition5-s03,edition5-s04,edition5-s05,edition5-s06,edition5-s07,edition5-s08,edition5-s09,edition5-s10,edition5-s11,edition5-s12,edition5-s13,edition5-s14,edition5-s15,edition5-s16,edition5-s17,edition5-s18,edition5-s19,edition5-s20,edition5-s21,edition5-s22,edition5-s23,edition5-s24,edition5-s25,edition5-s26,edition5-s27,edition5-s28,edition5-s29,edition5-s30,edition5-s31,edition5-s32-{240,320,480,800}.png + edition8-s01..s72-{240,320,480,800,hc,200}.png
+JETBRAINS HOST MATRIX: 1267/1267 checks passed against classpath-bundle; artifact target/certification/jetbrains-host-matrix.json
+JETBRAINS HOST MATRIX PASS
+
+> Task :frontend:smokeJetBrainsParity
+FAKTOR-OWNED TREE PASS: no vendored upstream UI corpus, panel sources present
+PASS tree: Faktor-owned repository root, no vendored upstream UI corpus
+PASS task mode: composer contract + strict request bodies
+PASS finish levels: four-level selector maps exactly to the completion contract
+PASS Task/Ask mode: Ask never attaches a contract, Task always does
+PASS Task options sheet: bounded, scrollable, draft-preserving, Escape never starts
+PASS run summary strip: Inspect opens Overview and missing values stay missing
+PASS inspect selector: one detail surface per tab, selection survives a refresh
+PASS agent tree: blockers, presentation, pixel identity
+PASS permissions: pending list, replies, unavailable state
+PASS terminal: rows, spawn body, events, output
+PASS review/tournament: review verdicts + decide gating
+PASS evidence navigation: refs, retrieval selector, transcript jump
+PASS settings: registry view + mutation modes
+PASS provider selection: per-provider model join
+PASS history: durable session list + open
+JETBRAINS PARITY MATRIX: 13 behavioral rows (13 passed), visual 8/8 panels (passed on macos), platforms linux=certified,macos=certified,windows=not_certified, artifact target/certification/jetbrains-parity.json @ d227d74c01058ca98dbf6f1e5645a35e1a206fee
+PASS fake daemon: panel end-to-end (task/agents/permissions/terminal/review/evidence/settings/history)
+PASS fake daemon: reconnect resumes the SSE cursor
+PASS task start single-flight: queued double click enqueues ONE request
+PASS task start single-flight: Enter + click race enqueues one start
+PASS task start single-flight: three rapid submits enqueue one start
+PASS task start submission id: lost response retry reuses the id, receipt and no second prompt
+PASS task start single-flight: success re-enables and the next start gets a new id
+PASS task start single-flight: typed refusal re-enables, keeps the draft and starts fresh next
+PASS task start single-flight: transport failure re-enables and keeps draft + attachments
+PASS task start immutability: edits while pending never reach the in-flight request
+PASS agent-control dialogs: input on the EDT, control on the worker, cancel is a no-op
+PASS prompt submission identity: identical retry reuses the id, edits mint new
+[2m2026-10-20T11:11:12.419348Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:11:12.440143Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741/store/backups/faktor-plus.db.pre-migration-v0-1792494672437-65508-0.db [3mfrom_version[0m[2m=[0m0
+[2m2026-10-20T11:11:12.460527Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama prefetch failed (conservative defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:11:12.462750Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:11:12.464878Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:11:12.618657Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618681Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618687Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618692Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618697Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618702Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618707Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618711Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618732Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618737Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.618741Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdefault [3mmodel[0m[2m=[0mdefault [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:12.752992Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up failed (defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:11:12.755668Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:11:12.760253Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:64420
+PASS real: start + create session
+PASS real: history lists the session
+PASS real: providers + models routes answer
+PASS real: task-run accepts goal/criteria/mutation mode
+PASS real: permissions route is served
+[2m2026-10-20T11:11:12.805909Z[0m [32m INFO[0m [2mfaktor_agent::runtime::contract_compiler[0m[2m:[0m baseline engineering contract compiled from intent + repository state [3msession[0m[2m=[0m1 [3mtask_id[0m[2m=[0m1 [3mobligations[0m[2m=[0m0 [3mconstraints[0m[2m=[0m0 [3minvariants[0m[2m=[0m0 [3mrisks[0m[2m=[0m2 [3muncertainties[0m[2m=[0m2 [3mbuild_systems[0m[2m=[0m [3macquisition[0m[2m=[0m"complete" [3mrepository[0m[2m=[0mrepo2:5ef953d13bcee26cdb62b843acd202f9baf63ca0331abf07334809d5faa31ad2
+[2m2026-10-20T11:11:12.817121Z[0m [32m INFO[0m [2mfaktor_agent::runtime::retrieval[0m[2m:[0m repository IndexService hosted
+PASS real: terminal spawn + session listing + events
+[2m2026-10-20T11:11:12.835259Z[0m [32m INFO[0m [2mfaktor_index::service[0m[2m:[0m index generation published [3mworkspace[0m[2m=[0m1 [3mgeneration[0m[2m=[0m1
+root verification unavailable for orchestrated run tx-session-1: the no-op reviewer verdict carried no admitted verification-opinion output; run stays unverified
+[2m2026-10-20T11:11:12.849649Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:11:13.086423Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m automatic backup written to /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741/backups/faktor-plus-1792494673063.db
+[2m2026-10-20T11:11:13.090656Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:11:13.090948Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m runtime index worker: stopped (bounded graceful join) [3melapsed_ms[0m[2m=[0m0
+[2m2026-10-20T11:11:15.869797Z[0m [33m WARN[0m [2mfaktor_cli::config::first_run[0m[2m:[0m sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+faktor sandbox: sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-parity-real-4236502128679111741` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+[2m2026-10-20T11:11:15.872719Z[0m [31mERROR[0m [2mfaktor_store::migration::legacy_import[0m[2m:[0m legacy verification fact skipped during the v22 import (row kept; typed note recorded) [3mfact_key[0m[2m=[0m"root:tx-session-1" [3mreason[0m[2m=[0mlegacy attempt key "root:tx-session-1" is not va:<task>:<op>
+[2m2026-10-20T11:11:15.874173Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama prefetch failed (conservative defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:11:15.874660Z[0m [32m INFO[0m [2mfaktor_index::service[0m[2m:[0m index temp-orphan sweep complete [3morigin[0m[2m=[0m"open" [3mworkspace[0m[2m=[0m0 [3mdirs[0m[2m=[0m1 [3mentries[0m[2m=[0m1 [3mremoved[0m[2m=[0m0 [3mkept[0m[2m=[0m1
+[2m2026-10-20T11:11:15.874691Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m repository IndexService hosted
+[2m2026-10-20T11:11:15.876917Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0) [3mlearnings[0m[2m=[0m0
+[2m2026-10-20T11:11:16.007146Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mopenai [3mmodel[0m[2m=[0mo4-mini [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007182Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007204Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-opus-4-1 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007220Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007225Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-4-5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007230Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-sonnet-4 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007234Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0manthropic [3mmodel[0m[2m=[0mclaude-haiku-3.5 [3mtokenizer[0m[2m=[0manthropic@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007238Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.0-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007242Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mgoogle [3mmodel[0m[2m=[0mgemini-2.5-flash [3mtokenizer[0m[2m=[0mgemini@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007245Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdeepseek [3mmodel[0m[2m=[0mdeepseek-chat [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.007249Z[0m [32m INFO[0m [2mfaktor_cli::daemon::builder[0m[2m:[0m token accounting uncertainty: conservative UpperBound estimates [3mprovider[0m[2m=[0mdefault [3mmodel[0m[2m=[0mdefault [3mtokenizer[0m[2m=[0mgeneric_estimator@v1 [3mcompatibility[0m[2m=[0m"upper_bound" [3mestimate_kind[0m[2m=[0m"upper_bound" [3muncertainty[0m[2m=[0m"upper_bound"
+[2m2026-10-20T11:11:16.137369Z[0m [33m WARN[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up failed (defaults stay): Provider { code: "egress", retryable: false }: egress to http://127.0.0.1:9/<redacted-path> denied: no allowlist rule matches (default-deny)
+[2m2026-10-20T11:11:16.137967Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor build: {"exe":"<repo>/target/release/faktor-cli","install_root":null,"release_digest":null,"release_id":null,"schema":"faktor-build-report/v1","self_digest_matches_release":null,"self_sha256":null,"version":"0.1.0"}
+[2m2026-10-20T11:11:16.138810Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m faktor serving on 127.0.0.1:64428
+PASS real: restart preserves the durable session and cursor
+PASS real: reconnect at the current cursor
+[2m2026-10-20T11:11:16.142429Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m shutdown signal received; draining the daemon [3msignal[0m[2m=[0m"SIGTERM"
+[2m2026-10-20T11:11:16.142782Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m native server: stopped (bounded graceful join)
+[2m2026-10-20T11:11:16.441523Z[0m [32m INFO[0m [2mfaktor_cli::daemon::wiring[0m[2m:[0m startup backup skipped: a backup newer than 3600s exists
+[2m2026-10-20T11:11:16.441631Z[0m [32m INFO[0m [2mfaktor_cli::daemon::serve[0m[2m:[0m ollama warm-up shutdown drain [3mjoined[0m[2m=[0m1 [3mdetached[0m[2m=[0m0
+PASS real daemon: history/task/permissions/terminal/restart/reconnect
+PASS visual certification policy: platform records are never inherited
+VISUAL PLATFORM COVERAGE: linux=certified, macos=certified, windows=not_certified
+PASS parity matrix: behavioral rows + visual render vs pinned baselines + artifact
+JETBRAINS PARITY SMOKE PASS
+
+> Task :frontend:smokeVisual
+JETBRAINS HOST MATRIX screenshots: apps/jetbrains/frontend/build/screenshots/task,task-options,task-tree,plan,overview,changes,verification,blockers,tournament,permissions,terminal,evidence,board,agents,diagnostics,context,checkpoints,usage,settings,history,conversations,outcomes,edition5-s01,edition5-s02,edition5-s03,edition5-s04,edition5-s05,edition5-s06,edition5-s07,edition5-s08,edition5-s09,edition5-s10,edition5-s11,edition5-s12,edition5-s13,edition5-s14,edition5-s15,edition5-s16,edition5-s17,edition5-s18,edition5-s19,edition5-s20,edition5-s21,edition5-s22,edition5-s23,edition5-s24,edition5-s25,edition5-s26,edition5-s27,edition5-s28,edition5-s29,edition5-s30,edition5-s31,edition5-s32-{240,320,480,800}.png + edition8-s01..s72-{240,320,480,800,hc,200}.png
+JETBRAINS HOST MATRIX: 1267/1267 checks passed against classpath-bundle; artifact target/certification/jetbrains-host-matrix.json
+JETBRAINS HOST MATRIX PASS
+
+> Task :frontend:smoke
+> Task :smoke
+> Task :frontend:instrumentCode
+> Task :frontend:instrumentedJar
+> Task :frontend:composedJar
+> Task :frontend:prepareSandbox
+> Task :frontend:buildSearchableOptions SKIPPED
+> Task :frontend:prepareJarSearchableOptions SKIPPED
+> Task :frontend:jarSearchableOptions SKIPPED
+> Task :frontend:buildPlugin
+> Task :frontend:extractPluginZip
+> Task :frontend:smokeHostMatrixZip
+JETBRAINS HOST MATRIX screenshots: apps/jetbrains/frontend/build/screenshots/task,task-options,task-tree,plan,overview,changes,verification,blockers,tournament,permissions,terminal,evidence,board,agents,diagnostics,context,checkpoints,usage,settings,history,conversations,outcomes,edition5-s01,edition5-s02,edition5-s03,edition5-s04,edition5-s05,edition5-s06,edition5-s07,edition5-s08,edition5-s09,edition5-s10,edition5-s11,edition5-s12,edition5-s13,edition5-s14,edition5-s15,edition5-s16,edition5-s17,edition5-s18,edition5-s19,edition5-s20,edition5-s21,edition5-s22,edition5-s23,edition5-s24,edition5-s25,edition5-s26,edition5-s27,edition5-s28,edition5-s29,edition5-s30,edition5-s31,edition5-s32-{240,320,480,800}.png + edition8-s01..s72-{240,320,480,800,hc,200}.png
+JETBRAINS HOST MATRIX: 1270/1270 checks passed against plugin-zip (faktor-0.1.0.zip sha256=7db6cb476e6092857a0baff20845d98ccc0190fbe33ceadccf5279f5dc2a9482); artifact target/certification/jetbrains-host-matrix.json
+JETBRAINS HOST MATRIX PASS
+
+BUILD SUCCESSFUL in 8m 8s
+36 actionable tasks: 24 executed, 12 up-to-date
+Consider enabling configuration cache to speed up this build: https://docs.gradle.org/9.7.1/userguide/configuration_cache_enabling.html

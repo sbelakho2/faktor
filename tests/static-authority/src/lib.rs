@@ -2798,6 +2798,13 @@ mod scans {
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
+                // A linked worktree stores `.git` as a regular FILE whose
+                // content names the main checkout path. That path may carry
+                // retired branding tokens; the pointer is VCS metadata, not
+                // delivered source, so it is excluded in both shapes.
+                if name == ".git" {
+                    continue;
+                }
                 if file_type.is_dir() {
                     if RETIRED_TOKEN_SKIP_DIRS.contains(&name.as_str()) {
                         continue;
@@ -6910,9 +6917,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // per-site SAFETY justification.
         ("crates/terminal/src/windows_tests.rs", 1),
         // The CLI's test-gated out-of-line modules (the module-decomposition
-        // move out of main.rs): the two libc::kill zero-signal probes.
+        // move out of main.rs): the libc::kill zero-signal probes (signal
+        // delivery plus the browser-orphan liveness check).
         ("crates/cli/src/main_acp_tests.rs", 1),
-        ("crates/cli/src/main_serve_tests.rs", 1),
+        ("crates/cli/src/main_serve_tests.rs", 2),
         // The CLI bin test target's attributed live-byte memory guard
         // (CI pipeline 48): the single file-level allow backs the
         // `GlobalAlloc` wrapper whose allocation-free `libc::write` report

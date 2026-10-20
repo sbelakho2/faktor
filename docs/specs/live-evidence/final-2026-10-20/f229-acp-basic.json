@@ -1,0 +1,59 @@
+{
+  "scenario": "basic",
+  "frames": [
+    {
+      "id": 1,
+      "jsonrpc": "2.0",
+      "result": {
+        "agentCapabilities": {
+          "loadSession": false,
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": false,
+            "image": false
+          }
+        },
+        "authMethods": [],
+        "extensions": [
+          "faktor.terminal"
+        ],
+        "protocolVersion": 1
+      }
+    },
+    {
+      "id": 2,
+      "jsonrpc": "2.0",
+      "result": {
+        "sessionId": "1"
+      }
+    }
+  ],
+  "stderrTail": "\u001b[2m2026-10-20T09:44:29.082589Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0manthropic \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mclaude-haiku-3.5 \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0manthropic@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.082591Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mgoogle \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mgemini-2.0-flash \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgemini@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.082593Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mgoogle \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mgemini-2.5-flash \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgemini@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.082594Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mdeepseek \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mdeepseek-chat \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgeneric_estimator@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.082596Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mollama \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mdefault \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mgeneric_estimator@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.082598Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::builder\u001b[0m\u001b[2m:\u001b[0m token accounting uncertainty: conservative UpperBound estimates \u001b[3mprovider\u001b[0m\u001b[2m=\u001b[0mollama \u001b[3mmodel\u001b[0m\u001b[2m=\u001b[0mqwen3.8:latest \u001b[3mtokenizer\u001b[0m\u001b[2m=\u001b[0mllama@v1 \u001b[3mcompatibility\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3mestimate_kind\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\" \u001b[3muncertainty\u001b[0m\u001b[2m=\u001b[0m\"upper_bound\"\n\u001b[2m2026-10-20T09:44:29.210099Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m ollama: probed 1 model(s) from live discovery\n",
+  "initialize": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "agentCapabilities": {
+        "loadSession": false,
+        "promptCapabilities": {
+          "audio": false,
+          "embeddedContext": false,
+          "image": false
+        }
+      },
+      "authMethods": [],
+      "extensions": [
+        "faktor.terminal"
+      ],
+      "protocolVersion": 1
+    }
+  },
+  "sessionNew": {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "result": {
+      "sessionId": "1"
+    }
+  },
+  "sessionId": "1"
+}

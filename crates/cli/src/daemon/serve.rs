@@ -619,6 +619,29 @@ pub(crate) const FORCE_EXIT_CODE: i32 = 130;
 pub(crate) static FORCE_EXIT_PROBE: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<i32>>> =
     std::sync::Mutex::new(None);
 
+/// Weak handle to the daemon's ONE process supervisor for the FORCE-exit
+/// path. `process::exit` runs no destructors, so the browser tree must be
+/// killed explicitly through its owner before the exit; a `Weak` keeps this
+/// hook from extending the supervisor's lifetime on the normal path.
+pub(crate) static FORCE_KILL_SUPERVISOR: std::sync::RwLock<
+    Option<std::sync::Weak<faktor_terminal::ProcessSupervisor>>,
+> = std::sync::RwLock::new(None);
+
+/// Reap browser-owned children through the daemon supervisor before a forced
+/// exit. Returns the number of children whose kill was attempted; a missing
+/// or already-dropped supervisor is an inert no-op (the normal drain's Drop
+/// is the authority on that path).
+fn kill_browser_children_for_force_exit() -> usize {
+    let supervisor = FORCE_KILL_SUPERVISOR
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(std::sync::Weak::upgrade));
+    match supervisor {
+        Some(supervisor) => supervisor.kill_all_browsers().len(),
+        None => 0,
+    }
+}
+
 /// Test-only marker: the FIRST shutdown signal was observed and the drain
 /// (plus the second-signal watchdog) is being entered. Lets the signal tests
 /// synchronize deterministically instead of sleeping.
@@ -675,9 +698,11 @@ pub(crate) async fn wait_for_shutdown_signal() -> &'static str {
 /// sends a second SIGTERM/SIGINT asks to stop NOW. The code is reported to
 /// the test probe when one is installed; production exits immediately.
 pub(crate) async fn on_force_signal(signal: &str) {
+    let browser_children = kill_browser_children_for_force_exit();
     tracing::error!(
         signal,
         code = FORCE_EXIT_CODE,
+        browser_children,
         "second shutdown signal during the drain; forcing exit"
     );
     #[cfg(test)]
@@ -1062,6 +1087,15 @@ pub(crate) async fn serve_impl(
         build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)
             .await
             .map_err(|e| format!("daemon build failed: {e}"))?;
+    // Register the ONE supervisor for the force-exit browser reap. The Weak
+    // cannot extend the daemon graph's lifetime; the normal drain still owns
+    // reaping through `BrowserManager::drop` / `ProcessSupervisor::drop`.
+    match FORCE_KILL_SUPERVISOR.write() {
+        Ok(mut guard) => *guard = Some(std::sync::Arc::downgrade(&graph.supervisor)),
+        Err(poisoned) => {
+            *poisoned.into_inner() = Some(std::sync::Arc::downgrade(&graph.supervisor));
+        }
+    }
     let session = graph.session.clone();
     let agent = graph.agent.clone();
     let store = session.store();

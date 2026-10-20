@@ -1,0 +1,52 @@
+[2m2026-10-20T10:21:04.041234Z[0m [32m INFO[0m [2mfaktor_store::migration[0m[2m:[0m store pre-migration restore point verified [3mrestore_point[0m[2m=[0m/tmp/faktor-final-verify/data-doctor/store/backups/faktor-plus.db.pre-migration-v0-1792491664040-24240-0.db [3mfrom_version[0m[2m=[0m0
+value entitlements: state=disabled enabled=false plans=0 (offline default: value features are denied typed; the local product is unaffected)
+sandbox shell execution (agent shell tool): OS-isolated shell (network_guarantee=required; spawn refused typed where no OS backend exists) (mode=os_isolated, network_guarantee=required)
+sandbox shell execution (interactive session terminals): network-capable shell GRANTED BY USER (app-level gates only; NOT equivalent to OS isolation and NOT a network guarantee) (mode=network_capable_user_granted, network_guarantee=none)
+sandbox first-run choice: decision=pending platform=macos network_backend=absent record=none
+sandbox first-run choice REQUIRED on platform 'macos' (no per-process network-isolation backend): agent shell and verification commands stay FAIL-CLOSED (the secure default) until an operator chooses explicitly.
+  (a) keep fail-closed (default, nothing to do): run `faktor sandbox choose --fail-closed --data-dir /tmp/faktor-final-verify/data-doctor` to record that decision.
+  (b) grant network-capable shells: run `faktor sandbox choose --network-capable-shell --data-dir /tmp/faktor-final-verify/data-doctor` after reading the trade-off:
+      network-capable shells (strictly weaker than the fail-closed default): agent shell and verification children inherit the daemon's network namespace — a permitted shell can open its own sockets and direct network access is possible; the app-level destination gate still applies, but no OS-level network isolation backs this grant
+sandbox agent home: policy=scratch scratch_root=/tmp/faktor-final-verify/data-doctor/agent-home
+sandbox credential dirs: honest limitation: no OS confinement backend on macos — the per-session scratch HOME keeps $HOME-relative credential discovery empty, but absolute-path reads are not OS-denied
+sandbox network isolation: backend=unavailable (typed platform boundary: no per-process network-isolation backend on macos; DenyAll and BrokerOnly spawns are refused typed, proxy flags are application configuration only) runtime_proof=unavailable
+browser network isolation: app-level proxy only (raw Chromium sockets are NOT OS-confined): platform macos has no OS-level BrokerOnly backend; the browser is proxy-only at the application level and BrokerOnly requests are refused typed
+tokenizers: certified 16 row(s) exact=6 upper_bound=10 unsupported=0
+tokenizer: openai gpt-4o tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-4o-mini tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai o3 tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai o4-mini tokenizer=generic_estimator@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: openai gpt-5 tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-5-mini tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: openai gpt-5-nano tokenizer=o200k_base@v1 compatibility=exact accounting=Exact estimate_kind=exact uncertainty=none
+tokenizer: anthropic claude-opus-4 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-opus-4-1 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-sonnet-4-5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-haiku-4-5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-sonnet-4 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: anthropic claude-haiku-3.5 tokenizer=anthropic@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: google gemini-2.0-flash tokenizer=gemini@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: google gemini-2.5-flash tokenizer=gemini@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+tokenizer: deepseek deepseek-chat tokenizer=generic_estimator@v1 compatibility=upper_bound accounting=Conservative estimate_kind=upper_bound uncertainty=upper_bound
+engineering-contract compiler: native baseline OK state=verified obligations=2 selectors_bound=true tokens=race,refresh,token determinism=byte_identical
+live-canary mouser: absent
+live-canary digikey: absent
+live-canary lcsc: absent
+live-canary 1688: absent
+live-canary alibaba: absent
+store: ok
+{
+  "events": 0,
+  "integrity": [],
+  "journal_mode": "wal",
+  "messages": 0,
+  "sessions": 0
+}
+unfinished tool runs across sessions: 0
+index embeddings: no persisted index generations
+outcomes: no completed runs recorded
+cloud-db: 1 local commercial database(s) (top-level and nested); LOCAL commercial deployment authority — hosted deployments must move identity/auth/billing/credits/audit/retention to a transactional service
+cloud-db store/faktor-plus.db: journal_mode=wal synchronous=unrecorded policy=unrecorded integrity=ok tables=45 rows=3 digest=26dddcd6b02ccb17
+cloud-db store/faktor-plus.db: no rotating backup
+cloud-db store/faktor-plus.db: migration restore point: none recorded
+doctor: all checks passed
