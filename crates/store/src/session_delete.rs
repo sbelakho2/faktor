@@ -127,25 +127,18 @@ impl Store {
                     )
                     .map_err(StoreError::from)?;
                 }
-                let tasks: Vec<i64> = {
-                    let mut stmt = tx
-                        .prepare("SELECT task_id FROM task WHERE session_id = ?1")
-                        .map_err(StoreError::from)?;
-                    let rows = stmt
-                        .query_map(params![sid], |r| r.get::<_, i64>(0))
-                        .map_err(StoreError::from)?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(StoreError::from)?
-                };
-                let mut proof_rows = 0_i64;
-                for task_id in &tasks {
-                    proof_rows += tx
-                        .execute(
-                            "DELETE FROM verification_record WHERE task_id = ?1",
-                            params![task_id],
-                        )
-                        .map_err(StoreError::from)? as i64;
-                }
+                // Verification records are SESSION-scoped (schema v43), never
+                // task-id-scoped: a numeric task id is not unique across
+                // sessions, so deleting "WHERE task_id = ?" could erase a
+                // DIFFERENT session's proof rows. Rows whose pre-v43 owner
+                // could not be proven stay inert (excluded from every scoped
+                // read) rather than being guessed into this purge.
+                let proof_rows = tx
+                    .execute(
+                        "DELETE FROM verification_record WHERE session_id = ?1",
+                        params![sid],
+                    )
+                    .map_err(StoreError::from)? as i64;
                 tx.execute(
                     "INSERT INTO session_deletion_purge(session_id, table_name, rows)
                      VALUES (?1, 'verification_record', ?2)",

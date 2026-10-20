@@ -55,6 +55,7 @@ pub(crate) fn passing_record(
 ) -> VerificationRecordRow {
     VerificationRecordRow {
         id: VerificationRecordId::new(1),
+        session_id: Some(task.session_id),
         task_id: task.task_id,
         revision: task.revision,
         workspace_id: ws,
@@ -1354,6 +1355,7 @@ fn model_outcome_stats_survive_reopen_and_fold_per_phase() {
             "ALTER TABLE cost_reservation DROP COLUMN execution_class",
             [],
         );
+        crate::drop_verification_scope_for_rewind(&conn);
         conn.execute("PRAGMA user_version = 18", []).unwrap();
     }
     let store = Store::open(dir.path().join("store"), true).unwrap();

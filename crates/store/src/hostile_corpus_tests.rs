@@ -438,6 +438,12 @@ fn store_torn_migration_cursor_never_half_migrates_silently() {
         let root = dir.path().join("torn");
         apply_prefix(&root, applied);
         let conn = rusqlite::Connection::open(root.join("faktor-plus.db")).unwrap();
+        if applied >= head {
+            // The fixture already carries the newest (v43) scope column; a
+            // rewind to its predecessor must remove it exactly like the real
+            // v43 file would not have it.
+            crate::drop_verification_scope_for_rewind(&conn);
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {}", applied - 1))
             .unwrap();
         drop(conn);

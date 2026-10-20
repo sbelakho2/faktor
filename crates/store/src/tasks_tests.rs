@@ -278,6 +278,7 @@ mod typed_ledger_tests {
     ) -> VerificationRecordRow {
         VerificationRecordRow {
             id: VerificationRecordId::new(1),
+            session_id: Some(task.session_id),
             task_id: task.task_id,
             revision: task.revision,
             workspace_id: ws,
@@ -454,14 +455,27 @@ mod typed_ledger_tests {
         let ws2 = store.create_workspace("/w2").unwrap();
         let s2 = store.create_session(ws2, "t2", "p", "m").unwrap();
         let task6 = seed_verifying(&store, s2.id, TaskId::new(1), vec!["c1".into()]);
-        let mut foreign = passing_record(&task6, ws, WorktreeId::new(1));
-        foreign.workspace_id = ws;
+        // The record is written VALIDLY against s2/ws2, then its workspace
+        // is corrupted behind the API: the scoped read must classify the
+        // caller-session/workspace disagreement as a typed scope conflict
+        // (never surface the row and never complete through it).
+        let foreign = passing_record(&task6, ws2, WorktreeId::new(1));
         let x_id = store.verification_record_put(&foreign).unwrap();
+        store
+            .raw_conn()
+            .execute(
+                "UPDATE verification_record SET workspace_id = ?1 WHERE id = ?2",
+                params![ws.raw() as i64, x_id.raw() as i64],
+            )
+            .unwrap();
         let r6 = store
             .task_complete_verified(s2.id, task6.task_id, task6.revision, x_id, now)
             .unwrap()
             .unwrap_err();
-        assert!(matches!(r6, TaskCompletionRefusal::WorktreeMismatch { .. }));
+        assert!(matches!(
+            r6,
+            TaskCompletionRefusal::RecordScopeMismatch { .. }
+        ));
 
         // Revision mismatch of the TASK (expected != actual) is reported
         // before the record is even consulted.
@@ -601,6 +615,7 @@ mod typed_ledger_tests {
             store
                 .verification_record_put(&VerificationRecordRow {
                     id: VerificationRecordId::new(1),
+                    session_id: Some(task.session_id),
                     task_id: task.task_id,
                     revision: task.revision,
                     workspace_id: ws,
@@ -637,7 +652,7 @@ mod typed_ledger_tests {
         assert_ne!(rec_a, rec_b, "fresh row ids");
         // Deterministic list order (creation order), stable across reads.
         let list = store
-            .verification_record_list_by_task(task.task_id)
+            .verification_record_list_by_task(s.id, task.task_id)
             .unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, rec_a);
@@ -646,17 +661,17 @@ mod typed_ledger_tests {
         assert_eq!(list[1].changed_files[0].size, 10);
         assert_eq!(list[1].reviewer.as_ref().unwrap()["verdict"], "pass");
         let again = store
-            .verification_record_list_by_task(task.task_id)
+            .verification_record_list_by_task(s.id, task.task_id)
             .unwrap();
         assert_eq!(again, list, "deterministic across reads");
         assert!(store
-            .verification_record_list_by_task(TaskId::new(404))
+            .verification_record_list_by_task(s.id, TaskId::new(404))
             .unwrap()
             .is_empty());
         // CAS finalize: exactly one Running -> Passed wins.
         assert_eq!(
             store
-                .verification_record_finalize(rec_a, VerificationStatus::Passed, 99)
+                .verification_record_finalize(s.id, rec_a, VerificationStatus::Passed, 99)
                 .unwrap(),
             Ok(())
         );
@@ -664,7 +679,7 @@ mod typed_ledger_tests {
         // CURRENT status (a second finalize can never rewind or re-run).
         assert_eq!(
             store
-                .verification_record_finalize(rec_a, VerificationStatus::Failed, 100)
+                .verification_record_finalize(s.id, rec_a, VerificationStatus::Failed, 100)
                 .unwrap(),
             Err(RecordFinalizeRefusal::NotRunning {
                 record_id: rec_a,
@@ -675,7 +690,7 @@ mod typed_ledger_tests {
         let rec_c = put(VerificationStatus::Pending);
         assert_eq!(
             store
-                .verification_record_finalize(rec_c, VerificationStatus::Passed, 101)
+                .verification_record_finalize(s.id, rec_c, VerificationStatus::Passed, 101)
                 .unwrap(),
             Err(RecordFinalizeRefusal::NotRunning {
                 record_id: rec_c,
@@ -686,6 +701,7 @@ mod typed_ledger_tests {
         assert_eq!(
             store
                 .verification_record_finalize(
+                    s.id,
                     VerificationRecordId::new(909),
                     VerificationStatus::Passed,
                     1
@@ -697,11 +713,11 @@ mod typed_ledger_tests {
         );
         // Only Passed/Failed may finalize; Unavailable is malformed.
         assert!(matches!(
-            store.verification_record_finalize(rec_c, VerificationStatus::Running, 1),
+            store.verification_record_finalize(s.id, rec_c, VerificationStatus::Running, 1),
             Err(StoreError::Malformed(_))
         ));
         // The finalized row read back with its completed_ms.
-        let row = store.verification_record_get(rec_a).unwrap().unwrap();
+        let row = store.verification_record_get(s.id, rec_a).unwrap().unwrap();
         assert_eq!(row.status, VerificationStatus::Passed);
         assert_eq!(row.completed_ms, Some(99));
     }
@@ -727,7 +743,7 @@ mod typed_ledger_tests {
         // The record survived and the task reads exactly as it crashed.
         assert_eq!(
             store
-                .verification_record_get(rec_id)
+                .verification_record_get(sid, rec_id)
                 .unwrap()
                 .unwrap()
                 .status,
@@ -1182,11 +1198,11 @@ mod scan_perf_tests {
             }
             let record = |task_id: i64, revision: i64, status: &str| {
                 tx.execute(
-                    "INSERT INTO verification_record(task_id, revision, workspace_id, worktree_id,
-                        criteria_json, checks_json, changed_files_json, unrelated_changes_json,
-                        status, started_ms)
-                     VALUES (?1, ?2, 1, 1, '[]', '[]', '[]', '[]', ?3, 1)",
-                    params![task_id, revision, format!("\"{status}\"")],
+                    "INSERT INTO verification_record(session_id, task_id, revision, workspace_id,
+                        worktree_id, criteria_json, checks_json, changed_files_json,
+                        unrelated_changes_json, status, started_ms)
+                     VALUES (?1, ?2, ?3, 1, 1, '[]', '[]', '[]', '[]', ?4, 1)",
+                    params![sid.raw() as i64, task_id, revision, format!("\"{status}\"")],
                 )
                 .unwrap();
             };

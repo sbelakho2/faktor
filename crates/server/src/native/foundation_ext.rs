@@ -3737,7 +3737,7 @@ pub(crate) async fn native_session_export(
         // per task; regrouped below in the original task order.
         let mut by_task: std::collections::HashMap<i64, Vec<(i64, String)>> =
             std::collections::HashMap::new();
-        if let Ok(records) = store.verification_record_head_by_tasks(&ids, 20) {
+        if let Ok(records) = store.verification_record_head_by_tasks(handle.id(), &ids, 20) {
             for (task_id, revision, status) in records {
                 by_task.entry(task_id).or_default().push((revision, status));
             }

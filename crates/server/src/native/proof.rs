@@ -343,7 +343,12 @@ pub(crate) async fn native_task_proof(
         Ok(r) => r,
         Err(e) => return api_err(&e),
     };
-    records.retain(|r| r.workspace_id == scoped.session_row.workspace_id);
+    // The manager read is session-scoped (schema v43); the explicit owner +
+    // workspace guard is defense in depth (a same-numeric-id task of another
+    // session, even in the same workspace, can never enter this projection).
+    records.retain(|r| {
+        r.session_id == handle.id() && r.workspace_id == scoped.session_row.workspace_id
+    });
     if records.len() > MAX_NATIVE_LIST {
         records.truncate(MAX_NATIVE_LIST);
     }
@@ -1254,7 +1259,9 @@ mod proof_tests;
 #[cfg(test)]
 mod totals_tests {
     use super::*;
-    use faktor_core::id::{TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId};
+    use faktor_core::id::{
+        SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
+    };
     use faktor_core::state::{
         CheckExecution, CriterionBinding, CriterionVerification, VerificationStatus,
     };
@@ -1262,6 +1269,7 @@ mod totals_tests {
     fn record(n: usize) -> VerificationRecord {
         VerificationRecord {
             record_id: VerificationRecordId::new(1),
+            session_id: SessionId::new(1),
             task_id: TaskId::new(1),
             revision: TaskRevision::new(1),
             workspace_id: WorkspaceId::new(1),

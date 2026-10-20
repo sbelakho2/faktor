@@ -319,12 +319,12 @@ pub(crate) async fn native_task_verification(
         Ok(r) => r,
         Err(e) => return api_err(&e),
     };
-    // Records certify a task revision inside the session's workspace; the
-    // workspace guard keeps same-numeric-id tasks of OTHER workspaces out of
-    // this session's view.
+    // Records are already session-scoped by the manager read (schema v43);
+    // the explicit owner/workspace guard is defense in depth so a future
+    // unscoped read can never leak another session's evidence here.
     let records: Vec<&faktor_session::VerificationRecord> = records
         .iter()
-        .filter(|r| r.workspace_id == row.workspace_id)
+        .filter(|r| r.session_id == handle.id() && r.workspace_id == row.workspace_id)
         .collect();
     // The typed criteria of the session's OWN task row are the only source
     // of a criterion's origin/requirement (the durable record stores the

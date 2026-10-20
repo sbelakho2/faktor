@@ -1164,11 +1164,12 @@ fn doctor_deep_flags_a_passed_record_for_a_missing_task() {
     {
         let m =
             SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
-        let _s = m
+        let s = m
             .create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
             .unwrap();
         let row = faktor_store::VerificationRecordRow {
             id: faktor_core::id::VerificationRecordId::new(1), // ignored
+            session_id: Some(s.id()),
             task_id: faktor_core::id::TaskId::new(777),
             revision: faktor_core::id::TaskRevision::new(1),
             workspace_id: faktor_core::id::WorkspaceId::new(1),
@@ -1229,6 +1230,7 @@ fn doctor_deep_flags_passed_record_certifying_an_uncompleted_task() {
         .unwrap();
         let row = faktor_store::VerificationRecordRow {
             id: faktor_core::id::VerificationRecordId::new(1), // ignored
+            session_id: Some(s.id()),
             task_id,
             revision: faktor_core::id::TaskRevision::new(1),
             workspace_id: ws,

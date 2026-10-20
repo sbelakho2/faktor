@@ -1244,6 +1244,49 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON memory_fact(session_id, updated_ms DESC, kind DESC, key DESC);
      CREATE INDEX IF NOT EXISTS idx_memory_fact_kind_updated
         ON memory_fact(session_id, kind, updated_ms DESC, key DESC);",
+    // v43 — session-scoped verification records (cross-session isolation
+    // residual; schema target 43; array index 42). `verification_record` was
+    // keyed by the NUMERIC task id only while task ids are session-scoped
+    // (`task` PK `(session_id, task_id)`): two standalone sessions of one
+    // workspace (both task id 1) could read each other's records and a
+    // matching passing record could satisfy the wrong session's completion.
+    // The ADDITIVE nullable `session_id` is the durable owner dimension.
+    //
+    // Backfill is PROOF-ONLY (never guessed): a pre-v43 row is assigned a
+    // session only when exactly ONE task row with its `task_id` belongs to a
+    // session whose workspace AND worktree equal the record's recorded
+    // identity. Ambiguous rows (two same-named tasks in one workspace), rows
+    // with no task relationship, and workspace/worktree disagreements stay
+    // SQL NULL: they are excluded from every scoped read and any attempt to
+    // read/finalize/complete through them is a typed refusal. New writes are
+    // refused unless they carry their own session and it matches the
+    // session's workspace/worktree.
+    //
+    // The scope indexes make every read path one ordered index range:
+    // `(session_id, task_id, id)` serves the per-session task listing/head
+    // and `(workspace_id, task_id, id)` serves workspace-bounded audits.
+    // Workspace was already durable (v14); no other column moves.
+    "ALTER TABLE verification_record ADD COLUMN session_id INTEGER;
+     UPDATE verification_record
+        SET session_id = (
+            SELECT t.session_id
+              FROM task t
+              JOIN session s ON s.id = t.session_id
+             WHERE t.task_id = verification_record.task_id
+               AND s.workspace_id = verification_record.workspace_id
+               AND s.worktree_id = verification_record.worktree_id)
+      WHERE session_id IS NULL
+        AND 1 = (
+            SELECT COUNT(DISTINCT t.session_id)
+              FROM task t
+              JOIN session s ON s.id = t.session_id
+             WHERE t.task_id = verification_record.task_id
+               AND s.workspace_id = verification_record.workspace_id
+               AND s.worktree_id = verification_record.worktree_id);
+     CREATE INDEX IF NOT EXISTS idx_verification_record_session_task
+        ON verification_record(session_id, task_id, id);
+     CREATE INDEX IF NOT EXISTS idx_verification_record_workspace_task
+        ON verification_record(workspace_id, task_id, id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

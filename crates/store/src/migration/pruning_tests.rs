@@ -205,6 +205,7 @@ fn real_writer_prunes_the_numeric_oldest_under_equal_mtimes() {
             "ALTER TABLE cost_reservation DROP COLUMN execution_class",
             [],
         );
+        crate::drop_verification_scope_for_rewind(&conn);
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
         drop(conn);
@@ -236,6 +237,7 @@ fn real_writer_prunes_the_numeric_oldest_under_equal_mtimes() {
             "ALTER TABLE cost_reservation DROP COLUMN execution_class",
             [],
         );
+        crate::drop_verification_scope_for_rewind(&conn);
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
     }

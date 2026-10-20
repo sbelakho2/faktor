@@ -1,6 +1,8 @@
 //! `tasks`: cohesive slice of the mechanically decomposed parent module.
 
-use super::task_completion_guard::{read_and_validate_completion_record, record_unchanged};
+use super::task_completion_guard::{
+    read_and_validate_completion_record, record_unchanged, PreparedCompletionRecord,
+};
 use super::*;
 
 // ------------------------------------------- verification job bounds (v22)
@@ -130,6 +132,13 @@ pub struct TaskRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationRecordRow {
     pub id: VerificationRecordId,
+    /// The durable owning session (schema v43). `None` is a pre-v43 row whose
+    /// owner could not be PROVEN from the task/session relationship at
+    /// migration time (ambiguous task id, missing task row, or a
+    /// workspace/worktree disagreement). Such a row is permanently excluded
+    /// from every scoped read/write path and refuses typed; it is never
+    /// guessed into a session. New writes must carry `Some`.
+    pub session_id: Option<SessionId>,
     pub task_id: TaskId,
     pub revision: TaskRevision,
     pub workspace_id: WorkspaceId,
@@ -156,6 +165,22 @@ pub struct VerificationRecordRow {
 /// `None` is an honest absence (a pre-v20 row or a record written without
 /// that evidence); the session layer parses non-null values loudly.
 pub type VerificationRecordWithEvidence = (VerificationRecordRow, Option<String>, Option<String>);
+
+/// The scoped point-read verdict of one verification record (schema v43).
+///
+/// `UnboundLegacy` is a row whose pre-v43 owner could not be proven: it is
+/// inert and typed-refused. `ScopeMismatch` is only reported when the row
+/// names the CALLER's session but its recorded workspace disagrees with that
+/// session's workspace (durable corruption/injected row); a row owned by a
+/// DIFFERENT session is reported as [`Self::Missing`] so a caller can never
+/// probe for another session's record ids (non-leaking refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationRecordLookup {
+    Found(Box<VerificationRecordWithEvidence>),
+    Missing,
+    UnboundLegacy { record_id: VerificationRecordId },
+    ScopeMismatch { record_id: VerificationRecordId },
+}
 
 // ------------------------------------------------ verification jobs (v22)
 
@@ -275,8 +300,17 @@ pub enum TaskCompletionRefusal {
     },
     /// (a) only a `Verifying` task may be completed.
     NotVerifying { actual: TaskState },
-    /// (b) no verification record row exists with this id.
+    /// (b) no verification record row exists with this id IN THIS SESSION.
+    /// A record owned by another session is indistinguishable from absence
+    /// (non-leaking refusal).
     RecordMissing { record_id: VerificationRecordId },
+    /// (b') the id names a pre-v43 row whose owning session could not be
+    /// proven at migration time; it is excluded from every scope and can
+    /// never certify completion.
+    RecordUnboundLegacy { record_id: VerificationRecordId },
+    /// (b'') the row names this session but its recorded workspace disagrees
+    /// with the session's workspace (durable corruption/injected row).
+    RecordScopeMismatch { record_id: VerificationRecordId },
     /// (c) the record certifies a different task.
     RecordWrongTask {
         record_id: VerificationRecordId,
@@ -332,12 +366,31 @@ enum RawCompletionRefusal {
     CriteriaNotCovered(String),
 }
 
+/// Raw finalize-job miss payloads (schema v43): the job classifies scope with
+/// SQL only; the caller's thread decodes the one status string.
+enum RawFinalizeRefusal {
+    Missing,
+    UnboundLegacy,
+    ScopeMismatch,
+    NotRunning(String),
+}
+
 /// Typed refusal of a record-finalize CAS. A record finalizes exactly once
 /// (`Running -> Passed|Failed`); anything else is refused here with the
 /// record's current status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordFinalizeRefusal {
     Missing {
+        record_id: VerificationRecordId,
+    },
+    /// The row predates the v43 session binding and its owner could not be
+    /// proven; it can never be finalized through a session scope.
+    UnboundLegacy {
+        record_id: VerificationRecordId,
+    },
+    /// The row names the caller's session but its workspace disagrees with
+    /// that session's workspace (durable corruption/injected row).
+    ScopeMismatch {
         record_id: VerificationRecordId,
     },
     NotRunning {
@@ -443,6 +496,9 @@ pub struct VerificationInvariantIssue {
 pub struct VerificationInvariantScan {
     /// Every `verification_record` row, regardless of status.
     pub total_records: u64,
+    /// Pre-v43 rows whose owning session could not be proven at migration
+    /// time. They are excluded from every scoped read/write path.
+    pub unbound_legacy_records: u64,
     /// Every `task` row in a completion-relevant state
     /// (NeedsVerification / Verifying / VerifiedComplete).
     pub relevant_tasks: u64,
@@ -540,6 +596,13 @@ pub(crate) fn verification_record_map(r: &rusqlite::Row<'_>) -> StoreResult<Veri
     )?;
     Ok(VerificationRecordRow {
         id,
+        session_id: match r.get::<_, Option<i64>>(14)? {
+            Some(raw) => Some(id_field(
+                &format!("verification_record {id} session_id"),
+                raw,
+            )?),
+            None => None,
+        },
         task_id: id_field(
             &format!("verification_record {id} task_id"),
             r.get::<_, i64>(1)?,
@@ -1460,7 +1523,11 @@ impl Store {
             format!("task {session_id}/{task_id} vanished after completion commit");
         // Caller-side typed validation BEFORE enqueueing; the job surfaces its
         // verdict (including wrong-shape Corrupt) after the task refusals.
-        let prepared = read_and_validate_completion_record(&*self.read()?, record_id.raw() as i64);
+        let prepared = read_and_validate_completion_record(
+            &*self.read()?,
+            session_id.raw() as i64,
+            record_id.raw() as i64,
+        );
         // The job returns raw payloads this thread decodes (no JSON on the owner).
         type RawCompletion = Result<Option<TaskCompletionRefusal>, RawCompletionRefusal>;
         let raw: RawCompletion = self.writer.execute("task_complete_verified", move |conn| {
@@ -1503,20 +1570,56 @@ impl Store {
             }
             // Raw record columns, same discipline; the typed JSON shapes were
             // already validated caller-side, before this job was enqueued.
+            // The scoped read makes another session's record structurally
+            // absent; the caller-side taxonomy decides WHICH typed refusal a
+            // miss carries.
+            let prepared_lookup = prepared?;
             type RawRecord = (i64, i64, i64, i64, String, String);
             let record: Option<RawRecord> = tx
                 .query_row(
-                    "SELECT task_id, revision, workspace_id, worktree_id, criteria_json, status FROM verification_record WHERE id = ?1",
-                    params![record_id.raw() as i64],
+                    "SELECT task_id, revision, workspace_id, worktree_id, criteria_json, status
+                       FROM verification_record WHERE id = ?1 AND session_id = ?2",
+                    params![record_id.raw() as i64, session_id.raw() as i64],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
                 .optional()?;
             let Some(record) = record else {
-                return Ok(Ok(Some(TaskCompletionRefusal::RecordMissing { record_id })));
+                return Ok(Ok(Some(match prepared_lookup {
+                    PreparedCompletionRecord::UnboundLegacy => {
+                        TaskCompletionRefusal::RecordUnboundLegacy { record_id }
+                    }
+                    PreparedCompletionRecord::ScopeMismatch => {
+                        TaskCompletionRefusal::RecordScopeMismatch { record_id }
+                    }
+                    PreparedCompletionRecord::Missing
+                    | PreparedCompletionRecord::Prepared(_) => {
+                        TaskCompletionRefusal::RecordMissing { record_id }
+                    }
+                })));
             };
             // The prepared verdict surfaces HERE; the CAS requires byte-identity.
-            let prepared = prepared?;
-            if !record_unchanged(&tx, record_id.raw() as i64, prepared.as_ref())? {
+            let prepared = match prepared_lookup {
+                PreparedCompletionRecord::Prepared(prepared) => prepared,
+                PreparedCompletionRecord::UnboundLegacy => {
+                    return Ok(Ok(Some(TaskCompletionRefusal::RecordUnboundLegacy {
+                        record_id,
+                    })))
+                }
+                PreparedCompletionRecord::ScopeMismatch => {
+                    return Ok(Ok(Some(TaskCompletionRefusal::RecordScopeMismatch {
+                        record_id,
+                    })))
+                }
+                PreparedCompletionRecord::Missing => {
+                    return Ok(Ok(Some(TaskCompletionRefusal::RecordMissing { record_id })))
+                }
+            };
+            if !record_unchanged(
+                &tx,
+                session_id.raw() as i64,
+                record_id.raw() as i64,
+                Some(&prepared),
+            )? {
                 return Err(StoreError::Conflict(record_changed));
             }
             let record_task = id_field::<TaskId>(&record_task_label, record.0)?;
@@ -1689,6 +1792,12 @@ impl Store {
         candidate_proof_ref_json: Option<&str>,
     ) -> StoreResult<VerificationRecordId> {
         let rec = rec.to_owned();
+        let session_id = rec.session_id.ok_or_else(|| {
+            StoreError::Malformed(
+                "verification record carries no durable session binding; every new record must name its owning session"
+                    .into(),
+            )
+        })?;
         let environment_fingerprint_json = environment_fingerprint_json.map(|v| v.to_owned());
         let candidate_proof_ref_json = candidate_proof_ref_json.map(|v| v.to_owned());
         // Preparation BEFORE enqueueing: every serialized record column.
@@ -1699,17 +1808,43 @@ impl Store {
             durable_json("verification unrelated_changes", &rec.unrelated_changes)?;
         let status_json = durable_json("verification status", &rec.status)?;
         let reviewer_json = rec.reviewer.as_ref().map(|v| v.to_string());
+        let missing_session = format!(
+            "verification record write refused: session {session_id} is not a durable session"
+        );
+        let scope_mismatch = format!(
+            "verification record write refused: session {session_id} does not own workspace {} / worktree {}",
+            rec.workspace_id, rec.worktree_id
+        );
         self.writer
             .execute("verification_record_put_with_evidence", move |conn| {
+                // WRITE-SCOPE authority: the row may only carry the identity
+                // of a real session, and its recorded workspace/worktree must
+                // be exactly that session's base identity. A forged or stale
+                // scope is a typed refusal before any row is written.
+                let owner: Option<(i64, i64)> = conn
+                    .query_row(
+                        "SELECT workspace_id, worktree_id FROM session WHERE id = ?1",
+                        params![session_id.raw() as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match owner {
+                    None => return Err(StoreError::Malformed(missing_session)),
+                    Some((ws, wt))
+                        if ws == rec.workspace_id.raw() as i64
+                            && wt == rec.worktree_id.raw() as i64 => {}
+                    Some(_) => return Err(StoreError::Malformed(scope_mismatch)),
+                }
                 conn.execute(
                     "INSERT INTO verification_record(
-                task_id, revision, workspace_id, worktree_id, tree_hash,
+                session_id, task_id, revision, workspace_id, worktree_id, tree_hash,
                 criteria_json, checks_json, changed_files_json,
                 unrelated_changes_json, reviewer_json, status,
                 started_ms, completed_ms,
                 environment_fingerprint_json, candidate_proof_ref_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
+                        session_id.raw() as i64,
                         rec.task_id.raw() as i64,
                         rec.revision.raw() as i64,
                         rec.workspace_id.raw() as i64,
@@ -1734,97 +1869,166 @@ impl Store {
             })
     }
 
+    /// The scoped verification-record projection shared by the point lookup
+    /// and the evidence twin. Every read joins the owning session and
+    /// requires the record's workspace to equal that session's workspace, so
+    /// a stale/forged row can never surface through a session scope.
+    const VERIFICATION_RECORD_SCOPED_SELECT: &'static str =
+        "SELECT vr.id, vr.task_id, vr.revision, vr.workspace_id, vr.worktree_id, vr.tree_hash,
+                vr.criteria_json, vr.checks_json, vr.changed_files_json,
+                vr.unrelated_changes_json, vr.reviewer_json, vr.status,
+                vr.started_ms, vr.completed_ms, vr.session_id,
+                vr.environment_fingerprint_json, vr.candidate_proof_ref_json
+           FROM verification_record vr
+           JOIN session s ON s.id = vr.session_id
+          WHERE vr.id = ?2 AND vr.session_id = ?1 AND s.workspace_id = vr.workspace_id";
+
+    /// The scoped point read with the typed miss taxonomy (schema v43).
+    /// Foreign sessions are folded into [`VerificationRecordLookup::Missing`]
+    /// so record ids cannot be probed across session boundaries.
+    pub fn verification_record_lookup(
+        &self,
+        session_id: SessionId,
+        record_id: VerificationRecordId,
+    ) -> StoreResult<VerificationRecordLookup> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(Self::VERIFICATION_RECORD_SCOPED_SELECT)?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, record_id.raw() as i64])?;
+        if let Some(row) = rows.next()? {
+            return Ok(VerificationRecordLookup::Found(Box::new((
+                verification_record_map(row)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+            ))));
+        }
+        // Scoped miss: classify WITHOUT naming a foreign owner. The caller's
+        // own session on a mismatched row stays a typed corruption signal;
+        // another session's row is indistinguishable from absence.
+        let raw: Option<(Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT session_id, workspace_id FROM verification_record WHERE id = ?1",
+                params![record_id.raw() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let caller_workspace: Option<i64> = conn
+            .query_row(
+                "SELECT workspace_id FROM session WHERE id = ?1",
+                params![session_id.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match raw {
+            None => VerificationRecordLookup::Missing,
+            Some((None, _)) => VerificationRecordLookup::UnboundLegacy { record_id },
+            Some((Some(owner), _)) if owner != session_id.raw() as i64 => {
+                VerificationRecordLookup::Missing
+            }
+            Some((Some(_), workspace)) if Some(workspace) != caller_workspace => {
+                VerificationRecordLookup::ScopeMismatch { record_id }
+            }
+            // The scoped query should have matched this row; treating a
+            // residual miss as scope-mismatched is the fail-closed choice.
+            Some((Some(_), _)) => VerificationRecordLookup::ScopeMismatch { record_id },
+        })
+    }
+
     /// Additive v20 twin of [`Store::verification_record_get`]: the row plus
     /// its raw `(environment_fingerprint_json, candidate_proof_ref_json)`
-    /// evidence columns. `None` on either side means the record predates v20
-    /// or was written without that evidence — an honest absence the session
-    /// layer maps to an absent typed value, never a guess.
+    /// evidence columns. Scoped to the owning session/workspace (schema
+    /// v43); a legacy unbound or foreign row is `None` (use
+    /// [`Store::verification_record_lookup`] for the typed taxonomy).
     pub fn verification_record_get_with_evidence(
         &self,
+        session_id: SessionId,
         record_id: VerificationRecordId,
     ) -> StoreResult<Option<VerificationRecordWithEvidence>> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                    criteria_json, checks_json, changed_files_json,
-                    unrelated_changes_json, reviewer_json, status,
-                    started_ms, completed_ms,
-                    environment_fingerprint_json, candidate_proof_ref_json
-             FROM verification_record WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![record_id.raw() as i64])?;
+        let mut stmt = conn.prepare(Self::VERIFICATION_RECORD_SCOPED_SELECT)?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, record_id.raw() as i64])?;
         match rows.next()? {
             Some(row) => Ok(Some((
                 verification_record_map(row)?,
-                row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ))),
             None => Ok(None),
         }
     }
 
-    /// Every verification record of one task with its evidence columns, in
-    /// deterministic creation order (`id ASC`) — the v20 twin of
-    /// [`Store::verification_record_list_by_task`].
+    /// Every verification record of one session's task with its evidence
+    /// columns, in deterministic creation order (`id ASC`) — the v20 twin of
+    /// [`Store::verification_record_list_by_task`]. Rows owned by another
+    /// session, legacy unbound rows and workspace-mismatched rows are
+    /// structurally excluded (typed refusal on the point-read path).
     pub fn verification_record_list_by_task_with_evidence(
         &self,
+        session_id: SessionId,
         task_id: TaskId,
     ) -> StoreResult<Vec<VerificationRecordWithEvidence>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                    criteria_json, checks_json, changed_files_json,
-                    unrelated_changes_json, reviewer_json, status,
-                    started_ms, completed_ms,
-                    environment_fingerprint_json, candidate_proof_ref_json
-             FROM verification_record WHERE task_id = ?1 ORDER BY id ASC",
+            "SELECT vr.id, vr.task_id, vr.revision, vr.workspace_id, vr.worktree_id, vr.tree_hash,
+                    vr.criteria_json, vr.checks_json, vr.changed_files_json,
+                    vr.unrelated_changes_json, vr.reviewer_json, vr.status,
+                    vr.started_ms, vr.completed_ms, vr.session_id,
+                    vr.environment_fingerprint_json, vr.candidate_proof_ref_json
+               FROM verification_record vr
+               JOIN session s ON s.id = vr.session_id
+              WHERE vr.session_id = ?1 AND vr.task_id = ?2
+                AND s.workspace_id = vr.workspace_id
+              ORDER BY vr.id ASC",
         )?;
-        let mut rows = stmt.query(params![task_id.raw() as i64])?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push((
                 verification_record_map(row)?,
-                row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ));
         }
         Ok(out)
     }
 
+    /// One verification record by id, scoped to the owning session and its
+    /// current workspace (schema v43). `None` covers missing, foreign and
+    /// legacy-unbound rows; the typed taxonomy lives in
+    /// [`Store::verification_record_lookup`].
     pub fn verification_record_get(
         &self,
+        session_id: SessionId,
         record_id: VerificationRecordId,
     ) -> StoreResult<Option<VerificationRecordRow>> {
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                    criteria_json, checks_json, changed_files_json,
-                    unrelated_changes_json, reviewer_json, status,
-                    started_ms, completed_ms
-             FROM verification_record WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![record_id.raw() as i64])?;
+        let mut stmt = conn.prepare(Self::VERIFICATION_RECORD_SCOPED_SELECT)?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, record_id.raw() as i64])?;
         match rows.next()? {
             Some(row) => Ok(Some(verification_record_map(row)?)),
             None => Ok(None),
         }
     }
 
-    /// Every verification record of one task, in deterministic creation
-    /// order (`id ASC`).
+    /// Every verification record of one session's task, in deterministic
+    /// creation order (`id ASC`). Same structural scope as the evidence twin.
     pub fn verification_record_list_by_task(
         &self,
+        session_id: SessionId,
         task_id: TaskId,
     ) -> StoreResult<Vec<VerificationRecordRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                    criteria_json, checks_json, changed_files_json,
-                    unrelated_changes_json, reviewer_json, status,
-                    started_ms, completed_ms
-             FROM verification_record WHERE task_id = ?1 ORDER BY id ASC",
+            "SELECT vr.id, vr.task_id, vr.revision, vr.workspace_id, vr.worktree_id, vr.tree_hash,
+                    vr.criteria_json, vr.checks_json, vr.changed_files_json,
+                    vr.unrelated_changes_json, vr.reviewer_json, vr.status,
+                    vr.started_ms, vr.completed_ms, vr.session_id
+               FROM verification_record vr
+               JOIN session s ON s.id = vr.session_id
+              WHERE vr.session_id = ?1 AND vr.task_id = ?2
+                AND s.workspace_id = vr.workspace_id
+              ORDER BY vr.id ASC",
         )?;
-        let mut rows = stmt.query(params![task_id.raw() as i64])?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(verification_record_map(row)?);
@@ -1833,14 +2037,15 @@ impl Store {
     }
 
     /// The FIRST `per_task` verification records (creation order, `id
-    /// ASC`) of each named task, in ONE read transaction. The session
-    /// export used to run one `verification_record_list_by_task` query per
-    /// task (up to 50 sequential round trips per export).
+    /// ASC`) of each named task of ONE session, in ONE read transaction. The
+    /// session export used to run one `verification_record_list_by_task`
+    /// query per task (up to 50 sequential round trips per export).
     ///
     /// `record, revision, status` triples are returned task-ascending, so
     /// the caller's original grouping/ordering is reproducible.
     pub fn verification_record_head_by_tasks(
         &self,
+        session_id: SessionId,
         task_ids: &[TaskId],
         per_task: u64,
     ) -> StoreResult<Vec<(i64, i64, String)>> {
@@ -1857,13 +2062,17 @@ impl Store {
         let placeholders = vec!["?"; task_ids.len()].join(", ");
         let sql = format!(
             "SELECT task_id, revision, status FROM (
-                SELECT task_id, revision, status,
-                       ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id ASC) AS rn
-                FROM verification_record WHERE task_id IN ({placeholders})
+                SELECT vr.task_id, vr.revision, vr.status,
+                       ROW_NUMBER() OVER (PARTITION BY vr.task_id ORDER BY vr.id ASC) AS rn
+                FROM verification_record vr
+                JOIN session s ON s.id = vr.session_id
+                WHERE vr.session_id = ? AND vr.task_id IN ({placeholders})
+                  AND s.workspace_id = vr.workspace_id
              ) WHERE rn <= ? ORDER BY task_id ASC, rn ASC"
         );
         let mut params: Vec<rusqlite::types::Value> =
-            Vec::with_capacity(task_ids.len().saturating_add(1));
+            Vec::with_capacity(task_ids.len().saturating_add(2));
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
         for id in task_ids {
             params.push(rusqlite::types::Value::Integer(id.raw() as i64));
         }
@@ -1883,11 +2092,13 @@ impl Store {
     }
 
     /// The record's single allowed status write: a CAS from `Running` to
-    /// `Passed` or `Failed`. Exactly one finalize wins; a second attempt on
-    /// an already-final record is refused with its current status, and the
-    /// finalize never rewinds (a finalized record is immutable).
+    /// `Passed` or `Failed`, scoped to the record's owning session and that
+    /// session's workspace (schema v43). Exactly one finalize wins; a second
+    /// attempt on an already-final record is refused with its current status,
+    /// and the finalize never rewinds (a finalized record is immutable).
     pub fn verification_record_finalize(
         &self,
+        session_id: SessionId,
         record_id: VerificationRecordId,
         new_status: VerificationStatus,
         completed_ms: i64,
@@ -1901,8 +2112,8 @@ impl Store {
             )));
         }
         // Prepared ENTIRELY before enqueue: both status strings serialize on
-        // the caller's thread, and the closure returns the raw current-status
-        // text on a CAS miss (audit finding 5: no `parse_json` on the owner).
+        // the caller's thread, and the closure returns only raw values on a
+        // miss (audit finding 5: no `parse_json` on the owner).
         let new_status_json = serde_json::to_string(&new_status).unwrap();
         let running_status_json = serde_json::to_string(&VerificationStatus::Running).unwrap();
         let status_label = format!("verification_record {record_id} status");
@@ -1910,37 +2121,75 @@ impl Store {
             .writer
             .execute("verification_record_finalize", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // Scoped classification FIRST: a foreign/legacy row is never
+                // touched. A foreign session folds into Missing so ids cannot
+                // be probed across session boundaries.
+                let raw: Option<(Option<i64>, i64, String)> = tx
+                    .query_row(
+                        "SELECT session_id, workspace_id, status
+                           FROM verification_record WHERE id = ?1",
+                        params![record_id.raw() as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((owner, record_workspace, current_status)) = raw else {
+                    return Ok(Err(RawFinalizeRefusal::Missing));
+                };
+                let Some(owner) = owner else {
+                    return Ok(Err(RawFinalizeRefusal::UnboundLegacy));
+                };
+                if owner != session_id.raw() as i64 {
+                    return Ok(Err(RawFinalizeRefusal::Missing));
+                }
+                let caller_workspace: Option<i64> = tx
+                    .query_row(
+                        "SELECT workspace_id FROM session WHERE id = ?1",
+                        params![session_id.raw() as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if caller_workspace != Some(record_workspace) {
+                    return Ok(Err(RawFinalizeRefusal::ScopeMismatch));
+                }
+                if current_status != running_status_json {
+                    return Ok(Err(RawFinalizeRefusal::NotRunning(current_status)));
+                }
                 let updated = tx.execute(
                     "UPDATE verification_record
-             SET status = ?2, completed_ms = ?3
-             WHERE id = ?1 AND status = ?4",
+                        SET status = ?2, completed_ms = ?3
+                      WHERE id = ?1 AND session_id = ?4 AND status = ?5",
                     params![
                         record_id.raw() as i64,
                         new_status_json,
                         completed_ms,
+                        session_id.raw() as i64,
                         running_status_json
                     ],
                 )?;
-                if updated == 1 {
-                    tx.commit()?;
-                    return Ok(Ok(()));
+                if updated != 1 {
+                    // The row was classified Running at the top of this
+                    // IMMEDIATE transaction; a zero-row CAS means durable
+                    // state moved underneath us. Surface it as a conflict
+                    // rather than inventing a second status read.
+                    return Err(StoreError::Conflict(format!(
+                        "verification_record {record_id} changed during scoped finalize"
+                    )));
                 }
-                // The CAS missed: surface the RAW current status so callers
-                // can tell an already-final record from a not-yet-started
-                // one; the typed decode runs on the caller's thread.
-                let current_raw: Option<String> = tx
-                    .query_row(
-                        "SELECT status FROM verification_record WHERE id = ?1",
-                        params![record_id.raw() as i64],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                Ok(Err(current_raw))
+                tx.commit()?;
+                Ok(Ok(()))
             })?;
         match outcome {
             Ok(()) => Ok(Ok(())),
-            Err(None) => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
-            Err(Some(raw)) => {
+            Err(RawFinalizeRefusal::Missing) => {
+                Ok(Err(RecordFinalizeRefusal::Missing { record_id }))
+            }
+            Err(RawFinalizeRefusal::UnboundLegacy) => {
+                Ok(Err(RecordFinalizeRefusal::UnboundLegacy { record_id }))
+            }
+            Err(RawFinalizeRefusal::ScopeMismatch) => {
+                Ok(Err(RecordFinalizeRefusal::ScopeMismatch { record_id }))
+            }
+            Err(RawFinalizeRefusal::NotRunning(raw)) => {
                 let current: VerificationStatus = parse_json(&status_label, &raw)?;
                 Ok(Err(RecordFinalizeRefusal::NotRunning {
                     record_id,
@@ -3031,10 +3280,11 @@ impl Store {
                 tasks.push(task);
             }
         }
-        // Records: id, task_id, revision, status (typed parse of the status
-        // JSON text, same corruption contract as the row mappers).
+        // Records: id, session_id, task_id, revision, status (typed parse of
+        // the status JSON text, same corruption contract as the row mappers).
         struct RecordRef {
             id: i64,
+            session_id: Option<i64>,
             task_id: i64,
             revision: i64,
             status: VerificationStatus,
@@ -3042,12 +3292,17 @@ impl Store {
         let mut records: Vec<RecordRef> = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, revision, status FROM verification_record ORDER BY id ASC",
+                "SELECT id, task_id, revision, status, session_id FROM verification_record ORDER BY id ASC",
             )?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
+                let session_id: Option<i64> = row.get(4)?;
+                if session_id.is_none() {
+                    scan.unbound_legacy_records += 1;
+                }
                 records.push(RecordRef {
                     id: row.get(0)?,
+                    session_id,
                     task_id: row.get(1)?,
                     revision: row.get(2)?,
                     status: parse_json(
@@ -3060,28 +3315,50 @@ impl Store {
         scan.total_records = records.len() as u64;
         // Reference sets built in ONE pass: the former per-record/per-task
         // `iter().any()` scans were O(tasks x records) on a whole-table read.
-        let task_ids: std::collections::HashSet<i64> = tasks.iter().map(|t| t.task_id).collect();
-        let mut passed_certificates: std::collections::HashSet<(i64, i64)> =
+        // Task identity is the DURABLE `(session_id, task_id)` pair (schema
+        // v43): a numeric task id alone is not unique inside a workspace.
+        let task_keys: std::collections::HashSet<(i64, i64)> =
+            tasks.iter().map(|t| (t.session_id, t.task_id)).collect();
+        let mut passed_certificates: std::collections::HashSet<(i64, i64, i64)> =
             std::collections::HashSet::new();
-        let mut passed_by_task: std::collections::HashMap<i64, Vec<(i64, i64)>> =
+        let mut passed_by_task: std::collections::HashMap<(i64, i64), Vec<(i64, i64)>> =
             std::collections::HashMap::new();
         for r in &records {
+            let Some(session_id) = r.session_id else {
+                continue;
+            };
             if r.status == VerificationStatus::Passed {
-                passed_certificates.insert((r.task_id, r.revision));
+                passed_certificates.insert((session_id, r.task_id, r.revision));
                 passed_by_task
-                    .entry(r.task_id)
+                    .entry((session_id, r.task_id))
                     .or_default()
                     .push((r.revision, r.id));
             }
         }
-        // (1) Records whose task row is gone entirely.
+        // (0) A record whose session binding is unprovable is inert and
+        // excluded from every scoped path; doctor surfaces the count.
         for r in &records {
-            if !task_ids.contains(&r.task_id) {
+            if r.session_id.is_none() {
+                scan.issues.push(VerificationInvariantIssue {
+                    kind: "record_without_session",
+                    detail: format!(
+                        "verification record {} (status {:?}, revision {}) carries no PROVEN session binding; it is excluded from every read/write path and can never certify completion",
+                        r.id, r.status, r.revision
+                    ),
+                });
+            }
+        }
+        // (1) Records whose (session, task) row is gone entirely.
+        for r in &records {
+            let Some(session_id) = r.session_id else {
+                continue;
+            };
+            if !task_keys.contains(&(session_id, r.task_id)) {
                 scan.issues.push(VerificationInvariantIssue {
                     kind: "record_without_task",
                     detail: format!(
-                        "verification record {} (status {:?}, revision {}) references task {} which has no task row",
-                        r.id, r.status, r.revision, r.task_id
+                        "verification record {} (status {:?}, revision {}) references task {}/{} which has no task row",
+                        r.id, r.status, r.revision, session_id, r.task_id
                     ),
                 });
             }
@@ -3093,7 +3370,7 @@ impl Store {
                 continue;
             }
             for (revision, record_id) in passed_by_task
-                .get(&t.task_id)
+                .get(&(t.session_id, t.task_id))
                 .map(Vec::as_slice)
                 .unwrap_or_default()
             {
@@ -3114,8 +3391,8 @@ impl Store {
             if t.state != TaskState::VerifiedComplete {
                 continue;
             }
-            let certified =
-                t.revision >= 2 && passed_certificates.contains(&(t.task_id, t.revision - 1));
+            let certified = t.revision >= 2
+                && passed_certificates.contains(&(t.session_id, t.task_id, t.revision - 1));
             if !certified {
                 scan.issues.push(VerificationInvariantIssue {
                     kind: "verified_without_record",

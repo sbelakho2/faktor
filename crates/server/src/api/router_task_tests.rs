@@ -1214,6 +1214,7 @@ async fn native_verification_evidence_scoped_to_session_and_task() {
     let rec_for = |session_row: &faktor_store::SessionRow, task_id: u64, check: &str| {
         faktor_store::VerificationRecordRow {
             id: faktor_core::id::VerificationRecordId::new(1),
+            session_id: Some(session_row.id),
             task_id: faktor_core::id::TaskId::new(task_id),
             revision: rev,
             workspace_id: session_row.workspace_id,
@@ -1555,6 +1556,7 @@ async fn native_verification_serves_criterion_binding_origin_requirement_and_ver
     });
     let record = faktor_store::VerificationRecordRow {
         id: faktor_core::id::VerificationRecordId::new(1),
+        session_id: Some(s.id()),
         task_id,
         revision: faktor_core::id::TaskRevision::new(1),
         workspace_id: row.workspace_id,

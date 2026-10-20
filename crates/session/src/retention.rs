@@ -300,7 +300,7 @@ impl<'a> LiveReferenceScanner<'a> {
             for task in tasks {
                 let records = self
                     .store
-                    .verification_record_list_by_task_with_evidence(task.task_id)
+                    .verification_record_list_by_task_with_evidence(task.session_id, task.task_id)
                     .map_err(|error| RetentionScanError::Unavailable(error.to_string()))?;
                 for (record, _fingerprint_json, candidate_json) in records {
                     verification_records += 1;

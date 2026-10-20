@@ -713,3 +713,78 @@ async fn corrupt_present_components_fail_closed_with_a_typed_500() {
         .unwrap()
         .contains("run base record"));
 }
+
+/// A SECOND session of the SAME workspace owning the SAME numeric task id
+/// must project only its own (empty) evidence: the original session's passing
+/// record, checks and snapshots never surface through the sibling's proof.
+#[tokio::test]
+async fn same_workspace_sibling_with_the_same_task_id_cannot_surface_foreign_proof() {
+    let f = fixture(42).await;
+    let (_revision, record, snapshot) = verified_task(&f);
+    let workspace = f.handle.row().unwrap().workspace_id;
+    let sibling = f
+        .manager
+        .create_session(workspace, "proof-sibling", "fake", "m")
+        .unwrap();
+    sibling
+        .create_task(Task {
+            task_id: f.task_id,
+            session_id: sibling.id(),
+            goal: "sibling goal".into(),
+            acceptance_criteria: vec![f.criterion_entry.clone()],
+            state: TaskState::Running,
+            created_ms: 1,
+            updated_ms: 1,
+            ..Task::default()
+        })
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "{}/native/tasks/42/proof?session={}",
+            f.base(),
+            sibling.id()
+        ))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["sessionId"], sibling.id().to_string());
+    assert_eq!(body["proofState"], "unverified");
+    assert_eq!(body["criteria"]["recordId"], serde_json::Value::Null);
+    assert_eq!(body["criteria"]["certifiesCompletion"], false);
+    assert_eq!(body["checks"]["requiredPassed"], 0);
+    assert_eq!(body["trees"]["verified"], serde_json::Value::Null);
+    assert_eq!(body["trees"]["landed"], serde_json::Value::Null);
+
+    // The sibling's own durable verification list is empty as well; the
+    // original's record never appears through the same-workspace path.
+    let resp = client
+        .get(format!(
+            "{}/native/session/{}/tasks/42/verification",
+            f.base(),
+            sibling.id()
+        ))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["records"], serde_json::json!([]));
+
+    // The owner still projects its verified story unchanged.
+    let resp = f
+        .get("/native/tasks/42/proof", Some(&f.session_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["proofState"], "verified");
+    assert_eq!(body["criteria"]["recordId"], record.to_string());
+    assert_eq!(body["trees"]["verified"], snapshot);
+}

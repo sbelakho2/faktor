@@ -540,6 +540,31 @@ fn hot_query_plans_stay_index_backed_at_seeded_sizes() {
             &[],
             &["SCAN turn_record USING COVERING INDEX idx_turn_record_active"],
         ),
+        (
+            "scoped verification records of one session task",
+            "SELECT vr.id FROM verification_record vr
+             JOIN session s ON s.id = vr.session_id
+             WHERE vr.session_id = ?1 AND vr.task_id = ?2
+               AND s.workspace_id = vr.workspace_id
+             ORDER BY vr.id ASC",
+            &[1, 1],
+            &[
+                "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH vr USING INDEX idx_verification_record_workspace_task (workspace_id=? AND task_id=?)",
+            ],
+        ),
+        (
+            "scoped verification record point read",
+            "SELECT vr.id FROM verification_record vr
+             JOIN session s ON s.id = vr.session_id
+             WHERE vr.id = ?2 AND vr.session_id = ?1
+               AND s.workspace_id = vr.workspace_id",
+            &[1, 1],
+            &[
+                "SEARCH vr USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ),
     ];
 
     for (name, sql, values, expected) in checks {

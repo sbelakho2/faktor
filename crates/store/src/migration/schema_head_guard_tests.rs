@@ -180,6 +180,7 @@ fn a_pending_migration_writes_a_verified_pre_migration_restore_point() {
     const TOMBSTONE_PREDECESSOR: i64 = 37;
     {
         let conn = Connection::open(&db).unwrap();
+        crate::drop_verification_scope_for_rewind(&conn);
         conn.execute_batch(&format!(
             "DROP TABLE IF EXISTS session_deletion;
                  PRAGMA user_version = {TOMBSTONE_PREDECESSOR};"
@@ -266,6 +267,7 @@ fn restore_points_are_bounded_and_the_newest_survive() {
             "ALTER TABLE cost_reservation DROP COLUMN execution_class",
             [],
         );
+        crate::drop_verification_scope_for_rewind(&conn);
         conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_HEAD - 1))
             .unwrap();
         drop(conn);

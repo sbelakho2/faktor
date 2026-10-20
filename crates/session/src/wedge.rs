@@ -240,7 +240,7 @@ impl SessionManager {
             // row exactly once) OR an integration record for the task.
             let verified = match &task {
                 Some(t) => store
-                    .verification_record_list_by_task(t.task_id)
+                    .verification_record_list_by_task(t.session_id, t.task_id)
                     .map_err(crate::map_store_err)?
                     .iter()
                     .any(|r| r.revision.raw() >= t.revision.raw().saturating_sub(1)),

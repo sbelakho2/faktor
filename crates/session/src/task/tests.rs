@@ -698,10 +698,11 @@ fn completion_requires_proof_records_revision_criteria_and_worktree() {
     );
     keep_verifying(&s, t6.task_id, r6);
 
-    // (g) worktree mismatch: the record's base worktree must equal the
-    // completing session's. Standalone sessions share the numeric task
-    // id 1 but live in different workspaces: a record certified in /wb
-    // cannot complete task 1 of a session in /wc.
+    // (g) session/workspace scope: standalone sessions share the numeric
+    // task id 1 but own different sessions. A record certified by /wb's
+    // session is STRUCTURALLY ABSENT to /wc's session (the durable key is
+    // `(session_id, task_id)`), so completion refuses typed without
+    // revealing whether such a record exists.
     let wb = m.create_workspace("/wb").unwrap();
     let sb = m.create_session(wb, "b", "p", "m").unwrap();
     let tb = sb
@@ -723,7 +724,7 @@ fn completion_requires_proof_records_revision_criteria_and_worktree() {
     let err = sc
         .complete_verified_task(tc.task_id, rc, rec_b)
         .unwrap_err();
-    assert!(matches!(err, TaskError::WorktreeMismatch { .. }));
+    assert_eq!(err, TaskError::RecordNotFound(rec_b));
     assert_eq!(sc.task_revision(tc.task_id).unwrap(), rc);
     // And the same-workspace record completes it.
     let rec_c = passed_record(&sc, tc.task_id, &["c1".into()]);
@@ -2087,7 +2088,7 @@ fn hostile_or_oversized_evidence_columns_are_loud_on_read() {
     let row = s
         .manager
         .store()
-        .verification_record_get(base)
+        .verification_record_get(s.id, base)
         .unwrap()
         .unwrap();
     // A hostile injected value behind the API: not the typed shape.

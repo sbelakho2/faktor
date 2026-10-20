@@ -109,6 +109,7 @@ fn migration_v3_keeps_pre_v3_checkpoint_rows_readable() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 2", []).unwrap();
         }
         s.id
@@ -240,6 +241,7 @@ fn migration_v6_keeps_pre_v6_checkpoint_rows_readable_as_existing() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 5", []).unwrap();
         }
         s.id
@@ -371,6 +373,7 @@ fn migration_v7_replays_cleanly_on_a_v6_store() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 7", []).unwrap();
         }
         s.id
@@ -491,6 +494,7 @@ fn migration_v8_replays_cleanly_on_a_v7_store() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 8", []).unwrap();
         }
         (s.id, ws)
@@ -589,6 +593,7 @@ fn migration_v9_replays_cleanly_on_a_v8_store() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 9", []).unwrap();
         }
         (s.id, ws)
@@ -692,6 +697,7 @@ fn migration_v10_replays_cleanly_on_a_v9_store() {
             // The v30 shell-attribution column is post-this-version too:
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 9", []).unwrap();
         }
         (s.id, ledger)
@@ -984,6 +990,7 @@ fn migration_v13_replays_cleanly_on_a_v12_store() {
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 13", []).unwrap();
         }
         (s.id, row)
@@ -1069,6 +1076,7 @@ fn migration_v25_rebuilds_attachment_references_and_preserves_rows() {
                 "ALTER TABLE cost_reservation DROP COLUMN execution_class",
                 [],
             );
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 25", []).unwrap();
         }
         s.id
@@ -1137,6 +1145,7 @@ fn migration_v28_rebuilds_artifact_identity_per_session_and_preserves_rows() {
                 "ALTER TABLE cost_reservation DROP COLUMN execution_class",
                 [],
             );
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 28", []).unwrap();
         }
         s.id
@@ -1278,6 +1287,7 @@ fn upgrade_from_previous_head_restores_hot_path_indexes_and_backup_keeps_them() 
             // (v34) so every later additive migration (v36+) is also replayed;
             // `SCHEMA_HEAD - N` silently skipped v35 once v39 moved the head.
             let prev_head = 34;
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute_batch(&format!(
                 "ALTER TABLE cost_reservation DROP COLUMN execution_class;
                  CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event(session_id, seq);

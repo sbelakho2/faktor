@@ -228,6 +228,24 @@ pub use billing::*;
 mod outcome_ledger;
 pub use outcome_ledger::*;
 
+/// Test-only rewind helper: remove the v43 verification-record scope column
+/// and its indexes before a test sets `PRAGMA user_version` BELOW the v43
+/// step. Every tolerant statement keeps a fixture that never reached v43
+/// working unchanged; a fixture that did reach it rewinds to the exact
+/// predecessor shape the real v41 binary would have left.
+#[cfg(test)]
+pub(crate) fn drop_verification_scope_for_rewind(conn: &rusqlite::Connection) {
+    let _ = conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_verification_record_session_task;
+         DROP INDEX IF EXISTS idx_verification_record_workspace_task;",
+    );
+    let _ = conn.execute("ALTER TABLE verification_record DROP COLUMN session_id", []);
+}
+
+#[cfg(test)]
+#[path = "verification_scope_tests.rs"]
+mod verification_scope_tests;
+
 #[cfg(test)]
 #[path = "query_plan_tests.rs"]
 mod query_plan_tests;

@@ -103,6 +103,10 @@ pub(crate) fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> StoreRes
 mod concurrent_migration_tests;
 
 #[cfg(test)]
+#[path = "verification_scope_tests.rs"]
+mod verification_scope_tests;
+
+#[cfg(test)]
 #[path = "schema_head_guard_tests.rs"]
 mod schema_head_guard_tests;
 

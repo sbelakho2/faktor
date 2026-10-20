@@ -523,6 +523,7 @@ mod evidence_store_tests {
             // version cursor exactly as a pre-v21 build left the file.
             let mut conn = Connection::open(dir.path().join("faktor-plus.db")).unwrap();
             configure(&conn).unwrap();
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute_batch(
                 "DROP INDEX IF EXISTS idx_evidence_scope;
                  DROP INDEX IF EXISTS idx_evidence_session_task;

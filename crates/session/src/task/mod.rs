@@ -892,6 +892,9 @@ impl Task {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationRecord {
     pub record_id: VerificationRecordId,
+    /// The durable owning session (schema v43). Scoped reads only ever
+    /// surface records whose `session_id` equals the handle's own session.
+    pub session_id: SessionId,
     pub task_id: TaskId,
     /// The task revision this record certifies (its creation-time task
     /// revision). Completion requires the task to STILL be at this revision.
@@ -916,10 +919,16 @@ pub struct VerificationRecord {
     pub completed_ms: Option<i64>,
 }
 
-impl From<faktor_store::VerificationRecordRow> for VerificationRecord {
-    fn from(r: faktor_store::VerificationRecordRow) -> Self {
-        Self {
+impl TryFrom<faktor_store::VerificationRecordRow> for VerificationRecord {
+    type Error = TaskError;
+
+    fn try_from(r: faktor_store::VerificationRecordRow) -> Result<Self, TaskError> {
+        let session_id = r
+            .session_id
+            .ok_or(TaskError::RecordUnboundLegacy { record: r.id })?;
+        Ok(Self {
             record_id: r.id,
+            session_id,
             task_id: r.task_id,
             revision: r.revision,
             workspace_id: r.workspace_id,
@@ -935,7 +944,7 @@ impl From<faktor_store::VerificationRecordRow> for VerificationRecord {
             status: r.status,
             started_ms: r.started_ms,
             completed_ms: r.completed_ms,
-        }
+        })
     }
 }
 
@@ -983,6 +992,14 @@ pub enum TaskError {
     NotVerifying { actual: TaskState },
     #[error("verification record {0} does not exist")]
     RecordNotFound(VerificationRecordId),
+    #[error(
+        "verification record {record} carries no PROVEN durable session binding (pre-v43 legacy row); it is excluded from every scoped read/write path and can never certify completion — re-verify the task"
+    )]
+    RecordUnboundLegacy { record: VerificationRecordId },
+    #[error(
+        "verification record {record} does not match this session's workspace scope (durable corruption); refusing to read or consume it"
+    )]
+    RecordScopeMismatch { record: VerificationRecordId },
     #[error(
         "verification record {record} certifies task {record_task}, not task {requested_task}"
     )]
@@ -1917,6 +1934,12 @@ impl SessionHandle {
                 faktor_store::TaskCompletionRefusal::RecordMissing { record_id } => {
                     TaskError::RecordNotFound(record_id)
                 }
+                faktor_store::TaskCompletionRefusal::RecordUnboundLegacy { record_id } => {
+                    TaskError::RecordUnboundLegacy { record: record_id }
+                }
+                faktor_store::TaskCompletionRefusal::RecordScopeMismatch { record_id } => {
+                    TaskError::RecordScopeMismatch { record: record_id }
+                }
                 faktor_store::TaskCompletionRefusal::RecordWrongTask {
                     record_id,
                     record_task,
@@ -2268,9 +2291,18 @@ impl SessionHandle {
         if row.state != TaskState::Verifying {
             return Err(TaskError::NotVerifying { actual: row.state });
         }
-        let rec = store
-            .verification_record_get(proof)?
-            .ok_or(TaskError::RecordNotFound(proof))?;
+        let rec = match store.verification_record_lookup(self.id, proof)? {
+            faktor_store::VerificationRecordLookup::Found(boxed) => boxed.0,
+            faktor_store::VerificationRecordLookup::Missing => {
+                return Err(TaskError::RecordNotFound(proof))
+            }
+            faktor_store::VerificationRecordLookup::UnboundLegacy { .. } => {
+                return Err(TaskError::RecordUnboundLegacy { record: proof })
+            }
+            faktor_store::VerificationRecordLookup::ScopeMismatch { .. } => {
+                return Err(TaskError::RecordScopeMismatch { record: proof })
+            }
+        };
         if rec.task_id != task_id {
             return Err(TaskError::RecordWrongTask {
                 record: proof,
@@ -2772,6 +2804,7 @@ impl SessionHandle {
             .ok_or(TaskError::NotFound(task_id))?;
         let rec = faktor_store::VerificationRecordRow {
             id: VerificationRecordId::new(1), // ignored by put; a fresh id is minted
+            session_id: Some(self.id),
             task_id,
             revision: task.revision,
             workspace_id: session.workspace_id,
@@ -2860,7 +2893,10 @@ impl SessionHandle {
         )
     }
 
-    /// One verification record by id, or `None`.
+    /// One verification record by id, scoped to THIS session (schema v43):
+    /// another session's row is indistinguishable from absence, while a
+    /// legacy row whose owner could not be proven and a workspace-mismatched
+    /// row refuse typed.
     pub fn get_verification_record(
         &self,
         record_id: VerificationRecordId,
@@ -2868,31 +2904,39 @@ impl SessionHandle {
         match self
             .manager
             .store()
-            .verification_record_get_with_evidence(record_id)?
+            .verification_record_lookup(self.id, record_id)?
         {
-            Some((row, fingerprint_json, candidate_json)) => Ok(Some(
-                verification_record_from_row_with_evidence(row, fingerprint_json, candidate_json)?,
-            )),
-            None => Ok(None),
+            faktor_store::VerificationRecordLookup::Found(boxed) => {
+                let (row, fingerprint_json, candidate_json) = *boxed;
+                Ok(Some(verification_record_from_row_with_evidence(
+                    row,
+                    fingerprint_json,
+                    candidate_json,
+                )?))
+            }
+            faktor_store::VerificationRecordLookup::Missing => Ok(None),
+            faktor_store::VerificationRecordLookup::UnboundLegacy { record_id } => {
+                Err(TaskError::RecordUnboundLegacy { record: record_id })
+            }
+            faktor_store::VerificationRecordLookup::ScopeMismatch { record_id } => {
+                Err(TaskError::RecordScopeMismatch { record: record_id })
+            }
         }
     }
 
-    /// Every verification record of `task_id`, in deterministic creation
-    /// order (record id ascending).
-    ///
-    /// NOTE: `verification_record` rows are keyed by the NUMERIC task id
-    /// (the approved schema carries no session column), so records of a
-    /// standalone session (task id 1) of another session in the same
-    /// workspace are visible here. Completion itself is protected by the
-    /// record's workspace/worktree content check against the completing
-    /// session's base worktree.
+    /// Every verification record of `task_id` IN THIS SESSION, in
+    /// deterministic creation order (record id ascending), with the v20
+    /// evidence columns parsed loudly. The durable key is
+    /// `(session_id, task_id)` (schema v43): a same-numeric-id standalone task
+    /// of another session — even in the same workspace — is structurally
+    /// absent, and unbound legacy rows are excluded.
     pub fn list_verification_records(
         &self,
         task_id: TaskId,
     ) -> Result<Vec<VerificationRecord>, TaskError> {
         self.manager
             .store()
-            .verification_record_list_by_task_with_evidence(task_id)?
+            .verification_record_list_by_task_with_evidence(self.id, task_id)?
             .into_iter()
             .map(|(row, fingerprint_json, candidate_json)| {
                 verification_record_from_row_with_evidence(row, fingerprint_json, candidate_json)
@@ -3042,14 +3086,21 @@ impl SessionHandle {
             )));
         }
         let _guard = self.command_guard();
-        match self
-            .manager
-            .store()
-            .verification_record_finalize(record_id, status, completed_ms)?
-        {
+        match self.manager.store().verification_record_finalize(
+            self.id,
+            record_id,
+            status,
+            completed_ms,
+        )? {
             Ok(()) => Ok(()),
             Err(faktor_store::RecordFinalizeRefusal::Missing { .. }) => {
                 Err(TaskError::RecordNotFound(record_id))
+            }
+            Err(faktor_store::RecordFinalizeRefusal::UnboundLegacy { .. }) => {
+                Err(TaskError::RecordUnboundLegacy { record: record_id })
+            }
+            Err(faktor_store::RecordFinalizeRefusal::ScopeMismatch { .. }) => {
+                Err(TaskError::RecordScopeMismatch { record: record_id })
             }
             Err(faktor_store::RecordFinalizeRefusal::NotRunning { record_id, current }) => {
                 Err(TaskError::RecordNotFinalizable {
@@ -3632,7 +3683,7 @@ pub(crate) fn verification_record_from_row_with_evidence(
     let environment_fingerprint =
         parse_environment_fingerprint(record_id, environment_fingerprint_json)?;
     let candidate_proof_ref = parse_candidate_proof_ref(record_id, candidate_proof_ref_json)?;
-    let mut record = VerificationRecord::from(row);
+    let mut record = VerificationRecord::try_from(row)?;
     record.environment_fingerprint = environment_fingerprint;
     record.candidate_proof_ref = candidate_proof_ref;
     Ok(record)
@@ -3711,3 +3762,7 @@ fn accounting_digest_of(balance: &crate::budget::TaskCompletionBalance) -> Strin
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "verification_scope_tests.rs"]
+mod verification_scope_tests;

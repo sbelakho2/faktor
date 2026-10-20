@@ -79,6 +79,7 @@ fn migration_v14_replays_cleanly_on_a_v13_store() {
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 14", []).unwrap();
         }
         (s.id, TaskId::new(1))
@@ -101,6 +102,7 @@ fn migration_v14_replays_cleanly_on_a_v13_store() {
     );
     let rec = VerificationRecordRow {
         id: VerificationRecordId::new(1),
+        session_id: Some(sid),
         task_id: tid,
         revision: TaskRevision::new(2),
         workspace_id: WorkspaceId::new(1),
@@ -126,7 +128,7 @@ fn migration_v14_replays_cleanly_on_a_v13_store() {
     );
     assert_eq!(
         store
-            .verification_record_get(rec_id)
+            .verification_record_get(sid, rec_id)
             .unwrap()
             .unwrap()
             .task_id,
@@ -237,6 +239,7 @@ fn migration_v16_renames_legacy_abandoned_reservations_to_uncertain_and_adds_the
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 16", []).unwrap();
         }
         (s.id, tid)
@@ -396,6 +399,7 @@ pub(crate) fn passing_record(
 ) -> VerificationRecordRow {
     VerificationRecordRow {
         id: VerificationRecordId::new(1),
+        session_id: Some(task.session_id),
         task_id: task.task_id,
         revision: task.revision,
         workspace_id: ws,
@@ -428,7 +432,7 @@ fn verification_record_evidence_columns_roundtrip_and_legacy_put_stays_null() {
     // path writes SQL NULL and reads back as an honest absence. Both
     // survive a reopen.
     let dir = tempfile::tempdir().unwrap();
-    let (legacy, with_evidence) = {
+    let (sid, legacy, with_evidence) = {
         let store = Store::open(dir.path(), true).unwrap();
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
@@ -440,18 +444,18 @@ fn verification_record_evidence_columns_roundtrip_and_legacy_put_stays_null() {
         let with_evidence = store
             .verification_record_put_with_evidence(&rec, Some(fingerprint), Some(candidate))
             .unwrap();
-        (legacy, with_evidence)
+        (s.id, legacy, with_evidence)
     };
     let store = Store::open(dir.path(), true).unwrap();
     let (row, fingerprint, candidate) = store
-        .verification_record_get_with_evidence(legacy)
+        .verification_record_get_with_evidence(sid, legacy)
         .unwrap()
         .unwrap();
     assert_eq!(row.task_id.raw(), 1);
     assert!(fingerprint.is_none(), "legacy put writes NULL evidence");
     assert!(candidate.is_none(), "legacy put writes NULL evidence");
     let (_, fingerprint, candidate) = store
-        .verification_record_get_with_evidence(with_evidence)
+        .verification_record_get_with_evidence(sid, with_evidence)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -463,7 +467,7 @@ fn verification_record_evidence_columns_roundtrip_and_legacy_put_stays_null() {
         Some(r#"{"task_revision":1,"accounting_snapshot_digest":"accounting:v1:0"}"#)
     );
     let list = store
-        .verification_record_list_by_task_with_evidence(TaskId::new(1))
+        .verification_record_list_by_task_with_evidence(sid, TaskId::new(1))
         .unwrap();
     assert_eq!(list.len(), 2);
     assert!(list[0].1.is_none());
@@ -644,6 +648,7 @@ fn migration_v17_turns_v16_open_rows_into_reserved_and_keeps_the_marker_truth() 
             // drop it (tolerantly) so the full chain replays cleanly.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute("PRAGMA user_version = 17", []).unwrap();
         }
         (s.id, tid)

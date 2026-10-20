@@ -32,6 +32,7 @@ use super::*;
 /// decoding anything on the owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedRecordShape {
+    pub session_id: i64,
     pub task_id: i64,
     pub revision: i64,
     pub workspace_id: i64,
@@ -44,51 +45,93 @@ pub(crate) struct PreparedRecordShape {
     pub status: String,
 }
 
-/// Read one `verification_record` row and run the full typed decode
-/// ([`verification_record_map`]) on the caller's thread: JSON parse failures,
-/// `deny_unknown_fields` shape violations and invalid ids/statuses surface as
-/// the mapper's typed [`StoreError::Corrupt`] labels, exactly as they did when
-/// the decode ran inside the completion transaction. `None` when the row does
-/// not exist.
-pub(crate) fn read_and_validate_completion_record(
-    conn: &Connection,
-    record_id_raw: i64,
-) -> StoreResult<Option<PreparedRecordShape>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                criteria_json, checks_json, changed_files_json,
-                unrelated_changes_json, reviewer_json, status,
-                started_ms, completed_ms
-         FROM verification_record WHERE id = ?1",
-    )?;
-    let mut rows = stmt.query(params![record_id_raw])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    // The typed verdict IS the validation; only the raw columns are kept.
-    verification_record_map(row)?;
-    Ok(Some(PreparedRecordShape {
-        task_id: row.get(1)?,
-        revision: row.get(2)?,
-        workspace_id: row.get(3)?,
-        worktree_id: row.get(4)?,
-        criteria_json: row.get(6)?,
-        checks_json: row.get(7)?,
-        changed_files_json: row.get(8)?,
-        unrelated_changes_json: row.get(9)?,
-        reviewer_json: row.get(10)?,
-        status: row.get(11)?,
-    }))
+/// The caller-side scoped completion-record verdict (schema v43). A foreign
+/// session's row folds into `Missing` (non-leaking); an unbound pre-v43 row
+/// and a caller-session/workspace disagreement stay typed so completion can
+/// refuse them explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparedCompletionRecord {
+    Prepared(PreparedRecordShape),
+    Missing,
+    UnboundLegacy,
+    ScopeMismatch,
 }
 
-/// The completion transaction's CAS: re-read the durable record and demand
-/// byte/scalar equality with every prepared column. `false` when nothing was
-/// prepared (no row at validation time) or when the row changed — including
-/// the legal `Running -> Passed` finalize racing the caller — and the job maps
-/// it to the prepared typed conflict. SQL and binds only: this runs on the
-/// writer owner and must not decode, parse, format or allocate.
+/// Read one `verification_record` row IN THE CALLER'S SESSION SCOPE and run
+/// the full typed decode ([`verification_record_map`]) on the caller's
+/// thread: JSON parse failures, `deny_unknown_fields` shape violations and
+/// invalid ids/statuses surface as the mapper's typed [`StoreError::Corrupt`]
+/// labels, exactly as they did when the decode ran inside the completion
+/// transaction. A row owned by another session is `Missing`; an unbound
+/// legacy row and a workspace-mismatched caller row are typed misses. The
+/// scoped query joins the owning session and requires the record's workspace
+/// to equal that session's workspace.
+pub(crate) fn read_and_validate_completion_record(
+    conn: &Connection,
+    session_id_raw: i64,
+    record_id_raw: i64,
+) -> StoreResult<PreparedCompletionRecord> {
+    let mut stmt = conn.prepare(
+        "SELECT vr.id, vr.task_id, vr.revision, vr.workspace_id, vr.worktree_id, vr.tree_hash,
+                vr.criteria_json, vr.checks_json, vr.changed_files_json,
+                vr.unrelated_changes_json, vr.reviewer_json, vr.status,
+                vr.started_ms, vr.completed_ms, vr.session_id
+           FROM verification_record vr
+           JOIN session s ON s.id = vr.session_id
+          WHERE vr.id = ?2 AND vr.session_id = ?1 AND s.workspace_id = vr.workspace_id",
+    )?;
+    let mut rows = stmt.query(params![session_id_raw, record_id_raw])?;
+    if let Some(row) = rows.next()? {
+        // The typed verdict IS the validation; only the raw columns are kept.
+        verification_record_map(row)?;
+        return Ok(PreparedCompletionRecord::Prepared(PreparedRecordShape {
+            session_id: row.get(14)?,
+            task_id: row.get(1)?,
+            revision: row.get(2)?,
+            workspace_id: row.get(3)?,
+            worktree_id: row.get(4)?,
+            criteria_json: row.get(6)?,
+            checks_json: row.get(7)?,
+            changed_files_json: row.get(8)?,
+            unrelated_changes_json: row.get(9)?,
+            reviewer_json: row.get(10)?,
+            status: row.get(11)?,
+        }));
+    }
+    let raw: Option<(Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT session_id, workspace_id FROM verification_record WHERE id = ?1",
+            params![record_id_raw],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let caller_workspace: Option<i64> = conn
+        .query_row(
+            "SELECT workspace_id FROM session WHERE id = ?1",
+            params![session_id_raw],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match raw {
+        None => PreparedCompletionRecord::Missing,
+        Some((None, _)) => PreparedCompletionRecord::UnboundLegacy,
+        Some((Some(owner), _)) if owner != session_id_raw => PreparedCompletionRecord::Missing,
+        Some((Some(_), workspace)) if Some(workspace) != caller_workspace => {
+            PreparedCompletionRecord::ScopeMismatch
+        }
+        Some((Some(_), _)) => PreparedCompletionRecord::ScopeMismatch,
+    })
+}
+
+/// The completion transaction's CAS: re-read the durable record IN SCOPE and
+/// demand byte/scalar equality with every prepared column. `false` when
+/// nothing was prepared (no row at validation time) or when the row changed —
+/// including the legal `Running -> Passed` finalize racing the caller — and
+/// the job maps it to the prepared typed conflict. SQL and binds only: this
+/// runs on the writer owner and must not decode, parse, format or allocate.
 pub(crate) fn record_unchanged(
     conn: &Connection,
+    session_id_raw: i64,
     record_id_raw: i64,
     prepared: Option<&PreparedRecordShape>,
 ) -> StoreResult<bool> {
@@ -96,14 +139,15 @@ pub(crate) fn record_unchanged(
         return Ok(false);
     };
     let mut stmt = conn.prepare(
-        "SELECT task_id = ?2 AND revision = ?3 AND workspace_id = ?4
-                AND worktree_id = ?5 AND criteria_json = ?6 AND checks_json = ?7
-                AND changed_files_json = ?8 AND unrelated_changes_json = ?9
-                AND reviewer_json IS ?10 AND status = ?11
-         FROM verification_record WHERE id = ?1",
+        "SELECT task_id = ?3 AND revision = ?4 AND workspace_id = ?5
+                AND worktree_id = ?6 AND criteria_json = ?7 AND checks_json = ?8
+                AND changed_files_json = ?9 AND unrelated_changes_json = ?10
+                AND reviewer_json IS ?11 AND status = ?12 AND session_id = ?2
+         FROM verification_record WHERE id = ?1 AND session_id = ?2",
     )?;
     let mut rows = stmt.query(params![
         record_id_raw,
+        session_id_raw,
         p.task_id,
         p.revision,
         p.workspace_id,
@@ -184,6 +228,7 @@ mod tests {
     fn passing_record(task: &TaskRow, ws: WorkspaceId, wt: WorktreeId) -> VerificationRecordRow {
         VerificationRecordRow {
             id: VerificationRecordId::new(1),
+            session_id: Some(task.session_id),
             task_id: task.task_id,
             revision: task.revision,
             workspace_id: ws,
@@ -258,7 +303,7 @@ mod tests {
                 ),
                 other => panic!("{column}: wrong-shape JSON must refuse Corrupt: {other:?}"),
             }
-            match store.verification_record_get(rec_id) {
+            match store.verification_record_get(s.id, rec_id) {
                 Err(StoreError::Corrupt(msgs)) => assert!(
                     msgs.iter().any(|m| m.contains(stem)),
                     "{column}: the typed mapper must agree: {msgs:?}"
@@ -339,7 +384,10 @@ mod tests {
         let task_row = store.get_task(s.id, task.task_id).unwrap().unwrap();
         assert_eq!(task_row.state, TaskState::Verifying, "zero task mutation");
         assert_eq!(task_row.revision, task.revision, "zero task mutation");
-        let record = store.verification_record_get(rec_id).unwrap().unwrap();
+        let record = store
+            .verification_record_get(s.id, rec_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             record.status,
             VerificationStatus::Passed,

@@ -1826,6 +1826,7 @@ mod tests {
         let db = dir.path().join("faktor-plus.db");
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::drop_verification_scope_for_rewind(&conn);
             conn.execute_batch(
                 "ALTER TABLE engineering_outcome RENAME TO engineering_outcome_head;
                  CREATE TABLE engineering_outcome (

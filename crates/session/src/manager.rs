@@ -686,23 +686,25 @@ impl SessionManager {
         crate::budget::BudgetState::from(self.budget_view(session, task_id).await)
     }
 
-    /// Every durable verification record of `task_id`
-    /// (`SessionHandle::list_verification_records` semantics — records are
-    /// keyed by the numeric task id), read off the pool. The v20 evidence
-    /// columns (environment fingerprint, candidate-proof reference) parse
-    /// exactly like the handle's synchronous read, so both surfaces return
-    /// byte-identical records.
+    /// Every durable verification record of `session`'s `task_id`, scoped by
+    /// the durable `(session_id, task_id)` owner relationship (schema v43),
+    /// read off the pool. The v20 evidence columns (environment fingerprint,
+    /// candidate-proof reference) parse exactly like the handle's synchronous
+    /// read, so both surfaces return byte-identical records. Another
+    /// session's same-numeric-id task and unbound legacy rows are
+    /// structurally excluded.
     pub async fn verification_records(
         &self,
-        _session: SessionId,
+        session: SessionId,
         task_id: TaskId,
     ) -> faktor_core::Result<Vec<crate::task::VerificationRecord>> {
         self.reads
             .submit_tagged(DbReadKind::Verification, move |store| {
-                let rows = match store.verification_record_list_by_task_with_evidence(task_id) {
-                    Ok(rows) => rows,
-                    Err(e) => return Err(crate::task::TaskError::from(e).into()),
-                };
+                let rows =
+                    match store.verification_record_list_by_task_with_evidence(session, task_id) {
+                        Ok(rows) => rows,
+                        Err(e) => return Err(crate::task::TaskError::from(e).into()),
+                    };
                 rows.into_iter()
                     .map(|(row, fingerprint_json, candidate_json)| {
                         crate::task::verification_record_from_row_with_evidence(

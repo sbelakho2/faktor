@@ -248,6 +248,7 @@ fn main() {
         let record_id = store
             .verification_record_put(&VerificationRecordRow {
                 id: Default::default(),
+                session_id: Some(sid),
                 task_id,
                 revision,
                 workspace_id: workspace,
