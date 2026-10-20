@@ -65,6 +65,13 @@ async fn scale_10k_forced_compactions() {
     let projection = projection();
     let target = 20_000usize;
     let mut history: Vec<RecentTurn> = (0..1_200).map(synthetic_turn).collect();
+    // A pre-existing summary must be carried VERBATIM forever: it must never
+    // be fed back into a summarizer (summary-of-summary drift).
+    let summary_text = "SUMMARY-v1: the parser is recursive descent; tests are green";
+    history.push(RecentTurn {
+        role: "summary".into(),
+        text: summary_text.into(),
+    });
     let mut next_turn = history.len();
     let mut total_compact_us = 0u128;
     let mut total_write_us = 0u128;
