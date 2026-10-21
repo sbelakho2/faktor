@@ -22,13 +22,14 @@
 //!
 //! ```text
 //! <data-dir>/approval/ledger.jsonl      append-only request/decision chain
+//! <data-dir>/approval/ledger.head       committed tail anchor (anti-truncation)
 //! <data-dir>/approval/operators.json    human-operator public-key registry
 //! <data-dir>/approval/operators/*.key   owner-only (0600) signing seeds
 //! ```
 //!
 //! Every ledger entry commits to the previous digest, its sequence number
-//! and the canonical JSON body; re-opening verifies the whole chain and
-//! refuses typed on corruption. The decision signature commits to the
+//! and the canonical JSON body; re-opening verifies the whole chain and the
+//! committed head, and refuses typed on corruption or tail truncation. The decision signature commits to the
 //! request digest, request id, outcome, human principal, rationale and
 //! decision time, so a decision cannot be replayed for another request or
 //! altered after the fact.

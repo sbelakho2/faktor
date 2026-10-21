@@ -256,6 +256,18 @@ impl ApprovalAuthority {
         ledger: &ApprovalLedger,
         now_ms: u64,
     ) -> Result<ApprovalToken, ApprovalError> {
+        let trusted = crate::operator::trusted_key_ids(&self.root)?;
+        let operators = load_registry(&self.root)?;
+        Self::evaluate_with_trust(request, ledger, now_ms, &trusted, &operators)
+    }
+
+    fn evaluate_with_trust(
+        request: &ApprovalRequest,
+        ledger: &ApprovalLedger,
+        now_ms: u64,
+        trusted: &BTreeSet<String>,
+        operators: &[crate::operator::RegisteredOperator],
+    ) -> Result<ApprovalToken, ApprovalError> {
         if now_ms > request.expires_at_ms {
             return Err(ApprovalError::Expired {
                 request_id: request.id.clone(),
@@ -269,7 +281,7 @@ impl ApprovalAuthority {
                 subject: request.subject.clone(),
             });
         };
-        self.verify_decision(request, decision)?;
+        verify_decision_with(request, decision, trusted, operators)?;
         match &decision.outcome {
             DecisionOutcome::Approved => ApprovalToken::from_verified(request, decision),
             DecisionOutcome::Denied { reason } => Err(ApprovalError::Denied {
@@ -337,8 +349,10 @@ impl ApprovalAuthority {
                 .cmp(&left.created_at_ms)
                 .then(right.id.cmp(&left.id))
         });
+        let trusted = crate::operator::trusted_key_ids(&self.root)?;
+        let operators = load_registry(&self.root)?;
         for request in requests {
-            match self.evaluate(request, &ledger, now_ms) {
+            match Self::evaluate_with_trust(request, &ledger, now_ms, &trusted, &operators) {
                 Ok(token) => return Ok(Some(token)),
                 Err(
                     ApprovalError::Pending { .. }
