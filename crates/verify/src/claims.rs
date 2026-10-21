@@ -756,6 +756,7 @@ mod tests {
                 detail: "passed".into(),
             }],
             proofs: Vec::new(),
+            binding_updates: Vec::new(),
         };
         let request = ClaimRequest::from_obligation(&obligation);
         assert_eq!(request.obligation_id, "po1:identity");

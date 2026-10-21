@@ -1278,8 +1278,11 @@ pub(crate) fn review_signals(
 }
 
 /// True when the bounded head looks like an unfinished body: a stub line
-/// ("...", "// todo: implement") or fewer than 60 chars of actual code
-/// (comment-only heads and tiny scaffolds count — they are placeholders).
+/// ("...", "// todo: implement"), a comment-only head, or a SHORT function
+/// declaration with a missing/unbalanced/empty body. A tiny but COMPLETE
+/// implementation (e.g. a one-expression helper) is not a placeholder: the
+/// old "fewer than 60 code chars" rule blocked legitimate small changes in
+/// a rename task.
 pub(crate) fn review_placeholder(head: &str) -> bool {
     if head.lines().any(|l| {
         let t = l.trim().to_lowercase();
@@ -1287,7 +1290,33 @@ pub(crate) fn review_placeholder(head: &str) -> bool {
     }) {
         return true;
     }
-    review_code_chars(head) < 60
+    let code_chars = review_code_chars(head);
+    if code_chars == 0 {
+        return true;
+    }
+    // A truncated head cannot prove structural completeness either way.
+    if code_chars >= 60 || head.chars().count() >= REVIEW_HEAD_CHARS {
+        return false;
+    }
+    let has_fn = head.contains("fn ")
+        || head.contains("def ")
+        || head.contains("function ")
+        || head.contains("func ");
+    if !has_fn {
+        return false;
+    }
+    let opens = head.chars().filter(|c| *c == '{').count();
+    let closes = head.chars().filter(|c| *c == '}').count();
+    if opens == 0 || opens > closes {
+        return true;
+    }
+    // Balanced body: an EMPTY body is still a scaffold.
+    head.split_once('{')
+        .map(|(_, rest)| {
+            let body = rest.rsplit_once('}').map(|(body, _)| body).unwrap_or(rest);
+            !body.chars().any(|c| c.is_ascii_alphanumeric())
+        })
+        .unwrap_or(false)
 }
 
 /// Non-comment code characters in the head (whitespace dropped, inline "//"

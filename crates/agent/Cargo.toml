@@ -15,6 +15,7 @@ faktor-provider.workspace = true
 faktor-scheduler.workspace = true
 faktor-sandbox.workspace = true
 faktor-fs.workspace = true
+faktor-git.workspace = true
 faktor-edit.workspace = true
 faktor-snapshot.workspace = true
 faktor-terminal.workspace = true

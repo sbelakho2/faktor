@@ -120,6 +120,7 @@ pub(crate) use settlement::*;
 mod compaction;
 mod contract_compiler;
 mod contract_eval;
+mod test_rebind;
 pub(crate) use compaction::*;
 mod verification_attribution;
 pub use verification_attribution::*;

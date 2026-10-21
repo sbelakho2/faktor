@@ -34,8 +34,8 @@ use crate::inventory::{
     probe_manifest_text, CandidateGeneration, ManifestProbe, ManifestProbeRefusal,
 };
 use crate::{
-    compileall_token, is_test_related, rust_test_filter, under_dir, MAX_CHECKS,
-    MAX_SIMULTANEOUS_JOBS, MAX_TOTAL_WALL_BUDGET,
+    compileall_token, is_test_related, under_dir, MAX_CHECKS, MAX_SIMULTANEOUS_JOBS,
+    MAX_TOTAL_WALL_BUDGET,
 };
 
 /// The language families a component may contain.
@@ -1186,35 +1186,24 @@ fn derive_cargo(
         .filter(|file| is_test_related(file))
         .cloned()
         .collect();
-    if let Some(first) = test_related.first() {
-        if let Some(stem) = rust_test_filter(first) {
-            push_check(
-                out,
-                component,
-                &format!("rust_test:{stem}"),
-                CheckKind::Test,
-                CheckCategory::Unit,
-                "cargo",
-                &["test", &stem],
-                test_related,
-                true,
-            );
-        }
-    } else if let Some(workspace_root) = workspace_root {
-        // INLINE tests in a non-test-named source file (the common
-        // `#[cfg(test)] mod tests` layout): the contract compiler discovers
-        // these selectors and binds required test-execution obligations to
-        // them. Without a derived `cargo test <selector>` the obligation can
-        // never be discharged and a correct change blocks forever. Read only
-        // the changed Rust files, bounded by count and bytes; the shared
-        // parser is the one the contract compiler uses, so demanded and
-        // executable selectors cannot drift.
-        const MAX_INLINE_TEST_FILES: usize = 64;
-        const MAX_INLINE_TEST_FILE_BYTES: u64 = 1024 * 1024;
-        const MAX_INLINE_TEST_CHECKS: usize = 16;
-        let mut selectors: Vec<String> = Vec::new();
+    if let Some(workspace_root) = workspace_root {
+        // Exact, EXECUTABLE test selectors (the shared core inventory): a
+        // changed test file derives one required `cargo test` check per
+        // declared test, so a passing check proves that test RAN. A
+        // file-stem filter alone can run zero tests (libtest filters by test
+        // NAME, not by target) and would discharge proof vacuously.
+        const MAX_SCAN_TEST_FILES: usize = 64;
+        const MAX_TEST_FILE_BYTES: u64 = 1024 * 1024;
+        const MAX_EXACT_TEST_CHECKS: usize = 16;
+        let scan: &[String] = if test_related.is_empty() {
+            &rust
+        } else {
+            &test_related
+        };
         let component_root = workspace_root.join(&component.root);
-        for file in rust.iter().take(MAX_INLINE_TEST_FILES) {
+        let mut declarations: Vec<(faktor_core::contract_compile::RustTestDeclaration, String)> =
+            Vec::new();
+        for file in scan.iter().take(MAX_SCAN_TEST_FILES) {
             // Changed paths may arrive absolute (the shadow root of an
             // isolated drive) or workspace-relative. Normalize to the
             // component-relative spelling the selector parser understands.
@@ -1225,45 +1214,69 @@ fn derive_cargo(
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
-            if meta.len() > MAX_INLINE_TEST_FILE_BYTES {
+            if meta.len() > MAX_TEST_FILE_BYTES {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let relative = relative.to_string_lossy();
-            for selector in
-                faktor_core::contract_compile::rust_test_selectors_for_path(&relative, &content)
+            let relative = relative.to_string_lossy().to_string();
+            for declaration in
+                faktor_core::contract_compile::rust_test_declarations_for_path(&relative, &content)
             {
-                if !selectors.contains(&selector) {
-                    selectors.push(selector);
+                if !declarations
+                    .iter()
+                    .any(|(existing, _)| existing.selector == declaration.selector)
+                {
+                    declarations.push((declaration, relative.clone()));
                 }
             }
         }
-        selectors.sort();
-        selectors.dedup();
-        let discovered = !selectors.is_empty();
-        for selector in selectors.into_iter().take(MAX_INLINE_TEST_CHECKS) {
-            push_check(
-                out,
-                component,
-                &format!("rust_test:{selector}"),
-                CheckKind::Test,
-                CheckCategory::Unit,
-                "cargo",
-                &["test", selector.as_str()],
-                rust.clone(),
-                true,
-            );
-        }
-        if !discovered {
-            // No inline selectors in the CHANGED file, but the component's
-            // integration tests (`tests/*.rs`) and any model-added tests are
-            // still part of the change's contract. `--lib` skipped them, so
-            // a verified candidate could carry a failing integration test
-            // (observed: a config migration passed `--lib` while
-            // tests/config.rs failed five assertions). `--tests` runs every
-            // test target; the check is REQUIRED.
+        declarations.sort_by(|a, b| a.0.selector.cmp(&b.0.selector));
+        declarations.dedup_by(|a, b| a.0.selector == b.0.selector);
+        let exact: Vec<_> = declarations
+            .into_iter()
+            .take(MAX_EXACT_TEST_CHECKS)
+            .collect();
+        if !exact.is_empty() {
+            for (declaration, relative) in exact {
+                let base_id = format!("rust_test:{}", declaration.selector);
+                let affects: Vec<String> = if test_related.is_empty() {
+                    rust.clone()
+                } else {
+                    vec![relative]
+                };
+                if let Some(target) = declaration.target.as_deref() {
+                    push_check(
+                        out,
+                        component,
+                        &base_id,
+                        CheckKind::Test,
+                        CheckCategory::Unit,
+                        "cargo",
+                        &["test", "--test", target, declaration.executable.as_str()],
+                        affects,
+                        true,
+                    );
+                } else {
+                    push_check(
+                        out,
+                        component,
+                        &base_id,
+                        CheckKind::Test,
+                        CheckCategory::Unit,
+                        "cargo",
+                        &["test", declaration.selector.as_str()],
+                        affects,
+                        true,
+                    );
+                }
+            }
+        } else {
+            // No executable selector could be discovered from the CHANGED
+            // files, but the component's integration tests and any
+            // model-added tests are still part of the change's contract: run
+            // every test target REQUIRED (never a vacuous file-stem filter).
             push_check(
                 out,
                 component,
@@ -1272,7 +1285,11 @@ fn derive_cargo(
                 CheckCategory::Unit,
                 "cargo",
                 &["test", "--tests"],
-                Vec::new(),
+                if test_related.is_empty() {
+                    Vec::new()
+                } else {
+                    test_related.clone()
+                },
                 true,
             );
         }
@@ -2485,6 +2502,37 @@ mod tests {
             ]
         );
         assert!(integration.required);
+    }
+
+    #[test]
+    fn a_changed_integration_test_file_derives_the_exact_executable_selector() {
+        let (dir, files) = fixture(&[
+            ("Cargo.toml", "[package]\nname = \"root\"\n"),
+            ("src/lib.rs", "pub fn total() -> i64 { 3 }\n"),
+            (
+                "tests/cart.rs",
+                "#[test]\nfn totals_add_up() { assert_eq!(1 + 1, 2); }\n",
+            ),
+        ]);
+        let profile = detect_project_profile(dir.path(), &files);
+        let checks =
+            derive_checks_at_root(&profile, &[PathBuf::from("tests/cart.rs")], dir.path()).unwrap();
+        let test = checks
+            .iter()
+            .find(|spec| spec.id == "rust_test:cart::totals_add_up")
+            .unwrap_or_else(|| panic!("exact integration test check missing: {checks:?}"));
+        assert_eq!(test.kind, CheckKind::Test);
+        assert!(test.required);
+        assert_eq!(
+            test.args,
+            vec![
+                std::ffi::OsString::from("test"),
+                std::ffi::OsString::from("--test"),
+                std::ffi::OsString::from("cart"),
+                std::ffi::OsString::from("totals_add_up"),
+            ],
+            "the check must run the test by its libtest name, not a vacuous stem filter"
+        );
     }
 
     #[test]

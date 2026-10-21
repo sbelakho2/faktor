@@ -36,6 +36,10 @@ pub const MAX_EVIDENCE_BINDING_TARGET_BYTES: usize = 512;
 /// Hard bound on the proof records one obligation may carry (oldest records
 /// are dropped when a fresh proof is recorded).
 pub const MAX_PROOF_RECORDS: usize = 8;
+/// Hard bound on the proven binding updates one obligation may carry.
+pub const MAX_BINDING_UPDATES: usize = 8;
+/// Hard bound on one binding-update basis string (UTF-8 bytes).
+pub const MAX_BINDING_UPDATE_BASIS_BYTES: usize = 512;
 
 // ------------------------------------------------------------------ claims
 
@@ -298,6 +302,22 @@ impl EvidenceBinding {
 
 fn sets_intersect(a: &[String], b: &[String]) -> bool {
     !a.is_empty() && !b.is_empty() && a.iter().any(|x| b.iter().any(|y| x == y))
+}
+
+/// One PROVEN binding update recorded on a proof obligation (the
+/// proof/evidence ledger's provenance row): the old binding, the new binding
+/// and the deterministic basis that authorized the change. A binding update
+/// is never a hint: it is written only when a real authority proved the
+/// old→new rename edge (git rename detection / impact or LSP symbol
+/// relationship / verification inventory) and the match was unique.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingUpdate {
+    pub old_binding: EvidenceBinding,
+    pub new_binding: EvidenceBinding,
+    /// Bounded machine-readable basis (`git_rename:...`,
+    /// `same_target:...`, `inventory_rename:...`).
+    pub basis: String,
 }
 
 // -------------------------------------------------------- evidence & origins
@@ -593,6 +613,10 @@ pub struct ProofObligation {
     /// bases demonstrably survives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proofs: Vec<ProofRecord>,
+    /// Proven binding updates (old→new + basis). Append-only provenance:
+    /// a rebind is only recorded after an authority proved the mapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_updates: Vec<BindingUpdate>,
 }
 
 impl ProofObligation {
@@ -665,6 +689,46 @@ impl ProofObligation {
         }
     }
 
+    /// Rebind this obligation to a PROVEN new evidence binding (a renamed
+    /// test selector). The update is appended to the provenance ledger; the
+    /// prior evaluation state and proof records are INVALIDATED (they were
+    /// established against the old binding and must never silently satisfy
+    /// the new one). The claim text is re-pointed at the new selector when it
+    /// names the old one. Returns `false` when the binding is unchanged.
+    pub fn rebind_evidence_binding(&mut self, new_binding: EvidenceBinding, basis: String) -> bool {
+        if self.evidence_binding == new_binding {
+            return false;
+        }
+        let old_binding = self.evidence_binding.clone();
+        if let (Some(old), Some(new)) = (
+            old_binding.selector().map(str::to_string),
+            new_binding.selector().map(str::to_string),
+        ) {
+            if old != new {
+                self.claim = self.claim.replace(&old, &new);
+            }
+        }
+        let mut basis = basis;
+        while basis.len() > MAX_BINDING_UPDATE_BASIS_BYTES {
+            basis.pop();
+        }
+        self.binding_updates.push(BindingUpdate {
+            old_binding,
+            new_binding: new_binding.clone(),
+            basis,
+        });
+        if self.binding_updates.len() > MAX_BINDING_UPDATES {
+            let excess = self.binding_updates.len() - MAX_BINDING_UPDATES;
+            self.binding_updates.drain(..excess);
+        }
+        self.evidence_binding = new_binding;
+        self.state = ClaimState::Unknown;
+        self.confidence_bps = None;
+        self.evidence_refs.clear();
+        self.proofs.clear();
+        true
+    }
+
     /// The newest record's staleness reason when the obligation carries a
     /// claim-grade state whose basis does not survive; `None` when the state
     /// is reusable, has no claim-grade state, or carries no records (an
@@ -708,6 +772,7 @@ impl ProofObligation {
             confidence_bps: None,
             evidence_refs: Vec::new(),
             proofs: Vec::new(),
+            binding_updates: self.binding_updates.clone(),
         }
     }
 }
@@ -874,6 +939,7 @@ impl EngineeringContract {
             confidence_bps: None,
             evidence_refs: Vec::new(),
             proofs: Vec::new(),
+            binding_updates: Vec::new(),
         }
     }
 

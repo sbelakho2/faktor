@@ -752,7 +752,9 @@ async fn completion_proof_spec_sections_map_to_code_paths() {
 #[tokio::test]
 async fn turn_verification_with_test_change_runs_both_required_checks_in_order() {
     // A change under tests/ derives TWO required checks (cargo check +
-    // cargo test <stem>); both run, in deterministic order.
+    // cargo test). The fixture's fake write tool leaves no readable test
+    // content, so derivation conservatively runs every test target rather
+    // than a vacuous file-stem filter; both run in deterministic order.
     let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls2 = calls.clone();
     let verifier = fake(move |cmd: &str| {
@@ -764,7 +766,10 @@ async fn turn_verification_with_test_change_runs_both_required_checks_in_order()
             ScriptedResponse::ToolCall {
                 id: "c1".into(),
                 name: "write_file".into(),
-                input: serde_json::json!({"path": "tests/foo.rs", "content": "x"}),
+                input: serde_json::json!({
+                    "path": "tests/foo.rs",
+                    "content": "#[test]\nfn foo_works() { assert!(true); }\n"
+                }),
             },
             ScriptedResponse::Text("done".into()),
             ScriptedResponse::End,
@@ -779,7 +784,7 @@ async fn turn_verification_with_test_change_runs_both_required_checks_in_order()
         .unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
-        vec!["cargo check".to_string(), "cargo test foo".to_string()],
+        vec!["cargo check".to_string(), "cargo test --tests".to_string()],
         "both required checks run in deterministic order"
     );
     assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
@@ -787,7 +792,7 @@ async fn turn_verification_with_test_change_runs_both_required_checks_in_order()
         outcome.verification,
         vec![
             ("rust_check".to_string(), true),
-            ("rust_test:foo".to_string(), true),
+            ("rust_test_workspace".to_string(), true),
         ]
     );
 }
@@ -3908,3 +3913,20 @@ async fn verification_job_resolve_loss_is_marked_and_reconstructed_on_reopen() {
 /// `use super::*`.
 #[path = "verification_attribution_more_tests.rs"]
 mod verification_attribution_more_tests;
+
+#[test]
+fn complete_tiny_function_is_not_a_placeholder() {
+    // A legitimate one-expression helper (the rename task's money.rs) is a
+    // COMPLETE body; the review must not flag it as a placeholder merely
+    // because it is short.
+    let head = "pub fn total_cents(cents: &[i64]) -> i64 {\n    cents.iter().sum()\n}\n";
+    let evidence = signals_for(&[("src/money.rs", head)]);
+    let f = &evidence["files"][0];
+    assert_eq!(f["placeholder_detected"], false, "{evidence}");
+    let verdict = review_verdict(&evidence, &[]);
+    assert!(blocking_of(&verdict).is_empty(), "{verdict}");
+    assert!(suspects_of(&verdict).is_empty(), "{verdict}");
+    // An actually empty body is still a placeholder.
+    let empty = signals_for(&[("src/empty.rs", "pub fn f() -> i64 {}\n")]);
+    assert_eq!(empty["files"][0]["placeholder_detected"], true, "{empty}");
+}

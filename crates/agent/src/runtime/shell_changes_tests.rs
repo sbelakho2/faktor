@@ -2287,3 +2287,125 @@ async fn provider_verdict_omitting_the_declared_subject_changes_no_proof_state()
         other => panic!("expected a blocked gate, got {other:?}"),
     }
 }
+
+/// Crash between the rename and the rebind: the candidate worktree moved a
+/// test file, the daemon restarted before any contract evaluation, and the
+/// next settlement must reconstruct the base/rename evidence from DURABLE
+/// state (git's run base + the candidate tree) and rebind the obligation.
+#[tokio::test]
+async fn crash_between_test_rename_and_rebind_recovers_durably() {
+    use faktor_verify::rebind::{rebind_test_obligations, TestRebindEvidence};
+    use std::process::Command;
+
+    let env = shell_env(vec![]);
+    let root = env.root.clone();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let before =
+        "#[test]\nfn totals_add_up() {\n    assert_eq!(compute_total(&[10, 20]), 30);\n}\n";
+    std::fs::write(root.join("tests/cart.rs"), before).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+
+    // The model renames the file AND the test symbol, then the daemon dies
+    // before contract evaluation. No rebinding row exists yet.
+    let after =
+        "#[test]\nfn total_cents_adds_up() {\n    assert_eq!(total_cents(&[10, 20]), 30);\n}\n";
+    std::fs::write(root.join("tests/cart_total.rs"), after).unwrap();
+    std::fs::remove_file(root.join("tests/cart.rs")).unwrap();
+    // The model staged the move before the crash; git's rename detection is
+    // the edge authority the resumed settlement consumes.
+    git(&["add", "-A"]);
+
+    // Crash/restart: a fresh manager/runtime over the SAME durable store.
+    let manager = env.manager.clone();
+    let session = env.session;
+    drop(env.deps);
+    drop(manager);
+    let manager2 = SessionManager::open(
+        env.dir.path().join("store"),
+        env.dir.path().join("cas"),
+        true,
+    )
+    .unwrap();
+    let runtime = AgentRuntime::new(deps_on_manager(manager2.clone(), vec![])).unwrap();
+    let handle = manager2.get_session(session).unwrap().unwrap();
+    let row = handle.row().unwrap();
+    let ws = runtime
+        .deps
+        .workspaces
+        .open(row.workspace_id, root.clone())
+        .unwrap();
+    let changed = vec![
+        "tests/cart.rs".to_string(),
+        "tests/cart_total.rs".to_string(),
+    ];
+    let evidence: TestRebindEvidence = runtime
+        .test_rebind_evidence(&handle, &ws, &changed, &root)
+        .await;
+    assert!(
+        evidence
+            .renames
+            .iter()
+            .any(|edge| edge.from == "tests/cart.rs" && edge.to == "tests/cart_total.rs"),
+        "git rename detection must survive the restart: {evidence:?}"
+    );
+    assert!(
+        evidence
+            .files
+            .iter()
+            .any(|file| file.path == "tests/cart.rs" && file.before.is_some()),
+        "the durable base side must survive the restart: {evidence:?}"
+    );
+    let mut contract = faktor_core::EngineeringContract {
+        proof_obligations: vec![faktor_core::EngineeringContract::obligation_bound(
+            "existing test `cart::totals_add_up` passes after the change",
+            faktor_core::ProofEvidenceKind::TestExecution,
+            faktor_core::ContractOrigin::Native,
+            faktor_core::Requirement::Required,
+            faktor_core::EvidenceBinding::TestSelectors(vec![
+                "cart::totals_add_up".into(),
+                "totals_add_up".into(),
+            ]),
+            faktor_core::AcceptedStrength::Supported,
+        )],
+        ..Default::default()
+    };
+    let outcome = rebind_test_obligations(
+        &mut contract,
+        "Rename compute_total to total_cents across the crate, including tests.",
+        &evidence,
+    );
+    assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
+    let update = &contract.proof_obligations[0].binding_updates[0];
+    assert!(
+        update
+            .basis
+            .contains("git_rename:tests/cart.rs->tests/cart_total.rs"),
+        "the git-proven rename edge must be recorded: {}",
+        update.basis
+    );
+    match &update.new_binding {
+        faktor_core::EvidenceBinding::TestSelectors(targets) => {
+            assert!(targets.contains(&"cart_total::total_cents_adds_up".to_string()));
+            assert!(targets.contains(&"total_cents_adds_up".to_string()));
+        }
+        other => panic!("expected a test-selector binding, got {other:?}"),
+    }
+}

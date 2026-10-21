@@ -59,6 +59,7 @@ pub mod inventory;
 pub mod manifest;
 pub mod native;
 pub mod provider;
+pub mod rebind;
 pub mod review;
 
 pub use claims::{

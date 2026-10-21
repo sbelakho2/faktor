@@ -2106,14 +2106,17 @@ impl AgentRuntime {
                 cancellation: cancel.clone(),
             }
         });
-        let contract_outcome = crate::runtime::contract_eval::evaluate_and_persist_contract(
-            handle,
-            &executed,
-            review.as_ref(),
-            candidate_snapshot.as_ref(),
-            provider_dispatch.as_ref(),
-        )
-        .await;
+        let rebind_evidence = self.test_rebind_evidence(handle, &ws, changed, &root).await;
+        let contract_outcome =
+            crate::runtime::contract_eval::evaluate_and_persist_contract_with_rebind(
+                handle,
+                &executed,
+                review.as_ref(),
+                candidate_snapshot.as_ref(),
+                provider_dispatch.as_ref(),
+                Some(&rebind_evidence),
+            )
+            .await;
         if let Some(detail) = crate::runtime::contract_eval::replan_detail(&contract_outcome) {
             self.dw_note_ledger_decision(
                 handle,

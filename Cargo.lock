@@ -863,6 +863,7 @@ dependencies = [
  "faktor-core",
  "faktor-edit",
  "faktor-fs",
+ "faktor-git",
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",

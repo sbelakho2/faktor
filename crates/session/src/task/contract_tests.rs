@@ -419,6 +419,94 @@ fn contract_merge_unions_by_id_preserves_state_is_idempotent_and_durable() {
 }
 
 #[test]
+fn proven_test_selector_rebindings_are_durable_idempotent_and_chain_checked() {
+    use faktor_core::contract::{
+        AcceptedStrength, ClaimState, ContractOrigin, EvidenceBinding, ProofEvidenceKind,
+        ProofObligation, Requirement,
+    };
+    let (dir, m) = test_manager();
+    let s = session(&m);
+    let task_id = s.task_id().unwrap();
+    let mut seed = task(&s);
+    let old_binding =
+        EvidenceBinding::TestSelectors(vec!["cart::totals_add_up".into(), "totals_add_up".into()]);
+    seed.contract = EngineeringContract {
+        proof_obligations: vec![EngineeringContract::obligation_bound(
+            "existing test `cart::totals_add_up` passes after the change",
+            ProofEvidenceKind::TestExecution,
+            ContractOrigin::Native,
+            Requirement::Required,
+            old_binding.clone(),
+            AcceptedStrength::Supported,
+        )],
+        ..Default::default()
+    };
+    let created = s.create_task(seed).unwrap();
+    let revision = s.task_revision(task_id).unwrap();
+    let new_binding = EvidenceBinding::TestSelectors(vec![
+        "cart::total_cents_adds_up".into(),
+        "total_cents_adds_up".into(),
+    ]);
+    let mut update: ProofObligation = created.contract.proof_obligations[0].clone();
+    assert!(update.rebind_evidence_binding(
+        new_binding.clone(),
+        "match:unique;body:equivalent;same_target:tests/cart.rs;cart::totals_add_up->cart::total_cents_adds_up".into(),
+    ));
+    let updated = s
+        .apply_task_contract_rebindings(task_id, std::slice::from_ref(&update))
+        .unwrap();
+    assert_eq!(s.task_revision(task_id).unwrap().raw(), revision.raw() + 1);
+    let obligation = &updated.contract.proof_obligations[0];
+    assert_eq!(obligation.evidence_binding, new_binding);
+    assert_eq!(obligation.binding_updates.len(), 1);
+    assert_eq!(obligation.binding_updates[0].old_binding, old_binding);
+    assert_eq!(obligation.state, ClaimState::Unknown);
+    assert!(obligation.proofs.is_empty() && obligation.evidence_refs.is_empty());
+    assert!(obligation.claim.contains("cart::total_cents_adds_up"));
+
+    // Crash-recovery replay: the identical update is an idempotent no-op.
+    let replayed = s
+        .apply_task_contract_rebindings(task_id, std::slice::from_ref(&update))
+        .unwrap();
+    assert_eq!(s.task_revision(task_id).unwrap().raw(), revision.raw() + 1);
+    assert_eq!(replayed.contract, updated.contract);
+
+    // The rebinding is DURABLE across a store reopen (a crash between the
+    // rename and the evaluation resumes from the persisted ledger).
+    drop(s);
+    drop(m);
+    let m2 = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let s2 = m2.get_session(created.session_id).unwrap().unwrap();
+    let reopened = s2.get_task(task_id).unwrap().unwrap();
+    assert_eq!(
+        reopened.contract.proof_obligations[0].evidence_binding,
+        new_binding
+    );
+    assert_eq!(
+        reopened.contract.proof_obligations[0].binding_updates.len(),
+        1
+    );
+
+    // A rebind can never smuggle a supported state.
+    let mut supported = update.clone();
+    supported.state = ClaimState::Supported;
+    supported.confidence_bps = Some(8_000);
+    assert!(matches!(
+        s2.apply_task_contract_rebindings(task_id, &[supported])
+            .unwrap_err(),
+        TaskError::Malformed(_)
+    ));
+    // An unrelated binding rewrite (no ledger extension) is refused.
+    let mut unproven: ProofObligation = reopened.contract.proof_obligations[0].clone();
+    unproven.evidence_binding = EvidenceBinding::TestSelector("attacker::test".into());
+    assert!(matches!(
+        s2.apply_task_contract_rebindings(task_id, &[unproven])
+            .unwrap_err(),
+        TaskError::Malformed(_)
+    ));
+}
+
+#[test]
 fn obligation_state_updates_are_idempotent_evidence_preserving_and_bounded() {
     use faktor_core::contract::{
         ClaimState, ContractOrigin, EvidenceRef, ProofEvidenceKind, ProofObligation,

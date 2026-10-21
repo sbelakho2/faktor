@@ -237,6 +237,7 @@ impl KiwiJob {
                 confidence_bps: None,
                 evidence_refs: Vec::new(),
                 proofs: Vec::new(),
+                binding_updates: Vec::new(),
             })
             .collect();
         let job = Self {

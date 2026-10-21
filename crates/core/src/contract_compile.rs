@@ -2073,9 +2073,69 @@ pub fn rust_test_selectors_for_path(path: &str, content: &str) -> Vec<String> {
         .collect()
 }
 
+/// One discovered Rust test declaration. `selector` is the semantic
+/// module-qualified identity recorded on the contract; `executable` is the
+/// libtest filter name that actually runs it (`cargo test --test <target>
+/// <executable>` for integration targets, `cargo test <selector>` for unit
+/// tests); `body` is the bounded function body used by proof rebinding to
+/// prove a symbol rename. `target` is the integration test target (file
+/// stem) when the declaration lives in `tests/<name>.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustTestDeclaration {
+    pub selector: String,
+    pub executable: String,
+    pub target: Option<String>,
+    pub body: String,
+}
+
+/// Discover the Rust test declarations authored in ONE file. This is the
+/// shared authority for the contract compiler, the verifier's derived test
+/// checks and proof rebinding: a selector the contract demands and a
+/// selector the verifier executes can never drift.
+pub fn rust_test_declarations_for_path(path: &str, content: &str) -> Vec<RustTestDeclaration> {
+    if !path.ends_with(".rs") || content.len() > MAX_FILE_CONTENT_BYTES {
+        return Vec::new();
+    }
+    let Some(module) = rust_module_path(path) else {
+        return Vec::new();
+    };
+    let target = rust_integration_target(path);
+    let mut out = Vec::new();
+    for declaration in extract_test_declarations(&module, content) {
+        if declaration.selector.len() > MAX_SELECTOR_BYTES {
+            continue;
+        }
+        let executable = match &target {
+            Some(target) => declaration
+                .selector
+                .strip_prefix(&format!("{target}::"))
+                .unwrap_or(&declaration.selector)
+                .to_string(),
+            None => declaration.selector.clone(),
+        };
+        if executable.is_empty() || executable.len() > MAX_SELECTOR_BYTES {
+            continue;
+        }
+        out.push(RustTestDeclaration {
+            selector: declaration.selector,
+            executable,
+            target: target.clone(),
+            body: declaration.body,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.selector
+            .cmp(&b.selector)
+            .then_with(|| a.executable.cmp(&b.executable))
+    });
+    out.dedup_by(|a, b| a.selector == b.selector && a.executable == b.executable);
+    out
+}
+
 /// One discovered test selector.
 struct DiscoveredTest {
     selector: String,
+    executable: String,
     path: String,
 }
 
@@ -2088,25 +2148,15 @@ struct DiscoveredTest {
 fn discover_test_selectors(files: &[&RepositoryFile]) -> Vec<DiscoveredTest> {
     let mut out: Vec<DiscoveredTest> = Vec::new();
     for file in files {
-        if !file.path.ends_with(".rs") {
-            continue;
-        }
         let Some(content) = &file.content else {
             continue;
         };
-        if content.len() > MAX_FILE_CONTENT_BYTES {
-            continue;
-        }
-        let Some(module) = rust_module_path(&file.path) else {
-            continue;
-        };
-        for selector in extract_test_selectors(&module, content) {
-            if selector.len() <= MAX_SELECTOR_BYTES {
-                out.push(DiscoveredTest {
-                    selector,
-                    path: file.path.clone(),
-                });
-            }
+        for declaration in rust_test_declarations_for_path(&file.path, content) {
+            out.push(DiscoveredTest {
+                selector: declaration.selector,
+                executable: declaration.executable,
+                path: file.path.clone(),
+            });
         }
     }
     out.sort_by(|a, b| {
@@ -2119,16 +2169,23 @@ fn discover_test_selectors(files: &[&RepositoryFile]) -> Vec<DiscoveredTest> {
     out
 }
 
-/// The cargo test selector binding for one discovered test: the exact
-/// selector, plus the runtime's derived test filter (the sanitized file stem)
-/// WHEN the selector provably contains it — `cargo test <filter>` runs every
-/// test whose name contains the filter, so the coarse filter genuinely
-/// exercises the claimed test (and the native runtime derives exactly that
-/// filter for the changed file).
+/// The cargo test selector binding for one discovered test: the semantic
+/// selector, the EXECUTABLE libtest filter that actually runs it, and the
+/// runtime's derived file-stem filter only when that filter is genuinely a
+/// substring of the executable test name (`cargo test <filter>` only runs a
+/// test whose NAME contains the filter; a file-stem filter on an integration
+/// test whose function name differs would run zero tests and must never
+/// discharge the claim).
 fn selector_binding(test: &DiscoveredTest) -> EvidenceBinding {
     let mut targets = vec![test.selector.clone()];
+    if test.executable != test.selector {
+        targets.push(test.executable.clone());
+    }
     if let Some(filter) = rust_test_filter(&test.path) {
-        if filter != test.selector && test.selector.contains(&filter) {
+        if filter != test.selector
+            && test.executable.contains(&filter)
+            && !targets.contains(&filter)
+        {
             targets.push(filter);
         }
     }
@@ -2152,6 +2209,23 @@ fn rust_test_filter(path: &str) -> Option<String> {
     clean.then(|| stem.to_string())
 }
 
+/// The integration test target (file stem) of a top-level
+/// `tests/<name>.rs` (or `<pkg>/tests/<name>.rs`) file. Nested test files
+/// are not cargo targets.
+fn rust_integration_target(path: &str) -> Option<String> {
+    let stem = path.strip_suffix(".rs")?;
+    let rest = if let Some(rest) = stem.strip_prefix("tests/") {
+        rest
+    } else {
+        let index = stem.rfind("/tests/")?;
+        &stem[index + 7..]
+    };
+    if rest.contains('/') || rest.is_empty() {
+        return None;
+    }
+    is_ident(rest).then(|| rest.to_string())
+}
+
 /// The module path of one Rust file (`None` when the layout is unknown):
 /// * top-level integration targets `tests/<name>.rs` (and `<pkg>/tests/...`)
 ///   yield `<name>`;
@@ -2159,18 +2233,10 @@ fn rust_test_filter(path: &str) -> Option<String> {
 ///   `lib.rs` / `main.rs` / `mod.rs`), empty for the crate root;
 /// * anything else is unknown and yields no selectors.
 fn rust_module_path(path: &str) -> Option<Vec<String>> {
-    let stem = path.strip_suffix(".rs")?;
-    let tests_rest = if let Some(rest) = stem.strip_prefix("tests/") {
-        Some(rest)
-    } else {
-        stem.rfind("/tests/").map(|index| &stem[index + 7..])
-    };
-    if let Some(rest) = tests_rest {
-        if rest.contains('/') || rest.is_empty() {
-            return None;
-        }
-        return is_ident(rest).then(|| vec![rest.to_string()]);
+    if let Some(target) = rust_integration_target(path) {
+        return Some(vec![target]);
     }
+    let stem = path.strip_suffix(".rs")?;
     let below_src = if let Some(index) = stem.rfind("/src/") {
         &stem[index + 5..]
     } else {
@@ -2199,13 +2265,21 @@ fn is_ident(value: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Extract the test selectors of one Rust file: `module::inline_mods::fn`.
-fn extract_test_selectors(module: &[String], content: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// One test declaration extracted from a single source file.
+struct ExtractedTest {
+    selector: String,
+    body: String,
+}
+
+/// Extract the test declarations of one Rust file: `module::inline_mods::fn`
+/// plus the bounded body used to prove a symbol rename.
+fn extract_test_declarations(module: &[String], content: &str) -> Vec<ExtractedTest> {
+    let lines: Vec<&str> = content.lines().take(MAX_SCAN_LINES).collect();
+    let mut out: Vec<ExtractedTest> = Vec::new();
     let mut mods: Vec<(String, i32)> = Vec::new();
     let mut depth: i32 = 0;
     let mut pending_test_attr = false;
-    for line in content.lines().take(MAX_SCAN_LINES) {
+    for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         if is_test_attribute(trimmed) {
             pending_test_attr = true;
@@ -2216,7 +2290,10 @@ fn extract_test_selectors(module: &[String], content: &str) -> Vec<String> {
                 let mut parts = module.to_vec();
                 parts.extend(mods.iter().map(|(name, _)| name.clone()));
                 parts.push(name);
-                out.push(parts.join("::"));
+                out.push(ExtractedTest {
+                    selector: parts.join("::"),
+                    body: rust_test_body(&lines, index),
+                });
             }
             if !trimmed.is_empty() && !trimmed.starts_with("//") {
                 pending_test_attr = false;
@@ -2234,9 +2311,50 @@ fn extract_test_selectors(module: &[String], content: &str) -> Vec<String> {
             }
         }
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| a.selector.cmp(&b.selector));
+    out.dedup_by(|a, b| a.selector == b.selector);
     out
+}
+
+/// The bounded body of the function starting at `start`: everything after
+/// the first opening brace through the matching closing brace. Malformed /
+/// unterminated declarations yield the text seen (never a panic).
+fn rust_test_body(lines: &[&str], start: usize) -> String {
+    let mut body = String::new();
+    let mut depth = 0i32;
+    let mut opened = false;
+    for line in lines.iter().skip(start) {
+        body.push_str(line);
+        body.push('\n');
+        let delta = brace_delta(line);
+        if !opened {
+            if line.contains('{') {
+                opened = true;
+                depth = delta;
+                if depth <= 0 {
+                    break;
+                }
+            }
+        } else {
+            depth += delta;
+            if depth <= 0 {
+                break;
+            }
+        }
+    }
+    match body.find('{') {
+        Some(index) => body[index + 1..].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Extract only the test selectors of one Rust file (the semantic identity
+/// used by the contract compiler and the historical public API).
+fn extract_test_selectors(module: &[String], content: &str) -> Vec<String> {
+    extract_test_declarations(module, content)
+        .into_iter()
+        .map(|test| test.selector)
+        .collect()
 }
 
 fn is_test_attribute(trimmed: &str) -> bool {
@@ -3465,6 +3583,60 @@ fn replayed_refresh_token_fails() {}
             .touched_files
             .iter()
             .all(|path| !path.contains("..") && !path.starts_with('/')));
+    }
+
+    #[test]
+    fn integration_selectors_expose_the_executable_test_name() {
+        let content = r#"
+#[test]
+fn totals_add_up() {
+    assert_eq!(1 + 1, 2);
+}
+"#;
+        let declarations = rust_test_declarations_for_path("tests/cart.rs", content);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].selector, "cart::totals_add_up");
+        assert_eq!(declarations[0].executable, "totals_add_up");
+        assert_eq!(declarations[0].target.as_deref(), Some("cart"));
+        assert!(!declarations[0].body.is_empty());
+        // A unit test's executable name IS its semantic selector.
+        let unit = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn adds_works() { assert_eq!(1 + 1, 2); }
+}
+"#;
+        let declarations = rust_test_declarations_for_path("src/lib.rs", unit);
+        assert_eq!(declarations[0].selector, "tests::adds_works");
+        assert_eq!(declarations[0].executable, "tests::adds_works");
+        assert!(declarations[0].target.is_none());
+    }
+
+    #[test]
+    fn integration_obligation_binding_never_uses_a_vacuous_stem_filter() {
+        let files = [RepositoryFile::with_content(
+            "tests/cart.rs",
+            "#[test]\nfn totals_add_up() { assert_eq!(1 + 1, 2); }\n",
+        )];
+        let refs: Vec<&RepositoryFile> = files.iter().collect();
+        let discovered = discover_test_selectors(&refs);
+        assert_eq!(discovered.len(), 1);
+        let binding = selector_binding(&discovered[0]);
+        match binding {
+            EvidenceBinding::TestSelectors(targets) => {
+                assert!(targets.contains(&"cart::totals_add_up".to_string()));
+                assert!(
+                    targets.contains(&"totals_add_up".to_string()),
+                    "the executable test name must be a binding target: {targets:?}"
+                );
+                assert!(
+                    !targets.contains(&"cart".to_string()),
+                    "a file-stem filter that runs zero tests must never discharge proof: {targets:?}"
+                );
+            }
+            other => panic!("expected a test-selector binding, got {other:?}"),
+        }
     }
 
     #[test]

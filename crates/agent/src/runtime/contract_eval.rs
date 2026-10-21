@@ -33,7 +33,7 @@
 //! Evidence references are appended and deduplicated by (kind, source,
 //! detail); identical re-evaluation is idempotent (no update).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use faktor_core::state::{OutcomeReason, ReasonCode};
 use faktor_core::{
@@ -524,12 +524,30 @@ fn provider_claim_evidence(
 /// executed checks, optional review verdict and optional candidate snapshot,
 /// and persist the evaluated obligation states. Infallible by construction:
 /// every failure is a typed outcome the gate site can act on.
+#[cfg(test)]
 pub(crate) async fn evaluate_and_persist_contract(
     handle: &SessionHandle,
     executed: &[ExecutedCheck],
     review: Option<&serde_json::Value>,
     candidate: Option<&SubjectSnapshot>,
     dispatch: Option<&ContractProviderDispatch<'_>>,
+) -> ContractGateOutcome {
+    evaluate_and_persist_contract_with_rebind(handle, executed, review, candidate, dispatch, None)
+        .await
+}
+
+/// [`evaluate_and_persist_contract`] with the candidate's PROVEN test-rename
+/// evidence. The rebinding pass runs BEFORE evidence matching, persists its
+/// old→new ledger through the dedicated durable writer, and marks every
+/// unproven/ambiguous stale binding so it can never be discharged by a
+/// coarse selector.
+pub(crate) async fn evaluate_and_persist_contract_with_rebind(
+    handle: &SessionHandle,
+    executed: &[ExecutedCheck],
+    review: Option<&serde_json::Value>,
+    candidate: Option<&SubjectSnapshot>,
+    dispatch: Option<&ContractProviderDispatch<'_>>,
+    rebind: Option<&faktor_verify::rebind::TestRebindEvidence>,
 ) -> ContractGateOutcome {
     let task_id = match handle.task_id() {
         Ok(task_id) => task_id,
@@ -559,6 +577,27 @@ pub(crate) async fn evaluate_and_persist_contract(
     if task.state.is_terminal() {
         return ContractGateOutcome::TerminalFrozen;
     }
+    let mut contract = task.contract.clone();
+    let mut stale: BTreeSet<String> = BTreeSet::new();
+    if let Some(rebind_evidence) = rebind {
+        let outcome = faktor_verify::rebind::rebind_test_obligations(
+            &mut contract,
+            &task.goal,
+            rebind_evidence,
+        );
+        stale.extend(outcome.stale.iter().cloned());
+        if !outcome.updates.is_empty() {
+            match handle.apply_task_contract_rebindings(task_id, &outcome.updates) {
+                Ok(_) => {}
+                Err(TaskError::TerminalTask { .. }) => return ContractGateOutcome::TerminalFrozen,
+                Err(e) => {
+                    return ContractGateOutcome::PersistFailed(format!(
+                        "proven test-selector rebindings could not be persisted: {e}"
+                    ));
+                }
+            }
+        }
+    }
     let mut evidence: Vec<ContractEvidence> = executed
         .iter()
         .map(|run| ContractEvidence::from_executed(run, candidate))
@@ -579,7 +618,7 @@ pub(crate) async fn evaluate_and_persist_contract(
     // evaluation/persistence/replan path as native evidence, and a disproven
     // claim re-opens work with a typed replan cause.
     if let Some(dispatch) = dispatch {
-        match dispatch_provider_claims(handle, &task.contract, candidate, dispatch).await {
+        match dispatch_provider_claims(handle, &contract, candidate, dispatch).await {
             Ok(provider_evidence) => evidence.extend(provider_evidence),
             Err(ProviderDispatchFailure::Recoverable(detail)) => {
                 // Provider absence/failure is never a silent pass: the
@@ -597,7 +636,7 @@ pub(crate) async fn evaluate_and_persist_contract(
             }
         }
     }
-    let evaluation = evaluate_contract(&task.contract, &evidence, candidate);
+    let evaluation = evaluate_contract_with_stale(&contract, &evidence, candidate, &stale);
     if evaluation.updates.is_empty() {
         return ContractGateOutcome::Evaluated {
             updates_applied: 0,
@@ -1026,16 +1065,41 @@ pub(crate) fn contract_verification_policy(
 }
 
 /// Evaluate `contract` against this attempt's evidence at `candidate`.
+#[cfg(test)]
 pub(crate) fn evaluate_contract(
     contract: &EngineeringContract,
     evidence: &[ContractEvidence],
     candidate: Option<&SubjectSnapshot>,
+) -> ContractEvaluation {
+    evaluate_contract_with_stale(contract, evidence, candidate, &BTreeSet::new())
+}
+
+/// [`evaluate_contract`] with the set of obligations whose test-selector
+/// binding is STALE (the old selector is gone and the rename was not proven).
+/// A stale obligation is forced unevaluated and its prior evidence/proofs are
+/// cleared BEFORE evidence matching, so no coarse selector can silently
+/// discharge it; a required stale obligation refuses completion typed.
+pub(crate) fn evaluate_contract_with_stale(
+    contract: &EngineeringContract,
+    evidence: &[ContractEvidence],
+    candidate: Option<&SubjectSnapshot>,
+    stale: &BTreeSet<String>,
 ) -> ContractEvaluation {
     let mut updated = contract.clone();
     let mut updates = Vec::new();
     let mut replan = Vec::new();
     for obligation in updated.proof_obligations.iter_mut() {
         let before = obligation.clone();
+        if stale.contains(&obligation.id) {
+            obligation.state = ClaimState::Unknown;
+            obligation.confidence_bps = None;
+            obligation.proofs.clear();
+            obligation.evidence_refs.clear();
+            if *obligation != before {
+                updates.push(obligation.clone());
+            }
+            continue;
+        }
         // 1. Snapshot law: a claim-grade state whose recorded basis does not
         // demonstrably survive the current candidate degrades to Unknown
         // BEFORE any fresh evidence is considered; the stale confidence is
@@ -1269,6 +1333,114 @@ mod tests {
             proof_obligations: obligations,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn proven_renamed_selector_is_verified_and_a_failing_rename_is_disproven() {
+        use faktor_verify::rebind::{rebind_test_obligations, TestFileDelta, TestRebindEvidence};
+
+        let before = "#[test]\nfn totals_add_up() { assert_eq!(compute_total(&[10, 20]), 30); }\n";
+        let after =
+            "#[test]\nfn total_cents_adds_up() { assert_eq!(total_cents(&[10, 20]), 30); }\n";
+        let evidence = TestRebindEvidence {
+            files: vec![TestFileDelta {
+                path: "tests/cart.rs".into(),
+                before: Some(before.into()),
+                after: Some(after.into()),
+            }],
+            renames: Vec::new(),
+        };
+        let mut contract = contract_with(vec![bound(
+            "existing test `cart::totals_add_up` passes after the change",
+            ProofEvidenceKind::TestExecution,
+            EvidenceBinding::TestSelectors(vec![
+                "cart::totals_add_up".into(),
+                "totals_add_up".into(),
+            ]),
+        )]);
+        let outcome = rebind_test_obligations(
+            &mut contract,
+            "Rename compute_total to total_cents across the crate, including tests.",
+            &evidence,
+        );
+        assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
+        let passing = native(
+            ProofEvidenceKind::TestExecution,
+            "rust_test:cart::total_cents_adds_up",
+            true,
+            vec![selector("total_cents_adds_up")],
+        );
+        let evaluation = evaluate_contract_with_stale(
+            &contract,
+            std::slice::from_ref(&passing),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            evaluation.contract.proof_obligations[0].state,
+            ClaimState::Supported
+        );
+        assert!(evaluation.unresolved_required.is_empty());
+        assert!(evaluation.disproven.is_empty());
+        let failing = native(
+            ProofEvidenceKind::TestExecution,
+            "rust_test:cart::total_cents_adds_up",
+            false,
+            vec![selector("total_cents_adds_up")],
+        );
+        let evaluation = evaluate_contract_with_stale(
+            &contract,
+            std::slice::from_ref(&failing),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            evaluation.contract.proof_obligations[0].state,
+            ClaimState::Disproven,
+            "the renamed test failing must disprove the rebound obligation"
+        );
+    }
+
+    #[test]
+    fn a_stale_binding_cannot_be_satisfied_by_its_coarse_selector() {
+        use faktor_verify::rebind::{rebind_test_obligations, TestFileDelta, TestRebindEvidence};
+
+        let before = "#[test]\nfn totals_add_up() { assert_eq!(1 + 1, 2); }\n";
+        let ambiguous_after = "#[test]\nfn total_cents_a() { assert_eq!(1 + 1, 2); }\n#[test]\nfn total_cents_b() { assert_eq!(1 + 1, 2); }\n";
+        let evidence = TestRebindEvidence {
+            files: vec![TestFileDelta {
+                path: "tests/cart.rs".into(),
+                before: Some(before.into()),
+                after: Some(ambiguous_after.into()),
+            }],
+            renames: Vec::new(),
+        };
+        let mut contract = contract_with(vec![bound(
+            "existing test `cart::totals_add_up` passes after the change",
+            ProofEvidenceKind::TestExecution,
+            EvidenceBinding::TestSelectors(vec!["cart::totals_add_up".into(), "cart".into()]),
+        )]);
+        let outcome = rebind_test_obligations(
+            &mut contract,
+            "Rename compute_total to total_cents across the crate, including tests.",
+            &evidence,
+        );
+        assert!(outcome.rebinds.is_empty());
+        let stale: BTreeSet<String> = outcome.stale.iter().cloned().collect();
+        // A coarse `cart` check must NOT discharge the stale obligation.
+        let coarse = native(
+            ProofEvidenceKind::TestExecution,
+            "rust_test:cart",
+            true,
+            vec![selector("cart")],
+        );
+        let evaluation =
+            evaluate_contract_with_stale(&contract, std::slice::from_ref(&coarse), None, &stale);
+        assert_eq!(
+            evaluation.contract.proof_obligations[0].state,
+            ClaimState::Unknown
+        );
+        assert_eq!(evaluation.unresolved_required.len(), 1);
     }
 
     #[test]

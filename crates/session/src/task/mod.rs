@@ -1607,6 +1607,187 @@ impl SessionHandle {
         Ok(Task::from(out))
     }
 
+    /// Durably apply PROVEN test-selector rebindings (old→new + basis) to
+    /// obligations that already exist on a task row. This is the ONLY writer
+    /// of `evidence_binding` after compilation: it accepts a strict
+    /// append-only extension of the obligation's provenance ledger, requires
+    /// every ledger step to chain (`old_binding` == the prior binding), the
+    /// final new binding to equal the update's binding, and the evaluated
+    /// state to be FRESH (Unknown/None/no proofs/refs) — a rebind can never
+    /// smuggle a supported state or rewrite an unrelated claim. Terminal rows
+    /// stay frozen; replaying the identical update is an idempotent no-op.
+    pub fn apply_task_contract_rebindings(
+        &self,
+        task_id: TaskId,
+        updates: &[ProofObligation],
+    ) -> Result<Task, TaskError> {
+        use faktor_core::contract::{
+            ClaimState, MAX_BINDING_UPDATES, MAX_BINDING_UPDATE_BASIS_BYTES,
+        };
+
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        if updates.is_empty() {
+            return Err(TaskError::Malformed(
+                "no proof-obligation rebindings supplied".into(),
+            ));
+        }
+        let _guard = self.command_guard();
+        let store = self.manager.store();
+        let row = store
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        let mut current = Task::from(row.clone());
+        for update in updates {
+            if !current
+                .contract
+                .proof_obligations
+                .iter()
+                .any(|o| o.id == update.id)
+            {
+                return Err(TaskError::Malformed(format!(
+                    "rebinding names unknown obligation id {:?}: rebinding cannot add entries",
+                    update.id
+                )));
+            }
+        }
+        let mut changed = false;
+        for update in updates {
+            let obligation = current
+                .contract
+                .proof_obligations
+                .iter_mut()
+                .find(|o| o.id == update.id)
+                .expect("existence pre-checked above");
+            // Idempotent replay after a crash between the write and the
+            // caller's next observation: identical update, nothing to do.
+            if obligation.evidence_binding == update.evidence_binding
+                && obligation.binding_updates == update.binding_updates
+                && obligation.claim == update.claim
+                && obligation.state == update.state
+                && obligation.confidence_bps == update.confidence_bps
+                && obligation.proofs == update.proofs
+                && obligation.evidence_refs == update.evidence_refs
+            {
+                continue;
+            }
+            if update.binding_updates.len() > MAX_BINDING_UPDATES {
+                return Err(TaskError::Oversized(format!(
+                    "obligation {} carries {} binding updates (max {MAX_BINDING_UPDATES})",
+                    update.id,
+                    update.binding_updates.len()
+                )));
+            }
+            if update.binding_updates.len() <= obligation.binding_updates.len()
+                || !update
+                    .binding_updates
+                    .starts_with(&obligation.binding_updates)
+            {
+                return Err(TaskError::Malformed(format!(
+                    "obligation {} rebinding is not an append-only ledger extension",
+                    update.id
+                )));
+            }
+            // The ledger chain must start at the CURRENT binding and each new
+            // step must lead into the next; the final step names the update's
+            // binding exactly.
+            let mut chained = obligation.evidence_binding.clone();
+            for record in update
+                .binding_updates
+                .iter()
+                .skip(obligation.binding_updates.len())
+            {
+                if record.old_binding != chained {
+                    return Err(TaskError::Malformed(format!(
+                        "obligation {} rebinding chain breaks at {:?}",
+                        update.id, record.old_binding
+                    )));
+                }
+                record.old_binding.validate().map_err(|detail| {
+                    TaskError::Malformed(format!("rebinding old binding: {detail}"))
+                })?;
+                record.new_binding.validate().map_err(|detail| {
+                    TaskError::Malformed(format!("rebinding new binding: {detail}"))
+                })?;
+                if record.basis.is_empty() || record.basis.len() > MAX_BINDING_UPDATE_BASIS_BYTES {
+                    return Err(TaskError::Malformed(format!(
+                        "obligation {} rebinding basis must be 1..={MAX_BINDING_UPDATE_BASIS_BYTES} bytes",
+                        update.id
+                    )));
+                }
+                chained = record.new_binding.clone();
+            }
+            if chained != update.evidence_binding {
+                return Err(TaskError::Malformed(format!(
+                    "obligation {} rebinding does not end at the update binding",
+                    update.id
+                )));
+            }
+            // A rebind is never a proof: the state must be fresh and the old
+            // evidence/proofs cleared.
+            if update.state != ClaimState::Unknown
+                || update.confidence_bps.is_some()
+                || !update.proofs.is_empty()
+                || !update.evidence_refs.is_empty()
+            {
+                return Err(TaskError::Malformed(format!(
+                    "obligation {} rebinding must carry fresh unevaluated state",
+                    update.id
+                )));
+            }
+            // The claim may only be re-pointed deterministically at the new
+            // selector (never an unrelated rewrite).
+            if update.claim != obligation.claim {
+                let old = update
+                    .binding_updates
+                    .last()
+                    .and_then(|record| record.old_binding.selector())
+                    .unwrap_or_default();
+                let new = update
+                    .binding_updates
+                    .last()
+                    .and_then(|record| record.new_binding.selector())
+                    .unwrap_or_default();
+                if old.is_empty()
+                    || new.is_empty()
+                    || update.claim != obligation.claim.replace(old, new)
+                {
+                    return Err(TaskError::Malformed(format!(
+                        "obligation {} rebinding may only re-point its claim at the new selector",
+                        update.id
+                    )));
+                }
+            }
+            obligation.claim = update.claim.clone();
+            obligation.evidence_binding = update.evidence_binding.clone();
+            obligation.binding_updates = update.binding_updates.clone();
+            obligation.state = ClaimState::Unknown;
+            obligation.confidence_bps = None;
+            obligation.proofs.clear();
+            obligation.evidence_refs.clear();
+            changed = true;
+        }
+        if !changed {
+            return Ok(current);
+        }
+        if row.state.is_terminal() {
+            return Err(TaskError::TerminalTask {
+                task_id,
+                state: row.state,
+            });
+        }
+        current.updated_ms = self.manager.now_ms();
+        validate_task_fields(&current)?;
+        let revision = row
+            .revision
+            .checked_next()
+            .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
+        let out = task_row(current, revision);
+        store.upsert_task(&out)?;
+        Ok(Task::from(out))
+    }
+
     /// Atomically seed ONE task's durable attachment set (audit finding 2):
     /// every id is structurally validated and every CAS blob is verified by a
     /// streamed re-hash (`Cas::verify_now`, no bytes materialize) BEFORE
@@ -3365,6 +3546,49 @@ fn validate_task_contract_impl(
                 return Err(TaskError::Oversized(format!(
                     "evidence detail of {} bytes exceeds MAX_TASK_CONTRACT_STRING_BYTES ({MAX_TASK_CONTRACT_STRING_BYTES})",
                     evidence.detail.len()
+                )));
+            }
+        }
+        if o.binding_updates.len() > faktor_core::contract::MAX_BINDING_UPDATES {
+            return Err(TaskError::Oversized(format!(
+                "proof obligation {} carries {} binding updates (max {})",
+                o.id,
+                o.binding_updates.len(),
+                faktor_core::contract::MAX_BINDING_UPDATES
+            )));
+        }
+        if let Some(first) = o.binding_updates.first() {
+            let mut chained = first.old_binding.clone();
+            for update in &o.binding_updates {
+                update
+                    .old_binding
+                    .validate()
+                    .map_err(|detail| TaskError::Malformed(format!("binding update: {detail}")))?;
+                update
+                    .new_binding
+                    .validate()
+                    .map_err(|detail| TaskError::Malformed(format!("binding update: {detail}")))?;
+                if update.old_binding != chained {
+                    return Err(TaskError::Malformed(format!(
+                        "proof obligation {} binding-update ledger chain is broken",
+                        o.id
+                    )));
+                }
+                if update.basis.is_empty()
+                    || update.basis.len() > faktor_core::contract::MAX_BINDING_UPDATE_BASIS_BYTES
+                {
+                    return Err(TaskError::Malformed(format!(
+                        "proof obligation {} binding-update basis must be 1..={} bytes",
+                        o.id,
+                        faktor_core::contract::MAX_BINDING_UPDATE_BASIS_BYTES
+                    )));
+                }
+                chained = update.new_binding.clone();
+            }
+            if chained != o.evidence_binding {
+                return Err(TaskError::Malformed(format!(
+                    "proof obligation {} binding-update ledger does not end at the current binding",
+                    o.id
                 )));
             }
         }

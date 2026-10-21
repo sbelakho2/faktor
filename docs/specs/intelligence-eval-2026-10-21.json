@@ -185,21 +185,21 @@
       "pipeline": "Faktor after changes",
       "aggregate": {
         "tasks": 12,
-        "verified": 11,
-        "success_rate": 0.9166666666666666,
+        "verified": 12,
+        "success_rate": 1.0,
         "attempts": 61,
         "tool_calls": 93,
-        "tokens": 224285,
-        "prompt_tokens": 211891,
-        "output_tokens": 12394,
-        "wall_ms": 1585156,
+        "tokens": 224666,
+        "prompt_tokens": 212195,
+        "output_tokens": 12471,
+        "wall_ms": 1514704,
         "mean_attempts": 5.083333333333333,
         "mean_tool_calls": 7.75,
-        "mean_tokens": 18690.416666666668,
-        "tokens_per_verified": 20389.545454545456,
-        "wall_per_task_ms": 132096.33333333334,
-        "pipeline_claims_verified": 11,
-        "pipeline_claims_matching_external": 11
+        "mean_tokens": 18722.166666666668,
+        "tokens_per_verified": 18722.166666666668,
+        "wall_per_task_ms": 126225.33333333333,
+        "pipeline_claims_verified": 12,
+        "pipeline_claims_matching_external": 12
       },
       "results": [
         {
@@ -254,13 +254,15 @@
           "id": "rust_refactor_rename",
           "category": "cross_file_refactor",
           "language": "rust",
-          "verified_success": false,
+          "verified_success": true,
           "attempts": 5,
           "tool_calls": 14,
-          "tokens": 19795,
-          "wall_ms": 175723,
-          "pipeline_task_state": "blocked",
-          "pipeline_proof_state": "unverified"
+          "tokens": 20176,
+          "wall_ms": 105271,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified",
+          "prompt_tokens": 18751,
+          "output_tokens": 1425
         },
         {
           "id": "js_refactor_extract",
@@ -546,10 +548,19 @@
       "gap": "terse tool descriptions; no directory listing; no workflow prompt",
       "fix": "explicit tool contracts, list_dir, 6-step protocol",
       "file": "crates/cli/src/tools.rs:888,957; crates/cli/src/config/mcp.rs:24"
+    },
+    {
+      "gap": "renamed test selectors left required proof bound to the OLD selector, and integration test checks used a file-stem filter that can run zero tests",
+      "fix": "deterministic proof rebinding (git rename detection / verification inventory rename edge + same test target + unique match) with old\u2192new provenance in the durable ledger; exact executable test selectors; ambiguous/stale bindings refuse typed",
+      "file": "crates/verify/src/rebind.rs; crates/core/src/contract_compile.rs; crates/agent/src/runtime/test_rebind.rs; crates/session/src/task/mod.rs"
+    },
+    {
+      "gap": "a complete one-expression helper was misclassified as a placeholder body, blocking an otherwise verified rename",
+      "fix": "structural placeholder check (missing/unbalanced/empty body) instead of a raw short-body threshold",
+      "file": "crates/agent/src/runtime/turn/state.rs"
     }
   ],
   "residual": [
-    "rust_refactor_rename: model edits were correct (definition/export/callers/tests) and both required checks passed, but settlement blocked the modified-test proof; raw passed it. This is a proof-rebinding gap, not a model-intelligence gap; verification was not weakened.",
-    "raw one-shot is still far cheaper per verified change on this small corpus (1,442 vs 20,390 tokens); Faktor spends on retrieval, multi-turn verification and proof state."
+    "raw one-shot is still far cheaper per verified change on this small corpus (cost tradeoff, not a correctness gap)."
   ]
 }
