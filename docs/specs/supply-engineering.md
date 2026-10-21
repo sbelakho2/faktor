@@ -107,7 +107,11 @@ through licensed stores/connectors; never reproduced blindly.
 **Solvers**: neutral `EngineeringSolver` (capabilities, applicability, solve
 on a frozen case) with receipts binding input/model digest, solver identity
 and version, property revisions, boundary conditions, mesh/settings,
-convergence, warnings, results, uncertainty, artifacts, repeatability.
+convergence, warnings, results, uncertainty, artifacts, repeatability and an
+Ed25519 attestation over the canonical digest. Model choice is owned by the
+central applicability selector, and gates 3/4 recompute its result; see
+`docs/engineering-receipt-attestation.md` for key location, rotation and
+verification instructions.
 Rust numerical kernels for units/dimensional analysis and deterministic
 math; real solvers through supervised adapters (KiCad CLI, ngspice, Gmsh,
 OpenFOAM, FMI; commercial via the same contract). No Python.

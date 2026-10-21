@@ -8,7 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engineering_core::{AuthorityRef, Digest};
+use engineering_core::{
+    AuthorityRef, CatalogModel, Digest, Discipline, ModelCatalog, SelectionProvenance,
+    ValidityDomain as SelectorValidityDomain,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -591,7 +594,159 @@ impl KnowledgePack {
         }
         Ok(())
     }
+}
 
+impl KnowledgePack {
+    /// Convert the pack's governing models and validity domains into the
+    /// central selector's catalog form. A model without a registered validity
+    /// domain is refused by the catalog validator rather than treated as
+    /// universally applicable.
+    pub fn model_catalog(&self) -> KnowledgeResult<Vec<CatalogModel>> {
+        let digest = self
+            .digest()
+            .ok_or_else(|| KnowledgeError::Bundled("pack lost its source digest".to_string()))?;
+        let mut models = Vec::with_capacity(self.models.len());
+        for model in &self.models {
+            let mut domains = Vec::with_capacity(model.validity_domain_ids.len());
+            for id in &model.validity_domain_ids {
+                let domain = self
+                    .validity_domains
+                    .iter()
+                    .find(|domain| &domain.id == id)
+                    .ok_or_else(|| KnowledgeError::MissingReference {
+                        from: model.id.clone(),
+                        target: id.clone(),
+                    })?;
+                domains.push(SelectorValidityDomain {
+                    id: domain.id.clone(),
+                    statement: domain.statement.clone(),
+                    temperature: domain.temperature.as_ref().and_then(|range| {
+                        if range.unit == "K" {
+                            engineering_units::Interval::new(range.min, range.max).ok()
+                        } else {
+                            None
+                        }
+                    }),
+                    conditions: Vec::new(),
+                    exclusions: domain.exclusions.clone(),
+                    materials: Vec::new(),
+                    provenance: pack_provenance(domain.provenance.clone(), digest),
+                });
+            }
+            if domains.is_empty() {
+                return Err(KnowledgeError::EmptyField {
+                    field: "model.validity_domain_ids",
+                });
+            }
+            let (disciplines, properties) = model_targeting(&self.id, &model.id, &self.domain);
+            models.push(CatalogModel {
+                model_id: model.id.clone(),
+                source_model_id: Some(model.id.clone()),
+                version: self.version.clone(),
+                pack_id: Some(self.id.clone()),
+                pack_version: Some(self.version.clone()),
+                pack_digest: Some(digest),
+                equation_ids: model.equation_ids.clone(),
+                disciplines,
+                properties,
+                domains,
+                provenance: pack_provenance(model.provenance.clone(), digest),
+            });
+        }
+        Ok(models)
+    }
+}
+
+fn pack_provenance(provenance: PackProvenance, digest: Digest) -> SelectionProvenance {
+    SelectionProvenance {
+        kind: provenance.kind,
+        citation: provenance.citation,
+        edition: provenance.edition,
+        locator: provenance.locator,
+        note: provenance.note,
+        digest: Some(digest),
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+/// The explicit target mapping for the four shipped packs. Registered packs
+/// stay authoritative: the selector only matches requirements whose
+/// discipline/property tokens are covered here.
+fn model_targeting(pack_id: &str, model_id: &str, domain: &str) -> (Vec<Discipline>, Vec<String>) {
+    match (pack_id, model_id) {
+        ("bolted-joint", "model-torque-preload") => (
+            vec![Discipline::Mechanical],
+            strings(&[
+                "torque", "preload", "bolt", "bolted", "thread", "clamp", "fastener", "joint",
+                "stress", "nut",
+            ]),
+        ),
+        ("power-electronics", "model-conduction-thermal") => (
+            vec![Discipline::Electrical, Discipline::Thermal],
+            strings(&[
+                "mosfet",
+                "conduction",
+                "loss",
+                "junction",
+                "thermal",
+                "rds",
+                "power",
+                "temperature",
+                "heatsink",
+                "current",
+            ]),
+        ),
+        ("injection-molding", "model-moldability-checks") => (
+            vec![Discipline::Manufacturing, Discipline::Mechanical],
+            strings(&[
+                "draft",
+                "wall",
+                "flow",
+                "mold",
+                "molding",
+                "injection",
+                "geometry",
+                "manufactur",
+                "ejection",
+                "thickness",
+            ]),
+        ),
+        ("passives", "model-cap-thermal-ripple") => (
+            vec![Discipline::Electrical, Discipline::Thermal],
+            strings(&[
+                "capacitor",
+                "cap",
+                "esr",
+                "ripple",
+                "capacitance",
+                "dielectric",
+                "voltage",
+                "life",
+            ]),
+        ),
+        _ => {
+            let disciplines = match domain {
+                "machine_design" => vec![Discipline::Mechanical],
+                "manufacturing" => vec![Discipline::Manufacturing],
+                "power_electronics" | "passives" => {
+                    vec![Discipline::Electrical, Discipline::Thermal]
+                }
+                _ => vec![Discipline::Other],
+            };
+            let properties = model_id
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|token| token.len() >= 3)
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
+            (disciplines, properties)
+        }
+    }
+}
+
+impl KnowledgePack {
     pub fn authority(&self) -> Option<AuthorityRef> {
         Some(AuthorityRef {
             pack_id: self.id.clone(),
@@ -678,6 +833,15 @@ impl KnowledgeRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.packs.is_empty()
+    }
+
+    /// The full registered-model catalog for every pack in this registry.
+    pub fn model_catalog(&self) -> KnowledgeResult<ModelCatalog> {
+        let mut models = Vec::new();
+        for pack in self.packs() {
+            models.extend(pack.model_catalog()?);
+        }
+        ModelCatalog::new(models).map_err(|error| KnowledgeError::Bundled(error.to_string()))
     }
 
     /// The starter packs shipped with this build. They are loaded through the

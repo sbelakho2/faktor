@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use engineering_core::{
     CandidateFacts, CategoricalFact, Discipline, EngineeringRequirement, EngineeringRequirementSet,
-    EngineeringVerdict, ModelBinding, NumericLimit, OutcomeState, RequirementEvidence,
-    RequirementTarget, RevisionId,
+    EngineeringVerdict, GateState, ModelBinding, NumericLimit, OutcomeState, ReceiptSigner,
+    ReceiptVerifier, RequirementEvidence, RequirementTarget, RevisionId,
 };
 use engineering_units::{Quantity, UnitRegistry};
 use faktor_supply_core::{
@@ -980,4 +980,92 @@ fn fixture_supply_term_types_are_reachable() {
         evidence: vec![],
     };
     let _ = ExactError::Overflow;
+}
+
+#[test]
+fn the_response_records_the_selector_decision_and_bounds_it_into_the_signed_receipt() {
+    let engineering = capacitor_requirements();
+    let baseline = candidate(
+        "baseline",
+        1,
+        capacitor_facts("baseline", 50.0, 1.2, "X7R", Some(2_000.0)),
+        "1.00",
+        "100.00",
+        100,
+        100,
+        30,
+    );
+    let outcome = run(&request(vec![baseline], engineering, vec![])).unwrap();
+    let response = outcome.response.as_ref().expect("response");
+    let theory = match &response.theory.state {
+        GateState::Established(theory) => theory,
+        other => panic!("theory not established: {other:?}"),
+    };
+    let selection = theory.selection.as_ref().expect("selector result");
+    assert!(selection.is_all_selected());
+    assert_eq!(
+        selection.unique_models()[0].pack_id.as_deref(),
+        Some("passives")
+    );
+    assert_eq!(
+        outcome.receipt.selection_digest,
+        Some(selection.digest().unwrap())
+    );
+    outcome.receipt.verify_attestation().unwrap();
+    outcome.cross_check.verify_attestation().unwrap();
+
+    let mut overridden = response.clone();
+    if let GateState::Established(theory) = &mut overridden.theory.state {
+        let selection = theory.selection.as_mut().unwrap();
+        let selected = match &mut selection.selections[0] {
+            engineering_core::RequirementSelection::Selected { models, .. } => &mut models[0],
+            other => panic!("selected outcome expected: {other:?}"),
+        };
+        selected.validity[0].temperature =
+            Some(engineering_units::Interval::new(1.0, 10_000.0).unwrap());
+    }
+    assert!(!overridden.is_ready(), "{:?}", overridden.assess());
+}
+
+#[test]
+fn out_of_domain_candidate_gets_typed_research_not_a_caller_model() {
+    let engineering = capacitor_requirements();
+    let mut facts = capacitor_facts("hot", 50.0, 1.2, "X7R", Some(2_000.0));
+    facts
+        .conditions
+        .push("frequency outside the measured band".to_string());
+    let hot = candidate("hot", 1, facts, "1.00", "100.00", 100, 100, 30);
+    let outcome = run(&request(vec![hot], engineering, vec![])).unwrap();
+    let response = outcome.response.as_ref().expect("response");
+    assert!(matches!(
+        response.theory.state,
+        GateState::ResearchRequired(_)
+    ));
+    assert!(matches!(
+        response.validity.state,
+        GateState::ResearchRequired(_)
+    ));
+    assert!(matches!(
+        outcome.decision.recommended_action,
+        RecommendedAction::RequestEvidence { .. }
+    ));
+    assert!(!outcome.is_verified());
+}
+
+#[test]
+fn daemon_trusted_verification_refuses_a_foreign_signing_key() {
+    let engineering = capacitor_requirements();
+    let facts = capacitor_facts("baseline", 50.0, 1.2, "X7R", Some(2_000.0));
+    let candidate = candidate("baseline", 1, facts, "1.00", "100.00", 100, 100, 30);
+    let signer = ReceiptSigner::from_seed([21u8; 32]);
+    let outcome = faktor_supply_engineering::run_with_signer(
+        &request(vec![candidate], engineering, vec![]),
+        &signer,
+    )
+    .unwrap();
+    let trusted = ReceiptVerifier::trusting_key_id(&signer.key_id()).unwrap();
+    assert!(outcome.is_verified_with_verifier(&trusted));
+    let foreign = ReceiptSigner::from_seed([22u8; 32]);
+    let foreign_verifier = ReceiptVerifier::trusting_key_id(&foreign.key_id()).unwrap();
+    assert!(outcome.verify_with_verifier(&foreign_verifier).is_err());
 }

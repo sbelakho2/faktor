@@ -50,22 +50,39 @@ fn parse_input(args: &Value) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn execute_loop(args: Value) -> Result<Value, Error> {
+    let signer = engineering_core::ReceiptSigner::generate();
+    execute_loop_with(args, &signer)
+}
+
+pub(crate) fn execute_loop_with(
+    args: Value,
+    signer: &engineering_core::ReceiptSigner,
+) -> Result<Value, Error> {
     let bytes = parse_input(&args)?;
     let request: faktor_supply_engineering::LoopRequest = serde_json::from_slice(&bytes)
         .map_err(|error| Error::malformed(format!("invalid loop request: {error}")))?;
-    let outcome = faktor_supply_engineering::run(&request)
+    let outcome = faktor_supply_engineering::run_with_signer(&request, signer)
         .map_err(|error| Error::malformed(format!("loop refused: {error}")))?;
     serde_json::to_value(outcome)
         .map_err(|error| Error::internal(format!("cannot encode loop outcome: {error}")))
 }
 
+#[cfg(test)]
 pub(crate) fn execute_verify(args: Value) -> Result<Value, Error> {
+    execute_verify_with(args, &engineering_core::ReceiptVerifier::self_attested())
+}
+
+pub(crate) fn execute_verify_with(
+    args: Value,
+    verifier: &engineering_core::ReceiptVerifier,
+) -> Result<Value, Error> {
     let bytes = parse_input(&args)?;
     let outcome: faktor_supply_engineering::LoopOutcome = serde_json::from_slice(&bytes)
         .map_err(|error| Error::malformed(format!("invalid loop outcome: {error}")))?;
     let verification = outcome
-        .verify()
+        .verify_with_verifier(verifier)
         .map_err(|error| Error::malformed(format!("verification refused: {error}")))?;
     let verified = verification.decision_valid
         && verification.requirement_set_valid
@@ -80,10 +97,14 @@ pub(crate) fn execute_verify(args: Value) -> Result<Value, Error> {
 }
 
 /// Register every closed-loop tool on the daemon registry.
-pub(crate) fn register(registry: &mut faktor_agent::ToolRegistry) {
-    registry.register(supply_decision_tool());
-    registry.register(engineering_analyse_tool());
-    registry.register(engineering_verify_tool());
+pub(crate) fn register(
+    registry: &mut faktor_agent::ToolRegistry,
+    signer: Arc<engineering_core::ReceiptSigner>,
+    verifier: Arc<engineering_core::ReceiptVerifier>,
+) {
+    registry.register(supply_decision_tool(signer.clone()));
+    registry.register(engineering_analyse_tool(signer));
+    registry.register(engineering_verify_tool(verifier));
 }
 
 fn schema() -> Value {
@@ -95,7 +116,7 @@ fn schema() -> Value {
 }
 
 /// The `supply_decision` tool.
-pub fn supply_decision_tool() -> Tool {
+pub fn supply_decision_tool(signer: Arc<engineering_core::ReceiptSigner>) -> Tool {
     Tool {
         name: SUPPLY_DECISION_TOOL.into(),
         description: "Run the deterministic closed Engineering -> Supply loop over a typed JSON \
@@ -111,14 +132,15 @@ pub fn supply_decision_tool() -> Tool {
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
-        execute: Arc::new(|_ctx: ToolRunCtx, args| {
-            Box::pin(async move { bounded_output(execute_loop(args)?) })
+        execute: Arc::new(move |_ctx: ToolRunCtx, args| {
+            let signer = signer.clone();
+            Box::pin(async move { bounded_output(execute_loop_with(args, &signer)?) })
         }),
     }
 }
 
 /// The `engineering_analyse` tool.
-pub fn engineering_analyse_tool() -> Tool {
+pub fn engineering_analyse_tool(signer: Arc<engineering_core::ReceiptSigner>) -> Tool {
     Tool {
         name: ENGINEERING_ANALYSE_TOOL.into(),
         description:
@@ -132,14 +154,15 @@ pub fn engineering_analyse_tool() -> Tool {
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
-        execute: Arc::new(|_ctx: ToolRunCtx, args| {
-            Box::pin(async move { bounded_output(execute_loop(args)?) })
+        execute: Arc::new(move |_ctx: ToolRunCtx, args| {
+            let signer = signer.clone();
+            Box::pin(async move { bounded_output(execute_loop_with(args, &signer)?) })
         }),
     }
 }
 
 /// The `engineering_verify` tool.
-pub fn engineering_verify_tool() -> Tool {
+pub fn engineering_verify_tool(verifier: Arc<engineering_core::ReceiptVerifier>) -> Tool {
     Tool {
         name: ENGINEERING_VERIFY_TOOL.into(),
         description: "Verify a stored closed-loop result: decision and requirement-set bounds, \
@@ -151,8 +174,9 @@ pub fn engineering_verify_tool() -> Tool {
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
-        execute: Arc::new(|_ctx: ToolRunCtx, args| {
-            Box::pin(async move { bounded_output(execute_verify(args)?) })
+        execute: Arc::new(move |_ctx: ToolRunCtx, args| {
+            let verifier = verifier.clone();
+            Box::pin(async move { bounded_output(execute_verify_with(args, &verifier)?) })
         }),
     }
 }

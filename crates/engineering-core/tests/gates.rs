@@ -1,12 +1,13 @@
 use engineering_core::{
     Agreement, AnalysisIdentity, AnalysisKind, AnalysisReceipt, AnalysisWarning, AssumptionRecord,
-    AuthorityRef, Convergence, CounterexampleProbe, CounterexampleSearch, CrossCheck, Digest,
-    DimensionCheck, DimensionChecks, EngineeringResponse, ExecutedAnalysis, FalsifiableTest,
-    FalsifiableVerification, Formulation, Gate, GateId, KnowledgeAuthority, ModelSelection, NodeId,
-    ProbeOutcome, RealizationCategory, RealizationConsequence, RealizationConsequences,
-    ReceiptContent, ReceiptResult, ReceiptValue, Repeatability, RevisionId, TheorySelection,
-    UncertaintyContribution, UncertaintyStatement, ValidityEnvelope, ValidityEnvelopes, ValueState,
-    WarningSeverity,
+    AuthorityRef, CatalogModel, Convergence, CounterexampleProbe, CounterexampleSearch, CrossCheck,
+    Digest, DimensionCheck, DimensionChecks, Discipline, EngineeringResponse, ExecutedAnalysis,
+    FalsifiableTest, FalsifiableVerification, Formulation, Gate, GateId, KnowledgeAuthority,
+    ModelCatalog, ModelSelection, ModelSelector, NodeId, ProbeOutcome, RealizationCategory,
+    RealizationConsequence, RealizationConsequences, ReceiptContent, ReceiptResult, ReceiptSigner,
+    ReceiptValue, Repeatability, RevisionId, SelectionProvenance, SelectionRequest,
+    TheorySelection, UncertaintyContribution, UncertaintyStatement, ValidityDomain,
+    ValidityEnvelopes, ValueState, WarningSeverity,
 };
 use engineering_units::{Dimension, Interval, Quantity, Uncertainty, UnitRegistry};
 
@@ -38,7 +39,7 @@ fn receipt(solver_id: &str) -> AnalysisReceipt {
         uncertainty: Uncertainty::Exact,
     }];
     content.repeatability = Repeatability::deterministic();
-    AnalysisReceipt::kernel(
+    let mut receipt = AnalysisReceipt::kernel(
         AnalysisIdentity {
             solver_id: solver_id.to_string(),
             solver_version: "1.0.0".to_string(),
@@ -46,6 +47,49 @@ fn receipt(solver_id: &str) -> AnalysisReceipt {
         },
         content,
         0,
+    )
+    .unwrap();
+    ReceiptSigner::from_seed([7u8; 32])
+        .sign_receipt(&mut receipt)
+        .unwrap();
+    receipt
+}
+
+fn selection() -> engineering_core::ApplicabilitySelection {
+    let catalog = ModelCatalog::new(vec![CatalogModel {
+        model_id: "torque-preload".to_string(),
+        source_model_id: None,
+        version: "1.0.0".to_string(),
+        pack_id: Some("bolted-joint".to_string()),
+        pack_version: Some("1.0.0".to_string()),
+        pack_digest: Some(Digest::of_text("fixture-pack")),
+        equation_ids: vec!["eq-torque-preload".to_string()],
+        disciplines: vec![Discipline::Mechanical],
+        properties: vec!["torque".to_string(), "preload".to_string()],
+        domains: vec![ValidityDomain {
+            id: "val-fixture".to_string(),
+            statement: "fixture validity domain".to_string(),
+            temperature: Some(Interval::new(233.15, 573.15).unwrap()),
+            conditions: vec!["qualified nut factor".to_string()],
+            exclusions: vec!["gross yielding".to_string()],
+            materials: vec![],
+            provenance: SelectionProvenance::new("reference", "fixture").unwrap(),
+        }],
+        provenance: SelectionProvenance::new("reference", "fixture").unwrap(),
+    }])
+    .unwrap();
+    ModelSelector::select(
+        &catalog,
+        &[SelectionRequest {
+            requirement_id: "req-preload".to_string(),
+            discipline: Discipline::Mechanical,
+            property: Some("preload".to_string()),
+            conditions: vec!["qualified nut factor".to_string()],
+            material: None,
+            temperature: Some(
+                Quantity::new(300.0, UnitRegistry::si().require("K").unwrap()).unwrap(),
+            ),
+        }],
     )
     .unwrap()
 }
@@ -55,6 +99,16 @@ fn valid_response() -> EngineeringResponse {
     let generation = Digest::of_text("fixture-pack");
     let model = receipt("kernel-a");
     let independent = receipt("kernel-b");
+    let selection = selection();
+    let rationale = selection
+        .selected_models()
+        .next()
+        .expect("fixture selection")
+        .rationale
+        .clone();
+    let validity = ValidityEnvelopes {
+        envelopes: selection.envelopes().unwrap(),
+    };
     EngineeringResponse {
         formulation: Gate::established(Formulation {
             objective: "check a bolted joint".to_string(),
@@ -81,18 +135,12 @@ fn valid_response() -> EngineeringResponse {
                 model_id: "torque-preload".to_string(),
                 version: "1.0.0".to_string(),
                 equation_ids: vec!["eq-torque-preload".to_string()],
-                rationale: "governing scalar relation for this regime".to_string(),
+                rationale,
             }],
             alternatives_considered: vec!["thread-strip model (different regime)".to_string()],
+            selection: Some(selection),
         }),
-        validity: Gate::established(ValidityEnvelopes {
-            envelopes: vec![ValidityEnvelope {
-                model_id: "torque-preload".to_string(),
-                temperature: Some(Interval::new(233.15, 573.15).unwrap()),
-                conditions: vec!["qualified nut factor".to_string()],
-                exclusions: vec!["gross yielding".to_string()],
-            }],
-        }),
+        validity: Gate::established(validity),
         dimensions: Gate::established(DimensionChecks {
             checks: vec![
                 DimensionCheck::new("T = K F d", Dimension::ENERGY, Dimension::ENERGY).unwrap(),
@@ -324,4 +372,59 @@ fn the_gate_ids_are_the_eleven_contract_steps() {
     assert_eq!(GateId::ALL[0], GateId::Formulation);
     assert_eq!(GateId::ALL[10], GateId::Verification);
     assert_eq!(RevisionId::new(1).get(), 1);
+}
+
+#[test]
+fn an_unsigned_receipt_cannot_establish_execution() {
+    let mut response = valid_response();
+    if let engineering_core::GateState::Established(executed) =
+        &mut response.executed_analysis.state
+    {
+        executed.receipts[0].attestation = None;
+    }
+    let assessment = response.assess();
+    assert!(!assessment.is_ready());
+    assert!(assessment.violations.iter().any(|violation| {
+        violation.gate == GateId::ExecutedAnalysis && violation.message.contains("attestation")
+    }));
+}
+
+#[test]
+fn a_receipt_signed_by_a_foreign_key_cannot_establish_execution() {
+    let response = valid_response();
+    let other = ReceiptSigner::from_seed([8u8; 32]);
+    let verifier = engineering_core::ReceiptVerifier::trusting_key_id(&other.key_id()).unwrap();
+    let assessment = response.assess_with_verifier(&verifier);
+    assert!(!assessment.is_ready());
+    assert!(assessment.violations.iter().any(|violation| {
+        violation.gate == GateId::ExecutedAnalysis && violation.message.contains("untrusted key")
+    }));
+}
+
+#[test]
+fn a_caller_cannot_replace_a_selected_validity_envelope() {
+    let mut response = valid_response();
+    if let engineering_core::GateState::Established(validity) = &mut response.validity.state {
+        validity.envelopes[0].temperature = Some(Interval::new(1.0, 10_000.0).unwrap());
+    }
+    let assessment = response.assess();
+    assert!(!assessment.is_ready());
+    assert!(assessment
+        .violations
+        .iter()
+        .any(|violation| violation.gate == GateId::Validity));
+}
+
+#[test]
+fn a_caller_cannot_substitute_a_model_outside_the_selector() {
+    let mut response = valid_response();
+    if let engineering_core::GateState::Established(theory) = &mut response.theory.state {
+        theory.models[0].model_id = "caller-preferred".to_string();
+    }
+    let assessment = response.assess();
+    assert!(!assessment.is_ready());
+    assert!(assessment
+        .violations
+        .iter()
+        .any(|violation| violation.gate == GateId::Theory));
 }

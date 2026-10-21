@@ -1,10 +1,12 @@
 use engineering_units::{Dimension, Interval, Uncertainty};
 use serde::{Deserialize, Serialize};
 
+use crate::attestation::ReceiptVerifier;
 use crate::digest::Digest;
 use crate::error::CoreResult;
 use crate::graph::NodeId;
 use crate::receipt::{AnalysisReceipt, ExecutionEvidence};
+use crate::selector::{ApplicabilitySelection, RequirementSelection};
 use crate::value::{Provenance, ValueState};
 
 /// Model responses are untrusted text: every established gate bounds the
@@ -21,6 +23,39 @@ fn bounded_evidence(values: &[String], max: usize) -> bool {
 fn unknown_solver_version(version: &str) -> bool {
     let version = version.trim().to_ascii_lowercase();
     version == "unknown" || version.ends_with("/unknown")
+}
+
+/// Translate a non-selected applicability outcome into the gate's typed
+/// research request vocabulary. Ambiguity is research, never a silent pick.
+fn push_selection_research(
+    out: &mut ResponseAssessment,
+    gate: GateId,
+    selection: &ApplicabilitySelection,
+) {
+    for outcome in &selection.selections {
+        match outcome {
+            RequirementSelection::Selected { .. } => {}
+            RequirementSelection::ResearchRequired {
+                reason,
+                sources_required,
+                ..
+            } => out.research_required.push(ResearchRequest {
+                gate,
+                reason: reason.clone(),
+                sources_required: sources_required.clone(),
+            }),
+            RequirementSelection::Ambiguous {
+                candidates, reason, ..
+            } => out.research_required.push(ResearchRequest {
+                gate,
+                reason: reason.clone(),
+                sources_required: candidates
+                    .iter()
+                    .map(|candidate| format!("disambiguate by a validity condition: {candidate}"))
+                    .collect(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -199,6 +234,11 @@ pub struct ModelSelection {
 pub struct TheorySelection {
     pub models: Vec<ModelSelection>,
     pub alternatives_considered: Vec<String>,
+    /// The central [`crate::selector::ModelSelector`] decision that produced
+    /// these models. Gate 3 recomputes it; a caller-supplied model list that
+    /// disagrees with the selector is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ApplicabilitySelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -419,6 +459,13 @@ impl EngineeringResponse {
     /// receipts with consistent digests/evidence. An unavailable theory or
     /// validity envelope produces a typed research request, never a pass.
     pub fn assess(&self) -> ResponseAssessment {
+        self.assess_with_verifier(&ReceiptVerifier::self_attested())
+    }
+
+    /// Assess the contract and verify every receipt against `verifier`'s
+    /// trusted daemon key set. A missing, tampered, malformed or wrong-key
+    /// attestation is a typed gate violation and gate 6 cannot be established.
+    pub fn assess_with_verifier(&self, verifier: &ReceiptVerifier) -> ResponseAssessment {
         let mut out = ResponseAssessment::default();
 
         self.assess_formulation(&mut out);
@@ -426,8 +473,8 @@ impl EngineeringResponse {
         self.assess_theory(&mut out);
         self.assess_validity(&mut out);
         self.assess_dimensions(&mut out);
-        self.assess_execution(&mut out);
-        self.assess_cross_check(&mut out);
+        self.assess_execution(&mut out, verifier);
+        self.assess_cross_check(&mut out, verifier);
         self.assess_uncertainty(&mut out);
         self.assess_counterexamples(&mut out);
         self.assess_realization(&mut out);
@@ -440,8 +487,19 @@ impl EngineeringResponse {
         self.assess().is_ready()
     }
 
+    pub fn is_ready_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
+        self.assess_with_verifier(verifier).is_ready()
+    }
+
     pub fn require_ready(&self) -> Result<(), ResponseAssessment> {
-        let assessment = self.assess();
+        self.require_ready_with_verifier(&ReceiptVerifier::self_attested())
+    }
+
+    pub fn require_ready_with_verifier(
+        &self,
+        verifier: &ReceiptVerifier,
+    ) -> Result<(), ResponseAssessment> {
+        let assessment = self.assess_with_verifier(verifier);
         if assessment.is_ready() {
             Ok(())
         } else {
@@ -453,6 +511,13 @@ impl EngineeringResponse {
     /// "validate this contract" call shape.
     pub fn validate(&self) -> Result<(), ResponseAssessment> {
         self.require_ready()
+    }
+
+    pub fn validate_with_verifier(
+        &self,
+        verifier: &ReceiptVerifier,
+    ) -> Result<(), ResponseAssessment> {
+        self.require_ready_with_verifier(verifier)
     }
 
     fn assess_formulation(&self, out: &mut ResponseAssessment) {
@@ -556,6 +621,86 @@ impl EngineeringResponse {
                     );
                     return;
                 }
+                let Some(selection) = &value.selection else {
+                    out.violation(
+                        GateId::Theory,
+                        "theory selection is not backed by the central applicability selector",
+                    );
+                    return;
+                };
+                if let Err(error) = selection.validate() {
+                    out.violation(
+                        GateId::Theory,
+                        format!("applicability selection is not reproducible: {error}"),
+                    );
+                    return;
+                }
+                if !selection.is_all_selected() {
+                    push_selection_research(out, GateId::Theory, selection);
+                    return;
+                }
+                let expected = selection.unique_models();
+                if expected.is_empty() {
+                    out.violation(
+                        GateId::Theory,
+                        "applicability selector recorded no selected model",
+                    );
+                    return;
+                }
+                if let GateState::Established(authority) = &self.authority.state {
+                    for selected in &expected {
+                        let (Some(pack_id), Some(pack_version), Some(pack_digest)) = (
+                            selected.pack_id.as_deref(),
+                            selected.pack_version.as_deref(),
+                            selected.pack_digest,
+                        ) else {
+                            continue;
+                        };
+                        if !authority.packs.iter().any(|pack| {
+                            pack.pack_id == pack_id
+                                && pack.version == pack_version
+                                && pack.digest == pack_digest
+                        }) {
+                            out.violation(
+                                GateId::Theory,
+                                format!(
+                                    "selected model {} cites pack {pack_id}@{pack_version} whose digest is not in the authority gate",
+                                    selected.model_id
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+                if value.models.len() != expected.len() {
+                    out.violation(
+                        GateId::Theory,
+                        format!(
+                            "theory names {} model(s) but the applicability selector selected {}",
+                            value.models.len(),
+                            expected.len()
+                        ),
+                    );
+                    return;
+                }
+                for (actual, expected) in value.models.iter().zip(expected.iter()) {
+                    if actual.model_id != expected.model_id
+                        || actual.version != expected.version
+                        || actual.equation_ids != expected.equation_ids
+                    {
+                        out.violation(
+                            GateId::Theory,
+                            format!(
+                                "theory model {}@{} does not match the selector's {}@{}",
+                                actual.model_id,
+                                actual.version,
+                                expected.model_id,
+                                expected.version
+                            ),
+                        );
+                        return;
+                    }
+                }
                 out.established_gates += 1;
             }
             GateState::Unavailable(gap) => out.research(GateId::Theory, gap.clone()),
@@ -587,6 +732,42 @@ impl EngineeringResponse {
                         );
                         return;
                     }
+                }
+                let selection = match &self.theory.state {
+                    GateState::Established(theory) => theory.selection.as_ref(),
+                    _ => None,
+                };
+                let Some(selection) = selection else {
+                    out.violation(
+                        GateId::Validity,
+                        "validity envelopes were not produced by the central applicability selector",
+                    );
+                    return;
+                };
+                if let Err(error) = selection.validate() {
+                    out.violation(
+                        GateId::Validity,
+                        format!("applicability selection is not reproducible: {error}"),
+                    );
+                    return;
+                }
+                if !selection.is_all_selected() {
+                    push_selection_research(out, GateId::Validity, selection);
+                    return;
+                }
+                let expected = match selection.envelopes() {
+                    Ok(envelopes) => envelopes,
+                    Err(error) => {
+                        out.violation(GateId::Validity, error.to_string());
+                        return;
+                    }
+                };
+                if value.envelopes != expected {
+                    out.violation(
+                        GateId::Validity,
+                        "recorded envelopes do not match the selector's registered validity domains",
+                    );
+                    return;
                 }
                 out.established_gates += 1;
             }
@@ -640,7 +821,7 @@ impl EngineeringResponse {
         }
     }
 
-    fn assess_execution(&self, out: &mut ResponseAssessment) {
+    fn assess_execution(&self, out: &mut ResponseAssessment, verifier: &ReceiptVerifier) {
         match &self.executed_analysis.state {
             GateState::Established(value) => {
                 if value.receipts.is_empty() {
@@ -651,6 +832,13 @@ impl EngineeringResponse {
                     return;
                 }
                 for receipt in &value.receipts {
+                    if unknown_solver_version(&receipt.identity.solver_version) {
+                        out.violation(
+                            GateId::ExecutedAnalysis,
+                            "receipt names an unknown solver version; version authority is required",
+                        );
+                        return;
+                    }
                     if let Err(error) = receipt.validate() {
                         out.violation(
                             GateId::ExecutedAnalysis,
@@ -658,10 +846,10 @@ impl EngineeringResponse {
                         );
                         return;
                     }
-                    if unknown_solver_version(&receipt.identity.solver_version) {
+                    if let Err(error) = verifier.verify(receipt) {
                         out.violation(
                             GateId::ExecutedAnalysis,
-                            "receipt names an unknown solver version; version authority is required",
+                            format!("receipt attestation refused: {error}"),
                         );
                         return;
                     }
@@ -712,7 +900,7 @@ impl EngineeringResponse {
         }
     }
 
-    fn assess_cross_check(&self, out: &mut ResponseAssessment) {
+    fn assess_cross_check(&self, out: &mut ResponseAssessment, verifier: &ReceiptVerifier) {
         match &self.cross_check.state {
             GateState::Established(value) => {
                 if !bounded(&value.method, 512) || !bounded(&value.independent_of, 256) {
@@ -765,6 +953,13 @@ impl EngineeringResponse {
                         out.violation(
                             GateId::CrossCheck,
                             format!("cross-check receipt invalid: {error}"),
+                        );
+                        return;
+                    }
+                    if let Err(error) = verifier.verify(receipt) {
+                        out.violation(
+                            GateId::CrossCheck,
+                            format!("cross-check receipt attestation refused: {error}"),
                         );
                         return;
                     }

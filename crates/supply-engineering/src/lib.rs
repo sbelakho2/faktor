@@ -17,16 +17,17 @@ use std::time::Instant;
 
 use engineering_core::{
     evaluate_requirements, si_crosscheck_verdict, Agreement, AnalysisIdentity, AnalysisKind,
-    AnalysisReceipt, AssumptionRecord, AuthorityRef,
-    CandidateEvaluation as EngineeringCandidateEvaluation, CandidateFacts, CounterexampleProbe,
-    CounterexampleSearch, CrossCheck, DerivedTest, Digest, DimensionChecks, Discipline,
-    EngineeringRequirementSet, EngineeringResponse, EngineeringValue, EngineeringVerdict,
-    ExecutedAnalysis, FalsifiableTest, FalsifiableVerification, Formulation, Gate,
-    KnowledgeAuthority, ModelSelection, NodeId, OutcomeState, ProbeOutcome, PropertyRevision,
-    Provenance, ProvenanceKind, RealizationCategory, RealizationConsequence,
-    RealizationConsequences, ReceiptContent, ReceiptResult, ReceiptValue, RequirementEvidence,
-    RevisionId, TheorySelection, UncertaintyContribution, UncertaintyStatement, ValidityEnvelope,
-    ValidityEnvelopes, ValueState,
+    AnalysisReceipt, ApplicabilitySelection, AssumptionRecord, AuthorityRef,
+    CandidateEvaluation as EngineeringCandidateEvaluation, CandidateFacts, CatalogModel,
+    CounterexampleProbe, CounterexampleSearch, CrossCheck, DerivedTest, Digest, DimensionChecks,
+    Discipline, EngineeringRequirementSet, EngineeringResponse, EngineeringValue,
+    EngineeringVerdict, ExecutedAnalysis, FalsifiableTest, FalsifiableVerification, Formulation,
+    Gate, GateId, KnowledgeAuthority, ModelCatalog, ModelSelection, ModelSelector, NodeId,
+    OutcomeState, ProbeOutcome, PropertyRevision, Provenance, ProvenanceKind, RealizationCategory,
+    RealizationConsequence, RealizationConsequences, ReceiptContent, ReceiptResult, ReceiptSigner,
+    ReceiptValue, ReceiptVerifier, RequirementEvidence, RequirementSelection, RevisionId,
+    SelectionProvenance, SelectionRequest, TheorySelection, UncertaintyContribution,
+    UncertaintyStatement, ValidityDomain, ValidityEnvelopes, ValueState,
 };
 use engineering_knowledge::{KnowledgeError, KnowledgePack, KnowledgeRegistry};
 use engineering_units::{Quantity, Uncertainty};
@@ -249,6 +250,17 @@ impl LoopRequest {
         if self.engineering.models.is_empty() {
             return Err(LoopError::Invalid(
                 "a closed-loop requirement set needs at least one governing model".to_string(),
+            ));
+        }
+        if !self
+            .engineering
+            .requirements
+            .iter()
+            .any(|requirement| requirement.target.model().is_some())
+        {
+            return Err(LoopError::Invalid(
+                "no requirement binds a governing model; the applicability selector has nothing to govern"
+                    .to_string(),
             ));
         }
         if self.candidates.is_empty() || self.candidates.len() > MAX_LOOP_CANDIDATES {
@@ -559,10 +571,16 @@ impl LoopOutcome {
     /// Recompute every proof/evidence binding. This is the command/tool-side
     /// verification entry point; it never trusts the stored booleans.
     pub fn verify(&self) -> LoopResult<LoopVerification> {
+        self.verify_with_verifier(&ReceiptVerifier::self_attested())
+    }
+
+    /// Verify every proof binding and require the receipts (including the
+    /// response gate receipts) to attest under the daemon's trusted key.
+    pub fn verify_with_verifier(&self, verifier: &ReceiptVerifier) -> LoopResult<LoopVerification> {
         self.decision.validate()?;
         self.requirement_set.validate()?;
-        self.receipt.validate()?;
-        self.cross_check.validate()?;
+        verifier.verify(&self.receipt)?;
+        verifier.verify(&self.cross_check)?;
         let payload = digest_payload(
             &self.decision,
             &self.requirement_set,
@@ -571,14 +589,34 @@ impl LoopOutcome {
             &self.knowledge,
         )?;
         let model_digest = Digest::of_json(&self.knowledge.to_vec())?;
+        let selected_digest = match self.response.as_ref() {
+            Some(response) => match &response.theory.state {
+                engineering_core::GateState::Established(theory) => match &theory.selection {
+                    Some(selection) => Some(selection.digest()?),
+                    None => None,
+                },
+                _ => None,
+            },
+            None => None,
+        };
+        let selection_binding = match (&self.response, selected_digest) {
+            (Some(_), Some(digest)) => {
+                self.receipt.selection_digest == Some(digest)
+                    && self.cross_check.selection_digest == Some(digest)
+            }
+            (Some(_), None) => false,
+            (None, None) => true,
+            (None, Some(_)) => false,
+        };
         let receipt_binding = self.receipt.input_digest == self.binding.input_digest
             && self.cross_check.input_digest == self.binding.input_digest
             && self.receipt.model_digest == model_digest
             && self.cross_check.model_digest == model_digest
             && self.binding.engineering_revision == self.requirement_set.revision
-            && self.binding.supply_revision == self.decision.revision;
+            && self.binding.supply_revision == self.decision.revision
+            && selection_binding;
         let response_ready = match (&self.response, &self.decision.recommended_action) {
-            (Some(response), _) => response.is_ready(),
+            (Some(response), _) => response.is_ready_with_verifier(verifier),
             (None, RecommendedAction::Proceed { .. }) => false,
             (None, _) => true,
         };
@@ -595,7 +633,11 @@ impl LoopOutcome {
 
     /// True when verification passed every binding.
     pub fn is_verified(&self) -> bool {
-        self.verify()
+        self.is_verified_with_verifier(&ReceiptVerifier::self_attested())
+    }
+
+    pub fn is_verified_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
+        self.verify_with_verifier(verifier)
             .map(|v| {
                 v.decision_valid
                     && v.requirement_set_valid
@@ -611,6 +653,15 @@ impl LoopOutcome {
 /// Run the closed loop. Deterministic and bounded; evaluation is O(n), and
 /// ranking is one `sort_by` over n candidates (O(n log n)).
 pub fn run(request: &LoopRequest) -> LoopResult<LoopOutcome> {
+    // Standalone/embedded callers get an ephemeral process key: receipts are
+    // still signed and self-verifiable, but the daemon path uses the durable
+    // data-dir key through [`run_with_signer`].
+    let signer = ReceiptSigner::generate();
+    run_with_signer(request, &signer)
+}
+
+/// Run the closed loop with the daemon-local engineering signing key.
+pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopResult<LoopOutcome> {
     request.validate()?;
     let started = Instant::now();
     let input_digest = Digest::of_json(request)?;
@@ -790,6 +841,8 @@ pub fn run(request: &LoopRequest) -> LoopResult<LoopOutcome> {
         &quotes,
         &package,
         &normalization,
+        &packs,
+        signer,
         started,
     )?;
 
@@ -1278,6 +1331,8 @@ fn build_decision(
     quotes: &[Quote],
     package: &RfqPackage,
     normalization: &NormalizationContext,
+    packs: &[&KnowledgePack],
+    signer: &ReceiptSigner,
     started: Instant,
 ) -> LoopResult<DecisionParts> {
     let mut evidence = Vec::new();
@@ -1550,6 +1605,8 @@ fn build_decision(
             authorities,
             &evidence,
             &assumptions,
+            packs,
+            signer,
         )?),
         _ => None,
     };
@@ -1746,12 +1803,24 @@ fn build_decision(
         conflicts,
     };
 
+    let selection_digest = match response.as_ref() {
+        Some(response) => match &response.theory.state {
+            engineering_core::GateState::Established(theory) => match &theory.selection {
+                Some(selection) => Some(selection.digest()?),
+                None => None,
+            },
+            _ => None,
+        },
+        None => None,
+    };
     let (receipt, cross_check) = build_receipts(
         request,
         requirements,
         evaluations,
         authorities,
         &evidence,
+        selection_digest,
+        signer,
         started,
     )?;
 
@@ -1765,12 +1834,15 @@ fn build_decision(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_receipts(
     request: &LoopRequest,
     requirements: &EngineeringRequirementSet,
     evaluations: &[CandidateEvaluation],
     authorities: &[AuthorityRef],
     evidence: &[EvidenceRef],
+    selection_digest: Option<Digest>,
+    signer: &ReceiptSigner,
     started: Instant,
 ) -> LoopResult<(AnalysisReceipt, AnalysisReceipt)> {
     let input_digest = Digest::of_json(request)?;
@@ -1794,6 +1866,7 @@ fn build_receipts(
 
     let mut content = ReceiptContent::new(input_digest, model_digest, settings_digest)
         .with_boundary_condition("supply_revision", boundary);
+    content.selection_digest = selection_digest;
     let mut results = Vec::new();
     for evaluation in evaluations.iter().take(MAX_LOOP_RANKED) {
         results.push(ReceiptResult {
@@ -1819,7 +1892,7 @@ fn build_receipts(
         .map(|requirement| PropertyRevision::new(requirement.id.clone(), requirements.revision))
         .collect::<Result<Vec<_>, _>>()?;
     let runtime_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let receipt = AnalysisReceipt::kernel(
+    let mut receipt = AnalysisReceipt::kernel(
         AnalysisIdentity {
             solver_id: "faktor-supply-engineering.loop".to_string(),
             solver_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1828,6 +1901,7 @@ fn build_receipts(
         content.clone(),
         runtime_ms,
     )?;
+    signer.sign_receipt(&mut receipt)?;
 
     let candidate_by_id = index_candidates(&request.candidates);
     let mut cross_results = Vec::new();
@@ -1854,7 +1928,7 @@ fn build_receipts(
     }
     let mut cross_content = content;
     cross_content.results = cross_results;
-    let cross_check = AnalysisReceipt::kernel(
+    let mut cross_check = AnalysisReceipt::kernel(
         AnalysisIdentity {
             solver_id: "faktor-supply-engineering.si-crosscheck".to_string(),
             solver_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1863,6 +1937,7 @@ fn build_receipts(
         cross_content,
         runtime_ms,
     )?;
+    signer.sign_receipt(&mut cross_check)?;
     if disagreements > 0 {
         return Err(LoopError::Invalid(format!(
             "{disagreements} SI cross-check disagreements; the analysis is not accepted"
@@ -1871,6 +1946,261 @@ fn build_receipts(
     Ok((receipt, cross_check))
 }
 
+fn build_applicability_selection(
+    requirements: &EngineeringRequirementSet,
+    candidate: &CandidateFacts,
+    packs: &[&KnowledgePack],
+) -> LoopResult<ApplicabilitySelection> {
+    let catalog = build_model_catalog(requirements, packs)?;
+    let requests = selection_requests(requirements, candidate);
+    Ok(ModelSelector::select(&catalog, &requests)?)
+}
+
+fn build_model_catalog(
+    requirements: &EngineeringRequirementSet,
+    packs: &[&KnowledgePack],
+) -> LoopResult<ModelCatalog> {
+    let mut models = Vec::with_capacity(requirements.models.len());
+    let mut seen = BTreeSet::new();
+    for binding in &requirements.models {
+        if !seen.insert(binding.model_id.clone()) {
+            return Err(LoopError::Invalid(format!(
+                "duplicate model binding {}",
+                binding.model_id
+            )));
+        }
+        let (disciplines, properties, domains, source_model_id, provenance) = match (
+            &binding.pack_id,
+            &binding.pack_version,
+        ) {
+            (Some(pack_id), Some(pack_version)) => {
+                let pack = packs
+                        .iter()
+                        .find(|pack| &pack.id == pack_id && &pack.version == pack_version)
+                        .ok_or_else(|| {
+                            LoopError::Invalid(format!(
+                                "model {} cites pack {pack_id}@{pack_version}, which is not in the requested knowledge domains",
+                                binding.model_id
+                            ))
+                        })?;
+                // A registered pack with one model may be bound under a
+                // caller alias (legacy fixture ids); the validity domains
+                // are still the registered ones, never the binding's.
+                let source = pack
+                        .models
+                        .iter()
+                        .find(|model| model.id == binding.model_id)
+                        .or_else(|| {
+                            (pack.models.len() == 1).then(|| pack.models.first()).flatten()
+                        })
+                        .ok_or_else(|| {
+                            LoopError::Invalid(format!(
+                                "model {} is not registered in pack {pack_id}@{pack_version} and the pack has no unique model to alias",
+                                binding.model_id
+                            ))
+                        })?;
+                if !binding
+                    .equation_ids
+                    .iter()
+                    .all(|id| source.equation_ids.contains(id))
+                {
+                    return Err(LoopError::Invalid(format!(
+                        "model {} cites an equation that is not registered for pack model {}",
+                        binding.model_id, source.id
+                    )));
+                }
+                let converted = pack
+                    .model_catalog()?
+                    .into_iter()
+                    .find(|model| model.model_id == source.id)
+                    .ok_or_else(|| {
+                        LoopError::Invalid(format!(
+                            "pack model {} vanished during catalog conversion",
+                            source.id
+                        ))
+                    })?;
+                (
+                    converted.disciplines,
+                    converted.properties,
+                    converted.domains,
+                    Some(source.id.clone()),
+                    converted.provenance,
+                )
+            }
+            (None, None) => {
+                let mut disciplines = BTreeSet::new();
+                let mut properties = property_tokens(&binding.model_id);
+                for requirement in &requirements.requirements {
+                    if requirement.target.model() == Some(binding.model_id.as_str()) {
+                        disciplines.insert(requirement.discipline);
+                        properties.extend(property_tokens(requirement.target.property()));
+                    }
+                }
+                for equation in &binding.equation_ids {
+                    properties.extend(property_tokens(equation));
+                }
+                properties.sort();
+                properties.dedup();
+                if disciplines.is_empty() {
+                    disciplines.insert(Discipline::Other);
+                }
+                let provenance = SelectionProvenance {
+                    kind: binding.provenance.kind.as_str().to_string(),
+                    citation: binding.provenance.citation.clone(),
+                    edition: None,
+                    locator: binding.provenance.locator.clone(),
+                    note: None,
+                    digest: binding.provenance.digest,
+                };
+                let domain = ValidityDomain {
+                    id: format!("explicit-{}", binding.model_id),
+                    statement:
+                        "explicit revision-bound model binding with its declared validity envelope"
+                            .to_string(),
+                    temperature: binding.temperature,
+                    conditions: binding.conditions.clone(),
+                    exclusions: binding.exclusions.clone(),
+                    materials: Vec::new(),
+                    provenance: provenance.clone(),
+                };
+                (
+                    disciplines.into_iter().collect(),
+                    properties,
+                    vec![domain],
+                    None,
+                    provenance,
+                )
+            }
+            _ => {
+                return Err(LoopError::Invalid(
+                    "pack id and version must be provided together".to_string(),
+                ))
+            }
+        };
+        models.push(CatalogModel {
+            model_id: binding.model_id.clone(),
+            source_model_id,
+            version: binding.version.clone(),
+            pack_id: binding.pack_id.clone(),
+            pack_version: binding.pack_version.clone(),
+            pack_digest: binding.pack_id.as_ref().and_then(|_| {
+                packs
+                    .iter()
+                    .find(|pack| {
+                        Some(&pack.id) == binding.pack_id.as_ref()
+                            && Some(&pack.version) == binding.pack_version.as_ref()
+                    })
+                    .and_then(|pack| pack.digest())
+            }),
+            equation_ids: binding.equation_ids.clone(),
+            disciplines,
+            properties,
+            domains,
+            provenance,
+        });
+    }
+    ModelCatalog::new(models).map_err(LoopError::Engineering)
+}
+
+fn selection_requests(
+    requirements: &EngineeringRequirementSet,
+    candidate: &CandidateFacts,
+) -> Vec<SelectionRequest> {
+    let mut requests = Vec::new();
+    for requirement in &requirements.requirements {
+        if requirement.target.model().is_none() {
+            continue;
+        }
+        let property = requirement.target.property();
+        let mut conditions = candidate.conditions.clone();
+        for condition in &requirement.conditions {
+            if !conditions.iter().any(|existing| existing == condition) {
+                conditions.push(condition.clone());
+            }
+        }
+        let value = candidate.values.get(property);
+        if let Some(value) = value {
+            if let Some(condition) = &value.condition {
+                if !conditions.iter().any(|existing| existing == condition) {
+                    conditions.push(condition.clone());
+                }
+            }
+            for condition in &value.applicability.conditions {
+                if !conditions.iter().any(|existing| existing == condition) {
+                    conditions.push(condition.clone());
+                }
+            }
+        }
+        let material = value
+            .and_then(|value| value.material.as_ref())
+            .map(|material| {
+                let mut text = material.name.clone();
+                if let Some(grade) = &material.grade {
+                    text.push(' ');
+                    text.push_str(grade);
+                }
+                if let Some(temper) = &material.temper {
+                    text.push(' ');
+                    text.push_str(temper);
+                }
+                text
+            });
+        requests.push(SelectionRequest {
+            requirement_id: requirement.id.clone(),
+            discipline: requirement.discipline,
+            property: Some(property.to_string()),
+            conditions,
+            material,
+            temperature: candidate.temperature.clone(),
+        });
+    }
+    requests
+}
+
+fn property_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn selection_research(selection: &ApplicabilitySelection) -> (String, Vec<String>) {
+    for outcome in &selection.selections {
+        match outcome {
+            RequirementSelection::Selected { .. } => {}
+            RequirementSelection::ResearchRequired {
+                requirement_id,
+                reason,
+                sources_required,
+            } => {
+                return (
+                    format!("{requirement_id}: {reason}"),
+                    sources_required.clone(),
+                )
+            }
+            RequirementSelection::Ambiguous {
+                requirement_id,
+                candidates,
+                reason,
+            } => {
+                return (
+                    format!("{requirement_id}: {reason}"),
+                    candidates
+                        .iter()
+                        .map(|candidate| format!("disambiguate {candidate}"))
+                        .collect(),
+                )
+            }
+        }
+    }
+    (
+        "applicability selector returned no selected model".to_string(),
+        vec!["a registered model with an established validity domain".to_string()],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_response(
     request: &LoopRequest,
     requirements: &EngineeringRequirementSet,
@@ -1878,6 +2208,8 @@ fn build_response(
     authorities: &[AuthorityRef],
     evidence: &[EvidenceRef],
     assumptions: &[Assumption],
+    packs: &[&KnowledgePack],
+    signer: &ReceiptSigner,
 ) -> LoopResult<EngineeringResponse> {
     let candidate = request
         .candidates
@@ -1950,34 +2282,50 @@ fn build_response(
     let knowledge = KnowledgeAuthority {
         packs: authorities.to_vec(),
     };
-    let theory = TheorySelection {
-        models: requirements
-            .models
-            .iter()
+    let selection = build_applicability_selection(requirements, &candidate.facts, packs)?;
+    let (theory, validity) = if selection.is_all_selected() {
+        let models = selection
+            .unique_models()
+            .into_iter()
             .map(|model| ModelSelection {
                 model_id: model.model_id.clone(),
                 version: model.version.clone(),
                 equation_ids: model.equation_ids.clone(),
-                rationale: "governing model selected from the revision-bound requirement set"
-                    .to_string(),
+                rationale: model.rationale.clone(),
             })
-            .collect(),
-        alternatives_considered: vec![
-            "catalogue headline comparison without conditions".to_string(),
-            "datasheet limit comparison with the model validity envelope".to_string(),
-        ],
-    };
-    let validity = ValidityEnvelopes {
-        envelopes: requirements
-            .models
-            .iter()
-            .map(|model| ValidityEnvelope {
-                model_id: model.model_id.clone(),
-                temperature: model.temperature,
-                conditions: model.conditions.clone(),
-                exclusions: model.exclusions.clone(),
-            })
-            .collect(),
+            .collect::<Vec<_>>();
+        let mut alternatives = Vec::new();
+        for outcome in &selection.selections {
+            if let RequirementSelection::Selected {
+                alternatives_considered,
+                ..
+            } = outcome
+            {
+                alternatives.extend(alternatives_considered.iter().cloned());
+            }
+        }
+        alternatives.sort();
+        alternatives.dedup();
+        if alternatives.is_empty() {
+            alternatives.push(
+                "no registered alternative model covers these requirement regimes".to_string(),
+            );
+        }
+        let theory = TheorySelection {
+            models,
+            alternatives_considered: alternatives,
+            selection: Some(selection.clone()),
+        };
+        let validity = ValidityEnvelopes {
+            envelopes: selection.envelopes()?,
+        };
+        (Gate::established(theory), Gate::established(validity))
+    } else {
+        let (reason, sources) = selection_research(&selection);
+        (
+            Gate::research_required(GateId::Theory, reason.clone(), sources.clone()),
+            Gate::research_required(GateId::Validity, reason, sources),
+        )
     };
 
     let mut probes = Vec::new();
@@ -2108,19 +2456,25 @@ fn build_response(
         }
     }
 
+    let selection_digest = selection
+        .is_all_selected()
+        .then(|| selection.digest())
+        .transpose()?;
     let (response_receipt, response_cross_check) = build_receipts(
         request,
         requirements,
         std::slice::from_ref(evaluation),
         authorities,
         evidence,
+        selection_digest,
+        signer,
         Instant::now(),
     )?;
     let response = EngineeringResponse {
         formulation: Gate::established(formulation),
         authority: Gate::established(knowledge),
-        theory: Gate::established(theory),
-        validity: Gate::established(validity),
+        theory,
+        validity,
         dimensions: Gate::established(DimensionChecks {
             checks: dimension_checks,
         }),

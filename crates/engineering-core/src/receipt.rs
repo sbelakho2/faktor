@@ -251,6 +251,14 @@ pub struct AnalysisReceipt {
     pub repeatability: Repeatability,
     pub executed: bool,
     pub execution: ExecutionEvidence,
+    /// Digest of the central applicability selection that governed this
+    /// analysis. The response records the full selection; the receipt binds
+    /// it into the canonical signed digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_digest: Option<Digest>,
+    /// Ed25519 attestation over [`AnalysisReceipt::canonical_digest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<crate::attestation::ReceiptAttestation>,
 }
 
 /// Everything except identity/execution that a kernel or tool run records.
@@ -269,6 +277,8 @@ pub struct ReceiptContent {
     pub uncertainty: Uncertainty,
     pub artifacts: Vec<ArtifactRef>,
     pub repeatability: Repeatability,
+    /// Optional digest of the selected model/applicability record.
+    pub selection_digest: Option<Digest>,
 }
 
 impl ReceiptContent {
@@ -286,6 +296,7 @@ impl ReceiptContent {
             uncertainty: Uncertainty::Exact,
             artifacts: Vec::new(),
             repeatability: Repeatability::deterministic(),
+            selection_digest: None,
         }
     }
 
@@ -332,6 +343,11 @@ impl ReceiptContent {
         self.repeatability = repeatability;
         self
     }
+
+    pub fn with_selection_digest(mut self, digest: Digest) -> Self {
+        self.selection_digest = Some(digest);
+        self
+    }
 }
 
 impl AnalysisReceipt {
@@ -366,6 +382,8 @@ impl AnalysisReceipt {
                 runtime_ms,
                 result_digest,
             },
+            selection_digest: content.selection_digest,
+            attestation: None,
         };
         receipt.validate()?;
         Ok(receipt)
@@ -404,6 +422,8 @@ impl AnalysisReceipt {
                 output_truncated: process.output_truncated,
                 deadline_ms: process.deadline_ms,
             },
+            selection_digest: content.selection_digest,
+            attestation: None,
         };
         receipt.validate()?;
         Ok(receipt)
@@ -499,6 +519,9 @@ impl AnalysisReceipt {
             return Err(CoreError::InvalidReceipt {
                 reason: "receipt records neither results nor artifacts".to_string(),
             });
+        }
+        if self.attestation.is_some() {
+            self.verify_attestation()?;
         }
         Ok(())
     }

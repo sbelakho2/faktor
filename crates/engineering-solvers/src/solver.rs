@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use engineering_core::{
     AnalysisIdentity, AnalysisKind, AnalysisReceipt, AnalysisWarning, ArtifactRef, Convergence,
     CoreError, Digest, EngineeringValue, PropertyRevision, ReceiptContent, ReceiptResult,
-    ReceiptValue, Repeatability,
+    ReceiptSigner, ReceiptValue, Repeatability,
 };
 use engineering_units::Uncertainty;
 use faktor_cas::Cas;
@@ -64,6 +64,10 @@ pub struct SolveContext {
     pub cancellation: CancellationToken,
     pub deadline: Duration,
     pub operation_id: u64,
+    /// Daemon-local receipt signer. Adapter execution signs the canonical
+    /// receipt digest (including the adapter identity and captured output
+    /// digest) whenever the signer is installed.
+    pub signer: Option<Arc<ReceiptSigner>>,
 }
 
 impl SolveContext {
@@ -79,7 +83,13 @@ impl SolveContext {
             cancellation: CancellationToken::new(),
             deadline,
             operation_id,
+            signer: None,
         }
+    }
+
+    pub fn with_signer(mut self, signer: Arc<ReceiptSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -474,7 +484,7 @@ pub fn receipt_from_process(
         .map(|artifact| artifact.digest);
     content.artifacts = artifacts;
     content.repeatability = repeatability;
-    Ok(AnalysisReceipt::supervised(
+    let mut receipt = AnalysisReceipt::supervised(
         identity,
         content,
         engineering_core::SupervisedProcessEvidence {
@@ -485,7 +495,11 @@ pub fn receipt_from_process(
             output_truncated: evidence.truncated,
             deadline_ms: run.deadline_ms,
         },
-    )?)
+    )?;
+    if let Some(signer) = &context.signer {
+        signer.sign_receipt(&mut receipt)?;
+    }
+    Ok(receipt)
 }
 
 pub fn failure_receipt(

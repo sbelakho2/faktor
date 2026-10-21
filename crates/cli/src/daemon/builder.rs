@@ -1506,7 +1506,17 @@ pub(crate) fn build_daemon_core(
     // Coordination board + the closed Engineering -> Supply loop. The loop
     // tools are deterministic CPU kernels and never send or order anything.
     tools::register_board_tools(&mut tools, session.clone());
-    tools_supply_engineering::register(&mut tools);
+    // The daemon-local engineering signing key (owner-only 0600 in the data
+    // dir) attests executed receipts; the verify tool trusts exactly this key.
+    let engineering_signer = std::sync::Arc::new(
+        engineering_core::load_or_create_signing_key(data_dir)
+            .map_err(|error| format!("engineering signing key: {error}"))?,
+    );
+    let engineering_verifier = std::sync::Arc::new(
+        engineering_core::ReceiptVerifier::trusting_key_id(&engineering_signer.key_id())
+            .map_err(|error| format!("engineering receipt verifier: {error}"))?,
+    );
+    tools_supply_engineering::register(&mut tools, engineering_signer, engineering_verifier);
     // Faktor Acquire (docs/acquire.md §4): the `source_market` tool enters
     // the registry LAZILY with the deterministic activation policy and the
     // §4 phase mask — until a signal/product URL/`/source on` activates it,

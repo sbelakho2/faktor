@@ -75,6 +75,7 @@ faktor-supply-logistics.workspace = true
 faktor-supply-planning.workspace = true
 faktor-supply-execution.workspace = true
 faktor-supply-engineering.workspace = true
+engineering-core.workspace = true
 async-trait = "0.1"
 futures.workspace = true
 clap = { version = "4", features = ["derive"] }

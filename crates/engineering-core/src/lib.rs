@@ -7,14 +7,20 @@
 //! and 6 can only be established by machine-checked dimensions and executed
 //! receipts, never by prose.
 
+pub mod attestation;
 pub mod digest;
 pub mod error;
 pub mod gate;
 pub mod graph;
 pub mod receipt;
 pub mod requirements;
+pub mod selector;
 pub mod value;
 
+pub use attestation::{
+    load_or_create_signing_key, load_signing_key, signing_key_path, ReceiptAttestation,
+    ReceiptSigner, ReceiptVerifier, ATTESTATION_ALGORITHM, ENGINEERING_SIGNING_KEY_FILE,
+};
 pub use digest::Digest;
 pub use error::{CoreError, CoreResult};
 pub use gate::{
@@ -42,6 +48,11 @@ pub use requirements::{
     RequirementEvidence, RequirementOutcome, RequirementTarget, TestKind, MAX_CANDIDATE_CATEGORIES,
     MAX_CANDIDATE_FACTS, MAX_DERIVED_TESTS, MAX_REQUIREMENTS, MAX_REQUIREMENT_CONSTRAINTS,
     MAX_REQUIREMENT_EVIDENCE, MAX_REQUIREMENT_MODELS,
+};
+pub use selector::{
+    ApplicabilitySelection, CatalogModel, ModelCatalog, ModelSelector, RequirementSelection,
+    SelectedModel, SelectionProvenance, SelectionRequest, ValidityDomain, MAX_CATALOG_MODELS,
+    MAX_SELECTION_REQUESTS, MAX_VALIDITY_DOMAINS,
 };
 pub use value::{
     quantity_in, Applicability, EngineeringValue, MaterialRef, Orientation, Provenance,

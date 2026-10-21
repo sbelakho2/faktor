@@ -796,9 +796,12 @@ name = "engineering-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ed25519-dalek",
  "engineering-units",
+ "rand",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1050,6 +1053,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "clap",
+ "engineering-core",
  "faktor-acp",
  "faktor-agent",
  "faktor-anthropic",
@@ -2097,6 +2101,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "clap",
+ "engineering-core",
  "faktor-acp",
  "faktor-acquire",
  "faktor-agent",

@@ -478,7 +478,9 @@ pub const VERSION: &str = MODEL_VERSION;
 
 #[cfg(test)]
 mod tests {
-    use engineering_core::{Provenance, ProvenanceKind, RevisionId, ValueState};
+    use std::sync::Arc;
+
+    use engineering_core::{Provenance, ProvenanceKind, ReceiptSigner, RevisionId, ValueState};
     use engineering_units::{Distribution, UnitRegistry};
 
     use super::*;
@@ -519,6 +521,14 @@ mod tests {
         assert!(min < result.preload_nominal.value());
         assert!(max > result.preload_nominal.value());
         assert!(result.utilization.is_known());
+    }
+
+    #[test]
+    fn signed_model_execution_attests_the_receipt() {
+        let signer = Arc::new(ReceiptSigner::from_seed([5u8; 32]));
+        let report = torque_preload(&input(), &context().with_signer(signer)).unwrap();
+        assert_eq!(report.status, ModelStatus::Solved);
+        report.receipt.verify_attestation().unwrap();
     }
 
     #[test]

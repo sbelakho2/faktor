@@ -41,6 +41,18 @@ pub enum CoreError {
     Units(#[from] engineering_units::UnitError),
     #[error("digest {0} is not the canonical digest of the recorded results")]
     ResultDigestMismatch(Digest),
+    #[error("receipt carries no Ed25519 attestation")]
+    MissingReceiptAttestation,
+    #[error("receipt attestation is invalid: {reason}")]
+    InvalidReceiptAttestation { reason: String },
+    #[error("receipt signature does not verify against the canonical digest")]
+    ReceiptSignatureMismatch,
+    #[error("receipt was signed by untrusted key {key_id}")]
+    UntrustedReceiptKey { key_id: String },
+    #[error("signing key store {path}: {reason}")]
+    KeyStore { path: String, reason: String },
+    #[error("applicability selection is invalid: {reason}")]
+    InvalidSelection { reason: String },
     #[error("gate contract violation in {gate}: {message}")]
     GateViolation {
         gate: crate::gate::GateId,

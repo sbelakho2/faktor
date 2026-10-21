@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use engineering_core::{
     AnalysisIdentity, AnalysisKind, AnalysisReceipt, AnalysisWarning, Convergence, Digest,
     DimensionCheck, EngineeringValue, PropertyRevision, Provenance, ReceiptContent, ReceiptResult,
-    ReceiptValue, Repeatability, RevisionId, UnavailableValue, ValueState, WarningSeverity,
+    ReceiptSigner, ReceiptValue, Repeatability, RevisionId, UnavailableValue, ValueState,
+    WarningSeverity,
 };
 use engineering_units::{Dimension, Quantity, Uncertainty, UnitError, UnitRegistry};
 use serde::Serialize;
@@ -36,6 +38,9 @@ pub struct ModelContext {
     pub revision: RevisionId,
     pub source: Provenance,
     pub property_revisions: Vec<PropertyRevision>,
+    /// Daemon-local receipt signer, when the caller executes through a daemon
+    /// that owns an engineering signing key.
+    pub signer: Option<Arc<ReceiptSigner>>,
 }
 
 impl ModelContext {
@@ -44,7 +49,13 @@ impl ModelContext {
             revision,
             source,
             property_revisions: Vec::new(),
+            signer: None,
         }
+    }
+
+    pub fn with_signer(mut self, signer: Arc<ReceiptSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     pub fn with_property_revision(mut self, revision: PropertyRevision) -> Self {
@@ -248,11 +259,11 @@ pub(crate) fn build_receipt(
     content.results = results;
     content.uncertainty = uncertainty;
     content.repeatability = Repeatability::deterministic();
-    Ok(AnalysisReceipt::kernel(
-        model_identity(model_id),
-        content,
-        0,
-    )?)
+    let mut receipt = AnalysisReceipt::kernel(model_identity(model_id), content, 0)?;
+    if let Some(signer) = &context.signer {
+        signer.sign_receipt(&mut receipt)?;
+    }
+    Ok(receipt)
 }
 
 pub(crate) fn warning(
