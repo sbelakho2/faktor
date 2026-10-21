@@ -1110,13 +1110,50 @@ fn test_dir_files(files: &[String]) -> Vec<String> {
             under_dir(file, "test")
                 || under_dir(file, "tests")
                 || under_dir(file, "spec")
-                || file.ends_with(".test.ts")
-                || file.ends_with(".test.tsx")
-                || file.ends_with(".spec.ts")
-                || file.ends_with(".spec.tsx")
+                || [
+                    ".test.ts",
+                    ".test.tsx",
+                    ".spec.ts",
+                    ".spec.tsx",
+                    ".test.js",
+                    ".test.jsx",
+                    ".spec.js",
+                    ".spec.jsx",
+                    ".test.mjs",
+                    ".test.cjs",
+                    ".spec.mjs",
+                    ".spec.cjs",
+                ]
+                .iter()
+                .any(|suffix| file.ends_with(suffix))
         })
         .cloned()
         .collect()
+}
+
+/// TRUE when the component's package.json declares a non-empty `test` script
+/// under `scripts`. Bounded read; a missing/unreadable/oversized manifest is
+/// `false` (no derived Node check rather than a guessed command). This is
+/// what lets a change in `src/` still derive the component's real test
+/// command: the old derivation only looked at the changed files, so a
+/// JS/TS source edit produced no checks at all and the task could never
+/// reach VerifiedComplete.
+fn node_has_test_script(component: &ProjectComponent, workspace_root: Option<&Path>) -> bool {
+    let Some(root) = workspace_root else {
+        return false;
+    };
+    let rel = component.root.join("package.json");
+    let rel = rel.to_string_lossy();
+    let Ok(bytes) = crate::manifest::read_manifest_bounded(root, &rel, 256 * 1024) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    json.get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(|test| test.as_str())
+        .is_some_and(|test| !test.trim().is_empty())
 }
 
 fn derive_cargo(
@@ -1220,16 +1257,23 @@ fn derive_cargo(
             );
         }
         if !discovered {
+            // No inline selectors in the CHANGED file, but the component's
+            // integration tests (`tests/*.rs`) and any model-added tests are
+            // still part of the change's contract. `--lib` skipped them, so
+            // a verified candidate could carry a failing integration test
+            // (observed: a config migration passed `--lib` while
+            // tests/config.rs failed five assertions). `--tests` runs every
+            // test target; the check is REQUIRED.
             push_check(
                 out,
                 component,
-                "rust_test_lib",
+                "rust_test_workspace",
                 CheckKind::Test,
                 CheckCategory::Unit,
                 "cargo",
-                &["test", "--lib"],
+                &["test", "--tests"],
                 Vec::new(),
-                false,
+                true,
             );
         }
     } else {
@@ -1249,7 +1293,12 @@ fn derive_cargo(
     }
 }
 
-fn derive_node(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: &[String]) {
+fn derive_node(
+    out: &mut Vec<CheckSpec>,
+    component: &ProjectComponent,
+    local: &[String],
+    workspace_root: Option<&Path>,
+) {
     let sources: Vec<String> = local
         .iter()
         .filter(|file| file.ends_with(".ts") || file.ends_with(".tsx"))
@@ -1269,7 +1318,27 @@ fn derive_node(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: &[
         );
     }
     let tests = test_dir_files(local);
-    if !tests.is_empty() {
+    // A source-only change is still governed by the component's declared
+    // test script: derive `npm test` even when no changed path is itself a
+    // test file. Without this, a JS `src/` edit produced an EMPTY check set,
+    // stayed unverified by construction, and the verified candidate was
+    // never landed.
+    let node_sources: Vec<String> = local
+        .iter()
+        .filter(|file| {
+            [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"]
+                .iter()
+                .any(|suffix| file.ends_with(suffix))
+        })
+        .cloned()
+        .collect();
+    let declared = !node_sources.is_empty() && node_has_test_script(component, workspace_root);
+    if !tests.is_empty() || declared {
+        let affects = if tests.is_empty() {
+            node_sources
+        } else {
+            tests
+        };
         push_check(
             out,
             component,
@@ -1278,8 +1347,8 @@ fn derive_node(out: &mut Vec<CheckSpec>, component: &ProjectComponent, local: &[
             CheckCategory::Unit,
             "npm",
             &["test"],
-            tests,
-            false,
+            affects,
+            true,
         );
     }
 }
@@ -1774,7 +1843,7 @@ fn derive_component_checks(
         derive_cargo(&mut out, component, local, workspace_root);
     }
     if has(BuildSystem::Npm) {
-        derive_node(&mut out, component, local);
+        derive_node(&mut out, component, local, workspace_root);
     }
     if has(BuildSystem::Maven) {
         derive_maven(&mut out, component, local);
@@ -2364,6 +2433,58 @@ mod tests {
         assert!(checks
             .iter()
             .all(|spec| spec.cwd_rel.as_os_str().is_empty()));
+    }
+
+    #[test]
+    fn a_node_source_change_derives_the_declared_test_script() {
+        // The JS change is in src/, not in a test file. The component's
+        // package.json declares `npm test`; that is the executable check and
+        // must be REQUIRED. The old derivation returned an empty check set,
+        // so every JS task was unverifiable by construction.
+        let (dir, files) = fixture(&[
+            ("package.json", "{\"scripts\":{\"test\":\"node --test\"}}"),
+            ("src/app.js", "export const x = 1;\n"),
+            ("test/app.test.js", "test('x', () => {});\n"),
+        ]);
+        let profile = detect_project_profile(dir.path(), &files);
+        let checks =
+            derive_checks_at_root(&profile, &[PathBuf::from("src/app.js")], dir.path()).unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|spec| spec.id.ends_with("node_test") && spec.required),
+            "a declared test script must produce a required node_test: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_src_change_runs_integration_tests_not_only_the_lib() {
+        let (dir, files) = fixture(&[
+            ("Cargo.toml", "[package]\nname = \"root\"\n"),
+            (
+                "src/lib.rs",
+                "pub fn clamp_index(i: usize, n: usize) -> usize { i.min(n) }\n",
+            ),
+            (
+                "tests/config.rs",
+                "#[test]\nfn rejects_missing_port() {\n    assert!(true);\n}\n",
+            ),
+        ]);
+        let profile = detect_project_profile(dir.path(), &files);
+        let checks =
+            derive_checks_at_root(&profile, &[PathBuf::from("src/lib.rs")], dir.path()).unwrap();
+        let integration = checks
+            .iter()
+            .find(|spec| spec.id.ends_with("rust_test_workspace"))
+            .expect("src-only change must derive the integration test target");
+        assert_eq!(
+            integration.args,
+            vec![
+                std::ffi::OsString::from("test"),
+                std::ffi::OsString::from("--tests")
+            ]
+        );
+        assert!(integration.required);
     }
 
     #[test]

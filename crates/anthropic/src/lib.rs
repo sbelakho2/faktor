@@ -251,12 +251,12 @@ impl AnthropicProvider {
                     ContentKind::Text { text } => {
                         content.push(serde_json::json!({ "type": "text", "text": text }));
                     }
-                    ContentKind::Reasoning { text } => {
-                        content.push(serde_json::json!({
-                            "type": "reasoning",
-                            "text": text
-                        }));
-                    }
+                    // Prior-turn reasoning is output-only scratchpad.
+                    // Anthropic thinking blocks require provider signatures
+                    // and are never reconstructible from stored text; the
+                    // old unsigned `type:"reasoning"` block was both
+                    // invalid and re-sent on every turn.
+                    ContentKind::Reasoning { .. } => {}
                     ContentKind::Image { url } => {
                         content.push(serde_json::json!({
                             "type": "image",

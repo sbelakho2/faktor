@@ -1,0 +1,555 @@
+{
+  "schema": "faktor-intelligence-eval/v1",
+  "date": "2026-10-21",
+  "model": "qwen3.8:latest (Ollama 27B Q4, 262k ctx)",
+  "corpus": {
+    "tasks": 12,
+    "categories": [
+      "bug_fix",
+      "failing_test",
+      "cross_file_refactor",
+      "migration",
+      "security_fix"
+    ],
+    "workspaces": "materialized real git workspaces; hidden tests are the external success authority"
+  },
+  "conditions": {
+    "baseline": {
+      "pipeline": "Faktor before changes",
+      "aggregate": {
+        "tasks": 12,
+        "verified": 4,
+        "success_rate": 0.3333333333333333,
+        "attempts": 51,
+        "tool_calls": 72,
+        "tokens": 129186,
+        "prompt_tokens": 117128,
+        "output_tokens": 12058,
+        "wall_ms": 2841377,
+        "mean_attempts": 4.25,
+        "mean_tool_calls": 6,
+        "mean_tokens": 10765.5,
+        "tokens_per_verified": 32296.5,
+        "wall_per_task_ms": 236781.41666666666,
+        "pipeline_claims_verified": 5,
+        "pipeline_claims_matching_external": 4
+      },
+      "results": [
+        {
+          "id": "rust_bug_wrap",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": false,
+          "attempts": 3,
+          "tool_calls": 5,
+          "tokens": 6548,
+          "wall_ms": 300317,
+          "pipeline_task_state": "verifying",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "js_bug_ttl",
+          "category": "bug_fix",
+          "language": "js",
+          "verified_success": false,
+          "attempts": 2,
+          "tool_calls": 3,
+          "tokens": 3641,
+          "wall_ms": 300170,
+          "pipeline_task_state": "verifying",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "rust_failing_stack",
+          "category": "failing_test",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 5,
+          "tokens": 9767,
+          "wall_ms": 114752,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_failing_slug",
+          "category": "failing_test",
+          "language": "js",
+          "verified_success": false,
+          "attempts": 2,
+          "tool_calls": 3,
+          "tokens": 3472,
+          "wall_ms": 300365,
+          "pipeline_task_state": "verifying",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "rust_refactor_rename",
+          "category": "cross_file_refactor",
+          "language": "rust",
+          "verified_success": false,
+          "attempts": 4,
+          "tool_calls": 7,
+          "tokens": 10082,
+          "wall_ms": 102848,
+          "pipeline_task_state": "blocked",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "js_refactor_extract",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": false,
+          "attempts": 5,
+          "tool_calls": 6,
+          "tokens": 10399,
+          "wall_ms": 300256,
+          "pipeline_task_state": "verifying",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "rust_migration_config",
+          "category": "migration",
+          "language": "rust",
+          "verified_success": false,
+          "attempts": 5,
+          "tool_calls": 7,
+          "tokens": 13460,
+          "wall_ms": 232393,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_migration_promise",
+          "category": "migration",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 7,
+          "tool_calls": 11,
+          "tokens": 24633,
+          "wall_ms": 276598,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_security_traversal",
+          "category": "security_fix",
+          "language": "rust",
+          "verified_success": false,
+          "attempts": 5,
+          "tool_calls": 7,
+          "tokens": 14496,
+          "wall_ms": 300349,
+          "pipeline_task_state": "pending",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "js_security_exec",
+          "category": "security_fix",
+          "language": "js",
+          "verified_success": false,
+          "attempts": 5,
+          "tool_calls": 4,
+          "tokens": 12441,
+          "wall_ms": 300383,
+          "pipeline_task_state": "verifying",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "rust_bug_bisect",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 4,
+          "tool_calls": 4,
+          "tokens": 8553,
+          "wall_ms": 159268,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_refactor_callsites",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 4,
+          "tool_calls": 10,
+          "tokens": 11694,
+          "wall_ms": 153678,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        }
+      ]
+    },
+    "improved": {
+      "pipeline": "Faktor after changes",
+      "aggregate": {
+        "tasks": 12,
+        "verified": 11,
+        "success_rate": 0.9166666666666666,
+        "attempts": 61,
+        "tool_calls": 93,
+        "tokens": 224285,
+        "prompt_tokens": 211891,
+        "output_tokens": 12394,
+        "wall_ms": 1585156,
+        "mean_attempts": 5.083333333333333,
+        "mean_tool_calls": 7.75,
+        "mean_tokens": 18690.416666666668,
+        "tokens_per_verified": 20389.545454545456,
+        "wall_per_task_ms": 132096.33333333334,
+        "pipeline_claims_verified": 11,
+        "pipeline_claims_matching_external": 11
+      },
+      "results": [
+        {
+          "id": "rust_bug_wrap",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 6,
+          "tokens": 18356,
+          "wall_ms": 153962,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_bug_ttl",
+          "category": "bug_fix",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 5,
+          "tokens": 16261,
+          "wall_ms": 124032,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_failing_stack",
+          "category": "failing_test",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 5,
+          "tokens": 15263,
+          "wall_ms": 88480,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_failing_slug",
+          "category": "failing_test",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 6,
+          "tokens": 16655,
+          "wall_ms": 118720,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_refactor_rename",
+          "category": "cross_file_refactor",
+          "language": "rust",
+          "verified_success": false,
+          "attempts": 5,
+          "tool_calls": 14,
+          "tokens": 19795,
+          "wall_ms": 175723,
+          "pipeline_task_state": "blocked",
+          "pipeline_proof_state": "unverified"
+        },
+        {
+          "id": "js_refactor_extract",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 9,
+          "tokens": 17158,
+          "wall_ms": 81790,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_migration_config",
+          "category": "migration",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 6,
+          "tokens": 18978,
+          "wall_ms": 156741,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_migration_promise",
+          "category": "migration",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 11,
+          "tokens": 22655,
+          "wall_ms": 141094,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_security_traversal",
+          "category": "security_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 4,
+          "tool_calls": 4,
+          "tokens": 14121,
+          "wall_ms": 84237,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_security_exec",
+          "category": "security_fix",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 7,
+          "tool_calls": 9,
+          "tokens": 27557,
+          "wall_ms": 151569,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "rust_bug_bisect",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 5,
+          "tokens": 16509,
+          "wall_ms": 107141,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        },
+        {
+          "id": "js_refactor_callsites",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 5,
+          "tool_calls": 13,
+          "tokens": 20977,
+          "wall_ms": 201667,
+          "pipeline_task_state": "verified_complete",
+          "pipeline_proof_state": "verified"
+        }
+      ]
+    },
+    "raw": {
+      "pipeline": "raw model one-shot full-context edit, no Faktor",
+      "aggregate": {
+        "tasks": 12,
+        "verified": 11,
+        "success_rate": 0.9166666666666666,
+        "attempts": 12,
+        "tool_calls": 0,
+        "tokens": 15865,
+        "prompt_tokens": 5724,
+        "output_tokens": 10141,
+        "wall_ms": 933575,
+        "mean_attempts": 1,
+        "mean_tool_calls": 0,
+        "mean_tokens": 1322.0833333333333,
+        "tokens_per_verified": 1442.2727272727273,
+        "wall_per_task_ms": 77797.91666666667,
+        "pipeline_claims_verified": 0,
+        "pipeline_claims_matching_external": 0
+      },
+      "results": [
+        {
+          "id": "rust_bug_wrap",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 1490,
+          "wall_ms": 71516,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_bug_ttl",
+          "category": "bug_fix",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 766,
+          "wall_ms": 23254,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "rust_failing_stack",
+          "category": "failing_test",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 834,
+          "wall_ms": 26560,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_failing_slug",
+          "category": "failing_test",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 854,
+          "wall_ms": 34472,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "rust_refactor_rename",
+          "category": "cross_file_refactor",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 934,
+          "wall_ms": 32940,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_refactor_extract",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 878,
+          "wall_ms": 29283,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "rust_migration_config",
+          "category": "migration",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 1884,
+          "wall_ms": 126334,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_migration_promise",
+          "category": "migration",
+          "language": "js",
+          "verified_success": false,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 3130,
+          "wall_ms": 190565,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "rust_security_traversal",
+          "category": "security_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 2000,
+          "wall_ms": 169275,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_security_exec",
+          "category": "security_fix",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 978,
+          "wall_ms": 59282,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "rust_bug_bisect",
+          "category": "bug_fix",
+          "language": "rust",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 914,
+          "wall_ms": 117552,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        },
+        {
+          "id": "js_refactor_callsites",
+          "category": "cross_file_refactor",
+          "language": "js",
+          "verified_success": true,
+          "attempts": 1,
+          "tool_calls": 0,
+          "tokens": 1203,
+          "wall_ms": 52542,
+          "pipeline_task_state": null,
+          "pipeline_proof_state": null
+        }
+      ]
+    }
+  },
+  "gaps_fixed": [
+    {
+      "gap": "retrieval returned bare paths, not definitions/callers/tests",
+      "fix": "bounded source windows + labeled definition/test/usage evidence",
+      "file": "crates/agent/src/runtime/retrieval.rs:52,102,1666"
+    },
+    {
+      "gap": "contract goal was the session title",
+      "fix": "seed from newest user prompt",
+      "file": "crates/agent/src/runtime/retrieval.rs:936; crates/agent/src/runtime/turn/drive_phases.rs:204"
+    },
+    {
+      "gap": "contract omitted same-package tests and compiled contradictory compatibility on rename",
+      "fix": "component-aware test obligations + breaking-rename suppression",
+      "file": "crates/core/src/contract_compile.rs:1188,1323; crates/agent/src/runtime/settlement.rs:2754"
+    },
+    {
+      "gap": "failed mutation ended the turn; read_file had no hash",
+      "fix": "bounded retry + read hash header",
+      "file": "crates/agent/src/runtime/turn/drive_phases.rs:1307; crates/cli/src/tools.rs:112"
+    },
+    {
+      "gap": "JS source changes derived no checks; Rust src changes skipped integration tests",
+      "fix": "npm test when declared; cargo test --tests required",
+      "file": "crates/verify/src/derive.rs:1141,1275,1301"
+    },
+    {
+      "gap": "terse tool descriptions; no directory listing; no workflow prompt",
+      "fix": "explicit tool contracts, list_dir, 6-step protocol",
+      "file": "crates/cli/src/tools.rs:888,957; crates/cli/src/config/mcp.rs:24"
+    }
+  ],
+  "residual": [
+    "rust_refactor_rename: model edits were correct (definition/export/callers/tests) and both required checks passed, but settlement blocked the modified-test proof; raw passed it. This is a proof-rebinding gap, not a model-intelligence gap; verification was not weakened.",
+    "raw one-shot is still far cheaper per verified change on this small corpus (1,442 vs 20,390 tokens); Faktor spends on retrieval, multi-turn verification and proof state."
+  ]
+}

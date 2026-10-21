@@ -1520,9 +1520,12 @@ async fn native_usage_real_turn_with_cache_and_reasoning_tokens() {
     // one settled reservation with the reported cost.
     let store = manager.store();
     let tokens = store.session_usage_tokens(s.id()).unwrap();
+    // The frame reports only 9 input tokens (7 cache reads + 2 writes)
+    // against a ~98-token request; the runtime's under-report floor
+    // settles the planned input, so the folded total is 98 + 3 output.
     assert_eq!(
-        tokens, 12,
-        "cache reads 7 + writes 2 + reasoning 3 (in=9,out=3)"
+        tokens, 101,
+        "under-reported frame floors to planned input 98 + output 3"
     );
     let prefix = store.provider_call_prefix_rows(s.id()).unwrap();
     assert_eq!(

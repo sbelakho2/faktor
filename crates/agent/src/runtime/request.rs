@@ -24,6 +24,27 @@ pub(crate) const HISTORY_BYTES_PER_TOKEN: u64 = 3;
 /// dense ASCII) so the provider is never starved of conversation context.
 pub(crate) const HISTORY_TOKEN_FLOOR: usize = 800;
 
+/// Hard bound on ONE historical tool-call's argument JSON re-sent on the
+/// wire. The durable transcript keeps the exact arguments (recovery and UI
+/// need them); the model's HISTORY only needs the call identity, its small
+/// discriminator fields, and a digest of any large payload it already
+/// produced. A `write_file` of a 200 KiB file must not be re-sent on every
+/// later turn.
+pub(crate) const MAX_WIRE_TOOL_CALL_ARG_BYTES: usize = 2 * 1024;
+/// Longest individual string value kept verbatim inside a bounded historical
+/// tool-call argument. Anything longer is replaced by a digest marker.
+pub(crate) const MAX_WIRE_TOOL_CALL_STRING_BYTES: usize = 256;
+
+/// Minimum excerpt length considered for duplicate-result compaction. A
+/// shorter repeated result costs less than the reference marker.
+pub(crate) const MIN_DUPLICATE_TOOL_RESULT_BYTES: usize = 256;
+
+/// Hard bound on a durable context-checkpoint payload accepted for replay.
+/// A legitimate 1M-token compacted context serializes to a few MiB; 32 MiB
+/// is generous headroom while keeping a corrupt/hostile row from forcing an
+/// unbounded JSON allocation at session open.
+pub(crate) const MAX_CONTEXT_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
+
 /// How the runtime asks for permission. The server implementation waits on a
 /// durable permission row + a UI response channel (async so blocking on the
 /// user never stalls a tokio worker).
@@ -114,8 +135,97 @@ pub(crate) fn sanitize_tool_pairing(messages: Vec<RequestMessage>) -> Vec<Reques
 pub(crate) fn decode_checkpoint_turns(
     checkpoint: &faktor_session::ContextCheckpoint,
 ) -> faktor_core::Result<Vec<RecentTurn>> {
+    if checkpoint.payload.len() > MAX_CONTEXT_CHECKPOINT_BYTES {
+        return Err(Error::oversized(format!(
+            "context checkpoint payload of {} bytes exceeds MAX_CONTEXT_CHECKPOINT_BYTES",
+            checkpoint.payload.len()
+        )));
+    }
     serde_json::from_slice(&checkpoint.payload)
         .map_err(|e| Error::malformed(format!("context checkpoint turns: {e}")))
+}
+
+/// Bound ONE historical tool-call argument value for the wire.
+///
+/// Small values are returned BYTE-IDENTICAL (the common case: paths,
+/// commands, flags). When the serialized value exceeds
+/// [`MAX_WIRE_TOOL_CALL_ARG_BYTES`], long strings are replaced by a
+/// deterministic digest marker (first 256 bytes + original length + BLAKE3);
+/// if the structural skeleton still exceeds the bound, the whole value is
+/// replaced by one bounded digest marker. The projection is total and
+/// deterministic, so an unchanged durable call renders the same wire bytes
+/// on every turn (prompt-cache friendly) and a hostile 16 MiB argument cannot
+/// grow the request.
+pub(crate) fn bound_tool_call_input(input: &serde_json::Value) -> serde_json::Value {
+    let encoded = serde_json::to_vec(input).unwrap_or_default();
+    if encoded.len() <= MAX_WIRE_TOOL_CALL_ARG_BYTES {
+        return input.clone();
+    }
+    let projected = truncate_argument_strings(input, 0);
+    let projected_len = serde_json::to_vec(&projected)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if projected_len <= MAX_WIRE_TOOL_CALL_ARG_BYTES {
+        projected
+    } else {
+        serde_json::json!({
+            "_bounded": format!(
+                "tool arguments elided on the wire ({} bytes, blake3 {})",
+                encoded.len(),
+                blake3::hash(&encoded).to_hex()
+            )
+        })
+    }
+}
+
+fn truncate_argument_strings(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    // Depth bound: a hostile nested argument cannot recurse without a
+    // ceiling (JSON depth is already bounded by the parser, but this keeps
+    // the projection's own allocation bounded too).
+    if depth >= 16 {
+        return serde_json::json!("[nested argument elided]");
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            if text.len() <= MAX_WIRE_TOOL_CALL_STRING_BYTES {
+                value.clone()
+            } else {
+                let mut end = MAX_WIRE_TOOL_CALL_STRING_BYTES;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                serde_json::Value::String(format!(
+                    "{}…[bounded {} bytes, blake3 {}]",
+                    &text[..end],
+                    text.len(),
+                    blake3::hash(text.as_bytes()).to_hex()
+                ))
+            }
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| truncate_argument_strings(item, depth + 1))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, item) in map {
+                let key = if key.len() <= MAX_WIRE_TOOL_CALL_STRING_BYTES {
+                    key.clone()
+                } else {
+                    format!(
+                        "key…[bounded {} bytes, blake3 {}]",
+                        key.len(),
+                        blake3::hash(key.as_bytes()).to_hex()
+                    )
+                };
+                out.insert(key, truncate_argument_strings(item, depth + 1));
+            }
+            serde_json::Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 impl AgentRuntime {
@@ -265,6 +375,7 @@ impl AgentRuntime {
                         let input = part
                             .data
                             .get("input")
+                            .map(bound_tool_call_input)
                             .map(|v| v.to_string())
                             .unwrap_or_default();
                         turns.push(RecentTurn {
@@ -326,6 +437,14 @@ impl AgentRuntime {
             .or(checkpoint_seq)
             .filter(|seq| *seq > 0);
         let mut out = recent_turns_to_messages(&checkpoint_turns);
+        // Exact repeated tool results are conversation noise: the model
+        // already has the earlier bytes in THIS window. Render the later
+        // result as a bounded reference to the first call, keeping the
+        // call/result pairing (the provider still sees an answer for every
+        // call). Only results long enough to be worth the marker are
+        // considered; a shorter repeat stays byte-identical.
+        let mut seen_tool_results: std::collections::HashMap<FileHash, String> =
+            std::collections::HashMap::new();
         for row in rows {
             let role_is_user = row.role == "user";
             let mut user_parts: Vec<ContentPart> = Vec::new();
@@ -356,10 +475,9 @@ impl AgentRuntime {
                             assistant_parts.push(ContentPart::tool_call(
                                 str_field(&part.data, "tool_call_id")?,
                                 str_field(&part.data, "name")?,
-                                part.data
-                                    .get("input")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null),
+                                bound_tool_call_input(
+                                    part.data.get("input").unwrap_or(&serde_json::Value::Null),
+                                ),
                             ));
                         }
                     }
@@ -369,11 +487,25 @@ impl AgentRuntime {
                             .get("exit_code")
                             .and_then(|v| if v.is_null() { None } else { v.as_i64() })
                             .is_some_and(|c| c != 0);
-                        user_parts.push(ContentPart::tool_result(
-                            str_field(&part.data, "excerpt")?,
-                            is_error,
-                            str_field(&part.data, "tool_call_id")?,
-                        ));
+                        let call_id = str_field(&part.data, "tool_call_id")?;
+                        let excerpt = str_field(&part.data, "excerpt")?;
+                        let excerpt = if excerpt.len() >= MIN_DUPLICATE_TOOL_RESULT_BYTES {
+                            let digest =
+                                FileHash::from(*blake3::hash(excerpt.as_bytes()).as_bytes());
+                            match seen_tool_results.get(&digest) {
+                                Some(first_call) => format!(
+                                    "[duplicate tool result: identical to call {first_call}; {} bytes]",
+                                    excerpt.len()
+                                ),
+                                None => {
+                                    seen_tool_results.insert(digest, call_id.clone());
+                                    excerpt
+                                }
+                            }
+                        } else {
+                            excerpt
+                        };
+                        user_parts.push(ContentPart::tool_result(excerpt, is_error, call_id));
                     }
                     "summary" => {}
                     other => {
@@ -429,6 +561,7 @@ impl AgentRuntime {
     /// Thin adapter: the wire request IS the budgeted plan — `system`,
     /// `messages`, and `tools` each appear exactly once, already measured
     /// against the model budget by the planner.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_request(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -437,13 +570,21 @@ impl AgentRuntime {
         model: &str,
         cancel: &CancellationToken,
         attempt: u32,
+        max_output: usize,
     ) -> faktor_core::Result<GenericAgentRequest> {
         Ok(GenericAgentRequest {
             model: model.to_string(),
             system: plan.system.clone(),
             messages: plan.messages.clone(),
             tools: plan.tools.clone(),
-            max_output: None,
+            // Bounded everything: the wire carries an EXPLICIT output cap.
+            // Leaving it None delegates the bound to the provider, and a
+            // native Ollama runtime treats an absent num_predict as
+            // "generate until stop/context" — a real measured run emitted
+            // 20,968 tokens in one iteration. The cap is the resolved
+            // model profile's max_output (the same dimension the router
+            // priced and qualified this call against).
+            max_output: Some(max_output.max(1)),
             reasoning: None,
             stream: true,
             meta: RequestMeta {

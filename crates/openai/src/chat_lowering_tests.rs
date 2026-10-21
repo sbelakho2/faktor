@@ -37,6 +37,61 @@ fn req(model: &str) -> GenericAgentRequest {
     }
 }
 
+/// Streaming Chat Completions must ask the endpoint for the terminal usage
+/// frame (`stream_options.include_usage`); without it OpenAI/DeepSeek/Ollama
+/// omit usage entirely and the runtime records zero tokens.
+#[test]
+fn streaming_chat_body_requests_usage_and_non_streaming_does_not() {
+    let mut r = req("m1");
+    let body = chat_completions_body(&r, &OpenAiQuirks::default());
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    r.stream = false;
+    let body = chat_completions_body(&r, &OpenAiQuirks::default());
+    assert!(
+        body.get("stream_options").is_none(),
+        "non-streaming responses carry usage inline; no stream_options"
+    );
+}
+
+/// Prior-turn reasoning is the model's private scratchpad, not conversation
+/// state: a plain Chat Completions endpoint must never receive it back (the
+/// old path emitted non-standard `{type:"reasoning"}` content blocks). Only
+/// the explicit DeepSeek-style replay quirk may carry `reasoning_content`.
+#[test]
+fn prior_reasoning_is_not_replayed_except_for_the_deepseek_quirk() {
+    let mut r = req("m1");
+    r.messages.push(RequestMessage {
+        role: Role::Assistant,
+        content: vec![
+            ContentPart::reasoning("SECRET-SCRATCHPAD the user wants X"),
+            ContentPart::text("the answer"),
+        ],
+    });
+    let body = chat_completions_body(&r, &OpenAiQuirks::default());
+    let wire = serde_json::to_string(&body).unwrap();
+    assert!(
+        !wire.contains("SECRET-SCRATCHPAD"),
+        "plain Chat Completions must not replay reasoning: {wire}"
+    );
+    assert!(
+        !wire.contains("\"type\":\"reasoning\""),
+        "no non-standard reasoning content block may reach the wire: {wire}"
+    );
+    assert_eq!(body["messages"][2]["content"][0]["text"], "the answer");
+
+    // The explicit DeepSeek-style quirk still replays it where tool
+    // continuation requires the assistant's reasoning.
+    let quirks = OpenAiQuirks {
+        requires_reasoning_replay_with_tools: true,
+        ..OpenAiQuirks::default()
+    };
+    let body = chat_completions_body(&r, &quirks);
+    assert_eq!(
+        body["messages"][2]["reasoning_content"],
+        "SECRET-SCRATCHPAD the user wants X"
+    );
+}
+
 #[tokio::test]
 async fn wire_body_has_no_internal_leakage() {
     let server = MockServer::new();
@@ -57,6 +112,10 @@ async fn wire_body_has_no_internal_leakage() {
                 assert_eq!(body["messages"][0]["content"], "sys");
                 assert_eq!(body["messages"][1]["role"], "user");
                 assert!(body["stream"].as_bool().unwrap());
+                assert_eq!(
+                    body["stream_options"]["include_usage"], true,
+                    "streaming must request the terminal usage envelope so the runtime records real tokens"
+                );
                 assert_eq!(body["max_tokens"], 1000);
                 assert_eq!(body["tools"][0]["type"], "function");
                 assert_eq!(body["tool_choice"], "auto");

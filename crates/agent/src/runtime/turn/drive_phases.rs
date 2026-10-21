@@ -119,6 +119,12 @@ pub(crate) struct TurnDriveState<'a> {
     pub(crate) tool_bundle: Option<ToolBundle>,
     pub(crate) wire_plan: Option<WirePlan>,
     pub(crate) tool_calls: Vec<(String, String, serde_json::Value)>,
+    /// Bounded in-turn retries of a failed MUTATION batch (stale hash,
+    /// malformed operation, missing file). A recoverable tool error is not
+    /// task completion; the model gets to see the typed failure and correct
+    /// its arguments. The loop detector still ends a repeated identical
+    /// failure, so this cannot spin.
+    pub(crate) tool_retry_rounds: u8,
     pub(crate) assistant_message: Option<i64>,
     pub(crate) text_buf: String,
     pub(crate) reasoning_buf: String,
@@ -128,6 +134,10 @@ pub(crate) struct TurnDriveState<'a> {
     pub(crate) frame_cache_read: u64,
     pub(crate) frame_cache_write: u64,
     pub(crate) frame_output: u64,
+    /// The FINAL wire plan's own input estimate for this attempt: the
+    /// conservative floor a zero/under-reported usage frame may never fall
+    /// below without evidence (an empty frame is not a free call).
+    pub(crate) planned_input_tokens: u64,
     pub(crate) iteration_progress: bool,
     pub(crate) attempt_started: std::time::Instant,
     pub(crate) settled_attempt: u32,
@@ -186,10 +196,27 @@ impl<'a> TurnDriveState<'a> {
         // escalation).
         let settled_calls: Vec<(SettledCallOutcome, u8)> = Vec::new();
         let drive_semantic_risk: u8 = 10;
-        // The durable task state starts from the user's own goal: the first
-        // prompt (session title) — audit round: goal was never set.
+        // The durable task state starts from the user's own goal. The prompt
+        // is the authority; the title is only a label and is often generic
+        // ("task", "cli run"). Using the title here made the contract
+        // compiler analyze a label with no obligations or risks.
         if ledger.goal.is_empty() {
-            ledger.goal = truncate(&handle.title()?, 200).to_string();
+            match AgentRuntime::latest_user_prompt(handle) {
+                Some(prompt) => {
+                    // A prompt carrying a detectable credential never
+                    // becomes the durable goal: the system contract is a
+                    // cacheable prefix and the compactor archives it, so
+                    // copying the secret there would duplicate it beyond
+                    // the user turn. Fall back to the non-secret title.
+                    let policy = faktor_security::SecretPolicy::default();
+                    if faktor_security::scan_secrets(&prompt, &policy).is_empty() {
+                        ledger.goal = truncate(&prompt, 200).to_string();
+                    } else {
+                        ledger.goal = truncate(&handle.title()?, 200).to_string();
+                    }
+                }
+                None => ledger.goal = truncate(&handle.title()?, 200).to_string(),
+            }
         }
         // Typed durable ledger (audits 27/71-72): heal the typed entry
         // stream from the legacy blob/task rows when it predates them
@@ -203,7 +230,7 @@ impl<'a> TurnDriveState<'a> {
         // seeded only when absent or stale — never duplicated) and heals the
         // row's spend from durable sources. A missing row is created from
         // the goal so gates always have a row to update.
-        rt.restore_task_rows(handle, &ledger).await?;
+        rt.restore_task_rows(handle, &mut ledger).await?;
         // Layered lifetimes (audit 26): this drive is ONE turn_budget_ms
         // slice. Wall-clock is measured from the drive's start; expiry is
         // evaluated at every iteration boundary so no single future spans
@@ -268,7 +295,10 @@ impl<'a> TurnDriveState<'a> {
         // — folded into the volatile system slot at every boundary and
         // NEVER conversation messages.
         let mut internal_context = rt.take_internal_context(op_id);
-        let pending = take_pending_internal_context(handle);
+        // Bound the durable pending-handoff block to the system class
+        // budget: 200 finished children stay a bounded per-turn section and
+        // drain over subsequent turns instead of overflowing the plan.
+        let pending = take_pending_internal_context_bounded(handle, budget.system);
         if !pending.is_empty() {
             if !internal_context.is_empty() {
                 internal_context.push('\n');
@@ -310,6 +340,7 @@ impl<'a> TurnDriveState<'a> {
             tool_bundle: None,
             wire_plan: None,
             tool_calls: Vec::new(),
+            tool_retry_rounds: 0,
             assistant_message: None,
             text_buf: String::new(),
             reasoning_buf: String::new(),
@@ -319,6 +350,7 @@ impl<'a> TurnDriveState<'a> {
             frame_cache_read: 0,
             frame_cache_write: 0,
             frame_output: 0,
+            planned_input_tokens: 0,
             iteration_progress: false,
             attempt_started: std::time::Instant::now(),
             settled_attempt: 0,
@@ -866,10 +898,9 @@ impl AgentRuntime {
             {
                 intent.required_capabilities.push("vision".into());
             }
-            // The wire request carries no explicit max_output
-            // (build_request), so the provider's own output bound is
-            // the call's real output cap: price and qualify the route
-            // against the planning model's cap.
+            // The wire request carries the planning model's explicit
+            // max_output as its output cap (build_request), so price and
+            // qualify the route against that same dimension.
             intent.expected_output_tokens = st.effective_caps.max_output.max(1) as u64;
             let dims = crate::wire_plan::planned_request_dimensions(
                 &wire_plan,
@@ -1172,6 +1203,17 @@ impl AgentRuntime {
                 ExecutionPhase::Tool
             };
             self.note_execution_phase(st.handle, batch_phase);
+            let attempted = std::mem::take(&mut st.tool_calls);
+            let attempted_count = attempted.len();
+            let retryable_mutation = attempted.iter().any(|(_, name, _)| {
+                self.deps
+                    .tools
+                    .get(name)
+                    .map(|tool| {
+                        tool.resource_class == faktor_core::resource::ResourceClass::DiskWrite
+                    })
+                    .unwrap_or(false)
+            });
             let executed = self
                 .run_tool_calls(
                     st.handle,
@@ -1184,7 +1226,7 @@ impl AgentRuntime {
                     &mut st.turn_summary,
                     &st.cancel,
                     st.semantic_turn.as_ref(),
-                    std::mem::take(&mut st.tool_calls),
+                    attempted,
                 )
                 .await?;
             // Durable cross-turn loop detection (spec §28): the same
@@ -1265,6 +1307,38 @@ impl AgentRuntime {
                 return Ok(PhaseFlow::Continue);
             }
             if st.handle.state()? == AgentState::FailedRecoverable {
+                // A recoverable mismatch in a MUTATION batch (stale
+                // expected_hash, malformed operation, missing file) is not
+                // task completion: the model can see the typed tool error
+                // and correct the arguments. The retry re-enters through
+                // the legal FailedRecoverable -> Preparing hop; the loop
+                // detector still ends a repeated identical failure, and the
+                // bound keeps this finite. Other all-failed batches (denied
+                // permission, unknown tool, shell failure) keep the
+                // classified end below.
+                const MAX_MUTATION_RETRIES: u8 = 2;
+                if retryable_mutation
+                    && attempted_count > 0
+                    && st.tool_retry_rounds < MAX_MUTATION_RETRIES
+                {
+                    st.tool_retry_rounds += 1;
+                    // The batch's own `put_task_ledger` just overwrote the
+                    // blob with the ledger it was handed, so the decision
+                    // must ride THIS ledger object (the typed entry alone is
+                    // not enough for the next prompt).
+                    st.ledger
+                        .decisions
+                        .push("retry the failed edit with corrected arguments".to_string());
+                    self.guarded_ledger_decision(
+                        st.handle,
+                        "retry",
+                        "retry the failed edit with corrected arguments",
+                        "a mutating tool call failed recoverably; the typed error is in the transcript",
+                        DW_SITE_LOOP_DECISION,
+                    )?;
+                    self.walk_tool_batch_to_waiting(st.handle, st.op_id).await?;
+                    return Ok(PhaseFlow::Continue);
+                }
                 // executed == 0 with at least one submitted tool that
                 // failed recoverably: the turn's classified end. The
                 // machine is already at `FailedRecoverable` (the failed

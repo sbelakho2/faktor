@@ -2201,6 +2201,71 @@ impl faktor_provider::Provider for CacheSplitProvider {
     }
 }
 
+/// A provider that emits a malformed ZERO usage frame on a non-zero
+/// request (the no-usage wire contract emits no frame at all). The runtime
+/// must settle at the plan's input floor, never for free.
+pub(crate) struct ZeroUsageProvider;
+
+impl faktor_provider::Provider for ZeroUsageProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        ModelCapabilities {
+            tools: true,
+            streaming: true,
+            ..Default::default()
+        }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
+
+    fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+        Box::pin(futures::stream::iter(vec![
+            Ok(ProviderChunk::Text {
+                text: "answer".into(),
+            }),
+            Ok(ProviderChunk::Usage(CanonicalUsage::ZERO)),
+            Ok(ProviderChunk::Done),
+        ]))
+    }
+}
+
+/// A provider that emits a PLAUSIBLE-LOOKING but grossly under-reported
+/// usage frame (1 input + 1 output token for a multi-hundred-token request).
+/// The zero-frame guard alone cannot catch it; the runtime must settle at
+/// the plan's conservative floor rather than trusting the under-report.
+pub(crate) struct UnderReportedUsageProvider;
+
+impl faktor_provider::Provider for UnderReportedUsageProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        ModelCapabilities {
+            tools: true,
+            streaming: true,
+            ..Default::default()
+        }
+    }
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
+
+    fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+        Box::pin(futures::stream::iter(vec![
+            Ok(ProviderChunk::Text {
+                text: "answer".into(),
+            }),
+            Ok(ProviderChunk::Usage(CanonicalUsage::new(1, 0, 0, 1))),
+            Ok(ProviderChunk::Done),
+        ]))
+    }
+}
+
 /// A routed runtime whose single candidate prices at $1/M input,
 /// $0.5/M cache read, $1/M output, against a fresh durable ledger.
 pub(crate) async fn routed_settlement_runtime(

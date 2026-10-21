@@ -182,6 +182,11 @@ pub(crate) struct StreamingSummarizer {
     ///   it to record durable compaction provenance; it is never admitted to
     ///   a fact/evidence writer (those refuse this class typed).
     pub(crate) output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>>,
+    /// The provider's OWN usage frame for this summarizer call. The compact
+    /// site settles the real exchange with these numbers instead of
+    /// pretending the before/after context sizes are input/output tokens;
+    /// absent (no-usage wire) leaves the conservative plan figures.
+    pub(crate) usage_slot: Arc<std::sync::Mutex<Option<CanonicalUsage>>>,
 }
 
 impl StreamingSummarizer {
@@ -216,7 +221,10 @@ impl StreamingSummarizer {
     /// and replace the real history with a partial state transfer.
     pub(crate) async fn run(&self, history: &[faktor_context::RecentTurn]) -> Option<String> {
         use futures::StreamExt as _;
-        const SUMMARY_MAX_CHARS: usize = 60_000;
+        // The compaction model is bounded to the strict summary schema's
+        // budget: a verbose stream is refused rather than allowed to burn
+        // 4x the tokens the state transfer can ever use.
+        const SUMMARY_MAX_CHARS: usize = faktor_context::compactor::SUMMARY_MAX_OUTPUT_TOKENS * 4;
         // Cancellation is polled at this cadence even while the stream is
         // silent (std CancellationToken has no async wait primitive; a
         // bounded tick mirrors the guarded transports' cancellation checks).
@@ -247,7 +255,9 @@ impl StreamingSummarizer {
                 })
                 .collect(),
             tools: vec![],
-            max_output: Some(4096),
+            // Hard generation bound of the high-signal schema (the request
+            // carries a token budget, not an open-ended "summarize" ask).
+            max_output: Some(faktor_context::compactor::SUMMARY_MAX_OUTPUT_TOKENS),
             reasoning: None,
             stream: true,
             meta: RequestMeta {
@@ -294,8 +304,7 @@ impl StreamingSummarizer {
                     }
                     chunk = stream.next() => {
                         match chunk {
-                            Some(Ok(ProviderChunk::Text { text: t }))
-                            | Some(Ok(ProviderChunk::Reasoning { text: t })) => {
+                            Some(Ok(ProviderChunk::Text { text: t })) => {
                                 // Capacity is checked BEFORE appending so an
                                 // oversized accepted buffer is never built.
                                 if t.len() > SUMMARY_MAX_CHARS.saturating_sub(text.len()) {
@@ -303,6 +312,24 @@ impl StreamingSummarizer {
                                     return;
                                 }
                                 text.push_str(&t);
+                            }
+                            // Thinking is the model's private scratchpad, not
+                            // a state transfer. Admitting it into the summary
+                            // (the old branch merged both streams) leaks
+                            // chain-of-thought into the context that replaces
+                            // the conversation and poisons later turns with
+                            // speculative text ("the user is asking me..."),
+                            // summary drift, and output-token burn. Only the
+                            // final text is the summary.
+                            Some(Ok(ProviderChunk::Reasoning { .. })) => {}
+                            // The provider's measured exchange. Captured so
+                            // the compaction reservation settles at the REAL
+                            // input/cache/output split, never the context
+                            // sizes masquerading as usage.
+                            Some(Ok(ProviderChunk::Usage(usage))) => {
+                                if let Ok(mut slot) = self.usage_slot.lock() {
+                                    *slot = Some(usage);
+                                }
                             }
                             Some(Ok(ProviderChunk::Done)) => {
                                 // Clean end: the ONLY unconditional Complete.

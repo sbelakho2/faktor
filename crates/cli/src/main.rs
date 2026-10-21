@@ -3478,3 +3478,6 @@ mod main_value_tests;
 
 #[cfg(test)]
 mod main_cli_tests;
+
+#[cfg(test)]
+mod indep_coding_audit;

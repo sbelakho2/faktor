@@ -98,6 +98,7 @@ impl AgentRuntime {
             .wire_plan
             .take()
             .expect("route phase fixed the wire plan");
+        st.planned_input_tokens = u64::try_from(wire_plan.total_tokens).unwrap_or(u64::MAX);
         'attempts: for attempt in 0..max_attempts {
             if attempt > 0 {
                 // Bounded exponential backoff with jitter before the
@@ -404,7 +405,13 @@ impl AgentRuntime {
                 })?;
         st.settled_attempt_identity = Some(attempt_identity);
         let request = self.build_request(
-            st.handle, wire_plan, st.op_id, &st.model, &st.cancel, attempt,
+            st.handle,
+            wire_plan,
+            st.op_id,
+            &st.model,
+            &st.cancel,
+            attempt,
+            st.effective_caps.max_output,
         )?;
         CapabilityValidator::validate(&request, &st.caps)?;
         // The vision-like DOCUMENT gate at the wire boundary: a
@@ -787,20 +794,52 @@ impl AgentRuntime {
                             // them — that ambiguity is what
                             // double-billed cache reads.
                             let recorded_input = recorded_input_total(&usage);
-                            st.tokens_in = recorded_input;
-                            st.tokens_out = usage.output_tokens;
-                            // The LAST usage frame wins (providers
-                            // settle once, usually at the end): its
-                            // categories are the settlement basis
-                            // (uncached input + the cache lines +
-                            // output — reasoning already folds into
-                            // the output line at the adapter, so
-                            // the informational reasoning subset is
-                            // never billed a second time).
-                            st.frame_uncached_input = usage.uncached_input_tokens;
-                            st.frame_cache_read = usage.cache_read_tokens;
-                            st.frame_cache_write = usage.cache_write_tokens;
-                            st.frame_output = usage.output_tokens;
+                            // The plan's conservative input is an UPPER
+                            // bound on what a legitimate tokenizer can
+                            // report for these exact bytes. A frame below
+                            // HALF of it is not a tokenizer difference, it
+                            // is an under-report: trusting it would let a
+                            // hostile/buggy provider price a large request
+                            // as a handful of tokens and bypass the task
+                            // cap (the zero-frame guard caught only the
+                            // degenerate case). Settle at the plan floor.
+                            let input_floor = if st.planned_input_tokens > 0 {
+                                st.planned_input_tokens.saturating_div(2).max(1)
+                            } else {
+                                0
+                            };
+                            if st.planned_input_tokens > 0 && recorded_input < input_floor {
+                                tracing::warn!(
+                                    session = %st.handle.id(),
+                                    planned_input = st.planned_input_tokens,
+                                    reported_input = recorded_input,
+                                    "under-reported usage frame on a non-zero request; \
+                                     settling at the planned input floor"
+                                );
+                                st.tokens_in = st.planned_input_tokens;
+                                st.tokens_out = usage.output_tokens;
+                                // The local floor is uncached input: no
+                                // fabricated cache lines are claimed.
+                                st.frame_uncached_input = st.planned_input_tokens;
+                                st.frame_cache_read = 0;
+                                st.frame_cache_write = 0;
+                                st.frame_output = usage.output_tokens;
+                            } else {
+                                st.tokens_in = recorded_input;
+                                st.tokens_out = usage.output_tokens;
+                                // The LAST usage frame wins (providers
+                                // settle once, usually at the end): its
+                                // categories are the settlement basis
+                                // (uncached input + the cache lines +
+                                // output — reasoning already folds into
+                                // the output line at the adapter, so
+                                // the informational reasoning subset is
+                                // never billed a second time).
+                                st.frame_uncached_input = usage.uncached_input_tokens;
+                                st.frame_cache_read = usage.cache_read_tokens;
+                                st.frame_cache_write = usage.cache_write_tokens;
+                                st.frame_output = usage.output_tokens;
+                            }
                             if let Some(cost) = usage.reported_cost {
                                 match authoritative_reported_micro(&cost) {
                                     Some(micro) => st.provider_reported_cost = Some(micro),

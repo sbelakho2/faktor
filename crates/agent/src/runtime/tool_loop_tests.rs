@@ -1279,6 +1279,64 @@ async fn generic_shell_still_barriers_against_a_path_writer_through_the_real_too
 }
 
 #[tokio::test]
+async fn a_failed_mutation_gets_a_bounded_argument_retry_instead_of_ending_the_task() {
+    // A stale expected_hash / malformed edit operation is recoverable: the
+    // model must see the typed error and correct it. The old all-failed path
+    // ended at FailedRecoverable immediately, so one bad tool call killed an
+    // otherwise-correct task.
+    let writer = Tool {
+        name: "write_probe".into(),
+        description: "always conflicts".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: RecoveryHint::WorkspaceWrite,
+        path_args: vec![],
+        execute: Arc::new(|_ctx, _args| {
+            Box::pin(async move { Err(Error::malformed("stale expected_hash; re-read and retry")) })
+        }),
+    };
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "bad-write".into(),
+                name: "write_probe".into(),
+                input: serde_json::json!({}),
+            },
+            ScriptedResponse::Text("retried with corrected arguments".into()),
+            ScriptedResponse::End,
+        ]),
+        vec![writer],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let outcome = runtime
+        .run_turn(session, "write the file", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.final_state,
+        AgentState::ReadyForNextTurn,
+        "the model must get a chance to correct the failed mutation"
+    );
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    let ledger = runtime.load_ledger(&handle).unwrap();
+    assert!(
+        ledger
+            .decisions
+            .iter()
+            .any(|decision| decision.contains("retry the failed edit")),
+        "the retry decision must be durable: {:?}",
+        ledger.decisions
+    );
+}
+
+#[tokio::test]
 async fn mixed_tool_batch_completes_lawfully_with_per_tool_records() {
     // DEFECT REPRODUCER (mixed success+failure batch): one scheduled
     // tool succeeds and one fails recoverably in the SAME batch. The
@@ -3337,4 +3395,63 @@ async fn settled_model_call_emits_a_call_receipt() {
     assert_eq!(recorded[0].model, "m");
     assert!(recorded[0].call_id.starts_with("attempt-"));
     assert!(recorded[0].ended_ms.is_some());
+}
+
+#[test]
+fn unchanged_read_marker_is_digest_keyed_bounded_and_fresh_bypassable() {
+    let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let input = serde_json::json!({"path": "src/cache_target.rs"});
+    let first = "pub fn stable() {}\n".repeat(128);
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "read_file", &input, &first)
+            .is_none(),
+        "the first read returns the bytes"
+    );
+    let marker = runtime
+        .unchanged_read_marker(&handle, "read_file", &input, &first)
+        .expect("an identical second read is a compact reference");
+    assert!(marker.contains("[unchanged excerpt] src/cache_target.rs"));
+    assert!(marker.contains("fresh:true"));
+    assert!(
+        marker.len() < 384,
+        "the marker is bounded: {}",
+        marker.len()
+    );
+
+    let changed = "pub fn changed() {}\n".repeat(128);
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "read_file", &input, &changed)
+            .is_none(),
+        "changed content always returns the bytes"
+    );
+    let fresh_input = serde_json::json!({"path": "src/cache_target.rs", "fresh": true});
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "read_file", &fresh_input, &changed)
+            .is_none(),
+        "fresh:true bypasses the reference"
+    );
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "read_file", &input, &changed)
+            .is_some(),
+        "the fresh read refreshed the recorded digest"
+    );
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "read_file", &input, "tiny")
+            .is_none(),
+        "a tiny read is never replaced by a marker that costs more"
+    );
+    assert!(
+        runtime
+            .unchanged_read_marker(&handle, "write_file", &input, &first)
+            .is_none(),
+        "only the read tool uses the read cache"
+    );
 }

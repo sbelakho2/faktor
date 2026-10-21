@@ -71,10 +71,16 @@ async fn turn_verification_runs_required_check_and_passes() {
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     assert_eq!(
         *calls.lock().unwrap(),
-        vec!["cargo check".to_string()],
-        "the derived required check runs exactly once"
+        vec!["cargo check".to_string(), "cargo test --tests".to_string()],
+        "the derived required checks run exactly once each"
     );
-    assert_eq!(outcome.verification, vec![("rust_check".to_string(), true)]);
+    assert_eq!(
+        outcome.verification,
+        vec![
+            ("rust_check".to_string(), true),
+            ("rust_test_workspace".to_string(), true)
+        ]
+    );
     assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
     assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
@@ -101,7 +107,10 @@ async fn turn_verification_runs_required_check_and_passes() {
     assert_eq!(last["status"], "passed", "{last}");
     assert_eq!(
         last["checks"],
-        serde_json::json!([{ "id": "rust_check", "passed": true }]),
+        serde_json::json!([
+            { "id": "rust_check", "passed": true },
+            { "id": "rust_test_workspace", "passed": true }
+        ]),
         "{last}"
     );
     assert!(last["changed"][0] == "src/a.rs", "{last}");
@@ -260,16 +269,25 @@ async fn turn_verification_failure_writes_durable_fact() {
     );
     assert_eq!(
         outcome.verification,
-        vec![("rust_check".to_string(), false)]
+        vec![
+            ("rust_check".to_string(), false),
+            ("rust_test_workspace".to_string(), false)
+        ]
     );
     assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Fail));
     assert_eq!(
         outcome.completion,
         Some(CompletionGate::FailedVerification {
-            reasons: vec![OutcomeReason::new(
-                ReasonCode::CheckFailed,
-                "required check 'rust_check' (cargo check) failed"
-            )]
+            reasons: vec![
+                OutcomeReason::new(
+                    ReasonCode::CheckFailed,
+                    "required check 'rust_check' (cargo check) failed"
+                ),
+                OutcomeReason::new(
+                    ReasonCode::CheckFailed,
+                    "required check 'rust_test_workspace' (cargo test --tests) failed"
+                ),
+            ]
         }),
         "a failed required check must gate the turn as FailedVerification"
     );
@@ -327,7 +345,10 @@ async fn completion_proof_spec_sections_map_to_code_paths() {
             ScriptedResponse::End,
         ],
         fake(|cmd: &str| {
-            assert_eq!(cmd, "cargo check");
+            assert!(
+                cmd == "cargo check" || cmd == "cargo test --tests",
+                "unexpected check command: {cmd}"
+            );
             Ok(())
         }),
         0.65,
@@ -614,7 +635,12 @@ async fn completion_proof_spec_sections_map_to_code_paths() {
 
     // ---- 7. Implementation status: agent hook ----
     spec_probe!("Implementation status: agent hook (`faktor-agent`)", {
-        if pass_out.verification != vec![("rust_check".to_string(), true)] {
+        if pass_out.verification
+            != vec![
+                ("rust_check".to_string(), true),
+                ("rust_test_workspace".to_string(), true),
+            ]
+        {
             return Err(format!("verification results: {:?}", pass_out.verification));
         }
         if pass_out.acceptance != Some(faktor_verify::Acceptance::Pass) {
@@ -1141,7 +1167,10 @@ async fn completion_gate_verified_complete_with_facts_on_every_path() {
             ScriptedResponse::End,
         ],
         Some(fake(|cmd: &str| {
-            assert_eq!(cmd, "cargo check");
+            assert!(
+                cmd == "cargo check" || cmd == "cargo test --tests",
+                "unexpected check command: {cmd}"
+            );
             Ok(())
         })),
     );
@@ -1320,7 +1349,10 @@ async fn task_row_reaches_verified_complete_and_mirrors_gate_rows() {
     assert_eq!(tasks.len(), 1, "one durable task row per session");
     let t = &tasks[0];
     assert_eq!(t.state, TaskState::VerifiedComplete);
-    assert_eq!(t.goal, "gating task", "goal seeded from the session goal");
+    assert_eq!(
+        t.goal, "write src/a.rs",
+        "goal seeded from the latest user prompt"
+    );
     assert!(
         t.acceptance_criteria
             .iter()
@@ -1331,7 +1363,7 @@ async fn task_row_reaches_verified_complete_and_mirrors_gate_rows() {
     let criteria_text = criteria_canonical_text(&t.acceptance_criteria);
     assert!(
         criteria_text.contains("required check: cargo check")
-            && !criteria_text.contains("goal: gating task"),
+            && !criteria_text.contains("goal: write src/a.rs"),
         "the canonical typed criteria row carries the derived check entries (never an automatic goal obligation): {criteria_text}"
     );
     assert_eq!(
@@ -1784,7 +1816,7 @@ async fn crash_between_durable_criteria_and_gate_write_converges_after_restart()
     let row_criteria1 = criteria_canonical_text(&h.list_tasks().unwrap()[0].acceptance_criteria);
     assert!(
         row_criteria1.contains("required check: cargo check")
-            && !row_criteria1.contains("goal: gating task"),
+            && !row_criteria1.contains("goal: write src/a.rs"),
         "{row_criteria1}"
     );
     assert_eq!(criteria_turn1, row_criteria1);

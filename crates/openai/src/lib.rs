@@ -559,17 +559,14 @@ fn lower_role_message(
                     serde_json::Value::Array(text)
                 };
                 msg["content"] = content;
-            } else if !calls.is_empty() {
-                // Chat Completions: an assistant tool-calling message carries
-                // TEXT-ONLY content blocks (plus tool_calls below) — reasoning
-                // is skipped for families that do not replay it.
-                msg["content"] = serde_json::Value::Array(text);
             } else {
-                // Keep prior reasoning mapped as content blocks per the API
-                // when the family supports them (no tool calls involved).
-                for t in reasoning {
-                    text.push(serde_json::json!({ "type": "reasoning", "text": t }));
-                }
+                // Plain Chat Completions: reasoning is an OUTPUT-ONLY
+                // stream. Replaying the model's private scratchpad as
+                // `{type:"reasoning"}` content blocks (the old path) is not
+                // a documented input shape, burns input tokens on every
+                // subsequent turn, and makes the conversation grow without
+                // new information. Only the explicit DeepSeek-style quirk
+                // above may replay it (where tool continuation requires it).
                 msg["content"] = serde_json::Value::Array(text);
             }
             if !calls.is_empty() {
@@ -1310,6 +1307,13 @@ pub fn chat_completions_body(
         "messages": messages,
         "stream": req.stream,
     });
+    if req.stream {
+        // Without this, OpenAI-compatible streaming endpoints (OpenAI,
+        // DeepSeek, Ollama /v1) omit the terminal usage envelope entirely,
+        // so the runtime records ZERO prompt/completion/cache tokens and
+        // cannot reconcile its estimate or price cached prefix reads.
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");

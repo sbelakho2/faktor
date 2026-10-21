@@ -241,12 +241,15 @@ async fn drive_start_compiles_persists_and_replays_the_baseline_contract() {
     let runtime = AgentRuntime::new(deps).unwrap();
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
 
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert!(
@@ -275,7 +278,10 @@ async fn drive_start_compiles_persists_and_replays_the_baseline_contract() {
     // Replayed drive start: the deterministic compile merges to a no-op and
     // the durable revision does not move.
     let revision = handle.task_revision(task_id).unwrap();
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     assert_eq!(handle.task_revision(task_id).unwrap(), revision);
     let replayed = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(replayed.contract, task.contract);
@@ -297,12 +303,15 @@ async fn drive_start_records_uncertainty_when_nothing_is_derivable() {
     let runtime = AgentRuntime::new(deps).unwrap();
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
 
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert!(task.contract.proof_obligations.is_empty());
@@ -352,11 +361,14 @@ async fn an_existing_contract_is_never_recompiled_over() {
             updated_ms: now,
         })
         .unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(
         task.contract, user_contract,
@@ -520,11 +532,14 @@ async fn installed_provider_answers_the_bounded_questions_into_the_durable_contr
     runtime.set_value_gate(granting_gate());
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
 
@@ -623,12 +638,15 @@ async fn refusing_provider_leaves_the_native_contract_and_never_fails_the_drive(
     runtime.set_value_gate(granting_gate());
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
     // The drive is not failed by the refusal...
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     // ...and the durable contract is exactly the native one.
@@ -652,11 +670,14 @@ async fn no_provider_is_byte_identical_to_the_native_compile() {
     let runtime = AgentRuntime::new(deps).unwrap();
     let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
     let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-    let ledger = TaskLedger {
+    let mut ledger = TaskLedger {
         goal: "Fix the refresh-token race".to_string(),
         ..Default::default()
     };
-    runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
     assert_eq!(external_count(&task.contract), 0);
@@ -728,11 +749,14 @@ async fn denied_organization_contracts_refuse_enrichment_typed_before_the_provid
         runtime.set_value_gate(gate);
         let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
         let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
-        let ledger = TaskLedger {
+        let mut ledger = TaskLedger {
             goal: "Fix the refresh-token race".to_string(),
             ..Default::default()
         };
-        runtime.restore_task_rows(&handle, &ledger).await.unwrap();
+        runtime
+            .restore_task_rows(&handle, &mut ledger)
+            .await
+            .unwrap();
         let task_id = handle.task_id().unwrap();
         let task = handle.get_task(task_id).unwrap().unwrap();
         assert_eq!(

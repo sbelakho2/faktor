@@ -93,13 +93,55 @@ fn claim_pending_internal_context(
     }
 }
 
+/// Default per-turn token budget of the pending internal-context block.
+/// The block rides the volatile system tail, so it must share the system
+/// class budget instead of concatenating every pending child handoff at
+/// once (200 finished children at the 2,048-token per-handoff bound would
+/// otherwise produce a ~400k-token required section and fail the whole
+/// turn). The unclaimed sections stay pending for later turns.
+pub const DEFAULT_PENDING_INTERNAL_CONTEXT_TOKENS: usize = 4_096;
+
+/// Drop ITEM lines already delivered by an earlier section in THIS claim.
+/// The production delivery arm renders one child handoff per durable row, so
+/// five siblings that report the same shared fact would otherwise repeat it
+/// five times in the same parent turn. Non-item lines (section headers,
+/// trust notice, item envelopes, unavailable markers) are preserved: the
+/// envelope stays well-formed even when every body item was a duplicate.
+fn dedupe_section_items(section: &str, seen: &mut std::collections::HashSet<String>) -> String {
+    let mut out = String::with_capacity(section.len());
+    for line in section.lines() {
+        if let Some(item) = line.strip_prefix("- ") {
+            let key = item.split_whitespace().collect::<Vec<_>>().join(" ");
+            if key.len() >= 8 && !seen.insert(key) {
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Take the pending internal-context sections recorded for the session of
 /// `handle`, in deterministic key order, claiming each rendered entry once.
 /// Empty when the session carries none; a fact read failure yields empty
 /// and logs (the following drive re-reads the durable rows). Concurrent
 /// consumers partition the pending set: every section is rendered by
 /// exactly one of them (see [`claim_pending_internal_context`]).
+#[cfg(test)]
 pub(crate) fn take_pending_internal_context(handle: &faktor_session::SessionHandle) -> String {
+    take_pending_internal_context_bounded(handle, DEFAULT_PENDING_INTERNAL_CONTEXT_TOKENS)
+}
+
+/// [`take_pending_internal_context`] with an explicit token budget. At most
+/// that many estimated tokens are claimed and returned this turn (the first
+/// section is always claimed so an oversized individual handoff cannot
+/// starve the queue); everything not claimed stays pending and is served by
+/// the next drive.
+pub(crate) fn take_pending_internal_context_bounded(
+    handle: &faktor_session::SessionHandle,
+    budget_tokens: usize,
+) -> String {
     // Bounded per-kind walk: the previous full fact-table scan got slower
     // with every turn's facts (O(n²) over a long task). 16 x 200 handoff
     // rows is far beyond the bounded child-control cap; exhausting the walk
@@ -151,10 +193,20 @@ pub(crate) fn take_pending_internal_context(handle: &faktor_session::SessionHand
     }
     pending.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::new();
+    let mut used = 0usize;
+    let mut seen_items: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, value) in pending {
+        let tokens = faktor_context::Estimator.estimate_tokens(&value);
+        if !out.is_empty() && used.saturating_add(tokens) > budget_tokens {
+            // Budget exhausted: leave the remaining durable rows pending
+            // for the next drive (never claim a section we cannot render).
+            continue;
+        }
         let Some(claimed) = claim_pending_internal_context(handle, &key, &value) else {
             continue;
         };
+        let claimed = dedupe_section_items(&claimed, &mut seen_items);
+        used = used.saturating_add(faktor_context::Estimator.estimate_tokens(&claimed));
         if !out.is_empty() {
             out.push('\n');
         }
@@ -245,6 +297,83 @@ mod tests {
                 .unwrap();
             assert_eq!(value.as_deref(), Some(""), "row {i} is acked");
         }
+        assert!(take_pending_internal_context(&handle).is_empty());
+    }
+
+    /// 200 finished children must never concatenate into one over-budget
+    /// required section: each drive claims only its token share and the
+    /// rest stay pending, so all 200 are delivered exactly once over bounded
+    /// turns (the old code claimed all 200 in one call).
+    /// Sibling fact dedupe at the PRODUCTION delivery arm: each child
+    /// handoff is a separate durable row, so the dedupe must happen when the
+    /// parent claims the batch — not only when a caller renders items
+    /// together. A shared fact appears once; unique per-child facts survive.
+    #[test]
+    fn pending_sections_dedupe_shared_sibling_facts() {
+        let (_dir, handle) = parent_session();
+        for i in 0..5 {
+            let section = format!(
+                "[faktor:internal-context]\n[internal-context-item kind=child-handoff provenance=orchestrator:child-handoff]\n[child-handoff]\n- shared fact SHARED-SIBLING-FACT\n- unique fact UNIQUE-{i}\n[internal-context-item-end]\n[/faktor:internal-context]\n"
+            );
+            handle
+                .upsert_memory_fact(
+                    PENDING_INTERNAL_CONTEXT_KIND,
+                    &format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{i}"),
+                    &section,
+                )
+                .unwrap();
+        }
+        let out = take_pending_internal_context_bounded(&handle, 4_096);
+        assert_eq!(
+            out.matches("SHARED-SIBLING-FACT").count(),
+            1,
+            "the shared sibling fact is delivered once: {out}"
+        );
+        for i in 0..5 {
+            assert!(
+                out.contains(&format!("UNIQUE-{i}")),
+                "unique child {i} fact survives: {out}"
+            );
+        }
+        assert!(take_pending_internal_context(&handle).is_empty());
+    }
+
+    #[test]
+    fn two_hundred_pending_handoffs_are_delivered_in_bounded_turns() {
+        let (_dir, handle) = parent_session();
+        let total = 200usize;
+        for i in 0..total {
+            handle
+                .upsert_memory_fact(
+                    PENDING_INTERNAL_CONTEXT_KIND,
+                    &format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{i:03}"),
+                    &format!("SECTION-{i:03} {}", "x".repeat(600)),
+                )
+                .unwrap();
+        }
+        let mut delivered = 0usize;
+        let mut turns = 0usize;
+        let started = std::time::Instant::now();
+        loop {
+            let out = take_pending_internal_context_bounded(&handle, 512);
+            if out.is_empty() {
+                break;
+            }
+            let tokens = faktor_context::Estimator.estimate_tokens(&out);
+            assert!(
+                tokens <= 512,
+                "one drive's pending block must fit its budget, got {tokens}"
+            );
+            delivered += out.matches("SECTION-").count();
+            turns += 1;
+            assert!(turns <= total + 1, "the queue must drain");
+        }
+        eprintln!(
+            "HANDOFF200 delivered={delivered} turns={turns} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert_eq!(delivered, total, "every handoff delivered exactly once");
+        assert!(turns > 1, "200 handoffs must span bounded turns");
         assert!(take_pending_internal_context(&handle).is_empty());
     }
 

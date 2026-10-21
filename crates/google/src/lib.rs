@@ -235,9 +235,10 @@ impl GoogleProvider {
                     ContentKind::Text { text } => {
                         parts.push(serde_json::json!({ "text": text }));
                     }
-                    ContentKind::Reasoning { text } => {
-                        parts.push(serde_json::json!({ "text": text }));
-                    }
+                    // Prior-turn reasoning is output-only scratchpad.
+                    // Replaying it as ordinary text burns input tokens on
+                    // every turn without adding conversation state.
+                    ContentKind::Reasoning { .. } => {}
                     ContentKind::Image { url } => {
                         parts.push(serde_json::json!({ "inline_data": { "mime_type": "image/png", "data": url } }));
                     }

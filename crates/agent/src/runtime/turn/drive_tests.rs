@@ -518,7 +518,13 @@ async fn verified_completion_lands_durable_passing_record_that_survives_reopen()
         .unwrap();
     drop(runtime);
     assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
-    assert_eq!(outcome.verification, vec![("rust_check".to_string(), true)]);
+    assert_eq!(
+        outcome.verification,
+        vec![
+            ("rust_check".to_string(), true),
+            ("rust_test_workspace".to_string(), true)
+        ]
+    );
     let h = manager.get_session(session).unwrap().unwrap();
     let tasks = h.list_tasks().unwrap();
     assert_eq!(tasks.len(), 1);
@@ -575,7 +581,7 @@ async fn verified_completion_lands_durable_passing_record_that_survives_reopen()
     // Checks mirror the executed runs (program/args/category/status/exit).
     assert_eq!(
         rec.checks.len(),
-        1,
+        2,
         "one execution row per check that ran: {:?}",
         rec.checks
     );
@@ -587,6 +593,16 @@ async fn verified_completion_lands_durable_passing_record_that_survives_reopen()
     assert!(check.required);
     assert_eq!(check.status, VerificationStatus::Passed);
     assert_eq!(check.exit, Some(0));
+    let test_check = &rec.checks[1];
+    assert_eq!(test_check.check, "rust_test_workspace");
+    assert_eq!(test_check.program, "cargo");
+    assert_eq!(
+        test_check.args,
+        vec!["test".to_string(), "--tests".to_string()]
+    );
+    assert_eq!(test_check.category, "test");
+    assert!(test_check.required);
+    assert_eq!(test_check.status, VerificationStatus::Passed);
     // Criterion verdicts cover EVERY current acceptance criterion with
     // passed=true (the exact contract complete_verified_task re-checks in
     // its store transaction).
@@ -625,8 +641,9 @@ async fn verified_completion_lands_durable_passing_record_that_survives_reopen()
     let records2 = h2.list_verification_records(task_id).unwrap();
     assert_eq!(records2.len(), 1, "no record duplication across reopen");
     assert_eq!(records2[0].status, VerificationStatus::Passed);
-    assert_eq!(records2[0].checks.len(), 1);
+    assert_eq!(records2[0].checks.len(), 2);
     assert_eq!(records2[0].checks[0].check, "rust_check");
+    assert_eq!(records2[0].checks[1].check, "rust_test_workspace");
     assert_eq!(
         records2[0].criteria, rec.criteria,
         "record content is immutable across reopen"

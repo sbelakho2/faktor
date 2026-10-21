@@ -112,12 +112,16 @@ fn sandbox_gate(
 pub fn read_file_tool() -> Tool {
     Tool {
         name: "read_file".into(),
-        description: "Read a file within the workspace (bounded, sandboxed).".into(),
+        description: "Read one workspace file. The first line is a Faktor header `[faktor:file path=... hash=<blake3> lines=N bytes=N]`; copy its hash into edit_file.expected_hash before editing. The body follows with no line numbers. max_bytes defaults to 64 KiB; a bounded read says hash=truncated and ends with [truncated]. Read the exact file returned by search/list_dir, not whole directories.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "max_bytes": { "type": "integer" }
+                "max_bytes": { "type": "integer" },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Return the bytes even when the file is unchanged since the last read."
+                }
             },
             "required": ["path"]
         }),
@@ -156,11 +160,30 @@ pub fn read_file_tool() -> Tool {
                 let truncated = !data.digest.is_full();
                 let bytes = &data.bytes;
                 let text = String::from_utf8_lossy(bytes).to_string();
+                // The hash is the value edit_file's optimistic-concurrency
+                // check expects. Returning it on the read (instead of making
+                // the model invent one) is what stops the stale-hash conflict
+                // loop that ended otherwise-correct turns.
+                let header = match data.full_hash() {
+                    Some(hash) => format!(
+                        "[faktor:file path={} hash={} lines={} bytes={}]\n",
+                        path,
+                        hash.to_hex(),
+                        text.lines().count(),
+                        data.size
+                    ),
+                    None => format!(
+                        "[faktor:file path={} hash=truncated lines={} bytes_returned={}]\n",
+                        path,
+                        text.lines().count(),
+                        data.size
+                    ),
+                };
                 Ok(ToolOutcome {
                     text: if truncated {
-                        format!("{text}\n[truncated at {max} bytes]")
+                        format!("{header}{text}\n[truncated at {max} bytes]")
                     } else {
-                        text
+                        format!("{header}{text}")
                     },
                     exit_code: Some(0),
                     ..Default::default()
@@ -173,7 +196,7 @@ pub fn read_file_tool() -> Tool {
 pub fn write_file_tool() -> Tool {
     Tool {
         name: "write_file".into(),
-        description: "Write a file within the workspace (transactional, checkpointed).".into(),
+        description: "Create or REPLACE a whole workspace file atomically (checkpointed; parent directories are not created implicitly). Use for a new file or a full rewrite only; prefer edit_file for a targeted change so the rest of the file is preserved. Returns the new expected_hash.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -699,7 +722,7 @@ fn apply_edit_op(buf: &mut String, op: &ToolEditOp, idx: usize) -> Result<(), Er
 pub fn edit_file_tool() -> Tool {
     Tool {
         name: "edit_file".into(),
-        description: "Edit a file with precise bounded operations (atomic; nothing is written unless EVERY operation succeeds). Input: {path, expected_hash? (BLAKE3 hex from the last read_file/edit_file/write_file outcome), operations: [op, ...]} (1..=8 ops). Op types: (1) replace_exact {search, replace} — replace the FIRST literal occurrence; (2) search_replace {search, replace, unique?} — unique (default true) requires exactly one match, ambiguous matches REFUSE with no write; unique: false replaces the first occurrence; (3) insert {anchor, position: before|after, text} — anchor must match uniquely; (4) region_replace {start_line, end_line, text} — replace whole lines (1-based inclusive) with the given line block; empty text deletes the lines. Escalation: exact -> unique search/replace -> bounded region; whole-file replacement is NOT offered (use write_file). Staleness: when expected_hash is supplied and the file changed since, the edit REFUSES (conflict) without writing. When a later operation fails, the error names the operation and the file is left UNCHANGED. The reply reports the file's new expected_hash — send it back as the next expected_hash. Paths resolve against the session workspace (sandboxed, symlink-safe).".into(),
+        description: "Edit a file atomically with 1..=8 bounded operations; nothing is written unless every operation succeeds. Ops: replace_exact {search, replace} replaces the first literal match; search_replace {search, replace, unique?} needs exactly one match by default (ambiguous REFUSES), unique:false replaces the first; insert {anchor, position: before|after, text} needs a unique anchor; region_replace {start_line, end_line, text} replaces 1-based inclusive whole lines (empty text deletes). expected_hash (BLAKE3 from the last read/edit/write) refuses with conflict if the file changed. A failed operation names itself and leaves the file unchanged. The reply carries the new expected_hash for the next edit. Paths resolve inside the session workspace.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -859,10 +882,82 @@ pub fn edit_file_tool() -> Tool {
     }
 }
 
+/// Bounded, sandboxed listing of ONE workspace directory. The repository map
+/// tells a model which paths exist; this tells it what is directly under a
+/// path without paying a shell (`ls`) permission or walking the whole tree.
+pub fn list_dir_tool() -> Tool {
+    Tool {
+        name: "list_dir".into(),
+        description: "List ONE workspace directory (non-recursive, sorted, bounded). Each line is `d <path>/` for a directory, `f <path>` for a file, or `l <path>` for a symlink. `path` defaults to the workspace root. Use it to orient before reading; it does not recurse.".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            }
+        }),
+        resource_class: ResourceClass::DiskRead,
+        capability: Some(Capability::ReadWorkspace { path: ".".into() }),
+        recovery_hint: RecoveryHint::Idempotent,
+        path_args: vec!["path".into()],
+        execute: Arc::new(|ctx, args| {
+            Box::pin(async move {
+                let (ws, sandbox) = require_workspace(&ctx)?;
+                let rel = workspace_rel(
+                    &ws,
+                    args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
+                )?;
+                sandbox_gate(
+                    &ctx,
+                    &sandbox,
+                    &Capability::ReadWorkspace {
+                        path: ws.root().join(&rel),
+                    },
+                    "list_dir",
+                )?;
+                let listing = ws.list_entries(&rel, 400)?;
+                let mut lines: Vec<String> = Vec::new();
+                for entry in listing.entries {
+                    let kind = if entry.is_dir() {
+                        "d"
+                    } else if entry.is_file() {
+                        "f"
+                    } else if entry.is_symlink() {
+                        "l"
+                    } else {
+                        "?"
+                    };
+                    let path = entry.rel.to_string_lossy();
+                    lines.push(if entry.is_dir() {
+                        format!("{kind} {path}/")
+                    } else {
+                        format!("{kind} {path}")
+                    });
+                }
+                lines.sort();
+                let mut text = if lines.is_empty() {
+                    "empty directory".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                if listing.overflowed {
+                    text.push_str(
+                        "\ncomplete: false; truncation_reason: directory exceeds 400 entries",
+                    );
+                }
+                Ok(ToolOutcome {
+                    text,
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
 pub fn search_tool() -> Tool {
     Tool {
         name: "search".into(),
-        description: "Substring search over workspace files (bounded, sandboxed).".into(),
+        description: "Case-sensitive LITERAL substring search (not regex) over workspace text files. Returns one matching workspace-relative path per line, no line numbers, or `no matches` (exit 1). `path` limits the walk to one directory. Use it before renaming/removing a symbol to find every caller and test call site, then read_file the hits. The walk is bounded; `complete: false; truncation_reason: ...` means the result is partial.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -1069,14 +1164,14 @@ const ARTIFACT_TRUNCATED_MARK: &str = "\n[artifact truncated at its cap]";
 pub fn run_command_tool() -> Tool {
     Tool {
         name: "run_command".into(),
-        description: "Run a shell command in the workspace (supervised, bounded).".into(),
+        description: "Run ONE shell command from the workspace root (supervised, deadline, bounded output with an explicit truncation marker; exit code reported). Use read_only:true for builds, tests and inspection (kernel denies workspace writes); omit it for commands that must write. Run the project's real test command after edits and read the failures before answering. Do not use it to read or search files (use read_file/search/list_dir).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string" },
                 "read_only": {
                     "type": "boolean",
-                    "description": "Verification-style command: the kernel denies workspace writes (only build/scratch roots stay writable) and no whole-workspace change accounting is needed. Use for builds, tests, and read-only queries."
+                    "description": "Builds/tests/read-only query: deny workspace writes and skip whole-workspace change accounting."
                 }
             },
             "required": ["command"]
@@ -1144,10 +1239,19 @@ pub fn run_command_tool() -> Tool {
                 // and only explicit build/scratch roots are writable — so
                 // they need no whole-workspace change manifest and never
                 // consume a path-constrained ChangeBudget.
+                // `read_only` promises KERNEL write denial, which is what
+                // makes the whole-workspace change manifest unnecessary. On
+                // a platform without the confinement backend the promise
+                // cannot be kept, so it degrades to the ordinary controlled
+                // command (pre-manifest + unknown effect) instead of
+                // refusing the command outright. Refusing every
+                // verification-style command on such a platform made the
+                // local agent unable to test its own work at all.
                 let read_only = args
                     .get("read_only")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && faktor_sandbox::filesystem_backend_available();
                 let filesystem_isolation = if read_only {
                     // P0: provisioning runs through the ROOTED filesystem
                     // authority (anchored, no-follow component walk), never
@@ -1168,10 +1272,19 @@ pub fn run_command_tool() -> Tool {
                             })?;
                         writable_roots.push(path);
                     }
+                    let required = match sandbox.spawn_filesystem_requirement() {
+                        faktor_terminal::FilesystemIsolationRequirement::Workspace {
+                            best_effort,
+                        } => !best_effort,
+                        // No workspace confinement is claimed by the policy:
+                        // the read-only mode is best-effort confinement, not
+                        // a guarantee the policy never promised.
+                        faktor_terminal::FilesystemIsolationRequirement::Inherit => false,
+                    };
                     faktor_terminal::FilesystemIsolation::WorkspaceReadOnly {
                         roots: vec![ws.root().to_path_buf()],
                         writable_roots,
-                        required: true,
+                        required,
                     }
                 } else {
                     faktor_terminal::FilesystemIsolation::for_requirement(
@@ -2021,6 +2134,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_dir_is_bounded_and_labels_kinds() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::create_dir_all(f.root.join("src/nested")).unwrap();
+        std::fs::write(f.root.join("src/lib.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(f.root.join("src/nested/deep.rs"), "fn deep() {}\n").unwrap();
+        let tool = list_dir_tool();
+        let out = (tool.execute)(ctx(&f), serde_json::json!({"path": "src"}))
+            .await
+            .unwrap();
+        assert!(out.text.contains("d src/nested/"), "{}", out.text);
+        assert!(out.text.contains("f src/lib.rs"), "{}", out.text);
+        assert!(
+            !out.text.contains("deep.rs"),
+            "listing must not recurse: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_header_carries_the_hash_an_edit_can_use() {
+        // The model must not have to invent an expected_hash: the read
+        // returns the whole-file BLAKE3, and that exact value edits cleanly.
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("a.txt"), "alpha\n").unwrap();
+        let read = read_file_tool();
+        let out = (read.execute)(ctx(&f), serde_json::json!({"path": "a.txt"}))
+            .await
+            .unwrap();
+        let header = out.text.lines().next().unwrap_or_default();
+        assert!(header.starts_with("[faktor:file "), "{header}");
+        assert!(header.contains("hash="), "{header}");
+        let hash = header
+            .split("hash=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(hash.len(), 64, "{header}");
+        let edit = edit_file_tool();
+        let out = (edit.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "path": "a.txt",
+                "expected_hash": hash,
+                "operations": [{"type": "replace_exact", "search": "alpha", "replace": "beta"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+            "beta\n"
+        );
+    }
+
+    #[tokio::test]
     async fn read_file_missing_is_not_found() {
         let f = fixture(SandboxPolicy::default());
         let tool = read_file_tool();
@@ -2484,7 +2656,12 @@ mod tests {
         let out = (read.execute)(ctx(&f), serde_json::json!({"path": "alias.txt"}))
             .await
             .unwrap();
-        assert_eq!(out.text, "inside-content");
+        assert!(
+            out.text.ends_with("inside-content"),
+            "the body follows the Faktor header: {}",
+            out.text
+        );
+        assert!(out.text.starts_with("[faktor:file path=alias.txt"));
         assert_eq!(out.exit_code, Some(0));
 
         // A regular file read successfully, then swapped for an outside
@@ -2624,6 +2801,34 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(out.text.contains("hello-from-tool"), "{:?}", out.text);
         assert_eq!(out.effect_status, EffectStatus::Unknown);
+    }
+
+    /// A `read_only` command on a platform without the kernel
+    /// filesystem-confinement backend must degrade to the ordinary
+    /// controlled command (pre-manifest + unknown effect), never refuse:
+    /// otherwise every verification-style command is unusable there and the
+    /// agent can never test its own change.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_only_command_degrades_when_no_filesystem_backend_exists() {
+        let f = fixture(SandboxPolicy {
+            execute_shell: Rule::Allow,
+            ..Default::default()
+        });
+        let tool = run_command_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"command": "echo read-only-fallback", "read_only": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.text);
+        assert!(out.text.contains("read-only-fallback"), "{:?}", out.text);
+        assert_eq!(
+            out.effect_status,
+            EffectStatus::Unknown,
+            "without kernel write denial the command keeps ordinary unknown-effect accounting"
+        );
     }
 
     /// Audit P1 consumer proof: a workspace-only policy (external

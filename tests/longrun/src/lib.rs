@@ -290,7 +290,7 @@ mod tests {
         ))
         .unwrap();
         let outcome = rt
-            .run_turn_with_model(sid, "fix the audit ledger", &[], Some("m1".into()))
+            .run_turn_with_model(sid, title, &[], Some("m1".into()))
             .await
             .unwrap();
         assert_eq!(

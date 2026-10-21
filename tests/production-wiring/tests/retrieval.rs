@@ -468,9 +468,20 @@ async fn openai_chat_endpoint_observes_the_retrieved_evidence() {
         messages[0]["role"], "system",
         "the cacheable prefix must be the FIRST chat message: {raw}"
     );
-    let system = messages[0]["content"]
-        .as_str()
-        .expect("the system message carries the lowered prefix as a string");
+    let system = messages
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .map(|message| match &message["content"] {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         system.contains("## Retrieved evidence"),
         "the daemon's evidence section must be observable on the OpenAI chat wire: {raw}"

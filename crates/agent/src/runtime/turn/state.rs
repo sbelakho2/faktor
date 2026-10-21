@@ -139,6 +139,33 @@ pub struct ChildHandoff {
 }
 
 impl ChildHandoff {
+    /// True when a child-controlled field carries instruction-override
+    /// phrasing. Child output is DATA at the prompt boundary: the Faktor
+    /// envelope and trust notice are not an enforcement boundary, so the
+    /// same override scan that guards rules/evidence/memory guards the
+    /// handoff before it reaches the parent prompt. Only fields the renderer
+    /// emits are scanned (fixed ordering, no serialization).
+    pub fn carries_instruction_override(&self) -> bool {
+        let hostile = faktor_security::contains_instruction_override;
+        if hostile(&self.child_id) || hostile(&self.goal) || hostile(&self.outcome) {
+            return true;
+        }
+        if self.refs.iter().any(|item| hostile(item)) {
+            return true;
+        }
+        [
+            &self.facts,
+            &self.findings,
+            &self.decisions,
+            &self.changed_files,
+        ]
+        .into_iter()
+        .any(|data| match data {
+            HandoffData::Available(items) => items.iter().any(|item| hostile(item)),
+            HandoffData::Unavailable { reason } => hostile(reason),
+        })
+    }
+
     pub fn new(child_id: impl Into<String>) -> Self {
         Self {
             child_id: child_id.into(),
@@ -321,6 +348,51 @@ impl ChildHandoff {
                 budget_tokens,
                 envelope_tokens: tokens,
             });
+        }
+        Ok(rendered)
+    }
+
+    /// Sibling-aware bounded render: items already delivered by another
+    /// handoff in this same parent section (`seen`, normalized) are
+    /// suppressed before the budget is spent, so five children reporting
+    /// the same shared fact contribute it ONCE. Only item lines that
+    /// actually render are marked seen (an item dropped by the budget was
+    /// never delivered and stays available to a later sibling). Within one
+    /// handoff, duplicate items collapse the same way.
+    pub(crate) fn render_bounded_dedup(
+        &self,
+        budget_tokens: usize,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<String, ChildHandoffOversized> {
+        let mut copy = self.clone();
+        let mut local: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unique = |data: &mut HandoffData<Vec<String>>| {
+            if let HandoffData::Available(items) = data {
+                items.retain(|item| {
+                    let key = faktor_context::sanitize_ledger_text(item)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if key.len() < 8 {
+                        return true;
+                    }
+                    !seen.contains(&key) && local.insert(key)
+                });
+            }
+        };
+        unique(&mut copy.decisions);
+        unique(&mut copy.findings);
+        unique(&mut copy.facts);
+        let rendered = copy.render_bounded(budget_tokens)?;
+        for line in rendered.lines().filter(|line| line.starts_with("- ")) {
+            let key = line
+                .trim_start_matches("- ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if key.len() >= 8 {
+                seen.insert(key);
+            }
         }
         Ok(rendered)
     }
@@ -2405,6 +2477,85 @@ impl AgentRuntime {
                 None
             }
         }
+    }
+
+    /// Detect a repeated read of an UNCHANGED file and return a compact
+    /// reference instead of the same bytes.
+    ///
+    /// Session-scoped, durable, and bounded: ONE memory fact holds at most
+    /// 256 `(path, blake3(text))` rows. The first read (or a changed file)
+    /// returns the full content and records its digest; an identical later
+    /// read returns a short marker naming the digest and the escape hatch
+    /// (`fresh:true`), which returns the bytes again. Small reads are never
+    /// compacted (the marker would cost more than the content).
+    pub(crate) fn unchanged_read_marker(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        tool: &str,
+        input: &serde_json::Value,
+        text: &str,
+    ) -> Option<String> {
+        const READ_CACHE_KIND: &str = "tool-read-cache";
+        const READ_CACHE_KEY: &str = "read_file";
+        const READ_CACHE_MAX_ENTRIES: usize = 256;
+        const READ_CACHE_MIN_BYTES: usize = 512;
+        const READ_CACHE_MAX_FACT_BYTES: usize = 32 * 1024;
+
+        if tool != "read_file" {
+            return None;
+        }
+        // Hash the EXCERPT the model actually sees (the tool result is
+        // truncated to 2 KB on the wire), never the full file: two reads
+        // whose visible bytes are identical are safe to collapse even when
+        // an unshown tail changed, and the marker says "excerpt" so it can
+        // never overclaim whole-file equality.
+        let observed = truncate(text, 2_000);
+        if observed.len() < READ_CACHE_MIN_BYTES {
+            return None;
+        }
+        let path = input.get("path").and_then(|v| v.as_str())?;
+        let fresh = input
+            .get("fresh")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // A hashing failure is impossible for the in-memory string; a
+        // read-cache failure only loses the optimization, never the bytes.
+        let digest = blake3::hash(observed.as_bytes()).to_hex().to_string();
+        let cached = handle
+            .memory_fact_get(READ_CACHE_KIND, READ_CACHE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(&raw).ok())
+            .unwrap_or_default();
+        let unchanged = !fresh && cached.iter().any(|(p, d)| p == path && d == &digest);
+        // Record the newest digest either way (a fresh read after a change
+        // must update the digest future reads compare against).
+        let mut entries = cached;
+        entries.retain(|(p, _)| p != path);
+        entries.push((path.to_string(), digest.clone()));
+        if entries.len() > READ_CACHE_MAX_ENTRIES {
+            let excess = entries.len() - READ_CACHE_MAX_ENTRIES;
+            entries.drain(0..excess);
+        }
+        if let Ok(encoded) = serde_json::to_string(&entries) {
+            if encoded.len() <= READ_CACHE_MAX_FACT_BYTES {
+                match handle.upsert_memory_fact(READ_CACHE_KIND, READ_CACHE_KEY, &encoded) {
+                    Ok(()) => {}
+                    Err(err) => tracing::debug!(
+                        session = %handle.id(),
+                        "read-cache update skipped: {err}"
+                    ),
+                }
+            }
+        }
+        unchanged.then(|| {
+            format!(
+                "[unchanged excerpt] {path}: the visible {} bytes are identical to the \
+                 last read_file result (blake3 {digest}). Call read_file with fresh:true \
+                 to receive the bytes again if the earlier result is no longer in context.",
+                observed.len()
+            )
+        })
     }
 
     /// Configure the layered per-logical-turn wall-clock budget (audit 26)

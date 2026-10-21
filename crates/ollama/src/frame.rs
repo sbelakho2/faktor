@@ -63,16 +63,26 @@ pub(crate) fn parse_ollama_frame(
         }
     }
     // Usage mapping (audit Phase-1 item C): the native /api/chat final
-    // frame reports `prompt_eval_count` (prompt tokens evaluated) and
-    // `eval_count` (generated tokens; thinking tokens ARE part of the
-    // generation, so `output_tokens` already contains them and the
-    // informational `reasoning_tokens` subset stays zero — the API reports
-    // no separate thinking count, so reasoning can never be double-billed).
-    // The API exposes NO cache split: when the daemon reuses a loaded KV
-    // context the evaluated count is the uncached remainder, and without a
-    // reported split the conservative correct category is uncached = the
-    // reported count with zero cache lines (cache is never invented).
-    // Counts are integers; a hostile wrong-typed/negative counter is
+    // frame reports `prompt_eval_count` (the TOTAL prompt tokens: cached
+    // prefix + newly evaluated remainder) and `eval_count` (generated
+    // tokens; thinking tokens ARE part of the generation, so
+    // `output_tokens` already contains them and the informational
+    // `reasoning_tokens` subset stays zero — the API reports no separate
+    // thinking count, so reasoning can never be double-billed).
+    //
+    // Ollama 0.40+ also reports `prompt_eval_cached_count`: the prefix the
+    // runtime served from its KV cache. Mapping the total as uncached (the
+    // old OptionalCacheDetail assumption) overstates uncached input by the whole
+    // cached prefix and reports a provably-false zero cache read — which
+    // then makes the runtime's prefix-cache classifier believe every turn
+    // is cold. The canonical split is therefore:
+    //   cache_read = prompt_eval_cached_count
+    //   uncached   = prompt_eval_count - prompt_eval_cached_count
+    // Older runtimes omit the field (cache_read = 0, uncached = total —
+    // the conservative historical behavior). A hostile cached>total row is
+    // not evidence of a cache hit: the field is ignored (uncached = total,
+    // cache_read = 0), never used to subtract into a negative/wrapped
+    // count. Counts are integers; a hostile wrong-typed/negative counter is
     // ignored (0) and yields no frame — unknown fields never panic.
     let prompt_eval_count = value
         .get("prompt_eval_count")
@@ -82,10 +92,19 @@ pub(crate) fn parse_ollama_frame(
         .get("eval_count")
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
+    let reported_cached = value
+        .get("prompt_eval_cached_count")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let cache_read_tokens = if reported_cached <= prompt_eval_count {
+        reported_cached
+    } else {
+        0
+    };
     if prompt_eval_count > 0 || eval_count > 0 {
         let usage = CanonicalUsage {
-            uncached_input_tokens: prompt_eval_count,
-            cache_read_tokens: 0,
+            uncached_input_tokens: prompt_eval_count.saturating_sub(cache_read_tokens),
+            cache_read_tokens,
             cache_write_tokens: 0,
             output_tokens: eval_count,
             reasoning_tokens: 0,

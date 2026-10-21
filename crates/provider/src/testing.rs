@@ -34,6 +34,12 @@ pub enum MockAction {
     /// Accept the request and send NOTHING (the client's first-byte /
     /// idle deadlines must fire; an unguarded client would hang forever).
     Silent { status: u16 },
+    /// Dynamic response computed from the parsed request body (for mocks
+    /// whose reply depends on the input, e.g. embedding vectors).
+    RespondFn {
+        status: u16,
+        respond: Arc<dyn Fn(&serde_json::Value) -> String + Send + Sync>,
+    },
     /// One action per matching request, consumed in order (a provider may
     /// receive several distinct responses over one route — e.g. two tool
     /// responses whose ids must differ). When the list is exhausted the
@@ -261,6 +267,16 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
                     break;
                 }
             }
+        }
+        MockAction::RespondFn { status, respond } => {
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let resp = respond(&json);
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp.len(),
+                resp
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
         }
         MockAction::Sequence { .. } => unreachable!("lookup_action unwraps nested Sequences"),
     }

@@ -1854,10 +1854,13 @@ impl Store {
 
     /// Settle one RESERVED/DISPATCHED reservation from a provider usage
     /// frame (P0-1 settlement truth, schema v18) in ONE transaction. The
-    /// chosen actual: the provider-reported cost when the usage frame
-    /// carried one (authoritative); otherwise the token categories x the
-    /// reservation's stored route-time [`PricingSnapshot`] — exactly the
-    /// price lines the router froze, never a fabricated per-token number.
+    /// chosen actual: the HIGHER of the provider-reported cost and the token
+    /// categories x the reservation's stored route-time [`PricingSnapshot`]
+    /// — exactly the price lines the router froze, never a fabricated
+    /// per-token number. A provider report may raise an invoice, but it can
+    /// never undercut the locally priced usage of its own reported token
+    /// categories (a spoofed 0/under-report cannot make a paid call free and
+    /// bypass the task cap).
     /// An Unknown price source (or no snapshot at all) with a hard task cap
     /// is a typed [`CostSettleOutcome::UnknownPrice`] refusal (nothing
     /// written); with no cap the reservation closes as an honest Unknown
@@ -1925,56 +1928,62 @@ impl Store {
                 local.map(|m| m.min(i64::MAX as u64) as i64),
                 provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
             );
-            // The chosen actual: the provider-reported cost when the usage frame
-            // carried one (authoritative); else the locally calculated
-            // categories x snapshot. Unknown price + no reported cost: with a
-            // hard cap this is a typed refusal (the cap was protected by the
-            // reservation's prediction, but a fabricated actual must never
-            // land); with no cap the row closes as a documented Unknown spend.
-            let chosen_i64: i64 = match provider_reported_micro {
-                Some(_) => reported_i64.expect("reported Some maps to Some"),
-                None => match local_i64 {
-                    Some(local) => local,
-                    None => {
-                        let has_cap: bool = tx
-                            .query_row(
-                                "SELECT max_cost_micro > 0 FROM task
+            // The chosen actual: the HIGHER of the provider-reported cost and
+            // the locally calculated categories x snapshot. A provider report
+            // may raise an invoice above the local price lines, but it can
+            // never LOWER the amount below what its own reported token
+            // categories price at the frozen snapshot — a hostile/buggy
+            // provider reporting cost 0 (or any under-report) must not make a
+            // paid call free and bypass the task budget. Unknown price + no
+            // reported cost: with a hard cap this is a typed refusal (the cap
+            // was protected by the reservation's prediction, but a fabricated
+            // actual must never land); with no cap the row closes as a
+            // documented Unknown spend.
+            let chosen_i64: i64 = match (reported_i64, local_i64) {
+                (Some(reported), Some(local)) => reported.max(local),
+                (Some(reported), None) => reported,
+                (None, Some(local)) => local,
+                (None, None) => {
+                    let has_cap: bool = tx
+                        .query_row(
+                            "SELECT max_cost_micro > 0 FROM task
                              WHERE session_id = ?1 AND task_id = ?2",
-                                params![session_id, task_id],
-                                |r| r.get(0),
-                            )
-                            .unwrap_or(false);
-                        if has_cap {
-                            tx.rollback()?;
-                            return Ok(CostSettleOutcome::UnknownPrice {
-                                reservation: reservation_id,
-                            });
-                        }
-                        // No cap: record the Unknown spend honestly — status
-                        // settled, both amount columns NULL, nothing folded,
-                        // cost_basis Unknown.
-                        tx.execute(
-                            "UPDATE cost_reservation
+                            params![session_id, task_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if has_cap {
+                        tx.rollback()?;
+                        return Ok(CostSettleOutcome::UnknownPrice {
+                            reservation: reservation_id,
+                        });
+                    }
+                    // No cap: record the Unknown spend honestly — status
+                    // settled, both amount columns NULL, nothing folded,
+                    // cost_basis Unknown.
+                    tx.execute(
+                        "UPDATE cost_reservation
                          SET status = 'settled', settled_ms = ?1, delivery_state = ?3,
                              provider_cost_micro = NULL, provider_reported_micro = NULL,
                              provider_reported_cost_micro = NULL, settled_cost_micro = NULL,
                              cost_basis = ?4,
                              route_decision_json = ?2
                          WHERE reservation_id = ?5",
-                            params![
-                                settled_ms,
-                                route_decision_json,
-                                DELIVERY_COMPLETED,
-                                COST_BASIS_UNKNOWN,
-                                reservation_id
-                            ],
-                        )?;
-                        tx.commit()?;
-                        return Ok(CostSettleOutcome::AppliedUnknown);
-                    }
-                },
+                        params![
+                            settled_ms,
+                            route_decision_json,
+                            DELIVERY_COMPLETED,
+                            COST_BASIS_UNKNOWN,
+                            reservation_id
+                        ],
+                    )?;
+                    tx.commit()?;
+                    return Ok(CostSettleOutcome::AppliedUnknown);
+                }
             };
-            let basis = if provider_reported_micro.is_some() {
+            // The basis names the authority behind the FOLDED amount: a
+            // provider report that won, otherwise the local price lines.
+            let basis = if reported_i64 == Some(chosen_i64) {
                 COST_BASIS_PROVIDER_REPORTED
             } else {
                 COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE

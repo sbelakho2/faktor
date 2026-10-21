@@ -148,7 +148,12 @@ impl Provider for CapturingProvider {
     }
 
     fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
-        self.systems.lock().unwrap().push(req.system.clone());
+        // The planner may place volatile/evidence content in a trailing
+        // message rather than the stable system head; capture both.
+        let mut text = req.system.clone();
+        text.push('\n');
+        text.push_str(&serde_json::to_string(&req.messages).unwrap_or_default());
+        self.systems.lock().unwrap().push(text);
         self.inner.stream(req)
     }
 }
@@ -250,32 +255,34 @@ async fn configured_ollama_embedder_fuses_semantic_evidence_into_an_ordinary_tur
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
 
-        // The Ollama mock: every `/api/embed` call answers keyword-axis
-        // vectors in request order — query calls then the two-candidate
-        // call (twice: once per concept).
+        // The Ollama mock answers every `/api/embed` call with keyword-axis
+        // vectors derived from the input, so query calls, candidate batches
+        // and index builds can interleave without exhausting a script.
         let server = MockServer::new();
         server.route(
             "POST",
             "/api/embed",
-            MockAction::Sequence {
-                actions: vec![
-                    MockAction::Respond {
-                        status: 200,
-                        body: r#"{"embeddings":[[1.0,0.0]]}"#.into(),
-                    },
-                    MockAction::Respond {
-                        status: 200,
-                        body: r#"{"embeddings":[[1.0,0.0],[0.0,1.0]]}"#.into(),
-                    },
-                    MockAction::Respond {
-                        status: 200,
-                        body: r#"{"embeddings":[[0.0,1.0]]}"#.into(),
-                    },
-                    MockAction::Respond {
-                        status: 200,
-                        body: r#"{"embeddings":[[1.0,0.0],[0.0,1.0]]}"#.into(),
-                    },
-                ],
+            MockAction::RespondFn {
+                status: 200,
+                respond: Arc::new(|body: &serde_json::Value| {
+                    let inputs = body
+                        .get("input")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let vectors: Vec<[f32; 2]> = inputs
+                        .iter()
+                        .map(|input| {
+                            let text = input.as_str().unwrap_or_default();
+                            if text.contains("quantum") || text.contains("ledger.rs") {
+                                [1.0, 0.0]
+                            } else {
+                                [0.0, 1.0]
+                            }
+                        })
+                        .collect();
+                    serde_json::json!({ "embeddings": vectors }).to_string()
+                }),
             },
         );
         let base = server.base_url().await;
@@ -704,20 +711,28 @@ fn durable_prior_flips_planner_selection_and_survives_reopen() {
     let ledger = TaskLedger::default();
     let cache = TokenCache::new();
 
+    let plan_text = |p: &WirePlan| {
+        format!(
+            "{}\n{}",
+            p.system,
+            serde_json::to_string(&p.messages).unwrap_or_default()
+        )
+    };
     let off = plan(&evidence, &budget, &ledger, &cache, None);
+    let off_text = plan_text(&off);
     assert!(
-        off.system.contains("### src/b.rs") && !off.system.contains("### learning:"),
-        "baseline: the 0.6 block wins the single slot; system={}",
-        off.system
+        off_text.contains("### src/b.rs") && !off_text.contains("### learning:"),
+        "baseline: the 0.6 block wins the single slot; plan={off_text}"
     );
 
     let prior = daemon_context_prior(true, &manager).expect("flag on");
     let on = plan(&evidence, &budget, &ledger, &cache, Some(prior.as_ref()));
+    let on_text = plan_text(&on);
     assert!(
-        on.system.contains(&format!("### learning:{failure}")),
+        on_text.contains(&format!("### learning:{failure}")),
         "the mined learning's omission risk must protect its candidate"
     );
-    assert!(!on.system.contains("### src/b.rs"));
+    assert!(!on_text.contains("### src/b.rs"));
     assert_eq!(
         off.cacheable_prefix().unwrap(),
         on.cacheable_prefix().unwrap(),
@@ -731,7 +746,8 @@ fn durable_prior_flips_planner_selection_and_survives_reopen() {
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let prior = daemon_context_prior(true, &reopened).expect("flag on");
     let again = plan(&evidence, &budget, &ledger, &cache, Some(prior.as_ref()));
-    assert!(again.system.contains(&format!("### learning:{failure}")));
+    let again_text = plan_text(&again);
+    assert!(again_text.contains(&format!("### learning:{failure}")));
 }
 
 /// The parsed `[efficiency]` switches thread 1:1 onto the agent-side
@@ -953,9 +969,10 @@ fn assistant_text_projects_newest_text_parts_only_in_order() {
 }
 
 /// The headless `run` entry has no host to answer a permission dialog: a
-/// capability request must be denied immediately (typed), never left to
-/// burn the durable permission deadline and fail the run. Read-only tools
-/// carry no capability and still work.
+/// mutating/external capability request must be denied immediately (typed),
+/// never left to burn the durable permission deadline and fail the run.
+/// Read-only workspace access is granted (read_file declares it) so a
+/// one-prompt investigation can actually read the repository.
 #[tokio::test]
 async fn headless_daemon_denies_capability_requests_immediately() {
     let dir = tempfile::tempdir().unwrap();
@@ -990,6 +1007,27 @@ async fn headless_daemon_denies_capability_requests_immediately() {
         started.elapsed() < std::time::Duration::from_secs(1),
         "a headless denial is immediate, got {:?}",
         started.elapsed()
+    );
+    // Read-only workspace access is the documented headless investigation
+    // path. `read_file` carries `ReadWorkspace`, so a blanket denial made
+    // the one-prompt run unable to read anything.
+    let read = faktor_session::ops::PermissionRequest {
+        capability: faktor_core::capability::Capability::ReadWorkspace {
+            path: "src/lib.rs".into(),
+        },
+        ..request
+    };
+    let decision = graph
+        .agent
+        .deps()
+        .permission_requester
+        .request(SessionId::new(1), &read)
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        faktor_core::capability::PermissionDecision::Allow,
+        "headless reads must not require a human"
     );
 }
 

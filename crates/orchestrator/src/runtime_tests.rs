@@ -22,14 +22,13 @@ use faktor_core::id::{SessionId, TaskId, WorktreeId};
 use faktor_core::model::ModelCapabilities;
 use faktor_core::time::SystemClock;
 use faktor_provider::{
-    FakeProvider, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
-    ProviderRegistry, ProviderStream, ScriptedResponse,
+    ContentKind, FakeProvider, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ProviderErrorKind, ProviderRegistry, ProviderStream, ScriptedResponse,
 };
 use faktor_session::child::{ChildControl, ChildOwnership};
 use faktor_session::SessionManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-
 // ------------------------------------------------------------------ fixture
 
 struct AlwaysAllow;
@@ -55,7 +54,8 @@ struct ScriptedPacedProvider {
     /// model of every request, in order.
     request_models: StdMutex<Vec<String>>,
     /// system text of every request, in order.
-    request_systems: StdMutex<Vec<String>>,
+    /// FULL text of every request (system + all message text), in order.
+    request_texts: StdMutex<Vec<String>>,
     chunk_delay_ms: u64,
     /// Optional per-stream-call pacing override (per-child jitter): call
     /// `i` waits `per_call_delay_ms[i]` ms per chunk when present, else the
@@ -63,7 +63,6 @@ struct ScriptedPacedProvider {
     per_call_delay_ms: StdMutex<Vec<u64>>,
     script_index: AtomicUsize,
 }
-
 impl ScriptedPacedProvider {
     fn new(
         id: &str,
@@ -76,23 +75,23 @@ impl ScriptedPacedProvider {
             calls: StdMutex::new(per_call_scripts),
             request_count: AtomicUsize::new(0),
             request_models: StdMutex::new(Vec::new()),
-            request_systems: StdMutex::new(Vec::new()),
+            request_texts: StdMutex::new(Vec::new()),
             chunk_delay_ms,
             per_call_delay_ms: StdMutex::new(Vec::new()),
             script_index: AtomicUsize::new(0),
         })
     }
-
     fn count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
     }
-
     fn model_of(&self, idx: usize) -> Option<String> {
         self.request_models.lock().unwrap().get(idx).cloned()
     }
-
-    fn system_of(&self, idx: usize) -> Option<String> {
-        self.request_systems.lock().unwrap().get(idx).cloned()
+    /// System + every message text of request `idx` (the volatile context
+    /// rides as a trailing SYSTEM message, so the system slot alone is not
+    /// the whole prompt).
+    fn text_of(&self, idx: usize) -> Option<String> {
+        self.request_texts.lock().unwrap().get(idx).cloned()
     }
     /// Per-child jitter: override the per-chunk pacing of stream call `i`
     /// (random spawn-completion delays of the randomized reopen test).
@@ -100,12 +99,10 @@ impl ScriptedPacedProvider {
         *self.per_call_delay_ms.lock().unwrap() = delays;
     }
 }
-
 impl Provider for ScriptedPacedProvider {
     fn id(&self) -> &str {
         "fake"
     }
-
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         self.inner.capabilities(_model)
     }
@@ -115,14 +112,19 @@ impl Provider for ScriptedPacedProvider {
         // Unknown lookup (or vice versa).
         self.inner.capability_resolution(model)
     }
-
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         self.request_count.fetch_add(1, Ordering::SeqCst);
         self.request_models.lock().unwrap().push(req.model.clone());
-        self.request_systems
-            .lock()
-            .unwrap()
-            .push(req.system.clone());
+        let mut text = req.system.clone();
+        for message in &req.messages {
+            for part in &message.content {
+                if let ContentKind::Text { text: body } = &part.kind {
+                    text.push('\n');
+                    text.push_str(body);
+                }
+            }
+        }
+        self.request_texts.lock().unwrap().push(text);
         let i = self.script_index.fetch_add(1, Ordering::SeqCst);
         let script: Vec<ScriptedResponse> = self
             .calls
@@ -141,7 +143,6 @@ impl Provider for ScriptedPacedProvider {
         Box::pin(futures_stream_paced(script, delay))
     }
 }
-
 fn futures_stream_paced(
     script: Vec<ScriptedResponse>,
     delay_ms: u64,
@@ -181,7 +182,6 @@ struct Env {
     owner: OwnerContext,
     isolated_root: std::path::PathBuf,
 }
-
 fn echo_tool() -> Tool {
     Tool {
         name: "echo".into(),
@@ -206,7 +206,6 @@ fn echo_tool() -> Tool {
         }),
     }
 }
-
 fn caps_tools() -> ModelCapabilities {
     ModelCapabilities {
         tools: true,
@@ -295,7 +294,6 @@ fn write_tool() -> Tool {
         }),
     }
 }
-
 fn open_env(
     root: &std::path::Path,
     per_call_scripts: Vec<Vec<ScriptedResponse>>,
@@ -308,7 +306,6 @@ fn open_env(
         faktor_agent::FixedRoutingPolicy::passthrough(),
     )
 }
-
 fn open_env_with_routing(
     root: &std::path::Path,
     per_call_scripts: Vec<Vec<ScriptedResponse>>,
@@ -395,7 +392,6 @@ fn open_env_with_routing(
         isolated_root,
     }
 }
-
 fn wi(id: &str, kind: WorkKind, deps: &[&str]) -> WorkItem {
     WorkItem {
         id: id.to_string(),
@@ -408,7 +404,6 @@ fn wi(id: &str, kind: WorkKind, deps: &[&str]) -> WorkItem {
         completion: WorkState::Pending,
     }
 }
-
 fn path_item(id: &str, kind: WorkKind, deps: &[&str], paths: &[&str]) -> WorkItem {
     let mut item = WorkItem::with_ownership(
         id,
@@ -443,7 +438,6 @@ fn raw_plan(items: Vec<WorkItem>) -> TaskPlan {
         work_items: items,
     }
 }
-
 fn base_config(env: &Env, run_id: &str) -> ExecConfig {
     ExecConfig {
         run_id: run_id.to_string(),
@@ -455,7 +449,6 @@ fn base_config(env: &Env, run_id: &str) -> ExecConfig {
         crash_seam: None,
     }
 }
-
 fn read_caps() -> CapabilitySet {
     CapabilitySet::from_grants(vec![CapabilityGrant::new(
         LatticeCap::ReadWorkspace,
@@ -939,10 +932,10 @@ async fn steer_applies_at_the_next_provider_selection_with_exactly_once_acks() {
         .expect("execute task panicked");
     assert!(outcome.complete);
     // The note rode the SECOND provider selection's system text.
-    let sys = env.provider.system_of(1).unwrap_or_default();
+    let sys = env.provider.text_of(1).unwrap_or_default();
     assert!(
         sys.contains("focus on the API surface"),
-        "note missing from request 2 system: {sys}"
+        "note missing from request 2 text: {sys}"
     );
     let sid = SessionId::new(outcome.children[0].session_id);
     let session = env.manager.get_session(sid).unwrap().unwrap();
@@ -4272,11 +4265,11 @@ async fn parent_continuation_receives_structured_child_handoff_not_the_raw_trans
         .expect("the parent continuation drives");
     let system = env
         .provider
-        .system_of(before)
+        .text_of(before)
         .expect("the parent's request was captured");
     assert!(
         system.contains("[faktor:internal-context]"),
-        "the parent continuation's system slot carries the channel section: {system}"
+        "the parent continuation's wire carries the channel section: {system}"
     );
     assert!(system.contains("handoff_child.rs"), "{system}");
     assert!(system.contains("unknown tool"), "{system}");

@@ -628,7 +628,7 @@ mod tests {
             None,
         ))
         .unwrap();
-        let o0 = rt0.run_turn(sid, "fix payments", &[]).await.unwrap();
+        let o0 = rt0.run_turn(sid, title, &[]).await.unwrap();
         assert_eq!(o0.final_state, AgentState::ReadyForNextTurn);
         assert!(
             !o0.compacted,
@@ -1210,7 +1210,7 @@ mod tests {
             None,
         ))
         .unwrap();
-        let o = rt.run_turn(sid, "fix payments", &[]).await.unwrap();
+        let o = rt.run_turn(sid, title, &[]).await.unwrap();
         assert_eq!(o.final_state, AgentState::ReadyForNextTurn);
         assert!(!o.compacted, "the seed turn stays under the 0.65 trigger");
         let h = handle(manager, sid);

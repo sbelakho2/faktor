@@ -164,7 +164,7 @@ async fn criteria_fact_survives_five_compacting_turns() {
     let handle = manager.get_session(session).unwrap().unwrap();
     let ledger: faktor_context::ledger::TaskLedger =
         serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
-    assert_eq!(ledger.goal, "gating task");
+    assert_eq!(ledger.goal, "prompt seed 0");
     let facts = handle.memory_facts().unwrap();
     assert!(
         facts
@@ -251,7 +251,7 @@ async fn task_rows_survive_five_compactions_byte_identical() {
     // The durable ledger goal survives too (byte-identical text).
     let ledger: faktor_context::ledger::TaskLedger =
         serde_json::from_value(h.get_task_ledger().unwrap().unwrap()).unwrap();
-    assert_eq!(ledger.goal, "gating task");
+    assert_eq!(ledger.goal, "prompt seed 0");
 }
 
 #[tokio::test]
@@ -513,6 +513,7 @@ async fn compaction_summary_timeout_discards_partial_text_and_falls_back() {
         summary_timeout: Duration::from_millis(150),
         budget_marker: None,
         output_slot: Arc::new(std::sync::Mutex::new(None)),
+        usage_slot: Arc::new(std::sync::Mutex::new(None)),
     });
     // Run the summary request on a task; once the provider's stream is
     // open (request recorded), push ONE sentence and then stall forever
@@ -999,11 +1000,11 @@ async fn typed_ledger_compaction_keeps_protected_entries_across_five_runs() {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         handle.compact_typed_ledger().unwrap();
-        let title = handle.title().unwrap();
+        let _title = handle.title().unwrap();
         let view = handle.ledger_view().unwrap();
         assert_eq!(
-            view.head.goal, title,
-            "GoalSet survives compaction after round {i}"
+            view.head.goal, "fix round 0",
+            "GoalSet is seeded from the first user prompt and survives compaction after round {i}"
         );
         assert!(
             !view.head.criteria.is_empty(),
@@ -1704,7 +1705,7 @@ async fn accepted_llm_summary_records_compression_provenance_and_never_replaces_
 // so an incomplete compression can never claim acceptance.
 // ============================================================================
 
-const SUMMARY_MAX_CHARS: usize = 60_000;
+const SUMMARY_MAX_CHARS: usize = faktor_context::compactor::SUMMARY_MAX_OUTPUT_TOKENS * 4;
 
 fn streaming_summarizer(
     provider: Arc<dyn faktor_provider::Provider>,
@@ -1719,6 +1720,7 @@ fn streaming_summarizer(
         summary_timeout,
         budget_marker: None,
         output_slot: Arc::new(std::sync::Mutex::new(None)),
+        usage_slot: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -1918,5 +1920,29 @@ async fn try_compact_skips_a_tiny_history_without_any_model_call() {
     assert!(
         plan.is_none(),
         "a history below the compactable floor must skip compaction"
+    );
+}
+
+#[tokio::test]
+async fn compaction_summary_never_includes_reasoning_chunks() {
+    // Real Ollama frames carry `message.thinking` BEFORE `message.content`.
+    // The summarizer must accept only the final text: thinking is private
+    // scratchpad, not a state transfer. The old branch merged both streams,
+    // so summaries opened with chain-of-thought ("the user is asking me...")
+    // and carried speculative text into the replacement context forever.
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Reasoning("SECRET-THOUGHT: the user wants a summary".into()),
+        ScriptedResponse::Text("SUMMARY: parser fixed; tests pass".into()),
+        ScriptedResponse::End,
+    ]));
+    let summarizer = streaming_summarizer(provider, Duration::from_secs(5));
+    let summary = summarizer
+        .run(&summary_history())
+        .await
+        .expect("a clean text stream is a complete summary");
+    assert_eq!(summary, "SUMMARY: parser fixed; tests pass");
+    assert!(
+        !summary.contains("SECRET-THOUGHT"),
+        "reasoning must never ride the durable summary: {summary}"
     );
 }

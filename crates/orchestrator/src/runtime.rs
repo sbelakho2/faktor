@@ -3496,11 +3496,16 @@ impl OrchestratorRuntime {
             .map(|w| w.summary.clone())
             .unwrap_or_default();
         let goal = truncate(&exec.plan.goal, 1000);
-        Ok(if summary.is_empty() {
+        // Child context scoping: ONE bounded task brief (parent goal +
+        // this item's summary), never the parent transcript or sibling
+        // results. 2 KiB is enough for the task contract and keeps a huge
+        // plan summary from multiplying across every child.
+        let brief = if summary.is_empty() {
             goal
         } else {
             format!("{goal}\n\nWork item: {summary}")
-        })
+        };
+        Ok(truncate(&brief, 2_000))
     }
 
     fn exec_root(&self, run_id: &str) -> PathBuf {

@@ -20,3 +20,10 @@ blake3.workspace = true
 
 [lints]
 workspace = true
+
+
+[dev-dependencies]
+faktor-ollama.workspace = true
+faktor-orchestrator.workspace = true
+faktor-security.workspace = true
+futures.workspace = true

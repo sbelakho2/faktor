@@ -1186,6 +1186,16 @@ impl<'a> NativeCompile<'a> {
     }
 
     fn compile_test_obligations(&mut self) {
+        // Tests in the SAME package as a touched file are obligations even
+        // when the user's wording does not repeat the test name. The old
+        // selector/path token match dropped exactly the tests that protect a
+        // rename or a bug fix ("fix add" vs `tests::add_returns_sum`), so the
+        // contract reached the model with no executable proof at all.
+        let touched_roots: BTreeSet<String> = self
+            .touched_files
+            .iter()
+            .map(|path| cargo_component_root(path, &self.cargo_roots))
+            .collect();
         let mut candidates: Vec<&DiscoveredTest> = self
             .selectors
             .iter()
@@ -1193,8 +1203,21 @@ impl<'a> NativeCompile<'a> {
                 self.intent.is_empty()
                     || matches_tokens(&test.selector.to_ascii_lowercase(), self.intent)
                     || matches_tokens(&test.path.to_ascii_lowercase(), self.intent)
+                    || touched_roots
+                        .iter()
+                        .any(|root| test.path.starts_with(root.as_str()))
+                    || self
+                        .touched_symbols
+                        .iter()
+                        .any(|symbol| test.selector.contains(symbol))
             })
             .collect();
+        // A vague goal that matched no path must not compile a contract with
+        // zero proof: the repository's bounded test surface is the honest
+        // fallback (truncated, deterministic).
+        if candidates.is_empty() {
+            candidates = self.selectors.iter().take(4).collect();
+        }
         candidates.sort_by(|a, b| {
             a.selector
                 .cmp(&b.selector)
@@ -1250,6 +1273,11 @@ impl<'a> NativeCompile<'a> {
             }
             roots.insert(cargo_component_root(path, &self.cargo_roots));
         }
+        // A goal that named no path still executes in a cargo workspace: the
+        // compile proof is the minimum honest contract.
+        if roots.is_empty() {
+            roots.insert(cargo_component_root("src/lib.rs", &self.cargo_roots));
+        }
         for root in roots.into_iter().take(MAX_COMPILE_OBLIGATIONS) {
             let label = component_label(&root);
             let claim = bounded(
@@ -1283,6 +1311,22 @@ impl<'a> NativeCompile<'a> {
             .iter()
             .any(|token| COMPAT_TOKENS.contains(&token.as_str()))
         {
+            return;
+        }
+        // A rename that explicitly forbids the old name is a BREAKING
+        // change: compiling "the public API stays source-compatible" from
+        // the word "rename" creates a contradiction the completion gate can
+        // never discharge (observed: a correct rename blocked at
+        // VerifiedComplete). A breaking rename gets the call-site/test
+        // obligations, not a compatibility claim.
+        let goal = self.request.goal.to_ascii_lowercase();
+        let removes_old_surface = goal.contains("rename")
+            && (goal.contains("no occurrence")
+                || goal.contains("no longer")
+                || goal.contains("must not remain")
+                || goal.contains("remove")
+                || goal.contains("delete"));
+        if removes_old_surface {
             return;
         }
         let mut by_component: std::collections::BTreeMap<String, (usize, usize, Vec<String>)> =
@@ -3591,5 +3635,70 @@ fn replayed_refresh_token_fails() {}
         assert_eq!(compiled, again, "input ordering must not change output");
         // The duplicate pair never doubles the constraint counts.
         assert_eq!(compiled.contract.constraints.len(), 1, "{compiled:?}");
+    }
+
+    #[test]
+    fn an_explicit_breaking_rename_does_not_compile_a_compatibility_constraint() {
+        let compiled = compile_contract(&request(
+            "Rename the public helper compute_total to total_cents. No occurrence of the old name may remain.",
+            RepositorySnapshot::from_files(vec![
+                RepositoryFile::with_content(
+                    "Cargo.toml",
+                    "[package]\nname = \"invoicing\"\n",
+                ),
+                RepositoryFile::with_content(
+                    "src/money.rs",
+                    "pub fn compute_total(cents: &[i64]) -> i64 { cents.iter().sum() }\n",
+                ),
+            ]),
+        ));
+        assert!(
+            compiled
+                .contract
+                .constraints
+                .iter()
+                .all(|constraint| !constraint.statement.contains("source-compatible")),
+            "a breaking rename must not demand source compatibility: {:?}",
+            compiled.contract.constraints
+        );
+    }
+
+    #[test]
+    fn same_component_tests_are_obligations_even_when_the_goal_does_not_name_them() {
+        // The user says "fix the off by one"; the test is named
+        // `boundary_case` and lives in tests/boundary.rs. The old
+        // intent-token filter dropped it, so the contract reached the model
+        // with no executable proof.
+        let compiled = compile_contract(&request(
+            "fix the off by one",
+            RepositorySnapshot::from_files(vec![
+                RepositoryFile::with_content(
+                    "Cargo.toml",
+                    "[package]\nname = \"boundary\"\n",
+                ),
+                RepositoryFile::with_content(
+                    "src/lib.rs",
+                    "pub fn clamp_index(index: usize, len: usize) -> usize { index.min(len) }\n",
+                ),
+                RepositoryFile::with_content(
+                    "tests/boundary.rs",
+                    "use boundary::clamp_index;\n\n#[test]\nfn boundary_case() {\n    assert_eq!(clamp_index(3, 3), 3);\n}\n",
+                ),
+            ]),
+        ));
+        let claims: Vec<&str> = compiled
+            .contract
+            .proof_obligations
+            .iter()
+            .map(|obligation| obligation.claim.as_str())
+            .collect();
+        assert!(
+            claims.iter().any(|claim| claim.contains("boundary_case")),
+            "the same-package test must be a proof obligation: {claims:?}"
+        );
+        assert!(
+            claims.iter().any(|claim| claim.contains("still compiles")),
+            "a cargo workspace with no intent-matched path must still require a compile: {claims:?}"
+        );
     }
 }

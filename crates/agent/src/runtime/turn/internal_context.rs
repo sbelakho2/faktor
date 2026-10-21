@@ -133,11 +133,59 @@ impl InternalContextItem {
     /// body is already sanitized by the handoff renderer; `provenance`
     /// passes through the same ONE sanitizer here.
     pub fn render_bounded(&self, budget_tokens: usize) -> Result<String, ChildHandoffOversized> {
+        self.render_bounded_with_seen(budget_tokens, None)
+    }
+
+    /// Section-scoped render used by [`ParentTurnInput::render_internal_bounded`]:
+    /// sibling handoffs reporting the same fact/decision/finding contribute
+    /// it once per parent section.
+    pub(crate) fn render_bounded_dedup(
+        &self,
+        budget_tokens: usize,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<String, ChildHandoffOversized> {
+        self.render_bounded_with_seen(budget_tokens, Some(seen))
+    }
+
+    /// Section-scoped render: `seen` carries the normalized item lines
+    /// already delivered by earlier items of the SAME parent section.
+    fn render_bounded_with_seen(
+        &self,
+        budget_tokens: usize,
+        seen: Option<&mut std::collections::HashSet<String>>,
+    ) -> Result<String, ChildHandoffOversized> {
         match self {
             Self::ChildHandoff {
                 provenance,
                 handoff,
             } => {
+                // Provenance guard: a child handoff is model-authored DATA.
+                // A hostile child can put "ignore all previous instructions"
+                // in a fact/finding/outcome; the envelope and trust notice
+                // are not an enforcement boundary, so such an item is
+                // withheld WHOLE (a fixed, bounded marker keeps the fact
+                // that the child finished without injecting its text).
+                if handoff.carries_instruction_override() {
+                    tracing::warn!(
+                        provenance = %sanitize_ledger_text(provenance),
+                        "withholding child handoff: instruction-override phrasing detected \
+                         (child output is data, not instruction authority)"
+                    );
+                    let withheld = format!(
+                        "[internal-context-item kind=child-handoff provenance={}]\n\
+[withheld: instruction-override phrasing in child DATA]\n\
+[internal-context-item-end]\n",
+                        truncate(&sanitize_ledger_text(provenance), 200)
+                    );
+                    let tokens = faktor_context::Estimator.estimate_tokens(&withheld);
+                    if tokens > budget_tokens {
+                        return Err(ChildHandoffOversized {
+                            budget_tokens,
+                            envelope_tokens: tokens,
+                        });
+                    }
+                    return Ok(withheld);
+                }
                 let open = format!(
                     "[internal-context-item kind=child-handoff provenance={}]\n",
                     sanitize_ledger_text(provenance)
@@ -155,7 +203,11 @@ impl InternalContextItem {
                     .estimate_tokens(&open)
                     .saturating_add(faktor_context::Estimator.estimate_tokens(close));
                 let body_budget = budget_tokens.saturating_sub(envelope_tokens);
-                let body = match handoff.render_bounded(body_budget) {
+                let bounded = match seen {
+                    Some(seen) => handoff.render_bounded_dedup(body_budget, seen),
+                    None => handoff.render_bounded(body_budget),
+                };
+                let body = match bounded {
                     Ok(body) => body,
                     // The estimator's per-fragment basis can be a token
                     // stricter than the whole-string basis: fall back to
@@ -237,21 +289,26 @@ impl ParentTurnInput {
             });
         }
         let mut remaining = budget_tokens - fixed_tokens;
+        // Sibling fact dedupe: a shared fact/decision/finding reported by
+        // several child handoffs is delivered by the FIRST one only.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (index, item) in self.internal.iter().enumerate() {
             // Reserve every later item's irreducible envelope: this item
             // may use the rest, and every later item still gets at least
             // its minimum — no item is ever dropped outright.
             let reserve: usize = item_minimums[index + 1..].iter().sum();
             let share = remaining.saturating_sub(reserve);
-            let rendered = item.render_bounded(share).map_err(|error| {
-                // Defensive: the reservation invariant above makes this
-                // unreachable; if it ever trips, the section-level typed
-                // Oversized is still exact (never an over-budget section).
-                InternalContextError::Oversized {
-                    budget_tokens,
-                    envelope_tokens: minimal_tokens.max(error.envelope_tokens),
-                }
-            })?;
+            let rendered = item
+                .render_bounded_dedup(share, &mut seen)
+                .map_err(|error| {
+                    // Defensive: the reservation invariant above makes this
+                    // unreachable; if it ever trips, the section-level typed
+                    // Oversized is still exact (never an over-budget section).
+                    InternalContextError::Oversized {
+                        budget_tokens,
+                        envelope_tokens: minimal_tokens.max(error.envelope_tokens),
+                    }
+                })?;
             remaining =
                 remaining.saturating_sub(faktor_context::Estimator.estimate_tokens(&rendered));
             out.push_str(&rendered);

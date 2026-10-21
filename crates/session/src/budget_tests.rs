@@ -184,7 +184,7 @@ async fn settle_usage_updates_spent_exactly_once_and_refuses_a_second_settle() {
 }
 
 #[tokio::test]
-async fn provider_reported_cost_wins_and_both_columns_are_recorded() {
+async fn provider_under_report_never_undercuts_local_usage_and_both_columns_are_recorded() {
     let (_d, m, ledger) = fresh_ledger();
     let s = session(&m);
     let task = seeded_task(&s, Some(50_000));
@@ -200,8 +200,10 @@ async fn provider_reported_cost_wins_and_both_columns_are_recorded() {
         .await
         .unwrap();
     // Locally calculated: 100k x 15 + 2k x 60 == 1_620_000 microUSD
-    // ($1.62). The provider reports 9_999: the REPORTED cost is
-    // authoritative.
+    // ($1.62). The provider reports 9_999: a provider report can raise an
+    // invoice but never lower it below its own token categories priced at
+    // the frozen snapshot (a spoofed under-report must not make a paid call
+    // free).
     let chosen = ledger
         .settle_usage(
             s.id,
@@ -215,7 +217,7 @@ async fn provider_reported_cost_wins_and_both_columns_are_recorded() {
         )
         .await
         .unwrap();
-    assert_eq!(chosen, Some(9_999));
+    assert_eq!(chosen, Some(1_620_000));
     let rows = ledger.reservations_of(s.id, task, 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "settled");
@@ -226,11 +228,11 @@ async fn provider_reported_cost_wins_and_both_columns_are_recorded() {
         rows[0].route_decision_json.as_deref(),
         Some(r#"{"provider":"p","model":"m"}"#)
     );
-    // The CHOSEN actual is the provider-reported cost.
+    // The CHOSEN actual is the local token-priced floor.
     assert_eq!(
         ledger.view(s.id, task).spent_cost_micro,
-        9_999,
-        "provider-reported cost is authoritative over the local actual"
+        1_620_000,
+        "a provider under-report cannot undercut its own priced token usage"
     );
 }
 
@@ -1382,7 +1384,7 @@ async fn settle_records_an_honest_cost_basis_read_back_on_the_row() {
     // the provider-reported amount and the frozen reserve-time estimate.
     let (_d, m, ledger) = fresh_ledger();
 
-    // Provider-reported wins: basis ProviderReported.
+    // Provider under-report: the local token-priced amount is the floor.
     let s1 = session(&m);
     let task1 = seeded_task(&s1, Some(5_000_000));
     let r1 = ledger
@@ -1402,8 +1404,8 @@ async fn settle_records_an_honest_cost_basis_read_back_on_the_row() {
         .await
         .unwrap();
     let row = ledger.reservations_of(s1.id, task1, 10).unwrap()[0].clone();
-    assert_eq!(row.cost_basis.as_deref(), Some("ProviderReported"));
-    assert_eq!(row.settled_cost_micro, Some(9_999));
+    assert_eq!(row.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+    assert_eq!(row.settled_cost_micro, Some(1_620_000));
     assert_eq!(row.provider_reported_cost_micro, Some(9_999));
     assert_eq!(row.estimated_cost_micro, Some(100_000));
     assert_eq!(

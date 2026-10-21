@@ -1890,10 +1890,14 @@ pub mod usage_conformance {
         /// canonical categories map as-is, modulo the creation lines that
         /// ride inside `input_tokens`.
         SplitCache,
-        /// The wire reports a single input count with NO cache split at all
-        /// (ollama `prompt_eval_count`): the conservative category is
-        /// uncached = the reported count, cache lines zero.
-        NoCacheDetail,
+        /// The wire reports ONE inclusive input total with an OPTIONAL
+        /// cache-detail counter (ollama `prompt_eval_count` plus
+        /// `prompt_eval_cached_count`): when the detail is present the
+        /// cached prefix is split out of the total; when it is absent (older
+        /// runtimes) the conservative category is uncached = the reported
+        /// count with cache lines zero. A detail counter above the total is
+        /// ignored (never subtracted into a wrapped count).
+        OptionalCacheDetail,
     }
 
     /// Required case names per wire family. These ARE the audit Phase-1
@@ -1921,8 +1925,10 @@ pub mod usage_conformance {
                 "cache_only_frame_no_input",
                 "unknown_fields_never_panic",
             ],
-            WireFamily::NoCacheDetail => &[
+            WireFamily::OptionalCacheDetail => &[
                 "counts_map_uncached_total",
+                "cache_detail_split_when_present",
+                "hostile_cache_over_total_ignored",
                 "thinking_included_in_output_never_double_billed",
                 "hostile_junk_counts_never_panic",
                 "zero_counts_no_usage_frame",

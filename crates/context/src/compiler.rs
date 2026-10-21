@@ -1225,6 +1225,7 @@ fn finish(
         bytes: render.len(),
         hash: faktor_core::hash::FileHash::from(*blake3::hash(render.as_bytes()).as_bytes()),
         tokens: u64::try_from(est.estimate_tokens(&render)).unwrap_or(u64::MAX),
+        kind: crate::TokenEstimateKind::UpperBound,
     };
     let segments = PromptSegments {
         evidence: segment,

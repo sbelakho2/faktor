@@ -984,14 +984,10 @@ impl AgentRuntime {
         semantic: Option<&SemanticTurnState>,
         calls: Vec<(String, String, serde_json::Value)>,
     ) -> faktor_core::Result<usize> {
-        // Resolve the session's workspace ONCE per batch (P0-48 root
-        // re-pointing: a live shadow of the session re-points the tools at
-        // the shadow root; un-shadowed sessions keep the stored workspace
-        // root byte-identically). The real tools (read/write/search/
-        // run_command) operate inside the canonical root with a per-session
-        // permission engine, never on model-supplied absolute paths. When
-        // the session has no resolvable workspace the ctx carries None and
-        // the tools error honestly.
+        // Resolve the session workspace ONCE per batch (P0-48): a live
+        // shadow re-points tools at the shadow root; real tools operate
+        // inside the canonical root under per-session permissions, never
+        // model absolute paths. No workspace => ctx None => honest error.
         let row = handle.row()?;
         let root = self.deps.session.resolve_workspace_root(handle.id())?;
         let workspace = match &root {
@@ -1006,16 +1002,14 @@ impl AgentRuntime {
             _ => None,
         };
         let now_ms = self.deps.clock.now_ms();
-        // Change-scope budget (audits 57/105), read ONCE per batch: the edit
-        // gate below refuses a mutating tool whose declared write paths leave
-        // the task's ChangeBudget BEFORE anything executes. No budget = today's
-        // behavior (parity).
+        // Change-scope budget (audits 57/105), read ONCE per batch: the
+        // edit gate refuses writes outside the task's ChangeBudget before
+        // anything executes. No budget = today's parity behavior.
         let change_budget = handle.change_budget()?;
 
         let mut executed = 0usize;
-        // Semantic risk reduces tool-batch parallelism (audit 54): None (no
-        // provider consulted) keeps the scheduler defaults byte-identically;
-        // High/Unknown serializes the batch's resource classes.
+        // Semantic risk reduces batch parallelism (audit 54): None keeps
+        // the scheduler defaults; High/Unknown serializes resource classes.
         let scheduler = Scheduler::new(handle.id(), self.deps.clock.clone())
             .with_limits(risk_adjusted_resource_limits(semantic.map(|s| s.level)));
         let outcomes: Arc<std::sync::Mutex<HashMap<OpId, ToolOutcome>>> =
@@ -1603,21 +1597,28 @@ impl AgentRuntime {
                 let mid = handle
                     .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
                     .await?;
-                // Large outputs go through THE durable evidence store (CCR):
+                // A repeated read of an UNCHANGED file is a compact
+                // reference keyed by the file's content digest, not another
+                // copy of the bytes. `fresh:true` bypasses it. Otherwise
+                // large outputs go through THE durable evidence store (CCR):
                 // a bounded compact reference is prepended while the
                 // normalized backing stays retrievable through the
                 // authority. Small outputs keep today's byte-identical body.
-                let excerpt = match self.archive_tool_output(
-                    handle,
-                    handle.task_id().unwrap_or_else(|_| TaskId::new(1)),
-                    &name,
-                    outcome.provenance,
-                    &outcome.text,
-                ) {
-                    Some(reference) => {
-                        format!("{reference}\n{}", truncate(&outcome.text, 2000))
-                    }
-                    None => truncate(&outcome.text, 2000),
+                let excerpt = match self.unchanged_read_marker(handle, &name, &input, &outcome.text)
+                {
+                    Some(marker) => marker,
+                    None => match self.archive_tool_output(
+                        handle,
+                        handle.task_id().unwrap_or_else(|_| TaskId::new(1)),
+                        &name,
+                        outcome.provenance,
+                        &outcome.text,
+                    ) {
+                        Some(reference) => {
+                            format!("{reference}\n{}", truncate(&outcome.text, 2000))
+                        }
+                        None => truncate(&outcome.text, 2000),
+                    },
                 };
                 // Durable message-part boundary: the configured-secret
                 // registry redaction is applied to the EXACT bytes that

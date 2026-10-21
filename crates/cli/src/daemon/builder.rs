@@ -65,11 +65,12 @@ pub fn build_daemon(
 
 /// [`build_daemon`] for the headless `run` entry, with an explicit
 /// permission requester. A one-prompt run has no host to answer a permission
-/// dialog: the CLI supplies [`HeadlessPermissionRequester`], which denies
-/// every capability request immediately (typed, never a silent allow and
-/// never a stall until the durable deadline). Read-only tools declare no
-/// capability, so investigation still works; a denied write/shell is
-/// reported to the model as a refused tool result.
+/// dialog: the CLI supplies [`HeadlessPermissionRequester`], which grants
+/// READ-ONLY workspace reads and denies every mutating/external capability
+/// immediately (typed, never a silent allow and never a stall until the
+/// durable deadline). `read_file`/search carry `ReadWorkspace`, so
+/// investigation still works; a denied write/shell is reported to the model
+/// as a refused tool result.
 pub(crate) fn build_daemon_with_permission(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
@@ -85,17 +86,20 @@ pub(crate) fn build_daemon_with_permission(
     )
 }
 
-/// The headless permission policy: every request is DENIED immediately.
-/// Denying is the only honest answer without a human in the loop; allowing
-/// would silently widen the session envelope, and waiting would spend the
-/// whole permission deadline before failing.
+/// The headless permission policy: read-only workspace access is GRANTED
+/// immediately; every other request is DENIED immediately. A read cannot
+/// widen the durable envelope and is required for a one-prompt investigation
+/// (`read_file` declares `ReadWorkspace` — the old blanket denial made the
+/// documented read-only path fail). Mutations, shell and external effects
+/// still need a human, and waiting would spend the whole deadline before
+/// failing.
 pub(crate) struct HeadlessPermissionRequester;
 
 impl faktor_agent::PermissionRequester for HeadlessPermissionRequester {
     fn request(
         &self,
         _session: faktor_core::id::SessionId,
-        _permission: &faktor_session::ops::PermissionRequest,
+        permission: &faktor_session::ops::PermissionRequest,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -103,7 +107,13 @@ impl faktor_agent::PermissionRequester for HeadlessPermissionRequester {
                 > + Send,
         >,
     > {
-        Box::pin(async { Ok(faktor_core::capability::PermissionDecision::Deny) })
+        let decision = match permission.capability {
+            faktor_core::capability::Capability::ReadWorkspace { .. } => {
+                faktor_core::capability::PermissionDecision::Allow
+            }
+            _ => faktor_core::capability::PermissionDecision::Deny,
+        };
+        Box::pin(async move { Ok(decision) })
     }
 }
 
@@ -328,12 +338,20 @@ pub(crate) async fn build_daemon_with_mcp_inner(
                 match server.list_tools().await {
                     Ok(tools) => {
                         let n = tools.len();
-                        for t in tools {
-                            if let Some(tool) = mcp_bridge::mcp_tool(server.clone(), &t) {
+                        if n > mcp_bridge::MAX_MCP_TOOLS_PER_SERVER {
+                            tracing::warn!(
+                                server = %name,
+                                tools = n,
+                                max = mcp_bridge::MAX_MCP_TOOLS_PER_SERVER,
+                                "mcp server advertises more tools than the bounded surface; the excess is not admitted"
+                            );
+                        }
+                        for t in tools.iter().take(mcp_bridge::MAX_MCP_TOOLS_PER_SERVER) {
+                            if let Some(tool) = mcp_bridge::mcp_tool(server.clone(), t) {
                                 mcp_tools.push(tool);
                             }
                         }
-                        tracing::info!("mcp server {name}: {n} tool(s) wired");
+                        tracing::info!("mcp server {name}: {n} tool(s) listed");
                     }
                     Err(e) => {
                         tracing::warn!("mcp server {name}: tool listing failed: {e}");
@@ -1206,8 +1224,7 @@ pub(crate) fn build_daemon_core(
     scm_seams: GithubAppSeams,
     permission_requester: Option<Arc<dyn faktor_agent::PermissionRequester>>,
 ) -> Result<DaemonGraph, String> {
-    // ONE policy instance for every provider call of this daemon (chat turns
-    // and the semantic embedder): the additive [retry] section, class-aware.
+    // ONE policy instance for every provider call (chat + semantic embedder).
     let retry_policy = config.retry.to_policy();
     // Step 4 — checked transport/security: the daemon's ONE sandbox policy
     // from the `[sandbox]` section (destination gate + OS-level
@@ -1482,6 +1499,7 @@ pub(crate) fn build_daemon_core(
     tools.register(tools::read_file_tool());
     tools.register(tools::write_file_tool());
     tools.register(tools::edit_file_tool());
+    tools.register(tools::list_dir_tool());
     tools.register(tools::search_tool());
     tools.register(tools::run_command_tool());
     // Coordination board: the tools are agent-crate definitions, the board

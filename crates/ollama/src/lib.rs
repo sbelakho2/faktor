@@ -13,11 +13,6 @@
 //! messages; the thinking knob is the top-level `/api/chat` `think`
 //! parameter (boolean or `"low"`/`"medium"`/`"high"` level).
 
-use std::collections::{HashMap, VecDeque};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::model::{CapabilityResolution, ModelCapabilities, ReasoningMode};
 use faktor_provider::catalog::{
@@ -35,10 +30,12 @@ use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
 use futures::Stream;
-
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 mod frame;
 use frame::parse_ollama_frame;
-
 /// Map a transport-level refusal onto the ollama host-facing error type.
 /// A genuine transport failure stays a retryable `Network` error (exactly
 /// what the raw client produced before); anything the policy/build layer
@@ -54,7 +51,6 @@ fn egress_to_host_error(e: faktor_provider::egress::EgressError) -> Error {
     };
     Error::new(kind, e.to_string())
 }
-
 /// Stream hang controls: first-byte / idle bounds from the transport
 /// defaults (audit round 9). The OVERALL bound now rides the operation
 /// deadline the runtime stamped into `RequestMeta::deadline_ms` (audit
@@ -73,35 +69,29 @@ use faktor_provider::{
     ContentKind, EmbeddingRequest, EmbeddingResponse, GenericAgentRequest, Provider, ProviderChunk,
     ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
-
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
-
 /// Per-image raw-byte ceiling the Ollama adapter delivers. Ollama's native
 /// `/api/chat` takes base64 `images` without documenting a per-image limit;
 /// the daemon-wide default ([`faktor_provider::MAX_MODEL_IMAGE_BYTES`]) is
 /// therefore the adapter's own bound, still capped structurally by
 /// [`faktor_provider::MAX_MEDIA_BYTES_HARD`] inside the delivery gate.
 pub const OLLAMA_MAX_IMAGE_BYTES: usize = faktor_provider::MAX_MODEL_IMAGE_BYTES;
-
 /// Hard bound on the RAW bytes of ONE `/api/embed` response body. A legal
 /// response is `inputs (≤ 64) × dimensions (≤ 8192) × 4` bytes plus JSON
 /// overhead (< 3 MiB); 8 MiB admits every legal shape while a hostile
 /// daemon cannot stream an unbounded body into RAM.
 pub const EMBED_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
-
 /// Hard bound on one classified error body: `Response::text()` would buffer
 /// a hostile daemon's unbounded body into RAM, so the classifier reads at
 /// most this many bytes (chunked reads, partial body dropped) and appends a
 /// typed truncation note. The status-derived classification is unaffected.
 pub const OLLAMA_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
-
 /// Documented wall-clock bound for one NON-streaming metadata request
 /// (`/api/tags`, `/api/show`, `/api/ps`, `/api/embed`'s HTTP call): the
 /// egress client only bounds connect, so without this a daemon that accepts
 /// and never answers would pin discovery/probing forever. Retries of the
 /// same metadata call are bounded by this same per-attempt bound.
 pub const OLLAMA_METADATA_TIMEOUT_MS: u64 = 30_000;
-
 /// Hard bound on the RAW bytes of ONE metadata JSON body (`/api/tags`,
 /// `/api/show`, `/api/ps`): a real tags list, capability document and
 /// loaded-model list are all far below this, while a hostile daemon cannot
@@ -109,17 +99,14 @@ pub const OLLAMA_METADATA_TIMEOUT_MS: u64 = 30_000;
 /// typed egress budget refusal — metadata is never read through a naked
 /// `resp.json()`.
 pub const OLLAMA_METADATA_MAX_BYTES: u64 = 8 * 1024 * 1024;
-
 /// The production metadata read bound (head/idle/total all equal the
 /// documented metadata timeout, byte cap [`OLLAMA_METADATA_MAX_BYTES`]).
 const OLLAMA_METADATA_BOUND: std::time::Duration =
     std::time::Duration::from_millis(OLLAMA_METADATA_TIMEOUT_MS);
-
 /// The [`ResponseBudget`] ONE metadata body read obeys.
 fn metadata_budget(bound: std::time::Duration) -> ResponseBudget {
     ResponseBudget::for_timeout(bound, OLLAMA_METADATA_MAX_BYTES)
 }
-
 /// Map a checked metadata read failure onto the host-facing error type:
 /// a malformed body (or a byte/frame breach) is a terminal `Malformed`
 /// refusal, a stalled head/idle/total read is a retryable `Network` error,
@@ -139,7 +126,6 @@ fn metadata_read_error(what: &str, e: EgressError) -> Error {
         _ => egress_to_host_error(e),
     }
 }
-
 /// Read ONE metadata JSON body under the metadata budget through the shared
 /// budget-aware checked-response helper: a giant body is cut at
 /// [`OLLAMA_METADATA_MAX_BYTES`], a streaming body at the idle bound, and
@@ -154,7 +140,6 @@ async fn read_metadata_json<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|e| metadata_read_error(what, e))
 }
-
 /// Await response HEADERS under the stream's existing first-byte deadline
 /// (default 60 s), capped by the overall deadline when the operation set
 /// one. `0` on both knobs keeps the historical unbounded behavior, but
@@ -167,7 +152,6 @@ fn request_head_timeout_ms(deadlines: StreamDeadlines) -> u64 {
         (first, overall) => first.min(overall),
     }
 }
-
 /// Execute one stream request, bounding the wait for response headers by
 /// [`request_head_timeout_ms`] (a typed `Timeout` on breach).
 async fn execute_with_head_timeout(
@@ -186,7 +170,6 @@ async fn execute_with_head_timeout(
         )),
     }
 }
-
 /// Outcome of one bounded error-body read (never a full materialization).
 enum ErrorBodyRead {
     /// Complete body within the byte cap.
@@ -196,7 +179,6 @@ enum ErrorBodyRead {
     /// No complete read inside the wall-clock bound.
     Stalled,
 }
-
 /// Read an error body under a hard BYTE cap and a wall-clock bound through
 /// the shared budget-aware reader: at most `cap` bytes retained (the rest
 /// is dropped, never buffered), and a typed note appended when the body was
@@ -264,7 +246,6 @@ async fn read_error_body_bounded(resp: CheckedResponse, cap: usize, bound_ms: u6
     }
     text
 }
-
 /// Run one metadata future under a wall-clock bound; breach is a typed
 /// [`ErrorKind::Timeout`]. `what` names the call for attributable errors.
 async fn metadata_bounded_with<F, T>(
@@ -283,7 +264,6 @@ where
         ))),
     }
 }
-
 /// The production metadata bound (see [`OLLAMA_METADATA_TIMEOUT_MS`]).
 async fn metadata_bounded<F, T>(what: &str, fut: F) -> Result<T, Error>
 where
@@ -296,7 +276,6 @@ where
     )
     .await
 }
-
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
     pub base_url: String,
@@ -305,7 +284,6 @@ pub struct OllamaConfig {
     /// Capability overrides per model (probed values win unless overridden).
     pub model_overrides: HashMap<String, ModelCapabilities>,
 }
-
 impl OllamaConfig {
     pub fn new(base_url: Option<String>) -> Self {
         Self {
@@ -315,12 +293,10 @@ impl OllamaConfig {
         }
     }
 }
-
 #[derive(Debug, Clone, serde::Deserialize)]
 struct TagsResponse {
     models: Vec<TagModel>,
 }
-
 #[derive(Debug, Clone, serde::Deserialize)]
 struct TagModel {
     name: String,
@@ -331,7 +307,6 @@ struct TagModel {
     #[allow(dead_code)]
     details: Option<ModelDetails>,
 }
-
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ModelDetails {
     #[allow(dead_code)]
@@ -341,7 +316,6 @@ struct ModelDetails {
     #[allow(dead_code)]
     quantization_level: Option<String>,
 }
-
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ShowResponse {
     model_info: Option<serde_json::Value>,
@@ -351,7 +325,6 @@ struct ShowResponse {
     #[allow(dead_code)]
     parameters: Option<serde_json::Value>,
 }
-
 /// Context-window facts for one model: the model's maximum (from
 /// `/api/show` — the same number `probe_model` reports as
 /// `ModelCapabilities::context`) and the runtime-effective window after the
@@ -362,7 +335,6 @@ pub struct OllamaContext {
     pub model_max: usize,
     pub runtime_effective: Option<usize>,
 }
-
 pub struct OllamaProvider {
     config: OllamaConfig,
     transport: Arc<dyn HttpTransport>,
@@ -385,7 +357,6 @@ pub struct OllamaProvider {
     /// response a session streams (see [`OllamaProvider::stream`]).
     response_seq: AtomicU64,
 }
-
 impl OllamaProvider {
     /// Concrete production constructor: the egress transport is injected
     /// (the daemon passes the policy-checked one); there is no permissive
@@ -399,7 +370,6 @@ impl OllamaProvider {
             response_seq: AtomicU64::new(0),
         })
     }
-
     /// Test-only default-allow constructor: production code MUST inject a
     /// policy-checked transport; in-crate tests use this for local mock
     /// servers.
@@ -407,7 +377,6 @@ impl OllamaProvider {
     pub fn permissive_for_tests(config: OllamaConfig) -> Arc<Self> {
         Self::new(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
     }
-
     /// Live capability warm-up (spec §10): `GET /api/tags` discovers the
     /// installed models, each is probed via `GET /api/show`, and the results
     /// drive `capabilities()` from then on. Bounded: at most
@@ -448,7 +417,6 @@ impl OllamaProvider {
         }
         Ok(n)
     }
-
     /// `GET /api/ps` refresh pass for the runtime-context cache: every
     /// probed model that the daemon reports as loaded gets
     /// `min(model max from /api/show, /api/ps allocation)` cached for
@@ -491,7 +459,6 @@ impl OllamaProvider {
         }
         Ok(updated)
     }
-
     /// Cache one `/api/ps` observation: `min(model max, allocation)` when
     /// the model is loaded; REMOVE the entry when it is not (no live data —
     /// the caller falls back to the model maximum, safe direction).
@@ -511,13 +478,11 @@ impl OllamaProvider {
             }
         }
     }
-
     /// Build a provider over an injected egress transport (the production
     /// trait-object surface; see [`OllamaProvider::new`]).
     pub fn build(config: OllamaConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
         Self::new(config, transport)
     }
-
     /// Discover installed models (spec §10): `GET /api/tags`.
     pub async fn discover_models(&self) -> Result<Vec<String>, Error> {
         let tags: TagsResponse = metadata_bounded("tags", async {
@@ -543,7 +508,6 @@ impl OllamaProvider {
         names.sort();
         Ok(names)
     }
-
     /// Probe a model's capabilities via `GET /api/show` (spec §10).
     pub async fn probe_model(&self, model: &str) -> Result<ModelCapabilities, Error> {
         let show: ShowResponse = metadata_bounded("show", async {
@@ -566,7 +530,6 @@ impl OllamaProvider {
         .await?;
         Ok(caps_from_show(model, &show))
     }
-
     /// `GET /api/ps`: the context window currently ALLOCATED for `model` in
     /// the loaded process. `Ok(None)` when the model is not loaded (or the
     /// daemon does not report an allocation); hostile bodies are loud
@@ -593,7 +556,6 @@ impl OllamaProvider {
         .await?;
         Ok(ps_allocated_context(&body, model)?.map(|c| c as usize))
     }
-
     /// Probe both context numbers for `model`: the model maximum
     /// (`/api/show`, exactly what `probe_model` reports as
     /// `ModelCapabilities::context`) and the runtime-effective window
@@ -610,7 +572,6 @@ impl OllamaProvider {
             runtime_effective,
         })
     }
-
     /// Effective context = `min(model max from /api/show, allocated from
     /// /api/ps)`; `Ok(None)` when the model is not currently loaded. The
     /// observation also lands in the [`Provider::runtime_context_limit`]
@@ -618,7 +579,6 @@ impl OllamaProvider {
     pub async fn effective_context(&self, model: &str) -> Result<Option<usize>, Error> {
         Ok(self.runtime_context(model).await?.runtime_effective)
     }
-
     /// Native wire serializer (P0 "Qwen3.8 not first-class"): the generic
     /// content-block model is lowered into real Ollama message objects,
     /// never OpenAI-style `{"type": ...}` content arrays. Shapes follow
@@ -649,7 +609,6 @@ impl OllamaProvider {
             .map(|m| (*m).clone())
             .unwrap_or_else(|| model.to_string())
     }
-
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if !req.system.is_empty() {
@@ -703,7 +662,6 @@ impl OllamaProvider {
         }
         body
     }
-
     /// Native `/api/embed` wire body: the model, the ordered batch input,
     /// and the configured `keep_alive` — never any internal metadata
     /// (operation/session/deadline/cancellation stay off the wire like
@@ -728,7 +686,6 @@ impl OllamaProvider {
         .unwrap_or(serde_json::Value::Null)
     }
 }
-
 impl Provider for OllamaProvider {
     fn id(&self) -> &str {
         "ollama"
@@ -1242,7 +1199,6 @@ fn ps_allocated_context(body: &serde_json::Value, model: &str) -> Result<Option<
 struct NativeMessage {
     role: &'static str,
     content: Vec<String>,
-    thinking: Vec<String>,
     images: Vec<String>,
     tool_calls: Vec<serde_json::Value>,
 }
@@ -1269,9 +1225,6 @@ fn flush_native(acc: &mut Option<NativeMessage>, out: &mut Vec<serde_json::Value
     let mut obj = serde_json::Map::new();
     obj.insert("role".into(), serde_json::json!(a.role));
     obj.insert("content".into(), serde_json::json!(a.content.join("\n")));
-    if !a.thinking.is_empty() {
-        obj.insert("thinking".into(), serde_json::json!(a.thinking.join("\n")));
-    }
     if !a.images.is_empty() {
         obj.insert("images".into(), serde_json::json!(a.images));
     }
@@ -1540,9 +1493,10 @@ where
 ///
 /// - text parts become plain `content` on the declared role (user text ->
 ///   user content; assistant text -> assistant content);
-/// - assistant reasoning parts become the message's native `thinking`
-///   field; reasoning recorded under any other role is lifted onto a
-///   role-assistant message (only assistant messages may carry thinking);
+/// - assistant reasoning parts are NOT replayed: `thinking` is an
+///   output-only stream and re-sending the model's private scratchpad on
+///   every later turn burns input tokens without adding conversation
+///   state (the native API never requires it back);
 /// - `ToolCall` parts become native `{"function": {"name", "arguments"}}`
 ///   entries on an assistant message (`tool_calls` exist nowhere else);
 ///   their ids are remembered so results can name the call they answer;
@@ -1578,11 +1532,7 @@ fn lower_native_message(
                     call_names.insert(id.clone(), name.clone());
                 }
             }
-            ContentKind::Reasoning { text } => {
-                switch_role(&mut acc, &mut out, "assistant");
-                let a = acc.as_mut().expect("switch_role guarantees an accumulator");
-                a.thinking.push(text.clone());
-            }
+            ContentKind::Reasoning { .. } => {}
             ContentKind::Text { text } => {
                 switch_role(&mut acc, &mut out, role_name(&m.role));
                 let a = acc.as_mut().expect("switch_role guarantees an accumulator");
@@ -3188,19 +3138,42 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "a"}),
                 // The result precedes its call in the parts: no tool_name.
                 serde_json::json!({"role": "tool", "content": "out"}),
-                // Tool call + reasoning coalesce onto ONE assistant message
-                // (assistant messages may carry tool_calls and thinking
-                // together — the native fields stay orthogonal).
+                // The reasoning part is NOT replayed: `thinking` is an
+                // output-only stream. The tool call still rides its own
+                // assistant message.
                 serde_json::json!({
                     "role": "assistant",
                     "content": "",
-                    "thinking": "think",
                     "tool_calls": [{
                         "function": { "name": "read_file", "arguments": { "path": "x" } }
                     }]
                 }),
                 serde_json::json!({"role": "user", "content": "b"}),
             ]
+        );
+    }
+
+    #[test]
+    fn prior_thinking_is_never_replayed_to_the_native_wire() {
+        // Native thinking models return `message.thinking`, but it is
+        // output-only: a later turn must not re-send the private
+        // scratchpad (the old lowering coalesced it onto an assistant
+        // message and every request paid for it again).
+        let m = RequestMessage {
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::reasoning("private chain-of-thought ".repeat(200)),
+                ContentPart::text("the answer"),
+            ],
+        };
+        let native = lower_native_message(&m, &mut HashMap::new());
+        assert_eq!(
+            native,
+            vec![serde_json::json!({"role": "assistant", "content": "the answer"})]
+        );
+        assert!(
+            !serde_json::to_string(&native).unwrap().contains("thinking"),
+            "no thinking field may reach the wire"
         );
     }
 
@@ -3726,19 +3699,49 @@ mod tests {
 
         canonical_usage_conformance! {
             driver: ollama_native_canonical_usage_conformance,
-            family: faktor_provider::usage_conformance::WireFamily::NoCacheDetail,
+            family: faktor_provider::usage_conformance::WireFamily::OptionalCacheDetail,
             label: "ollama native /api/chat",
             request: || req("qwen3.8"),
             provider: |base: String| OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base))),
             method: "POST",
             path: "/api/chat",
             cases: vec![
-                // The API exposes NO cache split: the conservative correct
-                // category is uncached = the reported evaluated count.
+                // An older runtime with no cache detail: the conservative
+                // category is uncached = the reported inclusive total.
                 faktor_provider::usage_conformance::WireUsageCase::frame(
                     "counts_map_uncached_total",
                     ndjson(serde_json::json!({
                         "done": true, "prompt_eval_count": 1000, "eval_count": 50,
+                    })),
+                    exp(1000, 50),
+                ),
+                // Ollama 0.40+ reports the cached prefix separately. The
+                // total is inclusive, so the cached prefix must be split out
+                // (uncached 600 + cache_read 400), never charged as fresh
+                // input.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_split_when_present",
+                    ndjson(serde_json::json!({
+                        "done": true, "prompt_eval_count": 1000,
+                        "prompt_eval_cached_count": 400, "eval_count": 50,
+                    })),
+                    CanonicalUsage {
+                        uncached_input_tokens: 600,
+                        cache_read_tokens: 400,
+                        cache_write_tokens: 0,
+                        output_tokens: 50,
+                        reasoning_tokens: 0,
+                        reported_cost: None,
+                        request_id: None,
+                    },
+                ),
+                // A hostile cached>total row is not a cache hit: the detail
+                // is ignored and the whole total stays uncached.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "hostile_cache_over_total_ignored",
+                    ndjson(serde_json::json!({
+                        "done": true, "prompt_eval_count": 1000,
+                        "prompt_eval_cached_count": 5000, "eval_count": 50,
                     })),
                     exp(1000, 50),
                 ),

@@ -73,6 +73,112 @@ pub const EVIDENCE_RETRIEVAL_MAX_BYTES: usize = EVIDENCE_BACKING_CAP_BYTES;
 /// the post-extraction residue exceeds this many estimated tokens.
 pub const DEFAULT_SUMMARIZER_RESIDUE_BUDGET_TOKENS: usize = 128;
 
+/// Hard ceiling of one compaction summary (input-relative budget is
+/// `hard_cap / 8`, clamped to this). The summary is a state transfer, not a
+/// transcript: a 1,024-token schema carries state/decisions/files/checks/
+/// blockers/next/facts while leaving the rest of the cap for recent turns.
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_024;
+
+/// Floor of the summary budget so a tiny target still gets a usable state
+/// transfer instead of an empty fragment.
+pub const SUMMARY_MIN_OUTPUT_TOKENS: usize = 64;
+
+/// The summary token budget for a compaction request: at most
+/// [`SUMMARY_MAX_OUTPUT_TOKENS`], never more than 1/8 of the hard cap, and
+/// never below [`SUMMARY_MIN_OUTPUT_TOKENS`] unless the cap itself is
+/// smaller (then it is the whole cap).
+pub fn summary_budget_tokens(req: &CompactionRequest) -> usize {
+    let hard = req.hard_cap();
+    let scaled = hard / 8;
+    scaled
+        .clamp(
+            SUMMARY_MIN_OUTPUT_TOKENS.min(hard),
+            SUMMARY_MAX_OUTPUT_TOKENS,
+        )
+        .min(hard)
+}
+
+/// Strict, deterministic post-processing of a model-authored summary.
+///
+/// The summary is a high-signal state transfer, never a place to restate
+/// durable truth. This function:
+/// - drops exact duplicate lines (facts appear once);
+/// - drops duplicate fact ids (`F:<id>` / `[<id>]` lines keep the first);
+/// - drops lines already present in the verbatim identity / durable
+///   projection (the wire carries those separately, so restating them is
+///   pure duplicate cost);
+/// - clamps the result to `budget_tokens` through the conservative
+///   estimator.
+///
+/// The result is byte-deterministic for identical input, so repeated
+/// compactions cannot grow the summary by rephrasing.
+pub fn compact_summary_text(summary: &str, durable_render: &str, budget_tokens: usize) -> String {
+    fn normalize(line: &str) -> String {
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    fn fact_id(line: &str) -> Option<String> {
+        let trimmed = line.trim_start().trim_start_matches("- ").trim();
+        let rest = trimmed.strip_prefix("F:").or_else(|| {
+            let close = trimmed.strip_prefix('[')?;
+            let (id, _) = close.split_once(']')?;
+            Some(id)
+        })?;
+        let id = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(':');
+        if id.is_empty() || id.len() > 64 {
+            None
+        } else {
+            Some(id.to_ascii_lowercase())
+        }
+    }
+    let durable: std::collections::HashSet<String> = durable_render
+        .lines()
+        .map(normalize)
+        .filter(|line| line.len() >= 12)
+        .collect();
+    // Bullet-stripped durable values catch a summary that restates a short
+    // goal/decision as "- <value>": the verbatim block still carries it.
+    let durable_values: std::collections::HashSet<String> = durable_render
+        .lines()
+        .map(|line| normalize(line.trim_start().trim_start_matches("- ")))
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = String::with_capacity(summary.len().min(budget_tokens.saturating_mul(3)));
+    for line in summary.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let key = normalize(line);
+        let value_key = normalize(line.trim_start().trim_start_matches("- "));
+        if (key.len() >= 12 && durable.contains(&key))
+            || (!value_key.is_empty() && durable_values.contains(&value_key))
+        {
+            continue;
+        }
+        if !seen_lines.insert(key) {
+            continue;
+        }
+        if let Some(id) = fact_id(line) {
+            if !seen_ids.insert(id) {
+                continue;
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    // clamp_to's documented bound is `max_tokens + 1` (the trailing
+    // ellipsis); the summary budget is a HARD bound, so clamp one below it.
+    Estimator.clamp_to(&out, budget_tokens.saturating_sub(1))
+}
+
 /// Insertion-ordered rendering of turns (`"{role}: {text}\n"`), the same
 /// shape the archive chunks use.
 #[cfg(test)]
@@ -780,19 +886,72 @@ impl Compactor {
         if let Some(summarizer) = &self.summarizer {
             if residue_tokens > req.summarizer_residue_budget_tokens {
                 let summary = summarizer.summarize(&residue, &durable_facts).await;
+                // High-signal normalization BEFORE acceptance: duplicate
+                // lines / duplicate fact ids collapse, and anything already
+                // carried verbatim by the identity or durable projection is
+                // removed (the wire carries those once). The model-authored
+                // text is bounded by the request-relative summary budget so
+                // a verbose summary can never consume the whole cap and
+                // starve the kept recent window.
+                let durable_render = format!("{identity}\n{durable_facts}");
+                let summary =
+                    compact_summary_text(&summary, &durable_render, summary_budget_tokens(req));
+                // A verbatim transcript echo is NOT a summary: the model
+                // returned the residue (role-prefixed rows included) and the
+                // clamp would otherwise make a ~0% reduction look accepted.
+                // Reject it exactly like a liar summary.
+                let echoes_transcript = residue.iter().any(|turn| {
+                    turn.text.len() > 64
+                        && summary.contains(&format!("{}: {}", turn.role, turn.text))
+                });
                 // An EMPTY/whitespace summary would pass the token cap and
                 // wipe the conversation: reject it exactly like a liar
                 // summary and let deterministic pruning carry the facts.
-                if !summary.trim().is_empty() {
+                if !summary.trim().is_empty() && !echoes_transcript {
                     // The accepted summary REPLACES the conversational
                     // residue (and every prior summary, which it supersedes).
-                    let mut kept_recent = synthesized.clone();
-                    // The prior archive pointer describes history that is
-                    // still archived even though this new summary replaces
-                    // the residue; carry it when it fits.
-                    if let Some(digest) = prior_digest.as_ref() {
+                    // Every replaced turn is still archived in the CAS, so
+                    // the wire MUST carry its archive pointer: without the
+                    // digest marker the whole archived history becomes
+                    // unreachable (the deterministic branch already does
+                    // this; the summary branch used to drop it, orphaning the
+                    // FIRST summary's archive forever).
+                    let archived = residue
+                        .iter()
+                        .chain(older_summaries.iter())
+                        .chain(carried_summary.iter())
+                        .map(|t| ArtifactRef {
+                            inline: None,
+                            artifact: None,
+                            summary: format!("archived turn ({} chars)", t.text.len()),
+                            size: t.text.len(),
+                        })
+                        .collect();
+                    let archive_chunks = fill_chunks(
+                        older_summaries
+                            .iter()
+                            .chain(carried_summary.iter())
+                            .chain(residue.iter()),
+                        ARCHIVE_CHUNK_BYTES,
+                    );
+                    let digest_text = archive_digest(&archive_chunks);
+                    let digest_turn = if !digest_text.is_empty() {
+                        Some(RecentTurn {
+                            role: "assistant".into(),
+                            text: digest_marker(&digest_text),
+                        })
+                    } else {
+                        // Already-compacted context: carry the previous
+                        // pointer verbatim instead of orphaning it.
+                        prior_digest.clone()
+                    };
+                    let mut kept_recent = Vec::new();
+                    if let Some(digest) = digest_turn.as_ref() {
+                        // FIRST on the wire so the runtime's manifest-hash
+                        // replacement targets this turn's placeholder.
                         kept_recent.push(digest.clone());
                     }
+                    kept_recent.extend(synthesized.iter().cloned());
                     kept_recent.push(RecentTurn {
                         role: "summary".into(),
                         text: summary,
@@ -808,24 +967,6 @@ impl Compactor {
                     }
                     let after = estimate_wire_turns(&kept_recent);
                     if after <= req.hard_cap() {
-                        let archived = residue
-                            .iter()
-                            .chain(older_summaries.iter())
-                            .chain(carried_summary.iter())
-                            .map(|t| ArtifactRef {
-                                inline: None,
-                                artifact: None,
-                                summary: format!("archived turn ({} chars)", t.text.len()),
-                                size: t.text.len(),
-                            })
-                            .collect();
-                        let archive_chunks = fill_chunks(
-                            older_summaries
-                                .iter()
-                                .chain(carried_summary.iter())
-                                .chain(residue.iter()),
-                            ARCHIVE_CHUNK_BYTES,
-                        );
                         return CompactionPlan {
                             accepted: true,
                             before_tokens: req.before_tokens,
@@ -1369,17 +1510,24 @@ mod tests {
         let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(plan.accepted);
         assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
-        // The wire content after an accepted summary is the summary plus
-        // the synthesized durable turns, NOT the full history (the old code
-        // kept history verbatim and the shrink was bookkeeping-only).
+        // The wire content after an accepted summary is the archive
+        // pointer + summary + the synthesized durable turns, NOT the full
+        // history (the old code kept history verbatim and the shrink was
+        // bookkeeping-only). The pointer is not optional: without it the
+        // archived turns are unreachable.
         assert_eq!(
             plan.kept_recent
                 .iter()
                 .filter(|t| t.role != "system")
                 .count(),
-            1,
-            "exactly one summary turn replaces the whole history"
+            2,
+            "exactly one archive pointer + one summary replace the history"
         );
+        assert!(plan
+            .kept_recent
+            .first()
+            .is_some_and(|t| t.text.starts_with("[Earlier context archived:")
+                && t.text.contains("<artifact://hash>")));
         assert!(plan
             .kept_recent
             .last()
@@ -1957,5 +2105,83 @@ mod tests {
             after = plan.after_tokens;
         }
         println!("PROBE compaction_100k_tokens best_ns={best} after_tokens={after}");
+    }
+    /// The strict summary schema is enforced deterministically: duplicate
+    /// lines collapse, duplicate fact ids keep the first, and lines that
+    /// restate the verbatim identity/durable projection are removed (those
+    /// already ride the wire once). The model-authored text is also clamped
+    /// to the request-relative summary budget, so a verbose summary cannot
+    /// consume the whole compaction cap.
+    #[tokio::test]
+    async fn strict_summary_schema_dedupes_facts_and_respects_the_budget() {
+        struct SchemaSummarizer;
+        impl Summarizer for SchemaSummarizer {
+            fn summarize<'a>(
+                &'a self,
+                _residue: &'a [RecentTurn],
+                _durable_facts: &'a str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    format!(
+                        "STATE: Implementing\n\
+DECISIONS:\n- 1: pick A -> because\n- 1: pick A -> because\n\
+FILES:\n- src/a.rs :: changed\n\
+BLOCKERS:\n- F:1 shared blocker\n\
+NOTES:\n- F:1 shared blocker\n- F:2 unique fact\n- F:2 unique fact\n- g\n{}",
+                        "verbose tail ".repeat(2_000)
+                    )
+                })
+            }
+        }
+        let projection = TaskContextProjection::from_durable_rows(DurableTaskRows {
+            task_state: "Implementing".into(),
+            goal: "g".into(),
+            ..Default::default()
+        });
+        let history = history(200);
+        let req = CompactionRequest::new(100_000, 30_000);
+        let compactor = Compactor::new(Some(Arc::new(SchemaSummarizer)));
+        let plan = compactor
+            .compact_projected(&history, &projection, &TaskLedger::default(), &req)
+            .await;
+        assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
+        let summary = plan
+            .kept_recent
+            .iter()
+            .find(|turn| turn.role == "summary")
+            .expect("accepted summary rides the wire")
+            .text
+            .clone();
+        assert!(
+            !summary.contains("STATE: Implementing"),
+            "durable projection already carries this line verbatim: {summary}"
+        );
+        assert!(
+            !summary.lines().any(|line| line == "- g"),
+            "the verbatim goal must never be restated by the summary"
+        );
+        assert_eq!(
+            summary.matches("shared blocker").count(),
+            1,
+            "duplicate fact ids/lines collapse to one: {summary}"
+        );
+        assert_eq!(
+            summary.matches("unique fact").count(),
+            1,
+            "duplicate lines collapse: {summary}"
+        );
+        assert_eq!(
+            summary.matches("pick A").count(),
+            1,
+            "duplicate decisions collapse: {summary}"
+        );
+        let tokens = Estimator.estimate_tokens(&summary);
+        assert!(
+            tokens <= summary_budget_tokens(&req),
+            "summary {tokens} tokens exceeds its budget {}",
+            summary_budget_tokens(&req)
+        );
+        assert!(tokens <= SUMMARY_MAX_OUTPUT_TOKENS);
     }
 }

@@ -11,18 +11,22 @@ use super::*;
 /// instead of summarizing. The agent instructions must stay out of this
 /// request entirely.
 pub(crate) const COMPACTOR_SYSTEM: &str =
-    "You are the Faktor context compactor. Your ONLY job is to \
-produce a faithful state transfer that REPLACES the conversation below, so the agent can \
-continue exactly where it stopped. The prior conversation is given as user/assistant \
-messages. Write a compact but complete summary that preserves: the user's goal and current \
-task; constraints and requirements; decisions made and their reasons; files changed (paths \
-and what changed); unresolved errors and blockers (NEVER omit an unresolved blocker); \
-results of tests and verification; observable tool effects (commands run, artifacts \
-created); explicit user instructions and preferences; the current implementation state; \
-and the next actions to take. NEVER invent facts, code, paths, or results that are not in \
-the transcript; if the transcript is incomplete, say exactly what is missing. Prefer \
-structured output (short labeled sections). Do not answer the latest user message: do not \
-add advice, do not continue the task, do not write code.";
+    "You are the Faktor context compactor. Produce a faithful state transfer (STATE \
+TRANSFER) that replaces the conversation below. Output ONLY the schema, no preamble, no \
+reasoning, no advice, no code:\n\
+STATE: <one line, <=200 chars>\n\
+DECISIONS:\n- <step>: <choice> -> <reason>\n\
+FILES:\n- <path> :: <change>\n\
+CHECKS:\n- <name>: pass|fail <summary>\n\
+BLOCKERS:\n- <unresolved errors and blockers, NEVER omit one>\n\
+NEXT:\n- <next action>\n\
+NOTES:\n- F:<stable-id> <fact>\n\
+Rules: the task goal, acceptance criteria and durable facts already ride the wire \
+VERBATIM outside your output; never restate them. Emit each fact ONCE with its stable id \
+and never repeat a line. Prefer ids/paths/deltas over prose. Omit greetings, thoughts, \
+acknowledgements. NEVER invent facts, code, paths or results. Keep the WHOLE output under \
+900 tokens and <=8 items per section. If the transcript is incomplete, say exactly what \
+is missing in STATE.";
 
 /// Fallback bound of the child-park wait (drive boundary) when the operator
 /// configured an unbounded (`0`) wall-clock turn budget. A parked child is
@@ -211,19 +215,6 @@ pub(crate) async fn semantic_turn_consult(
     })
 }
 
-impl Summarizer for LedgerSummarizer {
-    fn summarize<'a>(
-        &'a self,
-        _residue: &'a [faktor_context::RecentTurn],
-        durable_facts: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
-        // The weak deterministic summarizer echoes ONLY the durable facts
-        // render (never the goal/criteria: those never enter summarizer
-        // input — audit 70).
-        Box::pin(async move { durable_facts.to_string() })
-    }
-}
-
 /// Default bound on one compaction-model summary stream (spec §9): a
 /// summarizer that does not finish cleanly inside the bound is treated as
 /// failed and its partial text is discarded. Per-instance injectable so the
@@ -252,26 +243,13 @@ pub(crate) struct BudgetDispatchMarker {
     pub(crate) machine: Arc<tokio::sync::Mutex<crate::AttemptAccounting>>,
 }
 
-/// The failure fallback returned when the streaming summarizer produced no
-/// summary (provider error, deadline, cancellation, non-streaming model).
-/// An EMPTY string would be a data-loss hole: the compactor's token
-/// estimate of "" is 0, which always passes its hard cap, so a wiped
-/// history would be "accepted" as an LLM summary. Instead the unsummarizable
-/// transcript is echoed verbatim — every character is real, nothing is
-/// invented — and repeated 3× so its estimate (chars/4) provably exceeds
-/// the compactor's hard cap (at most 3/4 of the byte-based `before` figure;
-/// chars ≤ bytes, so 3×(chars/4) + prefixes > 3/4×before holds for ANY
-/// UTF-8 input, multibyte included). The compactor therefore REJECTS it and
-/// deterministic pruning takes over — the documented degradation path.
-pub(crate) fn summarize_failure_fallback(history: &[RecentTurn]) -> String {
-    const FALLBACK_COPIES: usize = 3;
-    let mut out = String::new();
-    for _ in 0..FALLBACK_COPIES {
-        for turn in history {
-            out.push_str(&format!("{}: {}\n", turn.role, turn.text));
-        }
-    }
-    out
+/// The failure fallback of the streaming summarizer. An EMPTY string is
+/// the typed "no summary" signal: the compactor rejects it and deterministic
+/// pruning takes over. The old verbatim 3x transcript echo relied on the
+/// compactor NOT clamping; once summaries are hard-budgeted, a transcript
+/// echo would be clamped and wrongly accepted as a ~0% LLM summary.
+pub(crate) fn summarize_failure_fallback(_history: &[RecentTurn]) -> String {
+    String::new()
 }
 
 impl Summarizer for StreamingSummarizer {
@@ -449,6 +427,108 @@ impl AgentRuntime {
             .await
     }
 
+    /// Select and budget the compaction summarizer for this turn: an
+    /// explicit compaction_model wins; otherwise the Compact phase is
+    /// routed (passthrough => deterministic pruning). Extracted from the
+    /// compaction orchestrator so its function-length ceiling stays honest;
+    /// the selection and refusal semantics are unchanged.
+    async fn select_compaction_summarizer(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        before: usize,
+        cancel: &CancellationToken,
+        compaction_output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>>,
+        compaction_usage_slot: Arc<std::sync::Mutex<Option<CanonicalUsage>>>,
+    ) -> faktor_core::Result<BudgetedSummarizer> {
+        Ok(if let Some(model) = self.deps.compaction_model.as_deref() {
+            let built = match self.resolve_compaction_model(handle, model) {
+                Ok((provider, model_name)) => Some(StreamingSummarizer {
+                    provider,
+                    model: model_name,
+                    // The summarizer runs under the compactor contract —
+                    // NEVER the agent instructions (P0 audit round 11).
+                    op_id: self.deps.session.try_next_op_id()?,
+                    session_id: handle.id(),
+                    cancellation: cancel.child(),
+                    summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                    budget_marker: None,
+                    output_slot: compaction_output_slot.clone(),
+                    usage_slot: compaction_usage_slot.clone(),
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        "compaction model {model:?} unresolvable: {e}; using the ledger summarizer"
+                    );
+                    None
+                }
+            };
+            let (summarizer, reservation, machine, trace) = self
+                .budgeted_summarizer(
+                    handle,
+                    built,
+                    before,
+                    None,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
+                .await?;
+            (summarizer, reservation, machine, trace)
+        } else {
+            // No explicit compaction model: route the Compact phase on the
+            // REAL summarizer dimensions (the transcript to exchange = the
+            // pre-compaction history estimate, the summary output cap).
+            let intent = crate::ModelCallIntent::compact();
+            let req = intent.route_request(before.max(4096) as u64, 4096, 0);
+            match self.deps.routing.route(&req) {
+                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None, None, None),
+                Ok(d) => {
+                    let built = match self.deps.providers.get(&d.provider) {
+                        Some(p) => Some(StreamingSummarizer {
+                            provider: p,
+                            model: d.model.clone(),
+                            op_id: self.deps.session.try_next_op_id()?,
+                            session_id: handle.id(),
+                            cancellation: cancel.child(),
+                            summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                            budget_marker: None,
+                            output_slot: compaction_output_slot.clone(),
+                            usage_slot: compaction_usage_slot.clone(),
+                        }),
+                        None => {
+                            return Err(Error::new(
+                                ErrorKind::Internal,
+                                format!(
+                                    "routing chose compaction provider {:?} which is not registered",
+                                    d.provider
+                                ),
+                            ));
+                        }
+                    };
+                    // P0-1: the routed compaction call freezes the route
+                    // decision's price capture on its reservation; P1: the
+                    // decision's execution class rides it too.
+                    self.budgeted_summarizer(
+                        handle,
+                        built,
+                        before,
+                        d.pricing_snapshot,
+                        d.execution_class,
+                    )
+                    .await?
+                }
+                Err(f) => {
+                    // Fail closed: no model may compact, and the turn must
+                    // not silently degrade past a typed denial — there is
+                    // no RouterUnavailable fallback to the ledger
+                    // summarizer anymore.
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        format!("routing refused the compaction call: {f:?}"),
+                    ));
+                }
+            }
+        })
+    }
+
     pub(crate) async fn try_compact_with_head(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -512,96 +592,25 @@ impl AgentRuntime {
         // name its trust class + durable call id.
         let compaction_output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let (summarizer, _reservation, machine, trace): BudgetedSummarizer = if let Some(model) =
-            self.deps.compaction_model.as_deref()
-        {
-            let built = match self.resolve_compaction_model(handle, model) {
-                Ok((provider, model_name)) => Some(StreamingSummarizer {
-                    provider,
-                    model: model_name,
-                    // The summarizer runs under the compactor contract —
-                    // NEVER the agent instructions (P0 audit round 11).
-                    op_id: self.deps.session.try_next_op_id()?,
-                    session_id: handle.id(),
-                    cancellation: cancel.child(),
-                    summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
-                    budget_marker: None,
-                    output_slot: compaction_output_slot.clone(),
-                }),
-                Err(e) => {
-                    tracing::warn!(
-                        "compaction model {model:?} unresolvable: {e}; using the ledger summarizer"
-                    );
-                    None
-                }
-            };
-            let (summarizer, reservation, machine, trace) = self
-                .budgeted_summarizer(
-                    handle,
-                    built,
-                    before,
-                    None,
-                    faktor_core::model::ExecutionClass::Unknown,
-                )
-                .await?;
-            (summarizer, reservation, machine, trace)
-        } else {
-            // No explicit compaction model: route the Compact phase on the
-            // REAL summarizer dimensions (the transcript to exchange = the
-            // pre-compaction history estimate, the summary output cap).
-            let intent = crate::ModelCallIntent::compact();
-            let req = intent.route_request(before.max(4096) as u64, 4096, 0);
-            match self.deps.routing.route(&req) {
-                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None, None, None),
-                Ok(d) => {
-                    let built = match self.deps.providers.get(&d.provider) {
-                        Some(p) => Some(StreamingSummarizer {
-                            provider: p,
-                            model: d.model.clone(),
-                            op_id: self.deps.session.try_next_op_id()?,
-                            session_id: handle.id(),
-                            cancellation: cancel.child(),
-                            summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
-                            budget_marker: None,
-                            output_slot: compaction_output_slot.clone(),
-                        }),
-                        None => {
-                            return Err(Error::new(
-                                ErrorKind::Internal,
-                                format!(
-                                    "routing chose compaction provider {:?} which is not registered",
-                                    d.provider
-                                ),
-                            ));
-                        }
-                    };
-                    // P0-1: the routed compaction call freezes the route
-                    // decision's price capture on its reservation; P1: the
-                    // decision's execution class rides it too.
-                    self.budgeted_summarizer(
-                        handle,
-                        built,
-                        before,
-                        d.pricing_snapshot,
-                        d.execution_class,
-                    )
-                    .await?
-                }
-                Err(f) => {
-                    // Fail closed: no model may compact, and the turn must
-                    // not silently degrade past a typed denial — there is
-                    // no RouterUnavailable fallback to the ledger
-                    // summarizer anymore.
-                    return Err(Error::new(
-                        ErrorKind::Conflict,
-                        format!("routing refused the compaction call: {f:?}"),
-                    ));
-                }
-            }
-        };
+        let compaction_usage_slot: Arc<std::sync::Mutex<Option<CanonicalUsage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let (summarizer, _reservation, machine, trace): BudgetedSummarizer = self
+            .select_compaction_summarizer(
+                handle,
+                before,
+                cancel,
+                compaction_output_slot.clone(),
+                compaction_usage_slot.clone(),
+            )
+            .await?;
         let compactor: Compactor = match summarizer {
             Some(s) => Compactor::new(Some(s)),
-            None => Compactor::new(Some(Arc::new(LedgerSummarizer))),
+            // No model may compact (routing passthrough): deterministic
+            // pruning IS the state transfer. The old ledger "summarizer"
+            // echoed the durable facts that the synthesized projection
+            // already rides verbatim, so every accepted cycle duplicated
+            // them on the wire.
+            None => Compactor::deterministic_only(),
         };
         // Audit 70/71: compaction consumes a READ-ONLY projection built from
         // the durable rows — goal/criteria/plan/state from the typed Task
@@ -641,6 +650,26 @@ impl AgentRuntime {
                     plan.strategy,
                     faktor_context::CompactionStrategy::LlmSummary
                 );
+            // The provider's measured exchange, when the wire reported one.
+            // A zero frame is not evidence (it is the malformed no-usage
+            // shape): fall back to the plan's conservative transcript
+            // figures for BOTH the money settlement and the durable row.
+            let measured = compaction_usage_slot
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .filter(|usage| recorded_input_total(usage) != 0 || usage.output_tokens != 0);
+            let (settle_in, settle_cache_read, settle_cache_write, settle_out) = measured
+                .as_ref()
+                .map(|usage| {
+                    (
+                        usage.uncached_input_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.output_tokens,
+                    )
+                })
+                .unwrap_or((plan.before_tokens as u64, 0, 0, plan.after_tokens as u64));
             let mut acct = machine.lock().await;
             match (settled, acct.dispatched()) {
                 (true, true) => {
@@ -652,11 +681,16 @@ impl AgentRuntime {
                     // actual.
                     if let Err(settle_err) = acct
                         .settle_usage(
-                            plan.before_tokens as u64,
-                            0,
-                            0,
-                            plan.after_tokens as u64,
-                            None,
+                            settle_in,
+                            settle_cache_read,
+                            settle_cache_write,
+                            settle_out,
+                            measured.as_ref().and_then(|u| {
+                                u.reported_cost
+                                    .as_ref()
+                                    .filter(|cost| cost.is_usd())
+                                    .map(|cost| cost.micro_usd)
+                            }),
                             None,
                         )
                         .await
@@ -679,18 +713,21 @@ impl AgentRuntime {
                     // The settled compaction exchange's attempt-keyed
                     // provider-call row (attempt accounting, schema v18):
                     // THIS physical attempt with the canonical exchange
-                    // basis the reservation settled at — the exchanged
-                    // transcript in/out (compaction usage frames never
-                    // surface, so the plan's honest transcript numbers ARE
-                    // the canonical usage of this call).
+                    // basis the reservation settled at: the provider's
+                    // measured usage frame when the wire reports one, else
+                    // the plan's conservative transcript figures.
                     if let Err(row_err) = handle.record_provider_call_attempt(
                         trace.attempt,
                         trace.reservation,
                         &trace.provider,
                         &trace.model,
                         "completed",
-                        Some(plan.before_tokens as u64),
-                        Some(plan.after_tokens as u64),
+                        Some(
+                            settle_in
+                                .saturating_add(settle_cache_read)
+                                .saturating_add(settle_cache_write),
+                        ),
+                        Some(settle_out),
                         None,
                     ) {
                         tracing::error!(
@@ -1152,7 +1189,12 @@ impl AgentRuntime {
             return Ok((None, None, None, None));
         };
         let task_id = handle.task_id()?;
-        let predicted = (before as u64).saturating_add(4096).saturating_add(1024);
+        // Transcript to exchange + the schema's hard generation bound +
+        // the compactor system prompt. The old 4096 output guess reserved
+        // 4x the tokens this call can ever produce.
+        let predicted = (before as u64)
+            .saturating_add(faktor_context::compactor::SUMMARY_MAX_OUTPUT_TOKENS as u64)
+            .saturating_add(1024);
         // Attempt identity (attempt-accounting audit): the compaction call
         // is one logical op (the summarizer's) with ONE physical attempt —
         // minted BEFORE the reservation so the reservation and the

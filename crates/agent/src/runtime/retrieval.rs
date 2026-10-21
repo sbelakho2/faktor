@@ -40,6 +40,149 @@ pub(crate) fn tool_evidence_kind(tool: &str) -> EvidenceKind {
 /// bounded package shape.
 pub(crate) const INDEX_EVIDENCE_MAX_HITS: usize = 8;
 
+/// Bound of one evidence window read from the effective workspace. Evidence
+/// is a pointer to the exact definition/caller/test line, never a whole-file
+/// dump: the model still has `read_file` for the full body.
+const EVIDENCE_READ_MAX_BYTES: usize = 128 * 1024;
+const EVIDENCE_WINDOW_LINES: usize = 18;
+const EVIDENCE_WINDOW_CHARS: usize = 1400;
+
+/// Test-like paths, including the JavaScript conventions that the old
+/// derivation ignored. Used only to LABEL evidence, never as proof.
+fn is_test_evidence_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        || lower.starts_with("spec/")
+        || lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.contains("/spec/")
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.contains("_test.")
+        || lower.contains("/test_")
+}
+
+/// One bounded source window: the kind label plus the numbered lines.
+struct EvidenceWindow {
+    kind: &'static str,
+    snippet: String,
+}
+
+fn line_looks_like_definition(line: &str, concept: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.contains(concept) {
+        return false;
+    }
+    [
+        "fn ",
+        "pub fn ",
+        "function ",
+        "export function ",
+        "const ",
+        "let ",
+        "class ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "type ",
+        "def ",
+        "impl ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Read a bounded window around the most relevant concept occurrence. The
+/// window is numbered so the model can target a precise edit without reading
+/// the whole file, and it is labeled definition/test/usage so a small model
+/// does not have to infer the role from the path alone.
+fn evidence_window(
+    ws: &faktor_fs::WorkspaceHandle,
+    path: &str,
+    concepts: &[String],
+    prefer_line: Option<usize>,
+    require_match: bool,
+) -> Option<EvidenceWindow> {
+    let data = ws
+        .read(std::path::Path::new(path), EVIDENCE_READ_MAX_BYTES)
+        .ok()?;
+    if data.bytes.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data.bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut matched = false;
+    let mut definition = false;
+    let mut match_line = prefer_line.filter(|line| *line > 0).map(|line| line - 1);
+    if match_line.is_none() {
+        for (index, line) in lines.iter().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            if concepts.iter().any(|concept| lower.contains(concept)) {
+                matched = true;
+                if line_looks_like_definition(line, &concepts[0]) {
+                    definition = true;
+                    match_line = Some(index);
+                    break;
+                }
+                if match_line.is_none() {
+                    match_line = Some(index);
+                }
+            }
+        }
+    } else {
+        matched = true;
+        if let Some(line) = lines.get(match_line.unwrap_or(0)) {
+            definition = line_looks_like_definition(line, &concepts[0]);
+        }
+    }
+    if require_match && !matched {
+        return None;
+    }
+    let center = match_line.unwrap_or(0).min(lines.len().saturating_sub(1));
+    let mut start = center.saturating_sub(EVIDENCE_WINDOW_LINES / 3);
+    let mut end = (start + EVIDENCE_WINDOW_LINES).min(lines.len());
+    if end - start < EVIDENCE_WINDOW_LINES && end == lines.len() {
+        start = end.saturating_sub(EVIDENCE_WINDOW_LINES);
+    }
+    if end <= start {
+        end = (start + 1).min(lines.len());
+    }
+    let mut snippet = String::new();
+    let kind = if is_test_evidence_path(path) {
+        "test"
+    } else if definition {
+        "definition"
+    } else {
+        "usage"
+    };
+    snippet.push_str(&format!("// [{kind}] {}:{}\n", path, center + 1));
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let number = start + offset + 1;
+        let marker = if number == center + 1 { ">" } else { " " };
+        snippet.push_str(&format!("{marker}{number:>4}: {line}\n"));
+        if snippet.chars().count() >= EVIDENCE_WINDOW_CHARS {
+            break;
+        }
+    }
+    Some(EvidenceWindow { kind, snippet })
+}
+
+fn evidence_line_hint(snippet: &str) -> Option<usize> {
+    let marker = "at line ";
+    let start = snippet.find(marker)? + marker.len();
+    let digits: String = snippet[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 /// Supplies retrieved evidence before a reasoning turn (spec §20). Default
 /// implementation returns nothing; the index wires itself here.
 ///
@@ -619,19 +762,219 @@ pub(crate) fn changed_files_fold(files: &[FileStateEvidence]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// True when one memory fact's MODEL-VISIBLE fields carry
+/// instruction-override phrasing. Scans only what `render_context_facts`
+/// emits (subject, predicate, current value); metadata and the retained
+/// `previous` revision are not prompt content and are not serialized or
+/// scanned. Text/path values allocate nothing; only a JSON value needs the
+/// same serialization the renderer would perform anyway.
+fn memory_fact_carries_override(fact: &faktor_memory::MemoryFactV2) -> bool {
+    use faktor_memory::TypedMemoryValue;
+    let hostile = faktor_security::contains_instruction_override;
+    if hostile(&fact.subject) || hostile(&fact.predicate) {
+        return true;
+    }
+    match &fact.value {
+        TypedMemoryValue::Text(text) => hostile(text),
+        TypedMemoryValue::PathList(paths) => paths.iter().any(|path| hostile(path)),
+        TypedMemoryValue::Json(value) => serde_json::to_string(value)
+            .map(|encoded| hostile(&encoded))
+            .unwrap_or(false),
+        TypedMemoryValue::Bool(_) | TypedMemoryValue::Number(_) => false,
+    }
+}
+
+/// Words that describe the REQUEST rather than repository identity. Keeping
+/// them retrieves every README/test/Cargo.toml and buries the definition the
+/// task is about under generic matches.
+fn is_generic_goal_word(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "across"
+            | "add"
+            | "after"
+            | "again"
+            | "against"
+            | "all"
+            | "also"
+            | "and"
+            | "api"
+            | "apply"
+            | "are"
+            | "assert"
+            | "avoid"
+            | "based"
+            | "because"
+            | "before"
+            | "behavior"
+            | "behaviour"
+            | "bug"
+            | "call"
+            | "caller"
+            | "callers"
+            | "can"
+            | "change"
+            | "check"
+            | "code"
+            | "correct"
+            | "create"
+            | "current"
+            | "does"
+            | "don"
+            | "each"
+            | "edit"
+            | "ensure"
+            | "error"
+            | "every"
+            | "existing"
+            | "fail"
+            | "failing"
+            | "file"
+            | "files"
+            | "find"
+            | "fix"
+            | "for"
+            | "from"
+            | "function"
+            | "functional"
+            | "helper"
+            | "implementation"
+            | "implement"
+            | "into"
+            | "keep"
+            | "line"
+            | "make"
+            | "module"
+            | "must"
+            | "need"
+            | "never"
+            | "new"
+            | "not"
+            | "old"
+            | "only"
+            | "output"
+            | "pass"
+            | "passes"
+            | "please"
+            | "problem"
+            | "public"
+            | "refactor"
+            | "rename"
+            | "require"
+            | "required"
+            | "return"
+            | "returns"
+            | "run"
+            | "same"
+            | "should"
+            | "signature"
+            | "source"
+            | "still"
+            | "task"
+            | "test"
+            | "tests"
+            | "than"
+            | "that"
+            | "the"
+            | "their"
+            | "them"
+            | "then"
+            | "there"
+            | "these"
+            | "this"
+            | "through"
+            | "under"
+            | "update"
+            | "use"
+            | "used"
+            | "uses"
+            | "using"
+            | "value"
+            | "values"
+            | "verify"
+            | "with"
+            | "without"
+            | "works"
+            | "your"
+    )
+}
+
+/// Higher signal = an identifier/path the repository is likely indexed by,
+/// not prose. Identifier-shaped tokens (`compute_total`, `parsettl`) and
+/// path-shaped tokens (`src/parse.js` tokenizes to `parse`) rank ahead of
+/// ordinary nouns.
+fn concept_signal(token: &str) -> u8 {
+    let mut signal = 0;
+    if token.contains('_') || token.contains('-') {
+        signal += 3;
+    }
+    if token.len() >= 6 {
+        signal += 1;
+    }
+    if token.chars().any(|c| c.is_ascii_digit()) {
+        signal += 1;
+    }
+    signal
+}
+
+/// Words the worker's own prose uses to ask for evidence; they are not
+/// repository identity either.
+fn is_retrieval_noise(token: &str) -> bool {
+    is_generic_goal_word(token)
+        || matches!(
+            token,
+            "line" | "src" | "lib" | "main" | "index" | "test" | "tests" | "spec"
+        )
+}
+
 impl AgentRuntime {
-    /// Concepts from the retrieval signal (spec §20): the prompt's own
-    /// words first, then basename tokens of the changed files (so edited
-    /// files rank for follow-up), then failure keywords. Bounded, deduped —
-    /// mirrors `faktor_cli::evidence::RepoEvidence::concepts` so the
-    /// index-backed path and the bounded-scan fallback agree.
+    /// The CURRENT user prompt (the newest durable user row), never the
+    /// session title. The title is a label (often "task" or "cli run") and
+    /// using it as the goal made the contract compiler analyze the label
+    /// instead of the task, leaving every test obligation and risk empty.
+    pub(crate) fn latest_user_prompt(handle: &faktor_session::SessionHandle) -> Option<String> {
+        let page = handle.messages_before(None, 8).ok()?;
+        for row in page {
+            if row.role != "user" {
+                continue;
+            }
+            if let Some(text) = row
+                .data
+                .get("text")
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.trim().is_empty())
+            {
+                return Some(text.to_string());
+            }
+        }
+        None
+    }
+
+    /// Concepts from the retrieval signal (spec §20): identifier-shaped
+    /// prompt tokens first, then remaining prompt tokens, then basename tokens
+    /// of the changed files (so edited files rank for follow-up), then failure
+    /// keywords. Generic request prose ("fix", "file", "tests", "the") is
+    /// dropped: it matches every file and is the main cause of the package
+    /// burying the actual definition under noise. Bounded, deduped — mirrors
+    /// `faktor_cli::evidence::RepoEvidence::concepts` so the index-backed path
+    /// and the bounded-scan fallback agree.
     pub(crate) fn evidence_concepts(query: &EvidenceQuery) -> Vec<String> {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         let push_tokens = |text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
-            for tok in faktor_index::tokenize(text).into_iter().take(512) {
-                if tok.len() < INDEX_EVIDENCE_CONCEPT_MIN_CHARS || !seen.insert(tok.clone()) {
+            let mut tokens: Vec<(u8, usize, String)> = faktor_index::tokenize(text)
+                .into_iter()
+                .enumerate()
+                .filter(|(_, tok)| {
+                    tok.len() >= INDEX_EVIDENCE_CONCEPT_MIN_CHARS && !is_retrieval_noise(tok)
+                })
+                .map(|(position, tok)| (concept_signal(&tok), position, tok))
+                .collect();
+            tokens.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            for (_, _, tok) in tokens.into_iter().take(512) {
+                if !seen.insert(tok.clone()) {
                     continue;
                 }
                 out.push(tok);
@@ -1399,15 +1742,117 @@ impl AgentRuntime {
             );
             return Ok(None);
         }
+        // The index stores paths/symbol lines but NOT file bodies, so the raw
+        // hit snippet was often only the path. Read a bounded window around
+        // the matched definition/usage from the EFFECTIVE root (the shadow
+        // while shadowed) and label it, instead of handing the model a list of
+        // filenames and forcing whole-file reads.
+        let workspace = self.open_effective_workspace(handle);
+        let mut ranked: Vec<(u8, usize, Evidence)> = Vec::new();
+        let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (index, hit) in hits.iter().enumerate() {
+            let window = workspace.as_ref().and_then(|ws| {
+                evidence_window(
+                    ws,
+                    &hit.path,
+                    &concepts,
+                    evidence_line_hint(&hit.snippet),
+                    false,
+                )
+            });
+            let (priority, kind, snippet) = match window {
+                Some(window) => (
+                    match window.kind {
+                        "definition" => 3u8,
+                        "test" => 2,
+                        _ => 1,
+                    },
+                    window.kind,
+                    window.snippet,
+                ),
+                None => (
+                    0u8,
+                    if is_test_evidence_path(&hit.path) {
+                        "test"
+                    } else {
+                        "usage"
+                    },
+                    hit.snippet.clone(),
+                ),
+            };
+            if !seen_paths.insert(hit.path.clone()) {
+                continue;
+            }
+            let score = match kind {
+                "definition" => 1.0,
+                "test" => 0.9,
+                _ => 0.8,
+            } - index as f64 * 0.005;
+            ranked.push((
+                priority,
+                index,
+                Evidence {
+                    path: hit.path.clone(),
+                    snippet: self.redact_configured_secrets(&snippet),
+                    score,
+                },
+            ));
+        }
+        // Tests are the contract's executable meaning. Add bounded test-file
+        // windows that mention a high-signal concept even when the fused
+        // ranking (dominated by definitions/usages) would have dropped them.
+        if let Some(ws_handle) = workspace.as_ref() {
+            let high_signal: Vec<String> = concepts
+                .iter()
+                .filter(|concept| concept_signal(concept) > 0)
+                .take(6)
+                .cloned()
+                .collect();
+            let probe_concepts = if high_signal.is_empty() {
+                concepts.clone()
+            } else {
+                high_signal
+            };
+            let test_paths: Vec<String> = {
+                let index = view.index();
+                let guard = index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard
+                    .file_paths(ws)
+                    .into_iter()
+                    .filter(|path| is_test_evidence_path(path))
+                    .take(24)
+                    .collect()
+            };
+            let mut added = 0usize;
+            for path in test_paths {
+                if added >= 3 || seen_paths.contains(&path) {
+                    continue;
+                }
+                let Some(window) = evidence_window(ws_handle, &path, &probe_concepts, None, true)
+                else {
+                    continue;
+                };
+                seen_paths.insert(path.clone());
+                ranked.push((
+                    2,
+                    hits.len() + added,
+                    Evidence {
+                        path,
+                        snippet: self.redact_configured_secrets(&window.snippet),
+                        score: 0.9 - added as f64 * 0.01,
+                    },
+                ));
+                added += 1;
+            }
+        }
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        ranked.truncate(INDEX_EVIDENCE_MAX_HITS);
         Ok(Some(IndexEvidencePackage {
-            evidence: hits
+            evidence: ranked
                 .into_iter()
-                .enumerate()
-                .map(|(i, h)| Evidence {
-                    path: h.path,
-                    snippet: h.snippet,
-                    score: 1.0 / (1.0 + i as f64),
-                })
+                .map(|(_, _, evidence)| evidence)
                 .collect(),
             meta,
         }))
@@ -1560,7 +2005,9 @@ impl AgentRuntime {
         // stays bounded by the same MAX_RULES_BYTES cap. A hostile tree
         // (oversized authority rules) is a surfaced warn — repository rules
         // are never silently truncated into the prompt.
-        let prompt_hint = handle.title().unwrap_or_default();
+        let prompt_hint = Self::latest_user_prompt(handle)
+            .or_else(|| handle.title().ok())
+            .unwrap_or_default();
         // I-11: the FIRST hop of this turn captures the instruction bundle
         // (epoch + real bundle digest); every later hop with the SAME op is
         // pinned to that epoch. A mid-turn rule edit therefore changes the
@@ -1595,7 +2042,7 @@ impl AgentRuntime {
                     })
                     .flatten()
             });
-        let mut captured_epoch = None;
+        let mut captured_binding: Option<(String, String)> = None;
         match self.deps.instructions_resolver.resolve_for_session(
             handle.id().raw(),
             row.workspace_id.raw(),
@@ -1603,7 +2050,24 @@ impl AgentRuntime {
         ) {
             Ok(loaded) => {
                 if pinned.is_none() {
-                    captured_epoch = loaded.epoch().map(|epoch| epoch.to_string());
+                    // Capture the SAME loaded tree the turn renders: the
+                    // old code resolved the workspace a second time here
+                    // (a second provider root read + cache lock + full
+                    // rule scan) just to hash the bundle. One snapshot,
+                    // one material walk.
+                    if let Some(epoch) = loaded.epoch() {
+                        let mut material = Vec::new();
+                        if let Some(instructions) = loaded.instructions() {
+                            for instruction in instructions.all() {
+                                material.extend_from_slice(instruction.path.as_bytes());
+                                material.push(0);
+                                material.extend_from_slice(instruction.hash.to_string().as_bytes());
+                                material.push(0);
+                            }
+                        }
+                        let bundle_hash = blake3::hash(&material).to_hex().to_string();
+                        captured_binding = Some((epoch.to_string(), bundle_hash));
+                    }
                 }
                 for instr in loaded.active_for(&prompt_hint, &[]).iter().take(16) {
                     // Same provenance guard per appended rule: a repository-
@@ -1632,25 +2096,7 @@ impl AgentRuntime {
                 );
             }
         }
-        if let Some(epoch) = captured_epoch {
-            // The SAME material hash the instruction inspector exposes:
-            // ordered (path, file hash) pairs, each NUL-terminated.
-            let mut material = Vec::new();
-            if let Ok(loaded) = self.deps.instructions_resolver.resolve_for_session(
-                handle.id().raw(),
-                row.workspace_id.raw(),
-                None,
-            ) {
-                if let Some(instructions) = loaded.instructions() {
-                    for instruction in instructions.all() {
-                        material.extend_from_slice(instruction.path.as_bytes());
-                        material.push(0);
-                        material.extend_from_slice(instruction.hash.to_string().as_bytes());
-                        material.push(0);
-                    }
-                }
-            }
-            let bundle_hash = blake3::hash(&material).to_hex().to_string();
+        if let Some((epoch, bundle_hash)) = captured_binding {
             let _ = self.deps.session.store().put_instruction_binding(
                 faktor_store::InstructionBindingRow {
                     session_id: handle.id(),
@@ -1680,7 +2126,12 @@ impl AgentRuntime {
                 let name = meta
                     .path
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
+                    .map(|n| {
+                        // File names are repository DATA: control characters
+                        // (embedded newlines included) must never open a
+                        // prompt section inside the stable repository map.
+                        faktor_context::sanitize_ledger_text(&n.to_string_lossy())
+                    })
                     .unwrap_or_default();
                 let child = if rel.is_empty() {
                     name.clone()
@@ -1746,6 +2197,28 @@ impl AgentRuntime {
                 .cmp(&a.updated_ms)
                 .then_with(|| b.version.cmp(&a.version))
                 .then_with(|| a.id.cmp(&b.id))
+        });
+        // Provenance guard (memory is model/tool-writable DATA): a stored
+        // fact that carries instruction-override phrasing is withheld from
+        // the semi-stable head exactly like hostile evidence/rules. The
+        // DATA banner is not an enforcement boundary, so the override scan
+        // is. Only the RENDERED fields are scanned: the old path serialized
+        // every whole fact (including `previous`, a retained history value
+        // that never reaches the model) on every hop, which both burned an
+        // allocation per fact and could withhold a clean fact because of a
+        // stale revision.
+        facts.retain(|fact| {
+            if memory_fact_carries_override(fact) {
+                tracing::warn!(
+                    session = %handle.id(),
+                    fact = %fact.id,
+                    "withholding memory fact: instruction-override phrasing detected \
+                     (memory rows are data, not instruction authority)"
+                );
+                false
+            } else {
+                true
+            }
         });
         let mut out = faktor_memory::render_context_facts(&facts, MEMORY_RENDER_BUDGET_BYTES);
         out.truncate(MEMORY_RENDER_BUDGET_BYTES);

@@ -193,8 +193,28 @@ impl EvidenceProvider for EmbedderEvidence {
     }
 }
 
+/// The complete text the provider receives: the stable system head plus
+/// every message part (including the trailing volatile-context message).
+pub(crate) fn wire_text(req: &GenericAgentRequest) -> String {
+    let mut out = req.system.clone();
+    for message in &req.messages {
+        for part in &message.content {
+            match &part.kind {
+                faktor_provider::ContentKind::Text { text }
+                | faktor_provider::ContentKind::Reasoning { text }
+                | faktor_provider::ContentKind::ToolResult { content: text, .. } => {
+                    out.push('\n');
+                    out.push_str(text);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// One full turn over a two-file corpus with a Ready index generation,
-/// producing the CAPTURED wire request's system prompt.
+/// producing the CAPTURED wire request's full text.
 pub(crate) async fn captured_system_for_prompt(
     embedder: Option<Arc<dyn faktor_search::Embedder>>,
     prompt: &str,
@@ -235,7 +255,7 @@ pub(crate) async fn captured_system_for_prompt(
     let hook = {
         let seen = seen.clone();
         move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
-            *seen.lock().unwrap() = Some(req.system.clone());
+            *seen.lock().unwrap() = Some(wire_text(req));
             Ok(())
         }
     };
@@ -251,6 +271,53 @@ pub(crate) async fn captured_system_for_prompt(
     runtime.run_turn(sid, prompt, &[]).await.unwrap();
     let captured = seen.lock().unwrap().clone().expect("request sent");
     captured
+}
+
+/// Every production model call must carry an EXPLICIT output cap on the
+/// wire. `None` delegates the bound to the provider; the native Ollama
+/// runtime treats an absent `num_predict` as unbounded and a measured
+/// 340-turn run emitted 20,968 tokens in one iteration (a token-burn/DoS
+/// hole, not a theoretical one). The cap is the resolved model profile's
+/// max_output — the dimension the router priced and qualified.
+#[tokio::test]
+async fn every_model_request_carries_the_explicit_output_cap() {
+    let provider = scripted_provider(vec![
+        ScriptedResponse::Text("ok".into()),
+        ScriptedResponse::End,
+    ]);
+    let (mut adeps, _dir) = deps_with(
+        Arc::new(provider.clone()) as Arc<dyn faktor_provider::Provider>,
+        vec![],
+    );
+    let (_manager, sid) = shared_session(&adeps);
+    let captured: Arc<std::sync::Mutex<Vec<Option<usize>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = captured.clone();
+    let inspected: Arc<dyn faktor_provider::Provider> = Arc::new(InspectingProvider::new(
+        Arc::new(provider),
+        move |_n, req| {
+            seen.lock().unwrap().push(req.max_output);
+            Ok(())
+        },
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(inspected).unwrap();
+    adeps.providers = Arc::new(registry);
+    let caps = adeps
+        .providers
+        .capabilities("fake", "m")
+        .expect("registered provider capabilities");
+    let runtime = AgentRuntime::new(adeps).unwrap();
+    runtime.run_turn(sid, "hi", &[]).await.unwrap();
+    let caps_seen = captured.lock().unwrap().clone();
+    assert!(!caps_seen.is_empty(), "the provider must be called");
+    for cap in caps_seen {
+        assert_eq!(
+            cap,
+            Some(caps.max_output),
+            "the wire must bound generation to the model profile, never None"
+        );
+    }
 }
 
 // -------------------------------------------------------- prefix fill

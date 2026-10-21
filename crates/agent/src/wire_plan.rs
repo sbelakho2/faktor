@@ -268,7 +268,7 @@ pub fn plan_wire_turn_with_counter(
     // hashed and counter-looked-up a single time; the shrink passes below
     // only re-run the pure planner over the same priced candidates).
     let (message_candidates, evidence_candidates, ev_by_id) =
-        price_candidates(history, evidence, counter);
+        price_candidates(history, evidence, counter, volatile_budget);
     let mut last_error: Option<WirePlanError> = None;
     for _ in 0..MAX_REPLANS {
         let (messages_kept, evidence_kept) = select_window(
@@ -329,27 +329,51 @@ pub fn plan_wire_turn_with_counter(
 /// message. Calls themselves are never dropped: a call's result, when it
 /// exists, always sits newer than the call and therefore inside a suffix
 /// window that contains the call.
-fn pairing_aware_window(history: &[RequestMessage], mut kept: usize) -> usize {
+///
+/// The newest index of every call id is indexed ONCE (O(history)); the
+/// previous implementation rebuilt a call-id set from the shrinking suffix
+/// for every dropped head, which is O(history²) for a long run of leading
+/// tool results. A call is inside the window iff its newest index is at or
+/// after the window start (a call can only pair with a newer result).
+fn pairing_aware_window(history: &[RequestMessage], kept: usize) -> usize {
+    let mut lookups = 0u64;
+    pairing_aware_window_counted(history, kept, &mut lookups)
+}
+
+fn pairing_aware_window_counted(
+    history: &[RequestMessage],
+    mut kept: usize,
+    lookups: &mut u64,
+) -> usize {
     kept = kept.min(history.len());
+    if kept == 0 {
+        return 0;
+    }
+    // Newest occurrence of each call id, built in one pass over the whole
+    // history (older duplicates are irrelevant: pairing only needs to know
+    // whether SOME call with the id survives in the suffix).
+    let mut newest_call: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(history.len() / 4);
+    for (index, message) in history.iter().enumerate() {
+        for part in &message.content {
+            if let ContentKind::ToolCall { id, .. } = &part.kind {
+                newest_call.insert(id.as_str(), index);
+            }
+        }
+    }
     while kept > 0 {
         let start = history.len() - kept;
         let head = &history[start];
         if head.role != Role::User || !has_tool_result(head) {
             break;
         }
-        let calls: std::collections::HashSet<&str> = history[start..]
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .filter_map(|p| match &p.kind {
-                ContentKind::ToolCall { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        let dangling = head.content.iter().any(|p| match &p.kind {
-            ContentKind::ToolResult { .. } => p
-                .tool_call_id
-                .as_deref()
-                .is_none_or(|id| !calls.contains(id)),
+        let dangling = head.content.iter().any(|part| match &part.kind {
+            ContentKind::ToolResult { .. } => {
+                *lookups = lookups.saturating_add(1);
+                part.tool_call_id
+                    .as_deref()
+                    .is_none_or(|id| newest_call.get(id).is_none_or(|&call| call < start))
+            }
             _ => false,
         });
         if dangling {
@@ -397,6 +421,7 @@ fn price_candidates<'a>(
     history: &[RequestMessage],
     evidence: &'a [Evidence],
     counter: &dyn TokenCounter,
+    message_token_cap: u32,
 ) -> (
     Vec<ContextCandidate>,
     Vec<ContextCandidate>,
@@ -405,10 +430,24 @@ fn price_candidates<'a>(
     // Message candidates newest-first (the durable loader contract), sized
     // by the renderer's exact per-message accounting (text runs through the
     // counter — repeat plans of identical content hit the token cache
-    // instead of re-tokenizing).
-    let mut messages: Vec<ContextCandidate> = Vec::with_capacity(history.len());
+    // instead of re-tokenizing). Pricing STOPS once the newest-first
+    // cumulative price reaches the volatile budget: the selector takes a
+    // contiguous newest prefix and can never admit an older message past
+    // that point, so pricing the rest of a 10k-message transcript every
+    // turn is pure waste (one boundary message is kept so the selector can
+    // see the first non-fitting row).
+    let cap = u64::from(message_token_cap);
+    let mut priced_tokens = 0u64;
+    let mut messages: Vec<ContextCandidate> = Vec::with_capacity(
+        history.len().min(
+            usize::try_from(cap / 2)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+        ),
+    );
     for (i, m) in history.iter().rev().enumerate() {
         let tokens = estimate_message(counter, m);
+        priced_tokens = priced_tokens.saturating_add(u64::try_from(tokens).unwrap_or(u64::MAX));
         messages.push(ContextCandidate {
             id: format!("msg:{i}"),
             kind: CandidateKind::Message,
@@ -417,6 +456,9 @@ fn price_candidates<'a>(
             utility: 1.0,
             ..ContextCandidate::default()
         });
+        if priced_tokens >= cap {
+            break;
+        }
     }
     // Evidence candidates: the exact rendered block text (the renderer's
     // `truncate(snippet, 1500)` shape) plus the per-block envelope, so the
@@ -621,19 +663,16 @@ impl<'a> TurnCandidatePlanner<'a> {
 
     /// Seed the pre-built plan of the planning `model` (the runtime's
     /// pre-route render): building it again would be a second render of a
-    /// request that already exists. Exactness is re-derived through the
-    /// same counter identity (cache hits — no re-tokenization). The plan is
-    /// MOVED in; the runtime recovers it with
+    /// request that already exists. The plan's own `total_tokens`/`exact`
+    /// ride along (no re-tokenization). The plan is MOVED in; the runtime
+    /// recovers it with
     /// [`TurnCandidatePlanner::take_seed_plan`] when the route ends unsized.
     pub fn seed(&self, model: &str, plan: WirePlan) {
-        let counter = ModelTokenCounter::new(model, self.cache);
-        let probe = ExactnessProbe::new(&counter);
-        let estimate = faktor_context::wire_plan::size_request_with_counter(
-            &probe,
-            &plan.system,
-            &plan.messages,
-            &plan.tools,
-        );
+        // The plan carries its OWN measured total and the exactness of every
+        // counted run, so seeding never re-tokenizes the rendered request
+        // (the old path re-sized 1M-token plans on every turn just to
+        // recover a boolean).
+        let exact = plan.exact;
         let mut seeded = self
             .seeded
             .lock()
@@ -641,7 +680,7 @@ impl<'a> TurnCandidatePlanner<'a> {
         *seeded = Some(SeededPlan {
             model: model.to_string(),
             plan,
-            exact: estimate.kind == faktor_context::TokenEstimateKind::Exact,
+            exact,
         });
     }
 
@@ -746,6 +785,348 @@ mod tests {
     use faktor_context::wire_plan::WirePlan;
     use faktor_context::{PromptSegments, WirePlanError};
 
+    /// The rendered conversation WITHOUT the ONE trailing volatile-context
+    /// message (the planner window comparison).
+    fn history_part(plan: &WirePlan) -> Vec<RequestMessage> {
+        plan.messages
+            .iter()
+            .filter(|message| {
+                !message.content.first().is_some_and(|part| {
+                    matches!(
+                        &part.kind,
+                        ContentKind::Text { text }
+                            if text.starts_with(&format!(
+                                "\n{}",
+                                faktor_context::wire_plan::VOLATILE_CONTEXT_HEADER
+                            ))
+                    )
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The trailing volatile-context text (task progress/evidence/errors).
+    fn volatile_text(plan: &WirePlan) -> &str {
+        plan.messages
+            .iter()
+            .find_map(
+                |message| match message.content.first().map(|part| &part.kind) {
+                    Some(ContentKind::Text { text })
+                        if text.starts_with(&format!(
+                            "\n{}",
+                            faktor_context::wire_plan::VOLATILE_CONTEXT_HEADER
+                        )) =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                },
+            )
+            .unwrap_or("")
+    }
+
+    #[test]
+    #[ignore = "perf probe: 10k messages / ~1M tokens through the real planner"]
+    fn perf_probe_ten_thousand_messages_one_million_tokens() {
+        // 10k messages, each ~100+ tokens (≈660 ASCII chars): ~1M tokens.
+        let history: Vec<RequestMessage> = (0..10_000)
+            .map(|i| RequestMessage {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: vec![ContentPart::text(format!("turn {i}: {}", "x".repeat(660)))],
+            })
+            .collect();
+        let budget = ContextBudget {
+            system: 20_000,
+            tools: 10_000,
+            working: 20_000,
+            retrieved: 20_000,
+            recent: 1_000_000,
+            output_reserve: 50_000,
+            safety: 20_000,
+        };
+        let cache = TokenCache::new();
+        // Warm the cache with the same content (the second-turn shape).
+        let warm = plan_wire_turn(
+            "You are Faktor.\n",
+            "",
+            &[tool("read_file")],
+            "rules",
+            &ledger(),
+            "map",
+            &history,
+            &[],
+            &budget,
+            TEST_MODEL,
+            &cache,
+        );
+        let warm = match warm {
+            Ok(plan) => plan,
+            Err(err) => panic!("probe plan must fit: {err}"),
+        };
+        let hits_before = cache.hits();
+        let started = std::time::Instant::now();
+        let plan = plan_wire_turn(
+            "You are Faktor.\n",
+            "",
+            &[tool("read_file")],
+            "rules",
+            &ledger(),
+            "map",
+            &history,
+            &[],
+            &budget,
+            TEST_MODEL,
+            &cache,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "PLAN10K messages={} selected={} tokens={} warm_ms={} hits={} misses={}",
+            history.len(),
+            plan.messages.len(),
+            plan.total_tokens,
+            elapsed.as_millis(),
+            cache.hits() - hits_before,
+            cache.misses()
+        );
+        assert_eq!(plan.messages.len(), warm.messages.len());
+    }
+
+    #[test]
+    #[ignore = "perf probe: 10k messages + 256 evidence snippets through the real planner"]
+    fn perf_probe_evidence_dedupe_against_one_million_token_history() {
+        // The dedupe haystack is bounded by the planner's own history
+        // window, but it must be built LAZILY (no evidence = no scan) and
+        // in one allocation pass: 10k messages / ~1M tokens + 256 distinct
+        // snippets is the worst case the renderer can see in one turn.
+        let history: Vec<RequestMessage> = (0..10_000)
+            .map(|i| RequestMessage {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: vec![ContentPart::text(format!("turn {i}: {}", "x".repeat(660)))],
+            })
+            .collect();
+        let evidence: Vec<Evidence> = (0..256)
+            .map(|i| Evidence {
+                path: format!("src/ev{i}.rs"),
+                snippet: format!("distinct snippet {i} {}", "e".repeat(1400)),
+                score: (256 - i) as f64,
+            })
+            .collect();
+        let budget = ContextBudget {
+            system: 20_000,
+            tools: 10_000,
+            working: 20_000,
+            retrieved: 20_000,
+            recent: 1_000_000,
+            output_reserve: 50_000,
+            safety: 20_000,
+        };
+        let cache = TokenCache::new();
+        let plan = |cache: &TokenCache| {
+            plan_wire_turn(
+                "You are Faktor.\n",
+                "",
+                &[tool("read_file")],
+                "rules",
+                &ledger(),
+                "map",
+                &history,
+                &evidence,
+                &budget,
+                TEST_MODEL,
+                cache,
+            )
+        };
+        let warm = match plan(&cache) {
+            Ok(plan) => plan,
+            Err(err) => panic!("probe plan must fit: {err}"),
+        };
+        let started = std::time::Instant::now();
+        let plan = plan(&cache).unwrap();
+        let elapsed = started.elapsed();
+        let volatile = plan
+            .messages
+            .last()
+            .and_then(|m| m.content.first())
+            .map(|part| match &part.kind {
+                ContentKind::Text { text } => text.matches("### ").count(),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        eprintln!(
+            "EVIDENCE10K messages={} evidence={} rendered_evidence={} tokens={} warm_ms={}",
+            history.len(),
+            evidence.len(),
+            volatile,
+            plan.total_tokens,
+            elapsed.as_millis()
+        );
+        assert_eq!(plan.total_tokens, warm.total_tokens);
+        assert!(volatile > 0, "some evidence must ride the volatile block");
+    }
+
+    #[test]
+    fn ten_thousand_leading_tool_results_drop_in_one_bounded_pass() {
+        let history: Vec<RequestMessage> = (0..10_000)
+            .map(|i| RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result(
+                    "x",
+                    false,
+                    format!("missing-call-{i}"),
+                )],
+            })
+            .collect();
+        let mut lookups = 0u64;
+        let started = std::time::Instant::now();
+        let kept = pairing_aware_window_counted(&history, history.len(), &mut lookups);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "PAIRING results={} kept={} lookups={} elapsed_ms={}",
+            history.len(),
+            kept,
+            lookups,
+            elapsed.as_millis()
+        );
+        assert_eq!(kept, 0);
+        assert!(
+            lookups <= history.len() as u64,
+            "each dropped head must be one O(1) index lookup, got {lookups} for {} heads (the old suffix rescan was O(n^2))",
+            history.len()
+        );
+        let _ = elapsed;
+    }
+
+    #[test]
+    fn pairing_window_keeps_a_head_whose_call_is_inside_the_suffix() {
+        let history = vec![
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("orphan", false, "missing")],
+            },
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    "c1",
+                    "read_file",
+                    serde_json::json!({}),
+                )],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("ok", false, "c1")],
+            },
+        ];
+        let mut lookups = 0u64;
+        // The suffix [call, result] starts on a call: unchanged.
+        assert_eq!(pairing_aware_window_counted(&history, 2, &mut lookups), 2);
+        // The full window starts on the orphaned result (call `missing`
+        // does not exist): only that head is dropped, the paired suffix stays.
+        assert_eq!(pairing_aware_window_counted(&history, 3, &mut lookups), 2);
+        assert_eq!(lookups, 1, "one lookup for the one orphaned head");
+    }
+
+    #[test]
+    fn ten_thousand_message_pricing_stops_at_the_turn_budget() {
+        struct CountingCounter {
+            texts: std::sync::atomic::AtomicUsize,
+        }
+        impl TokenCounter for CountingCounter {
+            fn count_text(&self, text: &str) -> faktor_context::TokenEstimate {
+                self.texts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                faktor_context::TokenEstimate::upper_bound(
+                    u64::try_from(text.len() / 3 + 1).unwrap_or(u64::MAX),
+                )
+            }
+            fn count_json(&self, _value: &serde_json::Value) -> faktor_context::TokenEstimate {
+                faktor_context::TokenEstimate::upper_bound(0)
+            }
+        }
+        let history: Vec<RequestMessage> = (0..10_000)
+            .map(|i| RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text(format!("msg {i} {}", "x".repeat(100)))],
+            })
+            .collect();
+        let counter = CountingCounter {
+            texts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let budget = 1_000u32;
+        let (messages, _, _) = price_candidates(&history, &[], &counter, budget);
+        let counted = counter.texts.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "PRICING history={} priced={} text_counts={} budget={}",
+            history.len(),
+            messages.len(),
+            counted,
+            budget
+        );
+        assert!(
+            messages.len() < history.len() / 10,
+            "only the newest budget-fitting window may be priced, got {} of {}",
+            messages.len(),
+            history.len()
+        );
+        assert_eq!(
+            counted,
+            messages.len(),
+            "exactly one counter call per priced message"
+        );
+        // The priced set is still the newest-first contiguous window.
+        assert_eq!(messages.first().map(|c| c.id.as_str()), Some("msg:0"));
+    }
+
+    #[test]
+    fn plan_carries_honest_tokenizer_exactness() {
+        let b = ContextBudget::default();
+        let cache = TokenCache::new();
+        let history = small_history(4);
+        let exact = plan_wire_turn(
+            "sys",
+            "",
+            &[],
+            "",
+            &ledger(),
+            "",
+            &history,
+            &[],
+            &b,
+            "gpt-5",
+            &cache,
+        )
+        .unwrap();
+        assert!(exact.exact, "gpt-5 maps to the local o200k backend");
+        let fallback = plan_wire_turn(
+            "sys",
+            "",
+            &[],
+            "",
+            &ledger(),
+            "",
+            &history,
+            &[],
+            &b,
+            "claude-sonnet-4-5",
+            &cache,
+        )
+        .unwrap();
+        assert!(
+            !fallback.exact,
+            "a family with no local vocabulary is an honest upper bound"
+        );
+        assert!(exact.total_tokens > 0 && fallback.total_tokens > 0);
+    }
+
     #[test]
     fn planned_dimensions_surface_the_plans_real_totals() {
         let plan = WirePlan {
@@ -755,6 +1136,7 @@ mod tests {
             total_tokens: 12_345,
             cacheable_prefix_len: 0,
             prompt_segments: PromptSegments::default(),
+            exact: false,
         };
         let dims = planned_request_dimensions(&plan, 4096);
         assert_eq!(
@@ -852,15 +1234,16 @@ mod tests {
         assert!(plan.total_tokens <= b.context_max());
         // The planner window is a suffix of history (newest kept), and the
         // renderer did NOT trim further: messages equal the planned slice.
-        assert!(plan.messages.len() < 400 && !plan.messages.is_empty());
+        let window = history_part(&plan);
+        assert!(window.len() < 400 && !window.is_empty());
         assert_eq!(
-            plan.messages,
-            history[history.len() - plan.messages.len()..],
+            window,
+            &history[history.len() - window.len()..],
             "the render must send exactly the planner's window"
         );
         // Evidence survives budget pressure through utility, never as a
         // wholesale-dropped section.
-        assert!(plan.system.contains("## Retrieved evidence"));
+        assert!(volatile_text(&plan).contains("## Retrieved evidence"));
         // Byte-stable head: the boundary sits before the volatile tail and
         // equals the head a tool-less static render produces.
         let probe = plan_wire_request(
@@ -929,7 +1312,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            plan.system.contains("src/parser.rs"),
+            volatile_text(&plan).contains("src/parser.rs"),
             "high-utility evidence must survive a tight budget"
         );
         assert!(plan.total_tokens <= b.context_max());
@@ -949,17 +1332,18 @@ mod tests {
             &cache,
         )
         .unwrap();
+        let window = history_part(&plan);
         assert!(
-            plan.messages.len() < counterfactual.messages.len(),
+            window.len() < history_part(&counterfactual).len(),
             "message window must shrink instead of dropping all evidence: {} vs {}",
-            plan.messages.len(),
-            counterfactual.messages.len()
+            window.len(),
+            history_part(&counterfactual).len()
         );
-        assert!(plan.messages.len() < msgs.len(), "window is bounded");
+        assert!(window.len() < msgs.len(), "window is bounded");
         // Contiguity: still a newest suffix.
         assert_eq!(
-            plan.messages,
-            msgs[msgs.len() - plan.messages.len()..],
+            window,
+            &msgs[msgs.len() - window.len()..],
             "never a hole in the conversation window"
         );
     }
@@ -1396,18 +1780,19 @@ mod tests {
         .unwrap();
         // Performance distribution gates are release-mode only and run
         // outside the default CI suite.
-        assert!(plan.messages.len() < 20_000, "window must be bounded");
-        assert!(!plan.messages.is_empty());
+        let window = history_part(&plan);
+        assert!(window.len() < 20_000, "window must be bounded");
+        assert!(!window.is_empty());
         assert_eq!(
-            plan.messages,
-            history[history.len() - plan.messages.len()..],
+            window,
+            &history[history.len() - window.len()..],
             "the planner picked the newest window"
         );
         assert!(
-            !plan.system.contains("sym.rs"),
+            !volatile_text(&plan).contains("sym.rs"),
             "NaN-score evidence must never be selected"
         );
-        assert!(plan.system.contains("src/f2.rs"));
+        assert!(volatile_text(&plan).contains("src/f2.rs"));
         assert!(plan.total_tokens <= b.context_max());
     }
 
@@ -1459,9 +1844,9 @@ mod tests {
         )
         .unwrap();
         assert!(plan.total_tokens <= b.context_max());
-        assert!(!plan.messages.is_empty());
+        assert!(!history_part(&plan).is_empty());
         // Duplicate path rendered once.
-        assert_eq!(plan.system.matches("### dup.rs").count(), 1);
+        assert_eq!(volatile_text(&plan).matches("### dup.rs").count(), 1);
         assert!(plan.system.is_char_boundary(plan.cacheable_prefix_len));
     }
 
@@ -1568,17 +1953,16 @@ mod tests {
         let off = plan_with_prior(&history, &ev, &b, &cache, None);
         assert!(off.total_tokens <= b.context_max());
         assert!(
-            off.system.contains("### src/b.rs"),
+            volatile_text(&off).contains("### src/b.rs"),
             "baseline: the 0.6 block wins the single slot; system={}",
             off.system
         );
         assert!(
-            !off.system.contains("### src/a.rs"),
+            !volatile_text(&off).contains("### src/a.rs"),
             "baseline: only one block fits; system={}",
             off.system
         );
-        assert!(!off.system.contains("### src/a.rs"));
-        assert!(off.messages.is_empty());
+        assert!(history_part(&off).is_empty());
 
         let boost_a = RiskPrior(
             |c: &ContextCandidate| {
@@ -1591,18 +1975,26 @@ mod tests {
         );
         let on = plan_with_prior(&history, &ev, &b, &cache, Some(&boost_a));
         assert!(
-            on.system.contains("### src/a.rs"),
+            volatile_text(&on).contains("### src/a.rs"),
             "prior on: the protected 0.5 block wins the slot"
         );
-        assert!(!on.system.contains("### src/b.rs"));
-        assert_ne!(off.system, on.system, "the prior must change selection");
+        assert!(!volatile_text(&on).contains("### src/b.rs"));
+        assert_ne!(
+            volatile_text(&off),
+            volatile_text(&on),
+            "the prior must change selection"
+        );
         assert_eq!(
             off.cacheable_prefix().unwrap(),
             on.cacheable_prefix().unwrap(),
             "head bytes are prior-independent"
         );
         assert_eq!(off.cacheable_prefix_len, on.cacheable_prefix_len);
-        assert_eq!(off.messages, on.messages, "message window unchanged");
+        assert_eq!(
+            history_part(&off),
+            history_part(&on),
+            "message window unchanged"
+        );
         assert_eq!(off.tools, on.tools);
         assert!(on.total_tokens <= b.context_max());
     }
@@ -1750,7 +2142,8 @@ mod tests {
 
         let off = plan_with_prior(&[], &ev, &b, &cache, None);
         assert!(
-            off.system.contains("### src/b.rs") && !off.system.contains("### learning:"),
+            volatile_text(&off).contains("### src/b.rs")
+                && !volatile_text(&off).contains("### learning:"),
             "baseline: the 0.6 block wins the single slot; system={}",
             off.system
         );
@@ -1758,11 +2151,10 @@ mod tests {
         let prior = KeyedRiskPrior(risks);
         let on = plan_with_prior(&[], &ev, &b, &cache, Some(&prior));
         assert!(
-            on.system
-                .contains(&format!("### learning:{}", key.to_hex())),
+            volatile_text(&on).contains(&format!("### learning:{}", key.to_hex())),
             "the mined learning's omission risk must protect its candidate"
         );
-        assert!(!on.system.contains("### src/b.rs"));
+        assert!(!volatile_text(&on).contains("### src/b.rs"));
         assert_eq!(
             off.cacheable_prefix().unwrap(),
             on.cacheable_prefix().unwrap(),
@@ -1788,7 +2180,7 @@ mod tests {
                     .unwrap(),
             )),
         );
-        assert!(plain.system.contains("### src/b.rs"));
+        assert!(volatile_text(&plain).contains("### src/b.rs"));
         assert!(service.len() == 1);
     }
 

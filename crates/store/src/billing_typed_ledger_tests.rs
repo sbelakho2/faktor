@@ -686,7 +686,9 @@ fn settle_records_an_honest_cost_basis_and_amounts() {
     let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
     let tid = task.task_id;
     let now = now_ms();
-    // Provider-reported wins: basis ProviderReported.
+    // Provider under-report: the local token-priced amount is the floor.
+    // A spoofed 0 (or any below-local report) can never make a paid call
+    // free; the folded amount is the HIGHER local 1,620,000.
     let CostReserveOutcome::Granted(r1) = store
         .cost_reserve_priced(
             s.id,
@@ -714,8 +716,12 @@ fn settle_records_an_honest_cost_basis_and_amounts() {
         Some(1_620_000),
         "local 100k@15+2k@60"
     );
-    assert_eq!(row.settled_cost_micro, Some(9_999), "the folded amount");
-    assert_eq!(row.cost_basis.as_deref(), Some("ProviderReported"));
+    assert_eq!(
+        row.settled_cost_micro,
+        Some(1_620_000),
+        "the folded amount never undercuts the locally priced usage"
+    );
+    assert_eq!(row.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
     assert_eq!(row.estimated_cost_micro, Some(100_000));
     assert_eq!(row.delivery_state.as_deref(), Some("completed"));
     assert_eq!(
@@ -724,8 +730,31 @@ fn settle_records_an_honest_cost_basis_and_amounts() {
             .unwrap()
             .unwrap()
             .spent_cost_micro,
-        9_999
+        1_620_000
     );
+
+    // A provider report ABOVE the local lines still wins (invoice truth).
+    let CostReserveOutcome::Granted(r1b) = store
+        .cost_reserve_priced(
+            s.id,
+            tid,
+            OpId::new(11),
+            100_000,
+            now,
+            Some(&known_snapshot_json()),
+            ExecutionClass::Unknown,
+        )
+        .unwrap()
+    else {
+        panic!("reserve r1b")
+    };
+    store.cost_mark_dispatched(r1b, now).unwrap();
+    store
+        .cost_settle_usage(r1b, 100_000, 0, 0, 2_000, Some(2_000_000), None, now + 1)
+        .unwrap();
+    let row = store.cost_reservations_of(s.id, tid, 10).unwrap()[0].clone();
+    assert_eq!(row.settled_cost_micro, Some(2_000_000));
+    assert_eq!(row.cost_basis.as_deref(), Some("ProviderReported"));
 
     // No provider report: categories x the frozen snapshot, basis
     // RouteSnapshotEstimate.

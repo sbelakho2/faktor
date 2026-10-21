@@ -1810,7 +1810,7 @@ async fn legacy_client_criteria_fact_converges_to_the_derived_typed_row() {
     let fact = criteria_fact(&h2).expect("criteria fact present");
     assert_eq!(
         fact,
-        row.acceptance_criteria.first().cloned().unwrap_or_default(),
+        row.acceptance_criteria.join("\n"),
         "the durable fact is converged to the derived typed criteria"
     );
     assert!(
@@ -2196,7 +2196,10 @@ async fn slow_or_panicking_legacy_provider_cannot_block_the_turn() {
     let hook = {
         let captured = captured.clone();
         move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
-            captured.lock().unwrap().push(req.system.clone());
+            captured
+                .lock()
+                .unwrap()
+                .push(format!("{}\n{}", req.system, request_text(req)));
             Ok(())
         }
     };
@@ -2345,7 +2348,10 @@ async fn legacy_poll_served_keeps_ranking_and_is_durable_served() {
     let hook = {
         let captured = captured.clone();
         move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
-            captured.lock().unwrap().push(req.system.clone());
+            captured
+                .lock()
+                .unwrap()
+                .push(format!("{}\n{}", req.system, request_text(req)));
             Ok(())
         }
     };
@@ -3276,7 +3282,7 @@ async fn child_boundary_coordination_notice_is_bounded_never_a_body_and_memoized
     );
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 1, "one wire request for the turn");
-    let system = &requests[0].system;
+    let system = format!("{}\n{}", requests[0].system, request_text(&requests[0]));
     assert!(
         system.contains("coordination: 2 unread; use board_read"),
         "the bounded notice must ride the child prompt: {system}"

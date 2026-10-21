@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-20T21:53:41.944Z",
-  "commit": "96a5c2d0621f6c7c66f7baec48b06a9f0fe4368c",
-  "tree": "4cb3102cadc3ac40af0ffb473a0f138ee88057a2",
+  "generated_at": "2026-10-21T06:49:49.057Z",
+  "commit": "e16619cf69e2c41a0fb200e138138352d8ec457c",
+  "tree": "e26f51f9644babf83eb8939400203dba93066df3",
   "layers": [
     "structural",
     "unit",
@@ -19,12 +19,12 @@
     "release"
   ],
   "counts": {
-    "rows": 940,
+    "rows": 941,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
-      "builtin-tool": 8,
+      "builtin-tool": 9,
       "cli-command": 44,
       "config-key": 53,
       "control": 200,
@@ -40,20 +40,20 @@
     "by_status": {
       "deferred": 558,
       "proven": 320,
-      "stub": 62
+      "stub": 63
     },
     "by_lane": {
       "nightly": 512,
-      "pull": 609,
-      "trusted": 939,
+      "pull": 610,
+      "trusted": 940,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 396,
+      "contracts": 397,
       "ide-screen-readers": 385,
-      "state-model-crash": 250,
-      "unit-property": 235
+      "state-model-crash": 251,
+      "unit-property": 236
     }
   },
   "rows": [
@@ -24944,7 +24944,7 @@
           "hostile": {
             "case": "unicode-boundaries",
             "status": 200,
-            "bytes": 9032
+            "bytes": 9186
           }
         }
       }
@@ -26895,7 +26895,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/2682fffe1ddcb783153c8ff5d0603a8e"
+              "handle": "vault://provider_key/ce35eb043461ba9db55eb5ad0df40912"
             }
           },
           {
@@ -32990,6 +32990,41 @@
       "status": "stub",
       "meta": {
         "tool": "edit-file"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.list-dir",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.list-dir",
+        "tool.bounds.list-dir",
+        "tool.contract.list-dir"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "list-dir"
       },
       "adversarial": [
         "denied",

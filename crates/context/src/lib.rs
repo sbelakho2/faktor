@@ -160,9 +160,13 @@ impl TokenEstimate {
     }
 }
 
-/// Default LRU entry cap of [`TokenCache`] (configurable via
-/// [`TokenCache::with_capacity`]).
-pub const DEFAULT_TOKEN_CACHE_CAPACITY: usize = 4096;
+/// Default entry cap of [`TokenCache`] (configurable via
+/// [`TokenCache::with_capacity`]). Sized above the runtime's bounded
+/// `MAX_HISTORY_MESSAGES` window (2,000) with headroom for the system/tool
+/// segments, so a long conversation's unchanged messages stay warm across
+/// turns instead of thrashing a 4k LRU. 16k entries is ~1.3 MiB worst case
+/// (identity + 32-byte digest + count), still a hard bound.
+pub const DEFAULT_TOKEN_CACHE_CAPACITY: usize = 16_384;
 
 /// Deterministic content digest of a cache key (blake3 over the UTF-8
 /// bytes): identical across processes and independent cache instances.
@@ -173,39 +177,78 @@ fn content_hash(text: &str) -> FileHash {
 #[derive(Debug, Clone, Copy)]
 struct CacheEntry {
     estimate: TokenEstimate,
-    last_used: u64,
+    /// CLOCK second-chance bit: set on a hit, cleared when the hand passes.
+    referenced: bool,
 }
 
 struct TokenCacheInner {
     entries: HashMap<(TokenizerId, FileHash), CacheEntry>,
+    /// One slot per capacity: the CLOCK hand sweeps these and either clears
+    /// a referenced bit or replaces the victim. Eviction is O(1) amortized
+    /// instead of a full-cap least-recently-used scan on every miss.
+    slots: Vec<Option<(TokenizerId, FileHash)>>,
+    hand: usize,
     cap: usize,
-    clock: u64,
     hits: u64,
     misses: u64,
 }
 
 impl TokenCacheInner {
     fn new(cap: usize) -> Self {
+        let cap = cap.max(1);
         Self {
-            entries: HashMap::new(),
-            cap: cap.max(1),
-            clock: 0,
+            entries: HashMap::with_capacity(cap),
+            slots: vec![None; cap],
+            hand: 0,
+            cap,
             hits: 0,
             misses: 0,
         }
     }
 
-    /// Evict the least-recently-used entry (scan of ≤ cap entries). Ties
-    /// (identical stamps are impossible — every insert bumps) are broken
-    /// arbitrarily; only the evicted KEY choice can vary, never counts.
-    fn evict_lru(&mut self) {
-        let victim = self
-            .entries
-            .iter()
-            .min_by_key(|(_, v)| v.last_used)
-            .map(|(k, _)| *k);
-        if let Some(k) = victim {
-            self.entries.remove(&k);
+    /// Insert one new key, evicting a victim when full. A referenced victim
+    /// loses its bit and survives one sweep (second chance); an unreferenced
+    /// victim is replaced. Only the evicted KEY choice can vary — counts and
+    /// exactness never do.
+    fn insert(&mut self, key: (TokenizerId, FileHash), estimate: TokenEstimate) {
+        let mut slot = self.hand;
+        loop {
+            self.hand = (slot + 1) % self.cap;
+            match self.slots[slot].take() {
+                None => {
+                    self.slots[slot] = Some(key);
+                    self.entries.insert(
+                        key,
+                        CacheEntry {
+                            estimate,
+                            referenced: false,
+                        },
+                    );
+                    return;
+                }
+                Some(victim) => {
+                    if self
+                        .entries
+                        .get_mut(&victim)
+                        .is_some_and(|entry| std::mem::replace(&mut entry.referenced, false))
+                    {
+                        // Second chance: keep the victim in its slot.
+                        self.slots[slot] = Some(victim);
+                        slot = self.hand;
+                        continue;
+                    }
+                    self.entries.remove(&victim);
+                    self.slots[slot] = Some(key);
+                    self.entries.insert(
+                        key,
+                        CacheEntry {
+                            estimate,
+                            referenced: false,
+                        },
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -219,7 +262,7 @@ fn lock(inner: &Mutex<TokenCacheInner>) -> std::sync::MutexGuard<'_, TokenCacheI
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Bounded LRU cache of token counts keyed by
+/// Bounded CLOCK (second-chance LRU approximation) cache of token counts keyed by
 /// `(TokenizerId { family, version }, blake3(content hash))` (P0-81,
 /// audits 72/73). Thread-safe (interior mutex); misses run the registered
 /// tokenizer / estimator OUTSIDE the lock so a huge hostile text never
@@ -238,7 +281,7 @@ impl TokenCache {
         Self::with_registry(global_registry())
     }
 
-    /// A cache with a configurable LRU cap (`0` is clamped to `1`) and the
+    /// A cache with a configurable entry cap (`0` is clamped to `1`) and the
     /// process-wide registry.
     pub fn with_capacity(cap: usize) -> Self {
         Self::with_registry_capacity(global_registry(), cap)
@@ -250,7 +293,7 @@ impl TokenCache {
         Self::with_registry_capacity(registry, DEFAULT_TOKEN_CACHE_CAPACITY)
     }
 
-    /// A cache over an explicit registry with a configurable LRU cap (`0`
+    /// A cache over an explicit registry with a configurable entry cap (`0`
     /// is clamped to `1`).
     pub fn with_registry_capacity(registry: Arc<TokenizerRegistry>, cap: usize) -> Self {
         Self {
@@ -273,9 +316,7 @@ impl TokenCache {
             let inner = &mut *g; // direct field projections below: disjoint
             if let Some(entry) = inner.entries.get_mut(&key) {
                 inner.hits = inner.hits.saturating_add(1);
-                let now = inner.clock.wrapping_add(1);
-                inner.clock = now;
-                entry.last_used = now;
+                entry.referenced = true;
                 return entry.estimate;
             }
             inner.misses = inner.misses.saturating_add(1);
@@ -284,23 +325,12 @@ impl TokenCache {
         let estimate = self.registry.count(tokenizer, text);
         let mut g = lock(&self.inner);
         let inner = &mut *g;
-        let now = inner.clock.wrapping_add(1);
-        inner.clock = now;
         if let Some(entry) = inner.entries.get_mut(&key) {
             // Lost an insert race to another thread: the value is identical
-            // (same deterministic inputs); keep the newest stamp.
-            entry.last_used = now;
+            // (same deterministic inputs); mark it referenced.
+            entry.referenced = true;
         } else {
-            if inner.entries.len() >= inner.cap {
-                inner.evict_lru();
-            }
-            inner.entries.insert(
-                key,
-                CacheEntry {
-                    estimate,
-                    last_used: now,
-                },
-            );
+            inner.insert(key, estimate);
         }
         estimate
     }
@@ -320,7 +350,7 @@ impl TokenCache {
         lock(&self.inner).entries.get(&key).map(|e| e.estimate)
     }
 
-    /// LRU cap (entries).
+    /// Entry cap.
     pub fn capacity(&self) -> usize {
         lock(&self.inner).cap
     }
@@ -412,6 +442,40 @@ mod token_cache_tests {
 
     fn est(text: &str) -> u64 {
         u64::try_from(Estimator.estimate_tokens(text)).unwrap_or(u64::MAX)
+    }
+
+    #[test]
+    fn ten_thousand_distinct_texts_stay_warm_under_the_default_capacity() {
+        let cache = TokenCache::new();
+        let texts: Vec<String> = (0..10_000)
+            .map(|i| format!("turn {i}: {}", "x".repeat(330)))
+            .collect();
+        let first = std::time::Instant::now();
+        for text in &texts {
+            cache.count_tokenizer(TokenizerId::GENERIC_ESTIMATOR, text);
+        }
+        let cold = first.elapsed();
+        let hits_before = cache.hits();
+        let second = std::time::Instant::now();
+        for text in &texts {
+            cache.count_tokenizer(TokenizerId::GENERIC_ESTIMATOR, text);
+        }
+        let warm = second.elapsed();
+        eprintln!(
+            "TOKENCACHE cold_ms={} warm_ms={} warm_hits={} misses_total={} cap={}",
+            cold.as_millis(),
+            warm.as_millis(),
+            cache.hits() - hits_before,
+            cache.misses(),
+            cache.capacity()
+        );
+        assert_eq!(
+            cache.hits() - hits_before,
+            10_000,
+            "every unchanged 10k-message text must be a warm hit; the old 4k cap re-counted all of them"
+        );
+        assert_eq!(cache.misses(), 10_000, "cold pass counts exactly once");
+        let _ = (cold, warm);
     }
 
     #[test]

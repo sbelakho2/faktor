@@ -734,6 +734,11 @@ impl Instructions {
     /// matches their scope path or a `# Scope:` keyword directive.
     pub fn active_for(&self, prompt: &str, touched: &[String]) -> Vec<Instruction> {
         let mut out = Vec::new();
+        // The prompt is lowercased ONCE for every keyword directive (the old
+        // implementation allocated a full lowercase copy per keyword line,
+        // i.e. rules x directives x prompt bytes on every turn). Nothing is
+        // allocated when no rule declares a keyword.
+        let mut prompt_lower: Option<String> = None;
         for r in &self.rules {
             let top = r.scope.is_empty();
             let mut reason = None;
@@ -756,7 +761,9 @@ impl Instructions {
                 for line in r.content.lines().take(8) {
                     if let Some(kws) = line.trim_start().strip_prefix("# Scope:") {
                         for kw in kws.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                            if prompt.to_lowercase().contains(&kw.to_lowercase()) {
+                            let haystack =
+                                prompt_lower.get_or_insert_with(|| prompt.to_lowercase());
+                            if haystack.contains(&kw.to_lowercase()) {
                                 reason = Some(format!("keyword:{kw}"));
                                 break;
                             }

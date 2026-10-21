@@ -329,10 +329,6 @@ pub(crate) fn marker_session_verdict(marker: &serde_json::Value, session: u64) -
     }
 }
 
-/// Weak-but-honest summarizer: emits the ledger render. The compactor's hard
-/// invariant rejects it when it does not shrink enough.
-pub(crate) struct LedgerSummarizer;
-
 /// The REAL separate-compaction-model summarizer (spec §9 + §36): the
 /// configured compaction model streams an actual provider request that
 /// summarizes the recent history. The request carries its own compactor
@@ -1153,7 +1149,7 @@ impl AgentRuntime {
     pub(crate) async fn restore_task_rows(
         &self,
         handle: &faktor_session::SessionHandle,
-        ledger: &TaskLedger,
+        ledger: &mut TaskLedger,
     ) -> faktor_core::Result<()> {
         let task = match self.session_task(handle)? {
             Some(t) => t,
@@ -1185,6 +1181,9 @@ impl AgentRuntime {
                 if created.contract.is_empty() && !created.state.is_terminal() {
                     self.compile_baseline_contract(handle, &created).await;
                 }
+                if let Some(compiled) = self.session_task(handle)? {
+                    seed_ledger_contract(ledger, &compiled.contract);
+                }
                 return Ok(());
             }
         };
@@ -1213,6 +1212,15 @@ impl AgentRuntime {
         // logged and retried on the next drive; it never fails the turn.
         if healed.contract.is_empty() && !healed.state.is_terminal() {
             self.compile_baseline_contract(handle, &healed).await;
+        }
+        // The compiled contract is the actionable definition of done. Fold
+        // its constraints/invariants/required proofs into the durable-task
+        // view the wire prompt renders; without this the model never saw the
+        // obligations the end gate would enforce. Seeding is idempotent.
+        if let Some(source) = self.session_task(handle)? {
+            seed_ledger_contract(ledger, &source.contract);
+        } else {
+            seed_ledger_contract(ledger, &healed.contract);
         }
         let state_str = serde_json::to_value(healed.state)
             .ok()
@@ -2736,5 +2744,39 @@ impl AgentRuntime {
         if let Err(err) = self.route_task_to(handle, task_id, state) {
             self.record_durable_write_failure(handle, site, &intent, &err);
         }
+    }
+}
+
+/// Fold the compiled contract's actionable statements into the ledger view
+/// the wire prompt renders. Bounded, deterministic and idempotent (a replay
+/// or a later turn never duplicates a line). Provenance is preserved in the
+/// prefix so the model can tell a contract line from a user preference.
+fn seed_ledger_contract(
+    ledger: &mut TaskLedger,
+    contract: &faktor_core::contract::EngineeringContract,
+) {
+    const MAX_CONTRACT_LINES: usize = 12;
+    let mut push = |line: String| {
+        let line = truncate(&line, 160).to_string();
+        if ledger.constraints.len() >= MAX_CONTRACT_LINES
+            || ledger.constraints.iter().any(|existing| existing == &line)
+        {
+            return;
+        }
+        ledger.constraints.push(line);
+    };
+    // Proofs first: the ledger renders only the first eight constraints,
+    // and the executable definition of done is the most actionable line.
+    for obligation in contract.proof_obligations.iter().take(6) {
+        push(format!("proof required: {}", obligation.claim));
+    }
+    for invariant in contract.invariants.iter().take(2) {
+        push(format!("invariant: {}", invariant.statement));
+    }
+    for constraint in contract.constraints.iter().take(2) {
+        push(format!("contract: {}", constraint.statement));
+    }
+    for risk in contract.risks.iter().take(2) {
+        push(format!("risk: {}", risk.description));
     }
 }

@@ -459,9 +459,11 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
         // P0-1/wave-B: the descriptor's economics is the router's
         // per-token ESTIMATE surface ($1/Mtok in AND out); the
         // route-time price capture is cut from the catalog state
-        // ($1/M per-million-token quote) so settlement is priced at
-        // the frozen exact quote — 40 x 1 + 9 x 1 == 49 microUSD,
-        // never a fabricated 1-micro-per-token fallback.
+        // ($1/M per-million-token quote) so settlement is priced at the
+        // frozen exact quote — never a fabricated 1-micro-per-token
+        // fallback. The frame's 40-input report is below half the plan,
+        // so the runtime prices the plan's input floor (under-report
+        // guard) and the provider report can only raise the amount.
         economics: faktor_core::model::ModelEconomics {
             input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
             output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from_dollars_per_million(
@@ -523,9 +525,10 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
     let view = ledger
         .session_budget_view(session, task_id)
         .expect("durable budget view");
-    assert_eq!(
-        view.spent_cost_micro, 777,
-        "the provider-reported cost is authoritative at settlement"
+    assert!(
+        view.spent_cost_micro >= 777,
+        "the provider report is a price FLOOR: an under-reported token frame (40 in for a \
+         multi-hundred-token request) may not lower the local floor below the report"
     );
     let rows = ledger.reservations_of(session, task_id, 10).unwrap();
     assert_eq!(rows.len(), 1, "one reservation per paid call");
@@ -536,10 +539,10 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
         Some(777),
         "the provider-reported cost rides the reservation row"
     );
-    assert_eq!(
-        row.provider_cost_micro,
-        Some(49),
-        "the locally calculated cost (40 in + 9 out at the frozen 1 microUSD/token lines) is recorded too"
+    assert!(
+        row.provider_cost_micro.is_some_and(|cost| cost >= 777),
+        "the locally calculated cost (the plan's input floor + 9 output at the frozen \
+         1 microUSD/token lines) is recorded too: {row:?}"
     );
     assert_eq!(
         row.pricing_snapshot.as_ref().map(|s| s.authority),
@@ -565,6 +568,77 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
     assert!(
         json.contains("\"provider\":\"fake\"") && json.contains("\"model\":\"m\""),
         "the routing decision JSON rides the reservation: {json}"
+    );
+}
+
+#[tokio::test]
+async fn zero_usage_frame_on_a_nonzero_request_settles_at_the_planned_floor() {
+    // Token-accounting tampering (new angle): a hostile/buggy provider can
+    // emit a zero usage frame. The no-usage wire contract emits NO frame, so
+    // a zero frame on a non-zero request is malformed and must not settle
+    // the reservation for free; the plan's conservative input floor prices it.
+    let provider: Arc<dyn faktor_provider::Provider> = Arc::new(ZeroUsageProvider);
+    let (runtime, session, ledger) = routed_settlement_runtime(provider).await;
+    let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let task_id = runtime
+        .deps
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap()
+        .task_id()
+        .unwrap();
+    let view = ledger
+        .session_budget_view(session, task_id)
+        .expect("durable budget view");
+    assert!(
+        view.spent_cost_micro > 0,
+        "a zero usage frame must never make a non-zero call free: {view:?}"
+    );
+    let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "settled");
+    assert!(
+        rows[0].provider_cost_micro.unwrap_or(0) > 0,
+        "the plan's input floor is priced at the frozen snapshot: {:?}",
+        rows[0]
+    );
+}
+
+#[tokio::test]
+async fn under_reported_usage_frame_settles_at_the_planned_floor() {
+    // Usage spoofing (new angle): the zero-frame guard alone lets a hostile
+    // provider report "1 input token" for a multi-hundred-token request.
+    // The plan's conservative input is an upper bound, so a sub-half report
+    // is not a tokenizer difference; the runtime settles at the floor.
+    let provider: Arc<dyn faktor_provider::Provider> = Arc::new(UnderReportedUsageProvider);
+    let (runtime, session, ledger) = routed_settlement_runtime(provider).await;
+    let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let task_id = runtime
+        .deps
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap()
+        .task_id()
+        .unwrap();
+    let view = ledger
+        .session_budget_view(session, task_id)
+        .expect("durable budget view");
+    let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "settled");
+    let cost = rows[0].provider_cost_micro.unwrap_or(0);
+    assert!(
+        cost > 2,
+        "1 reported input + 1 output token (2 micro) must not price the call: {:?}",
+        rows[0]
+    );
+    assert!(
+        view.spent_cost_micro >= cost,
+        "the floored amount reaches the budget: {view:?}"
     );
 }
 
@@ -709,11 +783,11 @@ async fn typed_ledger_records_goal_criteria_verify_and_blocker_entries() {
         .unwrap();
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-    let title = handle.title().unwrap();
+    let _title = handle.title().unwrap();
     let view = handle.ledger_view().unwrap();
     assert_eq!(
-        view.head.goal, title,
-        "GoalSet seeded from the session title"
+        view.head.goal, "write src/a.rs",
+        "GoalSet is seeded from the latest user prompt"
     );
     assert!(
         view.head.criteria.iter().any(|c| c.contains("cargo check")),
@@ -773,7 +847,18 @@ async fn typed_ledger_records_goal_criteria_verify_and_blocker_entries() {
     let view = handle.ledger_view().unwrap();
     assert_eq!(
         view.head.open_blockers.len(),
-        1,
+        2,
+        "one blocker per failed required check"
+    );
+    let reasons: std::collections::BTreeSet<String> = view
+        .head
+        .open_blockers
+        .iter()
+        .map(|blocker| format!("{blocker:?}"))
+        .collect();
+    assert_eq!(
+        reasons.len(),
+        view.head.open_blockers.len(),
         "the same open reason is never re-opened"
     );
 }
@@ -876,8 +961,8 @@ async fn typed_ledger_records_routing_decisions_from_the_router_service() {
     );
     assert!(routed.cost_micro > 0);
     assert_eq!(
-        view.head.goal, "router",
-        "the routed turn still seeds GoalSet from the session title"
+        view.head.goal, "hi",
+        "the routed turn still seeds GoalSet from the latest user prompt"
     );
 }
 
