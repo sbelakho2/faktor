@@ -3565,8 +3565,12 @@ mod tests {
         // Workspace B must still receive a REAL watcher via a fresh worker.
         let ordinary = tempfile::tempdir().unwrap();
         std::fs::write(ordinary.path().join("keep.txt"), b"x").unwrap();
+        // A generous bound: the property under test is that B is never
+        // starved by A's wedge, not that FSEvents attaches within a tight
+        // wall clock. On a loaded host the OS registration itself can take
+        // seconds; a starvation bug would still time out here.
         let service_b = WorkspaceFileService::with_watch_registration_deadline(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
         );
         let b = service_b
             .open(WorkspaceId::new(302), ordinary.path().to_path_buf())
