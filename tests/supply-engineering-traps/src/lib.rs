@@ -1,27 +1,36 @@
 //! Vicious trap benchmark for Faktor Supply + Engineering.
 //!
-//! Every case is deterministic and bounded. A case either executes a real
-//! knowledge-pack-backed model/solver/unit kernel, or it returns the typed
-//! research-required/refusal/unavailable/escalation the missing authority
-//! demands. No missing physical data is replaced by a plausible number, and
-//! no benchmark fixture is presented as authoritative external evidence.
+//! The benchmark is split into an untrusted SUT and an independent oracle:
 //!
-//! The machine-readable report records the eight review dimensions required
-//! by `docs/specs/supply-engineering.md`: correct physics, correct authority,
-//! missing-information detection, boundary conditions, uncertainty, trap
-//! detection, valid falsifiable experiment construction, and willingness to
-//! refuse.
+//! * [`sut`] submits fixture requests to the real engineering pipeline
+//!   (requirement validation -> authoritative model selection -> unit-aware
+//!   kernels -> 11-gate response) or to the real supply cost/logistics/unit
+//!   kernels, and returns an opaque [`SutAnswer`].
+//! * [`oracle`] owns its own expected numerical windows, refusal codes, gate
+//!   states and assumption coverage, re-reads the bundled knowledge registry
+//!   for authority, and computes the eight review dimensions.
+//!
+//! There is no metric boolean, acceptance flag or `with_*` setter in the SUT
+//! contract. A case passes only when the independent oracle says so.
 
-use engineering_core::{FalsifiableTest, GateId};
-use faktor_supply_core::Money;
 use serde::Serialize;
 use thiserror::Error;
 
-pub mod cases;
+pub mod contract;
 pub mod fixtures;
+mod oracle;
+mod sut;
 
-pub const SUITE_SCHEMA: &str = "faktor.supply-engineering-traps/v1";
-pub const SUITE_VERSION: &str = "1.0.0";
+pub use contract::{
+    ControlAnswer, ExpectedKind, GateRecord, GateStateKind, Observation, SutAnswer, SutOutcome,
+    SutUncertainty, SUITE_SCHEMA, SUITE_VERSION,
+};
+pub use oracle::{
+    evaluate as evaluate_answer, expectation as oracle_expectation, AuthorityExpectation,
+    ControlExpectation, MoneyWindow, OracleExpectation, OracleVerdict, QuantityWindow,
+    TrapExpectation, UncertaintyExpectation, CASE_COUNT, CASE_IDS,
+};
+
 pub const MAX_CASES: usize = 32;
 pub const MAX_EVIDENCE: usize = 64;
 pub const MAX_MISSING_INFO: usize = 64;
@@ -57,269 +66,111 @@ pub enum BenchError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// The typed result a trap case is expected to produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExpectedKind {
-    /// The model executed and produced a usable result.
-    Solved,
-    /// The model executed and rejected the design/claim through a required
-    /// check.
-    Rejected,
-    /// The model returned a typed refusal.
-    Refused,
-    /// The authority/theory/validity needed for a conclusion is missing.
-    ResearchRequired,
-    /// A value is unknown and remains unavailable.
-    Unavailable,
-    /// Conflicting authoritative inputs require escalation.
-    Escalated,
+/// Static presentation metadata. It contains no expected result and no
+/// acceptance state.
+#[derive(Debug, Clone, Copy)]
+struct CaseMeta {
+    id: &'static str,
+    domain: &'static str,
+    title: &'static str,
+    shallow_claim: &'static str,
 }
 
-impl ExpectedKind {
-    /// Stable wire label.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Solved => "solved",
-            Self::Rejected => "rejected",
-            Self::Refused => "refused",
-            Self::ResearchRequired => "research_required",
-            Self::Unavailable => "unavailable",
-            Self::Escalated => "escalated",
-        }
-    }
-}
-
-/// One observed value, kept typed so money never becomes a float.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Observation {
-    /// A physical quantity in its explicit unit.
-    Quantity {
-        /// Name.
-        name: String,
-        /// Numeric value.
-        value: f64,
-        /// Unit symbol.
-        unit: String,
+const CASE_META: &[CaseMeta] = &[
+    CaseMeta {
+        id: "analog/opamp-nominal-gain-stability",
+        domain: "analog",
+        title: "Nominal gain is not a stability proof",
+        shallow_claim: "The closed-loop gain is 10, therefore the amplifier is stable.",
     },
-    /// Exact integer money.
-    Money {
-        /// Name.
-        name: String,
-        /// Micro-units.
-        micros: i64,
-        /// Currency code.
-        currency: String,
+    CaseMeta {
+        id: "analog/opamp-large-signal-slew",
+        domain: "analog",
+        title: "Small-signal stability does not cover large-signal slew limiting",
+        shallow_claim: "The small-signal loop is compensated, so the amplifier is stable for every large-signal step.",
     },
-    /// A bounded text observation.
-    Text {
-        /// Name.
-        name: String,
-        /// Value.
-        value: String,
+    CaseMeta {
+        id: "power/flyback-leakage-overvoltage",
+        domain: "power-electronics",
+        title: "Flyback leakage spike is outside the conduction-only model",
+        shallow_claim: "Vds_peak = Vin + N*Vout is below the MOSFET rating, so the switch is safe.",
     },
-}
-
-impl Observation {
-    /// A physical quantity observation.
-    pub fn quantity(name: impl Into<String>, value: f64, unit: impl Into<String>) -> Self {
-        Self::Quantity {
-            name: name.into(),
-            value,
-            unit: unit.into(),
-        }
-    }
-
-    /// An exact money observation.
-    pub fn money(name: impl Into<String>, amount: Money) -> Self {
-        Self::Money {
-            name: name.into(),
-            micros: amount.micros(),
-            currency: amount.currency.as_str().to_string(),
-        }
-    }
-
-    /// A text observation.
-    pub fn text(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::Text {
-            name: name.into(),
-            value: value.into(),
-        }
-    }
-
-    /// True for exact money observations.
-    pub const fn is_money(&self) -> bool {
-        matches!(self, Self::Money { .. })
-    }
-}
-
-/// The typed outcome of executing one case.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CaseOutcome {
-    /// The model executed and produced observations.
-    Solved {
-        /// Observations.
-        observations: Vec<Observation>,
-        /// Explanatory notes.
-        notes: Vec<String>,
+    CaseMeta {
+        id: "pcb/alternate-thermal-pad",
+        domain: "pcb/thermal",
+        title: "Alternate PCB with a different thermal pad is not equivalent",
+        shallow_claim: "Same copper area and same MOSFET means the alternate PCB is thermally equivalent.",
     },
-    /// The model executed and the design failed a required check.
-    Rejected {
-        /// Stable rejection code.
-        code: String,
-        /// Why the design was rejected.
-        reasons: Vec<String>,
+    CaseMeta {
+        id: "materials/aluminium-temper-thickness",
+        domain: "materials",
+        title: "Wrong temper and thickness invalidate an aluminium strength claim",
+        shallow_claim: "Aluminium 6061 has a familiar yield strength, so any 6061 part can use it.",
     },
-    /// The model returned a typed refusal.
-    Refused {
-        /// Stable refusal code.
-        code: String,
-        /// Why it refused.
-        reason: String,
-        /// Missing or invalid inputs named by the refusal.
-        required: Vec<String>,
-        /// True when the refusal is bound to an executable receipt.
-        receipt_bound: bool,
+    CaseMeta {
+        id: "machine/fastener-nut-factor-scatter",
+        domain: "machine-design",
+        title: "Nominal torque hides nut-factor scatter and validity",
+        shallow_claim: "K = 0.2 gives 41.7 kN, so the joint preload is known.",
     },
-    /// A theory, authority or validity envelope is missing.
-    ResearchRequired {
-        /// The gate that cannot be established.
-        gate: GateId,
-        /// Why research is required.
-        reason: String,
-        /// Sources needed to proceed.
-        sources_required: Vec<String>,
+    CaseMeta {
+        id: "fatigue/sn-outside-regime",
+        domain: "fatigue",
+        title: "S-N extrapolation outside the tested regime is not valid",
+        shallow_claim: "Endurance limit is half the tensile strength, so the part has infinite life.",
     },
-    /// A value is unknown and stays unavailable.
-    Unavailable {
-        /// Why the value is unavailable.
-        reason: String,
-        /// Inputs needed to establish it.
-        required: Vec<String>,
+    CaseMeta {
+        id: "thermal/missing-contact-resistance",
+        domain: "thermal",
+        title: "Ignoring contact resistance understates junction temperature",
+        shallow_claim: "Use Rth_jc + Rth_sa; the thermal interface is negligible.",
     },
-    /// Conflicting authoritative inputs require escalation.
-    Escalated {
-        /// Stable escalation kind.
-        escalation: String,
-        /// Reason.
-        reason: String,
-        /// Authority to consult.
-        authority: String,
+    CaseMeta {
+        id: "manufacturing/molding-draft-wall",
+        domain: "manufacturing",
+        title: "Draft and wall violations make the molded geometry unmanufacturable",
+        shallow_claim: "The CAD model closes, so the molded part can be produced.",
     },
-}
+    CaseMeta {
+        id: "fea/mesh-convergence-pathology",
+        domain: "fea",
+        title: "A mesh is not a converged finite-element result",
+        shallow_claim: "The solver exited successfully and the mesh has many elements, so the stress is converged.",
+    },
+    CaseMeta {
+        id: "supply/cheaper-supplier-tco",
+        domain: "supply/tco",
+        title: "Cheaper unit price vanishes under landed TCO",
+        shallow_claim: "$8.50 is cheaper than $10.00, so the cheap supplier saves money.",
+    },
+    CaseMeta {
+        id: "customs/hs-classification-ambiguity",
+        domain: "customs",
+        title: "Classification ambiguity must escalate, not pick a code",
+        shallow_claim: "Choose the candidate with the lower duty rate and declare it.",
+    },
+    CaseMeta {
+        id: "units/torque-lbf-ft",
+        domain: "units",
+        title: "lbf*ft and N*m are not interchangeable numbers",
+        shallow_claim: "100 ft-lb equals 100 N-m; the number is the same.",
+    },
+    CaseMeta {
+        id: "supply/unknown-cost-not-zero",
+        domain: "supply/tco",
+        title: "An unknown cost term is unavailable, never zero",
+        shallow_claim: "Duty is unknown but probably small, so set it to zero and compare totals.",
+    },
+    CaseMeta {
+        id: "emc/return-path-loop-inductance",
+        domain: "emc/pcb",
+        title: "Equal copper area does not preserve the return-path loop",
+        shallow_claim: "The layouts use the same copper area, so their EMC behaviour is equivalent.",
+    },
+];
 
-impl CaseOutcome {
-    /// The outcome class.
-    pub const fn kind(&self) -> ExpectedKind {
-        match self {
-            Self::Solved { .. } => ExpectedKind::Solved,
-            Self::Rejected { .. } => ExpectedKind::Rejected,
-            Self::Refused { .. } => ExpectedKind::Refused,
-            Self::ResearchRequired { .. } => ExpectedKind::ResearchRequired,
-            Self::Unavailable { .. } => ExpectedKind::Unavailable,
-            Self::Escalated { .. } => ExpectedKind::Escalated,
-        }
-    }
-}
-
-/// The eight review dimensions the suite measures.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct Metrics {
-    /// The result matches the physically/legally correct behaviour.
-    pub correct_physics: bool,
-    /// The result is bound to a real pack/solver/unit/evidence authority.
-    pub authority: bool,
-    /// Missing information is detected and named rather than filled in.
-    pub missing_info_detected: bool,
-    /// The governing boundary/validity condition is named and checked.
-    pub boundary_conditions: bool,
-    /// Uncertainty, or its typed absence, is explicit.
-    pub uncertainty: bool,
-    /// The shallow claim is contradicted by the executed case.
-    pub trap_detected: bool,
-    /// A concrete falsifiable experiment is constructed.
-    pub falsifiable_experiment: bool,
-    /// The case refuses/rejects/escalates where the correct behaviour does.
-    pub refused_where_appropriate: bool,
-}
-
-impl Metrics {
-    /// All eight dimensions pass.
-    pub const fn all(&self) -> bool {
-        self.correct_physics
-            && self.authority
-            && self.missing_info_detected
-            && self.boundary_conditions
-            && self.uncertainty
-            && self.trap_detected
-            && self.falsifiable_experiment
-            && self.refused_where_appropriate
-    }
-
-    /// Count of passing dimensions.
-    pub const fn count(&self) -> usize {
-        self.correct_physics as usize
-            + self.authority as usize
-            + self.missing_info_detected as usize
-            + self.boundary_conditions as usize
-            + self.uncertainty as usize
-            + self.trap_detected as usize
-            + self.falsifiable_experiment as usize
-            + self.refused_where_appropriate as usize
-    }
-
-    /// Builder: correct physics.
-    pub const fn with_physics(mut self, value: bool) -> Self {
-        self.correct_physics = value;
-        self
-    }
-
-    /// Builder: authority.
-    pub const fn with_authority(mut self, value: bool) -> Self {
-        self.authority = value;
-        self
-    }
-
-    /// Builder: missing information.
-    pub const fn with_missing_info(mut self, value: bool) -> Self {
-        self.missing_info_detected = value;
-        self
-    }
-
-    /// Builder: boundary conditions.
-    pub const fn with_boundaries(mut self, value: bool) -> Self {
-        self.boundary_conditions = value;
-        self
-    }
-
-    /// Builder: uncertainty.
-    pub const fn with_uncertainty(mut self, value: bool) -> Self {
-        self.uncertainty = value;
-        self
-    }
-
-    /// Builder: trap detection.
-    pub const fn with_trap(mut self, value: bool) -> Self {
-        self.trap_detected = value;
-        self
-    }
-
-    /// Builder: falsifiable experiment.
-    pub const fn with_experiment(mut self, value: bool) -> Self {
-        self.falsifiable_experiment = value;
-        self
-    }
-
-    /// Builder: refusal/rejection/escalation.
-    pub const fn with_refusal(mut self, value: bool) -> Self {
-        self.refused_where_appropriate = value;
-        self
-    }
-}
-
-/// One trap case result.
+/// One trap case result. The SUT answer is opaque; the oracle verdict is the
+/// only acceptance state.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CaseReport {
     /// Stable case id.
@@ -330,183 +181,22 @@ pub struct CaseReport {
     pub title: String,
     /// What a shallow answer would claim.
     pub shallow_claim: String,
-    /// The expected outcome class.
+    /// The expected outcome class (owned by the oracle).
     pub expected: ExpectedKind,
-    /// The actual typed outcome.
-    pub outcome: CaseOutcome,
-    /// The measured review dimensions.
-    pub metrics: Metrics,
-    /// Evidence/digest/citation strings.
-    pub evidence: Vec<String>,
-    /// Missing information named by the case.
-    pub missing_info: Vec<String>,
-    /// Boundary/validity conditions named by the case.
-    pub boundary_conditions: Vec<String>,
-    /// Explicit uncertainty statement.
-    pub uncertainty_statement: String,
-    /// The falsifiable experiment that could disprove the result.
-    pub falsifiable_test: FalsifiableTest,
+    /// The opaque SUT result.
+    pub sut: SutAnswer,
+    /// The independent oracle verdict.
+    pub oracle: OracleVerdict,
 }
 
 impl CaseReport {
-    /// True when all eight dimensions pass and the expected outcome matches.
+    /// True only when the independent oracle passes all eight dimensions.
     pub fn passed(&self) -> bool {
-        self.metrics.all() && self.outcome.kind() == self.expected
+        self.oracle.all()
     }
 }
 
-/// Builder for a bounded [`CaseReport`].
-#[derive(Debug)]
-pub struct CaseBuilder {
-    id: String,
-    domain: String,
-    title: String,
-    shallow_claim: String,
-    expected: ExpectedKind,
-    outcome: Option<CaseOutcome>,
-    metrics: Metrics,
-    evidence: Vec<String>,
-    missing_info: Vec<String>,
-    boundary_conditions: Vec<String>,
-    uncertainty_statement: String,
-    falsifiable_test: Option<FalsifiableTest>,
-}
-
-impl CaseBuilder {
-    /// Start a case.
-    pub fn new(
-        id: impl Into<String>,
-        domain: impl Into<String>,
-        title: impl Into<String>,
-        expected: ExpectedKind,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            domain: domain.into(),
-            title: title.into(),
-            shallow_claim: String::new(),
-            expected,
-            outcome: None,
-            metrics: Metrics::default(),
-            evidence: Vec::new(),
-            missing_info: Vec::new(),
-            boundary_conditions: Vec::new(),
-            uncertainty_statement: String::new(),
-            falsifiable_test: None,
-        }
-    }
-
-    /// Set the shallow claim.
-    pub fn shallow(mut self, claim: impl Into<String>) -> Self {
-        self.shallow_claim = claim.into();
-        self
-    }
-
-    /// Set the typed outcome.
-    pub fn outcome(mut self, outcome: CaseOutcome) -> Self {
-        self.outcome = Some(outcome);
-        self
-    }
-
-    /// Set the metrics.
-    pub const fn metrics(mut self, metrics: Metrics) -> Self {
-        self.metrics = metrics;
-        self
-    }
-
-    /// Add evidence lines.
-    pub fn evidence(mut self, items: impl IntoIterator<Item = String>) -> Self {
-        self.evidence.extend(items);
-        self
-    }
-
-    /// Add missing-information lines.
-    pub fn missing(mut self, items: impl IntoIterator<Item = String>) -> Self {
-        self.missing_info.extend(items);
-        self
-    }
-
-    /// Add boundary-condition lines.
-    pub fn boundaries(mut self, items: impl IntoIterator<Item = String>) -> Self {
-        self.boundary_conditions.extend(items);
-        self
-    }
-
-    /// Set the uncertainty statement.
-    pub fn uncertainty(mut self, statement: impl Into<String>) -> Self {
-        self.uncertainty_statement = statement.into();
-        self
-    }
-
-    /// Set the falsifiable test.
-    pub fn test(mut self, test: FalsifiableTest) -> Self {
-        self.falsifiable_test = Some(test);
-        self
-    }
-
-    /// Build and enforce the report bounds.
-    pub fn build(self) -> Result<CaseReport, BenchError> {
-        let outcome = self.outcome.ok_or_else(|| BenchError::Case {
-            id: self.id.clone(),
-            detail: "case produced no outcome".to_string(),
-        })?;
-        let falsifiable_test = self.falsifiable_test.ok_or_else(|| BenchError::Case {
-            id: self.id.clone(),
-            detail: "case produced no falsifiable experiment".to_string(),
-        })?;
-        let report = CaseReport {
-            id: self.id,
-            domain: self.domain,
-            title: self.title,
-            shallow_claim: self.shallow_claim,
-            expected: self.expected,
-            outcome,
-            metrics: self.metrics,
-            evidence: self.evidence,
-            missing_info: self.missing_info,
-            boundary_conditions: self.boundary_conditions,
-            uncertainty_statement: self.uncertainty_statement,
-            falsifiable_test,
-        };
-        validate_report(&report)?;
-        Ok(report)
-    }
-}
-
-fn validate_report(report: &CaseReport) -> Result<(), BenchError> {
-    if report.id.trim().is_empty() || report.id.len() > MAX_TEXT {
-        return Err(BenchError::EmptyCaseId);
-    }
-    if report.evidence.len() > MAX_EVIDENCE {
-        return Err(BenchError::ReportBound("evidence"));
-    }
-    if report.missing_info.len() > MAX_MISSING_INFO {
-        return Err(BenchError::ReportBound("missing_info"));
-    }
-    if report.boundary_conditions.len() > MAX_BOUNDARIES {
-        return Err(BenchError::ReportBound("boundary_conditions"));
-    }
-    if let CaseOutcome::Solved { observations, .. } = &report.outcome {
-        if observations.len() > MAX_OBSERVATIONS {
-            return Err(BenchError::ReportBound("observations"));
-        }
-    }
-    if report.uncertainty_statement.trim().is_empty() {
-        return Err(BenchError::ReportBound("uncertainty_statement"));
-    }
-    if report.shallow_claim.trim().is_empty() {
-        return Err(BenchError::ReportBound("shallow_claim"));
-    }
-    if report.falsifiable_test.procedure.trim().is_empty()
-        || report.falsifiable_test.pass_criterion.trim().is_empty()
-        || report.falsifiable_test.refutation.trim().is_empty()
-    {
-        return Err(BenchError::ReportBound("falsifiable_test"));
-    }
-    Ok(())
-}
-
-/// Aggregate pass/fail state for the eight metrics.
+/// Per-metric pass counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct MetricPass {
     /// Cases passing correct physics.
@@ -532,22 +222,22 @@ pub struct MetricPass {
 pub struct Summary {
     /// Total cases.
     pub total: usize,
-    /// Cases whose metrics all pass and whose outcome matches.
+    /// Cases whose oracle verdict passes.
     pub passed: usize,
-    /// Cases that failed.
+    /// Cases that failed the oracle.
     pub failed: usize,
-    /// Outcomes by class.
+    /// SUT outcomes by class.
     pub solved: usize,
-    /// Rejected designs.
+    /// SUT rejected designs.
     pub rejected: usize,
-    /// Typed refusals.
+    /// SUT typed refusals.
     pub refused: usize,
-    /// Research-required outcomes.
+    /// SUT research-required outcomes.
     pub research_required: usize,
-    /// Unavailable outcomes.
+    /// SUT unavailable outcomes.
     pub unavailable: usize,
-    /// Escalations.
-    pub escalated: usize,
+    /// SUT ambiguity escalations.
+    pub ambiguous: usize,
     /// Per-metric pass counts.
     pub metric_pass: MetricPass,
     /// Failed case ids.
@@ -577,11 +267,11 @@ pub struct SuiteReport {
 impl SuiteReport {
     /// Build a report from cases, enforcing the suite bound.
     pub fn from_cases(cases: Vec<CaseReport>) -> Result<Self, BenchError> {
-        if cases.is_empty() {
+        if cases.is_empty() || cases.len() > MAX_CASES {
             return Err(BenchError::CaseBound);
         }
-        if cases.len() > MAX_CASES {
-            return Err(BenchError::CaseBound);
+        for case in &cases {
+            validate_report(case)?;
         }
         let summary = summarize(&cases);
         Ok(Self {
@@ -602,6 +292,40 @@ impl SuiteReport {
     }
 }
 
+fn validate_report(report: &CaseReport) -> Result<(), BenchError> {
+    if report.id.trim().is_empty() || report.id.len() > MAX_TEXT {
+        return Err(BenchError::EmptyCaseId);
+    }
+    let sut = &report.sut;
+    if sut.evidence.len() > MAX_EVIDENCE {
+        return Err(BenchError::ReportBound("evidence"));
+    }
+    if sut.missing_info.len() > MAX_MISSING_INFO {
+        return Err(BenchError::ReportBound("missing_info"));
+    }
+    if sut.boundary_conditions.len() > MAX_BOUNDARIES {
+        return Err(BenchError::ReportBound("boundary_conditions"));
+    }
+    if sut.outcome.observations().len() > MAX_OBSERVATIONS {
+        return Err(BenchError::ReportBound("observations"));
+    }
+    if sut.experiments.is_empty()
+        || sut.experiments.iter().any(|test| {
+            test.claim.trim().is_empty()
+                || test.procedure.trim().is_empty()
+                || test.pass_criterion.trim().is_empty()
+                || test.refutation.trim().is_empty()
+                || test.instrument.trim().is_empty()
+        })
+    {
+        return Err(BenchError::ReportBound("falsifiable_experiment"));
+    }
+    if report.shallow_claim.trim().is_empty() {
+        return Err(BenchError::ReportBound("shallow_claim"));
+    }
+    Ok(())
+}
+
 fn summarize(cases: &[CaseReport]) -> Summary {
     let mut summary = Summary {
         total: cases.len(),
@@ -612,41 +336,42 @@ fn summarize(cases: &[CaseReport]) -> Summary {
         refused: 0,
         research_required: 0,
         unavailable: 0,
-        escalated: 0,
+        ambiguous: 0,
         metric_pass: MetricPass::default(),
         failed_cases: Vec::new(),
     };
     for case in cases {
-        match case.outcome.kind() {
+        match case.sut.outcome.kind() {
             ExpectedKind::Solved => summary.solved += 1,
             ExpectedKind::Rejected => summary.rejected += 1,
             ExpectedKind::Refused => summary.refused += 1,
             ExpectedKind::ResearchRequired => summary.research_required += 1,
             ExpectedKind::Unavailable => summary.unavailable += 1,
-            ExpectedKind::Escalated => summary.escalated += 1,
+            ExpectedKind::Ambiguous => summary.ambiguous += 1,
         }
-        if case.metrics.correct_physics {
+        let oracle = &case.oracle;
+        if oracle.correct_physics {
             summary.metric_pass.correct_physics += 1;
         }
-        if case.metrics.authority {
+        if oracle.authority {
             summary.metric_pass.authority += 1;
         }
-        if case.metrics.missing_info_detected {
+        if oracle.missing_info_detected {
             summary.metric_pass.missing_info_detected += 1;
         }
-        if case.metrics.boundary_conditions {
+        if oracle.boundary_conditions {
             summary.metric_pass.boundary_conditions += 1;
         }
-        if case.metrics.uncertainty {
+        if oracle.uncertainty {
             summary.metric_pass.uncertainty += 1;
         }
-        if case.metrics.trap_detected {
+        if oracle.trap_detected {
             summary.metric_pass.trap_detected += 1;
         }
-        if case.metrics.falsifiable_experiment {
+        if oracle.falsifiable_experiment {
             summary.metric_pass.falsifiable_experiment += 1;
         }
-        if case.metrics.refused_where_appropriate {
+        if oracle.refused_where_appropriate {
             summary.metric_pass.refused_where_appropriate += 1;
         }
         if case.passed() {
@@ -668,15 +393,79 @@ pub fn run_suite() -> Result<SuiteReport, BenchError> {
     SuiteReport::from_cases(cases)
 }
 
-/// Run one case by id.
+/// Run one case by id. The SUT runs first; the oracle is evaluated against
+/// the resulting opaque answer and its own expectation.
 pub fn run_case(id: &str) -> Result<CaseReport, BenchError> {
     if id.trim().is_empty() {
         return Err(BenchError::EmptyCaseId);
     }
-    cases::dispatch(id)
+    let meta = CASE_META
+        .iter()
+        .find(|meta| meta.id == id)
+        .ok_or_else(|| BenchError::UnknownCase(id.to_string()))?;
+    let expectation =
+        oracle_expectation(id).ok_or_else(|| BenchError::UnknownCase(id.to_string()))?;
+    let sut = sut::run(id)?;
+    let oracle = evaluate_answer(expectation, &sut);
+    Ok(CaseReport {
+        id: meta.id.to_string(),
+        domain: meta.domain.to_string(),
+        title: meta.title.to_string(),
+        shallow_claim: meta.shallow_claim.to_string(),
+        expected: expectation.kind,
+        sut,
+        oracle,
+    })
 }
 
 /// The stable case ids in dispatch order.
 pub fn case_ids() -> Vec<&'static str> {
-    cases::CASE_IDS.to_vec()
+    CASE_IDS.to_vec()
+}
+
+/// A deliberately wrong SUT answer for negative-control tests. It preserves
+/// the case id and experiment but replaces the outcome with the shallow claim:
+/// a solved answer with no authoritative observations.
+pub fn negative_control(case: &CaseReport) -> SutAnswer {
+    let observations = if case.sut.outcome.kind() == ExpectedKind::Solved {
+        case.sut
+            .outcome
+            .observations()
+            .iter()
+            .map(|observation| match observation {
+                Observation::Money {
+                    name,
+                    currency,
+                    micros,
+                } => Observation::Money {
+                    name: name.clone(),
+                    micros: micros.saturating_sub(1),
+                    currency: currency.clone(),
+                },
+                Observation::Quantity { name, unit, .. } => Observation::Quantity {
+                    name: name.clone(),
+                    value: 0.0,
+                    unit: unit.clone(),
+                },
+                Observation::Text { name, value } => Observation::Text {
+                    name: name.clone(),
+                    value: value.clone(),
+                },
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    SutAnswer {
+        id: case.sut.id.clone(),
+        outcome: SutOutcome::Solved { observations },
+        gate_states: Vec::new(),
+        missing_info: Vec::new(),
+        boundary_conditions: Vec::new(),
+        uncertainty: SutUncertainty::Exact,
+        assumption_coverage: Vec::new(),
+        evidence: Vec::new(),
+        experiments: case.sut.experiments.clone(),
+        controls: Vec::new(),
+    }
 }

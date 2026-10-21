@@ -70,6 +70,8 @@ pub enum RefusalCode {
     OutsideValidity,
     MissingInterfaceResistance,
     MissingStrength,
+    MissingProperty,
+    AmbiguousProperty,
     ThermalRunaway,
     NonPositiveGeometry,
     UnsupportedCondition,
@@ -97,6 +99,9 @@ impl Refusal {
 pub enum ModelStatus {
     Solved,
     Refused,
+    /// The model executed but a required input is missing; the affected
+    /// values stay typed unavailable rather than being filled with zero.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

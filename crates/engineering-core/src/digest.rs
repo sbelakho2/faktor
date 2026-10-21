@@ -85,6 +85,20 @@ impl<'de> Deserialize<'de> for Digest {
     }
 }
 
+impl schemars::JsonSchema for Digest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Digest".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "BLAKE3 content digest, lowercase hex",
+            "pattern": "^[0-9a-f]{64}$"
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

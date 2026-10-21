@@ -1296,9 +1296,15 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // ordering-relevant session mutation and is the paging order/bound;
     // `updated_ms` remains presentation metadata.
     //
-    // Existing rows are backfilled to dense revisions in stable id order
-    // (1..=N), then the sequence starts at N+1: a legacy database is
-    // deterministic and no backfilled revision can collide with a new write.
+    // Existing rows are backfilled to dense revisions in the LEGACY HISTORY
+    // ORDER, preserved exactly: pre-v44 presentation listed
+    // `ORDER BY updated_ms DESC, id DESC`, so the row that used to appear
+    // first (the most recently edited, highest id on a tie) must receive the
+    // highest revision. `updated_ms ASC, id ASC` is that order reversed, which
+    // keeps every legacy row in its old relative position while the new paging
+    // order (`listing_revision DESC, id DESC`) presents it identically.
+    // The sequence then starts at N+1: a legacy database is deterministic and
+    // no backfilled revision can collide with a new write.
     "ALTER TABLE session ADD COLUMN listing_revision INTEGER NOT NULL DEFAULT 0;
      DROP TABLE IF EXISTS temp.session_listing_backfill;
      CREATE TEMP TABLE session_listing_backfill(
@@ -1306,7 +1312,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         revision INTEGER NOT NULL
      );
      INSERT INTO session_listing_backfill(id, revision)
-        SELECT id, ROW_NUMBER() OVER (ORDER BY id ASC) FROM session;
+        SELECT id, ROW_NUMBER() OVER (ORDER BY updated_ms ASC, id ASC) FROM session;
      UPDATE session SET listing_revision = (
         SELECT revision FROM session_listing_backfill b WHERE b.id = session.id);
      DROP TABLE session_listing_backfill;

@@ -45,9 +45,9 @@ pub use generation::{
 pub use manifest::{CrateInfo, TopologyOptions, Workspace};
 pub use model::{
     crate_id, file_id, module_id, package_id, symbol_id, test_id, EdgeKind, Graph, GraphEdge,
-    GraphError, GraphFile, GraphNode, GraphStats, Language, NodeKind, Provenance, Revision,
-    GRAPH_SCHEMA, MAX_EDGES, MAX_FILES, MAX_FILE_BYTES, MAX_NODES, MAX_PATH_BYTES,
-    MAX_SYMBOL_BYTES,
+    GraphError, GraphFile, GraphNode, GraphStats, Language, MaterialInput, NodeKind, Provenance,
+    Revision, GRAPH_SCHEMA, MAX_EDGES, MAX_FILES, MAX_FILE_BYTES, MAX_INPUTS, MAX_NODES,
+    MAX_PATH_BYTES, MAX_SYMBOL_BYTES,
 };
 pub use parse::{parse_file, ParsedFile};
 pub use query::{

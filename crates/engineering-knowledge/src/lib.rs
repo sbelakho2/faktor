@@ -23,6 +23,12 @@ const BOLTED_JOINT: &str = include_str!("../packs/bolted_joint.json");
 const POWER_ELECTRONICS: &str = include_str!("../packs/power_electronics.json");
 const INJECTION_MOLDING: &str = include_str!("../packs/injection_molding.json");
 const PASSIVES: &str = include_str!("../packs/passives.json");
+const ANALOG_STABILITY: &str = include_str!("../packs/analog_stability.json");
+const FLYBACK_CONVERTERS: &str = include_str!("../packs/flyback_converters.json");
+const THERMAL_NETWORKS: &str = include_str!("../packs/thermal_networks.json");
+const FATIGUE_MATERIALS: &str = include_str!("../packs/fatigue_materials.json");
+const EMC_PCB: &str = include_str!("../packs/emc_pcb.json");
+const MATERIALS_CONDITIONAL: &str = include_str!("../packs/materials_conditional.json");
 
 #[derive(Debug, Error)]
 pub enum KnowledgeError {
@@ -727,6 +733,95 @@ fn model_targeting(pack_id: &str, model_id: &str, domain: &str) -> (Vec<Discipli
                 "life",
             ]),
         ),
+        ("analog-stability", "model-opamp-loop-stability") => (
+            vec![Discipline::Electrical],
+            strings(&[
+                "opamp",
+                "op-amp",
+                "amplifier",
+                "loop",
+                "gain",
+                "phase",
+                "margin",
+                "stability",
+                "compensation",
+                "capacitance",
+                "load",
+                "bandwidth",
+            ]),
+        ),
+        ("flyback-converters", "model-flyback-converter") => (
+            vec![Discipline::Electrical],
+            strings(&[
+                "flyback",
+                "converter",
+                "transformer",
+                "leakage",
+                "snubber",
+                "clamp",
+                "vds",
+                "dcm",
+                "ccm",
+                "duty",
+            ]),
+        ),
+        ("thermal-networks", "model-thermal-network") => (
+            vec![Discipline::Thermal, Discipline::Electrical],
+            strings(&[
+                "thermal_network",
+                "transient",
+                "heatsink",
+                "sink",
+                "contact",
+                "interface",
+                "rc",
+                "impedance",
+                "layer",
+                "case",
+            ]),
+        ),
+        ("fatigue-materials", "model-fatigue-damage") => (
+            vec![Discipline::Mechanical, Discipline::Reliability],
+            strings(&[
+                "fatigue",
+                "sn",
+                "s-n",
+                "strain",
+                "damage",
+                "miner",
+                "endurance",
+                "goodman",
+                "basquin",
+            ]),
+        ),
+        ("emc-pcb", "model-pcb-loop-inductance") => (
+            vec![Discipline::Emc, Discipline::Electrical],
+            strings(&[
+                "emc",
+                "loop",
+                "inductance",
+                "return",
+                "decoupling",
+                "creepage",
+                "clearance",
+                "pcb",
+                "placement",
+                "spacing",
+                "stackup",
+            ]),
+        ),
+        ("materials-conditional", "model-material-property-lookup") => (
+            vec![Discipline::Mechanical, Discipline::Other],
+            strings(&[
+                "material",
+                "temper",
+                "property",
+                "yield",
+                "strength",
+                "aluminium",
+                "orientation",
+            ]),
+        ),
         _ => {
             let disciplines = match domain {
                 "machine_design" => vec![Discipline::Mechanical],
@@ -734,6 +829,11 @@ fn model_targeting(pack_id: &str, model_id: &str, domain: &str) -> (Vec<Discipli
                 "power_electronics" | "passives" => {
                     vec![Discipline::Electrical, Discipline::Thermal]
                 }
+                "analog" => vec![Discipline::Electrical],
+                "thermal" => vec![Discipline::Thermal],
+                "fatigue" => vec![Discipline::Mechanical, Discipline::Reliability],
+                "emc" => vec![Discipline::Emc],
+                "materials" => vec![Discipline::Mechanical, Discipline::Other],
                 _ => vec![Discipline::Other],
             };
             let properties = model_id
@@ -853,6 +953,12 @@ impl KnowledgeRegistry {
             ("power_electronics", POWER_ELECTRONICS),
             ("injection_molding", INJECTION_MOLDING),
             ("passives", PASSIVES),
+            ("analog_stability", ANALOG_STABILITY),
+            ("flyback_converters", FLYBACK_CONVERTERS),
+            ("thermal_networks", THERMAL_NETWORKS),
+            ("fatigue_materials", FATIGUE_MATERIALS),
+            ("emc_pcb", EMC_PCB),
+            ("materials_conditional", MATERIALS_CONDITIONAL),
         ] {
             registry
                 .register_json(bytes.as_bytes())
@@ -888,7 +994,7 @@ mod tests {
     #[test]
     fn bundled_packs_load_and_validate() {
         let registry = KnowledgeRegistry::bundled().unwrap();
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 10);
         for pack in registry.packs() {
             pack.validate().unwrap();
             assert_eq!(pack.schema, PACK_SCHEMA);

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use engineering_units::{Dimension, Interval, Quantity, Unit, UnitRegistry};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
@@ -35,7 +36,9 @@ pub const MAX_CANDIDATE_CATEGORIES: usize = 128;
 pub const MAX_DERIVED_TESTS: usize = 128;
 
 /// Engineering discipline a requirement belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Discipline {
     /// Electrical behaviour.
@@ -75,7 +78,7 @@ impl Discipline {
 /// A numeric acceptance limit. All quantities carry their own unit; the
 /// evaluator converts the candidate value into the limit's unit and refuses
 /// a dimension mismatch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NumericLimit {
     /// Actual >= limit.
@@ -226,7 +229,7 @@ fn require_quantity(quantity: &Quantity) -> CoreResult<()> {
 }
 
 /// What one requirement asserts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementTarget {
     /// A numeric property with a dimensioned limit.
@@ -291,7 +294,7 @@ impl RequirementTarget {
 }
 
 /// One typed requirement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineeringRequirement {
     /// Stable requirement id within the set.
@@ -336,7 +339,7 @@ impl EngineeringRequirement {
 }
 
 /// A constraint groups requirements and states why they must hold together.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineeringConstraint {
     /// Stable constraint id.
@@ -372,7 +375,7 @@ impl EngineeringConstraint {
 }
 
 /// A governing model and the validity envelope it may be applied under.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelBinding {
     /// Model id (matching a knowledge pack model or an explicit authority).
@@ -422,7 +425,7 @@ impl ModelBinding {
 }
 
 /// A revision-bound evidence binding shared with the supply decision.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequirementEvidence {
     /// Stable evidence id.
@@ -450,7 +453,7 @@ impl RequirementEvidence {
 
 /// The typed requirement/constraint set. Every member is bound to one
 /// revision; an evaluation against another revision is refused.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineeringRequirementSet {
     /// Stable set id.
@@ -462,15 +465,19 @@ pub struct EngineeringRequirementSet {
     /// What is in and out of scope.
     pub scope: String,
     /// Requirements in deterministic evaluation order.
+    #[schemars(length(min = 1, max = MAX_REQUIREMENTS))]
     pub requirements: Vec<EngineeringRequirement>,
     /// Constraints binding requirements together.
     #[serde(default)]
+    #[schemars(length(max = MAX_REQUIREMENT_CONSTRAINTS))]
     pub constraints: Vec<EngineeringConstraint>,
     /// Governing models and their validity envelopes.
     #[serde(default)]
+    #[schemars(length(max = MAX_REQUIREMENT_MODELS))]
     pub models: Vec<ModelBinding>,
     /// Evidence bound to the set.
     #[serde(default)]
+    #[schemars(length(max = MAX_REQUIREMENT_EVIDENCE))]
     pub evidence: Vec<RequirementEvidence>,
 }
 
@@ -545,9 +552,70 @@ impl EngineeringRequirementSet {
         Ok(())
     }
 
+    /// The exact binding a human approval must cover to relax this
+    /// requirement: the frozen set digest, its revision, the requirement id
+    /// and the proposed limit.
+    pub fn relaxation_digest(
+        &self,
+        requirement_id: &str,
+        new_limit: &NumericLimit,
+    ) -> CoreResult<Digest> {
+        #[derive(Serialize)]
+        struct Binding<'a> {
+            schema: &'static str,
+            set: Digest,
+            revision: RevisionId,
+            requirement_id: &'a str,
+            new_limit: &'a NumericLimit,
+        }
+        Digest::of_json(&Binding {
+            schema: "faktor.engineering.relaxation-binding/v1",
+            set: Digest::of_json(self)?,
+            revision: self.revision,
+            requirement_id,
+            new_limit,
+        })
+    }
+
+    /// The exact binding for an acceptance-criteria/requirement change.
+    pub fn change_digest(&self, requirement: &EngineeringRequirement) -> CoreResult<Digest> {
+        #[derive(Serialize)]
+        struct Binding<'a> {
+            schema: &'static str,
+            set: Digest,
+            revision: RevisionId,
+            requirement: &'a EngineeringRequirement,
+        }
+        Digest::of_json(&Binding {
+            schema: "faktor.engineering.requirement-change-binding/v1",
+            set: Digest::of_json(self)?,
+            revision: self.revision,
+            requirement,
+        })
+    }
+
+    /// The exact binding for waiving/downgrading a proof obligation.
+    pub fn waiver_digest(&self, requirement_id: &str) -> CoreResult<Digest> {
+        #[derive(Serialize)]
+        struct Binding<'a> {
+            schema: &'static str,
+            set: Digest,
+            revision: RevisionId,
+            requirement_id: &'a str,
+        }
+        Digest::of_json(&Binding {
+            schema: "faktor.engineering.proof-waiver-binding/v1",
+            set: Digest::of_json(self)?,
+            revision: self.revision,
+            requirement_id,
+        })
+    }
+
     /// Replace one requirement's numeric limit and publish a new revision.
     /// The old limit survives in the caller's history; this method never
-    /// edits a frozen revision in place.
+    /// edits a frozen revision in place. A human approval bound to the
+    /// current set revision and [`Self::relaxation_digest`] is mandatory.
+    #[allow(clippy::too_many_arguments)]
     pub fn relax(
         &self,
         requirement_id: &str,
@@ -556,9 +624,17 @@ impl EngineeringRequirementSet {
         provenance: Provenance,
         falsifier: &str,
         evidence: RequirementEvidence,
+        approval: &faktor_approval::ApprovalToken,
     ) -> CoreResult<Self> {
         self.validate()?;
         new_limit.validate()?;
+        let binding = self.relaxation_digest(requirement_id, &new_limit)?;
+        approval.require(&faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::EngineeringConstraintRelaxation,
+            self.id.clone(),
+            self.revision.get().to_string(),
+            binding.to_hex(),
+        ))?;
         require_text("relaxation.rationale", rationale, 2_048)?;
         require_text("relaxation.falsifier", falsifier, 2_048)?;
         evidence.validate()?;
@@ -605,11 +681,87 @@ impl EngineeringRequirementSet {
         next.validate()?;
         Ok(next)
     }
+
+    /// Change a requirement or acceptance criterion. A previously verified
+    /// constraint can never be rewritten without a human approval bound to
+    /// the current set revision and the exact replacement.
+    pub fn change_requirement(
+        &self,
+        requirement: EngineeringRequirement,
+        approval: &faktor_approval::ApprovalToken,
+    ) -> CoreResult<Self> {
+        self.validate()?;
+        requirement.validate(self.revision)?;
+        let binding = self.change_digest(&requirement)?;
+        let kind = if self
+            .requirements
+            .iter()
+            .any(|existing| existing.id == requirement.id)
+        {
+            faktor_approval::ApprovalKind::EngineeringVerifiedConstraintChange
+        } else {
+            faktor_approval::ApprovalKind::EngineeringAcceptanceCriteriaChange
+        };
+        approval.require(&faktor_approval::ApprovalCheck::new(
+            kind,
+            self.id.clone(),
+            self.revision.get().to_string(),
+            binding.to_hex(),
+        ))?;
+        let mut next = self.clone();
+        next.revision = self.revision.next();
+        match next
+            .requirements
+            .iter_mut()
+            .find(|existing| existing.id == requirement.id)
+        {
+            Some(existing) => *existing = requirement,
+            None => next.requirements.push(requirement),
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Waive (downgrade to optional) one requirement's proof obligation.
+    /// Mandatory gates can only be relaxed by an explicit human approval
+    /// bound to the current revision and the exact requirement id.
+    pub fn waive_requirement(
+        &self,
+        requirement_id: &str,
+        rationale: &str,
+        approval: &faktor_approval::ApprovalToken,
+    ) -> CoreResult<Self> {
+        self.validate()?;
+        require_text("waiver.rationale", rationale, 2_048)?;
+        let binding = self.waiver_digest(requirement_id)?;
+        approval.require(&faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::EngineeringProofObligationWaiver,
+            self.id.clone(),
+            self.revision.get().to_string(),
+            binding.to_hex(),
+        ))?;
+        let mut next = self.clone();
+        next.revision = self.revision.next();
+        let requirement = next
+            .requirements
+            .iter_mut()
+            .find(|requirement| requirement.id == requirement_id)
+            .ok_or_else(|| CoreError::InvalidValue {
+                reason: format!("unknown requirement {requirement_id}"),
+            })?;
+        requirement.mandatory = false;
+        requirement.statement = format!(
+            "{} (proof obligation waived: {rationale})",
+            requirement.statement
+        );
+        next.validate()?;
+        Ok(next)
+    }
 }
 
 /// A categorical candidate fact. Text facts carry their own source/revision;
 /// they are never folded into a numeric property.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CategoricalFact {
     /// Exact value.
@@ -633,7 +785,7 @@ impl CategoricalFact {
 }
 
 /// One candidate's conditional engineering facts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateFacts {
     /// Stable candidate id.
@@ -716,24 +868,16 @@ impl CandidateFacts {
         Ok(())
     }
 
-    /// All established conditions, including the condition attached to a
-    /// numeric fact.
+    /// Conditions independently established for the candidate. Fact-level
+    /// annotations are *claims* about conditions; they are not evidence that
+    /// the condition holds.
     fn established(&self) -> BTreeSet<&str> {
-        let mut out: BTreeSet<&str> = self.conditions.iter().map(String::as_str).collect();
-        for value in self.values.values() {
-            if let Some(condition) = &value.condition {
-                out.insert(condition);
-            }
-            for condition in &value.applicability.conditions {
-                out.insert(condition);
-            }
-        }
-        out
+        self.conditions.iter().map(String::as_str).collect()
     }
 }
 
 /// How one requirement was resolved.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutcomeState {
     /// The candidate satisfies the requirement.
@@ -782,7 +926,7 @@ impl OutcomeState {
 }
 
 /// One evaluated requirement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequirementOutcome {
     /// Requirement id.
@@ -800,7 +944,9 @@ pub struct RequirementOutcome {
 }
 
 /// The deterministic engineering verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineeringVerdict {
     /// Every mandatory and optional requirement is satisfied.
@@ -832,7 +978,9 @@ impl EngineeringVerdict {
 }
 
 /// Why a test is derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TestKind {
     /// A measurement.
@@ -848,7 +996,7 @@ pub enum TestKind {
 }
 
 /// A falsifiable test derived from an unresolved requirement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedTest {
     /// Requirement the test resolves.
@@ -886,7 +1034,7 @@ impl DerivedTest {
 }
 
 /// The complete evaluation for one candidate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateEvaluation {
     /// Candidate id.
@@ -955,6 +1103,10 @@ pub fn evaluate(
             OutcomeState::Unavailable {
                 reason: format!("condition not established: {missing}"),
             }
+        } else if let Some(reason) =
+            value_applicability_failure(requirement, candidate, &established)
+        {
+            OutcomeState::Unavailable { reason }
         } else {
             match &requirement.target {
                 RequirementTarget::Numeric {
@@ -1008,6 +1160,74 @@ pub fn evaluate(
         tests,
         dimension_checks,
     })
+}
+
+/// A conditional fact is admissible only when every condition it claims is
+/// independently established by the candidate. A value's own `condition`
+/// annotation never establishes itself: that would let a caller attach an
+/// out-of-regime condition to a value and then cite it as satisfied.
+fn value_applicability_failure(
+    requirement: &EngineeringRequirement,
+    candidate: &CandidateFacts,
+    established: &BTreeSet<&str>,
+) -> Option<String> {
+    let RequirementTarget::Numeric { property, .. } = &requirement.target else {
+        return None;
+    };
+    let value = candidate.values.get(property)?;
+    if let Some(condition) = &value.condition {
+        if !established.contains(condition.as_str()) {
+            return Some(format!(
+                "property {property} condition not established: {condition}"
+            ));
+        }
+    }
+    for condition in &value.applicability.conditions {
+        if !established.contains(condition.as_str()) {
+            return Some(format!(
+                "property {property} applicability condition not established: {condition}"
+            ));
+        }
+    }
+    for exclusion in &value.applicability.exclusions {
+        if established.contains(exclusion.as_str()) {
+            return Some(format!(
+                "property {property} does not apply when {exclusion} is established"
+            ));
+        }
+    }
+    if let Some(regime) = &value.applicability.load_regime {
+        if !established.contains(regime.as_str()) {
+            return Some(format!(
+                "property {property} load regime not established: {regime}"
+            ));
+        }
+    }
+    if value.applicability.temperature.is_some() {
+        let temperature = value
+            .temperature
+            .as_ref()
+            .or(candidate.temperature.as_ref());
+        let Some(temperature) = temperature else {
+            return Some(format!(
+                "property {property} applicability is temperature-bound but no temperature is established"
+            ));
+        };
+        match value.applicability.contains_temperature(temperature) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some(format!(
+                    "property {property} temperature is outside its declared applicability"
+                ))
+            }
+            Err(error) => {
+                return Some(format!(
+                    "property {property} applicability cannot be checked: {error}"
+                ))
+            }
+        }
+    }
+    None
 }
 
 fn model_failure(
@@ -1291,6 +1511,20 @@ pub fn si_crosscheck_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relaxation_approval(
+        set: &EngineeringRequirementSet,
+        requirement_id: &str,
+        limit: &NumericLimit,
+    ) -> faktor_approval::ApprovalToken {
+        let digest = set.relaxation_digest(requirement_id, limit).unwrap();
+        faktor_approval::ApprovalToken::test_token(
+            faktor_approval::ApprovalKind::EngineeringConstraintRelaxation,
+            set.id.clone(),
+            set.revision.get().to_string(),
+            digest.to_hex(),
+        )
+    }
     use crate::value::ProvenanceKind;
 
     fn revision() -> RevisionId {
@@ -1420,6 +1654,70 @@ mod tests {
     }
 
     #[test]
+    fn a_fact_cannot_establish_its_own_conditional_applicability() {
+        let mut requirement = numeric(
+            "esr",
+            "esr",
+            NumericLimit::Max {
+                limit: quantity(100.0, "mohm"),
+            },
+            true,
+        );
+        requirement.conditions = vec!["105 C".to_string()];
+        let requirements = set(vec![requirement]);
+        let mut candidate = facts(&[("esr", 50.0, "mohm")]);
+        candidate.values.get_mut("esr").unwrap().condition = Some("105 C".to_string());
+        let evaluation = evaluate(&requirements, &candidate).unwrap();
+        assert_eq!(evaluation.verdict, EngineeringVerdict::Unavailable);
+        assert!(matches!(
+            evaluation.outcomes[0].state,
+            OutcomeState::Unavailable { .. }
+        ));
+
+        // Control: the same claim is admissible when the candidate actually
+        // establishes the condition.
+        candidate.conditions = vec!["105 C".to_string()];
+        let evaluation = evaluate(&requirements, &candidate).unwrap();
+        assert_eq!(evaluation.verdict, EngineeringVerdict::Accept);
+    }
+
+    #[test]
+    fn value_applicability_exclusions_and_temperature_bounds_are_enforced() {
+        let requirements = set(vec![numeric(
+            "esr",
+            "esr",
+            NumericLimit::Max {
+                limit: quantity(100.0, "mohm"),
+            },
+            true,
+        )]);
+        let mut candidate = facts(&[("esr", 50.0, "mohm")]);
+        candidate.conditions = vec!["105 C".to_string()];
+        candidate.values.get_mut("esr").unwrap().applicability =
+            crate::value::Applicability::unrestricted().with_exclusion("105 C");
+        let evaluation = evaluate(&requirements, &candidate).unwrap();
+        assert!(matches!(
+            evaluation.outcomes[0].state,
+            OutcomeState::Unavailable { .. }
+        ));
+
+        let mut candidate = facts(&[("esr", 50.0, "mohm")]);
+        candidate.temperature = Some(quantity(500.0, "K"));
+        candidate.values.get_mut("esr").unwrap().applicability =
+            crate::value::Applicability::unrestricted()
+                .with_temperature(engineering_units::Interval::new(273.15, 373.15).unwrap());
+        let evaluation = evaluate(&requirements, &candidate).unwrap();
+        assert!(matches!(
+            evaluation.outcomes[0].state,
+            OutcomeState::Unavailable { .. }
+        ));
+
+        candidate.temperature = Some(quantity(300.0, "K"));
+        let evaluation = evaluate(&requirements, &candidate).unwrap();
+        assert_eq!(evaluation.verdict, EngineeringVerdict::Accept);
+    }
+
+    #[test]
     fn a_missing_mandatory_fact_is_unavailable_not_zero() {
         let requirements = set(vec![numeric(
             "esr",
@@ -1518,6 +1816,14 @@ mod tests {
                     digest: None,
                     provenance: provenance(),
                 },
+                &relaxation_approval(
+                    &requirements,
+                    "hole",
+                    &NumericLimit::EqualWithin {
+                        nominal: quantity(10.0, "mm"),
+                        tolerance: quantity(0.025, "mm"),
+                    },
+                ),
             )
             .unwrap();
         assert_eq!(relaxed.revision, RevisionId::new(8));
@@ -1549,6 +1855,14 @@ mod tests {
                     digest: None,
                     provenance: provenance(),
                 },
+                &relaxation_approval(
+                    &multi,
+                    "hole",
+                    &NumericLimit::EqualWithin {
+                        nominal: quantity(10.0, "mm"),
+                        tolerance: quantity(0.025, "mm"),
+                    },
+                ),
             )
             .unwrap();
         assert_eq!(multi.requirements.len(), 2);
@@ -1567,8 +1881,58 @@ mod tests {
                 digest: None,
                 provenance: provenance(),
             },
+            &relaxation_approval(
+                &requirements,
+                "hole",
+                &NumericLimit::EqualWithin {
+                    nominal: quantity(10.0, "mm"),
+                    tolerance: quantity(10.0, "s"),
+                },
+            ),
         );
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn relaxation_without_the_bound_human_approval_is_refused() {
+        let requirements = set(vec![numeric(
+            "hole",
+            "hole_diameter",
+            NumericLimit::EqualWithin {
+                nominal: quantity(10.0, "mm"),
+                tolerance: quantity(0.010, "mm"),
+            },
+            true,
+        )]);
+        let token = faktor_approval::ApprovalToken::test_token(
+            faktor_approval::ApprovalKind::EngineeringConstraintRelaxation,
+            requirements.id.clone(),
+            requirements.revision.get().to_string(),
+            "0".repeat(64),
+        );
+        let error = requirements
+            .relax(
+                "hole",
+                NumericLimit::EqualWithin {
+                    nominal: quantity(10.0, "mm"),
+                    tolerance: quantity(0.025, "mm"),
+                },
+                "process capability study",
+                provenance().with_revision(RevisionId::new(8)),
+                "a capability study",
+                RequirementEvidence {
+                    id: "cpk-study".to_string(),
+                    revision: RevisionId::new(2),
+                    digest: None,
+                    provenance: provenance(),
+                },
+                &token,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Approval(faktor_approval::ApprovalError::Stale { .. })
+        ));
     }
 
     #[test]
@@ -1617,5 +1981,65 @@ mod tests {
         );
         let evaluation = evaluate(&requirements, &candidate).unwrap();
         assert_eq!(evaluation.verdict, EngineeringVerdict::Reject);
+    }
+    #[test]
+    fn a_relaxation_approval_cannot_be_widened_or_replayed_after_a_set_mutation() {
+        let requirements = set(vec![numeric(
+            "cap",
+            "capacitance",
+            NumericLimit::EqualWithin {
+                nominal: quantity(10.0, "uF"),
+                tolerance: quantity(0.010, "uF"),
+            },
+            true,
+        )]);
+        let approved = NumericLimit::EqualWithin {
+            nominal: quantity(10.0, "uF"),
+            tolerance: quantity(0.025, "uF"),
+        };
+        let token = relaxation_approval(&requirements, "cap", &approved);
+        let wider = NumericLimit::EqualWithin {
+            nominal: quantity(10.0, "uF"),
+            tolerance: quantity(0.050, "uF"),
+        };
+        let error = requirements
+            .relax(
+                "cap",
+                wider,
+                "wider than approved",
+                provenance(),
+                "a wider falsifier",
+                requirements.evidence[0].clone(),
+                &token,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CoreError::Approval(faktor_approval::ApprovalError::Stale { .. })
+            ),
+            "a wider limit must not reuse the narrower approval: {error}"
+        );
+
+        let mut mutated = requirements.clone();
+        mutated.requirements[0].statement = "a mutated statement".to_string();
+        let error = mutated
+            .relax(
+                "cap",
+                approved,
+                "post-mutation",
+                provenance(),
+                "a falsifier",
+                mutated.evidence[0].clone(),
+                &token,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CoreError::Approval(faktor_approval::ApprovalError::Stale { .. })
+            ),
+            "a set mutation must invalidate the approval: {error}"
+        );
     }
 }

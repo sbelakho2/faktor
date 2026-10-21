@@ -50,6 +50,7 @@ faktor-worker.workspace = true
 faktor-updater.workspace = true
 faktor-scm.workspace = true
 faktor-commerce.workspace = true
+faktor-approval.workspace = true
 faktor-supply-core.workspace = true
 faktor-supply-supplier.workspace = true
 faktor-supply-cost.workspace = true
@@ -66,6 +67,7 @@ futures.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

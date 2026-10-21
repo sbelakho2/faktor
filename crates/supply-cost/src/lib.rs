@@ -40,6 +40,7 @@ use faktor_supply_core::{
     Currency, ExactError, Money, Rate, ScaledQuantity, Term, Unavailable, UnavailableReason, Units,
     MAX_TEXT_BYTES,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Maximum material lines in one should-cost.
@@ -89,7 +90,7 @@ fn exact(value: Result<Money, ExactError>) -> Result<Money, CostError> {
 // --------------------------------------------------------------- should-cost
 
 /// One material input per finished unit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterialLine {
     /// Material description.
@@ -103,7 +104,7 @@ pub struct MaterialLine {
 }
 
 /// Machine time for one process step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineTime {
     /// Machine / work-center rate per hour.
@@ -113,7 +114,7 @@ pub struct MachineTime {
 }
 
 /// Setup amortization for one process step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupCost {
     /// Setup cost per lot.
@@ -123,7 +124,7 @@ pub struct SetupCost {
 }
 
 /// Tooling / NRE amortization for one process step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolingAmortization {
     /// One-time tooling or NRE cost.
@@ -133,7 +134,7 @@ pub struct ToolingAmortization {
 }
 
 /// Direct labor for one process step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaborTime {
     /// Fully burdened labor rate per hour.
@@ -144,7 +145,7 @@ pub struct LaborTime {
 }
 
 /// One ordered process-route step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStep {
     /// Operation name.
@@ -162,7 +163,7 @@ pub struct ProcessStep {
 }
 
 /// Scrap and rework model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScrapRework {
     /// Scrap rate applied to material + route + inspection.
@@ -174,7 +175,7 @@ pub struct ScrapRework {
 }
 
 /// The overhead allocation base.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverheadBase {
     /// Direct labor only.
@@ -188,7 +189,7 @@ pub enum OverheadBase {
 }
 
 /// Overhead model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overhead {
     /// Rate applied to the selected base.
@@ -198,7 +199,7 @@ pub struct Overhead {
 }
 
 /// How margin is expressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarginMode {
     /// Price = cost * (1 + margin).
@@ -208,7 +209,7 @@ pub enum MarginMode {
 }
 
 /// Complete should-cost input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShouldCostInput {
     /// Analysis currency. Every known money term must match it.
@@ -345,7 +346,9 @@ fn check_non_negative(money: Money, what: &'static str) -> Result<(), CostError>
 }
 
 /// The named term in a should-cost breakdown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CostTerm {
     /// Raw material / purchased content.
@@ -373,7 +376,7 @@ pub enum CostTerm {
 }
 
 /// One should-cost line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostLine {
     /// The term.
@@ -390,7 +393,7 @@ pub struct CostLine {
 }
 
 /// Complete should-cost result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShouldCost {
     /// Analysis currency.
@@ -1099,7 +1102,7 @@ pub enum TcoError {
 }
 
 /// Insurance premium.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Insurance {
     /// Insured value.
@@ -1112,7 +1115,7 @@ pub struct Insurance {
 
 /// Duty computation inputs. The customs value is explicit so the duty does
 /// not depend circularly on an insurance premium computed later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Duty {
     /// Customs value used by the tariff authority.
@@ -1124,7 +1127,7 @@ pub struct Duty {
 }
 
 /// Tax computation inputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tax {
     /// Taxable value.
@@ -1136,7 +1139,7 @@ pub struct Tax {
 }
 
 /// Working-capital cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingCapital {
     /// Annual capital cost rate.
@@ -1148,7 +1151,7 @@ pub struct WorkingCapital {
 }
 
 /// Expected quality cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualityCost {
     /// Defect rate in defective parts per million.
@@ -1160,7 +1163,7 @@ pub struct QualityCost {
 }
 
 /// Expected expedite cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpediteCost {
     /// Probability of an expedite event.
@@ -1170,7 +1173,7 @@ pub struct ExpediteCost {
 }
 
 /// Excess-MOQ inventory carrying cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExcessMoq {
     /// Units bought only because of the MOQ.
@@ -1184,7 +1187,7 @@ pub struct ExcessMoq {
 }
 
 /// Obsolescence exposure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Obsolescence {
     /// Exposure rate.
@@ -1194,7 +1197,9 @@ pub struct Obsolescence {
 }
 
 /// The TCO term vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TcoTerm {
     /// Ex-works goods value.
@@ -1230,7 +1235,7 @@ pub enum TcoTerm {
 }
 
 /// One TCO line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcoLine {
     /// Term.
@@ -1248,7 +1253,7 @@ pub struct TcoLine {
 
 /// TCO input. Every term is required to be present — either known with a
 /// basis, unknown with a reason, or explicitly not applicable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcoInput {
     /// Analysis currency.
@@ -1365,7 +1370,7 @@ impl TcoInput {
 }
 
 /// Complete landed-cost result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tco {
     /// Currency.

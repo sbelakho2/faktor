@@ -12,6 +12,10 @@
 //! or message side effects. Orders and messages remain authorization-gated by
 //! `faktor-supply-execution`; this crate never executes them.
 
+#![allow(clippy::result_large_err)]
+
+pub mod tool_schema;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -52,6 +56,7 @@ use faktor_supply_supplier::{
     assess as assess_supplier, AuthorizationState, FitReport, FitVerdict, SourcingRequirement,
     SupplierProfile,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -63,6 +68,10 @@ pub const MAX_LOOP_RANKED: usize = 64;
 pub const MAX_LOOP_KNOWLEDGE_DOMAINS: usize = 16;
 /// Maximum applied relaxations.
 pub const MAX_LOOP_RELAXATIONS: usize = 16;
+/// Maximum should-cost assumption overrides.
+pub const MAX_LOOP_SHOULD_COST_OVERRIDES: usize = 16;
+/// Maximum process labels on one candidate.
+pub const MAX_LOOP_CANDIDATE_PROCESSES: usize = 64;
 
 /// Closed-loop error. Every variant is a refusal, never a fabricated result.
 #[derive(Debug, Error)]
@@ -83,13 +92,32 @@ pub enum LoopError {
     Units(#[from] engineering_units::UnitError),
     #[error("invalid loop request: {0}")]
     Invalid(String),
+    /// A consequential change needs a current human-operator approval.
+    #[error(transparent)]
+    Approval(#[from] faktor_approval::ApprovalError),
+}
+
+impl LoopError {
+    /// The typed approval refusal, when this is one.
+    pub fn approval(&self) -> Option<&faktor_approval::ApprovalError> {
+        match self {
+            Self::Approval(error) => Some(error),
+            Self::Engineering(engineering_core::CoreError::Approval(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// The `approval_required` JSON result for CLI/tool surfaces.
+    pub fn approval_json(&self) -> Option<serde_json::Value> {
+        self.approval().map(faktor_approval::ApprovalError::to_json)
+    }
 }
 
 /// Result alias.
 pub type LoopResult<T> = Result<T, LoopError>;
 
 /// Inventory position for the requirement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryContext {
     /// On hand at the decision revision.
@@ -101,7 +129,7 @@ pub struct InventoryContext {
 }
 
 /// Negotiation context. The loop normalizes quotes; it never sends one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NegotiationContext {
     /// Annual cost of capital.
@@ -120,7 +148,7 @@ pub struct NegotiationContext {
 /// preserved; a successful relaxation publishes a new revision and its
 /// evidence. Supply may attach revised should-cost, quote and TCO inputs;
 /// they are used only when a relaxation actually applied.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relaxation {
     /// Requirement to relax.
@@ -137,8 +165,44 @@ pub struct Relaxation {
     pub evidence: RequirementEvidence,
 }
 
+/// A human-approved should-cost assumption override. The override is used in
+/// place of the candidate's should-cost input only while a current human
+/// approval binds to this exact override and candidate revision.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShouldCostOverride {
+    /// Candidate whose cost basis is overridden.
+    pub candidate: CandidateId,
+    /// The replacement should-cost input.
+    pub input: ShouldCostInput,
+    /// Why the override is justified.
+    pub rationale: String,
+}
+
+impl ShouldCostOverride {
+    /// Validate bounds.
+    pub fn validate(&self) -> LoopResult<()> {
+        self.candidate.validate()?;
+        self.input.validate()?;
+        validate_text(
+            &self.rationale,
+            MAX_TEXT_BYTES,
+            "should-cost override rationale",
+        )?;
+        Ok(())
+    }
+
+    /// The exact digest a human approval binds to.
+    pub fn digest(&self) -> LoopResult<Digest> {
+        Ok(Digest::of_json(&(
+            "faktor.supply.should-cost-override/v1",
+            self,
+        ))?)
+    }
+}
+
 /// One supply candidate with its engineering facts and commercial terms.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopCandidate {
     /// Candidate id.
@@ -153,6 +217,7 @@ pub struct LoopCandidate {
     pub part: Option<PartId>,
     /// Manufacturing processes claimed for the candidate.
     #[serde(default)]
+    #[schemars(length(max = MAX_LOOP_CANDIDATE_PROCESSES))]
     pub processes: Vec<String>,
     /// Engineering facts for the candidate/alternate.
     pub facts: CandidateFacts,
@@ -188,14 +253,17 @@ pub struct LoopCandidate {
 }
 
 /// One bounded loop request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopRequest {
     /// Decision id.
+    #[schemars(length(min = 1, max = MAX_ID_BYTES))]
     pub decision_id: String,
     /// Supply decision revision.
+    #[schemars(range(min = 1))]
     pub revision: Revision,
     /// Engineering requirement-set revision the request was built against.
+    #[schemars(range(min = 1))]
     pub engineering_revision: RevisionId,
     /// Supply requirement.
     pub requirement: SupplyRequirement,
@@ -207,14 +275,18 @@ pub struct LoopRequest {
     #[serde(default)]
     pub require_supplier_fit: bool,
     /// Candidates.
+    #[schemars(length(min = 1, max = MAX_LOOP_CANDIDATES))]
     pub candidates: Vec<LoopCandidate>,
     /// Knowledge domains whose packs are the cited authority.
+    #[schemars(length(min = 1, max = MAX_LOOP_KNOWLEDGE_DOMAINS))]
     pub knowledge_domains: Vec<String>,
     /// Explicit assumptions.
     #[serde(default)]
+    #[schemars(length(max = MAX_DECISION_ASSUMPTIONS))]
     pub assumptions: Vec<Assumption>,
     /// Evidence bound to the request.
     #[serde(default)]
+    #[schemars(length(max = MAX_DECISION_EVIDENCE))]
     pub evidence: Vec<EvidenceRef>,
     /// Inventory position.
     pub inventory: InventoryContext,
@@ -222,7 +294,12 @@ pub struct LoopRequest {
     pub negotiation: NegotiationContext,
     /// Optional requirement relaxations, applied in order.
     #[serde(default)]
+    #[schemars(length(max = MAX_LOOP_RELAXATIONS))]
     pub relaxations: Vec<Relaxation>,
+    /// Optional should-cost assumption overrides, each human-approved.
+    #[serde(default)]
+    #[schemars(length(max = MAX_LOOP_SHOULD_COST_OVERRIDES))]
+    pub should_cost_overrides: Vec<ShouldCostOverride>,
 }
 
 impl LoopRequest {
@@ -284,6 +361,31 @@ impl LoopRequest {
                 "relaxations exceed {MAX_LOOP_RELAXATIONS}"
             )));
         }
+        if self.should_cost_overrides.len() > MAX_LOOP_SHOULD_COST_OVERRIDES {
+            return Err(LoopError::Invalid(format!(
+                "should-cost overrides exceed {MAX_LOOP_SHOULD_COST_OVERRIDES}"
+            )));
+        }
+        let mut overridden = BTreeSet::new();
+        for should_cost_override in &self.should_cost_overrides {
+            should_cost_override.validate()?;
+            if !overridden.insert(should_cost_override.candidate.0.clone()) {
+                return Err(LoopError::Invalid(format!(
+                    "candidate {} has more than one should-cost override",
+                    should_cost_override.candidate.0
+                )));
+            }
+            if !self
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == should_cost_override.candidate)
+            {
+                return Err(LoopError::Invalid(format!(
+                    "should-cost override targets unknown candidate {}",
+                    should_cost_override.candidate.0
+                )));
+            }
+        }
         if self.assumptions.len() > MAX_DECISION_ASSUMPTIONS {
             return Err(LoopError::Invalid(format!(
                 "assumptions exceed {MAX_DECISION_ASSUMPTIONS}"
@@ -327,6 +429,15 @@ impl LoopRequest {
                 input.validate()?;
             }
             candidate.lead_time_days.validate()?;
+            if candidate.processes.len() > MAX_LOOP_CANDIDATE_PROCESSES {
+                return Err(LoopError::Invalid(format!(
+                    "candidate {} records more than {MAX_LOOP_CANDIDATE_PROCESSES} processes",
+                    candidate.id.0
+                )));
+            }
+            for process in &candidate.processes {
+                validate_text(process, MAX_TEXT_BYTES, "candidate process")?;
+            }
             for reference in &candidate.evidence {
                 reference.validate()?;
             }
@@ -358,12 +469,17 @@ impl LoopRequest {
                 "negotiation context is invalid".to_string(),
             ));
         }
+        validate_text(
+            &self.negotiation.destination_country,
+            128,
+            "negotiation destination country",
+        )?;
         Ok(())
     }
 }
 
 /// One requirement relaxed during this run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppliedRelaxation {
     /// Requirement id.
@@ -383,7 +499,7 @@ pub struct AppliedRelaxation {
 }
 
 /// Compact supplier-fit projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupplierFitSummary {
     /// Verdict.
@@ -424,7 +540,7 @@ impl SupplierFitSummary {
 }
 
 /// One candidate's complete evaluation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateEvaluation {
     /// Candidate id.
@@ -466,7 +582,7 @@ pub struct CandidateEvaluation {
 }
 
 /// Negotiation outcome for the decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NegotiationOutcome {
     /// RFQ package used for normalization.
@@ -480,7 +596,7 @@ pub struct NegotiationOutcome {
 }
 
 /// The loop's typed digest binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopBinding {
     /// Digest of the request.
@@ -494,7 +610,7 @@ pub struct LoopBinding {
 }
 
 /// The typed authorization notice. The loop never sends or orders anything.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationNotice {
     /// Orders and messages always require an explicit grant.
@@ -504,7 +620,7 @@ pub struct AuthorizationNotice {
 }
 
 /// Measured loop work.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopPerformance {
     /// Candidates evaluated.
@@ -518,7 +634,7 @@ pub struct LoopPerformance {
 }
 
 /// Verification of a stored loop result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopVerification {
     /// The decision validates.
@@ -536,7 +652,7 @@ pub struct LoopVerification {
 }
 
 /// The closed-loop result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopOutcome {
     /// The central supply decision.
@@ -568,9 +684,11 @@ pub struct LoopOutcome {
 }
 
 impl LoopOutcome {
-    /// Recompute every proof/evidence binding. This is the command/tool-side
-    /// verification entry point; it never trusts the stored booleans.
-    pub fn verify(&self) -> LoopResult<LoopVerification> {
+    /// Recompute every proof/evidence binding against the receipts' OWN
+    /// enclosed keys. Integrity only: this never establishes that the signing
+    /// key is the daemon's trusted key. Authority paths must use
+    /// [`Self::verify_with_verifier`] or [`Self::is_verified`].
+    pub fn verify_integrity_only(&self) -> LoopResult<LoopVerification> {
         self.verify_with_verifier(&ReceiptVerifier::self_attested())
     }
 
@@ -616,7 +734,7 @@ impl LoopOutcome {
             && self.binding.supply_revision == self.decision.revision
             && selection_binding;
         let response_ready = match (&self.response, &self.decision.recommended_action) {
-            (Some(response), _) => response.is_ready_with_verifier(verifier),
+            (Some(response), _) => response.is_verified(verifier),
             (None, RecommendedAction::Proceed { .. }) => false,
             (None, _) => true,
         };
@@ -631,12 +749,16 @@ impl LoopOutcome {
         })
     }
 
-    /// True when verification passed every binding.
-    pub fn is_verified(&self) -> bool {
-        self.is_verified_with_verifier(&ReceiptVerifier::self_attested())
+    /// Integrity-only: every binding recomputes under the receipts' own keys.
+    /// A self-signed/attacker outcome can satisfy this; it is not authority.
+    pub fn is_self_verified(&self) -> bool {
+        self.is_verified(&ReceiptVerifier::self_attested())
     }
 
-    pub fn is_verified_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
+    /// Authority check: every binding recomputes AND every receipt verifies
+    /// under `verifier`'s trusted key set. There is intentionally no
+    /// verifier-less overload.
+    pub fn is_verified(&self, verifier: &ReceiptVerifier) -> bool {
         self.verify_with_verifier(verifier)
             .map(|v| {
                 v.decision_valid
@@ -648,21 +770,80 @@ impl LoopOutcome {
             })
             .unwrap_or(false)
     }
+
+    /// Explicit-verifier alias of [`Self::is_verified`].
+    pub fn is_verified_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
+        self.is_verified(verifier)
+    }
 }
 
-/// Run the closed loop. Deterministic and bounded; evaluation is O(n), and
-/// ranking is one `sort_by` over n candidates (O(n log n)).
-pub fn run(request: &LoopRequest) -> LoopResult<LoopOutcome> {
-    // Standalone/embedded callers get an ephemeral process key: receipts are
-    // still signed and self-verifiable, but the daemon path uses the durable
-    // data-dir key through [`run_with_signer`].
+/// Run the closed loop with an EPHEMERAL process-local signing key.
+///
+/// This is an explicit test/embedded mode, never the CLI default: receipts
+/// are self-consistent (they verify against the key they carry) but are not
+/// durably auditable, because the key exists only in this process. The
+/// daemon and `faktor supply decision` use the persistent data-dir key
+/// through [`run_with_signer`]/[`run_with_authority`]; `faktor engineering
+/// verify` trusts only that key (or its recorded retired predecessors) and
+/// therefore refuses ephemeral receipts.
+pub fn run_ephemeral(request: &LoopRequest) -> LoopResult<LoopOutcome> {
     let signer = ReceiptSigner::generate();
     run_with_signer(request, &signer)
 }
 
-/// Run the closed loop with the daemon-local engineering signing key.
+/// Run the closed loop with the daemon-local engineering signing key. Any
+/// requirement relaxation is refused typed: this entry point has no approval
+/// authority, so it can never silently relax a constraint.
 pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopResult<LoopOutcome> {
+    run_with_authority_opt(request, signer, None)
+}
+
+/// Run the closed loop with the durable human-approval authority. Every
+/// relaxation must already carry a current human approval bound to the live
+/// requirement revision and the exact proposed limit; an agent cannot supply
+/// the token itself (tokens are minted only by [`faktor_approval::ApprovalAuthority`]).
+pub fn run_with_authority(
+    request: &LoopRequest,
+    signer: &ReceiptSigner,
+    authority: &faktor_approval::ApprovalAuthority,
+) -> LoopResult<LoopOutcome> {
+    run_with_authority_opt(request, signer, Some(authority))
+}
+
+fn run_with_authority_opt(
+    request: &LoopRequest,
+    signer: &ReceiptSigner,
+    authority: Option<&faktor_approval::ApprovalAuthority>,
+) -> LoopResult<LoopOutcome> {
     request.validate()?;
+    if !request.relaxations.is_empty() && authority.is_none() {
+        let probe = request.engineering.clone();
+        if let Some(relaxation) = request.relaxations.first() {
+            let digest =
+                probe.relaxation_digest(&relaxation.requirement_id, &relaxation.new_limit)?;
+            return Err(faktor_approval::ApprovalError::ApprovalRequired {
+                kind: faktor_approval::ApprovalKind::EngineeringConstraintRelaxation,
+                subject: probe.id.clone(),
+                bound_revision: probe.revision.get().to_string(),
+                bound_digest: digest.to_hex(),
+            }
+            .into());
+        }
+    }
+    if !request.should_cost_overrides.is_empty() && authority.is_none() {
+        let override_ = &request.should_cost_overrides[0];
+        return Err(faktor_approval::ApprovalError::ApprovalRequired {
+            kind: faktor_approval::ApprovalKind::SupplyShouldCostAssumptionOverride,
+            subject: override_.candidate.0.clone(),
+            bound_revision: "candidate".to_string(),
+            bound_digest: override_.digest()?.to_hex(),
+        }
+        .into());
+    }
+    // The signer we just minted/loaded is the authority for this run: internal
+    // gate decisions verify against exactly that trusted fingerprint, never
+    // through a self-attested shortcut.
+    let verifier = ReceiptVerifier::trusting_key_id(&signer.key_id())?;
     let started = Instant::now();
     let input_digest = Digest::of_json(request)?;
 
@@ -735,6 +916,22 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
             })?;
         let next_revision = requirements.revision.next();
         let provenance = relaxation.provenance.clone().with_revision(next_revision);
+        let digest =
+            requirements.relaxation_digest(&relaxation.requirement_id, &relaxation.new_limit)?;
+        let check = faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::EngineeringConstraintRelaxation,
+            requirements.id.clone(),
+            requirements.revision.get().to_string(),
+            digest.to_hex(),
+        );
+        let authority =
+            authority.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+                kind: check.kind,
+                subject: check.subject.clone(),
+                bound_revision: check.bound_revision.clone(),
+                bound_digest: check.bound_digest.clone(),
+            })?;
+        let token = authority.authorize(&check, faktor_approval::unix_now_ms())?;
         requirements = requirements.relax(
             &relaxation.requirement_id,
             relaxation.new_limit.clone(),
@@ -742,6 +939,7 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
             provenance,
             &relaxation.falsifier,
             relaxation.evidence.clone(),
+            &token,
         )?;
         applied_relaxations.push(AppliedRelaxation {
             requirement_id: relaxation.requirement_id.clone(),
@@ -752,6 +950,28 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
             rationale: relaxation.rationale.clone(),
             evidence: relaxation.evidence.id.clone(),
         });
+    }
+
+    let mut approved_overrides: BTreeMap<&str, &ShouldCostInput> = BTreeMap::new();
+    for should_cost_override in &request.should_cost_overrides {
+        let check = faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::SupplyShouldCostAssumptionOverride,
+            should_cost_override.candidate.0.clone(),
+            "candidate",
+            should_cost_override.digest()?.to_hex(),
+        );
+        let authority =
+            authority.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+                kind: check.kind,
+                subject: check.subject.clone(),
+                bound_revision: check.bound_revision.clone(),
+                bound_digest: check.bound_digest.clone(),
+            })?;
+        authority.authorize(&check, faktor_approval::unix_now_ms())?;
+        approved_overrides.insert(
+            should_cost_override.candidate.0.as_str(),
+            &should_cost_override.input,
+        );
     }
 
     let package = rfq_package(request, &requirements)?;
@@ -773,6 +993,7 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
             &normalization,
             !applied_relaxations.is_empty(),
             &packs,
+            approved_overrides.get(candidate.id.0.as_str()).copied(),
         )?);
         let quote = selected_quote(candidate, !applied_relaxations.is_empty());
         if let Some(quote) = quote {
@@ -843,6 +1064,7 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
         &normalization,
         &packs,
         signer,
+        &verifier,
         started,
     )?;
 
@@ -903,6 +1125,9 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
     decision.validate()?;
 
     let result_digest = digest_payload(&decision, &requirements, &returned, &ranked, &authorities)?;
+    if let Some(authority) = authority {
+        authorize_plan_baseline(authority, request, &decision, &result_digest)?;
+    }
     let payload = LoopBinding {
         input_digest,
         result_digest,
@@ -935,6 +1160,53 @@ pub fn run_with_signer(request: &LoopRequest, signer: &ReceiptSigner) -> LoopRes
         },
     };
     Ok(outcome)
+}
+
+/// A `Proceed` recommendation that changes an already human-approved plan
+/// baseline is itself consequential. The latest approved `SupplyPlanProceed`
+/// for this decision id is the baseline; a different result digest requires a
+/// fresh human approval bound to that exact digest and revision.
+fn authorize_plan_baseline(
+    authority: &faktor_approval::ApprovalAuthority,
+    request: &LoopRequest,
+    decision: &SupplyDecision,
+    result_digest: &Digest,
+) -> LoopResult<()> {
+    if !matches!(
+        decision.recommended_action,
+        RecommendedAction::Proceed { .. }
+    ) {
+        return Ok(());
+    }
+    let now = faktor_approval::unix_now_ms();
+    let baseline = authority.latest_authorized(
+        faktor_approval::ApprovalKind::SupplyPlanProceed,
+        &request.decision_id,
+        now,
+    )?;
+    if let Some(token) = &baseline {
+        if token.bound_revision() == request.revision.get().to_string()
+            && token.bound_digest() == result_digest.to_hex()
+        {
+            return Ok(());
+        }
+    }
+    let prior = authority.latest_request(
+        faktor_approval::ApprovalKind::SupplyPlanProceed,
+        &request.decision_id,
+    )?;
+    if prior.is_none() {
+        // A new decision is a recommendation, not yet an approved baseline.
+        return Ok(());
+    }
+    let check = faktor_approval::ApprovalCheck::new(
+        faktor_approval::ApprovalKind::SupplyPlanProceed,
+        request.decision_id.clone(),
+        request.revision.get().to_string(),
+        result_digest.to_hex(),
+    );
+    authority.authorize(&check, now)?;
+    Ok(())
 }
 
 fn index_candidates(candidates: &[LoopCandidate]) -> BTreeMap<&str, &LoopCandidate> {
@@ -990,6 +1262,7 @@ fn evaluate_candidate(
     normalization: &NormalizationContext,
     relaxed: bool,
     packs: &[&KnowledgePack],
+    should_cost_override: Option<&ShouldCostInput>,
 ) -> LoopResult<CandidateEvaluation> {
     let mut engineering = evaluate_requirements(requirements, &candidate.facts)?;
     let knowledge_refs = augment_tests(requirements, &mut engineering, packs);
@@ -1001,7 +1274,8 @@ fn evaluate_candidate(
 
     let tco_input = selected_tco(candidate, relaxed);
     let tco_result = tco_input.map(tco).transpose()?;
-    let should_cost_result = selected_should_cost(candidate, relaxed)
+    let should_cost_result = should_cost_override
+        .or_else(|| selected_should_cost(candidate, relaxed))
         .map(should_cost)
         .transpose()?;
     let quote = selected_quote(candidate, relaxed);
@@ -1247,9 +1521,14 @@ fn derive_continuity_risk(candidate: &LoopCandidate) -> Availability<RiskSummary
                 current.max(value.severity)
             }));
             drivers.push(format!(
-                "{:?}: recovery {} days",
+                "{:?}: recovery {}",
                 value.kind,
-                value.recovery_days.value.as_known().copied().unwrap_or(0)
+                value
+                    .recovery_days
+                    .value
+                    .as_known()
+                    .map(|days| format!("{days} days"))
+                    .unwrap_or_else(|| "unavailable".to_string())
             ));
             if let Some(basis) = &exposure.basis {
                 collect_basis_evidence(basis, &mut evidence);
@@ -1319,22 +1598,12 @@ struct DecisionParts {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_decision(
+fn collect_decision_evidence(
     request: &LoopRequest,
     requirements: &EngineeringRequirementSet,
     evaluations: &[CandidateEvaluation],
-    recommended_index: Option<usize>,
-    authorities: &[AuthorityRef],
-    no_relaxation_applied: bool,
-    baseline_verdicts: &[EngineeringVerdict],
-    relaxations: &[AppliedRelaxation],
-    quotes: &[Quote],
-    package: &RfqPackage,
-    normalization: &NormalizationContext,
-    packs: &[&KnowledgePack],
-    signer: &ReceiptSigner,
-    started: Instant,
-) -> LoopResult<DecisionParts> {
+    relaxed: bool,
+) -> LoopResult<Vec<EvidenceRef>> {
     let mut evidence = Vec::new();
     for reference in &request.evidence {
         push_evidence(&mut evidence, reference.clone());
@@ -1346,7 +1615,7 @@ fn build_decision(
         for reference in &candidate.evidence {
             push_evidence(&mut evidence, reference.clone());
         }
-        if let Some(quote) = selected_quote(candidate, !no_relaxation_applied) {
+        if let Some(quote) = selected_quote(candidate, relaxed) {
             push_evidence(&mut evidence, quote.document.clone());
         }
     }
@@ -1376,6 +1645,29 @@ fn build_decision(
             "the decision needs at least one evidence reference".to_string(),
         ));
     }
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_decision(
+    request: &LoopRequest,
+    requirements: &EngineeringRequirementSet,
+    evaluations: &[CandidateEvaluation],
+    recommended_index: Option<usize>,
+    authorities: &[AuthorityRef],
+    no_relaxation_applied: bool,
+    baseline_verdicts: &[EngineeringVerdict],
+    relaxations: &[AppliedRelaxation],
+    quotes: &[Quote],
+    package: &RfqPackage,
+    normalization: &NormalizationContext,
+    packs: &[&KnowledgePack],
+    signer: &ReceiptSigner,
+    verifier: &ReceiptVerifier,
+    started: Instant,
+) -> LoopResult<DecisionParts> {
+    let evidence =
+        collect_decision_evidence(request, requirements, evaluations, !no_relaxation_applied)?;
 
     let candidate_by_id = index_candidates(&request.candidates);
     let mut negotiation = None;
@@ -1612,12 +1904,12 @@ fn build_decision(
     };
     let recommended_action = match (response.as_ref(), recommended) {
         (Some(response), Some(evaluation)) => {
-            if response.is_ready() {
+            if response.is_verified(verifier) {
                 RecommendedAction::Proceed {
                     candidate: evaluation.candidate.clone(),
                 }
             } else {
-                let assessment = response.assess();
+                let assessment = response.assess_with_verifier(verifier);
                 let missing = assessment
                     .violations
                     .iter()

@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 
 use engineering_units::{Quantity, Uncertainty};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
 use crate::error::{require_text, CoreError, CoreResult};
 use crate::value::{EngineeringValue, RevisionId, UnavailableValue};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisKind {
     /// Deterministic arithmetic executed inside the Rust process.
@@ -16,7 +17,7 @@ pub enum AnalysisKind {
     SupervisedProcess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisIdentity {
     pub solver_id: String,
     pub solver_version: String,
@@ -30,7 +31,7 @@ impl AnalysisIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningSeverity {
     Info,
@@ -38,7 +39,7 @@ pub enum WarningSeverity {
     Critical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisWarning {
     pub code: String,
     pub message: String,
@@ -52,7 +53,7 @@ impl AnalysisWarning {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Convergence {
     pub converged: bool,
     pub iterations: u32,
@@ -105,7 +106,7 @@ impl Convergence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptValue {
     Quantity(Quantity),
@@ -131,7 +132,7 @@ impl ReceiptValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptResult {
     pub name: String,
     pub value: ReceiptValue,
@@ -145,7 +146,7 @@ impl ReceiptResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropertyRevision {
     pub property: String,
     pub revision: RevisionId,
@@ -164,7 +165,7 @@ impl PropertyRevision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub name: String,
     pub digest: Digest,
@@ -179,7 +180,7 @@ impl ArtifactRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repeatability {
     /// True only when a repeat run (or a bitwise-deterministic kernel) backs
     /// the claim. External tools are not assumed reproducible by default.
@@ -215,7 +216,7 @@ impl Repeatability {
 
 /// What actually executed. A receipt is never accepted on prose alone: the
 /// gate validation re-checks this evidence and the recorded digests.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionEvidence {
     InProcess {
@@ -233,7 +234,7 @@ pub enum ExecutionEvidence {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisReceipt {
     pub identity: AnalysisIdentity,
     pub input_digest: Digest,
@@ -262,7 +263,7 @@ pub struct AnalysisReceipt {
 }
 
 /// Everything except identity/execution that a kernel or tool run records.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptContent {
     pub input_digest: Digest,
     pub model_digest: Digest,
@@ -527,7 +528,7 @@ impl AnalysisReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisedProcessEvidence {
     pub command: String,
     pub exit_code: i32,

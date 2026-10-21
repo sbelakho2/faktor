@@ -22,9 +22,12 @@ const JAVA_WEAK_OLD: &str = include_str!("fixtures/rebind/WeakCartTest.java");
 const JAVA_WEAK_NEW: &str = include_str!("fixtures/rebind/WeakCartSuccessTest.java");
 const KOTLIN_OLD: &str = include_str!("fixtures/rebind/CartTest.kt");
 const KOTLIN_NEW: &str = include_str!("fixtures/rebind/CartTotalsTest.kt");
-const PY_OLD: &str = include_str!("fixtures/rebind/test_cart.py");
-const PY_NEW: &str = include_str!("fixtures/rebind/test_totals.py");
-const PY_WEAK: &str = include_str!("fixtures/rebind/test_weakened.py");
+// Python proof-rebind fixtures carry a `.py.fixture` suffix so the repository
+// never commits a runnable `.py` source (docs/repo-hygiene.md). The logical
+// language path below is supplied explicitly on every adapter call.
+const PY_OLD: &str = include_str!("fixtures/rebind/test_cart.py.fixture");
+const PY_NEW: &str = include_str!("fixtures/rebind/test_totals.py.fixture");
+const PY_WEAK: &str = include_str!("fixtures/rebind/test_weakened.py.fixture");
 const GO_OLD: &str = include_str!("fixtures/rebind/cart_test.go");
 const GO_NEW: &str = include_str!("fixtures/rebind/totals_test.go");
 const GO_WEAK: &str = include_str!("fixtures/rebind/weakened_test.go");

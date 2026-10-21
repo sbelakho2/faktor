@@ -7,6 +7,7 @@
 //! interpolation and no distribution fitting here: planning consumes the
 //! stated quantile with an explicit policy.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ExactError;
@@ -15,7 +16,7 @@ use crate::ExactError;
 pub const MAX_SAMPLE_SIZE: u32 = 100_000_000;
 
 /// The quantile a policy asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Quantile {
     /// 10th percentile.
@@ -29,7 +30,7 @@ pub enum Quantile {
 }
 
 /// A monotonic empirical distribution of non-negative integer observations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Distribution {
     /// 10th percentile.

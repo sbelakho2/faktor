@@ -37,6 +37,7 @@ use faktor_supply_logistics::{
     allocate_legs, validate_term_for_mode, CostLeg, InsuranceObligation, LegEstimate,
     LogisticsError, RiskTransferPoint,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Maximum volume breaks in an RFQ or quote.
@@ -87,12 +88,15 @@ pub enum ExecutionError {
     /// Quantity zero.
     #[error("quantity must be positive")]
     ZeroQuantity,
+    /// A human approval is required for this consequential action.
+    #[error(transparent)]
+    Approval(#[from] faktor_approval::ApprovalError),
 }
 
 // ------------------------------------------------------------------- RFQ
 
 /// An RFQ request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RfqRequest {
     /// Stable RFQ id.
@@ -128,7 +132,7 @@ pub struct RfqRequest {
 }
 
 /// A generated RFQ package.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RfqPackage {
     /// RFQ id.
@@ -344,7 +348,7 @@ pub fn generate_rfq(request: &RfqRequest) -> Result<RfqPackage, ExecutionError> 
 // ----------------------------------------------------------------- quotes
 
 /// A price at one volume break.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolumePrice {
     /// Quantity at which the price applies.
@@ -354,7 +358,7 @@ pub struct VolumePrice {
 }
 
 /// A supplier quote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Quote {
     /// Stable quote id.
@@ -476,7 +480,7 @@ impl Quote {
 }
 
 /// A detected quote inconsistency.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteIssue {
     /// Stable issue code.
@@ -488,7 +492,7 @@ pub struct QuoteIssue {
 }
 
 /// Normalization context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizationContext {
     /// Target quantity.
@@ -517,7 +521,7 @@ impl NormalizationContext {
 }
 
 /// The status of a normalized bid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BidStatus {
     /// Comparable and complete enough to rank.
@@ -535,7 +539,7 @@ pub enum BidStatus {
 }
 
 /// A normalized bid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedBid {
     /// Quote id.
@@ -1027,7 +1031,7 @@ pub fn normalize_quote(
 }
 
 /// A bid comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BidComparison {
     /// Normalized bids in input order.
@@ -1111,7 +1115,7 @@ pub fn compare_bids(
 // -------------------------------------------------------- incoterm comparison
 
 /// One Incoterm comparison row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncotermComparison {
     /// Term.
@@ -1242,7 +1246,7 @@ pub fn compare_incoterms(
 // ------------------------------------------------------------------- BATNA
 
 /// One BATNA alternative.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatnaAlternative {
     /// Quote id.
@@ -1256,7 +1260,7 @@ pub struct BatnaAlternative {
 }
 
 /// BATNA scaffold derived from normalized alternatives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Batna {
     /// Alternatives in deterministic order.
@@ -1319,7 +1323,7 @@ pub fn batna(comparison: &BidComparison) -> Batna {
 }
 
 /// Negotiation scaffold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NegotiationPlan {
     /// Should-cost target per unit.
@@ -1371,11 +1375,13 @@ pub fn negotiation_plan(package: &RfqPackage, comparison: &BidComparison) -> Neg
 // ------------------------------------------------------------ authorization
 
 /// An externally visible action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
     /// Send an RFQ.
     SendRfq,
+    /// Accept an RFQ or its commercial terms.
+    AcceptRfq,
     /// Send a message to a counterparty.
     SendMessage,
     /// Create a purchase order.
@@ -1384,6 +1390,14 @@ pub enum ActionKind {
     AmendPurchaseOrder,
     /// Cancel a purchase order.
     CancelPurchaseOrder,
+    /// Accept or change payment terms.
+    SetPaymentTerms,
+    /// Accept or change contract terms.
+    SetContractTerms,
+    /// Accept an ambiguous HS/tariff classification.
+    SetTariffClassification,
+    /// Change inventory policy or safety stock.
+    ChangeInventoryPolicy,
 }
 
 impl ActionKind {
@@ -1391,10 +1405,27 @@ impl ActionKind {
     pub const fn requires_amount(self) -> bool {
         matches!(self, Self::CreatePurchaseOrder | Self::AmendPurchaseOrder)
     }
+
+    /// The human-approval class this action always requires.
+    pub const fn approval_kind(self) -> faktor_approval::ApprovalKind {
+        match self {
+            Self::SendRfq | Self::AcceptRfq => faktor_approval::ApprovalKind::SupplyRfqAcceptance,
+            Self::SendMessage => faktor_approval::ApprovalKind::SupplySupplierMessage,
+            Self::CreatePurchaseOrder | Self::AmendPurchaseOrder | Self::CancelPurchaseOrder => {
+                faktor_approval::ApprovalKind::SupplyPurchaseOrder
+            }
+            Self::SetPaymentTerms => faktor_approval::ApprovalKind::SupplyPaymentTerms,
+            Self::SetContractTerms => faktor_approval::ApprovalKind::SupplyContractTerms,
+            Self::SetTariffClassification => {
+                faktor_approval::ApprovalKind::SupplyTariffClassification
+            }
+            Self::ChangeInventoryPolicy => faktor_approval::ApprovalKind::SupplyInventoryPolicy,
+        }
+    }
 }
 
 /// An explicit grant. No grant is implied by role, scope or a previous action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationGrant {
     /// Grant id.
@@ -1444,7 +1475,7 @@ impl AuthorizationGrant {
 }
 
 /// A requested action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionRequest {
     /// Action.
@@ -1460,7 +1491,7 @@ pub struct ActionRequest {
 }
 
 /// Why an action was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenialReason {
     /// No grant exists.
@@ -1485,10 +1516,18 @@ pub enum DenialReason {
     CurrencyMismatch,
     /// A matching grant is structurally invalid.
     InvalidGrant,
+    /// The action matches a grant but has no current human approval.
+    ApprovalRequired,
+    /// The human approval is bound to an older revision/digest.
+    ApprovalStale,
+    /// The human approval expired.
+    ApprovalExpired,
+    /// A human explicitly denied the action.
+    ApprovalDenied,
 }
 
 /// The authorization decision. Nothing in this crate performs the action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum AuthorizationDecision {
     /// The action is authorized by the named grant.
@@ -1503,6 +1542,8 @@ pub enum AuthorizationDecision {
         amount: Option<Money>,
         /// Grant revision.
         grant_revision: Revision,
+        /// The human approval request that authorized this exact action.
+        approval_request_id: String,
     },
     /// The action is refused.
     Denied {
@@ -1513,9 +1554,45 @@ pub enum AuthorizationDecision {
     },
 }
 
-/// Authorize a requested action against explicit grants. This is the only
-/// gate; there is no default allow and no state-changing side effect.
+/// The exact action binding a human approval must cover. The entire grant is
+/// part of the digest: mutating the scope, counterparty, amount, day, grant
+/// revision, grant ceilings, validity window, grantor or grant evidence
+/// invalidates a previous approval. Caller-supplied grant text therefore
+/// cannot be widened after the human reviewed the action.
+pub fn action_digest(
+    request: &ActionRequest,
+    grant: &AuthorizationGrant,
+) -> Result<String, ExecutionError> {
+    faktor_approval::content_digest(
+        b"faktor.supply.action-binding/v1",
+        &(
+            request.action,
+            &request.scope,
+            &request.counterparty,
+            &request.amount,
+            request.as_of,
+            grant,
+        ),
+    )
+    .map_err(ExecutionError::Approval)
+}
+
+/// Authorize a requested action against explicit grants. This entry point has
+/// no human approvals, so any matching grant still refuses with
+/// [`DenialReason::ApprovalRequired`]. Use [`authorize_with_approvals`] with
+/// tokens minted by the durable human approval authority.
 pub fn authorize(request: &ActionRequest, grants: &[AuthorizationGrant]) -> AuthorizationDecision {
+    authorize_with_approvals(request, grants, &[])
+}
+
+/// The only action gate. Both an explicit grant AND a current human approval
+/// token bound to the exact action must match; there is no default allow and
+/// no state-changing side effect.
+pub fn authorize_with_approvals(
+    request: &ActionRequest,
+    grants: &[AuthorizationGrant],
+    approvals: &[faktor_approval::ApprovalToken],
+) -> AuthorizationDecision {
     if grants.len() > MAX_GRANTS {
         return AuthorizationDecision::Denied {
             reason: DenialReason::NoGrant,
@@ -1600,12 +1677,40 @@ pub fn authorize(request: &ActionRequest, grants: &[AuthorizationGrant]) -> Auth
                 continue;
             }
         }
+        let binding = match action_digest(request, grant) {
+            Ok(binding) => binding,
+            Err(error) => {
+                last_reason = DenialReason::ApprovalRequired;
+                last_detail = error.to_string();
+                continue;
+            }
+        };
+        let check = faktor_approval::ApprovalCheck::new(
+            grant.action.approval_kind(),
+            request.scope.clone(),
+            grant.revision.get().to_string(),
+            binding,
+        );
+        let Some(approval) = approvals
+            .iter()
+            .find(|approval| approval.require(&check).is_ok())
+        else {
+            last_reason = DenialReason::ApprovalRequired;
+            last_detail = format!(
+                "approval_required: {} on {} at grant revision {} needs a human-operator approval bound to the exact action",
+                grant.action.approval_kind(),
+                request.scope,
+                grant.revision.get()
+            );
+            continue;
+        };
         return AuthorizationDecision::Authorized {
             grant_id: grant.id.clone(),
             action: request.action,
             counterparty: request.counterparty,
             amount: request.amount,
             grant_revision: grant.revision,
+            approval_request_id: approval.request_id().to_string(),
         };
     }
     AuthorizationDecision::Denied {
@@ -2024,6 +2129,19 @@ mod tests {
         }
     }
 
+    fn approval(
+        request: &ActionRequest,
+        grant: &AuthorizationGrant,
+    ) -> faktor_approval::ApprovalToken {
+        let digest = action_digest(request, grant).unwrap();
+        faktor_approval::ApprovalToken::test_token(
+            grant.action.approval_kind(),
+            request.scope.clone(),
+            grant.revision.get().to_string(),
+            digest,
+        )
+    }
+
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct AuthorizeFixture {
@@ -2052,7 +2170,12 @@ mod tests {
     fn json_fixture_authorizes_send_rfq() {
         let fixture: AuthorizeFixture =
             serde_json::from_str(include_str!("../tests/fixtures/authorization.json")).unwrap();
-        let decision = authorize(&fixture.request, &fixture.grants);
+        let approvals: Vec<_> = fixture
+            .grants
+            .iter()
+            .map(|grant| approval(&fixture.request, grant))
+            .collect();
+        let decision = authorize_with_approvals(&fixture.request, &fixture.grants, &approvals);
         assert!(matches!(decision, AuthorizationDecision::Authorized { .. }));
     }
 
@@ -2073,15 +2196,15 @@ mod tests {
 
     #[test]
     fn matching_grant_authorizes_exactly() {
-        let decision = authorize(
-            &request(ActionKind::CreatePurchaseOrder, Some("100.00")),
-            &[grant(
-                ActionKind::CreatePurchaseOrder,
-                "rfq:part-1",
-                "100.00",
-                Day(DAY + 10),
-            )],
-        );
+        let request = request(ActionKind::CreatePurchaseOrder, Some("100.00"));
+        let grants = [grant(
+            ActionKind::CreatePurchaseOrder,
+            "rfq:part-1",
+            "100.00",
+            Day(DAY + 10),
+        )];
+        let approvals = [approval(&request, &grants[0])];
+        let decision = authorize_with_approvals(&request, &grants, &approvals);
         match decision {
             AuthorizationDecision::Authorized {
                 grant_id, amount, ..
@@ -2091,6 +2214,56 @@ mod tests {
             }
             AuthorizationDecision::Denied { .. } => panic!("expected authorization"),
         }
+    }
+
+    #[test]
+    fn an_approval_cannot_be_replayed_after_any_grant_term_changes() {
+        let request = request(ActionKind::CreatePurchaseOrder, Some("100.00"));
+        let original = grant(
+            ActionKind::CreatePurchaseOrder,
+            "rfq:part-1",
+            "100.00",
+            Day(DAY + 10),
+        );
+        let token = approval(&request, &original);
+        assert!(matches!(
+            authorize_with_approvals(
+                &request,
+                std::slice::from_ref(&original),
+                std::slice::from_ref(&token)
+            ),
+            AuthorizationDecision::Authorized { .. }
+        ));
+
+        let mut widened = original.clone();
+        widened.max_amount = money("9999.00");
+        assert!(matches!(
+            authorize_with_approvals(&request, &[widened], std::slice::from_ref(&token)),
+            AuthorizationDecision::Denied {
+                reason: DenialReason::ApprovalRequired,
+                ..
+            }
+        ));
+
+        let mut revalidated = original.clone();
+        revalidated.valid_from = Day(DAY - 2);
+        assert!(matches!(
+            authorize_with_approvals(&request, &[revalidated], std::slice::from_ref(&token)),
+            AuthorizationDecision::Denied {
+                reason: DenialReason::ApprovalRequired,
+                ..
+            }
+        ));
+
+        let mut regranted = original;
+        regranted.granted_by = "agent-impersonating-procurement".to_string();
+        assert!(matches!(
+            authorize_with_approvals(&request, &[regranted], &[token]),
+            AuthorizationDecision::Denied {
+                reason: DenialReason::ApprovalRequired,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2212,16 +2385,62 @@ mod tests {
 
     #[test]
     fn message_action_does_not_require_an_amount() {
+        let request = request(ActionKind::SendMessage, None);
+        let grants = [grant(
+            ActionKind::SendMessage,
+            "rfq:part-1",
+            "1.00",
+            Day(DAY + 1),
+        )];
+        let approvals = [approval(&request, &grants[0])];
+        let decision = authorize_with_approvals(&request, &grants, &approvals);
+        assert!(matches!(decision, AuthorizationDecision::Authorized { .. }));
+    }
+
+    #[test]
+    fn matching_grant_without_human_approval_is_refused_typed() {
         let decision = authorize(
-            &request(ActionKind::SendMessage, None),
+            &request(ActionKind::CreatePurchaseOrder, Some("100.00")),
             &[grant(
-                ActionKind::SendMessage,
+                ActionKind::CreatePurchaseOrder,
                 "rfq:part-1",
-                "1.00",
-                Day(DAY + 1),
+                "100.00",
+                Day(DAY + 10),
             )],
         );
-        assert!(matches!(decision, AuthorizationDecision::Authorized { .. }));
+        match decision {
+            AuthorizationDecision::Denied { reason, detail } => {
+                assert_eq!(reason, DenialReason::ApprovalRequired);
+                assert!(detail.starts_with("approval_required:"), "{detail}");
+            }
+            AuthorizationDecision::Authorized { .. } => {
+                panic!("agent-only grant must not authorize")
+            }
+        }
+    }
+
+    #[test]
+    fn stale_human_approval_is_refused_after_the_action_changes() {
+        let request = request(ActionKind::CreatePurchaseOrder, Some("100.00"));
+        let grants = [grant(
+            ActionKind::CreatePurchaseOrder,
+            "rfq:part-1",
+            "100.00",
+            Day(DAY + 10),
+        )];
+        let approvals = [approval(&request, &grants[0])];
+        let mutated = ActionRequest {
+            amount: Some(money("99.00")),
+            ..request.clone()
+        };
+        let decision = authorize_with_approvals(&mutated, &grants, &approvals);
+        assert!(matches!(
+            decision,
+            AuthorizationDecision::Denied {
+                reason: DenialReason::ApprovalRequired,
+                ..
+            }
+        ));
     }
 
     #[test]

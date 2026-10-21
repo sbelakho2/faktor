@@ -1,5 +1,6 @@
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{UnitError, UnitResult};
@@ -13,7 +14,7 @@ pub const DIMENSION_COUNT: usize = 7;
 ///
 /// Exponents are deliberately small (`i8`) and every combination is
 /// overflow-checked; a dimension can never wrap around into a false match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Dimension {
     exponents: [i8; DIMENSION_COUNT],
@@ -38,11 +39,14 @@ impl Dimension {
     pub const CHARGE: Self = Self::new([0, 0, 1, 1, 0, 0, 0]);
     pub const VOLTAGE: Self = Self::new([2, 1, -3, -1, 0, 0, 0]);
     pub const CAPACITANCE: Self = Self::new([-2, -1, 4, 2, 0, 0, 0]);
+    pub const INDUCTANCE: Self = Self::new([2, 1, -2, -2, 0, 0, 0]);
     pub const RESISTANCE: Self = Self::new([2, 1, -3, -2, 0, 0, 0]);
     pub const CONDUCTANCE: Self = Self::new([-2, -1, 3, 2, 0, 0, 0]);
     pub const FREQUENCY: Self = Self::new([0, 0, -1, 0, 0, 0, 0]);
     pub const ANGLE: Self = Self::SCALAR;
     pub const THERMAL_RESISTANCE: Self = Self::new([-2, -1, 3, 0, 1, 0, 0]);
+    pub const THERMAL_CAPACITANCE: Self = Self::new([2, 1, -2, 0, -1, 0, 0]);
+    pub const THERMAL_CONDUCTANCE: Self = Self::new([2, 1, -3, 0, -1, 0, 0]);
     pub const AREA: Self = Self::new([2, 0, 0, 0, 0, 0, 0]);
     pub const VOLUME: Self = Self::new([3, 0, 0, 0, 0, 0, 0]);
     pub const DENSITY: Self = Self::new([-3, 1, 0, 0, 0, 0, 0]);
@@ -76,11 +80,18 @@ impl Dimension {
     }
 
     pub fn checked_add(self, rhs: Self) -> UnitResult<Self> {
-        self.combine(rhs, 1)
+        if self == rhs {
+            Ok(self)
+        } else {
+            Err(UnitError::DimensionMismatch {
+                expected: self,
+                found: rhs,
+            })
+        }
     }
 
     pub fn checked_sub(self, rhs: Self) -> UnitResult<Self> {
-        self.combine(rhs, -1)
+        self.checked_add(rhs)
     }
 
     pub fn checked_powi(self, power: i8) -> UnitResult<Self> {
@@ -172,6 +183,26 @@ mod tests {
     fn torque_and_energy_share_a_dimension_but_not_a_meaning() {
         let torque = Dimension::FORCE.checked_mul(Dimension::LENGTH).unwrap();
         assert_eq!(torque, Dimension::ENERGY);
+    }
+
+    #[test]
+    fn addition_preserves_the_common_dimension_and_refuses_mismatch() {
+        assert_eq!(
+            Dimension::VOLTAGE.checked_add(Dimension::VOLTAGE).unwrap(),
+            Dimension::VOLTAGE
+        );
+        assert_eq!(
+            Dimension::TEMPERATURE
+                .checked_add(
+                    Dimension::POWER
+                        .checked_mul(Dimension::THERMAL_RESISTANCE)
+                        .unwrap()
+                )
+                .unwrap(),
+            Dimension::TEMPERATURE
+        );
+        assert!(Dimension::VOLTAGE.checked_add(Dimension::CURRENT).is_err());
+        assert!(Dimension::VOLTAGE.checked_sub(Dimension::CURRENT).is_err());
     }
 
     #[test]

@@ -11,15 +11,16 @@ use clap::Subcommand;
 use faktor_supply_core::{Day, SupplyDecision, SupplyGraph};
 use faktor_supply_cost::{should_cost, tco, ShouldCostInput, TcoInput};
 use faktor_supply_execution::{
-    authorize, batna, compare_bids, compare_incoterms, generate_rfq, negotiation_plan,
-    ActionRequest, AuthorizationGrant, NormalizationContext, Quote, RfqPackage, RfqRequest,
+    action_digest, authorize_with_approvals, batna, compare_bids, compare_incoterms, generate_rfq,
+    negotiation_plan, ActionRequest, AuthorizationGrant, NormalizationContext, Quote, RfqPackage,
+    RfqRequest,
 };
 use faktor_supply_logistics::{
     classify, compute_duty, Classification, ClassificationRequest, CustomsValuation, OriginClaim,
     TariffSchedule,
 };
 use faktor_supply_planning::{plan, PlanningInput};
-use faktor_supply_quality::{assess as assess_qualification, Qualification};
+use faktor_supply_quality::{assess_with_approval as assess_qualification, Qualification};
 use faktor_supply_supplier::{assess as assess_supplier, SourcingRequirement, SupplierProfile};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -49,11 +50,15 @@ pub(crate) enum SupplyAction {
         #[arg(long)]
         input: Option<String>,
     },
-    /// Derive an evidence-bound qualification state.
+    /// Derive an evidence-bound qualification state. A `qualified` or
+    /// `conditional` result requires a current human qualification approval.
     Qualify {
         /// JSON file, or `-`/omitted for stdin.
         #[arg(long)]
         input: Option<String>,
+        /// Data directory holding durable approvals.
+        #[arg(long, default_value = "~/.faktor")]
+        data_dir: String,
     },
     /// Classify a product into candidate HS codes (ambiguity escalates).
     Classify {
@@ -85,11 +90,15 @@ pub(crate) enum SupplyAction {
         #[arg(long)]
         input: Option<String>,
     },
-    /// Authorize an action against explicit grants. Never sends anything.
+    /// Authorize an action against explicit grants AND a current human
+    /// approval bound to the exact action. Never sends anything.
     Authorize {
         /// JSON file, or `-`/omitted for stdin.
         #[arg(long)]
         input: Option<String>,
+        /// Data directory holding durable approvals.
+        #[arg(long, default_value = "~/.faktor")]
+        data_dir: String,
     },
     /// Run the closed Engineering -> Supply loop: evaluate every candidate
     /// against the revision-bound requirement set, derive tests, qualify,
@@ -98,6 +107,11 @@ pub(crate) enum SupplyAction {
         /// JSON file, or `-`/omitted for stdin.
         #[arg(long)]
         input: Option<String>,
+        /// Data directory holding the daemon-local engineering signing key.
+        /// The key is created on first use and reused across restarts, so the
+        /// resulting receipts verify with `faktor engineering verify`.
+        #[arg(long, default_value = "~/.faktor")]
+        data_dir: String,
     },
     /// Validate a typed SupplyDecision document (revision/evidence/conflict
     /// bounds and candidate references).
@@ -128,14 +142,14 @@ fn input_path(action: &SupplyAction) -> &Option<String> {
         SupplyAction::ShouldCost { input }
         | SupplyAction::Tco { input }
         | SupplyAction::SupplierFit { input }
-        | SupplyAction::Qualify { input }
+        | SupplyAction::Qualify { input, .. }
         | SupplyAction::Classify { input }
         | SupplyAction::Duty { input }
         | SupplyAction::Plan { input }
         | SupplyAction::Rfq { input }
         | SupplyAction::NormalizeBids { input }
-        | SupplyAction::Authorize { input }
-        | SupplyAction::Decision { input }
+        | SupplyAction::Authorize { input, .. }
+        | SupplyAction::Decision { input, .. }
         | SupplyAction::DecisionCheck { input }
         | SupplyAction::GraphCheck { input } => input,
     }
@@ -160,11 +174,25 @@ fn execute(action: &SupplyAction) -> Result<Value, String> {
                 .map_err(|error| error.to_string())?;
             to_value(result)?
         }
-        SupplyAction::Qualify { .. } => {
+        SupplyAction::Qualify { data_dir, .. } => {
             let request: QualifyRequest = parse(&raw)?;
-            let result = assess_qualification(&request.qualification, request.as_of)
+            let authority = faktor_approval::ApprovalAuthority::open(&crate::expand(data_dir))
                 .map_err(|error| error.to_string())?;
-            to_value(result)?
+            let check = faktor_supply_quality::qualification_approval_check(&request.qualification)
+                .map_err(|error| error.to_string())?;
+            let approval = match authority.authorize(&check, faktor_approval::unix_now_ms()) {
+                Ok(token) => Some(token),
+                Err(error) if hard_approval_failure(&error) => return Err(error.to_string()),
+                Err(error @ faktor_approval::ApprovalError::Denied { .. }) => {
+                    return Ok(error.to_json())
+                }
+                Err(_) => None,
+            };
+            match assess_qualification(&request.qualification, request.as_of, approval.as_ref()) {
+                Ok(result) => to_value(result)?,
+                Err(faktor_supply_core::ExactError::Approval(error)) => error.to_json(),
+                Err(error) => return Err(error.to_string()),
+            }
         }
         SupplyAction::Classify { .. } => {
             let request: ClassificationRequest = parse(&raw)?;
@@ -216,16 +244,45 @@ fn execute(action: &SupplyAction) -> Result<Value, String> {
                 "incoterms": incoterms,
             })
         }
-        SupplyAction::Authorize { .. } => {
+        SupplyAction::Authorize { data_dir, .. } => {
             let request: AuthorizeRequest = parse(&raw)?;
-            let decision = authorize(&request.request, &request.grants);
+            let authority = faktor_approval::ApprovalAuthority::open(&crate::expand(data_dir))
+                .map_err(|error| error.to_string())?;
+            let mut approvals = Vec::new();
+            for grant in &request.grants {
+                let digest =
+                    action_digest(&request.request, grant).map_err(|error| error.to_string())?;
+                let check = faktor_approval::ApprovalCheck::new(
+                    grant.action.approval_kind(),
+                    request.request.scope.clone(),
+                    grant.revision.get().to_string(),
+                    digest,
+                );
+                match authority.authorize(&check, faktor_approval::unix_now_ms()) {
+                    Ok(token) => approvals.push(token),
+                    Err(error) if hard_approval_failure(&error) => return Err(error.to_string()),
+                    Err(error @ faktor_approval::ApprovalError::Denied { .. }) => {
+                        return Ok(error.to_json())
+                    }
+                    Err(_) => {}
+                }
+            }
+            let decision = authorize_with_approvals(&request.request, &request.grants, &approvals);
             to_value(decision)?
         }
-        SupplyAction::Decision { .. } => {
+        SupplyAction::Decision { data_dir, .. } => {
             let request: faktor_supply_engineering::LoopRequest = parse(&raw)?;
-            let outcome =
-                faktor_supply_engineering::run(&request).map_err(|error| error.to_string())?;
-            to_value(outcome)?
+            let signer = engineering_core::load_or_create_signing_key(&crate::expand(data_dir))
+                .map_err(|error| error.to_string())?;
+            let authority = faktor_approval::ApprovalAuthority::open(&crate::expand(data_dir))
+                .map_err(|error| error.to_string())?;
+            match faktor_supply_engineering::run_with_authority(&request, &signer, &authority) {
+                Ok(outcome) => to_value(outcome)?,
+                Err(error) => match error.approval_json() {
+                    Some(approval) => approval,
+                    None => return Err(error.to_string()),
+                },
+            }
         }
         SupplyAction::DecisionCheck { .. } => {
             let decision: SupplyDecision = parse(&raw)?;
@@ -245,6 +302,18 @@ fn execute(action: &SupplyAction) -> Result<Value, String> {
         }
     };
     Ok(value)
+}
+
+/// Store/lock failures are never "no approval": they are reported as hard
+/// errors so a corrupt ledger cannot be silently downgraded to a refusal.
+fn hard_approval_failure(error: &faktor_approval::ApprovalError) -> bool {
+    matches!(
+        error,
+        faktor_approval::ApprovalError::Store(_)
+            | faktor_approval::ApprovalError::Busy(_)
+            | faktor_approval::ApprovalError::Conflict(_)
+            | faktor_approval::ApprovalError::Invalid(_)
+    )
 }
 
 fn to_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
@@ -359,7 +428,13 @@ mod tests {
     #[test]
     fn cli_authorize_refuses_without_a_grant() {
         let path = fixture("authorize_denied.json");
-        let value = execute(&SupplyAction::Authorize { input: Some(path) }).unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("faktor-supply-authorize-{}", std::process::id()));
+        let value = execute(&SupplyAction::Authorize {
+            input: Some(path),
+            data_dir: data_dir.to_string_lossy().to_string(),
+        })
+        .unwrap();
         assert_eq!(value["decision"].as_str().unwrap(), "denied");
         assert_eq!(value["reason"].as_str().unwrap(), "no_grant");
     }

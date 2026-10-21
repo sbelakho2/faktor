@@ -203,8 +203,8 @@ fn valid_response() -> EngineeringResponse {
 #[test]
 fn a_fully_backed_response_is_ready() {
     let response = valid_response();
-    let assessment = response.assess();
-    assert!(assessment.is_ready(), "{assessment:?}");
+    let assessment = response.assess_integrity_only();
+    assert!(assessment.is_self_consistent(), "{assessment:?}");
     assert_eq!(assessment.established_gates, 11);
 }
 
@@ -212,8 +212,8 @@ fn a_fully_backed_response_is_ready() {
 fn gate_five_requires_machine_checked_dimensions() {
     let mut response = valid_response();
     response.dimensions = Gate::established(DimensionChecks { checks: vec![] });
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -226,8 +226,8 @@ fn gate_five_rejects_a_dimensionally_inconsistent_equation() {
     response.dimensions = Gate::established(DimensionChecks {
         checks: vec![DimensionCheck::new("T = K F", Dimension::ENERGY, Dimension::FORCE).unwrap()],
     });
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -238,8 +238,8 @@ fn gate_five_rejects_a_dimensionally_inconsistent_equation() {
 fn gate_six_requires_an_executed_receipt_not_prose() {
     let mut response = valid_response();
     response.executed_analysis = Gate::established(ExecutedAnalysis { receipts: vec![] });
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -251,8 +251,8 @@ fn gate_six_requires_an_executed_receipt_not_prose() {
     response.executed_analysis = Gate::established(ExecutedAnalysis {
         receipts: vec![lying],
     });
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -267,8 +267,8 @@ fn unavailable_theory_becomes_typed_research_not_improvisation() {
         "no validated model for creep at the operating temperature",
         vec!["validated creep model".to_string()],
     );
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     let request = assessment
         .research_required
         .iter()
@@ -284,8 +284,8 @@ fn unavailable_validity_becomes_typed_research() {
         "no source establishes the temperature envelope",
         vec!["revision-bound datasheet".to_string()],
     );
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .research_required
         .iter()
@@ -306,8 +306,8 @@ fn cross_check_must_be_independent_of_the_primary_solver() {
             agrees: true,
         },
     });
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -320,8 +320,8 @@ fn a_decision_gate_without_assumption_provenance_is_refused() {
     if let engineering_core::GateState::Established(formulation) = &mut response.formulation.state {
         formulation.assumptions[0].provenance.citation = " ".to_string();
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
 }
 
 #[test]
@@ -332,8 +332,8 @@ fn an_unknown_solver_version_cannot_establish_execution() {
     {
         executed.receipts[0].identity.solver_version = "1.0.0+tool/unknown".to_string();
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment.violations.iter().any(|violation| {
         violation.gate == GateId::ExecutedAnalysis
             && violation.message.contains("unknown solver version")
@@ -347,8 +347,8 @@ fn oversized_untrusted_text_cannot_pass_a_gate() {
     {
         verification.tests[0].evidence = vec!["x".repeat(2_048)];
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -358,8 +358,8 @@ fn oversized_untrusted_text_cannot_pass_a_gate() {
     if let engineering_core::GateState::Established(formulation) = &mut response.formulation.state {
         formulation.objective = "x".repeat(16_384);
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -382,8 +382,8 @@ fn an_unsigned_receipt_cannot_establish_execution() {
     {
         executed.receipts[0].attestation = None;
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment.violations.iter().any(|violation| {
         violation.gate == GateId::ExecutedAnalysis && violation.message.contains("attestation")
     }));
@@ -395,10 +395,20 @@ fn a_receipt_signed_by_a_foreign_key_cannot_establish_execution() {
     let other = ReceiptSigner::from_seed([8u8; 32]);
     let verifier = engineering_core::ReceiptVerifier::trusting_key_id(&other.key_id()).unwrap();
     let assessment = response.assess_with_verifier(&verifier);
-    assert!(!assessment.is_ready());
+    assert!(!assessment.is_self_consistent());
     assert!(assessment.violations.iter().any(|violation| {
         violation.gate == GateId::ExecutedAnalysis && violation.message.contains("untrusted key")
     }));
+    // The fixture is genuinely self-signed: integrity-only names accept it,
+    // while the verifier-requiring authority names refuse it.
+    assert!(response.is_self_consistent());
+    assert!(response.require_self_consistent().is_ok());
+    assert!(!response.is_verified(&verifier));
+    assert!(response.require_ready(&verifier).is_err());
+    let own = ReceiptSigner::from_seed([7u8; 32]);
+    let own_verifier = engineering_core::ReceiptVerifier::trusting_key_id(&own.key_id()).unwrap();
+    assert!(response.is_verified(&own_verifier));
+    assert!(response.require_ready(&own_verifier).is_ok());
 }
 
 #[test]
@@ -407,8 +417,8 @@ fn a_caller_cannot_replace_a_selected_validity_envelope() {
     if let engineering_core::GateState::Established(validity) = &mut response.validity.state {
         validity.envelopes[0].temperature = Some(Interval::new(1.0, 10_000.0).unwrap());
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()
@@ -421,8 +431,8 @@ fn a_caller_cannot_substitute_a_model_outside_the_selector() {
     if let engineering_core::GateState::Established(theory) = &mut response.theory.state {
         theory.models[0].model_id = "caller-preferred".to_string();
     }
-    let assessment = response.assess();
-    assert!(!assessment.is_ready());
+    let assessment = response.assess_integrity_only();
+    assert!(!assessment.is_self_consistent());
     assert!(assessment
         .violations
         .iter()

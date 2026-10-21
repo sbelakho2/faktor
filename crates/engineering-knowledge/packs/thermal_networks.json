@@ -1,0 +1,447 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "thermal-networks",
+  "version": "1.0.0",
+  "title": "Junction-case-sink transient thermal network with a required interface layer",
+  "domain": "thermal",
+  "provenance": {
+    "kind": "standard",
+    "citation": "JEDEC JESD51-14 transient thermal impedance; Incropera and DeWitt, Fundamentals of Heat and Mass Transfer",
+    "edition": null,
+    "locator": "thermal resistance network and transient thermal impedance",
+    "note": "Model structure only; layer values must come from revision-bound datasheet or measurement."
+  },
+  "terminology": [
+    {
+      "id": "term-cauer-network",
+      "term": "Cauer thermal network",
+      "definition": "A ladder of physical thermal resistances and capacitances from junction through case and interface to ambient.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "transient thermal impedance",
+        "note": null
+      }
+    },
+    {
+      "id": "term-interface-resistance",
+      "term": "case-to-sink interface resistance",
+      "definition": "The thermal resistance of the interface material and mounting between the device case and the heatsink.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement practice",
+        "edition": null,
+        "locator": "interface",
+        "note": "A missing interface is unknown, not zero."
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-thermal-network",
+      "name": "Three-node Cauer thermal network with steady-state and transient response",
+      "equation_ids": [
+        "eq-steady-chain",
+        "eq-node-balance",
+        "eq-time-constant"
+      ],
+      "assumption_ids": [
+        "asm-lumped-network",
+        "asm-constant-properties",
+        "asm-interface-required"
+      ],
+      "validity_domain_ids": [
+        "val-constant-layer-properties",
+        "val-complete-thermal-path"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14 and heat-transfer fundamentals",
+        "edition": null,
+        "locator": "lumped thermal network",
+        "note": null
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-steady-chain",
+      "expression": "T_j = T_a + P (R_th,jc + R_th,cs + R_th,sa)",
+      "dimensional_signature": "temperature",
+      "variables": [
+        {
+          "symbol": "T_j",
+          "description": "steady junction temperature",
+          "dimension": "Theta"
+        },
+        {
+          "symbol": "R_th",
+          "description": "layer thermal resistance",
+          "dimension": "Theta T^3 L^-2 M^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "steady-state thermal resistance",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-node-balance",
+      "expression": "C_i dT_i/dt = (T_{i-1}-T_i)/R_{i-1} - (T_i-T_{i+1})/R_i",
+      "dimensional_signature": "power",
+      "variables": [
+        {
+          "symbol": "C_i",
+          "description": "layer thermal capacitance",
+          "dimension": "M L^2 T^-2 Theta^-1"
+        },
+        {
+          "symbol": "T_i",
+          "description": "layer temperature",
+          "dimension": "Theta"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "Incropera and DeWitt, Fundamentals of Heat and Mass Transfer",
+        "edition": null,
+        "locator": "lumped capacitance",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-time-constant",
+      "expression": "tau_i = R_i C_i",
+      "dimensional_signature": "time",
+      "variables": [
+        {
+          "symbol": "tau_i",
+          "description": "layer time constant",
+          "dimension": "T"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "Incropera and DeWitt, Fundamentals of Heat and Mass Transfer",
+        "edition": null,
+        "locator": "transient conduction",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-lumped-network",
+      "statement": "The thermal path is a three-node lumped Cauer network; spreading and multi-dimensional effects are outside the model.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "lumped network",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-constant-properties",
+      "statement": "Layer resistances and capacitances are constant over the analyzed temperature excursion.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "linear thermal model",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-interface-required",
+      "statement": "The case-to-sink interface is a required physical layer; a missing interface resistance makes the network incomplete.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement practice",
+        "edition": null,
+        "locator": "interface",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-constant-layer-properties",
+      "statement": "The analysis applies while layer properties remain constant and the power step is the only forcing function.",
+      "temperature": null,
+      "exclusions": [
+        "temperature-dependent properties",
+        "phase change or airflow reversal",
+        "multi-dimensional spreading not represented by the lumped nodes"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "linear network validity",
+        "note": null
+      }
+    },
+    {
+      "id": "val-complete-thermal-path",
+      "statement": "All three resistances, including the interface, must be sourced for the actual assembly; transient analysis also requires all layer capacitances.",
+      "temperature": null,
+      "exclusions": [
+        "missing interface resistance",
+        "missing layer capacitance for transient analysis",
+        "natural convection assumed where forced convection is required"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "thermal path",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-layer-rth",
+      "property": "junction-to-case and sink-to-ambient thermal resistance",
+      "authority": "Revision-bound datasheet plus JESD51 measurement condition",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51",
+        "edition": null,
+        "locator": "thermal resistance",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-interface",
+      "property": "case-to-sink thermal resistance and capacitance",
+      "authority": "Interface material datasheet at the assembly pressure and thickness",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "Thermal interface material datasheet",
+        "edition": null,
+        "locator": "thermal impedance",
+        "note": "Missing interface data is unavailable, not zero."
+      }
+    },
+    {
+      "id": "prop-layer-cth",
+      "property": "layer thermal capacitance",
+      "authority": "Revision-bound transient thermal impedance or calorimetric data",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "transient thermal impedance",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-interface-required",
+      "rule": "Include the case-to-sink interface resistance; never treat a missing interface as zero.",
+      "check": "R_th,cs has a revision-bound source and is strictly positive",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51",
+        "edition": null,
+        "locator": "interface",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-transient-capacitance",
+      "rule": "A transient result requires all layer capacitances; a steady-state result does not establish transient margin.",
+      "check": "all C_th values present and positive",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "transient thermal impedance",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-interface-control",
+      "rule": "Control interface thickness, pressure and voiding because they dominate the case-to-sink resistance.",
+      "check": "assembly instruction and first-article thermal measurement",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Thermal interface application practice",
+        "edition": null,
+        "locator": "assembly",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-interface-degradation",
+      "mode": "interface dry-out or pump-out",
+      "cause": "thermal cycling, inadequate pressure or contamination",
+      "detection": "rising case-to-sink delta and transient thermal impedance",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement practice",
+        "edition": null,
+        "locator": "interface degradation",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-interface-rise",
+      "signature": "case-to-sink temperature difference rising faster than power or airflow explains",
+      "indicates": "degraded or missing interface resistance",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Thermal debug practice",
+        "edition": null,
+        "locator": "interface",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-transient-impedance",
+      "method": "Measure transient thermal impedance from junction to ambient on the actual assembly",
+      "measures": "layer resistances, capacitances and interface condition",
+      "standard_ref": "JEDEC JESD51-14",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "measurement procedure",
+        "note": "Licensed text is not reproduced."
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-jesd51-14",
+      "standard": "JEDEC JESD51-14",
+      "scope": "transient thermal impedance measurement of semiconductor packages",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51-14",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-three-node-network",
+      "description": "A 50 W step into a 0.5/0.2/1.0 K/W junction-case-sink-ambient network from 25 degC reaches 110 degC junction at steady state.",
+      "inputs": [
+        {
+          "name": "power",
+          "value": 50.0,
+          "unit": "W",
+          "note": null
+        },
+        {
+          "name": "ambient",
+          "value": 25.0,
+          "unit": "degC",
+          "note": null
+        },
+        {
+          "name": "r_jc",
+          "value": 0.5,
+          "unit": "K/W",
+          "note": null
+        },
+        {
+          "name": "r_cs",
+          "value": 0.2,
+          "unit": "K/W",
+          "note": null
+        },
+        {
+          "name": "r_sa",
+          "value": 1.0,
+          "unit": "K/W",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "steady_junction",
+          "value": 110.0,
+          "unit": "degC",
+          "tolerance": 1e-9,
+          "note": null
+        },
+        {
+          "name": "steady_case",
+          "value": 85.0,
+          "unit": "degC",
+          "tolerance": 1e-9,
+          "note": null
+        },
+        {
+          "name": "steady_sink",
+          "value": 75.0,
+          "unit": "degC",
+          "tolerance": 1e-9,
+          "note": null
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form solution of the declared three-node network",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Fixture values are synthetic, not a datasheet."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-missing-interface",
+      "claim": "Junction-to-case plus sink-to-ambient resistance is the complete thermal path.",
+      "refutation": "The omitted case-to-sink interface can dominate the temperature rise. A missing value is unknown, not zero, so the junction temperature is unavailable or the network is refused.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement practice",
+        "edition": null,
+        "locator": "interface",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-missing-contact-resistance",
+      "trap": "Summing only junction-to-case and sink-to-ambient resistance, or treating the missing interface as zero.",
+      "why_shallow_fails": "The arithmetic is valid only for the supplied layers; the omitted interface is an unknown thermal resistance, not a zero.",
+      "guard": "Require a revision-bound interface resistance or return a typed refusal/unavailable result.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51",
+        "edition": null,
+        "locator": "thermal path",
+        "note": null
+      }
+    }
+  ]
+}

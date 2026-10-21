@@ -73,15 +73,19 @@ fn execute(action: &EngineeringAction) -> Result<Value, String> {
             let request: LoopRequest = parse(&raw)?;
             let signer = engineering_core::load_or_create_signing_key(&data_dir(action))
                 .map_err(|error| error.to_string())?;
-            let outcome = faktor_supply_engineering::run_with_signer(&request, &signer)
+            let authority = faktor_approval::ApprovalAuthority::open(&data_dir(action))
                 .map_err(|error| error.to_string())?;
-            to_value(outcome)
+            match faktor_supply_engineering::run_with_authority(&request, &signer, &authority) {
+                Ok(outcome) => to_value(outcome),
+                Err(error) => match error.approval_json() {
+                    Some(approval) => Ok(approval),
+                    None => Err(error.to_string()),
+                },
+            }
         }
         EngineeringAction::Verify { .. } => {
             let outcome: LoopOutcome = parse(&raw)?;
-            let key = engineering_core::load_signing_key(&data_dir(action))
-                .map_err(|error| error.to_string())?;
-            let verifier = engineering_core::ReceiptVerifier::trusting_key_id(&key.key_id())
+            let verifier = engineering_core::load_trusted_verifier(&data_dir(action))
                 .map_err(|error| error.to_string())?;
             let verification = outcome
                 .verify_with_verifier(&verifier)

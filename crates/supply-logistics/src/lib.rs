@@ -32,6 +32,7 @@ use faktor_supply_core::{
     Money, Provenance, Quantile, Rate, Revision, Term, TransportMode, UnavailableReason,
     MAX_ID_BYTES, MAX_TEXT_BYTES,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Maximum packages in one chargeable-weight request.
@@ -117,7 +118,9 @@ pub enum LogisticsError {
 // ------------------------------------------------------------- incoterms
 
 /// One cost leg in the international sale of goods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CostLeg {
     /// Export packaging.
@@ -175,7 +178,7 @@ impl CostLeg {
 }
 
 /// Where risk passes from seller to buyer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskTransferPoint {
     /// At the seller's premises.
@@ -195,7 +198,7 @@ pub enum RiskTransferPoint {
 }
 
 /// The seller's insurance obligation under the term.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsuranceObligation {
     /// No seller insurance obligation.
@@ -342,7 +345,7 @@ pub fn validate_term_for_mode(
 }
 
 /// A freight/cost estimate for one leg, bound to evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegEstimate {
     /// The leg.
@@ -353,7 +356,7 @@ pub struct LegEstimate {
 
 /// Who bears each leg under a term, and the exact buyer-borne total when every
 /// buyer leg is estimated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegAllocation {
     /// The term.
@@ -438,7 +441,7 @@ pub fn allocate_legs(
 // ---------------------------------------------------------- physical cargo
 
 /// A rectangular package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Package {
     /// Length in millimetres.
@@ -487,7 +490,7 @@ impl Package {
 }
 
 /// The weight computation breakdown.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChargeableWeight {
     /// Actual weight in grams (all packages).
@@ -566,7 +569,7 @@ pub fn chargeable_weight(
 }
 
 /// A consolidated lane group.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsolidationGroup {
     /// Origin.
@@ -621,7 +624,7 @@ pub fn consolidate(
 }
 
 /// One selectable transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeOption {
     /// Mode.
@@ -639,7 +642,7 @@ pub struct ModeOption {
 }
 
 /// The selected mode and its exact cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeSelection {
     /// Selected mode.
@@ -721,7 +724,7 @@ pub fn select_mode(
 }
 
 /// Handling charges.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandlingCharge {
     /// Fixed charge per shipment.
@@ -744,7 +747,7 @@ impl HandlingCharge {
 }
 
 /// Demurrage / storage terms.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DemurrageTerms {
     /// Free days before charges begin.
@@ -806,7 +809,7 @@ impl DemurrageTerms {
 }
 
 /// Insurance terms.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InsuranceTerms {
     /// Premium rate on the insured value.
@@ -846,7 +849,7 @@ impl InsuranceTerms {
 }
 
 /// Dangerous-goods declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DangerousGoods {
     /// UN number (four digits, optional "UN" prefix).
@@ -885,7 +888,7 @@ impl DangerousGoods {
 // ---------------------------------------------------------------- customs
 
 /// A declared material share of the product.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionShare {
     /// Material name.
@@ -895,7 +898,7 @@ pub struct CompositionShare {
 }
 
 /// Product facts used for classification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductFacts {
     /// Description.
@@ -958,7 +961,7 @@ impl ProductFacts {
 }
 
 /// General Interpretive Rules 1-6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GirRule {
     /// GIR 1: classification by the terms of the headings and section/chapter notes.
@@ -982,7 +985,7 @@ pub enum GirRule {
 }
 
 /// One interpretive-rule assertion, bound to provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterpretiveRule {
     /// The GIR rule applied.
@@ -1003,7 +1006,7 @@ impl InterpretiveRule {
 }
 
 /// A criterion a candidate must satisfy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "criterion", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateCriterion {
     /// A material share must be at least the given ppm.
@@ -1083,7 +1086,7 @@ impl CandidateCriterion {
 }
 
 /// A candidate HS classification supplied by an authoritative input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HsCandidate {
     /// HS code (6-10 digits).
@@ -1136,7 +1139,7 @@ impl HsCandidate {
 }
 
 /// The outcome of candidate evaluation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClassificationOutcome {
     /// Exactly one viable candidate.
@@ -1159,7 +1162,7 @@ pub enum ClassificationOutcome {
 }
 
 /// Why escalation is required.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationKind {
     /// A binding classification ruling is required.
@@ -1171,7 +1174,7 @@ pub enum EscalationKind {
 }
 
 /// A typed escalation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Escalation {
     /// Kind.
@@ -1183,7 +1186,7 @@ pub struct Escalation {
 }
 
 /// One candidate evaluation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateEvaluation {
     /// Code.
@@ -1195,7 +1198,7 @@ pub struct CandidateEvaluation {
 }
 
 /// One criterion result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CriterionResult {
     /// The criterion description.
@@ -1207,7 +1210,7 @@ pub struct CriterionResult {
 }
 
 /// Classification input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassificationRequest {
     /// Product facts.
@@ -1217,9 +1220,15 @@ pub struct ClassificationRequest {
 }
 
 /// Classification result with audit trail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Classification {
+    /// Canonical digest of the exact ProductFacts/candidates request that
+    /// produced this classification. A human acceptance binds to it, so an
+    /// approval for one product cannot be replayed against another product
+    /// whose evaluations happen to look the same.
+    #[serde(default)]
+    pub request_digest: String,
     /// Outcome.
     pub outcome: ClassificationOutcome,
     /// Candidate evaluations.
@@ -1246,8 +1255,11 @@ impl Classification {
 /// missing facts and zero candidates are escalated, never guessed.
 pub fn classify(request: &ClassificationRequest) -> Result<Classification, LogisticsError> {
     request.facts.validate()?;
+    let request_digest = faktor_approval::content_digest(b"faktor.supply.hs-request/v1", request)
+        .map_err(ExactError::Approval)?;
     if request.candidates.is_empty() {
         return Ok(Classification {
+            request_digest,
             outcome: ClassificationOutcome::NoCandidate,
             evaluations: vec![],
             escalation: Some(Escalation {
@@ -1369,11 +1381,84 @@ pub fn classify(request: &ClassificationRequest) -> Result<Classification, Logis
         )
     };
     Ok(Classification {
+        request_digest,
         outcome,
         evaluations,
         escalation,
         evidence,
     })
+}
+
+/// Accept an ambiguous classification with an explicit human approval.
+/// The approval must bind to the entire classification and the chosen code;
+/// accepting a code that is not among the viable candidates is refused even
+/// with a token. Non-ambiguous outcomes need no approval.
+pub fn accept_classification(
+    classification: &Classification,
+    code: &str,
+    approval: Option<&faktor_approval::ApprovalToken>,
+) -> Result<Classification, LogisticsError> {
+    let mut accepted = classification.clone();
+    match &classification.outcome {
+        ClassificationOutcome::Classified { code: current } if current == code => Ok(accepted),
+        ClassificationOutcome::Classified { code: current } => {
+            Err(LogisticsError::ClassificationInconsistent(format!(
+                "already classified as {current}, not {code}"
+            )))
+        }
+        ClassificationOutcome::Ambiguous { codes } => {
+            if classification.request_digest.len() != 64
+                || !classification
+                    .request_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(LogisticsError::ClassificationInconsistent(
+                    "ambiguous classification is not bound to a product request".to_string(),
+                ));
+            }
+            if !codes.iter().any(|candidate| candidate == code) {
+                return Err(LogisticsError::ClassificationInconsistent(format!(
+                    "code {code} is not one of the viable candidates {}",
+                    codes.join(", ")
+                )));
+            }
+            let digest = faktor_approval::content_digest(
+                b"faktor.supply.hs-acceptance/v1",
+                &(classification, code),
+            )
+            .map_err(ExactError::Approval)?;
+            let check = faktor_approval::ApprovalCheck::new(
+                faktor_approval::ApprovalKind::SupplyTariffClassification,
+                "hs-classification",
+                "current",
+                digest,
+            );
+            let token = approval
+                .ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+                    kind: check.kind,
+                    subject: check.subject.clone(),
+                    bound_revision: check.bound_revision.clone(),
+                    bound_digest: check.bound_digest.clone(),
+                })
+                .map_err(ExactError::Approval)?;
+            token.require(&check).map_err(ExactError::Approval)?;
+            accepted.outcome = ClassificationOutcome::Classified {
+                code: code.to_string(),
+            };
+            accepted.escalation = None;
+            Ok(accepted)
+        }
+        ClassificationOutcome::InsufficientFacts { missing } => {
+            Err(LogisticsError::ClassificationNotFinal(format!(
+                "product facts are incomplete: {}",
+                missing.join(", ")
+            )))
+        }
+        ClassificationOutcome::NoCandidate => Err(LogisticsError::ClassificationNotFinal(
+            "no viable candidate exists; a ruling is required".to_string(),
+        )),
+    }
 }
 
 fn evaluate_criterion(
@@ -1460,7 +1545,9 @@ fn missing_facts(facts: &ProductFacts, candidates: &[HsCandidate]) -> Vec<String
 }
 
 /// A customs document class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CustomsDocumentKind {
     /// Commercial invoice.
@@ -1478,7 +1565,7 @@ pub enum CustomsDocumentKind {
 }
 
 /// One evidenced customs document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomsDocument {
     /// Kind.
@@ -1488,7 +1575,7 @@ pub struct CustomsDocument {
 }
 
 /// A customs document set.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomsDocumentSet {
     /// Documents.
@@ -1542,7 +1629,7 @@ pub fn required_documents(preference_claimed: bool) -> Vec<CustomsDocumentKind> 
 }
 
 /// Customs valuation basis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValuationBasis {
     /// Free-on-board valuation: goods only.
@@ -1552,7 +1639,7 @@ pub enum ValuationBasis {
 }
 
 /// Explicit valuation components.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomsValuation {
     /// Goods value.
@@ -1603,7 +1690,7 @@ impl CustomsValuation {
 }
 
 /// A tariff entry, supplied as an authoritative input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TariffEntry {
     /// Destination country.
@@ -1639,7 +1726,7 @@ impl TariffEntry {
 }
 
 /// A tariff schedule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TariffSchedule {
     /// Entries.
@@ -1679,7 +1766,7 @@ impl TariffSchedule {
 }
 
 /// An origin / preference claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginClaim {
     /// Origin country.
@@ -1689,7 +1776,7 @@ pub struct OriginClaim {
 }
 
 /// An FTA preference claim with evidence validity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreferenceClaim {
     /// Agreement identifier.
@@ -1711,7 +1798,7 @@ impl PreferenceClaim {
 }
 
 /// The preference decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PreferenceStatus {
     /// No preference was claimed.
@@ -1734,7 +1821,7 @@ pub enum PreferenceStatus {
 }
 
 /// Duty/tax computation result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DutyAssessment {
     /// Destination country.
@@ -1891,6 +1978,62 @@ pub fn compute_duty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambiguous_classification_acceptance_requires_a_human_approval() {
+        let classification = Classification {
+            request_digest: "b".repeat(64),
+            outcome: ClassificationOutcome::Ambiguous {
+                codes: vec!["850110".to_string(), "850120".to_string()],
+            },
+            evaluations: vec![],
+            escalation: Some(Escalation {
+                kind: EscalationKind::BindingRulingRequired,
+                reason: "two viable codes".to_string(),
+                authority: "customs classification authority".to_string(),
+            }),
+            evidence: vec![],
+        };
+        let error = accept_classification(&classification, "850110", None).unwrap_err();
+        assert!(matches!(
+            error,
+            LogisticsError::Exact(ExactError::Approval(
+                faktor_approval::ApprovalError::ApprovalRequired { .. }
+            ))
+        ));
+        let digest = faktor_approval::content_digest(
+            b"faktor.supply.hs-acceptance/v1",
+            &(&classification, "850110"),
+        )
+        .unwrap();
+        let token = faktor_approval::ApprovalToken::test_token(
+            faktor_approval::ApprovalKind::SupplyTariffClassification,
+            "hs-classification",
+            "current",
+            digest,
+        );
+        let accepted = accept_classification(&classification, "850110", Some(&token)).unwrap();
+        assert_eq!(accepted.code(), Some("850110"));
+        assert!(accepted.escalation.is_none());
+
+        let mut other_product = classification.clone();
+        other_product.request_digest = "c".repeat(64);
+        let error = accept_classification(&other_product, "850110", Some(&token)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                LogisticsError::Exact(ExactError::Approval(
+                    faktor_approval::ApprovalError::Stale { .. }
+                ))
+            ),
+            "an approval for one product request must not authorize another: {error}"
+        );
+
+        let mut unbound = classification;
+        unbound.request_digest.clear();
+        assert!(accept_classification(&unbound, "850110", Some(&token)).is_err());
+    }
+
     use faktor_supply_core::{EvidenceRef, Provenance, Revision, SourceKind};
 
     const CUR: Currency = Currency::USD;

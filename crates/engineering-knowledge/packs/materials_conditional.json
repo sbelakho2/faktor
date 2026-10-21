@@ -1,0 +1,420 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "materials-conditional",
+  "version": "1.0.0",
+  "title": "Conditional material properties: temper, thickness, temperature and orientation",
+  "domain": "materials",
+  "provenance": {
+    "kind": "standard",
+    "citation": "ASTM B209 and B557; EN 485; revision-bound mill certificates and material datasheets",
+    "edition": null,
+    "locator": "product form, temper, thickness and tensile testing",
+    "note": "No property value is embedded in this pack; every value must come from a revision-bound source."
+  },
+  "terminology": [
+    {
+      "id": "term-temper",
+      "term": "temper",
+      "definition": "The metallurgical condition produced by thermal or mechanical treatment, such as T6 or T651, that determines the property regime.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209",
+        "edition": null,
+        "locator": "temper designation",
+        "note": null
+      }
+    },
+    {
+      "id": "term-applicability",
+      "term": "property applicability",
+      "definition": "The material, product form, thickness, temperature, orientation and process conditions under which a property value is valid.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B557 and material datasheet practice",
+        "edition": null,
+        "locator": "test report scope",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-material-property-lookup",
+      "name": "Conditional material-property lookup with conflict and out-of-domain handling",
+      "equation_ids": [
+        "eq-applicability",
+        "eq-conflict"
+      ],
+      "assumption_ids": [
+        "asm-conditional-property",
+        "asm-no-extrapolation",
+        "asm-conflict-surface"
+      ],
+      "validity_domain_ids": [
+        "val-material-condition",
+        "val-thickness-temperature"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557 and mill-certificate practice",
+        "edition": null,
+        "locator": "conditional property",
+        "note": null
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-applicability",
+      "expression": "applicable = material && grade && temper && property && thickness_in_range && temperature_in_range && conditions && orientation",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "applicable",
+          "description": "record applicability predicate",
+          "dimension": "1"
+        },
+        {
+          "symbol": "thickness",
+          "description": "product thickness",
+          "dimension": "L"
+        },
+        {
+          "symbol": "temperature",
+          "description": "service temperature",
+          "dimension": "Theta"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "property scope",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-conflict",
+      "expression": "two applicable records with different values => ambiguous, not averaged",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "conflict",
+          "description": "conflicting record predicate",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Material property governance",
+        "edition": null,
+        "locator": "conflict handling",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-conditional-property",
+      "statement": "A material property is conditional on material identity, grade, temper, product form/thickness, temperature, orientation and any established process condition.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "property conditions",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-no-extrapolation",
+      "statement": "A property record is used only when every declared condition is satisfied; there is no interpolation or extrapolation outside the record.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Material property governance",
+        "edition": null,
+        "locator": "applicability",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-conflict-surface",
+      "statement": "Two applicable records with different values are a conflict to surface, not a value to average.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Material property governance",
+        "edition": null,
+        "locator": "conflict handling",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-material-condition",
+      "statement": "The material name, grade and temper must match the product actually specified; T6 thin sheet cannot substitute for T651 plate.",
+      "temperature": null,
+      "exclusions": [
+        "temper mismatch",
+        "grade mismatch",
+        "product form mismatch"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209",
+        "edition": null,
+        "locator": "temper and product form",
+        "note": null
+      }
+    },
+    {
+      "id": "val-thickness-temperature",
+      "statement": "Thickness and temperature must lie inside the record's declared range; orientation and process conditions must also be established.",
+      "temperature": null,
+      "exclusions": [
+        "thickness outside the record",
+        "temperature outside the record",
+        "missing orientation for an orientation-bound property"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B557",
+        "edition": null,
+        "locator": "test report scope",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-material-value",
+      "property": "yield strength, tensile strength and elongation",
+      "authority": "Revision-bound mill certificate or qualified material test report",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B557",
+        "edition": null,
+        "locator": "tensile test report",
+        "note": "No value is embedded in this pack."
+      }
+    },
+    {
+      "id": "prop-thickness",
+      "property": "product form and thickness range",
+      "authority": "Revision-bound drawing and mill certificate",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209",
+        "edition": null,
+        "locator": "product form",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-temperature",
+      "property": "service temperature applicability",
+      "authority": "Revision-bound material datasheet or test report",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "Material datasheet",
+        "edition": null,
+        "locator": "temperature range",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-conditional-property",
+      "rule": "Select a property only from a record whose material, temper, thickness, temperature and orientation all cover the design condition.",
+      "check": "every declared condition is satisfied",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "property scope",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-conflict-surface",
+      "rule": "Surface conflicting applicable records as an ambiguity; never average them.",
+      "check": "at most one distinct applicable value",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Material property governance",
+        "edition": null,
+        "locator": "conflict handling",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-certificate-traceability",
+      "rule": "Bind the mill certificate and heat/lot identity to the property record and the as-built part.",
+      "check": "certificate traceability",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209",
+        "edition": null,
+        "locator": "certificate",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-wrong-temper",
+      "mode": "strength shortfall from using the wrong temper or product form",
+      "cause": "substituting a thin-sheet or different-temper property for the actual plate",
+      "detection": "mill-certificate and temper verification plus tensile test",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "material condition",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-temper-mismatch",
+      "signature": "measured strength outside the expected band and a temper marking that differs from the drawing",
+      "indicates": "wrong temper or product form",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Material receiving inspection",
+        "edition": null,
+        "locator": "temper verification",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-tensile",
+      "method": "Tensile test specimens cut from the actual product at the required location and orientation",
+      "measures": "yield strength, tensile strength and elongation",
+      "standard_ref": "ASTM B557",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B557",
+        "edition": null,
+        "locator": "tensile test",
+        "note": "Licensed text is not reproduced."
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-astm-b209",
+      "standard": "ASTM B209",
+      "scope": "aluminium sheet and plate",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    },
+    {
+      "id": "std-astm-b557",
+      "standard": "ASTM B557",
+      "scope": "tension testing of aluminium products",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B557",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-t651-plate-lookup",
+      "description": "A 6061-T651 plate at 80 mm and 300 K must select a record covering that temper and thickness; a T6 thin-sheet record is not applicable.",
+      "inputs": [
+        {
+          "name": "material_grade",
+          "value": 6061.0,
+          "unit": "1",
+          "note": "identifier encoded as a fixture number; not a property"
+        },
+        {
+          "name": "temper",
+          "value": 651.0,
+          "unit": "1",
+          "note": "T651 identifier encoded as a fixture number"
+        },
+        {
+          "name": "thickness",
+          "value": 80.0,
+          "unit": "mm",
+          "note": null
+        },
+        {
+          "name": "temperature",
+          "value": 300.0,
+          "unit": "K",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "matched_record_count",
+          "value": 1.0,
+          "unit": "1",
+          "tolerance": 0.0,
+          "note": "a qualifying fixture record is required; no strength value is asserted"
+        }
+      ],
+      "provenance": {
+        "kind": "assumption",
+        "citation": "Applicability fixture, not a material property source",
+        "edition": null,
+        "locator": "worked case",
+        "note": "No material strength is embedded or implied."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-any-6061",
+      "claim": "Any 6061 aluminium has the familiar handbook strength.",
+      "refutation": "Temper and product thickness change the allowable; a T6 thin-sheet record is not applicable to T651 plate at 80 mm. The lookup refuses or returns unavailable rather than substituting the familiar number.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "temper and thickness",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-temper-thickness",
+      "trap": "Using a material property without checking temper, product form, thickness, temperature and orientation.",
+      "why_shallow_fails": "The material name matches, but the conditional property was measured on a different condition; the value is not applicable.",
+      "guard": "Require every declared applicability condition and return unavailable/out-of-domain/ambiguous rather than a number.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM B209/B557",
+        "edition": null,
+        "locator": "property scope",
+        "note": null
+      }
+    }
+  ]
+}

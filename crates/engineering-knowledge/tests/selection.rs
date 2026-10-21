@@ -62,6 +62,42 @@ fn every_shipped_pack_selects_its_registered_model_in_domain() {
             request("cap", Discipline::Electrical, "esr", &[], Some(298.15)),
             "model-cap-thermal-ripple",
         ),
+        (
+            request("opamp", Discipline::Electrical, "phase_margin", &[], None),
+            "model-opamp-loop-stability",
+        ),
+        (
+            request("flyback", Discipline::Electrical, "vds_peak", &[], None),
+            "model-flyback-converter",
+        ),
+        (
+            request(
+                "thermal-network",
+                Discipline::Thermal,
+                "rc_ladder",
+                &[],
+                Some(330.0),
+            ),
+            "model-thermal-network",
+        ),
+        (
+            request("fatigue", Discipline::Reliability, "damage", &[], None),
+            "model-fatigue-damage",
+        ),
+        (
+            request("emc", Discipline::Emc, "loop_inductance", &[], None),
+            "model-pcb-loop-inductance",
+        ),
+        (
+            request(
+                "material-property",
+                Discipline::Mechanical,
+                "yield_strength",
+                &[],
+                Some(300.0),
+            ),
+            "model-material-property-lookup",
+        ),
     ];
     for (request, expected) in cases {
         let selection = select(&request);

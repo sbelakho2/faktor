@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::dimension::Dimension;
@@ -14,7 +15,7 @@ const MAX_SYMBOL_BYTES: usize = 64;
 /// Linear units have `offset == 0`. Celsius/Fahrenheit are affine; they may
 /// be converted but never multiplied, divided, added or subtracted, which
 /// would silently turn an absolute temperature into a nonsense quantity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "UnitDef", into = "UnitDef")]
 pub struct Unit {
     symbol: String,
@@ -23,7 +24,7 @@ pub struct Unit {
     offset: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 struct UnitDef {
     symbol: String,
     dimension: Dimension,
@@ -272,6 +273,11 @@ impl UnitRegistry {
         add(Unit::linear("F", Dimension::CAPACITANCE, 1.0).unwrap());
         add(Unit::linear("uF", Dimension::CAPACITANCE, 1e-6).unwrap());
         add(Unit::linear("nF", Dimension::CAPACITANCE, 1e-9).unwrap());
+        add(Unit::linear("pF", Dimension::CAPACITANCE, 1e-12).unwrap());
+        add(Unit::linear("H", Dimension::INDUCTANCE, 1.0).unwrap());
+        add(Unit::linear("mH", Dimension::INDUCTANCE, 1e-3).unwrap());
+        add(Unit::linear("uH", Dimension::INDUCTANCE, 1e-6).unwrap());
+        add(Unit::linear("nH", Dimension::INDUCTANCE, 1e-9).unwrap());
         add(Unit::linear("ohm", Dimension::RESISTANCE, 1.0).unwrap());
         add(Unit::linear("kohm", Dimension::RESISTANCE, 1e3).unwrap());
         add(Unit::linear("mohm", Dimension::RESISTANCE, 1e-3).unwrap());
@@ -296,8 +302,11 @@ impl UnitRegistry {
         add(Unit::linear("ft*lbf", Dimension::ENERGY, 1.355_817_948_331_400_4).unwrap());
         add(Unit::linear("rad", scalar, 1.0).unwrap());
         add(Unit::linear("deg", scalar, std::f64::consts::PI / 180.0).unwrap());
+        add(Unit::linear("dB", scalar, 1.0).unwrap());
         add(Unit::linear("1/K", Dimension::INVERSE_TEMPERATURE, 1.0).unwrap());
         add(Unit::linear("K/W", Dimension::THERMAL_RESISTANCE, 1.0).unwrap());
+        add(Unit::linear("J/K", Dimension::THERMAL_CAPACITANCE, 1.0).unwrap());
+        add(Unit::linear("W/K", Dimension::THERMAL_CONDUCTANCE, 1.0).unwrap());
         add(Unit::linear("W/m/K", Dimension::new([1, 1, -3, 0, -1, 0, 0]), 1.0).unwrap());
         add(Unit::linear("J/kg/K", Dimension::new([2, 0, -2, 0, -1, 0, 0]), 1.0).unwrap());
         add(Unit::linear("kg/m^3", Dimension::DENSITY, 1.0).unwrap());
@@ -333,14 +342,15 @@ impl UnitRegistry {
 }
 
 /// One numeric value together with its dimensioned unit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "QuantityDef", into = "QuantityDef")]
 pub struct Quantity {
     value: f64,
     unit: Unit,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QuantityDef {
     value: f64,
     unit: Unit,

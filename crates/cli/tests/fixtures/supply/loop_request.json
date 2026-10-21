@@ -1,0 +1,1034 @@
+{
+  "decision_id": "decision-cap",
+  "revision": 3,
+  "engineering_revision": 7,
+  "requirement": {
+    "id": "req-cap",
+    "part": 1,
+    "description": "10 uF 25 V decoupling capacitor",
+    "quantity": 1000,
+    "needed_by": 20030,
+    "required_processes": [],
+    "required_qualifications": [],
+    "currency": "USD"
+  },
+  "engineering": {
+    "id": "capacitor-set",
+    "revision": 7,
+    "objective": "qualify a capacitor alternate without hidden assumptions",
+    "scope": "10 uF 25 V decoupling capacitor at the stated conditions",
+    "requirements": [
+      {
+        "id": "capacitance",
+        "statement": "capacitance is 10 uF +/- 10% at the stated condition",
+        "discipline": "electrical",
+        "mandatory": true,
+        "target": {
+          "kind": "numeric",
+          "property": "capacitance",
+          "limit": {
+            "kind": "equal_within",
+            "nominal": {
+              "value": 10.0,
+              "unit": {
+                "symbol": "uF",
+                "dimension": [
+                  -2,
+                  -1,
+                  4,
+                  2,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 1e-6,
+                "offset": 0.0
+              }
+            },
+            "tolerance": {
+              "value": 1.0,
+              "unit": {
+                "symbol": "uF",
+                "dimension": [
+                  -2,
+                  -1,
+                  4,
+                  2,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 1e-6,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": "model-cap"
+        },
+        "conditions": [
+          "25 C ambient"
+        ],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "voltage",
+        "statement": "rated voltage is at least 16 V",
+        "discipline": "electrical",
+        "mandatory": true,
+        "target": {
+          "kind": "numeric",
+          "property": "voltage",
+          "limit": {
+            "kind": "min",
+            "limit": {
+              "value": 16.0,
+              "unit": {
+                "symbol": "V",
+                "dimension": [
+                  2,
+                  1,
+                  -3,
+                  -1,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 1.0,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": "model-cap"
+        },
+        "conditions": [],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "esr",
+        "statement": "ESR is at most 100 mohm at 100 kHz",
+        "discipline": "electrical",
+        "mandatory": true,
+        "target": {
+          "kind": "numeric",
+          "property": "esr",
+          "limit": {
+            "kind": "max",
+            "limit": {
+              "value": 100.0,
+              "unit": {
+                "symbol": "mohm",
+                "dimension": [
+                  2,
+                  1,
+                  -3,
+                  -2,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 0.001,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": "model-cap"
+        },
+        "conditions": [
+          "100 kHz"
+        ],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "ripple",
+        "statement": "rated ripple current is at least 1 A at 105 C",
+        "discipline": "thermal",
+        "mandatory": true,
+        "target": {
+          "kind": "numeric",
+          "property": "ripple_current",
+          "limit": {
+            "kind": "min",
+            "limit": {
+              "value": 1.0,
+              "unit": {
+                "symbol": "A",
+                "dimension": [
+                  0,
+                  0,
+                  0,
+                  1,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 1.0,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": "model-cap"
+        },
+        "conditions": [
+          "105 C"
+        ],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "case",
+        "statement": "case length is at most 3.2 mm",
+        "discipline": "tolerance",
+        "mandatory": true,
+        "target": {
+          "kind": "numeric",
+          "property": "case_length",
+          "limit": {
+            "kind": "max",
+            "limit": {
+              "value": 3.2,
+              "unit": {
+                "symbol": "mm",
+                "dimension": [
+                  1,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 0.001,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": null
+        },
+        "conditions": [],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "dielectric",
+        "statement": "dielectric is X7R or X5R",
+        "discipline": "electrical",
+        "mandatory": true,
+        "target": {
+          "kind": "categorical",
+          "property": "dielectric",
+          "allowed": [
+            "X7R",
+            "X5R"
+          ],
+          "model": "model-cap"
+        },
+        "conditions": [],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      },
+      {
+        "id": "load_life",
+        "statement": "load-life evidence reaches 1000 h",
+        "discipline": "reliability",
+        "mandatory": false,
+        "target": {
+          "kind": "numeric",
+          "property": "load_life_hours",
+          "limit": {
+            "kind": "min",
+            "limit": {
+              "value": 1000.0,
+              "unit": {
+                "symbol": "h",
+                "dimension": [
+                  0,
+                  0,
+                  1,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "scale": 3600.0,
+                "offset": 0.0
+              }
+            }
+          },
+          "model": null
+        },
+        "conditions": [],
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      }
+    ],
+    "constraints": [],
+    "models": [
+      {
+        "model_id": "model-cap",
+        "version": "1.0.0",
+        "equation_ids": [
+          "eq-cap-ripple-loss"
+        ],
+        "temperature": {
+          "lower": 233.15,
+          "upper": 398.15
+        },
+        "conditions": [],
+        "exclusions": [],
+        "pack_id": "passives",
+        "pack_version": "1.0.0",
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor model",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      }
+    ],
+    "evidence": [
+      {
+        "id": "capacitor-requirement-rev-7",
+        "revision": 7,
+        "digest": null,
+        "provenance": {
+          "kind": "specification",
+          "citation": "capacitor requirement",
+          "locator": null,
+          "digest": null,
+          "revision": 7
+        }
+      }
+    ]
+  },
+  "sourcing": null,
+  "require_supplier_fit": false,
+  "candidates": [
+    {
+      "id": "baseline",
+      "supplier": 1,
+      "role": "manufacturer",
+      "site": 1,
+      "part": 1,
+      "processes": [
+        "smt"
+      ],
+      "facts": {
+        "candidate_id": "baseline",
+        "node": null,
+        "revision": 7,
+        "values": {
+          "capacitance": {
+            "quantity": {
+              "known": {
+                "value": 10.1,
+                "unit": {
+                  "symbol": "uF",
+                  "dimension": [
+                    -2,
+                    -1,
+                    4,
+                    2,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 1e-6,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:capacitance",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          },
+          "case_length": {
+            "quantity": {
+              "known": {
+                "value": 3.2,
+                "unit": {
+                  "symbol": "mm",
+                  "dimension": [
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 0.001,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:case_length",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          },
+          "esr": {
+            "quantity": {
+              "known": {
+                "value": 50.0,
+                "unit": {
+                  "symbol": "mohm",
+                  "dimension": [
+                    2,
+                    1,
+                    -3,
+                    -2,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 0.001,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:esr",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          },
+          "load_life_hours": {
+            "quantity": {
+              "known": {
+                "value": 2000.0,
+                "unit": {
+                  "symbol": "h",
+                  "dimension": [
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 3600.0,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:load_life",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          },
+          "ripple_current": {
+            "quantity": {
+              "known": {
+                "value": 1.2,
+                "unit": {
+                  "symbol": "A",
+                  "dimension": [
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 1.0,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:ripple_current",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          },
+          "voltage": {
+            "quantity": {
+              "known": {
+                "value": 25.0,
+                "unit": {
+                  "symbol": "V",
+                  "dimension": [
+                    2,
+                    1,
+                    -3,
+                    -1,
+                    0,
+                    0,
+                    0
+                  ],
+                  "scale": 1.0,
+                  "offset": 0.0
+                }
+              }
+            },
+            "material": null,
+            "condition": null,
+            "temperature": null,
+            "orientation": null,
+            "thickness_range": null,
+            "tolerance": null,
+            "source": {
+              "kind": "specification",
+              "citation": "baseline:voltage",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7,
+            "applicability": {
+              "temperature": null,
+              "conditions": [],
+              "exclusions": [],
+              "load_regime": null
+            },
+            "uncertainty": "exact"
+          }
+        },
+        "categorical": {
+          "dielectric": {
+            "value": "X7R",
+            "provenance": {
+              "kind": "specification",
+              "citation": "baseline:dielectric",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            },
+            "revision": 7
+          }
+        },
+        "conditions": [
+          "25 C ambient",
+          "100 kHz",
+          "105 C"
+        ],
+        "temperature": {
+          "value": 298.15,
+          "unit": {
+            "symbol": "K",
+            "dimension": [
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0
+            ],
+            "scale": 1.0,
+            "offset": 0.0
+          }
+        },
+        "evidence": [
+          {
+            "id": "baseline-datasheet",
+            "revision": 2,
+            "digest": null,
+            "provenance": {
+              "kind": "specification",
+              "citation": "baseline:datasheet",
+              "locator": null,
+              "digest": null,
+              "revision": 7
+            }
+          }
+        ]
+      },
+      "supplier_profile": null,
+      "quote": {
+        "id": "baseline-quote",
+        "supplier": 1,
+        "part": 1,
+        "revision": 2,
+        "currency": "USD",
+        "prices": [
+          {
+            "quantity": 100,
+            "unit_price": {
+              "value": {
+                "status": "known",
+                "value": {
+                  "micros": 1000000,
+                  "currency": "USD"
+                }
+              },
+              "basis": {
+                "kind": "provenance",
+                "source": "supplier_document",
+                "evidence": {
+                  "id": "baseline-quote",
+                  "revision": 2,
+                  "digest": null
+                },
+                "captured_on": 20000,
+                "method": "fixture",
+                "conditions": [],
+                "falsifier": "a revised document with a different value"
+              }
+            }
+          }
+        ],
+        "tooling": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "no tooling"
+            }
+          },
+          "basis": null
+        },
+        "nre": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "no NRE"
+            }
+          },
+          "basis": null
+        },
+        "amortization_units": null,
+        "payment_days": 30,
+        "moq": 100,
+        "multiple": 1,
+        "lead_time_days": {
+          "value": {
+            "status": "known",
+            "value": {
+              "p10": 20,
+              "p50": 28,
+              "p90": 35,
+              "p99": 45,
+              "sample_size": 30
+            }
+          },
+          "basis": {
+            "kind": "provenance",
+            "source": "supplier_document",
+            "evidence": {
+              "id": "baseline-quote",
+              "revision": 2,
+              "digest": null
+            },
+            "captured_on": 20000,
+            "method": "fixture",
+            "conditions": [],
+            "falsifier": "a revised document with a different value"
+          }
+        },
+        "valid_until": 20090,
+        "warranty_days": 365,
+        "ncnr": false,
+        "incoterm": "FOB",
+        "mode": "air",
+        "freight_estimates": [],
+        "document": {
+          "id": "baseline-quote",
+          "revision": 2,
+          "digest": null
+        }
+      },
+      "relaxed_quote": null,
+      "should_cost": null,
+      "relaxed_should_cost": null,
+      "tco": {
+        "currency": "USD",
+        "quantity": 1000,
+        "ex_works_unit": {
+          "value": {
+            "status": "known",
+            "value": {
+              "micros": 1000000,
+              "currency": "USD"
+            }
+          },
+          "basis": {
+            "kind": "provenance",
+            "source": "supplier_document",
+            "evidence": {
+              "id": "tco-ex-works",
+              "revision": 2,
+              "digest": null
+            },
+            "captured_on": 20000,
+            "method": "fixture",
+            "conditions": [],
+            "falsifier": "a revised document with a different value"
+          }
+        },
+        "origin_inland_freight": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "domestic supplier"
+            }
+          },
+          "basis": null
+        },
+        "export_handling": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "domestic supplier"
+            }
+          },
+          "basis": null
+        },
+        "international_freight": {
+          "value": {
+            "status": "known",
+            "value": {
+              "micros": 100000000,
+              "currency": "USD"
+            }
+          },
+          "basis": {
+            "kind": "provenance",
+            "source": "supplier_document",
+            "evidence": {
+              "id": "tco-freight",
+              "revision": 2,
+              "digest": null
+            },
+            "captured_on": 20000,
+            "method": "fixture",
+            "conditions": [],
+            "falsifier": "a revised document with a different value"
+          }
+        },
+        "insurance": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "self-insured"
+            }
+          },
+          "basis": null
+        },
+        "import_handling": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "domestic supplier"
+            }
+          },
+          "basis": null
+        },
+        "duty": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "domestic supplier"
+            }
+          },
+          "basis": null
+        },
+        "tax": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "no recoverable tax in the fixture"
+            }
+          },
+          "basis": null
+        },
+        "brokerage": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "domestic supplier"
+            }
+          },
+          "basis": null
+        },
+        "final_mile": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "included in freight"
+            }
+          },
+          "basis": null
+        },
+        "working_capital": {
+          "value": {
+            "status": "known",
+            "value": {
+              "annual_rate": 120000,
+              "days": 30,
+              "financed_amount": {
+                "micros": 1000000000,
+                "currency": "USD"
+              }
+            }
+          },
+          "basis": {
+            "kind": "provenance",
+            "source": "supplier_document",
+            "evidence": {
+              "id": "tco-capital",
+              "revision": 2,
+              "digest": null
+            },
+            "captured_on": 20000,
+            "method": "fixture",
+            "conditions": [],
+            "falsifier": "a revised document with a different value"
+          }
+        },
+        "expected_quality": {
+          "value": {
+            "status": "known",
+            "value": {
+              "defect_ppm": 100,
+              "units": 1000,
+              "cost_per_defect": {
+                "micros": 2000000,
+                "currency": "USD"
+              }
+            }
+          },
+          "basis": {
+            "kind": "provenance",
+            "source": "supplier_document",
+            "evidence": {
+              "id": "tco-quality",
+              "revision": 2,
+              "digest": null
+            },
+            "captured_on": 20000,
+            "method": "fixture",
+            "conditions": [],
+            "falsifier": "a revised document with a different value"
+          }
+        },
+        "expected_expedite": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "no expedite observed"
+            }
+          },
+          "basis": null
+        },
+        "excess_moq_carrying": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "quantity meets MOQ"
+            }
+          },
+          "basis": null
+        },
+        "obsolescence": {
+          "value": {
+            "status": "unavailable",
+            "unavailable": {
+              "reason": "not_applicable",
+              "detail": "active part"
+            }
+          },
+          "basis": null
+        }
+      },
+      "relaxed_tco": null,
+      "lead_time_days": {
+        "value": {
+          "status": "known",
+          "value": 30
+        },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": {
+            "id": "baseline-lead",
+            "revision": 2,
+            "digest": null
+          },
+          "captured_on": 20000,
+          "method": "fixture",
+          "conditions": [],
+          "falsifier": "a revised document with a different value"
+        }
+      },
+      "transit_days": {
+        "status": "known",
+        "value": 5
+      },
+      "chargeable_weight_g": {
+        "status": "known",
+        "value": 1200
+      },
+      "quality_risk": null,
+      "continuity_risk": null,
+      "lifecycle_risk": null,
+      "evidence": [
+        {
+          "id": "baseline-evidence",
+          "revision": 2,
+          "digest": null
+        }
+      ]
+    }
+  ],
+  "knowledge_domains": [
+    "passives"
+  ],
+  "assumptions": [],
+  "evidence": [
+    {
+      "id": "decision-input",
+      "revision": 3,
+      "digest": null
+    }
+  ],
+  "inventory": {
+    "on_hand": 100,
+    "confirmed": 200,
+    "safety_stock": 50
+  },
+  "negotiation": {
+    "cost_of_capital": 120000,
+    "baseline_payment_days": 30,
+    "destination_country": "US",
+    "requested_incoterm": "FOB",
+    "transport_mode": "air"
+  },
+  "relaxations": []
+}

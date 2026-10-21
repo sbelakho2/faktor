@@ -1,0 +1,517 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "fatigue-materials",
+  "version": "1.0.0",
+  "title": "S-N and strain-life fatigue with mean-stress correction and Miner damage",
+  "domain": "fatigue",
+  "provenance": {
+    "kind": "reference",
+    "citation": "ASTM E466 and E606 practices; Basquin (1910); Coffin-Manson; Shigley's Mechanical Engineering Design",
+    "edition": null,
+    "locator": "stress-life, strain-life and damage accumulation",
+    "note": "Model structure only; curve coefficients and validity limits must come from revision-bound test data."
+  },
+  "terminology": [
+    {
+      "id": "term-sn-curve",
+      "term": "S-N curve",
+      "definition": "Stress-amplitude versus cycles-to-failure curve at a stated stress ratio, surface condition and environment.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "constant-amplitude fatigue testing",
+        "note": null
+      }
+    },
+    {
+      "id": "term-strain-life",
+      "term": "strain-life curve",
+      "definition": "Total-strain-amplitude versus reversals-to-failure relation separating elastic and plastic strain components.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "strain-controlled fatigue testing",
+        "note": null
+      }
+    },
+    {
+      "id": "term-miner-damage",
+      "term": "Miner damage",
+      "definition": "Linear accumulation of block damage as the sum of cycles divided by life at each block amplitude.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "cumulative damage",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-fatigue-damage",
+      "name": "Regime-checked Basquin/Coffin-Manson fatigue and Miner damage",
+      "equation_ids": [
+        "eq-goodman",
+        "eq-basquin",
+        "eq-coffin-manson",
+        "eq-miner"
+      ],
+      "assumption_ids": [
+        "asm-basquin-regime",
+        "asm-strain-life-regime",
+        "asm-miner-linear"
+      ],
+      "validity_domain_ids": [
+        "val-sn-regime",
+        "val-strain-life-regime"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "ASTM E466/E606 and Shigley fatigue design",
+        "edition": null,
+        "locator": "fatigue life models",
+        "note": "The model refuses rather than extrapolating outside the fitted curve."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-goodman",
+      "expression": "sigma_a,eq = sigma_a/(1 - sigma_m/UTS)",
+      "dimensional_signature": "pressure",
+      "variables": [
+        {
+          "symbol": "sigma_a",
+          "description": "stress amplitude",
+          "dimension": "M L^-1 T^-2"
+        },
+        {
+          "symbol": "sigma_m",
+          "description": "mean stress",
+          "dimension": "M L^-1 T^-2"
+        },
+        {
+          "symbol": "UTS",
+          "description": "ultimate tensile strength",
+          "dimension": "M L^-1 T^-2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "mean-stress correction",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-basquin",
+      "expression": "sigma_a,eq = sigma_f' (2 N_f)^b",
+      "dimensional_signature": "pressure",
+      "variables": [
+        {
+          "symbol": "sigma_f'",
+          "description": "fatigue strength coefficient",
+          "dimension": "M L^-1 T^-2"
+        },
+        {
+          "symbol": "b",
+          "description": "fatigue strength exponent",
+          "dimension": "1"
+        },
+        {
+          "symbol": "N_f",
+          "description": "cycles to failure",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Basquin, The exponential law of endurance tests (1910)",
+        "edition": null,
+        "locator": "stress-life relation",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-coffin-manson",
+      "expression": "eps_a = (sigma_f'/E)(2N_f)^b + eps_f' (2N_f)^c",
+      "dimensional_signature": "dimensionless strain",
+      "variables": [
+        {
+          "symbol": "eps_a",
+          "description": "total strain amplitude",
+          "dimension": "1"
+        },
+        {
+          "symbol": "eps_f'",
+          "description": "fatigue ductility coefficient",
+          "dimension": "1"
+        },
+        {
+          "symbol": "c",
+          "description": "fatigue ductility exponent",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "strain-life relation",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-miner",
+      "expression": "D = sum n_i/N_i",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "D",
+          "description": "accumulated damage",
+          "dimension": "1"
+        },
+        {
+          "symbol": "n_i",
+          "description": "applied cycles in block i",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "Miner rule",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-basquin-regime",
+      "statement": "The S-N branch applies below yield and above the declared endurance limit; stress above yield is refused rather than extrapolated.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "stress-life validity",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-strain-life-regime",
+      "statement": "The strain-life branch applies only up to the declared transition cycles and maximum total strain.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "strain-life validity",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-miner-linear",
+      "statement": "Block damage accumulates linearly; load-sequence interaction and mean-stress relaxation are outside the model.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "Miner rule",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-sn-regime",
+      "statement": "Stress amplitude must be between the endurance limit and the yield strength, with the stress ratio and surface condition represented by the supplied curve.",
+      "temperature": null,
+      "exclusions": [
+        "stress above yield",
+        "stress outside the fitted S-N range",
+        "unmodeled surface or environmental effects"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "stress-life validity",
+        "note": null
+      }
+    },
+    {
+      "id": "val-strain-life-regime",
+      "statement": "Strain amplitude must be inside the fitted strain-life range and below the declared transition to the S-N regime.",
+      "temperature": null,
+      "exclusions": [
+        "strain above the fitted maximum",
+        "life beyond the transition cycles",
+        "missing elastic modulus or curve coefficients"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "strain-life validity",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-sn",
+      "property": "S-N curve coefficients, endurance limit and yield strength",
+      "authority": "Revision-bound test report at the service stress ratio and surface condition",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "test report",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-strain-life",
+      "property": "strain-life coefficients, modulus and transition cycles",
+      "authority": "Revision-bound strain-controlled test report",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "test report",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-strength",
+      "property": "ultimate tensile strength for mean-stress correction",
+      "authority": "Revision-bound material test report",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E8",
+        "edition": null,
+        "locator": "tensile test",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-refuse-outside-regime",
+      "rule": "Refuse to extrapolate outside the fitted S-N or strain-life regime; do not use a UTS fraction as an endurance limit.",
+      "check": "stress/strain and life inside the declared validity envelope",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466/E606",
+        "edition": null,
+        "locator": "validity",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-miner-sum",
+      "rule": "Accumulate block damage linearly and report the result as a damage sum, not an averaged stress.",
+      "check": "D = sum n_i/N_i",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "Miner rule",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-surface-condition",
+      "rule": "Record surface finish, residual stress and notch condition because they shift the fatigue curve.",
+      "check": "process records and specimen condition",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "specimen condition",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-mean-stress",
+      "mode": "premature fatigue failure under tensile mean stress",
+      "cause": "ignoring mean-stress correction and using the zero-mean curve",
+      "detection": "damage comparison with and without Goodman/Morrow correction",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design",
+        "edition": null,
+        "locator": "mean stress",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-early-crack",
+      "signature": "cracks initiating earlier than the zero-mean S-N prediction",
+      "indicates": "tensile mean stress or surface condition not represented by the curve",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Fatigue failure analysis practice",
+        "edition": null,
+        "locator": "fractography",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-constant-amplitude",
+      "method": "Constant-amplitude fatigue testing at the service stress ratio and surface condition",
+      "measures": "S-N curve, endurance limit and scatter",
+      "standard_ref": "ASTM E466",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "test method",
+        "note": "Licensed text is not reproduced."
+      }
+    },
+    {
+      "id": "test-strain-controlled",
+      "method": "Strain-controlled fatigue testing with stabilized hysteresis loops",
+      "measures": "strain-life coefficients and transition life",
+      "standard_ref": "ASTM E606",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "test method",
+        "note": "Licensed text is not reproduced."
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-astm-e466",
+      "standard": "ASTM E466",
+      "scope": "constant-amplitude axial fatigue testing",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    },
+    {
+      "id": "std-astm-e606",
+      "standard": "ASTM E606",
+      "scope": "strain-controlled fatigue testing",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E606",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-basquin",
+      "description": "A 300 MPa zero-mean stress amplitude on a curve with sigma_f' = 900 MPa and b = -0.1 has a finite Basquin life.",
+      "inputs": [
+        {
+          "name": "stress_amplitude",
+          "value": 300.0,
+          "unit": "MPa",
+          "note": null
+        },
+        {
+          "name": "sigma_f_prime",
+          "value": 900.0,
+          "unit": "MPa",
+          "note": null
+        },
+        {
+          "name": "b",
+          "value": -0.1,
+          "unit": "1",
+          "note": null
+        },
+        {
+          "name": "cycles",
+          "value": 1000.0,
+          "unit": "1",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "life_cycles",
+          "value": 29524.5,
+          "unit": "1",
+          "tolerance": 1e-6,
+          "note": "0.5 (300/900)^(1/-0.1)"
+        },
+        {
+          "name": "damage",
+          "value": 0.03387017,
+          "unit": "1",
+          "tolerance": 1e-8,
+          "note": "1000/life"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form Basquin evaluation of the declared fixture",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Fixture coefficients are synthetic, not a test report."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-endurance-half-uts",
+      "claim": "The endurance limit is always half the tensile strength.",
+      "refutation": "A UTS fraction is not an S-N curve and carries no stress ratio, surface, environment or run-out definition. The model refuses when no curve covers the regime.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466",
+        "edition": null,
+        "locator": "endurance limit",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-sn-outside-regime",
+      "trap": "Using a UTS fraction as an endurance limit or extrapolating an S-N curve above yield or beyond its fitted life.",
+      "why_shallow_fails": "The arithmetic looks plausible but the stress/life point is outside the tested regime, so the curve has no authority there.",
+      "guard": "Check yield, endurance limit, transition and fitted range; refuse or request a curve that covers the regime.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASTM E466/E606",
+        "edition": null,
+        "locator": "validity",
+        "note": null
+      }
+    }
+  ]
+}

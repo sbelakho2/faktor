@@ -1017,11 +1017,42 @@ pub struct QualificationAssessment {
     pub evidence: Vec<EvidenceRef>,
 }
 
+/// The exact digest a human qualification approval binds to.
+pub fn qualification_digest(qualification: &Qualification) -> Result<String, ExactError> {
+    faktor_approval::content_digest(b"faktor.supply.qualification/v1", qualification)
+        .map_err(ExactError::Approval)
+}
+
+/// The exact check a human qualification approval must satisfy.
+pub fn qualification_approval_check(
+    qualification: &Qualification,
+) -> Result<faktor_approval::ApprovalCheck, ExactError> {
+    Ok(faktor_approval::ApprovalCheck::new(
+        faktor_approval::ApprovalKind::SupplySupplierQualification,
+        format!("qualification:{}", qualification.id),
+        qualification.revision.get().to_string(),
+        qualification_digest(qualification)?,
+    ))
+}
+
 /// Assess a qualification at a day. The state is derived from evidence; an
-/// approval or a state string cannot override a failed or missing gate.
+/// approval or a state string cannot override a failed or missing gate. This
+/// entry point has no human approval, so a `qualified`/`conditional` result
+/// is refused typed. Use [`assess_with_approval`] for the action path.
 pub fn assess(
     qualification: &Qualification,
     as_of: Day,
+) -> Result<QualificationAssessment, ExactError> {
+    assess_with_approval(qualification, as_of, None)
+}
+
+/// Assess a qualification with an optional human approval token. A token is
+/// required exactly when the derived state would be `qualified` or
+/// `conditional`; it must bind to the qualification revision and digest.
+pub fn assess_with_approval(
+    qualification: &Qualification,
+    as_of: Day,
+    approval_token: Option<&faktor_approval::ApprovalToken>,
 ) -> Result<QualificationAssessment, ExactError> {
     qualification.validate()?;
     let mut gates = Vec::new();
@@ -1088,6 +1119,20 @@ pub fn assess(
             state = QualificationState::Expired;
             blockers.push(format!("qualification expired on day {}", valid_until.0));
         }
+    }
+    if matches!(
+        state,
+        QualificationState::Qualified | QualificationState::Conditional
+    ) {
+        let check = qualification_approval_check(qualification)?;
+        let token =
+            approval_token.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+                kind: check.kind,
+                subject: check.subject.clone(),
+                bound_revision: check.bound_revision.clone(),
+                bound_digest: check.bound_digest.clone(),
+            })?;
+        token.require(&check).map_err(ExactError::Approval)?;
     }
     Ok(QualificationAssessment {
         id: qualification.id.clone(),
@@ -1648,6 +1693,20 @@ fn dedup_evidence(evidence: &mut Vec<EvidenceRef>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn human_assess(
+        qualification: &Qualification,
+        as_of: Day,
+    ) -> Result<QualificationAssessment, ExactError> {
+        let check = qualification_approval_check(qualification)?;
+        let token = faktor_approval::ApprovalToken::test_token(
+            check.kind,
+            check.subject,
+            check.bound_revision,
+            check.bound_digest,
+        );
+        assess_with_approval(qualification, as_of, Some(&token))
+    }
     use faktor_supply_core::{Provenance, SourceKind};
 
     const DAY: i64 = 20_000;
@@ -1797,7 +1856,7 @@ mod tests {
 
     #[test]
     fn complete_current_evidence_qualifies() {
-        let assessment = assess(&full_qualification(), Day(DAY)).unwrap();
+        let assessment = human_assess(&full_qualification(), Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Qualified);
         assert!(assessment.blockers.is_empty());
         assert!(matches!(
@@ -1807,10 +1866,19 @@ mod tests {
     }
 
     #[test]
+    fn a_qualified_result_without_a_human_approval_token_is_refused() {
+        let error = assess(&full_qualification(), Day(DAY)).unwrap_err();
+        assert!(matches!(
+            error,
+            ExactError::Approval(faktor_approval::ApprovalError::ApprovalRequired { .. })
+        ));
+    }
+
+    #[test]
     fn evidence_alone_is_not_approval() {
         let mut qualification = full_qualification();
         qualification.approvals.clear();
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(matches!(assessment.approval, ApprovalAssessment::Absent));
     }
@@ -1820,7 +1888,7 @@ mod tests {
         let mut qualification = full_qualification();
         qualification.revision = Revision(8);
         // Evidence is also bound to the old revision, so the state is pending.
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(matches!(
             assessment.approval,
@@ -1832,7 +1900,7 @@ mod tests {
     fn approval_with_conditions_is_conditional() {
         let mut qualification = full_qualification();
         qualification.approvals[0].conditions = vec!["100% inspection for 3 lots".to_string()];
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Conditional);
     }
 
@@ -1850,7 +1918,7 @@ mod tests {
             }),
             Day(DAY - 4),
         );
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Disqualified);
         assert!(assessment
             .blockers
@@ -1864,7 +1932,7 @@ mod tests {
         qualification.ncrs[0].status = NcrStatus::Contained;
         qualification.ncrs[0].closed_on = None;
         qualification.ncrs[0].corrective_action_evidence = None;
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(assessment
             .gates
@@ -1887,7 +1955,7 @@ mod tests {
             ppap.elements
                 .retain(|element| *element != PpapElement::ControlPlan);
         }
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(assessment
             .blockers
@@ -1906,7 +1974,7 @@ mod tests {
         if let EvidencePayload::Ppap(ppap) = &mut qualification.evidence[0].payload {
             ppap.level = PpapLevel::Level4;
         }
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
     }
 
@@ -1916,7 +1984,7 @@ mod tests {
         if let EvidencePayload::Ppap(ppap) = &mut qualification.evidence[0].payload {
             ppap.psw_signed = false;
         }
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
     }
 
@@ -1924,7 +1992,7 @@ mod tests {
     fn expired_evidence_blocks() {
         let mut qualification = full_qualification();
         qualification.evidence[0].valid_until = Some(Day(DAY - 1));
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
     }
 
@@ -1932,7 +2000,7 @@ mod tests {
     fn evidence_older_than_gate_limit_blocks() {
         let mut qualification = full_qualification();
         qualification.requirements[0].max_age_days = Some(1);
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(assessment
             .blockers
@@ -1948,7 +2016,7 @@ mod tests {
         {
             capability.cpk = 1_100_000;
         }
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Disqualified);
     }
 
@@ -2007,7 +2075,7 @@ mod tests {
             }),
             Day(DAY - 1),
         ));
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Qualified);
     }
 
@@ -2019,7 +2087,7 @@ mod tests {
             evidence: evidence("suspension", 1),
             until: None,
         });
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Suspended);
     }
 
@@ -2027,7 +2095,7 @@ mod tests {
     fn expired_qualification_is_expired() {
         let mut qualification = full_qualification();
         qualification.valid_until = Some(Day(DAY - 1));
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Expired);
     }
 
@@ -2035,7 +2103,7 @@ mod tests {
     fn future_dated_approval_cannot_approve_today() {
         let mut qualification = full_qualification();
         qualification.approvals[0].approved_on = Day(DAY + 1);
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(matches!(
             assessment.approval,
@@ -2051,7 +2119,7 @@ mod tests {
         second.evidence = evidence("approval-sig-2", 1);
         second.conditions = vec!["stop shipment on any NCR".to_string()];
         qualification.approvals.push(second);
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
         assert!(matches!(
             assessment.approval,
@@ -2092,7 +2160,7 @@ mod tests {
             approvals: vec![],
             suspension: None,
         };
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::NotStarted);
     }
 
@@ -2105,7 +2173,7 @@ mod tests {
 
         let mut approval = full_qualification();
         approval.approvals[0].approved_revision = Revision(99);
-        let assessment = assess(&approval, Day(DAY)).unwrap();
+        let assessment = human_assess(&approval, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::EvidencePending);
     }
 
@@ -2120,7 +2188,7 @@ mod tests {
     fn json_fixture_qualifies_with_evidence_and_approval() {
         let fixture: QualificationFixture =
             serde_json::from_str(include_str!("../tests/fixtures/qualification.json")).unwrap();
-        let assessment = assess(&fixture.qualification, fixture.as_of).unwrap();
+        let assessment = human_assess(&fixture.qualification, fixture.as_of).unwrap();
         assert_eq!(assessment.state, QualificationState::Qualified);
         assert!(assessment.blockers.is_empty());
     }
@@ -2131,7 +2199,7 @@ mod tests {
         if let EvidencePayload::PcnReview(pcn) = &mut qualification.evidence[3].payload {
             pcn.acknowledged = false;
         }
-        let assessment = assess(&qualification, Day(DAY)).unwrap();
+        let assessment = human_assess(&qualification, Day(DAY)).unwrap();
         assert_eq!(assessment.state, QualificationState::Qualified);
         assert!(assessment
             .gates

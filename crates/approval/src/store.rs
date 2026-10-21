@@ -1,0 +1,588 @@
+//! Append-only, hash-chained durable approval ledger.
+//!
+//! One JSON object per line. Each entry commits to its sequence number, the
+//! previous entry digest, the recording time and the canonical JSON body, so
+//! deletion, reordering, truncation or in-place edits are detected on the
+//! next open instead of being read as absence. A bounded lock file serializes
+//! writers across processes.
+
+use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{
+    content_digest, ApprovalDecision, ApprovalError, ApprovalRequest, MAX_OPEN_APPROVALS,
+};
+use crate::operator::approval_dir;
+
+/// Ledger filename inside the approval directory.
+pub const LEDGER_FILE: &str = "ledger.jsonl";
+/// Committed-head anchor filename inside the approval directory.
+pub const LEDGER_HEAD_FILE: &str = "ledger.head";
+const LEDGER_DOMAIN: &[u8] = b"faktor.approval.ledger/v1";
+const LEDGER_SCHEMA: &str = "faktor.approval.ledger-entry/v1";
+const LEDGER_HEAD_SCHEMA: &str = "faktor.approval.ledger-head/v1";
+const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LEDGER_HEAD_BYTES: u64 = 1_024;
+const LOCK_FILE: &str = ".ledger.lock";
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_POLL: Duration = Duration::from_millis(5);
+const STALE_LOCK: Duration = Duration::from_secs(30);
+
+/// The durable ledger path inside a data dir.
+pub fn ledger_path(data_dir: &Path) -> PathBuf {
+    approval_dir(data_dir).join(LEDGER_FILE)
+}
+
+/// The committed-head anchor path inside a data dir.
+pub fn ledger_head_path(data_dir: &Path) -> PathBuf {
+    approval_dir(data_dir).join(LEDGER_HEAD_FILE)
+}
+
+/// The last durably committed chain position. The hash chain detects edits
+/// and reordering at any position; this anchor additionally detects tail
+/// truncation (a prefix of a valid chain is itself a valid chain).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerHead {
+    schema: String,
+    seq: u64,
+    digest: String,
+}
+
+/// One durable ledger event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LedgerBody {
+    /// An agent/requester proposed an action.
+    Requested {
+        /// The request.
+        request: ApprovalRequest,
+    },
+    /// A human operator decided exactly once.
+    Decided {
+        /// The signed decision.
+        decision: ApprovalDecision,
+    },
+}
+
+/// One hash-chained ledger entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerEntry {
+    /// Entry schema.
+    pub schema: String,
+    /// Monotonic sequence starting at 1.
+    pub seq: u64,
+    /// Recording time (epoch ms).
+    pub recorded_at_ms: u64,
+    /// Previous entry digest (64 hex zeros for the first).
+    pub prev_digest: String,
+    /// Event body.
+    pub body: LedgerBody,
+    /// This entry's digest.
+    pub digest: String,
+}
+
+/// A fully replayed ledger.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalLedger {
+    /// Every entry in order (the audit trail).
+    pub entries: Vec<LedgerEntry>,
+    /// Requests by id.
+    pub requests: BTreeMap<String, ApprovalRequest>,
+    /// Decisions by request id.
+    pub decisions: BTreeMap<String, ApprovalDecision>,
+}
+
+impl ApprovalLedger {
+    /// Load and verify the whole chain. A missing file is an honest empty
+    /// ledger; a malformed or truncated file is a typed refusal.
+    pub fn load(data_dir: &Path) -> Result<Self, ApprovalError> {
+        let path = ledger_path(data_dir);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(ApprovalError::Store(error.to_string())),
+        };
+        if !metadata.is_file() {
+            return Err(ApprovalError::Store(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_LEDGER_BYTES {
+            return Err(ApprovalError::Store(format!(
+                "approval ledger exceeds {MAX_LEDGER_BYTES} bytes"
+            )));
+        }
+        let mut raw = Vec::with_capacity(metadata.len() as usize);
+        std::fs::File::open(&path)
+            .map_err(|error| ApprovalError::Store(error.to_string()))?
+            .take(MAX_LEDGER_BYTES + 1)
+            .read_to_end(&mut raw)
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
+        if raw.len() as u64 > MAX_LEDGER_BYTES {
+            return Err(ApprovalError::Store(format!(
+                "approval ledger exceeds {MAX_LEDGER_BYTES} bytes"
+            )));
+        }
+        let text = std::str::from_utf8(&raw)
+            .map_err(|error| ApprovalError::Store(format!("ledger is not UTF-8: {error}")))?;
+        let mut ledger = Self::default();
+        let mut previous = "0".repeat(64);
+        let mut expected_seq = 1u64;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: LedgerEntry = serde_json::from_str(line).map_err(|error| {
+                ApprovalError::Store(format!("ledger line {}: {error}", index + 1))
+            })?;
+            if entry.schema != LEDGER_SCHEMA {
+                return Err(ApprovalError::Store(format!(
+                    "ledger line {} has schema {:?}",
+                    index + 1,
+                    entry.schema
+                )));
+            }
+            if entry.seq != expected_seq {
+                return Err(ApprovalError::Store(format!(
+                    "ledger sequence gap at line {}: expected {}, found {}",
+                    index + 1,
+                    expected_seq,
+                    entry.seq
+                )));
+            }
+            if entry.prev_digest != previous {
+                return Err(ApprovalError::Store(format!(
+                    "ledger chain break at line {}",
+                    index + 1
+                )));
+            }
+            let actual = entry_digest(
+                &entry.prev_digest,
+                entry.seq,
+                entry.recorded_at_ms,
+                &entry.body,
+            )?;
+            if actual != entry.digest {
+                return Err(ApprovalError::Store(format!(
+                    "ledger digest mismatch at line {}",
+                    index + 1
+                )));
+            }
+            match &entry.body {
+                LedgerBody::Requested { request } => {
+                    request.validate()?;
+                    if ledger
+                        .requests
+                        .insert(request.id.clone(), request.clone())
+                        .is_some()
+                    {
+                        return Err(ApprovalError::Store(format!(
+                            "duplicate approval request {}",
+                            request.id
+                        )));
+                    }
+                }
+                LedgerBody::Decided { decision } => {
+                    let Some(request) = ledger.requests.get(&decision.request_id) else {
+                        return Err(ApprovalError::Store(format!(
+                            "decision for unknown request {}",
+                            decision.request_id
+                        )));
+                    };
+                    decision.validate()?;
+                    if request.digest()? != decision.request_digest {
+                        return Err(ApprovalError::Store(
+                            "decision request digest does not match the recorded request"
+                                .to_string(),
+                        ));
+                    }
+                    if decision.decided_at_ms < request.created_at_ms
+                        || decision.decided_at_ms > request.expires_at_ms
+                    {
+                        return Err(ApprovalError::Store(format!(
+                            "decision for {} is timed outside its request lifetime",
+                            decision.request_id
+                        )));
+                    }
+                    if decision.principal.id == request.requester.id {
+                        return Err(ApprovalError::Store(format!(
+                            "request {} records a self-approval",
+                            decision.request_id
+                        )));
+                    }
+                    if ledger
+                        .decisions
+                        .insert(decision.request_id.clone(), decision.clone())
+                        .is_some()
+                    {
+                        return Err(ApprovalError::Store(format!(
+                            "request {} has more than one decision",
+                            decision.request_id
+                        )));
+                    }
+                }
+            }
+            previous = entry.digest.clone();
+            expected_seq += 1;
+            ledger.entries.push(entry);
+        }
+        verify_committed_head(data_dir, &ledger)?;
+        Ok(ledger)
+    }
+
+    /// Begin a locked read/write transaction. The chain is verified exactly
+    /// once per operation; the lock is held until the transaction is dropped.
+    pub(crate) fn begin(data_dir: &Path) -> Result<LedgerTransaction, ApprovalError> {
+        let lock = LedgerLock::acquire(data_dir)?;
+        let ledger = Self::load(data_dir)?;
+        Ok(LedgerTransaction {
+            _lock: lock,
+            data_dir: data_dir.to_path_buf(),
+            ledger,
+        })
+    }
+}
+
+/// One locked ledger transaction. Appends update both the durable line and
+/// the committed head without re-reading the whole chain a second time.
+pub(crate) struct LedgerTransaction {
+    _lock: LedgerLock,
+    data_dir: PathBuf,
+    ledger: ApprovalLedger,
+}
+
+impl LedgerTransaction {
+    /// The verified chain as observed under the lock.
+    pub(crate) fn ledger(&self) -> &ApprovalLedger {
+        &self.ledger
+    }
+
+    /// Append one body under the held cross-process lock.
+    pub(crate) fn append(
+        &mut self,
+        body: LedgerBody,
+        now_ms: u64,
+    ) -> Result<LedgerEntry, ApprovalError> {
+        if now_ms == 0 {
+            return Err(ApprovalError::Invalid(
+                "ledger time must be non-zero".to_string(),
+            ));
+        }
+        match &body {
+            LedgerBody::Requested { request } => {
+                request.validate()?;
+                if request.created_at_ms != now_ms {
+                    return Err(ApprovalError::Invalid(
+                        "request creation time must equal the ledger time".to_string(),
+                    ));
+                }
+                if let Some(existing) = self.ledger.requests.get(&request.id) {
+                    if existing == request {
+                        return self.recorded_request_entry(&request.id);
+                    }
+                    return Err(ApprovalError::Conflict(format!(
+                        "request {} already records different content",
+                        request.id
+                    )));
+                }
+                // Bounded pending queue under the held ledger lock: expired
+                // requests free capacity without a mutation, so a long task
+                // can never accumulate an unbounded human review backlog.
+                let open = self
+                    .ledger
+                    .requests
+                    .values()
+                    .filter(|request| {
+                        !self.ledger.decisions.contains_key(&request.id)
+                            && request.expires_at_ms >= now_ms
+                    })
+                    .count();
+                if open >= MAX_OPEN_APPROVALS {
+                    return Err(ApprovalError::PendingLimit {
+                        open,
+                        max: MAX_OPEN_APPROVALS,
+                    });
+                }
+            }
+            LedgerBody::Decided { decision } => {
+                let request = self
+                    .ledger
+                    .requests
+                    .get(&decision.request_id)
+                    .ok_or_else(|| {
+                        ApprovalError::NotFound(format!("approval request {}", decision.request_id))
+                    })?;
+                decision.validate()?;
+                if request.digest()? != decision.request_digest {
+                    return Err(ApprovalError::Invalid(
+                        "decision request digest does not match the recorded request".to_string(),
+                    ));
+                }
+                if decision.decided_at_ms < request.created_at_ms
+                    || decision.decided_at_ms > request.expires_at_ms
+                {
+                    return Err(ApprovalError::Invalid(
+                        "decision is timed outside its request lifetime".to_string(),
+                    ));
+                }
+                if decision.principal.id == request.requester.id {
+                    return Err(ApprovalError::SelfApproval {
+                        principal: decision.principal.id.clone(),
+                    });
+                }
+                if let Some(existing) = self.ledger.decisions.get(&decision.request_id) {
+                    if existing == decision {
+                        return self.recorded_decision_entry(&decision.request_id);
+                    }
+                    return Err(ApprovalError::Conflict(format!(
+                        "request {} is already decided",
+                        decision.request_id
+                    )));
+                }
+            }
+        }
+        let seq = self.ledger.entries.len() as u64 + 1;
+        let prev_digest = self
+            .ledger
+            .entries
+            .last()
+            .map(|entry| entry.digest.clone())
+            .unwrap_or_else(|| "0".repeat(64));
+        let digest = entry_digest(&prev_digest, seq, now_ms, &body)?;
+        let entry = LedgerEntry {
+            schema: LEDGER_SCHEMA.to_string(),
+            seq,
+            recorded_at_ms: now_ms,
+            prev_digest,
+            body,
+            digest,
+        };
+        let line = serde_json::to_vec(&entry)
+            .map_err(|error| ApprovalError::Store(format!("ledger encode: {error}")))?;
+        let path = ledger_path(&self.data_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| ApprovalError::Store(error.to_string()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
+        file.write_all(&line)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
+        sync_directory(
+            path.parent()
+                .ok_or_else(|| ApprovalError::Store("ledger has no parent".to_string()))?,
+        )?;
+        write_committed_head(&self.data_dir, entry.seq, &entry.digest)?;
+        self.record(entry.clone());
+        Ok(entry)
+    }
+
+    fn record(&mut self, entry: LedgerEntry) {
+        match &entry.body {
+            LedgerBody::Requested { request } => {
+                self.ledger
+                    .requests
+                    .insert(request.id.clone(), request.clone());
+            }
+            LedgerBody::Decided { decision } => {
+                self.ledger
+                    .decisions
+                    .insert(decision.request_id.clone(), decision.clone());
+            }
+        }
+        self.ledger.entries.push(entry);
+    }
+
+    fn recorded_request_entry(&self, id: &str) -> Result<LedgerEntry, ApprovalError> {
+        self.ledger
+            .entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.body,
+                    LedgerBody::Requested { request } if request.id == id
+                )
+            })
+            .cloned()
+            .ok_or_else(|| ApprovalError::Store("recorded request has no ledger entry".to_string()))
+    }
+
+    fn recorded_decision_entry(&self, request_id: &str) -> Result<LedgerEntry, ApprovalError> {
+        self.ledger
+            .entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.body,
+                    LedgerBody::Decided { decision } if decision.request_id == request_id
+                )
+            })
+            .cloned()
+            .ok_or_else(|| {
+                ApprovalError::Store("recorded decision has no ledger entry".to_string())
+            })
+    }
+}
+
+fn write_committed_head(data_dir: &Path, seq: u64, digest: &str) -> Result<(), ApprovalError> {
+    let head = LedgerHead {
+        schema: LEDGER_HEAD_SCHEMA.to_string(),
+        seq,
+        digest: digest.to_string(),
+    };
+    let bytes = serde_json::to_vec(&head)
+        .map_err(|error| ApprovalError::Store(format!("ledger head encode: {error}")))?;
+    faktor_fs::atomic::atomic_replace(&ledger_head_path(data_dir), &bytes)
+        .map_err(|error| ApprovalError::Store(format!("ledger head: {error}")))?;
+    Ok(())
+}
+
+fn verify_committed_head(data_dir: &Path, ledger: &ApprovalLedger) -> Result<(), ApprovalError> {
+    let path = ledger_head_path(data_dir);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A legacy ledger predates the committed-head anchor. It is
+            // still chain-verified; the next successful append writes a head.
+            return Ok(());
+        }
+        Err(error) => return Err(ApprovalError::Store(error.to_string())),
+    };
+    if raw.len() as u64 > MAX_LEDGER_HEAD_BYTES {
+        return Err(ApprovalError::Store(
+            "approval ledger head exceeds its bound".to_string(),
+        ));
+    }
+    let head: LedgerHead = serde_json::from_slice(&raw)
+        .map_err(|error| ApprovalError::Store(format!("ledger head: {error}")))?;
+    if head.schema != LEDGER_HEAD_SCHEMA {
+        return Err(ApprovalError::Store(format!(
+            "ledger head schema {:?} is not {LEDGER_HEAD_SCHEMA:?}",
+            head.schema
+        )));
+    }
+    if head.seq == 0
+        || head.digest.len() != 64
+        || !head.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApprovalError::Store("ledger head is malformed".to_string()));
+    }
+    let committed = head.seq as usize;
+    let Some(entry) = ledger.entries.get(committed.saturating_sub(1)) else {
+        return Err(ApprovalError::Store(format!(
+            "approval ledger was truncated: head commits to entry {} but only {} remain",
+            head.seq,
+            ledger.entries.len()
+        )));
+    };
+    if entry.seq != head.seq || entry.digest != head.digest {
+        return Err(ApprovalError::Store(format!(
+            "approval ledger head does not match entry {}",
+            head.seq
+        )));
+    }
+    Ok(())
+}
+
+fn entry_digest(
+    prev_digest: &str,
+    seq: u64,
+    recorded_at_ms: u64,
+    body: &LedgerBody,
+) -> Result<String, ApprovalError> {
+    #[derive(Serialize)]
+    struct EntryIdentity<'a> {
+        schema: &'static str,
+        seq: u64,
+        recorded_at_ms: u64,
+        prev_digest: &'a str,
+        body: &'a LedgerBody,
+    }
+    content_digest(
+        LEDGER_DOMAIN,
+        &EntryIdentity {
+            schema: LEDGER_SCHEMA,
+            seq,
+            recorded_at_ms,
+            prev_digest,
+            body,
+        },
+    )
+}
+
+fn sync_directory(path: &Path) -> Result<(), ApprovalError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
+    }
+    Ok(())
+}
+
+struct LedgerLock {
+    path: PathBuf,
+}
+
+impl LedgerLock {
+    fn acquire(data_dir: &Path) -> Result<Self, ApprovalError> {
+        let directory = approval_dir(data_dir);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
+        let path = directory.join(LOCK_FILE);
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = write!(file, "{}", std::process::id());
+                    let _ = file.sync_all();
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                        .is_some_and(|age| age > STALE_LOCK);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(ApprovalError::Busy(format!(
+                            "approval ledger lock {} held for more than {:?}",
+                            path.display(),
+                            LOCK_WAIT
+                        )));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(error) => return Err(ApprovalError::Store(error.to_string())),
+            }
+        }
+    }
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}

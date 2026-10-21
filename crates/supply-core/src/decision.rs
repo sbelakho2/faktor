@@ -7,6 +7,7 @@
 //! summary may be explicitly unavailable; a decision can never invent a
 //! missing field, and conflicts are stored, never averaged.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::basis::{
@@ -33,9 +34,9 @@ pub const MAX_CONFLICTS: usize = 64;
 pub const MAX_MISSING_ITEMS: usize = 64;
 
 /// A stable candidate identifier within a decision.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CandidateId(pub String);
+pub struct CandidateId(#[schemars(length(min = 1, max = MAX_ID_BYTES))] pub String);
 
 impl CandidateId {
     /// Validate the identifier.
@@ -45,14 +46,16 @@ impl CandidateId {
 }
 
 /// What is being sourced.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyRequirement {
     /// Requirement identifier.
+    #[schemars(length(min = 1, max = MAX_ID_BYTES))]
     pub id: String,
     /// The part, when the requirement is bound to a graph part.
     pub part: Option<PartId>,
     /// Bounded description of the need.
+    #[schemars(length(min = 1, max = MAX_TEXT_BYTES))]
     pub description: String,
     /// Required quantity.
     pub quantity: Units,
@@ -60,9 +63,11 @@ pub struct SupplyRequirement {
     pub needed_by: Day,
     /// Processes the part requires.
     #[serde(default)]
+    #[schemars(length(max = 32))]
     pub required_processes: Vec<String>,
     /// Qualifications the supplier must hold.
     #[serde(default)]
+    #[schemars(length(max = 32))]
     pub required_qualifications: Vec<String>,
     /// Comparison currency.
     pub currency: Currency,
@@ -90,7 +95,7 @@ impl SupplyRequirement {
 }
 
 /// One sourcing candidate. The role is copied from the graph, never inferred.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Candidate {
     /// Candidate identifier.
@@ -124,7 +129,7 @@ impl Candidate {
 }
 
 /// Technical fit against the requirement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FitAssessment {
     /// Requirement clauses satisfied with evidence.
@@ -137,7 +142,7 @@ pub struct FitAssessment {
 
 /// A capability summary. Engineering-grade detail lives in
 /// `faktor-supply-supplier`; this is the decision-level projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitySummary {
     /// Supplier role.
@@ -152,7 +157,7 @@ pub struct CapabilitySummary {
 }
 
 /// Commercial terms projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommercialTermsSummary {
     /// Incoterm.
@@ -171,7 +176,7 @@ pub struct CommercialTermsSummary {
 }
 
 /// Landed-cost projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LandedCostSummary {
     /// Exact per-unit landed cost.
@@ -187,7 +192,7 @@ pub struct LandedCostSummary {
 }
 
 /// A risk projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskSummary {
     /// Ordered qualitative level.
@@ -200,7 +205,7 @@ pub struct RiskSummary {
 }
 
 /// Logistics projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogisticsSummary {
     /// Selected mode.
@@ -217,7 +222,7 @@ pub struct LogisticsSummary {
 }
 
 /// Inventory effect projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventorySummary {
     /// On hand at the decision revision.
@@ -234,7 +239,7 @@ pub struct InventorySummary {
 }
 
 /// A counterfactual that was tested, with its typed outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Counterfactual {
     /// What was varied.
@@ -269,8 +274,8 @@ impl Counterfactual {
 }
 
 /// The single recommended action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecommendedAction {
     /// Proceed with a named candidate.
     Proceed {
@@ -322,7 +327,7 @@ impl RecommendedAction {
 }
 
 /// The central supply decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyDecision {
     /// Stable decision identifier.

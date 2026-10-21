@@ -1,14 +1,18 @@
 use std::fmt;
 
 use engineering_units::{Dimension, Interval, Quantity, Uncertainty, Unit, UnitRegistry};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{require_text, CoreError, CoreResult};
 
 /// Monotonic revision identity. Zero is not a revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
-pub struct RevisionId(u64);
+#[schemars(inline)]
+pub struct RevisionId(#[schemars(range(min = 1))] u64);
 
 impl RevisionId {
     pub const fn new(raw: u64) -> Self {
@@ -31,7 +35,7 @@ impl fmt::Display for RevisionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceKind {
     Specification,
@@ -64,7 +68,8 @@ impl ProvenanceKind {
 /// The source of one fact. A citation is mandatory; a digest and revision are
 /// mandatory only where the fact is revision-bound (checked by the consumers
 /// that need one).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub kind: ProvenanceKind,
     pub citation: String,
@@ -113,7 +118,8 @@ impl Provenance {
 /// Explicit conditions under which a value is claimed to hold. An empty
 /// temperature bound means "not established by the source", never "any
 /// temperature works".
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Applicability {
     /// Inclusive bounds in kelvin.
     pub temperature: Option<Interval>,
@@ -183,7 +189,8 @@ impl Applicability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialRef {
     pub name: String,
     pub grade: Option<String>,
@@ -234,8 +241,8 @@ impl MaterialRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Orientation {
     Longitudinal,
     Transverse,
@@ -256,7 +263,8 @@ impl Orientation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThicknessRange {
     pub min: Quantity,
     pub max: Quantity,
@@ -281,7 +289,8 @@ impl ThicknessRange {
 
 /// A typed unknown. The reason and the missing inputs travel with the value;
 /// there is no zero-default anywhere in this type.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnavailableValue {
     pub reason: String,
     pub required: Vec<String>,
@@ -306,8 +315,8 @@ impl UnavailableValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValueState<T> {
     Known(T),
     Unavailable(UnavailableValue),
@@ -360,7 +369,8 @@ impl<T> ValueState<T> {
 /// A conditional engineering fact. Every field is part of the claim:
 /// material, condition, temperature, orientation, thickness range,
 /// tolerance/distribution, source, revision, applicability and uncertainty.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineeringValue {
     pub quantity: ValueState<Quantity>,
     pub material: Option<MaterialRef>,

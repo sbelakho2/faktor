@@ -5,6 +5,7 @@
   "faktor-acquire",
   "faktor-agent",
   "faktor-anthropic",
+  "faktor-approval",
   "faktor-browser",
   "faktor-cas",
   "faktor-cli",

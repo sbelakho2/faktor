@@ -1,0 +1,26 @@
+[package]
+name = "faktor-approval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Durable human-operator approval authority for consequential Engineering and Supply actions."
+
+[dependencies]
+blake3.workspace = true
+faktor-fs.workspace = true
+faktor-security.workspace = true
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+test-utils = []
+
+[lints]
+workspace = true

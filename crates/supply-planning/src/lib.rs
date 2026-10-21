@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use faktor_supply_core::{
     mul_div_round_half_up, mul_div_round_up, validate_text, Availability, Currency, Day,
     Distribution, ExactError, LifecycleStatus, Money, PartId, Quantile, Rate, ScaledQuantity,
-    SupplierId, Term, UnavailableReason, Units, MAX_UNITS,
+    SupplierId, Term, UnavailableReason, Units, MAX_TEXT_BYTES, MAX_UNITS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -327,7 +327,56 @@ impl PartPlan {
     }
 }
 
-/// Planning input.
+/// A proposed safety-stock policy change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafetyStockChange {
+    /// Part whose policy changes.
+    pub part: PartId,
+    /// Current approved safety stock (from the policy record).
+    pub current: Units,
+    /// Proposed safety stock.
+    pub proposed: Units,
+    /// Why the policy changes.
+    pub rationale: String,
+}
+
+/// Safety-stock changes are consequential whenever the proposed value
+/// differs from the stated current value. There is deliberately no
+/// caller-relative "small change" exemption: a caller that controls both
+/// sides of the subtraction could otherwise claim an arbitrarily large
+/// change was a no-op. The claimed current value is part of the approval
+/// digest, and the caller must source it from the approved policy record.
+///
+/// A no-op (proposed == current) is returned without a token.
+pub fn apply_policy_change(
+    change: &SafetyStockChange,
+    approval: Option<&faktor_approval::ApprovalToken>,
+) -> Result<Units, PlanningError> {
+    validate_text(&change.rationale, MAX_TEXT_BYTES, "safety-stock rationale")?;
+    if change.current == change.proposed {
+        return Ok(change.proposed);
+    }
+    let digest = faktor_approval::content_digest(b"faktor.supply.safety-stock-change/v1", change)
+        .map_err(ExactError::Approval)?;
+    let check = faktor_approval::ApprovalCheck::new(
+        faktor_approval::ApprovalKind::SupplyInventoryPolicy,
+        format!("part:{}", change.part.0),
+        "policy",
+        digest,
+    );
+    let token = approval
+        .ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+            kind: check.kind,
+            subject: check.subject.clone(),
+            bound_revision: check.bound_revision.clone(),
+            bound_digest: check.bound_digest.clone(),
+        })
+        .map_err(ExactError::Approval)?;
+    token.require(&check).map_err(ExactError::Approval)?;
+    Ok(change.proposed)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanningInput {
@@ -1351,6 +1400,54 @@ fn dedup_flags(flags: &mut Vec<PlanningFlag>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safety_stock_policy_change_requires_a_human_approval_even_when_small() {
+        let change = SafetyStockChange {
+            part: PartId(1),
+            current: Units::new(100).unwrap(),
+            proposed: Units::new(200).unwrap(),
+            rationale: "double the buffer".to_string(),
+        };
+        for proposed in [200, 110, 101] {
+            let candidate = SafetyStockChange {
+                proposed: Units::new(proposed).unwrap(),
+                ..change.clone()
+            };
+            let error = apply_policy_change(&candidate, None).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PlanningError::Exact(ExactError::Approval(
+                        faktor_approval::ApprovalError::ApprovalRequired { .. }
+                    ))
+                ),
+                "a caller-relative small change must not bypass approval: {error}"
+            );
+        }
+        let digest =
+            faktor_approval::content_digest(b"faktor.supply.safety-stock-change/v1", &change)
+                .unwrap();
+        let token = faktor_approval::ApprovalToken::test_token(
+            faktor_approval::ApprovalKind::SupplyInventoryPolicy,
+            "part:1",
+            "policy",
+            digest,
+        );
+        assert_eq!(
+            apply_policy_change(&change, Some(&token)).unwrap().get(),
+            200
+        );
+        let no_op = SafetyStockChange {
+            proposed: change.current,
+            ..change
+        };
+        assert_eq!(
+            apply_policy_change(&no_op, None).unwrap().get(),
+            no_op.proposed.get()
+        );
+    }
+
     use faktor_supply_core::{Day, EvidenceRef, Provenance, Revision, SourceKind, SupplierId};
 
     const DAY: i64 = 20_000;

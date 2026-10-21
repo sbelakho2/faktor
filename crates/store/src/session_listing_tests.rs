@@ -331,11 +331,13 @@ fn keyset_walk_is_stable_under_inserts_and_hard_deletes() {
     assert_eq!(fresh, vec![9, 7, 6, 5, 4, 3, 2]);
 }
 
-/// v43 -> v44 migration: existing rows are backfilled to dense revisions in
-/// stable id order and the sequence resumes above them, so the first write
-/// after the upgrade can never collide with a legacy revision.
+/// v43 -> v44 migration: existing rows are backfilled in the exact legacy
+/// History presentation order (`updated_ms DESC, id DESC`), not creation-id
+/// order. An old session edited recently must outrank newer-created-but-idle
+/// sessions that still ride their creation timestamp, and the sequence resumes
+/// above the backfill so the first post-upgrade write cannot collide.
 #[test]
-fn migration_backfills_stable_revisions_and_seeds_the_sequence() {
+fn migration_backfills_legacy_history_order_and_seeds_the_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let mut ids = Vec::new();
     {
@@ -350,6 +352,23 @@ fn migration_backfills_stable_revisions_and_seeds_the_sequence() {
             );
         }
         let conn = store.raw_conn();
+        // id 1 was created first but edited most recently; ids 2..=5 are newer
+        // rows idle since creation. ids 3 and 4 share a millisecond, so the
+        // legacy `id DESC` tie-break must also survive the backfill.
+        for (index, id) in ids.iter().enumerate() {
+            let updated_ms = match index {
+                0 => 10_000,
+                1 => 2_000,
+                2 | 3 => 3_000,
+                4 => 5_000,
+                _ => unreachable!(),
+            };
+            conn.execute(
+                "UPDATE session SET created_ms = ?3, updated_ms = ?2 WHERE id = ?1",
+                params![id.raw() as i64, updated_ms, index as i64 * 1_000],
+            )
+            .unwrap();
+        }
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_session_listing_revision_id;
              DROP INDEX IF EXISTS idx_session_workspace_listing_revision_id;
@@ -361,16 +380,45 @@ fn migration_backfills_stable_revisions_and_seeds_the_sequence() {
     }
     let store = Store::open(dir.path(), true).unwrap();
     let conn = store.raw_conn();
-    let revisions: Vec<i64> = {
+    let legacy_order: Vec<i64> = {
         let mut stmt = conn
-            .prepare("SELECT listing_revision FROM session ORDER BY id ASC")
+            .prepare("SELECT id FROM session ORDER BY updated_ms DESC, id DESC")
             .unwrap();
         stmt.query_map([], |row| row.get(0))
             .unwrap()
             .map(|row| row.unwrap())
             .collect()
     };
-    assert_eq!(revisions, vec![1, 2, 3, 4, 5], "dense, stable id order");
+    let revisions: Vec<(i64, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, listing_revision FROM session ORDER BY listing_revision DESC, id DESC",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        revisions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        legacy_order,
+        "the backfill preserves the pre-v44 History presentation order"
+    );
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|(_, revision)| *revision)
+            .collect::<Vec<_>>(),
+        vec![5, 4, 3, 2, 1],
+        "dense revisions follow the legacy order: newest-edited gets the highest"
+    );
+    let edited_id = ids[0].raw() as i64;
+    assert_eq!(
+        revisions[0],
+        (edited_id, 5),
+        "the old session edited recently is listed first with the top revision"
+    );
     let next: i64 = conn
         .query_row(
             "SELECT next_value FROM listing_revision_seq WHERE id = 1",
@@ -390,12 +438,13 @@ fn migration_backfills_stable_revisions_and_seeds_the_sequence() {
     let page = store
         .list_sessions_page_at(None, None, 10, Some(created.listing_revision))
         .unwrap();
-    let mut walked: Vec<u64> = page.iter().map(|row| row.id.raw()).collect();
-    walked.sort_unstable();
-    let mut expected: Vec<u64> = ids.iter().map(|id| id.raw()).collect();
-    expected.push(created.id.raw());
-    expected.sort_unstable();
-    assert_eq!(walked, expected, "migrated rows remain page-readable");
+    assert_eq!(
+        page.iter().map(|row| row.id.raw()).collect::<Vec<_>>(),
+        std::iter::once(created.id.raw())
+            .chain(legacy_order.iter().map(|id| *id as u64))
+            .collect::<Vec<_>>(),
+        "the migrated rows remain page-readable in legacy order"
+    );
 }
 
 /// ([fault]) 1M-session History walk probe:

@@ -1095,6 +1095,51 @@ function createBindingFixture() {
   return { root, base, git, document };
 }
 
+function createRootSourceFixture({ manifest = true } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'faktor-selector-root-'));
+  const git = (...args) =>
+    execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  git('init', '-q');
+  git('config', 'user.email', 'selector@example.invalid');
+  git('config', 'user.name', 'selector');
+  if (manifest) writeFileSync(join(root, 'package.json'), '{"name":"root","private":true}\n');
+  mkdirSync(join(root, 'lib'), { recursive: true });
+  writeFileSync(join(root, 'lib/engine.ts'), 'export const engine = 1;\n');
+  git('add', '.');
+  git('commit', '-qm', 'base');
+  const base = git('rev-parse', 'HEAD').trim();
+  const document = sealImpactGraph({
+    schema: IMPACT_GRAPH_SCHEMA,
+    revision: { commit: base, tree: null, dirty: false },
+    workspace: 1,
+    files: [],
+    nodes: [
+      {
+        id: 'package:root',
+        kind: 'package',
+        name: 'root',
+        path: '.',
+        provenance: 'manifest',
+      },
+    ],
+    edges: [],
+    reverse_edges: [],
+    stats: {},
+    digest: '',
+  });
+  writeSelectorGraph(root, document);
+  git('add', '.');
+  git('commit', '-qm', 'graph at base');
+  clearWorkspaceGraphCache(root);
+  return { root, base, git, document };
+}
+
+function writeSelectorGraph(root, document) {
+  mkdirSync(join(root, 'tests/programme'), { recursive: true });
+  writeFileSync(join(root, 'tests/programme/impact-graph.json'), `${JSON.stringify(document)}\n`);
+  clearWorkspaceGraphCache(root);
+}
+
 function createWorktreeFixture() {
   const root = mkdtempSync(join(tmpdir(), 'faktor-selector-worktree-'));
   const git = (...args) =>
@@ -1259,6 +1304,72 @@ export function selftest() {
   } finally {
     rmSync(binding.root, { recursive: true, force: true });
     clearWorkspaceGraphCache(binding.root);
+  }
+
+  // A root package with `lib/` sources (not `src/`) and a generic
+  // manifestless repository must both mark their sources material. The
+  // selector consumes the Rust verdict verbatim; it never decides freshness
+  // with a second path heuristic.
+  for (const [label, options] of [
+    ['a root package lib source', { manifest: true }],
+    ['a manifestless generic source', { manifest: false }],
+  ]) {
+    const fixture = createRootSourceFixture(options);
+    try {
+      writeFileSync(join(fixture.root, 'lib/engine.ts'), 'export const engine = 2;\n');
+      fixture.git('add', '.');
+      fixture.git('commit', '-qm', 'source input');
+      const head = fixture.git('rev-parse', 'HEAD').trim();
+      const refused = loadImpactGraph(fixture.root, { head });
+      const direct = validateImpactGraph(fixture.document, head, { root: fixture.root });
+      check(
+        `${label} change is a typed refusal`,
+        /graph inputs changed/.test(refused.error ?? ''),
+        JSON.stringify(refused.error),
+      );
+      check(
+        `validator and selector agree on ${label} change`,
+        refused.error !== null && refused.error === direct && refused.code === 'stale_revision',
+        JSON.stringify({ refused, direct }),
+      );
+      const selection = select(['lib/engine.ts'], { root: fixture.root });
+      check(
+        `${label} never selects from a stale graph`,
+        selection.refused === true &&
+          selection.graph_source === 'conservative-fallback' &&
+          /graph inputs changed/.test(selection.graph_error ?? ''),
+        JSON.stringify(selection.graph_error),
+      );
+      writeSelectorGraph(
+        fixture.root,
+        sealImpactGraph({
+          ...structuredClone(fixture.document),
+          revision: { commit: head, tree: null, dirty: false },
+        }),
+      );
+      writeFileSync(join(fixture.root, 'package.json'), '{"name":"root","private":true,"version":"2"}\n');
+      fixture.git('add', '.');
+      fixture.git('commit', '-qm', 'manifest input');
+      const manifestHead = fixture.git('rev-parse', 'HEAD').trim();
+      const manifestRefused = loadImpactGraph(fixture.root, { head: manifestHead });
+      check(
+        `${label} repository manifest change is a typed refusal`,
+        /graph inputs changed/.test(manifestRefused.error ?? '') &&
+          manifestRefused.error ===
+            validateImpactGraph(
+              sealImpactGraph({
+                ...structuredClone(fixture.document),
+                revision: { commit: head, tree: null, dirty: false },
+              }),
+              manifestHead,
+              { root: fixture.root },
+            ),
+        JSON.stringify(manifestRefused.error),
+      );
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+      clearWorkspaceGraphCache(fixture.root);
+    }
   }
 
   // Scale fixture: 500 changed files across 50 crates and 10k registry rows.

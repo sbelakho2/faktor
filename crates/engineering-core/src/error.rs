@@ -49,8 +49,29 @@ pub enum CoreError {
     ReceiptSignatureMismatch,
     #[error("receipt was signed by untrusted key {key_id}")]
     UntrustedReceiptKey { key_id: String },
+    #[error(
+        "receipt signed at {signed_at_ms} is outside key {key_id}'s validity \
+         (not before {not_before_ms}, retired at {retired_at_ms:?})"
+    )]
+    ReceiptKeyOutsideValidity {
+        key_id: String,
+        signed_at_ms: u64,
+        not_before_ms: u64,
+        retired_at_ms: Option<u64>,
+    },
     #[error("signing key store {path}: {reason}")]
     KeyStore { path: String, reason: String },
+    #[error("signing key store {path} refused: {reason}")]
+    KeyStoreRefused { path: String, reason: String },
+    #[error(
+        "signing key store ownership/permission checks are unavailable on this \
+         platform ({platform}); refusing to trust the key"
+    )]
+    KeyStorePlatformUnsupported { platform: &'static str },
+    #[error("signing key {key_id} was retired at {retired_at_ms} and cannot sign new receipts")]
+    RetiredSigningKey { key_id: String, retired_at_ms: u64 },
+    #[error("signing key {key_id} is not valid before {not_before_ms}")]
+    SigningKeyNotYetValid { key_id: String, not_before_ms: u64 },
     #[error("applicability selection is invalid: {reason}")]
     InvalidSelection { reason: String },
     #[error("gate contract violation in {gate}: {message}")]
@@ -58,6 +79,9 @@ pub enum CoreError {
         gate: crate::gate::GateId,
         message: String,
     },
+    /// A human approval is required for this consequential change.
+    #[error(transparent)]
+    Approval(#[from] faktor_approval::ApprovalError),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;

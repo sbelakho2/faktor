@@ -1211,6 +1211,39 @@ pub(crate) fn daemon_context_prior(
 /// runtime below; `None` with no configured semantic providers leaves
 /// drive-start contract compilation byte-identical to the native path.
 #[allow(clippy::too_many_arguments)]
+/// Install the closed-loop Engineering/Supply tools over the daemon-local
+/// signing key and the durable HUMAN approval authority.
+fn install_engineering_tools(
+    data_dir: &std::path::Path,
+    tools: &mut ToolRegistry,
+) -> Result<(), String> {
+    // The daemon-local signing key (owner-only 0600) attests executed
+    // receipts; the verify tool trusts the recorded key history, so retired
+    // predecessors stay auditable for old receipts.
+    let engineering_signer = std::sync::Arc::new(
+        engineering_core::load_or_create_signing_key(data_dir)
+            .map_err(|error| format!("engineering signing key: {error}"))?,
+    );
+    let engineering_verifier = std::sync::Arc::new(
+        engineering_core::load_trusted_verifier(data_dir)
+            .map_err(|error| format!("engineering receipt verifier: {error}"))?,
+    );
+    // Agents may propose through approval_request; only a registered
+    // operator key (CLI-only) can decide, and loop tools mint no tokens.
+    let approval_authority = std::sync::Arc::new(
+        faktor_approval::ApprovalAuthority::open(data_dir)
+            .map_err(|error| format!("approval authority: {error}"))?,
+    );
+    tools_supply_engineering::register(
+        tools,
+        engineering_signer,
+        engineering_verifier,
+        approval_authority,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_daemon_core(
     data_dir: &std::path::Path,
     session: Arc<SessionManager>,
@@ -1506,17 +1539,7 @@ pub(crate) fn build_daemon_core(
     // Coordination board + the closed Engineering -> Supply loop. The loop
     // tools are deterministic CPU kernels and never send or order anything.
     tools::register_board_tools(&mut tools, session.clone());
-    // The daemon-local engineering signing key (owner-only 0600 in the data
-    // dir) attests executed receipts; the verify tool trusts exactly this key.
-    let engineering_signer = std::sync::Arc::new(
-        engineering_core::load_or_create_signing_key(data_dir)
-            .map_err(|error| format!("engineering signing key: {error}"))?,
-    );
-    let engineering_verifier = std::sync::Arc::new(
-        engineering_core::ReceiptVerifier::trusting_key_id(&engineering_signer.key_id())
-            .map_err(|error| format!("engineering receipt verifier: {error}"))?,
-    );
-    tools_supply_engineering::register(&mut tools, engineering_signer, engineering_verifier);
+    install_engineering_tools(data_dir, &mut tools)?;
     // Faktor Acquire (docs/acquire.md §4): the `source_market` tool enters
     // the registry LAZILY with the deterministic activation policy and the
     // §4 phase mask — until a signal/product URL/`/source on` activates it,

@@ -1589,6 +1589,7 @@ struct TelemetryLockProbe {
     waits: std::sync::atomic::AtomicU64,
     total_wait_ns: std::sync::atomic::AtomicU64,
     max_wait_ns: std::sync::atomic::AtomicU64,
+    total_hold_ns: std::sync::atomic::AtomicU64,
     max_hold_ns: std::sync::atomic::AtomicU64,
 }
 
@@ -1608,6 +1609,7 @@ impl TelemetryLockProbe {
     fn record_hold(&self, hold: std::time::Duration) {
         use std::sync::atomic::Ordering;
         let ns = hold.as_nanos().min(u64::MAX as u128) as u64;
+        self.total_hold_ns.fetch_add(ns, Ordering::Relaxed);
         self.max_hold_ns.fetch_max(ns, Ordering::Relaxed);
     }
 }

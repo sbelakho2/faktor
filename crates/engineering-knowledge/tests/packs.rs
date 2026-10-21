@@ -21,7 +21,7 @@ fn mutate(bytes: &[u8], change: impl FnOnce(&mut Value)) -> Vec<u8> {
 #[test]
 fn starter_packs_are_file_loaded_and_digest_stable() {
     let registry = KnowledgeRegistry::bundled().unwrap();
-    assert_eq!(registry.len(), 4);
+    assert_eq!(registry.len(), 10);
     for (file, id, domain) in [
         ("bolted_joint.json", "bolted-joint", "machine_design"),
         (
@@ -33,6 +33,20 @@ fn starter_packs_are_file_loaded_and_digest_stable() {
             "injection_molding.json",
             "injection-molding",
             "manufacturing",
+        ),
+        ("analog_stability.json", "analog-stability", "analog"),
+        (
+            "flyback_converters.json",
+            "flyback-converters",
+            "power_electronics",
+        ),
+        ("thermal_networks.json", "thermal-networks", "thermal"),
+        ("fatigue_materials.json", "fatigue-materials", "fatigue"),
+        ("emc_pcb.json", "emc-pcb", "emc"),
+        (
+            "materials_conditional.json",
+            "materials-conditional",
+            "materials",
         ),
     ] {
         let bytes = bundle(file);

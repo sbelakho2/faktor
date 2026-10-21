@@ -204,3 +204,91 @@ async fn fault_probe_spawn_rollback_leaves_no_live_orphan() {
         "a Closed spawn rollback tombstone is not a live orphan: {violations:?}"
     );
 }
+
+/// Approval-required outcomes are ORDINARY successful tool results: the
+/// child turn terminates, the run settles, and the parent receives a
+/// bounded handoff reporting `done` — never a deadlock, never a fabricated
+/// `approved`. (The daemon tools themselves are exercised by
+/// `tests/production-wiring/tests/approval_gate.rs`: no tool can decide.)
+#[tokio::test]
+async fn approval_required_tool_result_does_not_stall_the_child_handoff() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let approval_result = serde_json::json!({
+        "status": "approval_required",
+        "kind": "engineering_constraint_relaxation",
+        "subject": "req-set-1",
+        "bound_revision": "7",
+        "bound_digest": "a".repeat(64),
+    })
+    .to_string();
+    let env = Arc::new(open_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::Text("proposing a consequential change".into()),
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text": approval_result}),
+                },
+                ScriptedResponse::End,
+            ],
+            vec![
+                ScriptedResponse::Text(
+                    "approval pending with a human operator; no action taken".into(),
+                ),
+                ScriptedResponse::End,
+            ],
+        ],
+        0,
+    ));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-approval-required"),
+        vec![spec("a")],
+    )
+    .await
+    .expect("an approval-required tool result must not stall the run");
+    assert!(outcome.complete, "{outcome:?}");
+    let rows = OrchestratorRuntime::registry_rows(
+        env.manager.clone(),
+        env.parent,
+        "run-approval-required",
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].state,
+        ChildState::Done,
+        "the child lifecycle is terminal (approval is a separate human queue)"
+    );
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let key = format!("child-handoff/{}", rows[0].child_id);
+    let section = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("the parent handoff was delivered");
+    assert!(section.contains("outcome: done"), "{section}");
+    assert!(
+        !section.to_lowercase().contains("approved"),
+        "a pending approval must never be reported as approved: {section}"
+    );
+    // The parent consumes the handoff exactly once.
+    env.agent
+        .run_turn(env.parent, "continue", &[])
+        .await
+        .expect("parent continuation drives");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+}

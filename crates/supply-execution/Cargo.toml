@@ -6,13 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+faktor-approval.workspace = true
 faktor-supply-core.workspace = true
 faktor-supply-logistics.workspace = true
 serde.workspace = true
+schemars.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+faktor-approval = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

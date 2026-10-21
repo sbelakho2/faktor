@@ -413,3 +413,186 @@ fn doctor_deep_on_wedged_sessions_exits_nonzero() {
     );
     assert!(!stdout.contains("all checks passed"), "{stdout}");
 }
+
+/// Live tolerance-relaxation scenario: without a human approval the CLI must
+/// return a typed `approval_required` result and publish nothing; after a
+/// registered human operator approves the exact revision/digest it executes.
+#[test]
+fn tolerance_relaxation_returns_approval_required_then_executes_with_human_approval() {
+    use faktor_approval::{
+        ApprovalAuthority, ApprovalDraft, ApprovalKind, DecisionOutcome, OperatorKey, Principal,
+        PrincipalKind, RiskLevel,
+    };
+    use faktor_supply_engineering::{LoopRequest, Relaxation};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/supply/loop_request.json");
+    let raw = std::fs::read_to_string(&fixture).unwrap();
+    let mut request: LoopRequest = serde_json::from_str(&raw).unwrap();
+    let new_limit: engineering_core::NumericLimit = serde_json::from_value(serde_json::json!({
+        "kind": "max",
+        "limit": {"value": 140.0, "unit": {"symbol": "mohm", "dimension": [2,1,-3,-2,0,0,0], "scale": 0.001, "offset": 0.0}}
+    }))
+    .unwrap();
+    let relaxation = Relaxation {
+        requirement_id: "esr".to_string(),
+        new_limit: new_limit.clone(),
+        rationale: "measured ESR distribution supports a 140 mohm limit".to_string(),
+        provenance: request.engineering.requirements[2].provenance.clone(),
+        falsifier: "a lot exceeding 140 mohm".to_string(),
+        evidence: request.engineering.evidence[0].clone(),
+    };
+    let digest = request
+        .engineering
+        .relaxation_digest("esr", &new_limit)
+        .unwrap()
+        .to_hex();
+    let revision = request.engineering.revision.get().to_string();
+    request.relaxations.push(relaxation);
+    let mutated = dir.path().join("relaxed-request.json");
+    std::fs::write(&mutated, serde_json::to_vec(&request).unwrap()).unwrap();
+
+    let refused = cli()
+        .args(["supply", "decision", "--input"])
+        .arg(&mutated)
+        .arg("--data-dir")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        refused.status.success(),
+        "typed refusal must be a successful JSON result: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refusal["status"], "approval_required", "{refusal}");
+    assert_eq!(refusal["kind"], "engineering_constraint_relaxation");
+    assert!(!data.join("approval").join("ledger.jsonl").exists());
+
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(&data, "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        &data,
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms(),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(&data).unwrap();
+    let now = faktor_approval::unix_now_ms();
+    let approval = authority
+        .propose(
+            ApprovalDraft {
+                kind: ApprovalKind::EngineeringConstraintRelaxation,
+                subject: request.engineering.id.clone(),
+                evidence: request
+                    .engineering
+                    .evidence
+                    .iter()
+                    .map(|e| e.id.clone())
+                    .collect(),
+                proposed_change: "ESR max 100 -> 140 mohm".to_string(),
+                risk: RiskLevel::High,
+                requester: Principal::new("supply-agent", PrincipalKind::Agent).unwrap(),
+                bound_revision: revision,
+                bound_digest: digest,
+                expires_at_ms: now + 60_000,
+            },
+            now,
+        )
+        .unwrap();
+    authority
+        .decide(
+            &approval.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed ESR distribution".to_string(),
+            now + 1,
+        )
+        .unwrap();
+
+    let executed = cli()
+        .args(["supply", "decision", "--input"])
+        .arg(&mutated)
+        .arg("--data-dir")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "approved relaxation must execute: {}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(outcome["applied_relaxations"].as_array().unwrap().len(), 1);
+    assert!(data.join("approval").join("ledger.jsonl").is_file());
+}
+
+/// `faktor supply decision` must use the SAME durable data-dir signer as the
+/// engineering commands: a receipt emitted by one process is verified by a
+/// separate `faktor engineering verify` process that only reads durable state.
+#[test]
+fn supply_decision_artifact_verifies_with_the_engineering_verifier_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let request = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/supply/loop_request.json");
+
+    let decision = cli()
+        .args(["supply", "decision", "--input"])
+        .arg(&request)
+        .arg("--data-dir")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        decision.status.success(),
+        "supply decision failed: {}",
+        String::from_utf8_lossy(&decision.stderr)
+    );
+    let outcome_path = dir.path().join("stored-outcome.json");
+    std::fs::write(&outcome_path, &decision.stdout).unwrap();
+
+    let verify = cli()
+        .args(["engineering", "verify", "--input"])
+        .arg(&outcome_path)
+        .arg("--data-dir")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "a separate process must verify the stored artifact: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(report["verified"].as_bool(), Some(true), "{report}");
+    assert!(data.join("engineering-signing.key").is_file());
+    assert!(data.join("engineering-signing-keys.json").is_file());
+
+    // Retire the signing key: the stored receipt remains auditable through
+    // the recorded retired public key, even from a fresh process.
+    let retired_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    engineering_core::rotate_signing_key(&data, retired_at_ms).unwrap();
+    let verify_old = cli()
+        .args(["engineering", "verify", "--input"])
+        .arg(&outcome_path)
+        .arg("--data-dir")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        verify_old.status.success(),
+        "a retired key must still verify receipts signed before retirement: {}",
+        String::from_utf8_lossy(&verify_old.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&verify_old.stdout).unwrap();
+    assert_eq!(report["verified"].as_bool(), Some(true), "{report}");
+}

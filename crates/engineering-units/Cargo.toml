@@ -8,6 +8,7 @@ description = "Dimension-checked quantities, tolerances, uncertainty and determi
 
 [dependencies]
 serde.workspace = true
+schemars.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -12,14 +12,18 @@ pub mod digest;
 pub mod error;
 pub mod gate;
 pub mod graph;
+pub mod pipeline;
 pub mod receipt;
 pub mod requirements;
 pub mod selector;
 pub mod value;
 
 pub use attestation::{
-    load_or_create_signing_key, load_signing_key, signing_key_path, ReceiptAttestation,
-    ReceiptSigner, ReceiptVerifier, ATTESTATION_ALGORITHM, ENGINEERING_SIGNING_KEY_FILE,
+    key_history_path, load_key_history, load_or_create_signing_key, load_signing_key,
+    load_trusted_verifier, rotate_signing_key, signing_key_path, KeyHistory, KeyHistoryEntry,
+    KeyValidity, ReceiptAttestation, ReceiptSigner, ReceiptVerifier, ATTESTATION_ALGORITHM,
+    ENGINEERING_KEY_HISTORY_FILE, ENGINEERING_SIGNING_KEY_FILE, KEY_HISTORY_VERSION,
+    MAX_KEY_HISTORY_BYTES, MAX_TRUSTED_KEYS,
 };
 pub use digest::Digest;
 pub use error::{CoreError, CoreResult};
@@ -36,6 +40,11 @@ pub use graph::{
     DesignEdge, DesignGraph, DesignNode, EdgeId, EdgeKind, EdgeType, EngineeringDesignGraph,
     NodeId, NodeKind, NodeType, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES,
 };
+pub use pipeline::{
+    run as run_engineering_pipeline, KernelCrossCheck, KernelProbe, KernelRefusal, KernelRejection,
+    KernelReport, KernelStatus, PipelineBlocker, PipelineOutcome, PipelineRequest, PipelineRun,
+    MAX_PIPELINE_PROBES,
+};
 pub use receipt::{
     AnalysisIdentity, AnalysisKind, AnalysisReceipt, AnalysisWarning, ArtifactRef, Convergence,
     ExecutionEvidence, PropertyRevision, ReceiptContent, ReceiptResult, ReceiptValue,
@@ -50,9 +59,9 @@ pub use requirements::{
     MAX_REQUIREMENT_EVIDENCE, MAX_REQUIREMENT_MODELS,
 };
 pub use selector::{
-    ApplicabilitySelection, CatalogModel, ModelCatalog, ModelSelector, RequirementSelection,
-    SelectedModel, SelectionProvenance, SelectionRequest, ValidityDomain, MAX_CATALOG_MODELS,
-    MAX_SELECTION_REQUESTS, MAX_VALIDITY_DOMAINS,
+    ApplicabilitySelection, CatalogModel, ModelCatalog, ModelSelector, ModelValidityOverride,
+    RequirementSelection, SelectedModel, SelectionProvenance, SelectionRequest, ValidityDomain,
+    MAX_CATALOG_MODELS, MAX_SELECTION_REQUESTS, MAX_VALIDITY_DOMAINS,
 };
 pub use value::{
     quantity_in, Applicability, EngineeringValue, MaterialRef, Orientation, Provenance,

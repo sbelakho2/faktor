@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{UnitError, UnitResult};
@@ -6,14 +7,15 @@ pub const MAX_STRATIFIED_SAMPLES: usize = 100_000;
 
 /// A closed numeric interval. It carries no implicit unit; callers keep the
 /// unit alongside it (see `UncertainQuantity` in the models crate).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "IntervalDef", into = "IntervalDef")]
 pub struct Interval {
     lower: f64,
     upper: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IntervalDef {
     lower: f64,
     upper: f64,
@@ -161,7 +163,7 @@ impl Interval {
 ///
 /// `Normal` is unbounded; `envelope()` returns a documented 3-sigma numeric
 /// envelope, never a claim of a hard physical bound.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "DistributionDef", into = "DistributionDef")]
 pub enum Distribution {
     Point { value: f64 },
@@ -170,7 +172,8 @@ pub enum Distribution {
     Normal { mean: f64, std_dev: f64 },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum DistributionDef {
     Point { value: f64 },
     Uniform { low: f64, high: f64 },
@@ -379,7 +382,7 @@ impl Distribution {
 
 /// Uncertainty attached to one value. `Exact` means the model treats the
 /// input as exact; it never means "unknown" and it is never inferred.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Uncertainty {
     Exact,
@@ -448,7 +451,7 @@ impl Uncertainty {
 }
 
 /// Result of a linear uncertainty propagation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinearPropagation {
     pub interval: Option<Interval>,
     pub mean_deviation: Option<f64>,

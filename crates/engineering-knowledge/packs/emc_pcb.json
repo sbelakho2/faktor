@@ -1,0 +1,507 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "emc-pcb",
+  "version": "1.0.0",
+  "title": "PCB return-path loop inductance, decoupling placement and spacing rules",
+  "domain": "emc",
+  "provenance": {
+    "kind": "reference",
+    "citation": "Ott, Electromagnetic Compatibility Engineering; IPC-2221B metadata",
+    "edition": null,
+    "locator": "return paths, loop inductance, creepage and clearance",
+    "note": "Model structure only; stackup, geometry and spacing rules are revision-bound project inputs."
+  },
+  "terminology": [
+    {
+      "id": "term-return-path",
+      "term": "return path",
+      "definition": "The conductor that carries the return current of a signal or power loop, ideally directly beneath the outgoing trace.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "return current",
+        "note": null
+      }
+    },
+    {
+      "id": "term-creepage",
+      "term": "creepage",
+      "definition": "The shortest path along a solid insulating surface between two conductive parts.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "insulation coordination",
+        "note": null
+      }
+    },
+    {
+      "id": "term-clearance",
+      "term": "clearance",
+      "definition": "The shortest air distance between two conductive parts.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "insulation coordination",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-pcb-loop-inductance",
+      "name": "Trace-over-plane loop inductance with decoupling placement and explicit spacing rules",
+      "equation_ids": [
+        "eq-loop-inductance",
+        "eq-placement",
+        "eq-loop-impedance",
+        "eq-spacing"
+      ],
+      "assumption_ids": [
+        "asm-trace-over-plane",
+        "asm-rule-inputs",
+        "asm-static-layout"
+      ],
+      "validity_domain_ids": [
+        "val-return-path-geometry",
+        "val-rule-inputs"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering; IPC-2221B metadata",
+        "edition": null,
+        "locator": "loop inductance",
+        "note": "The estimate is a low-frequency geometric model."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-loop-inductance",
+      "expression": "L_loop ~= mu0 h l / w",
+      "dimensional_signature": "inductance",
+      "variables": [
+        {
+          "symbol": "L_loop",
+          "description": "loop inductance",
+          "dimension": "M L^2 T^-2 I^-2"
+        },
+        {
+          "symbol": "h",
+          "description": "dielectric height from trace to return plane",
+          "dimension": "L"
+        },
+        {
+          "symbol": "l",
+          "description": "loop length",
+          "dimension": "L"
+        },
+        {
+          "symbol": "w",
+          "description": "trace width",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "trace over plane",
+        "note": "Valid for l >> h and w >= h."
+      }
+    },
+    {
+      "id": "eq-placement",
+      "expression": "l = 2 (d + l_via); L_loop(d) - L_loop(0) = mu0 h 2 d / w",
+      "dimensional_signature": "inductance",
+      "variables": [
+        {
+          "symbol": "d",
+          "description": "decoupling capacitor distance from the load",
+          "dimension": "L"
+        },
+        {
+          "symbol": "l_via",
+          "description": "via length",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "decoupling placement",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-loop-impedance",
+      "expression": "Z_loop = 2 pi f L_loop",
+      "dimensional_signature": "resistance",
+      "variables": [
+        {
+          "symbol": "Z_loop",
+          "description": "loop impedance magnitude",
+          "dimension": "M L^2 T^-3 I^-2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "loop impedance",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-spacing",
+      "expression": "pass = actual_clearance >= rule_clearance && actual_creepage >= rule_creepage",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "actual",
+          "description": "measured spacing",
+          "dimension": "L"
+        },
+        {
+          "symbol": "rule",
+          "description": "project spacing rule",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "clearance and creepage",
+        "note": "The rule values are supplied by the project; no standard table is embedded."
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-trace-over-plane",
+      "statement": "The return current is directly below the trace and the loop inductance follows the parallel-plate trace-over-plane estimate.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "return path",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-rule-inputs",
+      "statement": "Clearance and creepage limits are explicit rule inputs with provenance; the model does not invent a standard table.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Project EMC/PCB design rules",
+        "edition": null,
+        "locator": "spacing rules",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-static-layout",
+      "statement": "The estimate is a low-frequency geometric loop estimate; via transitions, connector breakout and plane splits are not modeled.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "model limits",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-return-path-geometry",
+      "statement": "A revision-bound stackup with dielectric height and trace width is required; the trace width must be at least the dielectric height.",
+      "temperature": null,
+      "exclusions": [
+        "missing stackup",
+        "trace width below dielectric height",
+        "plane split or connector breakout dominating the loop"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "trace-over-plane validity",
+        "note": null
+      }
+    },
+    {
+      "id": "val-rule-inputs",
+      "statement": "Clearance and creepage checks require both the actual spacing and the project rule; missing either leaves the check unavailable.",
+      "temperature": null,
+      "exclusions": [
+        "missing actual spacing",
+        "missing rule value",
+        "rule without provenance"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1 metadata and project rules",
+        "edition": null,
+        "locator": "spacing",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-stackup",
+      "property": "dielectric height, copper thickness and trace width",
+      "authority": "Revision-bound PCB stackup and fabrication drawing",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "PCB stackup drawing",
+        "edition": null,
+        "locator": "stackup",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-spacing-rule",
+      "property": "clearance and creepage rules",
+      "authority": "Revision-bound project rule with source provenance",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1 and project rule",
+        "edition": null,
+        "locator": "spacing",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-placement",
+      "property": "capacitor distance and via length",
+      "authority": "Revision-bound placement and stackup geometry",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "PCB placement drawing",
+        "edition": null,
+        "locator": "decoupling placement",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-decoupling-distance",
+      "rule": "Place the decoupling capacitor so the return-loop inductance meets the target; loop inductance grows linearly with placement distance.",
+      "check": "L_loop <= target at the actual placement",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "decoupling",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-spacing",
+      "rule": "Check actual clearance and creepage against the project rules; a missing stackup/rule makes the check unavailable.",
+      "check": "actual >= rule for both clearance and creepage",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "clearance and creepage",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-stackup-control",
+      "rule": "Control dielectric thickness and copper thickness within the stackup tolerance because loop inductance depends on them.",
+      "check": "fabrication stackup inspection",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "PCB fabrication practice",
+        "edition": null,
+        "locator": "stackup tolerance",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-return-path",
+      "mode": "radiated or conducted emissions from an enlarged return loop",
+      "cause": "decoupling capacitor placed far from the load or return path interrupted by a plane split",
+      "detection": "near-field scan and loop-impedance measurement",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "return path",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-emission-peak",
+      "signature": "emission peak that scales with capacitor placement distance",
+      "indicates": "loop inductance dominated by decoupling placement",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "EMC debug practice",
+        "edition": null,
+        "locator": "near-field scan",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-loop-impedance",
+      "method": "Measure the power/ground loop impedance with a two-port probe or VNA",
+      "measures": "loop inductance and placement effect",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "EMC measurement practice",
+        "edition": null,
+        "locator": "loop impedance",
+        "note": null
+      }
+    },
+    {
+      "id": "test-spacing",
+      "method": "Measure clearance and creepage on the fabricated board against the project rule",
+      "measures": "minimum air and surface spacing",
+      "standard_ref": "IEC 60664-1",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "measurement",
+        "note": "Licensed text is not reproduced."
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-ipc-2221",
+      "standard": "IPC-2221B",
+      "scope": "generic PCB design",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IPC-2221B",
+        "edition": "B",
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    },
+    {
+      "id": "std-iec-60664",
+      "standard": "IEC 60664-1",
+      "scope": "insulation coordination including clearance and creepage",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60664-1",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only; the project supplies the rule values."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-decoupling-placement",
+      "description": "A 0.2 mm dielectric, 0.3 mm trace, 10 mm capacitor distance and 1 mm via length gives a 22 mm loop and a placement factor of 11 versus the adjacent position.",
+      "inputs": [
+        {
+          "name": "dielectric_height",
+          "value": 0.0002,
+          "unit": "m",
+          "note": null
+        },
+        {
+          "name": "trace_width",
+          "value": 0.0003,
+          "unit": "m",
+          "note": null
+        },
+        {
+          "name": "capacitor_distance",
+          "value": 0.01,
+          "unit": "m",
+          "note": null
+        },
+        {
+          "name": "via_length",
+          "value": 0.001,
+          "unit": "m",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "loop_inductance",
+          "value": 1.843067690106012e-08,
+          "unit": "H",
+          "tolerance": 1e-20,
+          "note": null
+        },
+        {
+          "name": "placement_factor",
+          "value": 11.0,
+          "unit": "1",
+          "tolerance": 1e-9,
+          "note": null
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form trace-over-plane evaluation of the declared fixture",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Fixture geometry is synthetic, not a layout."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-same-copper-area",
+      "claim": "Two layouts with the same copper area have the same EMC behaviour.",
+      "refutation": "Loop inductance depends on the current path length and return proximity, not copper area. Moving the decoupling capacitor multiplies the loop length and inductance while the copper area is unchanged.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "loop inductance",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-same-copper-area",
+      "trap": "Claiming EMC equivalence from equal copper area or from a missing stackup.",
+      "why_shallow_fails": "Copper area does not determine return-loop inductance; the stackup height, trace width and placement distance do. Without a stackup the value is unavailable.",
+      "guard": "Require stackup, trace width, placement distance and via length; return a typed unavailable loop inductance when stackup data is missing.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Ott, Electromagnetic Compatibility Engineering",
+        "edition": null,
+        "locator": "return path",
+        "note": null
+      }
+    }
+  ]
+}

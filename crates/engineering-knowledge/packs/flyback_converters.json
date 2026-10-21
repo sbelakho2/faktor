@@ -1,0 +1,614 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "flyback-converters",
+  "version": "1.0.0",
+  "title": "Flyback CCM/DCM operation, leakage-energy clamp and Vds stress",
+  "domain": "power_electronics",
+  "provenance": {
+    "kind": "reference",
+    "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics, 3rd edition",
+    "edition": "3rd",
+    "locator": "flyback converter, discontinuous conduction mode, RCD clamp",
+    "note": "Model structure only; transformer, MOSFET and capacitor values must come from revision-bound data."
+  },
+  "terminology": [
+    {
+      "id": "term-flyback",
+      "term": "flyback converter",
+      "definition": "An isolated converter that stores energy in the transformer magnetizing inductance during the switch on-time and transfers it to the secondary during the off-time.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "flyback converter",
+        "note": null
+      }
+    },
+    {
+      "id": "term-rcd-clamp",
+      "term": "RCD clamp",
+      "definition": "A resistor-capacitor-diode network that absorbs transformer leakage energy at switch turn-off and limits the drain-source voltage.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "leakage-energy clamp",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-flyback-converter",
+      "name": "Ideal flyback operating point with leakage-energy RCD clamp and output ripple",
+      "equation_ids": [
+        "eq-mode-boundary",
+        "eq-primary-current",
+        "eq-leakage-energy",
+        "eq-snubber-loss",
+        "eq-rcd-sizing",
+        "eq-vds-stress",
+        "eq-output-ripple"
+      ],
+      "assumption_ids": [
+        "asm-lossless-mode-selection",
+        "asm-constant-inductance",
+        "asm-ideal-clamp",
+        "asm-ripple-superposition"
+      ],
+      "validity_domain_ids": [
+        "val-ideal-flyback",
+        "val-clamp-above-reflected"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "flyback steady-state analysis",
+        "note": "Conduction and switching losses are reported separately; mode selection is ideal."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-mode-boundary",
+      "expression": "D_ccm = V_or/(Vin+V_or); D_dcm = sqrt(2 P L f)/Vin; DCM when D_dcm + D_reset <= 1",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "D",
+          "description": "duty ratio",
+          "dimension": "1"
+        },
+        {
+          "symbol": "V_or",
+          "description": "reflected output voltage, n V_out",
+          "dimension": "M L^2 T^-3 I^-1"
+        },
+        {
+          "symbol": "L",
+          "description": "primary magnetizing inductance",
+          "dimension": "M L^2 T^-2 I^-2"
+        },
+        {
+          "symbol": "f",
+          "description": "switching frequency",
+          "dimension": "T^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "DCM/CCM boundary",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-primary-current",
+      "expression": "I_pk = I_in/D + Vin D/(2 L f); I_valley = I_in/D - Vin D/(2 L f); I_sec,pk = n I_pk",
+      "dimensional_signature": "current",
+      "variables": [
+        {
+          "symbol": "I_pk",
+          "description": "primary peak current",
+          "dimension": "I"
+        },
+        {
+          "symbol": "I_in",
+          "description": "average input current",
+          "dimension": "I"
+        },
+        {
+          "symbol": "n",
+          "description": "primary-to-secondary turns ratio",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "CCM current waveforms",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-leakage-energy",
+      "expression": "E_lk = 0.5 L_lk I_pk^2; P_lk = E_lk f",
+      "dimensional_signature": "energy and power",
+      "variables": [
+        {
+          "symbol": "E_lk",
+          "description": "leakage energy per switching cycle",
+          "dimension": "M L^2 T^-2"
+        },
+        {
+          "symbol": "L_lk",
+          "description": "transformer leakage inductance",
+          "dimension": "M L^2 T^-2 I^-2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "leakage inductance",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-snubber-loss",
+      "expression": "P_snub = 0.5 L_lk I_pk^2 f V_cl/(V_cl - V_or)",
+      "dimensional_signature": "power",
+      "variables": [
+        {
+          "symbol": "P_snub",
+          "description": "RCD clamp dissipation",
+          "dimension": "M L^2 T^-3"
+        },
+        {
+          "symbol": "V_cl",
+          "description": "clamp voltage referred to the primary",
+          "dimension": "M L^2 T^-3 I^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "RCD clamp loss",
+        "note": "Valid when V_cl > V_or; otherwise the clamp cannot reset the transformer."
+      }
+    },
+    {
+      "id": "eq-rcd-sizing",
+      "expression": "R_cl = V_cl^2/P_snub; C_cl = I_pk/(f dV_cl)",
+      "dimensional_signature": "resistance and capacitance",
+      "variables": [
+        {
+          "symbol": "R_cl",
+          "description": "clamp resistor",
+          "dimension": "M L^2 T^-3 I^-2"
+        },
+        {
+          "symbol": "C_cl",
+          "description": "minimum clamp capacitor",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "RCD clamp design",
+        "note": "First-order sizing for a declared clamp ripple fraction."
+      }
+    },
+    {
+      "id": "eq-vds-stress",
+      "expression": "V_ds,pk = Vin + V_cl; margin = V_ds,rating derating - V_ds,pk",
+      "dimensional_signature": "voltage",
+      "variables": [
+        {
+          "symbol": "V_ds,pk",
+          "description": "clamped drain-source peak",
+          "dimension": "M L^2 T^-3 I^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "switch voltage stress",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-output-ripple",
+      "expression": "dV_out = I_out D/(C_out f) + ESR I_sec,pk",
+      "dimensional_signature": "voltage",
+      "variables": [
+        {
+          "symbol": "dV_out",
+          "description": "output ripple",
+          "dimension": "M L^2 T^-3 I^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "output capacitor ripple",
+        "note": "Conservative superposition of charge and ESR ripple."
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-lossless-mode-selection",
+      "statement": "The CCM/DCM boundary and primary current are computed from ideal power transfer; conduction and switching losses are separate.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "ideal flyback",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-constant-inductance",
+      "statement": "Magnetizing inductance is constant over the switching cycle and leakage is a lumped turn-off element.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Transformer datasheet and measurement",
+        "edition": null,
+        "locator": "inductance",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-ideal-clamp",
+      "statement": "The RCD clamp holds the primary winding at the declared clamp voltage during leakage-energy transfer; ringing and reverse recovery are outside the model.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "RCD clamp",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-ripple-superposition",
+      "statement": "Output ripple is the sum of the capacitive charge ripple and the ESR step at the secondary peak current.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Power-supply output-filter practice",
+        "edition": null,
+        "locator": "output ripple",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-ideal-flyback",
+      "statement": "The converter operates in CCM or DCM with duty below 0.90, a constant magnetizing inductance and a known turns ratio.",
+      "temperature": null,
+      "exclusions": [
+        "duty at or above 0.90",
+        "saturation or variable inductance",
+        "resonant or quasi-resonant operation"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "steady-state flyback assumptions",
+        "note": null
+      }
+    },
+    {
+      "id": "val-clamp-above-reflected",
+      "statement": "The RCD clamp voltage must exceed the reflected output voltage; leakage and Vds stress require a revision-bound leakage inductance and clamp voltage.",
+      "temperature": null,
+      "exclusions": [
+        "clamp voltage at or below the reflected output voltage",
+        "missing leakage inductance",
+        "avalanche operation"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "clamp validity",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-transformer",
+      "property": "magnetizing inductance, turns ratio and leakage inductance",
+      "authority": "Revision-bound transformer datasheet or measurement",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "Transformer datasheet",
+        "edition": null,
+        "locator": "inductance and turns ratio",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-mosfet-vds",
+      "property": "MOSFET Vds rating and derating",
+      "authority": "Revision-bound MOSFET datasheet",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "MOSFET datasheet",
+        "edition": null,
+        "locator": "absolute maximum ratings",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-output-cap",
+      "property": "output capacitance and ESR at the switching frequency",
+      "authority": "Revision-bound capacitor datasheet including derating",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor datasheet",
+        "edition": null,
+        "locator": "capacitance and ESR",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-leakage-stress",
+      "rule": "Include the leakage-inductance spike and RCD clamp in the Vds stress; reflected voltage alone is not the peak stress.",
+      "check": "V_ds,pk below the derated MOSFET rating",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "switch stress",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-clamp-reset",
+      "rule": "The clamp voltage must exceed the reflected output voltage or the transformer cannot reset.",
+      "check": "V_cl > V_or",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "RCD clamp",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-duty-bound",
+      "rule": "Duty ratios at or above 0.90 are outside this ideal model; use a validated high-duty design or change the topology.",
+      "check": "D < 0.90",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Flyback design practice",
+        "edition": null,
+        "locator": "duty limit",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-transformer-consistency",
+      "rule": "Control transformer turns ratio and leakage inductance lot-to-lot; the clamp and Vds margin depend on both.",
+      "check": "incoming transformer inductance and turns-ratio test",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Magnetic-component qualification practice",
+        "edition": null,
+        "locator": "incoming inspection",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-vds-avalanche",
+      "mode": "MOSFET avalanche or drain-source overvoltage",
+      "cause": "leakage energy raises Vds above the rating when the clamp is inadequate",
+      "detection": "high-voltage differential probe at worst-case high line and full load",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "switch stress",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-drain-spike",
+      "signature": "drain-source spike above Vin plus reflected voltage at turn-off",
+      "indicates": "leakage-inductance energy not fully absorbed by the clamp",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Power-supply debug practice",
+        "edition": null,
+        "locator": "turn-off waveform",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-flyback-waveform",
+      "method": "Measure primary current, Vds and secondary current at worst-case high line, full load and maximum temperature",
+      "measures": "peak currents, leakage spike, clamp voltage and output ripple",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Power-supply validation practice",
+        "edition": null,
+        "locator": "switching waveform",
+        "note": null
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-erickson",
+      "standard": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+      "scope": "converter modeling and flyback steady-state analysis",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "title and scope metadata",
+        "note": "Metadata only; text is not embedded."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-flyback-24v-12v",
+      "description": "A 24 V to 12 V, 2 A flyback at 100 kHz with 100 uH primary inductance, turns ratio 2, 2 uH leakage, 60 V clamp and 100 V/0.8 derated MOSFET.",
+      "inputs": [
+        {
+          "name": "input_voltage",
+          "value": 24.0,
+          "unit": "V",
+          "note": null
+        },
+        {
+          "name": "output_voltage",
+          "value": 12.0,
+          "unit": "V",
+          "note": null
+        },
+        {
+          "name": "output_current",
+          "value": 2.0,
+          "unit": "A",
+          "note": null
+        },
+        {
+          "name": "switching_frequency",
+          "value": 100000.0,
+          "unit": "Hz",
+          "note": null
+        },
+        {
+          "name": "primary_inductance",
+          "value": 0.0001,
+          "unit": "H",
+          "note": null
+        },
+        {
+          "name": "turns_ratio",
+          "value": 2.0,
+          "unit": "1",
+          "note": null
+        },
+        {
+          "name": "leakage_inductance",
+          "value": 0.000002,
+          "unit": "H",
+          "note": null
+        },
+        {
+          "name": "clamp_voltage",
+          "value": 60.0,
+          "unit": "V",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "duty",
+          "value": 0.5,
+          "unit": "1",
+          "tolerance": 1e-12,
+          "note": "CCM"
+        },
+        {
+          "name": "primary_peak_current",
+          "value": 2.6,
+          "unit": "A",
+          "tolerance": 1e-9,
+          "note": null
+        },
+        {
+          "name": "secondary_peak_current",
+          "value": 5.2,
+          "unit": "A",
+          "tolerance": 1e-9,
+          "note": null
+        },
+        {
+          "name": "snubber_loss",
+          "value": 1.1266666666666667,
+          "unit": "W",
+          "tolerance": 1e-9,
+          "note": null
+        },
+        {
+          "name": "vds_peak",
+          "value": 84.0,
+          "unit": "V",
+          "tolerance": 1e-12,
+          "note": "above the 80 V derated rating, so the design is rejected"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form flyback evaluation of the declared fixture",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Fixture values are synthetic, not a datasheet."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-reflected-voltage-only",
+      "claim": "Vin plus reflected output voltage is the complete MOSFET stress.",
+      "refutation": "The leakage inductance stores 0.5 L_lk I_pk^2 at turn-off. An RCD clamp holds Vds near Vin + V_cl, and the clamp loss scales with V_cl/(V_cl - V_or); ignoring either understates stress and dissipation.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "leakage and clamp",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-reflected-voltage-only",
+      "trap": "Claiming Vds_peak = Vin + N Vout without leakage inductance, clamp voltage or Vds rating.",
+      "why_shallow_fails": "The reflected voltage is only the transformer reset voltage; leakage energy and the clamp set the actual peak and its margin.",
+      "guard": "Require leakage inductance, clamp voltage and the derated Vds rating; keep leakage-driven stress unavailable when those inputs are absent.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Erickson and Maksimovic, Fundamentals of Power Electronics",
+        "edition": "3rd",
+        "locator": "switch stress",
+        "note": null
+      }
+    }
+  ]
+}

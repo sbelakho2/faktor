@@ -10,6 +10,7 @@
 //! 3. Evidence is revision-bound and condition-bound. Every assertion says
 //!    under which conditions it holds and how it could be disproved.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ExactError;
@@ -44,9 +45,21 @@ pub fn validate_text(value: &str, max: usize, what: &'static str) -> Result<(), 
 
 /// A monotonic revision number. Decisions and evidence are revision-bound.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+    JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Default,
 )]
 #[serde(transparent)]
+#[schemars(inline)]
 pub struct Revision(pub u64);
 
 impl Revision {
@@ -70,7 +83,18 @@ impl Revision {
 /// A day number (days since 1970-01-01). No timezone, no wall clock: all
 /// planning and expiry reasoning is deterministic over these integers.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+    JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Default,
 )]
 #[serde(transparent)]
 pub struct Day(pub i64);
@@ -94,7 +118,7 @@ impl Day {
 // -------------------------------------------------------------------- evidence
 
 /// The class of source a statement comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// A supplier-provided document (quote, datasheet, declaration).
@@ -120,7 +144,7 @@ pub enum SourceKind {
 }
 
 /// A revision-bound reference to a piece of evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     /// Stable evidence identifier.
@@ -156,7 +180,7 @@ impl EvidenceRef {
 }
 
 /// Why a statement is true, under which conditions, and how to disprove it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// Source class.
@@ -221,7 +245,7 @@ impl Provenance {
 }
 
 /// An explicit typed assumption with provenance and a falsifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assumption {
     /// Stable assumption identifier (unique within a decision).
@@ -268,8 +292,8 @@ impl Assumption {
 
 /// The basis of one term: evidence, an explicit assumption, or none (legal
 /// only when the term is unknown/not applicable).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Basis {
     /// Backed by captured evidence.
     Provenance(Provenance),
@@ -280,7 +304,7 @@ pub enum Basis {
 // ------------------------------------------------------------------ availability
 
 /// Why a value is unavailable. The reason is typed; zero is never a stand-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     /// The required evidence was not supplied.
@@ -321,7 +345,7 @@ impl UnavailableReason {
 }
 
 /// A typed unavailable value with a human-readable, bounded detail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Unavailable {
     /// The typed reason.
@@ -363,8 +387,8 @@ impl Unavailable {
 }
 
 /// A value that is either known or explicitly unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Availability<T> {
     /// A known value.
     Known {
@@ -476,7 +500,7 @@ impl<T> Availability<T> {
 ///
 /// A known value **must** carry a basis; an unavailable value does not need
 /// one. This is enforced by [`Term::validate`] and by every analysis kernel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Term<T> {
     /// The value or its typed absence.
@@ -595,7 +619,7 @@ impl<T> Term<T> {
 }
 
 /// The kind of uncertainty in a decision input or result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UncertaintyClass {
     /// Exact integer value.
@@ -611,7 +635,7 @@ pub enum UncertaintyClass {
 }
 
 /// One uncertainty disclosure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UncertaintyNote {
     /// The quantity concerned.
@@ -631,7 +655,7 @@ impl UncertaintyNote {
 }
 
 /// A surfaced conflict. Values are never averaged into a synthetic truth.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Conflict {
     /// The contested subject.

@@ -760,6 +760,7 @@ mod tests {
             nodes,
             edges,
             reverse_edges: reverse,
+            material_inputs: Vec::new(),
             stats: GraphStats::default(),
             digest: String::new(),
         };
@@ -851,6 +852,7 @@ mod tests {
             nodes,
             edges: vec![],
             reverse_edges: vec![],
+            material_inputs: Vec::new(),
             stats: GraphStats::default(),
             digest: String::new(),
         };
@@ -893,6 +895,7 @@ mod tests {
             nodes,
             edges: vec![],
             reverse_edges: vec![],
+            material_inputs: Vec::new(),
             stats: GraphStats::default(),
             digest: String::new(),
         };

@@ -18,12 +18,13 @@
 use std::collections::BTreeSet;
 
 use engineering_units::{Interval, Quantity, UnitRegistry};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
 use crate::error::{require_text, CoreError, CoreResult};
 use crate::gate::ValidityEnvelope;
-use crate::requirements::Discipline;
+use crate::requirements::{Discipline, EngineeringRequirementSet};
 
 pub const MAX_CATALOG_MODELS: usize = 128;
 pub const MAX_VALIDITY_DOMAINS: usize = 16;
@@ -33,7 +34,7 @@ pub const MAX_SELECTION_TEXT: usize = 2_048;
 /// Provenance of a registered model or validity domain. Knowledge packs use
 /// free-form provenance kinds ("reference", "standard", ...), preserved here
 /// verbatim rather than coerced into an enum.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionProvenance {
     pub kind: String,
@@ -74,7 +75,7 @@ impl SelectionProvenance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidityDomain {
     pub id: String,
@@ -119,7 +120,7 @@ impl ValidityDomain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogModel {
     /// Model identity used in a theory selection (an alias of the registered
@@ -321,7 +322,7 @@ impl CatalogModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCatalog {
     pub models: Vec<CatalogModel>,
@@ -361,7 +362,7 @@ impl ModelCatalog {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionRequest {
     pub requirement_id: String,
@@ -410,7 +411,7 @@ impl SelectionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedModel {
     pub requirement_id: String,
@@ -449,7 +450,80 @@ impl SelectedModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A human-approved model-validity override. The selector stays the only
+/// authority for model choice; this type records the exceptional decision and
+/// its approval binding, never a silent preference.
+///
+/// The binding covers the exact requirement set (id, revision and canonical
+/// digest), the exact catalog (so the model's registered validity domains
+/// cannot be swapped) and the selected model. An approval for one set or
+/// catalog cannot be replayed against another.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelValidityOverride {
+    /// Requirement set whose model choice is overridden.
+    pub requirement_set_id: String,
+    /// Requirement set revision.
+    pub requirement_set_revision: crate::value::RevisionId,
+    /// Canonical digest of that requirement set.
+    pub requirement_set_digest: Digest,
+    /// Requirement whose model choice is overridden.
+    pub requirement_id: String,
+    /// The model accepted outside its validity envelope.
+    pub model_id: String,
+    /// Why the out-of-envelope use is justified.
+    pub rationale: String,
+}
+
+impl ModelValidityOverride {
+    /// Validate bounds.
+    pub fn validate(&self) -> CoreResult<()> {
+        require_text("override.requirement_set_id", &self.requirement_set_id, 256)?;
+        if self.requirement_set_revision.get() == 0 {
+            return Err(CoreError::InvalidSelection {
+                reason: "override requirement-set revision must be non-zero".to_string(),
+            });
+        }
+        require_text("override.requirement_id", &self.requirement_id, 256)?;
+        require_text("override.model_id", &self.model_id, 256)?;
+        require_text("override.rationale", &self.rationale, 4_096)
+    }
+
+    /// The exact digest a human approval binds to, recomputed against the
+    /// live requirement set and catalog the selector is about to use.
+    pub fn digest(
+        &self,
+        requirements: &EngineeringRequirementSet,
+        catalog: &ModelCatalog,
+    ) -> CoreResult<Digest> {
+        self.validate()?;
+        let set_digest = Digest::of_json(requirements)?;
+        if self.requirement_set_id != requirements.id
+            || self.requirement_set_revision != requirements.revision
+            || self.requirement_set_digest != set_digest
+        {
+            return Err(CoreError::InvalidSelection {
+                reason: format!(
+                    "model override is bound to requirement set {}@{} ({}), not the live set {}@{} ({})",
+                    self.requirement_set_id,
+                    self.requirement_set_revision,
+                    self.requirement_set_digest.to_hex(),
+                    requirements.id,
+                    requirements.revision,
+                    set_digest.to_hex()
+                ),
+            });
+        }
+        let catalog_digest = catalog.digest()?;
+        Digest::of_json(&(
+            b"faktor.engineering.model-validity-override/v2".as_slice(),
+            self,
+            catalog_digest,
+        ))
+    }
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementSelection {
     Selected {
@@ -487,7 +561,7 @@ impl RequirementSelection {
 /// The recorded applicability decision. `validate` recomputes the selection
 /// from the recorded catalog and requests; the response gates call it so a
 /// theory or envelope that disagrees with the selector is refused.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicabilitySelection {
     pub catalog: ModelCatalog,
@@ -602,6 +676,31 @@ impl ModelSelector {
         catalog: &ModelCatalog,
         requests: &[SelectionRequest],
     ) -> CoreResult<ApplicabilitySelection> {
+        Self::select_inner(catalog, requests, None, None)
+    }
+
+    /// Select models with an explicit, human-approved override for at most
+    /// one requirement. The override must bind to the live requirement set
+    /// and catalog; an approval minted for another set/catalog is refused
+    /// typed. There is no preference-based silent override.
+    pub fn select_with_override(
+        catalog: &ModelCatalog,
+        requests: &[SelectionRequest],
+        requirements: &EngineeringRequirementSet,
+        approval: Option<(&ModelValidityOverride, &faktor_approval::ApprovalToken)>,
+    ) -> CoreResult<ApplicabilitySelection> {
+        if approval.is_none() {
+            return Self::select(catalog, requests);
+        }
+        Self::select_inner(catalog, requests, Some(requirements), approval)
+    }
+
+    fn select_inner(
+        catalog: &ModelCatalog,
+        requests: &[SelectionRequest],
+        requirements: Option<&EngineeringRequirementSet>,
+        approval: Option<(&ModelValidityOverride, &faktor_approval::ApprovalToken)>,
+    ) -> CoreResult<ApplicabilitySelection> {
         catalog.validate()?;
         if requests.is_empty() || requests.len() > MAX_SELECTION_REQUESTS {
             return Err(CoreError::InvalidSelection {
@@ -611,6 +710,62 @@ impl ModelSelector {
         let mut selections = Vec::with_capacity(requests.len());
         for request in requests {
             request.validate()?;
+            if let Some((selection_override, token)) = approval {
+                if selection_override.requirement_id == request.requirement_id {
+                    let requirements = requirements.ok_or_else(|| CoreError::InvalidSelection {
+                        reason: "a model override needs the live requirement set binding"
+                            .to_string(),
+                    })?;
+                    let digest = selection_override.digest(requirements, catalog)?;
+                    token.require(&faktor_approval::ApprovalCheck::new(
+                        faktor_approval::ApprovalKind::EngineeringModelValidityOverride,
+                        requirements.id.clone(),
+                        requirements.revision.get().to_string(),
+                        digest.to_hex(),
+                    ))?;
+                    let model = catalog.get(&selection_override.model_id).ok_or_else(|| {
+                        CoreError::InvalidSelection {
+                            reason: format!(
+                                "override names unknown model {}",
+                                selection_override.model_id
+                            ),
+                        }
+                    })?;
+                    selections.push(RequirementSelection::Selected {
+                        requirement_id: request.requirement_id.clone(),
+                        models: vec![SelectedModel {
+                            requirement_id: request.requirement_id.clone(),
+                            model_id: model.model_id.clone(),
+                            source_model_id: model.source_model_id.clone(),
+                            version: model.version.clone(),
+                            pack_id: model.pack_id.clone(),
+                            pack_version: model.pack_version.clone(),
+                            pack_digest: model.pack_digest,
+                            equation_ids: model.equation_ids.clone(),
+                            validity_domain_ids: model
+                                .domains
+                                .iter()
+                                .map(|domain| domain.id.clone())
+                                .collect(),
+                            validity: model.domains.clone(),
+                            rationale: format!(
+                                "human-approved validity override: {}",
+                                selection_override.rationale
+                            ),
+                            provenance: model.provenance.clone(),
+                        }],
+                        rationale: format!(
+                            "human-approved validity override: {}",
+                            selection_override.rationale
+                        ),
+                        alternatives_considered: vec![
+                            "the normal applicability selector was overridden by a recorded human decision"
+                                .to_string(),
+                        ],
+                    });
+                    continue;
+                }
+            }
             selections.push(Self::select_one(catalog, request));
         }
         Ok(ApplicabilitySelection {

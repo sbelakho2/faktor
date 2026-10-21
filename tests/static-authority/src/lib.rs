@@ -7270,6 +7270,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     /// red test even before the file is staged.
     const HYGIENE_RETIRED_PATHS: &[&str] = &[
         "crates/cli/tests/fixtures/__pycache__/mcp_mock.cpython-314.pyc",
+        "crates/verify/tests/fixtures/rebind/test_cart.py",
+        "crates/verify/tests/fixtures/rebind/test_totals.py",
+        "crates/verify/tests/fixtures/rebind/test_weakened.py",
         "mu_test",
     ];
 
@@ -9647,6 +9650,14 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join("scripts/planted.py"), "print('x')\n").unwrap();
+        // The constraint is repository-wide, not tooling-directory-only: a
+        // committed `.py` fixture outside scripts/ is equally refused.
+        std::fs::create_dir_all(dir.join("crates/fixtures")).unwrap();
+        std::fs::write(
+            dir.join("crates/fixtures/planted_fixture.py"),
+            "assert True\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("scripts/planted.sh"),
             "#!/bin/sh\npython3 scripts/planted.py\n",
@@ -9664,6 +9675,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         .unwrap();
         let files = [
             "scripts/planted.py",
+            "crates/fixtures/planted_fixture.py",
             "scripts/planted.sh",
             "scripts/planted-var.sh",
             "scripts/clean.sh",
@@ -9674,6 +9686,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert!(
             offenders.iter().any(|item| item.contains("planted.py")),
             "a planted .py source must fire: {offenders:#?}"
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|item| item.contains("crates/fixtures/planted_fixture.py")),
+            "a planted .py fixture outside tooling paths must fire too: {offenders:#?}"
         );
         assert!(
             offenders
@@ -9692,5 +9710,67 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "the sanctioned Rust invocation must stay clean: {offenders:#?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// The approval test-token constructor must never be compiled into a
+    /// production dependency graph. `faktor-approval/test-utils` is allowed
+    /// only under `[dev-dependencies]`, and no production source may name
+    /// `ApprovalToken::test_token` (test-gated modules are masked by the
+    /// normal production scan).
+    #[test]
+    fn approval_test_tokens_are_dev_dependency_only() {
+        let root = repo_root();
+        let mut offenders = Vec::new();
+        let mut dev_uses = 0usize;
+        let crates = std::fs::read_dir(root.join("crates")).expect("crates directory");
+        for entry in crates.flatten() {
+            let manifest = entry.path().join("Cargo.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&manifest).expect("Cargo.toml readable");
+            let mut section = String::new();
+            for (index, line) in text.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') {
+                    section = trimmed.to_string();
+                    continue;
+                }
+                if trimmed.contains("faktor-approval") && trimmed.contains("test-utils") {
+                    if section == "[dev-dependencies]" {
+                        dev_uses += 1;
+                    } else {
+                        offenders.push(format!(
+                            "{}:{}: test-utils enabled outside [dev-dependencies] ({section})",
+                            manifest.display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+        for rel in walk_crate_sources() {
+            let Some(file) = load(&rel) else {
+                continue;
+            };
+            let needle = "ApprovalToken::test_token";
+            for (offset, _) in file.src.match_indices(needle) {
+                if file
+                    .kept
+                    .iter()
+                    .any(|(start, end)| offset >= *start && offset < *end)
+                {
+                    offenders.push(format!("{rel}: production source names {needle}"));
+                }
+            }
+        }
+        assert!(
+            dev_uses > 0,
+            "the scan is load-bearing only if at least one crate uses the dev-only feature"
+        );
+        assert!(
+            offenders.is_empty(),
+            "approval test-token authority violations:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

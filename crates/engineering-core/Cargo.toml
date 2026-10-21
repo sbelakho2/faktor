@@ -7,16 +7,25 @@ rust-version.workspace = true
 description = "Faktor Engineering Design Graph, conditional engineering values, analysis receipts and the 11-gate response contract."
 
 [dependencies]
+faktor-approval.workspace = true
 engineering-units.workspace = true
 blake3.workspace = true
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 rand.workspace = true
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Safe, no-unsafe wrappers for anchored openat/fstat and the process euid:
+# the engineering key store refuses symlinks and validates owner/mode on
+# the opened handle, never a re-resolved pathname.
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+faktor-approval = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

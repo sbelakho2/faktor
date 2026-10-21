@@ -41,7 +41,18 @@ fn content() -> ReceiptContent {
     content
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn kernel(signer: &ReceiptSigner) -> AnalysisReceipt {
+    kernel_at(signer, now_ms())
+}
+
+fn kernel_at(signer: &ReceiptSigner, signed_at_ms: u64) -> AnalysisReceipt {
     let mut receipt = AnalysisReceipt::kernel(
         AnalysisIdentity {
             solver_id: "kernel-attestation".to_string(),
@@ -52,7 +63,7 @@ fn kernel(signer: &ReceiptSigner) -> AnalysisReceipt {
         1,
     )
     .unwrap();
-    signer.sign_receipt(&mut receipt).unwrap();
+    signer.sign_receipt_at(&mut receipt, signed_at_ms).unwrap();
     receipt
 }
 
@@ -211,4 +222,170 @@ fn property_revisions_and_boundary_conditions_are_in_the_signed_digest() {
         .property_revisions
         .push(PropertyRevision::new("proof_strength", RevisionId::new(2)).unwrap());
     assert!(receipt.verify_attestation().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_signing_key_is_refused_without_following_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    let decoy = dir.path().join("decoy.key");
+    std::fs::write(&decoy, [0x5au8; 32]).unwrap();
+    std::os::unix::fs::symlink(&decoy, engineering_core::signing_key_path(&data_dir)).unwrap();
+
+    let error = engineering_core::load_signing_key(&data_dir).unwrap_err();
+    assert!(
+        matches!(error, engineering_core::CoreError::KeyStoreRefused { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("symlink"), "{error}");
+    // The refusal never created or touched the link target through a write.
+    assert_eq!(std::fs::read(&decoy).unwrap(), [0x5au8; 32]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_group_or_world_writable_data_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let error = engineering_core::load_or_create_signing_key(&data_dir).unwrap_err();
+    assert!(
+        matches!(error, engineering_core::CoreError::KeyStoreRefused { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("group/world writable"),
+        "{error}"
+    );
+    assert!(!engineering_core::signing_key_path(&data_dir).exists());
+
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    engineering_core::load_or_create_signing_key(&data_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retired_key_verifies_old_receipts_but_cannot_sign_new_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = engineering_core::load_or_create_signing_key(dir.path()).unwrap();
+    let old_key_id = old.key_id();
+    let history = engineering_core::load_key_history(dir.path()).unwrap();
+    let not_before = history.entry_for(&old_key_id).unwrap().not_before_ms;
+    let issued_at = not_before.max(1);
+    let old_receipt = kernel_at(&old, issued_at);
+
+    let retired_at = issued_at + 1_000;
+    let new = engineering_core::rotate_signing_key(dir.path(), retired_at).unwrap();
+    assert_ne!(new.key_id(), old_key_id);
+    // The reloaded store now yields the active successor, never the old key.
+    let reloaded = engineering_core::load_signing_key(dir.path()).unwrap();
+    assert_eq!(reloaded.key_id(), new.key_id());
+
+    let verifier = engineering_core::load_trusted_verifier(dir.path()).unwrap();
+    verifier.verify(&old_receipt).unwrap();
+
+    // A receipt presented as signed after retirement is refused even though
+    // the signature itself is authentic.
+    let late = kernel_at(&old, retired_at + 1);
+    let error = verifier.verify(&late).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            engineering_core::CoreError::ReceiptKeyOutsideValidity { .. }
+        ),
+        "{error:?}"
+    );
+
+    // A signer reloaded with the retired window refuses to mint at all.
+    let retired_signer = old.clone().with_validity(engineering_core::KeyValidity {
+        not_before_ms: not_before,
+        retired_at_ms: Some(retired_at),
+    });
+    let mut receipt = AnalysisReceipt::kernel(
+        AnalysisIdentity {
+            solver_id: "kernel-attestation".to_string(),
+            solver_version: "1.0.0".to_string(),
+            kind: AnalysisKind::InProcessKernel,
+        },
+        content(),
+        1,
+    )
+    .unwrap();
+    let error = retired_signer
+        .sign_receipt_at(&mut receipt, retired_at)
+        .unwrap_err();
+    assert!(
+        matches!(error, engineering_core::CoreError::RetiredSigningKey { .. }),
+        "{error:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rotation_preserves_auditability_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = engineering_core::load_or_create_signing_key(dir.path()).unwrap();
+    let not_before = engineering_core::load_key_history(dir.path())
+        .unwrap()
+        .entry_for(&old.key_id())
+        .unwrap()
+        .not_before_ms;
+    let old_receipt = kernel_at(&old, not_before.max(1));
+    let retired_at = not_before.max(1) + 10_000;
+    let new = engineering_core::rotate_signing_key(dir.path(), retired_at).unwrap();
+    let new_receipt = kernel_at(&new, retired_at + 1);
+
+    // Simulate a process restart: drop every handle and load the trust set
+    // and both receipts from durable state only.
+    drop(old);
+    drop(new);
+    let verifier = engineering_core::load_trusted_verifier(dir.path()).unwrap();
+    verifier.verify(&old_receipt).unwrap();
+    verifier.verify(&new_receipt).unwrap();
+    let history = engineering_core::load_key_history(dir.path()).unwrap();
+    assert_eq!(history.keys.len(), 2);
+    assert!(history
+        .entry_for(&old_receipt.attestation.as_ref().unwrap().key_id)
+        .is_some());
+    assert!(history
+        .entry_for(&new_receipt.attestation.as_ref().unwrap().key_id)
+        .is_some());
+}
+
+#[test]
+fn signing_keys_are_never_logged_or_exported() {
+    let signer = ReceiptSigner::from_seed([0xabu8; 32]);
+    let debug = format!("{signer:?}");
+    assert!(debug.contains(&signer.key_id()));
+    assert!(!debug.contains(&"ab".repeat(32)));
+
+    let receipt = kernel(&signer);
+    let decoded = serde_json::to_string(&receipt).unwrap();
+    assert!(!decoded.contains(&"ab".repeat(32)));
+    assert!(decoded.contains(&signer.public_key_hex()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tampered_key_history_fingerprint_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    engineering_core::load_or_create_signing_key(dir.path()).unwrap();
+    let path = engineering_core::key_history_path(dir.path());
+    let mut history: engineering_core::KeyHistory =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    history.keys[0].key_id = "00".repeat(32);
+    std::fs::write(&path, serde_json::to_vec(&history).unwrap()).unwrap();
+
+    let error = engineering_core::load_trusted_verifier(dir.path()).unwrap_err();
+    assert!(
+        matches!(error, engineering_core::CoreError::KeyStoreRefused { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("fingerprint"), "{error}");
 }

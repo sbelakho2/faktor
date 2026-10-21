@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,9 @@ pub enum ExactError {
         /// The right currency.
         right: Currency,
     },
+    /// A human approval is required for this consequential change.
+    #[error(transparent)]
+    Approval(#[from] faktor_approval::ApprovalError),
 }
 
 // ------------------------------------------------------------------ currency
@@ -635,6 +639,95 @@ fn isqrt_u128(value: u128) -> u128 {
         }
     }
     low
+}
+
+// The exact-value newtypes below have hand-written serde bounds. Their JSON
+// Schema mirrors the wire shape and the same bounds (never the private Rust
+// representation), so a generated tool schema cannot drift from serde.
+
+impl JsonSchema for Currency {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Currency".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "ISO-4217-style three-letter uppercase currency code",
+            "pattern": "^[A-Z]{3}$"
+        })
+    }
+}
+
+impl JsonSchema for Money {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Money".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "Exact money: signed integer micro-units plus a currency",
+            "properties": {
+                "micros": {
+                    "type": "integer",
+                    "minimum": -MAX_MONEY_MICROS,
+                    "maximum": MAX_MONEY_MICROS
+                },
+                "currency": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                }
+            },
+            "required": ["micros", "currency"],
+            "additionalProperties": false
+        })
+    }
+}
+
+impl JsonSchema for Rate {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Rate".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "description": "A rate in parts-per-million",
+            "minimum": 0,
+            "maximum": MAX_PPM
+        })
+    }
+}
+
+impl JsonSchema for ScaledQuantity {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ScaledQuantity".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "description": "A scaled quantity in micro-units of its base measure",
+            "minimum": -MAX_SCALED_QUANTITY,
+            "maximum": MAX_SCALED_QUANTITY
+        })
+    }
+}
+
+impl JsonSchema for Units {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Units".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "description": "A whole-unit quantity",
+            "minimum": 0,
+            "maximum": MAX_UNITS
+        })
+    }
 }
 
 #[cfg(test)]

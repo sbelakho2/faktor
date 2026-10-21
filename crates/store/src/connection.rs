@@ -1784,7 +1784,13 @@ mod writer_service_tests {
         }
         assert_eq!(store.maintenance_active_count(), 1);
 
-        let bounded = Duration::from_millis(500);
+        // The hook below reacts to cancellation immediately, but the bound
+        // must also absorb scheduler latency on a loaded host: a 500ms
+        // wall-clock bound turned host contention into a false
+        // MaintenanceShutdownTimeout. The typed "ignores cancellation" path
+        // is covered separately by `shutdown_reports_typed_error_when_
+        // maintenance_does_not_drain`, which uses a short bound on purpose.
+        let bounded = Duration::from_secs(5);
         let at = Instant::now();
         let outcome = store.shutdown(bounded);
         let elapsed = at.elapsed();

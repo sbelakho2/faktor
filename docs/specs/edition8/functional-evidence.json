@@ -359,7 +359,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1042,
             "note": "Daemon route POST /native/presets/:id/roles.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets/{id}/roles\","
           },
           "live": {
             "test_id": "control.contract.M-05",
@@ -428,7 +428,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1046,
             "note": "Daemon route POST /native/presets/:id/fallback.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets/{id}/fallback\","
           },
           "live": {
             "test_id": "control.contract.M-06",
@@ -566,7 +566,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1051,
             "note": "Daemon route POST /native/catalog/probe.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/catalog/probe\","
           },
           "live": {
             "test_id": "control.contract.M-08",
@@ -842,7 +842,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1000,
             "note": "Daemon route GET /native/config/provenance?limit=500.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/config/provenance\","
           },
           "live": {
             "test_id": "control.contract.M-12",
@@ -980,7 +980,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1283,
             "note": "Daemon route POST /native/session/:session/tournament.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/tournament\","
           },
           "live": {
             "test_id": "control.contract.M-14",
@@ -1887,7 +1887,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1064,
+            "line": 1063,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -3037,7 +3037,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-01",
@@ -3105,7 +3105,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-02",
@@ -3173,7 +3173,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-03",
@@ -3241,7 +3241,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-04",
@@ -3309,7 +3309,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-05",
@@ -3377,7 +3377,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-06",
@@ -3445,7 +3445,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-07",
@@ -3513,7 +3513,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route POST /native/presets.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-08",
@@ -3785,7 +3785,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1030,
             "note": "Daemon route GET /native/presets?limit=200.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/presets\","
           },
           "live": {
             "test_id": "control.contract.A-12",
@@ -4111,7 +4111,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1259,
             "note": "Daemon route POST /native/session/:session/attachments.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/attachments\","
           },
           "live": {
             "test_id": "control.contract.C-05",
@@ -4176,7 +4176,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1259,
             "note": "Daemon route POST /native/session/:session/attachments.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/attachments\","
           },
           "live": {
             "test_id": "control.contract.C-06",
@@ -4240,7 +4240,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1095,
             "note": "Daemon route POST /native/session/:session/context/pins.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/context/pins\","
           },
           "live": {
             "test_id": "control.contract.C-07",
@@ -4518,7 +4518,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1321,
+            "line": 1320,
             "note": "Daemon route GET /native/index/coverage?session=:session.",
             "line_text": "        .route(\"/native/index/coverage\", get(native_index_coverage))"
           },
@@ -4728,7 +4728,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1101,
+            "line": 1100,
             "note": "Daemon route GET /native/context/export?session=:session.",
             "line_text": "        .route(\"/native/context/export\", get(r8::native_context_export))"
           },
@@ -5532,7 +5532,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1104,
             "note": "Daemon route GET /native/session/:session/efficiency.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/efficiency\","
           },
           "live": {
             "test_id": "control.contract.K-12",
@@ -5600,7 +5600,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-01",
@@ -5667,7 +5667,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-02",
@@ -5734,7 +5734,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-03",
@@ -5801,7 +5801,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route GET /native/instructions/records?limit=200.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-04",
@@ -5868,7 +5868,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-05",
@@ -5935,7 +5935,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route GET /native/instructions/records?kind=template&limit=200.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-06",
@@ -6002,7 +6002,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1012,
             "note": "Daemon route GET /native/instructions/records/preview.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records/preview\","
           },
           "live": {
             "test_id": "control.contract.I-07",
@@ -6069,7 +6069,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1020,
             "note": "Daemon route POST /native/instructions/import.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/import\","
           },
           "live": {
             "test_id": "control.contract.I-08",
@@ -6203,7 +6203,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.I-10",
@@ -6270,7 +6270,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1024,
             "note": "Daemon route GET /native/instructions/bindings.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/bindings\","
           },
           "live": {
             "test_id": "control.contract.I-11",
@@ -7084,7 +7084,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1441,
             "note": "Daemon route POST /native/enterprise/effective-config.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/enterprise/effective-config\","
           },
           "live": {
             "test_id": "control.contract.Q-12",
@@ -7292,7 +7292,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 985,
+            "line": 984,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -7960,7 +7960,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 985,
+            "line": 984,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -8300,7 +8300,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 948,
+            "line": 947,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -8369,7 +8369,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 961,
             "note": "Daemon route POST /native/skills/:id/invocation.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/skills/{id}/invocation\","
           },
           "live": {
             "test_id": "control.contract.S-02",
@@ -8436,7 +8436,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 953,
             "note": "Daemon route GET /native/skills/:skill.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/skills/{id}\","
           },
           "live": {
             "test_id": "control.contract.S-03",
@@ -8503,7 +8503,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 949,
             "note": "Daemon route POST /native/skills/install.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/skills/install\","
           },
           "live": {
             "test_id": "control.contract.S-04",
@@ -8637,7 +8637,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1008,
             "note": "Daemon route POST /native/instructions/records.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/instructions/records\","
           },
           "live": {
             "test_id": "control.contract.S-06",
@@ -8704,7 +8704,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-07",
@@ -8768,7 +8768,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-08",
@@ -8832,7 +8832,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-09",
@@ -8899,7 +8899,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-10",
@@ -8966,7 +8966,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-11",
@@ -9033,7 +9033,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 969,
             "note": "Daemon route POST /native/hooks.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks\","
           },
           "live": {
             "test_id": "control.contract.S-12",
@@ -9100,7 +9100,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 981,
             "note": "Daemon route POST /native/hooks/:hook/test.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/hooks/{id}/test\","
           },
           "live": {
             "test_id": "control.contract.S-13",
@@ -9162,7 +9162,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 948,
+            "line": 947,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -9572,7 +9572,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1074,
             "note": "Daemon route POST /native/browser/sessions.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/browser/sessions\","
           },
           "live": {
             "test_id": "control.contract.X-06",
@@ -9643,7 +9643,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 990,
             "note": "Daemon route POST /native/browser/validate-url.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/browser/validate-url\","
           },
           "live": {
             "test_id": "control.contract.X-07",
@@ -9714,7 +9714,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1082,
             "note": "Daemon route POST /native/browser/sessions/:browser/screenshot.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/browser/sessions/{id}/screenshot\","
           },
           "live": {
             "test_id": "control.contract.X-08",
@@ -9785,7 +9785,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1078,
             "note": "Daemon route GET /native/browser/sessions/:browser/observations.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/browser/sessions/{id}/observations\","
           },
           "live": {
             "test_id": "control.contract.X-09",
@@ -10067,7 +10067,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1064,
+            "line": 1063,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -10331,7 +10331,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1215,
+            "line": 1214,
             "note": "Daemon route GET /native/session/:session/usage.",
             "line_text": "        .route(\"/native/session/{id}/usage\", get(native_session_usage))"
           },
@@ -10404,7 +10404,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1108,
             "note": "Daemon route PUT /native/session/:session/budget.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/budget\","
           },
           "live": {
             "test_id": "control.contract.B-05",
@@ -10617,7 +10617,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1104,
             "note": "Daemon route GET /native/session/:session/efficiency.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/efficiency\","
           },
           "live": {
             "test_id": "control.contract.B-08",
@@ -11037,7 +11037,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1138,
             "note": "Daemon route POST /native/session/:session/review/comments.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/review/comments\","
           },
           "live": {
             "test_id": "control.contract.V-02",
@@ -11108,7 +11108,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1152,
             "note": "Daemon route POST /native/session/:session/changes/accept.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/changes/accept\","
           },
           "live": {
             "test_id": "control.contract.V-03",
@@ -11243,7 +11243,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1133,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore/preview.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/checkpoints/{sequence}/restore/preview\","
           },
           "live": {
             "test_id": "control.contract.V-05",
@@ -11307,7 +11307,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1112,
             "note": "Daemon route POST /native/session/:session/fork.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/fork\","
           },
           "live": {
             "test_id": "control.contract.V-06",
@@ -11372,7 +11372,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1235,
             "note": "Daemon route POST /native/session/:session/task-runs.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/task-runs\","
           },
           "live": {
             "test_id": "control.contract.V-07",
@@ -11505,7 +11505,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1225,
+            "line": 1224,
             "note": "Daemon route GET /native/tasks/:task/proof?session=:session.",
             "line_text": "        .route(\"/native/tasks/{id}/proof\", get(native_task_proof))"
           },
@@ -11572,7 +11572,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1235,
             "note": "Daemon route POST /native/session/:session/task-runs.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/task-runs\","
           },
           "live": {
             "test_id": "control.contract.V-10",
@@ -11634,7 +11634,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1345,
+            "line": 1344,
             "note": "Daemon route GET /native/repositories.",
             "line_text": "        .route(\"/native/repositories\", get(native_repositories))"
           },
@@ -11707,7 +11707,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1129,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/checkpoints/{sequence}/restore\","
           },
           "live": {
             "test_id": "control.contract.V-12",
@@ -12107,7 +12107,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1198,
             "note": "Daemon route POST /native/session/:session/export.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/session/{id}/export\","
           },
           "live": {
             "test_id": "control.contract.D-06",
@@ -12847,7 +12847,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1064,
+            "line": 1063,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -12987,7 +12987,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1064,
+            "line": 1063,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -13057,7 +13057,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1367,
+            "line": 1366,
             "note": "Daemon route POST /native/updater/check.",
             "line_text": "        .route(\"/native/updater/check\", post(native_updater_check))"
           },
@@ -13197,7 +13197,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1331,
+            "line": 1330,
             "note": "Daemon route GET /native/identity.",
             "line_text": "        .route(\"/native/identity\", get(native_identity))"
           },
@@ -13269,7 +13269,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1441,
             "note": "Daemon route POST /native/enterprise/effective-config.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/enterprise/effective-config\","
           },
           "live": {
             "test_id": "control.contract.O-08",
@@ -13477,7 +13477,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1378,
+            "line": 1377,
             "note": "Daemon route GET /native/workers.",
             "line_text": "        .route(\"/native/workers\", get(native_workers_list))"
           },
@@ -13619,7 +13619,7 @@
             "file": "crates/server/src/api/lifecycle.rs",
             "line": 1315,
             "note": "Daemon route GET /native/semantic/capabilities.",
-            "line_text": "        .route("
+            "line_text": "            \"/native/semantic/capabilities\","
           },
           "live": {
             "test_id": "control.contract.O-13",

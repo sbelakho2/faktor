@@ -32,6 +32,7 @@ use faktor_session::SessionManager;
 use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
+mod approval;
 mod billing_debits;
 mod billing_report;
 mod bootstrap;
@@ -249,6 +250,14 @@ pub(crate) enum Command {
     Engineering {
         #[command(subcommand)]
         action: engineering::EngineeringAction,
+    },
+    /// Human-operator approval authority for consequential Engineering and
+    /// Supply actions: keygen, request, signed decide, list/status/audit.
+    /// Agents can request; only a registered human key can decide.
+    #[command(display_order = 87)]
+    Approval {
+        #[command(subcommand)]
+        action: approval::ApprovalAction,
     },
 }
 
@@ -619,6 +628,12 @@ pub(crate) async fn main() {
         Command::Engineering { action } => {
             if let Err(error) = engineering::command(action) {
                 eprintln!("engineering: {error}");
+                std::process::exit(1);
+            }
+        }
+        Command::Approval { action } => {
+            if let Err(error) = approval::command(action) {
+                eprintln!("approval: {error}");
                 std::process::exit(1);
             }
         }

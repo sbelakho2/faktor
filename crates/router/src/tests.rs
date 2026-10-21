@@ -2723,25 +2723,34 @@ fn telemetry_record_under_16_thread_contention() {
     let waits = telemetry.probe.waits.load(Ordering::Relaxed);
     let total_wait = telemetry.probe.total_wait_ns.load(Ordering::Relaxed);
     let max_wait = telemetry.probe.max_wait_ns.load(Ordering::Relaxed);
+    let total_hold = telemetry.probe.total_hold_ns.load(Ordering::Relaxed);
     let max_hold = telemetry.probe.max_hold_ns.load(Ordering::Relaxed);
     eprintln!(
         "router telemetry probe: {THREADS} threads x {PER_THREAD} records in {elapsed:?} \
          ({:.0} records/s); acquires={acquires} waits(>=1us)={waits} max_wait={}us \
-         total_wait={}us max_hold={}us",
+         total_wait={}us total_hold={}us max_hold={}us",
         (THREADS * PER_THREAD) as f64 / elapsed.as_secs_f64(),
         max_wait / 1_000,
         total_wait / 1_000,
+        total_hold / 1_000,
         max_hold / 1_000,
     );
     assert_eq!(acquires, (THREADS * PER_THREAD) as u64);
     assert!(telemetry.success_estimate("provider-0", "model-0", RouterPhase::Implement) > 0.0);
     // No compute or I/O may run inside the map lock: the two EWMA updates
-    // are arithmetic on the entry only. (Scheduler preemption can inflate a
-    // single hold; only a structural regression would approach milliseconds
-    // on average.)
+    // are arithmetic on the entry only. A single observation is not a
+    // reliable signal — the scheduler can preempt a thread while it holds
+    // the lock, which is outside the critical-section code — so the gate is
+    // the AVERAGE hold over every acquisition. An accidental compute/IO
+    // inside the lock raises every hold and cannot hide in the average; a
+    // one-off preemption contributes at most a few microseconds per
+    // acquisition. `max_hold` stays in the probe line for diagnosis.
+    let average_hold = total_hold / acquires.max(1);
     assert!(
-        max_hold < 5_000_000,
-        "telemetry map lock was held {}us — the critical section grew",
+        average_hold < 500_000,
+        "telemetry map lock averaged {}ns across {acquires} acquisitions \
+         (max {}us) — the critical section grew",
+        average_hold,
         max_hold / 1_000
     );
 }

@@ -19,6 +19,10 @@ pub const MAX_NODES: usize = 2_000_000;
 pub const MAX_EDGES: usize = 8_000_000;
 pub const MAX_FILES: usize = 200_000;
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Scanned source files plus every topology manifest that decided the graph
+/// topology. Bounded independently so a corrupt document cannot claim an
+/// unbounded inventory.
+pub const MAX_INPUTS: usize = MAX_FILES + 65_536;
 
 /// Revision identity. A graph without a commit is explicitly unbound (for
 /// synthetic fixtures); CI refuses an unbound graph at selection time.
@@ -225,6 +229,17 @@ pub enum Provenance {
     Derived,
 }
 
+/// One canonical path the graph's content was derived from, with the BLAKE3
+/// digest of exactly the bytes that were read. The inventory is the
+/// authority's answer to "what can make this graph stale"; consumers never
+/// re-derive it from a manifest walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialInput {
+    pub path: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphFile {
@@ -291,6 +306,12 @@ pub struct Graph {
     /// may use either view, but both are produced by the same authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reverse_edges: Vec<GraphEdge>,
+    /// Canonical inventory of every content input (scanned sources and
+    /// topology manifests) with its BLAKE3 digest, sorted by path. Absent on
+    /// legacy documents: consumers must then fall back to the conservative
+    /// supported-extension rule instead of assuming a changed path is inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_inputs: Vec<MaterialInput>,
     pub stats: GraphStats,
     /// Blake3 over the canonical document with `digest` empty.
     pub digest: String,
@@ -373,6 +394,11 @@ pub fn validate_rel_path(raw: &str) -> Result<String, GraphError> {
         }
     }
     Ok(trimmed.to_string())
+}
+
+fn is_blake3_digest(raw: &str) -> bool {
+    raw.strip_prefix("blake3:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 pub fn validate_symbol(raw: &str) -> Result<(), GraphError> {
@@ -488,6 +514,53 @@ impl Graph {
                 return Err(GraphError::ReverseMismatch(format!(
                     "{from} -> {to} ({kind:?})"
                 )));
+            }
+        }
+        if self.material_inputs.len() > MAX_INPUTS {
+            return Err(GraphError::Oversized {
+                what: "material inputs",
+                max: MAX_INPUTS,
+                actual: self.material_inputs.len(),
+            });
+        }
+        let mut last_input: Option<&str> = None;
+        for input in &self.material_inputs {
+            if validate_rel_path(&input.path)? != input.path {
+                return Err(GraphError::Malformed(format!(
+                    "material input path is not canonical: {:?}",
+                    input.path
+                )));
+            }
+            if last_input.is_some_and(|previous| previous >= input.path.as_str()) {
+                return Err(GraphError::Unsorted(format!(
+                    "material input {}",
+                    input.path
+                )));
+            }
+            last_input = Some(&input.path);
+            if !is_blake3_digest(&input.digest) {
+                return Err(GraphError::Malformed(format!(
+                    "material input {} has an invalid digest: {:?}",
+                    input.path, input.digest
+                )));
+            }
+        }
+        if !self.material_inputs.is_empty() {
+            // A published inventory must describe the graph's own files
+            // exactly; otherwise a document could claim one input set while
+            // its nodes/edges were derived from another.
+            let inventory: std::collections::BTreeMap<&str, &str> = self
+                .material_inputs
+                .iter()
+                .map(|input| (input.path.as_str(), input.digest.as_str()))
+                .collect();
+            for file in &self.files {
+                if inventory.get(file.path.as_str()).copied() != Some(file.hash.as_str()) {
+                    return Err(GraphError::Malformed(format!(
+                        "material input inventory does not publish graph file {} (digest {})",
+                        file.path, file.hash
+                    )));
+                }
             }
         }
         Ok(())

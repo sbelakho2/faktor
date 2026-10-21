@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-21T15:19:53.660Z",
-  "commit": "060b8c8de3aea5b9597b85e74fb18259b3d4c23d",
-  "tree": "6a1cc508e17e63f3664e6ade585621a136b6b297",
+  "generated_at": "2026-10-21T20:53:40.553Z",
+  "commit": "cdd01d358672849edbb2d6c277b4f8c29f526525",
+  "tree": "bc86d43a2ed1562da7b770f14034eab1ca412b38",
   "layers": [
     "structural",
     "unit",
@@ -19,13 +19,13 @@
     "release"
   ],
   "counts": {
-    "rows": 941,
+    "rows": 942,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
       "builtin-tool": 7,
-      "cli-command": 46,
+      "cli-command": 47,
       "config-key": 53,
       "control": 200,
       "invariant": 158,
@@ -39,18 +39,18 @@
     },
     "by_status": {
       "deferred": 558,
-      "proven": 322,
+      "proven": 323,
       "stub": 61
     },
     "by_lane": {
       "nightly": 512,
-      "pull": 610,
-      "trusted": 940,
+      "pull": 611,
+      "trusted": 941,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 397,
+      "contracts": 398,
       "ide-screen-readers": 385,
       "state-model-crash": 249,
       "unit-property": 234
@@ -1806,6 +1806,43 @@
       }
     },
     {
+      "id": "cli.approval",
+      "kind": "cli-command",
+      "path": "crates/cli/src/main.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cli.exit-codes.approval",
+        "cli.help.approval"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
+      "status": "proven",
+      "meta": {
+        "command": "approval"
+      },
+      "adversarial": [
+        "help",
+        "unknown-flag",
+        "missing-daemon",
+        "redaction",
+        "idempotence"
+      ],
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "approval",
+          "help_bytes": 796,
+          "unknown_flag_exit": 2
+        }
+      }
+    },
+    {
       "id": "cli.bootstrap",
       "kind": "cli-command",
       "path": "crates/cli/src/main.rs",
@@ -2984,7 +3021,7 @@
         "passed": true,
         "observed": {
           "command": "supply",
-          "help_bytes": 1565,
+          "help_bytes": 1707,
           "unknown_flag_exit": 2
         }
       }
@@ -25018,7 +25055,7 @@
           "hostile": {
             "case": "unicode-boundaries",
             "status": 200,
-            "bytes": 9976
+            "bytes": 206567
           }
         }
       }
@@ -26969,7 +27006,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/f9ba4bba791b3f9840761b070bab8cb9"
+              "handle": "vault://provider_key/9c4cb0234ff93be8092cc2c7a48bc5b6"
             }
           },
           {

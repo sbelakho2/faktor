@@ -83,9 +83,14 @@ exists) and load-bearing (the rules would flag it without the exemption).
 
 The same crate also enforces the absolute no-Python tooling constraint:
 `repository_has_zero_python_sources_or_invocations` fails on any committed
-`.py` file and on any `python`/`python3` token in `scripts/`, `.woodpecker/`,
-`docker/` or `deny.toml`. `no_python_scan_fires_on_planted_sources_and_invocations`
-proves the scan is load-bearing. Repository tooling that used to be Python
+`.py` file anywhere in the repository and on any `python`/`python3` token in
+`scripts/`, `.woodpecker/`, `docker/` or `deny.toml`.
+`no_python_scan_fires_on_planted_sources_and_invocations` proves the scan is
+load-bearing for both a tooling `.py` source and a non-tooling `.py` fixture.
+Product-language test inputs that happen to contain Python are committed as
+`.py.fixture` (for example `crates/verify/tests/fixtures/rebind/`) and the
+consumer supplies the logical `*.py` path explicitly to the adapter; the file
+itself is never a runnable source. Repository tooling that used to be Python
 is implemented by the Rust `faktor-ci-tools` binary; product support for
 user Python projects in `crates/verify` is not a repository-tooling
 invocation and stays out of scope.
@@ -116,6 +121,13 @@ that cannot meet that bar does not belong in the repository.
   mock server. The repository now has zero Python sources or runtime
   invocations; test servers are compiled Rust fixtures
   (`crates/test-mocks`), and scan 13 keeps bytecode out.
+- `crates/verify/tests/fixtures/rebind/test_cart.py`,
+  `test_totals.py`, `test_weakened.py`: proof-rebind test inputs that were
+  committed as runnable Python sources. Renamed to the identical content
+  under `*.py.fixture`; every consumer passes the logical `tests/test_cart.py`
+  path to the language adapter, so rebind coverage is unchanged and the
+  repository-wide `.py` scan has no exemption. The retired paths are pinned
+  in `HYGIENE_RETIRED_PATHS` and must not reappear.
 - root `mu_test` (465576 B Mach-O 64-bit arm64 executable, sha256
   `27f1470a9de168d23c8a407dc3738b90d857c35082a52fe7b906dac00cb08e12`):
   added 2026-09-04 by commit 9d4824a ("Wave 4: CI overhaul, ...") with zero

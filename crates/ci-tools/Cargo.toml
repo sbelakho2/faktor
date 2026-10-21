@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 faktor-impact.workspace = true
 base64 = "0.22"
+blake3.workspace = true
 chrono = { workspace = true }
 hmac = "0.12"
 serde.workspace = true

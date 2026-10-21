@@ -112,6 +112,15 @@ Ed25519 attestation over the canonical digest. Model choice is owned by the
 central applicability selector, and gates 3/4 recompute its result; see
 `docs/engineering-receipt-attestation.md` for key location, rotation and
 verification instructions.
+
+`faktor supply decision` uses the daemon-persistent data-dir signing key
+(`--data-dir`, default `~/.faktor`), the same key and key history as
+`faktor engineering analyse`/`verify`; see
+`docs/engineering-receipt-attestation.md` for the key store, validity windows
+and retired-key audit rules. The library's `run_ephemeral` is an explicit
+test/embedded mode whose self-consistent receipts are refused by the normal
+trusted verifier.
+
 Rust numerical kernels for units/dimensional analysis and deterministic
 math; real solvers through supervised adapters (KiCad CLI, ngspice, Gmsh,
 OpenFOAM, FMI; commercial via the same contract). No Python.

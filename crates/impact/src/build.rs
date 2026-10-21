@@ -16,8 +16,8 @@ use faktor_core::id::WorkspaceId;
 use crate::manifest::{self, TopologyOptions, Workspace};
 use crate::model::{
     crate_id, file_id, module_id, package_id, sort_graph, EdgeKind, Graph, GraphEdge, GraphError,
-    GraphFile, GraphNode, GraphStats, Language, NodeKind, Provenance, Revision, GRAPH_SCHEMA,
-    MAX_EDGES, MAX_FILES, MAX_FILE_BYTES, MAX_NODES, MAX_PATH_BYTES,
+    GraphFile, GraphNode, GraphStats, Language, MaterialInput, NodeKind, Provenance, Revision,
+    GRAPH_SCHEMA, MAX_EDGES, MAX_FILES, MAX_FILE_BYTES, MAX_NODES, MAX_PATH_BYTES,
 };
 use crate::parse::{parse_file, ImportRef, NameRef, OwnerKind, ParsedFile, SymbolDef};
 use crate::topology::UnitKind;
@@ -29,6 +29,7 @@ pub const MAX_WALK_DEPTH: usize = 48;
 const TOPOLOGY_MANIFESTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
     "package.json",
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -87,6 +88,10 @@ pub struct BuildReport {
     /// `degraded` flag on an outcome is the typed fallback marker requested
     /// by the topology contract.
     pub adapter_outcomes: Vec<crate::topology::AdapterOutcome>,
+    /// The exact content inputs the assembled graph was derived from
+    /// (scanned sources plus topology manifests), published in the graph as
+    /// `material_inputs` and exposed here for local diagnostics.
+    pub material_inputs: Vec<MaterialInput>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -281,6 +286,7 @@ impl GraphBuilder {
             self.parse_path(&relative)?;
         }
         self.manifest_meta = self.capture_manifests();
+        self.report.material_inputs = self.material_inputs();
         if let Some(generation) = material_generation {
             self.revision = material_revision(self.files.values(), generation);
         }
@@ -310,6 +316,7 @@ impl GraphBuilder {
         self.report.bytes = 0;
         self.report.truncated = false;
         self.report.skipped.clear();
+        self.report.material_inputs.clear();
         self.report.degraded = self.workspace.degraded;
         self.report.degraded_reason = self.workspace.degraded_reason.clone();
         self.report.adapters = self
@@ -475,6 +482,36 @@ impl GraphBuilder {
             }
         }
         stamps
+    }
+
+    /// The graph's actual material input set: every scanned source file
+    /// (already content-addressed in `files`) plus every topology manifest
+    /// the unit graph was discovered from. Manifests are hashed here rather
+    /// than parsed again; an unreadable/oversized manifest is omitted and is
+    /// still caught by the validator's conservative manifest-name rule.
+    fn material_inputs(&self) -> Vec<MaterialInput> {
+        let mut inputs: BTreeMap<String, String> = self
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.hash.clone()))
+            .collect();
+        for path in self.manifest_paths() {
+            let absolute = self.root.join(&path);
+            let Ok(meta) = fs::symlink_metadata(&absolute) else {
+                continue;
+            };
+            if !meta.file_type().is_file() || meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&absolute) else {
+                continue;
+            };
+            inputs.insert(path, format!("blake3:{}", blake3::hash(&bytes).to_hex()));
+        }
+        inputs
+            .into_iter()
+            .map(|(path, digest)| MaterialInput { path, digest })
+            .collect()
     }
 
     /// Whole-workspace reconciliation: walk the same bounded candidate set
@@ -712,6 +749,7 @@ impl GraphBuilder {
                 reparsed += 1;
             }
         }
+        self.report.material_inputs = self.material_inputs();
         if let Some(generation) = material_generation {
             self.revision = material_revision(self.files.values(), generation);
         }
@@ -1244,6 +1282,7 @@ impl GraphBuilder {
             nodes,
             edges,
             reverse_edges: reverse,
+            material_inputs: self.material_inputs(),
             stats,
             digest: String::new(),
         };

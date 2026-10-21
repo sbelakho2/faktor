@@ -1,0 +1,528 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "analog-stability",
+  "version": "1.0.0",
+  "title": "Op-amp loop gain, phase margin and capacitive-load compensation",
+  "domain": "analog",
+  "provenance": {
+    "kind": "reference",
+    "citation": "Sedra and Smith, Microelectronic Circuits, 8th edition; Texas Instruments Op Amps for Everyone",
+    "edition": "8th",
+    "locator": "feedback stability, loop gain and compensation",
+    "note": "Model structure only; device poles, gain and capacitance must come from revision-bound datasheet or measurement."
+  },
+  "terminology": [
+    {
+      "id": "term-loop-gain",
+      "term": "loop gain",
+      "definition": "The product of the open-loop amplifier response and the feedback factor, evaluated around the closed loop.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "feedback stability",
+        "note": null
+      }
+    },
+    {
+      "id": "term-phase-margin",
+      "term": "phase margin",
+      "definition": "180 degrees plus the loop-gain phase at the unity-gain crossover frequency.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability criteria",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-opamp-loop-stability",
+      "name": "Linear op-amp loop gain with device, output-load and feedback-network poles",
+      "equation_ids": [
+        "eq-loop-gain",
+        "eq-output-pole",
+        "eq-feedback-network",
+        "eq-phase-margin"
+      ],
+      "assumption_ids": [
+        "asm-linear-loop",
+        "asm-capacitive-load",
+        "asm-gain-compensation"
+      ],
+      "validity_domain_ids": [
+        "val-linear-small-signal",
+        "val-declared-poles"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits; Texas Instruments Op Amps for Everyone",
+        "edition": "8th",
+        "locator": "loop-gain model",
+        "note": "Two device poles, one output pole and one feedback-network pole are explicit; higher-order poles are outside the model."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-loop-gain",
+      "expression": "T(s) = A0/((1+s/w_p1)(1+s/w_p2)(1+s/w_out)) * beta0 (1+s/w_z)/((1+s/w_in)(1+s/w_fb))",
+      "dimensional_signature": "dimensionless",
+      "variables": [
+        {
+          "symbol": "T",
+          "description": "loop gain",
+          "dimension": "1"
+        },
+        {
+          "symbol": "A0",
+          "description": "DC open-loop gain",
+          "dimension": "1"
+        },
+        {
+          "symbol": "beta0",
+          "description": "DC feedback factor, the inverse noise gain",
+          "dimension": "1"
+        },
+        {
+          "symbol": "w_p1",
+          "description": "first device pole",
+          "dimension": "T^-1"
+        },
+        {
+          "symbol": "w_p2",
+          "description": "second device pole",
+          "dimension": "T^-1"
+        },
+        {
+          "symbol": "w_out",
+          "description": "output pole from output resistance and total load capacitance",
+          "dimension": "T^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "loop gain",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-output-pole",
+      "expression": "f_out = 1/(2 pi R_out (C_load + C_out))",
+      "dimensional_signature": "frequency",
+      "variables": [
+        {
+          "symbol": "f_out",
+          "description": "output pole frequency",
+          "dimension": "T^-1"
+        },
+        {
+          "symbol": "R_out",
+          "description": "op-amp output resistance",
+          "dimension": "M L^2 T^-3 I^-2"
+        },
+        {
+          "symbol": "C_load",
+          "description": "load capacitance",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        },
+        {
+          "symbol": "C_out",
+          "description": "device output capacitance",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "capacitive-load stability",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-feedback-network",
+      "expression": "f_in = 1/(2 pi (R_f || R_g) C_in); f_z = 1/(2 pi R_f C_f); f_fb = 1/(2 pi (R_f || R_g) C_f)",
+      "dimensional_signature": "frequency",
+      "variables": [
+        {
+          "symbol": "R_f",
+          "description": "feedback resistance",
+          "dimension": "M L^2 T^-3 I^-2"
+        },
+        {
+          "symbol": "R_g",
+          "description": "gain-setting resistance",
+          "dimension": "M L^2 T^-3 I^-2"
+        },
+        {
+          "symbol": "C_in",
+          "description": "input capacitance at the inverting node",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        },
+        {
+          "symbol": "C_f",
+          "description": "feedback capacitor",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "feedback-network transfer",
+        "note": "The input and feedback capacitances are lumped at the inverting node."
+      }
+    },
+    {
+      "id": "eq-phase-margin",
+      "expression": "PM = 180 deg + arg T(j 2 pi f_c) where |T(j 2 pi f_c)| = 1",
+      "dimensional_signature": "angle",
+      "variables": [
+        {
+          "symbol": "PM",
+          "description": "phase margin",
+          "dimension": "1"
+        },
+        {
+          "symbol": "f_c",
+          "description": "unity-gain crossover frequency",
+          "dimension": "T^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability criteria",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-linear-loop",
+      "statement": "The loop is linear and time-invariant with the declared poles and no unmodeled higher-order device poles.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "small-signal analysis",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-capacitive-load",
+      "statement": "The load is a capacitance in parallel with the feedback network and the output pole is 1/(2 pi R_out (C_load + C_out)).",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "capacitive load",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-gain-compensation",
+      "statement": "Increasing the noise gain (reducing the feedback factor) lowers the crossover and can restore phase margin without changing the device; a load reduction is an alternative when the required capacitance is achievable.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "compensation",
+        "note": null
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-linear-small-signal",
+      "statement": "Small-signal operation without slew limiting, output saturation, thermal drift or device variation outside the supplied data.",
+      "temperature": null,
+      "exclusions": [
+        "large-signal slew-rate limiting",
+        "output saturation",
+        "unmodeled higher-order poles or zeros"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "small-signal validity",
+        "note": null
+      }
+    },
+    {
+      "id": "val-declared-poles",
+      "statement": "Pole ordering, output resistance and capacitances are revision-bound inputs; the second pole must be above the first pole.",
+      "temperature": null,
+      "exclusions": [
+        "unordered poles",
+        "missing output or input capacitance",
+        "device data outside its stated temperature range"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Manufacturer op-amp datasheet and loop measurement",
+        "edition": null,
+        "locator": "open-loop gain and phase",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-opamp-loop",
+      "property": "open-loop gain, first and second poles, output resistance",
+      "authority": "Revision-bound manufacturer datasheet or measured open-loop response",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "Manufacturer op-amp datasheet",
+        "edition": null,
+        "locator": "open-loop gain and phase",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-load-cap",
+      "property": "load capacitance including cable and PCB parasitics",
+      "authority": "Revision-bound load and layout model",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "System load model",
+        "edition": null,
+        "locator": "capacitive load",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-feedback-network",
+      "property": "feedback resistance, gain-setting resistance and feedback/input capacitance",
+      "authority": "Revision-bound schematic and PCB parasitics",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "reference",
+        "citation": "Schematic and layout",
+        "edition": null,
+        "locator": "feedback network",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-phase-margin",
+      "rule": "A stable design must meet the declared phase margin and gain margin at the worst-case load and temperature, not only the nominal closed-loop gain.",
+      "check": "phase margin >= acceptance and gain margin >= acceptance",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability criteria",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-compensation",
+      "rule": "If the margin fails, compute a compensation that the model supports and re-evaluate the loop; do not declare stability from a nominal gain.",
+      "check": "compensation raises the modeled margin above acceptance",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "compensation",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-parasitics",
+      "rule": "Control PCB parasitics at the inverting node and the output load because they move the poles that determine stability.",
+      "check": "layout extraction or measurement of critical parasitics",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Analog layout practice",
+        "edition": null,
+        "locator": "parasitic control",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-ringing",
+      "mode": "ringing, overshoot or sustained oscillation",
+      "cause": "insufficient phase margin from output/input capacitance or unmodeled poles",
+      "detection": "loop-gain injection and step-response measurement at worst-case load",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability symptoms",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-peaking",
+      "signature": "closed-loop frequency response peaking and load-dependent overshoot",
+      "indicates": "reduced phase margin or a load-dependent output pole",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Sedra and Smith, Microelectronic Circuits",
+        "edition": "8th",
+        "locator": "frequency response",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-loop-injection",
+      "method": "Break the loop with a injection transformer and measure gain/phase versus frequency at the worst-case load and temperature",
+      "measures": "loop gain, crossover, phase margin and gain margin",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Analog stability measurement practice",
+        "edition": null,
+        "locator": "loop-gain injection",
+        "note": null
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-ti-opamps",
+      "standard": "TI SLOA011 (Op Amps for Everyone)",
+      "scope": "op-amp stability and compensation practice",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only; text is not embedded."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-opamp-capacitive-load",
+      "description": "A 100 dB, 10 Hz first-pole op-amp with a 1 MHz second pole, 100 ohm output resistance, 1 uF load, 1 nF input capacitance and noise gain 10 has negative phase margin.",
+      "inputs": [
+        {
+          "name": "open_loop_gain",
+          "value": 100000.0,
+          "unit": "1",
+          "note": null
+        },
+        {
+          "name": "first_pole",
+          "value": 10.0,
+          "unit": "Hz",
+          "note": null
+        },
+        {
+          "name": "second_pole",
+          "value": 1000000.0,
+          "unit": "Hz",
+          "note": null
+        },
+        {
+          "name": "output_resistance",
+          "value": 100.0,
+          "unit": "ohm",
+          "note": null
+        },
+        {
+          "name": "load_capacitance",
+          "value": 0.000001,
+          "unit": "F",
+          "note": null
+        },
+        {
+          "name": "input_capacitance",
+          "value": 0.000000001,
+          "unit": "F",
+          "note": null
+        },
+        {
+          "name": "feedback_resistance",
+          "value": 10000.0,
+          "unit": "ohm",
+          "note": null
+        },
+        {
+          "name": "noise_gain",
+          "value": 10.0,
+          "unit": "1",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "crossover_frequency",
+          "value": 11496.327490255699,
+          "unit": "Hz",
+          "tolerance": 1.0,
+          "note": "numerical crossover of the declared loop"
+        },
+        {
+          "name": "phase_margin",
+          "value": -25.754959465310066,
+          "unit": "deg",
+          "tolerance": 0.01,
+          "note": "negative margin: unstable under the small-signal model"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form loop-gain evaluation of the declared fixture",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Inputs are synthetic fixture values, not a device datasheet."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-nominal-gain",
+      "claim": "A closed-loop gain of 10 proves stability.",
+      "refutation": "Gain is a DC algebra ratio. The loop can still have negative phase margin when the output and input capacitances add poles; the model produces a negative margin for a nominal gain of 10.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability criteria",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-nominal-gain-stability",
+      "trap": "Concluding stability from the nominal closed-loop gain without the load, input capacitance and loop phase.",
+      "why_shallow_fails": "The arithmetic for gain is correct but the stability question is about loop phase at crossover, which capacitive load and input capacitance change.",
+      "guard": "Require loop data and compute phase/gain margin; refuse or report unavailable when the capacitances are missing.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Texas Instruments Op Amps for Everyone",
+        "edition": null,
+        "locator": "stability criteria",
+        "note": null
+      }
+    }
+  ]
+}

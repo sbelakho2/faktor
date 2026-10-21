@@ -1,4 +1,5 @@
 use engineering_units::{Dimension, Interval, Uncertainty};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::attestation::ReceiptVerifier;
@@ -58,7 +59,9 @@ fn push_selection_research(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GateId {
     Formulation,
@@ -116,7 +119,7 @@ impl GateId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateGap {
     pub reason: String,
     pub missing: Vec<String>,
@@ -135,14 +138,14 @@ impl GateGap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchRequest {
     pub gate: GateId,
     pub reason: String,
     pub sources_required: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateState<T> {
     Established(T),
@@ -152,7 +155,7 @@ pub enum GateState<T> {
     ResearchRequired(ResearchRequest),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gate<T> {
     pub state: GateState<T>,
 }
@@ -192,14 +195,14 @@ impl<T> Gate<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssumptionRecord {
     pub id: String,
     pub statement: String,
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Formulation {
     pub objective: String,
     pub scope: String,
@@ -209,7 +212,7 @@ pub struct Formulation {
     pub unknowns: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorityRef {
     pub pack_id: String,
     pub version: String,
@@ -217,12 +220,12 @@ pub struct AuthorityRef {
     pub scope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeAuthority {
     pub packs: Vec<AuthorityRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelSelection {
     pub model_id: String,
     pub version: String,
@@ -230,7 +233,7 @@ pub struct ModelSelection {
     pub rationale: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TheorySelection {
     pub models: Vec<ModelSelection>,
     pub alternatives_considered: Vec<String>,
@@ -241,7 +244,7 @@ pub struct TheorySelection {
     pub selection: Option<ApplicabilitySelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidityEnvelope {
     pub model_id: String,
     pub temperature: Option<Interval>,
@@ -249,14 +252,14 @@ pub struct ValidityEnvelope {
     pub exclusions: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidityEnvelopes {
     pub envelopes: Vec<ValidityEnvelope>,
 }
 
 /// One machine-checked dimensional equation. `passed` is always recomputed
 /// from `lhs == rhs` during validation; a caller cannot assert it by prose.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DimensionCheck {
     expression: String,
     lhs: Dimension,
@@ -301,17 +304,17 @@ impl DimensionCheck {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DimensionChecks {
     pub checks: Vec<DimensionCheck>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutedAnalysis {
     pub receipts: Vec<AnalysisReceipt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Agreement {
     pub metric: String,
     pub value: f64,
@@ -319,7 +322,7 @@ pub struct Agreement {
     pub agrees: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CrossCheck {
     pub method: String,
     /// The primary method this check is independent of (solver id).
@@ -328,14 +331,14 @@ pub struct CrossCheck {
     pub agreement: Agreement,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UncertaintyContribution {
     pub source: String,
     pub uncertainty: Uncertainty,
     pub note: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UncertaintyStatement {
     pub method: String,
     pub contributions: Vec<UncertaintyContribution>,
@@ -343,7 +346,7 @@ pub struct UncertaintyStatement {
     pub summary: Option<Interval>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeOutcome {
     NoFailureFound,
@@ -351,7 +354,7 @@ pub enum ProbeOutcome {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CounterexampleProbe {
     pub probe: String,
     pub regime: String,
@@ -359,12 +362,12 @@ pub struct CounterexampleProbe {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CounterexampleSearch {
     pub probes: Vec<CounterexampleProbe>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RealizationCategory {
     Manufacturing,
@@ -374,7 +377,7 @@ pub enum RealizationCategory {
     Test,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RealizationConsequence {
     pub category: RealizationCategory,
     pub statement: String,
@@ -382,12 +385,12 @@ pub struct RealizationConsequence {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RealizationConsequences {
     pub consequences: Vec<RealizationConsequence>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FalsifiableTest {
     pub claim: String,
     pub procedure: String,
@@ -397,12 +400,12 @@ pub struct FalsifiableTest {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FalsifiableVerification {
     pub tests: Vec<FalsifiableTest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineeringResponse {
     pub formulation: Gate<Formulation>,
     pub authority: Gate<KnowledgeAuthority>,
@@ -417,13 +420,13 @@ pub struct EngineeringResponse {
     pub verification: Gate<FalsifiableVerification>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateViolation {
     pub gate: GateId,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResponseAssessment {
     pub established_gates: usize,
     pub violations: Vec<GateViolation>,
@@ -431,7 +434,11 @@ pub struct ResponseAssessment {
 }
 
 impl ResponseAssessment {
-    pub fn is_ready(&self) -> bool {
+    /// True when every gate is established with no violation or research gap.
+    /// This is a statement about the assessment, not about signer authority;
+    /// callers that need authority must verify receipts against a trusted key
+    /// set first.
+    pub fn is_self_consistent(&self) -> bool {
         self.established_gates == GateId::ALL.len()
             && self.violations.is_empty()
             && self.research_required.is_empty()
@@ -454,11 +461,16 @@ impl ResponseAssessment {
 }
 
 impl EngineeringResponse {
-    /// Validate the 11-gate contract. Gates 5 and 6 are only established when
-    /// they carry machine-checked dimensional equations and executed analysis
-    /// receipts with consistent digests/evidence. An unavailable theory or
-    /// validity envelope produces a typed research request, never a pass.
-    pub fn assess(&self) -> ResponseAssessment {
+    /// Validate the 11-gate contract against each receipt's OWN enclosed key.
+    /// Gates 5 and 6 are only established when they carry machine-checked
+    /// dimensional equations and executed analysis receipts with consistent
+    /// digests/evidence. An unavailable theory or validity envelope produces a
+    /// typed research request, never a pass.
+    ///
+    /// This establishes integrity only. It never proves that the signing key
+    /// belongs to this daemon. Authority paths must use [`Self::is_verified`]
+    /// or [`Self::require_ready`] with an explicit trusted verifier.
+    pub fn assess_integrity_only(&self) -> ResponseAssessment {
         self.assess_with_verifier(&ReceiptVerifier::self_attested())
     }
 
@@ -483,41 +495,67 @@ impl EngineeringResponse {
         out
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.assess().is_ready()
+    /// Integrity-only self-consistency: every gate passes under the receipt's
+    /// own key. A self-signed/attacker receipt can satisfy this; it is not an
+    /// authority decision.
+    pub fn is_self_consistent(&self) -> bool {
+        self.assess_integrity_only().is_self_consistent()
     }
 
-    pub fn is_ready_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
-        self.assess_with_verifier(verifier).is_ready()
+    /// Authority check: every receipt must verify under `verifier`'s trusted
+    /// key set. There is intentionally no verifier-less overload.
+    pub fn is_verified(&self, verifier: &ReceiptVerifier) -> bool {
+        self.assess_with_verifier(verifier).is_self_consistent()
     }
 
-    pub fn require_ready(&self) -> Result<(), ResponseAssessment> {
-        self.require_ready_with_verifier(&ReceiptVerifier::self_attested())
+    /// Explicit-verifier alias of [`Self::is_verified`].
+    pub fn is_verified_with_verifier(&self, verifier: &ReceiptVerifier) -> bool {
+        self.is_verified(verifier)
     }
 
-    pub fn require_ready_with_verifier(
-        &self,
-        verifier: &ReceiptVerifier,
-    ) -> Result<(), ResponseAssessment> {
-        let assessment = self.assess_with_verifier(verifier);
-        if assessment.is_ready() {
+    /// Integrity-only refusal: all gates must pass under the receipt's own
+    /// key. This never establishes signer authority.
+    pub fn require_self_consistent(&self) -> Result<(), ResponseAssessment> {
+        let assessment = self.assess_integrity_only();
+        if assessment.is_self_consistent() {
             Ok(())
         } else {
             Err(assessment)
         }
     }
 
-    /// Alias for [`Self::require_ready`], matching the conventional
-    /// "validate this contract" call shape.
-    pub fn validate(&self) -> Result<(), ResponseAssessment> {
-        self.require_ready()
+    /// Authority refusal: all gates must pass AND every receipt must verify
+    /// under `verifier`'s trusted key set.
+    pub fn require_ready(&self, verifier: &ReceiptVerifier) -> Result<(), ResponseAssessment> {
+        let assessment = self.assess_with_verifier(verifier);
+        if assessment.is_self_consistent() {
+            Ok(())
+        } else {
+            Err(assessment)
+        }
     }
 
+    /// Explicit-verifier alias of [`Self::require_ready`].
+    pub fn require_ready_with_verifier(
+        &self,
+        verifier: &ReceiptVerifier,
+    ) -> Result<(), ResponseAssessment> {
+        self.require_ready(verifier)
+    }
+
+    /// Integrity-only alias for the conventional "validate this contract"
+    /// call shape. It does not establish signer authority.
+    pub fn validate_self_consistent(&self) -> Result<(), ResponseAssessment> {
+        self.require_self_consistent()
+    }
+
+    /// Explicit-verifier alias for the conventional "validate this contract"
+    /// call shape.
     pub fn validate_with_verifier(
         &self,
         verifier: &ReceiptVerifier,
     ) -> Result<(), ResponseAssessment> {
-        self.require_ready_with_verifier(verifier)
+        self.require_ready(verifier)
     }
 
     fn assess_formulation(&self, out: &mut ResponseAssessment) {
@@ -1238,8 +1276,8 @@ mod tests {
             realization: Gate::unavailable("none", vec![]),
             verification: Gate::unavailable("none", vec![]),
         };
-        let assessment = response.assess();
-        assert!(!assessment.is_ready());
+        let assessment = response.assess_integrity_only();
+        assert!(!assessment.is_self_consistent());
         assert_eq!(assessment.research_required.len(), 2);
         assert!(!assessment.violations.is_empty());
     }

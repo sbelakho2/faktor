@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::basis::{validate_text, EvidenceRef, Revision, MAX_ID_BYTES, MAX_TEXT_BYTES};
@@ -30,7 +31,7 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 macro_rules! node_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(
+        #[derive(JsonSchema,
             Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
             Serialize, Deserialize, Default,
         )]
@@ -99,7 +100,7 @@ node_id!(
 
 /// The role a supplier plays. These are never merged: a broker is not an
 /// authorized distributor and a marketplace listing is not a manufacturer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupplierRole {
     /// The party that manufactures the part.
@@ -149,7 +150,7 @@ impl SupplierRole {
 }
 
 /// Explicit authorization status. `Unknown` is not "authorized".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorizationStatus {
     /// Authorization is evidenced.
@@ -162,7 +163,7 @@ pub enum AuthorizationStatus {
 
 /// Incoterms 2020 vocabulary. Operational semantics (who pays which leg and
 /// where risk transfers) live in `faktor-supply-logistics`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Incoterm {
     /// Ex Works.
@@ -214,7 +215,9 @@ impl Incoterm {
 }
 
 /// Transportation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportMode {
     /// Air freight.
@@ -232,7 +235,7 @@ pub enum TransportMode {
 }
 
 /// Part lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleStatus {
     /// Actively produced.
@@ -255,7 +258,7 @@ impl LifecycleStatus {
 }
 
 /// Process class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessKind {
     /// Machining (milling, turning, grinding).
@@ -281,7 +284,7 @@ pub enum ProcessKind {
 }
 
 /// Qualification vocabulary attached to a graph node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationKind {
     /// Production Part Approval Process.
@@ -305,7 +308,7 @@ pub enum QualificationKind {
 }
 
 /// The status of a qualification record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationStatus {
     /// Not started.
@@ -323,7 +326,7 @@ pub enum QualificationStatus {
 }
 
 /// PCN / lifecycle notice class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PcnKind {
     /// A process/material/design change notification.
@@ -337,7 +340,7 @@ pub enum PcnKind {
 }
 
 /// Risk class in the supply graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskKind {
     /// Single-source / continuity exposure.
@@ -359,7 +362,9 @@ pub enum RiskKind {
 }
 
 /// Ordered qualitative level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     /// Low.
@@ -373,7 +378,7 @@ pub enum RiskLevel {
 }
 
 /// A part node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Part {
     /// Identifier.
@@ -389,7 +394,7 @@ pub struct Part {
 }
 
 /// A manufacturer node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manufacturer {
     /// Identifier.
@@ -403,7 +408,7 @@ pub struct Manufacturer {
 }
 
 /// A supplier node. The role is mandatory and cannot be inferred.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Supplier {
     /// Identifier.
@@ -422,7 +427,7 @@ pub struct Supplier {
 }
 
 /// A physical site.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Site {
     /// Identifier.
@@ -438,7 +443,7 @@ pub struct Site {
 }
 
 /// A shipment record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shipment {
     /// Identifier.
@@ -456,7 +461,7 @@ pub struct Shipment {
 }
 
 /// A process node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Process {
     /// Identifier.
@@ -472,7 +477,7 @@ pub struct Process {
 }
 
 /// A qualification record node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     /// Identifier.
@@ -493,7 +498,7 @@ pub struct Qualification {
 }
 
 /// A PCN / EOL record node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pcn {
     /// Identifier.
@@ -515,7 +520,7 @@ pub struct Pcn {
 
 /// Contract terms node (commercial vocabulary; logistics semantics live in
 /// the logistics crate).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractTerms {
     /// Identifier.
@@ -539,7 +544,7 @@ pub struct ContractTerms {
 }
 
 /// A risk node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Risk {
     /// Identifier.
@@ -560,7 +565,7 @@ pub struct Risk {
 }
 
 /// A typed graph node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
     /// Part.
@@ -657,7 +662,9 @@ fn validate_evidence(evidence: &[EvidenceRef]) -> Result<(), ExactError> {
 }
 
 /// A typed node reference. Variants cannot be confused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum NodeRef {
     /// Part.
@@ -718,7 +725,9 @@ impl fmt::Display for NodeRef {
 }
 
 /// Typed edge class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// Supplier can supply the part.
@@ -742,7 +751,7 @@ pub enum EdgeKind {
 }
 
 /// A typed edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edge {
     /// Source node.
@@ -796,6 +805,9 @@ pub enum GraphError {
     /// A reference to a missing node.
     #[error("missing node {0}")]
     MissingNode(NodeRef),
+    /// A human approval is required for this consequential change.
+    #[error(transparent)]
+    Approval(#[from] faktor_approval::ApprovalError),
 }
 
 /// A bounded, deterministic supply graph.
@@ -1089,6 +1101,174 @@ impl SupplyGraph {
         }
     }
 
+    /// Approve/qualify a supplier qualification record. This is the only
+    /// mutator for `QualificationStatus`; the human token must bind to the
+    /// current record revision and the exact status change.
+    pub fn set_qualification_status(
+        &mut self,
+        id: QualificationId,
+        status: QualificationStatus,
+        approval: Option<&faktor_approval::ApprovalToken>,
+    ) -> Result<(), GraphError> {
+        let position = self
+            .index
+            .get(&NodeRef::Qualification(id))
+            .copied()
+            .ok_or(GraphError::MissingNode(NodeRef::Qualification(id)))?;
+        let mut node = self.nodes[position].clone();
+        let Node::Qualification(qualification) = &mut node else {
+            return Err(GraphError::InvalidNode(
+                "node is not a qualification".to_string(),
+            ));
+        };
+        let kind = if status == QualificationStatus::Revoked {
+            faktor_approval::ApprovalKind::SupplyAvlChange
+        } else {
+            faktor_approval::ApprovalKind::SupplySupplierQualification
+        };
+        let digest = faktor_approval::content_digest(
+            b"faktor.supply.qualification-change/v1",
+            &(
+                &self.revision,
+                &qualification.id,
+                &qualification.status,
+                &status,
+            ),
+        )?;
+        let check = faktor_approval::ApprovalCheck::new(
+            kind,
+            format!("qualification:{}", qualification.id.0),
+            qualification.revision.get().to_string(),
+            digest,
+        );
+        let token = approval.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+            kind: check.kind,
+            subject: check.subject.clone(),
+            bound_revision: check.bound_revision.clone(),
+            bound_digest: check.bound_digest.clone(),
+        })?;
+        token.require(&check)?;
+        qualification.status = status;
+        qualification.revision = qualification
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.revision = self
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.nodes[position] = node;
+        Ok(())
+    }
+
+    /// Change a contractual/payment term. Contract and payment changes are
+    /// always consequential and always require a human approval bound to the
+    /// exact new terms.
+    pub fn set_contract_terms(
+        &mut self,
+        id: ContractId,
+        terms: ContractTerms,
+        approval: Option<&faktor_approval::ApprovalToken>,
+    ) -> Result<(), GraphError> {
+        if terms.id != id {
+            return Err(GraphError::InvalidNode(
+                "contract terms id does not match the target".to_string(),
+            ));
+        }
+        let position = self
+            .index
+            .get(&NodeRef::Contract(id))
+            .copied()
+            .ok_or(GraphError::MissingNode(NodeRef::Contract(id)))?;
+        let current = self.nodes[position].clone();
+        let Node::Contract(existing) = &current else {
+            return Err(GraphError::InvalidNode(
+                "node is not a contract".to_string(),
+            ));
+        };
+        let digest = faktor_approval::content_digest(
+            b"faktor.supply.contract-change/v1",
+            &(&self.revision, existing, &terms),
+        )?;
+        let check = faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::SupplyContractTerms,
+            format!("contract:{}", id.0),
+            existing.revision.get().to_string(),
+            digest,
+        );
+        let token = approval.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+            kind: check.kind,
+            subject: check.subject.clone(),
+            bound_revision: check.bound_revision.clone(),
+            bound_digest: check.bound_digest.clone(),
+        })?;
+        token.require(&check)?;
+        let mut terms = terms;
+        terms.revision = existing
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.revision = self
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.nodes[position] = Node::Contract(terms);
+        Ok(())
+    }
+
+    /// Change a supplier's AVL authorization state.
+    pub fn set_supplier_authorization(
+        &mut self,
+        id: SupplierId,
+        authorization: AuthorizationStatus,
+        approval: Option<&faktor_approval::ApprovalToken>,
+    ) -> Result<(), GraphError> {
+        let position = self
+            .index
+            .get(&NodeRef::Supplier(id))
+            .copied()
+            .ok_or(GraphError::MissingNode(NodeRef::Supplier(id)))?;
+        let mut node = self.nodes[position].clone();
+        let Node::Supplier(supplier) = &mut node else {
+            return Err(GraphError::InvalidNode(
+                "node is not a supplier".to_string(),
+            ));
+        };
+        let digest = faktor_approval::content_digest(
+            b"faktor.supply.avl-change/v1",
+            &(
+                &self.revision,
+                &supplier.id,
+                &supplier.authorization,
+                &authorization,
+            ),
+        )?;
+        let check = faktor_approval::ApprovalCheck::new(
+            faktor_approval::ApprovalKind::SupplyAvlChange,
+            format!("supplier:{}", supplier.id.0),
+            supplier.revision.get().to_string(),
+            digest,
+        );
+        let token = approval.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+            kind: check.kind,
+            subject: check.subject.clone(),
+            bound_revision: check.bound_revision.clone(),
+            bound_digest: check.bound_digest.clone(),
+        })?;
+        token.require(&check)?;
+        supplier.authorization = authorization;
+        supplier.revision = supplier
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.revision = self
+            .revision
+            .next()
+            .map_err(|error| GraphError::InvalidNode(error.to_string()))?;
+        self.nodes[position] = node;
+        Ok(())
+    }
+
     /// Rebuild the adjacency, reverse-adjacency and edge-set indexes after
     /// deserialization (serde skips derived indexes). This is `O(V + E)`.
     pub fn rebuild_indexes(&mut self) {
@@ -1207,6 +1387,62 @@ mod tests {
             evidence: vec![],
             revision: Revision(1),
         })
+    }
+
+    #[test]
+    fn qualification_and_avl_changes_require_human_approval_tokens() {
+        let mut graph = SupplyGraph::new(Revision(1));
+        graph
+            .add_node(Node::Qualification(Qualification {
+                id: QualificationId(1),
+                subject: NodeRef::Part(PartId(1)),
+                kind: QualificationKind::ProcessCapability,
+                status: QualificationStatus::EvidencePending,
+                valid_until: None,
+                evidence: vec![],
+                revision: Revision(1),
+            }))
+            .unwrap();
+        let error = graph
+            .set_qualification_status(QualificationId(1), QualificationStatus::Approved, None)
+            .unwrap_err();
+        assert!(matches!(error, GraphError::Approval(_)));
+        let qualification = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Qualification(qualification) => Some(qualification.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let digest = faktor_approval::content_digest(
+            b"faktor.supply.qualification-change/v1",
+            &(
+                &graph.revision,
+                &qualification.id,
+                &qualification.status,
+                &QualificationStatus::Approved,
+            ),
+        )
+        .unwrap();
+        let token = faktor_approval::ApprovalToken::test_token(
+            faktor_approval::ApprovalKind::SupplySupplierQualification,
+            "qualification:1",
+            "1",
+            digest,
+        );
+        graph
+            .set_qualification_status(
+                QualificationId(1),
+                QualificationStatus::Approved,
+                Some(&token),
+            )
+            .unwrap();
+        assert!(graph.nodes.iter().any(|node| matches!(
+            node,
+            Node::Qualification(qualification)
+                if qualification.status == QualificationStatus::Approved
+        )));
     }
 
     #[test]

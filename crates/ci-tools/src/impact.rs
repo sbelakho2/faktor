@@ -11,12 +11,12 @@
 //! validates the structure first, so it can never bless an inconsistent
 //! graph.
 
-use std::collections::BTreeSet;
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use faktor_impact::{Graph, GraphError};
+use faktor_impact::{is_topology_manifest, Graph, GraphError, Language, NodeKind};
 use serde_json::{json, Value};
 
 const VERDICT_SCHEMA: &str = "faktor-impact-validation/v1";
@@ -313,7 +313,7 @@ fn binding_error(graph: &Graph, root: &Path, head: &str) -> Option<(&'static str
             format!("impact graph is stale: revision {commit} was built from a dirty tree, not HEAD {head}"),
         ));
     }
-    match changed_inputs(root, commit, head) {
+    match changed_inputs(graph, root, commit, head) {
         Ok(inputs) if inputs.is_empty() => None,
         Ok(inputs) => Some((
             "stale_revision",
@@ -322,14 +322,79 @@ fn binding_error(graph: &Graph, root: &Path, head: &str) -> Option<(&'static str
                 inputs.into_iter().take(3).collect::<Vec<_>>().join(", ")
             ),
         )),
-        Err(error) => Some((
-            "stale_diff_unavailable",
-            format!("impact graph is stale: revision {commit} != HEAD {head} (diff unavailable: {error})"),
+        Err((code, error)) => Some((
+            code,
+            format!("impact graph is stale: revision {commit} != HEAD {head} ({error})"),
         )),
     }
 }
 
-fn changed_inputs(root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
+/// Local units the graph actually scans. A root unit (`path: "."`) covers the
+/// whole repository; other units cover their directory. A graph that declares
+/// no unit cannot prove any changed path inert, so that is a typed refusal
+/// rather than a fresh verdict.
+struct Coverage {
+    root: bool,
+    dirs: Vec<String>,
+}
+
+impl Coverage {
+    fn from_graph(graph: &Graph) -> Self {
+        let mut root = false;
+        let mut dirs = Vec::new();
+        for node in &graph.nodes {
+            if !matches!(node.kind, NodeKind::Crate | NodeKind::Package) {
+                continue;
+            }
+            let Some(path) = node.path.as_deref() else {
+                continue;
+            };
+            let path = path.strip_prefix("./").unwrap_or(path);
+            let path = path.trim_end_matches('/');
+            if path.is_empty() || path == "." {
+                root = true;
+            } else {
+                dirs.push(path.to_string());
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+        Self { root, dirs }
+    }
+
+    fn known(&self) -> bool {
+        self.root || !self.dirs.is_empty()
+    }
+
+    fn covers(&self, graph: &Graph, path: &str) -> bool {
+        if self.root {
+            return true;
+        }
+        if self.dirs.iter().any(|dir| {
+            path == dir
+                || path
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            return true;
+        }
+        graph.files.iter().any(|file| file.path == path)
+            || graph.material_inputs.iter().any(|input| input.path == path)
+    }
+}
+
+/// Compare the revision delta against the graph's published material input
+/// inventory. Paths whose HEAD bytes still hash to the recorded digest did
+/// not change the graph content; deleted inputs, renamed sources, new sources
+/// under a covered unit and manifest changes do. Without an inventory the
+/// supported-extension/manifest rule is applied anywhere in the graph-covered
+/// repository (never "unknown means fresh").
+fn changed_inputs(
+    graph: &Graph,
+    root: &Path,
+    base: &str,
+    head: &str,
+) -> Result<Vec<String>, (&'static str, String)> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -337,106 +402,239 @@ fn changed_inputs(root: &Path, base: &str, head: &str) -> Result<Vec<String>, St
             "diff",
             "--name-only",
             "--no-renames",
-            "--diff-filter=ACMRD",
+            "--diff-filter=ACMRDT",
             "-z",
             &format!("{base}..{head}"),
             "--",
         ])
         .output()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            (
+                "stale_diff_unavailable",
+                format!("diff unavailable: {error}"),
+            )
+        })?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err((
+            "stale_diff_unavailable",
+            format!(
+                "diff unavailable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
     }
     if output.stdout.len() > MAX_GIT_BYTES {
-        return Err("changed-path list exceeded the bound".into());
+        return Err((
+            "stale_diff_unavailable",
+            "changed-path list exceeded the bound".into(),
+        ));
     }
-    let mut inputs = BTreeSet::new();
+    let mut changed = BTreeSet::new();
     for raw in output.stdout.split(|byte| *byte == 0) {
-        let Ok(path) = std::str::from_utf8(raw) else {
+        if raw.is_empty() {
             continue;
+        }
+        let Ok(path) = std::str::from_utf8(raw) else {
+            // Undecodable paths cannot be classified against canonical graph
+            // paths; treating them as inert is the fail-open bug.
+            return Err((
+                "stale_path_undecodable",
+                format!("changed path is not valid UTF-8: {}", raw.escape_ascii()),
+            ));
         };
         let path = path.replace('\\', "/");
         if path.is_empty() {
             continue;
         }
-        if graph_input(root, &path) {
-            inputs.insert(path);
+        if path.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+            return Err((
+                "stale_path_undecodable",
+                format!("changed path carries control characters: {path:?}"),
+            ));
+        }
+        changed.insert(path);
+    }
+    if changed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let coverage = Coverage::from_graph(graph);
+    let inventory: BTreeMap<&str, &str> = graph
+        .material_inputs
+        .iter()
+        .map(|input| (input.path.as_str(), input.digest.as_str()))
+        .collect();
+    let has_inventory = !inventory.is_empty();
+    let mut material = BTreeSet::new();
+    let mut verify = BTreeSet::new();
+    for path in &changed {
+        if inventory.contains_key(path.as_str()) {
+            verify.insert(path.clone());
+            continue;
+        }
+        let potential = Language::of_path(path).is_some() || is_topology_manifest(path);
+        if !potential {
+            continue;
+        }
+        if !coverage.known() {
+            // No published inventory entry and no declared unit: the graph
+            // cannot prove this path is inert, so refuse instead of guessing.
+            return Err((
+                "stale_coverage_unknown",
+                format!(
+                    "repository coverage is unknown: graph declares no local unit, so {path} cannot be proven inert"
+                ),
+            ));
+        }
+        // Legacy graph: conservative anywhere in the covered repository.
+        // Published inventory: a new source inside a unit is material; a
+        // manifest anywhere is material because it can add/move a unit.
+        let material_now = if has_inventory {
+            is_topology_manifest(path) || coverage.covers(graph, path)
+        } else {
+            true
+        };
+        if material_now {
+            material.insert(path.clone());
         }
     }
-    Ok(inputs.into_iter().collect())
-}
-
-fn graph_input(root: &Path, path: &str) -> bool {
-    const EXACT: &[&str] = &[
-        "Cargo.toml",
-        "Cargo.lock",
-        "rust-toolchain.toml",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "build.gradle",
-        "build.gradle.kts",
-        "pom.xml",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "poetry.lock",
-    ];
-    if EXACT.contains(&path) {
-        return true;
-    }
-    if path.ends_with("/Cargo.toml")
-        || path.ends_with("/package.json")
-        || path.ends_with("/build.gradle")
-        || path.ends_with("/build.gradle.kts")
-        || path.ends_with("/settings.gradle")
-        || path.ends_with("/settings.gradle.kts")
-        || path.ends_with("/pom.xml")
-        || path.ends_with("/pyproject.toml")
-        || path.ends_with("/setup.py")
-        || path.ends_with("/setup.cfg")
-    {
-        return true;
-    }
-    const SOURCE: &[&str] = &[
-        ".rs", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".py", ".pyi",
-        ".java", ".kt", ".kts",
-    ];
-    if !SOURCE.iter().any(|extension| path.ends_with(extension)) {
-        return false;
-    }
-    // A source file belongs to the graph only when the directory that owns
-    // it declares a unit manifest. Scripts and programme metadata under
-    // `tests/programme/` are not graph inputs even though they live below a
-    // directory named `tests`.
-    const UNIT_MANIFESTS: &[&str] = &[
-        "Cargo.toml",
-        "package.json",
-        "build.gradle",
-        "build.gradle.kts",
-        "pom.xml",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-    ];
-    let mut current = Path::new(path).parent();
-    while let Some(relative) = current {
-        if relative.as_os_str().is_empty() {
-            break;
-        }
-        for manifest in UNIT_MANIFESTS {
-            if root.join(relative).join(manifest).is_file() {
-                return true;
+    if !verify.is_empty() {
+        let digests = head_digests(root, head, &verify)?;
+        for path in verify {
+            let unchanged = inventory
+                .get(path.as_str())
+                .zip(digests.get(&path))
+                .is_some_and(|(recorded, actual)| *recorded == actual.as_str());
+            if !unchanged {
+                material.insert(path);
             }
         }
-        current = relative.parent();
     }
-    // Repository-root packages (`src/...` with a root manifest) are inputs;
-    // root-level scripts are not.
-    path.starts_with("src/")
+    Ok(material.into_iter().collect())
+}
+
+/// BLAKE3 digests of `head:path` blobs, read through one bounded git child.
+/// Missing objects (deleted inputs) and non-blob paths stay absent so the
+/// caller treats them as material, never as unchanged.
+fn head_digests(
+    root: &Path,
+    head: &str,
+    paths: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, (&'static str, String)> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            (
+                "stale_diff_unavailable",
+                format!("head content unavailable: {error}"),
+            )
+        })?;
+    let input: String = paths
+        .iter()
+        .map(|path| format!("{head}:{path}\n"))
+        .collect();
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err((
+            "stale_diff_unavailable",
+            "head content unavailable: no git stdin".into(),
+        ));
+    };
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut stdout = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        out.take(MAX_GIT_BYTES as u64 + 1)
+            .read_to_end(&mut stdout)
+            .map_err(|error| {
+                (
+                    "stale_diff_unavailable",
+                    format!("head content unavailable: {error}"),
+                )
+            })?;
+    }
+    let status = child.wait().map_err(|error| {
+        (
+            "stale_diff_unavailable",
+            format!("head content unavailable: {error}"),
+        )
+    })?;
+    let _ = writer.join();
+    if stdout.len() > MAX_GIT_BYTES {
+        return Err((
+            "stale_diff_unavailable",
+            "head content exceeded the bound".into(),
+        ));
+    }
+    if !status.success() {
+        return Err((
+            "stale_diff_unavailable",
+            "head content unavailable: git cat-file failed".into(),
+        ));
+    }
+    let mut digests = BTreeMap::new();
+    let mut cursor = 0usize;
+    for path in paths {
+        let rest = stdout.get(cursor..).ok_or_else(|| {
+            (
+                "stale_diff_unavailable",
+                "head content is truncated".to_string(),
+            )
+        })?;
+        let newline = rest.iter().position(|byte| *byte == b'\n').ok_or_else(|| {
+            (
+                "stale_diff_unavailable",
+                "head content header is truncated".to_string(),
+            )
+        })?;
+        let header = std::str::from_utf8(&rest[..newline]).map_err(|_| {
+            (
+                "stale_diff_unavailable",
+                "head content header is not UTF-8".to_string(),
+            )
+        })?;
+        cursor += newline + 1;
+        let mut fields = header.split(' ');
+        let _object = fields.next();
+        let kind = fields.next().unwrap_or_default();
+        if kind == "missing" {
+            continue;
+        }
+        let size: usize = fields
+            .next()
+            .and_then(|raw| raw.parse().ok())
+            .ok_or_else(|| {
+                (
+                    "stale_diff_unavailable",
+                    "head content header is malformed".to_string(),
+                )
+            })?;
+        let end = cursor.checked_add(size).ok_or_else(|| {
+            (
+                "stale_diff_unavailable",
+                "head content size overflows".to_string(),
+            )
+        })?;
+        if end > stdout.len() || stdout.get(end) != Some(&b'\n') {
+            return Err((
+                "stale_diff_unavailable",
+                "head content is truncated".to_string(),
+            ));
+        }
+        if kind == "blob" {
+            digests.insert(
+                path.clone(),
+                format!("blake3:{}", blake3::hash(&stdout[cursor..end]).to_hex()),
+            );
+        }
+        cursor = end + 1;
+    }
+    Ok(digests)
 }
 
 #[allow(dead_code)]

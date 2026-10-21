@@ -25,6 +25,7 @@ use faktor_supply_core::{
     Revision, RiskLevel, SiteId, SupplierId, SupplierRole, Term, Unavailable, UnavailableReason,
     Units, MAX_ID_BYTES, MAX_TEXT_BYTES,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Maximum processes on one profile.
@@ -102,7 +103,7 @@ pub mod capability_keys {
 
 /// A typed capability fact value. Units are explicit so comparisons are
 /// dimension-checked rather than guessed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FactValue {
     /// A scalar with its unit (for example `placement_accuracy_um`).
@@ -172,7 +173,7 @@ impl FactValue {
 }
 
 /// One named capability fact with evidence or an assumption.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityFact {
     /// Stable fact key (lowercase dotted namespace is recommended).
@@ -194,7 +195,7 @@ impl CapabilityFact {
 }
 
 /// How a requirement compares against an evidenced fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Comparison {
     /// Actual >= expected.
@@ -208,7 +209,7 @@ pub enum Comparison {
 }
 
 /// One capability requirement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityRequirement {
     /// Fact key to evaluate.
@@ -230,7 +231,7 @@ impl CapabilityRequirement {
 }
 
 /// Process route claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessCapability {
     /// Process class.
@@ -265,7 +266,7 @@ impl ProcessCapability {
 }
 
 /// Equipment / line capability record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EquipmentCapability {
     /// Process served.
@@ -298,7 +299,7 @@ impl EquipmentCapability {
 
 /// A capacity booking window. Capacity and commitment are separate terms so
 /// an absent commitment is not silently treated as zero.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityWindow {
     /// The site the capacity belongs to, when bound.
@@ -362,7 +363,7 @@ impl CapacityWindow {
 }
 
 /// Lot-size envelope with an order multiple.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LotSizeRange {
     /// Minimum lot.
@@ -400,7 +401,7 @@ impl LotSizeRange {
 }
 
 /// Tooling capability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolingCapability {
     /// Tooling class.
@@ -424,7 +425,7 @@ impl ToolingCapability {
 }
 
 /// Inspection / metrology capability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InspectionCapability {
     /// Inspection class (CMM, AOI, X-ray, ICT, FCT, SPI, MSA, ...).
@@ -455,7 +456,7 @@ impl InspectionCapability {
 }
 
 /// Process capability index (Cpk or Ppk), scaled by 1,000,000.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessCapabilityIndex {
     /// Process.
@@ -497,7 +498,7 @@ impl ProcessCapabilityIndex {
 
 /// A qualification claim. Approval is structurally impossible without
 /// evidence: validation refuses `Approved` with no evidence reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationClaim {
     /// Qualification class.
@@ -535,7 +536,9 @@ impl QualificationClaim {
 }
 
 /// Traceability depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceabilityLevel {
     /// No traceability.
@@ -551,7 +554,7 @@ pub enum TraceabilityLevel {
 }
 
 /// Authorization evidence record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationRecord {
     /// The role being authorized.
@@ -625,7 +628,7 @@ impl AuthorizationRecord {
 }
 
 /// The assessed authorization state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorizationState {
     /// Not required (manufacturer).
@@ -641,7 +644,7 @@ pub enum AuthorizationState {
 }
 
 /// The assessment and its bounded explanation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationAssessment {
     /// State.
@@ -651,7 +654,7 @@ pub struct AuthorizationAssessment {
 }
 
 /// Continuity exposure class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinuityKind {
     /// Single manufacturing site.
@@ -671,7 +674,7 @@ pub enum ContinuityKind {
 }
 
 /// A continuity exposure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContinuityExposure {
     /// Exposure class.
@@ -697,7 +700,7 @@ impl ContinuityExposure {
 }
 
 /// Delivery / quality / responsiveness distributions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupplierMetrics {
     /// On-time delivery, in parts-per-million of deliveries on time.
@@ -740,7 +743,7 @@ impl SupplierMetrics {
 }
 
 /// Ownership structure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ownership {
     /// Legal owner / group.
@@ -764,7 +767,7 @@ impl Ownership {
 }
 
 /// A declared site relationship.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteRelationship {
     /// The site.
@@ -781,7 +784,7 @@ impl SiteRelationship {
 }
 
 /// The complete supplier profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupplierProfile {
     /// Supplier graph id.
@@ -952,7 +955,7 @@ fn validate_term_list<T>(
 // ----------------------------------------------------------------- requirement
 
 /// A sourcing requirement evaluated against a profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcingRequirement {
     /// Roles that may satisfy the requirement. Never empty: the caller must
@@ -1047,7 +1050,7 @@ impl SourcingRequirement {
 // ---------------------------------------------------------------- assessment
 
 /// The area a check belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckArea {
     /// Commercial role.
@@ -1083,7 +1086,7 @@ pub enum CheckArea {
 }
 
 /// The outcome of one check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum CheckOutcome {
     /// The evidenced requirement is met.
@@ -1116,7 +1119,7 @@ pub enum CheckOutcome {
 }
 
 /// One evaluated check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Check {
     /// Area.
@@ -1130,7 +1133,9 @@ pub struct Check {
 }
 
 /// The deterministic verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FitVerdict {
     /// All mandatory checks satisfied and no optional gap.
@@ -1144,7 +1149,7 @@ pub enum FitVerdict {
 }
 
 /// The complete fit assessment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FitReport {
     /// Supplier.

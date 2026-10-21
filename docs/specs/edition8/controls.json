@@ -3068,7 +3068,7 @@
           "declared": "GET /native/runtime/status",
           "state": "exists",
           "actual": "/native/runtime/status",
-          "line": 1064
+          "line": 1063
         }
       ],
       "runtime_contracts_required": [
@@ -3110,7 +3110,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1064,
+          "line": 1063,
           "note": "Daemon route GET /native/runtime/status. Live: control.contract.P-13 (registered routes: GET /native/capabilities; POST /native/presets/:id/roles; POST /native/presets/:id/fallback; GET /native/models; POST /native/catalog/probe; GET /native/call-receipts?session=:session&limit=50; GET /native/config/provenance?limit=500; GET /native/usage; programme: deferred)."
         }
       ],
@@ -7377,7 +7377,7 @@
           "declared": "GET /native/index/coverage?session=:session",
           "state": "exists",
           "actual": "/native/index/coverage?session=:session",
-          "line": 1321
+          "line": 1320
         }
       ],
       "runtime_contracts_required": [
@@ -7420,7 +7420,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1321,
+          "line": 1320,
           "note": "Daemon route GET /native/index/coverage?session=:session. Live: control.contract.C-11 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; POST /native/session/:session/context/pins; POST /native/config/commit; GET /native/index/coverage?session=:session; POST /native/session/:session/context/preview; programme: deferred)."
         }
       ],
@@ -7704,7 +7704,7 @@
           "declared": "GET /native/context/export?session=:session",
           "state": "exists",
           "actual": "/native/context/export?session=:session",
-          "line": 1101
+          "line": 1100
         }
       ],
       "runtime_contracts_required": [
@@ -7747,7 +7747,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1101,
+          "line": 1100,
           "note": "Daemon route GET /native/context/export?session=:session. Live: control.contract.C-14 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; POST /native/session/:session/context/pins; POST /native/config/commit; GET /native/index/coverage?session=:session; POST /native/session/:session/context/preview; programme: deferred)."
         }
       ],
@@ -11803,7 +11803,7 @@
           "declared": "GET /native/tools",
           "state": "exists",
           "actual": "/native/tools",
-          "line": 985
+          "line": 984
         }
       ],
       "runtime_contracts_required": [
@@ -11845,7 +11845,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 985,
+          "line": 984,
           "note": "Daemon route GET /native/tools. Live: control.contract.T-01 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -12913,7 +12913,7 @@
           "declared": "GET /native/tools",
           "state": "exists",
           "actual": "/native/tools",
-          "line": 985
+          "line": 984
         }
       ],
       "runtime_contracts_required": [
@@ -12955,7 +12955,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 985,
+          "line": 984,
           "note": "Daemon route GET /native/tools. Live: control.contract.T-11 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -13454,7 +13454,7 @@
           "declared": "GET /native/skills",
           "state": "exists",
           "actual": "/native/skills",
-          "line": 948
+          "line": 947
         }
       ],
       "runtime_contracts_required": [
@@ -13493,7 +13493,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 948,
+          "line": 947,
           "note": "Daemon route GET /native/skills. Live: control.contract.S-01 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -14808,7 +14808,7 @@
           "declared": "GET /native/skills",
           "state": "exists",
           "actual": "/native/skills",
-          "line": 948
+          "line": 947
         }
       ],
       "runtime_contracts_required": [
@@ -14847,7 +14847,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 948,
+          "line": 947,
           "note": "Daemon route GET /native/skills. Live: control.contract.S-14 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -16241,7 +16241,7 @@
           "declared": "GET /native/runtime/status",
           "state": "exists",
           "actual": "/native/runtime/status",
-          "line": 1064
+          "line": 1063
         }
       ],
       "runtime_contracts_required": [
@@ -16284,7 +16284,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1064,
+          "line": 1063,
           "note": "Daemon route GET /native/runtime/status. Live: control.contract.X-13 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; POST /native/session/:session/context/pins; POST /native/config/commit; GET /native/index/coverage?session=:session; POST /native/session/:session/context/preview; programme: deferred)."
         }
       ],
@@ -16734,7 +16734,7 @@
           "declared": "GET /native/session/:session/usage",
           "state": "exists",
           "actual": "/native/session/:session/usage",
-          "line": 1215
+          "line": 1214
         }
       ],
       "runtime_contracts_required": [
@@ -16778,7 +16778,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1215,
+          "line": 1214,
           "note": "Daemon route GET /native/session/:session/usage. Live: control.contract.B-04 (registered routes: GET /native/capabilities; POST /native/presets/:id/roles; POST /native/presets/:id/fallback; GET /native/models; POST /native/catalog/probe; GET /native/call-receipts?session=:session&limit=50; GET /native/config/provenance?limit=500; GET /native/usage; programme: deferred)."
         }
       ],
@@ -18751,7 +18751,7 @@
           "declared": "GET /native/tasks/:task/proof?session=:session",
           "state": "exists",
           "actual": "/native/tasks/:task/proof?session=:session",
-          "line": 1225
+          "line": 1224
         }
       ],
       "runtime_contracts_required": [
@@ -18791,7 +18791,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1225,
+          "line": 1224,
           "note": "Daemon route GET /native/tasks/:task/proof?session=:session. Live: control.contract.V-09 (registered routes: GET /native/session/:session/verification; POST /native/session/:session/review/comments; POST /native/session/:session/changes/accept; POST /native/session/:session/task-runs; GET /native/tasks/:task/proof?session=:session; GET /native/repositories; GET /native/capabilities; POST /native/presets/:id/roles; programme: deferred)."
         }
       ],
@@ -19008,7 +19008,7 @@
           "declared": "GET /native/repositories",
           "state": "exists",
           "actual": "/native/repositories",
-          "line": 1345
+          "line": 1344
         }
       ],
       "runtime_contracts_required": [
@@ -19054,7 +19054,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1345,
+          "line": 1344,
           "note": "Daemon route GET /native/repositories. Live: control.contract.V-11 (registered routes: POST /native/session/:session/context/pins; POST /native/config/commit; GET /native/index/coverage?session=:session; POST /native/session/:session/context/preview; GET /native/context/manifest?session=:session; GET /native/context/export?session=:session; POST /native/session/:session/context/compaction; GET /native/session/:session/context/compaction; programme: deferred)."
         }
       ],
@@ -21136,7 +21136,7 @@
           "declared": "GET /native/runtime/status",
           "state": "exists",
           "actual": "/native/runtime/status",
-          "line": 1064
+          "line": 1063
         }
       ],
       "runtime_contracts_required": [
@@ -21182,7 +21182,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1064,
+          "line": 1063,
           "note": "Daemon route GET /native/runtime/status. Live: control.contract.O-02 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -21386,7 +21386,7 @@
           "declared": "GET /native/runtime/status",
           "state": "exists",
           "actual": "/native/runtime/status",
-          "line": 1064
+          "line": 1063
         }
       ],
       "runtime_contracts_required": [
@@ -21432,7 +21432,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1064,
+          "line": 1063,
           "note": "Daemon route GET /native/runtime/status. Live: control.contract.O-04 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -21509,7 +21509,7 @@
           "declared": "POST /native/updater/check",
           "state": "exists",
           "actual": "/native/updater/check",
-          "line": 1367
+          "line": 1366
         }
       ],
       "runtime_contracts_required": [
@@ -21555,7 +21555,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1367,
+          "line": 1366,
           "note": "Daemon route POST /native/updater/check. Live: control.contract.O-05 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -21774,7 +21774,7 @@
           "declared": "GET /native/identity",
           "state": "exists",
           "actual": "/native/identity",
-          "line": 1331
+          "line": 1330
         }
       ],
       "runtime_contracts_required": [
@@ -21820,7 +21820,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1331,
+          "line": 1330,
           "note": "Daemon route GET /native/identity. Live: control.contract.O-07 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],
@@ -22233,7 +22233,7 @@
           "declared": "GET /native/workers",
           "state": "exists",
           "actual": "/native/workers",
-          "line": 1378
+          "line": 1377
         }
       ],
       "runtime_contracts_required": [
@@ -22279,7 +22279,7 @@
         {
           "host": "daemon",
           "file": "crates/server/src/api/lifecycle.rs",
-          "line": 1378,
+          "line": 1377,
           "note": "Daemon route GET /native/workers. Live: control.contract.O-11 (registered routes: POST /native/providers/connections; POST /native/providers/connections/:id/test; GET /native/runtime/status; POST /native/providers/credentials/rotate; GET /native/tools; POST /native/mcp/servers; GET /native/mcp/servers; GET /native/mcp/servers/:mcp/tools; programme: deferred)."
         }
       ],

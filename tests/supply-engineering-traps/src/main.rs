@@ -90,7 +90,7 @@ fn print_text(report: &SuiteReport) {
         print_case(case);
     }
     println!(
-        "summary: {}/{} passed; solved={} rejected={} refused={} research_required={} unavailable={} escalated={}",
+        "summary: {}/{} oracle-passed; sut solved={} rejected={} refused={} research_required={} unavailable={} ambiguous={}",
         report.summary.passed,
         report.summary.total,
         report.summary.solved,
@@ -98,7 +98,7 @@ fn print_text(report: &SuiteReport) {
         report.summary.refused,
         report.summary.research_required,
         report.summary.unavailable,
-        report.summary.escalated
+        report.summary.ambiguous
     );
     if !report.summary.failed_cases.is_empty() {
         println!("failed: {}", report.summary.failed_cases.join(", "));
@@ -108,20 +108,29 @@ fn print_text(report: &SuiteReport) {
 fn print_case(case: &CaseReport) {
     let status = if case.passed() { "PASS" } else { "FAIL" };
     println!(
-        "{status} {:>2}/8 {} [{}] {}",
-        case.metrics.count(),
+        "{status} {:>2}/8 {} expected={} sut={}",
+        case.oracle.count(),
         case.id,
         case.expected.as_str(),
-        case.title
+        case.sut.outcome.kind().as_str()
     );
+    println!(
+        "      oracle_failed: {}",
+        if case.oracle.failed_dimensions.is_empty() {
+            "none".to_string()
+        } else {
+            case.oracle.failed_dimensions.join(", ")
+        }
+    );
+    for failure in &case.oracle.failures {
+        println!("      - {failure}");
+    }
     println!("      shallow: {}", case.shallow_claim);
     println!(
-        "      outcome: {:?}; missing={} boundaries={}",
-        case.outcome.kind(),
-        case.missing_info.len(),
-        case.boundary_conditions.len()
+        "      experiments={} controls={}",
+        case.sut.experiments.len(),
+        case.sut.controls.len()
     );
-    println!("      experiment: {}", case.falsifiable_test.procedure);
 }
 
 fn help() {
