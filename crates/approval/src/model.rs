@@ -319,6 +319,13 @@ impl ApprovalRequest {
                 "evidence exceeds {MAX_APPROVAL_EVIDENCE_BYTES} aggregate bytes"
             )));
         }
+        ensure_no_credential("subject", &self.subject)?;
+        ensure_no_credential("proposed change", &self.proposed_change)?;
+        ensure_no_credential("bound revision", &self.bound_revision)?;
+        ensure_no_credential("requester", &self.requester.id)?;
+        for evidence in &self.evidence {
+            ensure_no_credential("evidence", evidence)?;
+        }
         self.requester.validate()?;
         if self.created_at_ms == 0
             || self.expires_at_ms <= self.created_at_ms
@@ -486,6 +493,7 @@ impl ApprovalDecision {
         }
         self.principal.validate()?;
         bounded_text("rationale", &self.rationale, MAX_APPROVAL_TEXT_BYTES)?;
+        ensure_no_credential("rationale", &self.rationale)?;
         match &self.outcome {
             DecisionOutcome::Approved => {}
             DecisionOutcome::Denied { reason } => {

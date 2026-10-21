@@ -587,3 +587,25 @@ fn replayed_or_reassigned_decisions_fail_signature_and_operator_binding() {
         Err(ApprovalError::Stale { .. } | ApprovalError::ApprovalRequired { .. })
     ));
 }
+
+#[test]
+fn approval_text_refuses_credentials_at_propose_and_on_load() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, _key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    let mut credential_draft = draft("agent-1", &"d".repeat(64), "7");
+    credential_draft.proposed_change =
+        "use sk-0123456789abcdefghijklmnopqrstuv for the supplier".to_string();
+    let error = authority.propose(credential_draft, now).unwrap_err();
+    assert!(matches!(error, ApprovalError::Invalid(_)), "{error}");
+
+    let mut request = authority
+        .propose(draft("agent-1", &"e".repeat(64), "7"), now)
+        .unwrap();
+    request.proposed_change =
+        "use ghp_0123456789abcdefghijklmnopqrstuv for the supplier".to_string();
+    assert!(
+        request.validate().is_err(),
+        "a hand-edited ledger line must not persist a credential"
+    );
+}
