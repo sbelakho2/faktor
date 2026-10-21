@@ -147,7 +147,7 @@ pub struct ServerDeps {
     pub foundation: Option<Arc<faktor_foundation::Foundation>>,
     /// Live stdio MCP children owned by this daemon surface (explicit start/
     /// stop; one process group per server under the daemon supervisor).
-    pub mcp_runtime: Arc<crate::native::foundation_ext::McpRuntime>,
+    pub mcp_runtime: Arc<crate::native::McpRuntime>,
     /// The daemon's one browser authority. It owns the supervised Chromium
     /// manager; dropping `ServerDeps` drops the manager and kills every
     /// browser tree (no process outlives the daemon).
@@ -242,7 +242,7 @@ impl ServerDeps {
         tasks: Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
         budgets: Arc<faktor_session::DurableBudgetLedger>,
     ) -> Self {
-        let mcp_runtime = Arc::new(crate::native::foundation_ext::McpRuntime::new(
+        let mcp_runtime = Arc::new(crate::native::McpRuntime::new(
             agent.deps().supervisor.clone(),
         ));
         let browser = Arc::new(crate::native::browser_surface::BrowserSurface::new(

@@ -1873,6 +1873,146 @@ mod openai_contract_tests {
         );
     }
 
+    /// A hostile OpenAI-compatible stream fragments ONE tool call forever.
+    /// The adapter's own accumulator must stop at the resolved output
+    /// envelope with the typed `OutputLimitExceeded` error instead of
+    /// buffering without bound before the agent ever sees a complete call.
+    #[tokio::test]
+    async fn fragmented_chat_tool_arguments_stop_at_the_adapter_envelope() {
+        let server = MockServer::new();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300 {
+            let event = serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": format!("{i:04}{}", "x".repeat(60))
+                            }
+                        }]
+                    },
+                    "finish_reason": serde_json::Value::Null,
+                }]
+            });
+            frames.push(format!("data: {event}\n\n").into_bytes());
+        }
+        frames.push(b"data: [DONE]\n\n".to_vec());
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: frames,
+            },
+        );
+        let base = server.base_url().await;
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let mut stream = Box::pin(openai_stream_bounded(
+            transport,
+            format!("{base}/chat/completions"),
+            authorization_headers(None).unwrap(),
+            ExtraHeaders::empty(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+            1_024,
+        ));
+        let mut yielded = 0usize;
+        let err = loop {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("the bounded stream must terminate")
+                .expect("an item");
+            match item {
+                Ok(_) => {
+                    yielded += 1;
+                    assert!(
+                        yielded < 300,
+                        "the adapter must not drain the hostile stream"
+                    );
+                }
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind, ProviderErrorKind::OutputLimitExceeded, "{err:?}");
+        assert!(
+            err.message.contains("1024 bytes"),
+            "the error names the accumulation bound: {}",
+            err.message
+        );
+    }
+
+    /// The Responses codec accumulates `function_call_arguments.delta`
+    /// fragments: the same envelope refusal applies there.
+    #[tokio::test]
+    async fn fragmented_responses_tool_arguments_stop_at_the_adapter_envelope() {
+        let server = MockServer::new();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        frames.push(
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "write_file",
+                        "arguments": ""
+                    }
+                })
+            )
+            .into_bytes(),
+        );
+        for i in 0..300 {
+            frames.push(
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_1",
+                        "delta": format!("{i:04}{}", "x".repeat(60))
+                    })
+                )
+                .into_bytes(),
+            );
+        }
+        frames.push(b"data: [DONE]\n\n".to_vec());
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: frames,
+            },
+        );
+        let base = server.base_url().await;
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let mut stream = Box::pin(responses_stream_bounded(
+            transport,
+            format!("{base}/responses"),
+            authorization_headers(None).unwrap(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+            1_024,
+        ));
+        let err = loop {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("the bounded stream must terminate")
+                .expect("an item");
+            if let Err(e) = item {
+                break e;
+            }
+        };
+        assert_eq!(err.kind, ProviderErrorKind::OutputLimitExceeded, "{err:?}");
+    }
+
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {

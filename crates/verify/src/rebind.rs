@@ -4,22 +4,34 @@
 //! selector (`cart::totals_add_up`). When the task itself renames that test
 //! (file and/or function), the old selector stops existing and the obligation
 //! can never be discharged by the renamed test unless the binding is updated.
-//! This module performs that update ONLY when the mapping is proven:
+//! This module performs that update ONLY when the migration is proven:
 //!
-//! * a rename edge exists (git rename detection, or the verification
-//!   inventory's unique deleted→added test-target pair),
-//! * the old and new declarations are the same test target (same path or the
-//!   proven rename edge), and
-//! * exactly one new declaration matches the old one (same executable test
-//!   name, or an equivalent body under the task's declared rename pairs).
+//! * a rename edge proves only the PATH relation (git strong rename
+//!   detection, or the verification inventory's unique deleted→added
+//!   test-target pair) — never semantic preservation,
+//! * the declaration adapter proves the semantic selector, the executable
+//!   selector, the enclosing target and a normalized executable-body
+//!   identity (comments/trivia stripped, execution-changing attributes
+//!   included), and
+//! * the old and new body identities are EQUAL under the declared symbol
+//!   rename pairs (and the test's own proven name mapping), the mapping is
+//!   unique, and exactly one candidate matches.
 //!
 //! Anything else stays unresolved and the caller records the obligation as
 //! stale, so a required claim can never be satisfied by a coarse/vacuous
-//! selector. Every applied update carries old→new + basis provenance.
+//! selector. Every applied update carries old→new + basis + body digest
+//! provenance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use faktor_core::contract::{ClaimState, EngineeringContract, EvidenceBinding, ProofObligation};
+
+use crate::review::REVIEW_MAX_CHANGED_FILES;
+use crate::test_declaration::{
+    adapter_for_path, is_supported_test_path, IdentityToken, TestDeclaration,
+};
+
+pub use crate::test_declaration::TestDeclarationAdapter;
 
 /// One changed test-bearing file: the base content and the candidate content.
 /// A deletion has `after = None`; a creation has `before = None`.
@@ -31,7 +43,9 @@ pub struct TestFileDelta {
 }
 
 /// A PROVEN file rename edge (from a real authority: git rename detection or
-/// the verification inventory's unique test-move pair).
+/// the verification inventory's unique test-move pair). The edge proves the
+/// path relation only; semantic preservation is proven separately by the
+/// declaration body identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestRenameEdge {
     pub from: String,
@@ -54,6 +68,54 @@ pub struct TestRebindRecord {
     pub old_selector: String,
     pub new_selector: String,
     pub basis: String,
+    /// Digest of the normalized executable body the migration proved.
+    pub body_digest: String,
+}
+
+/// Why one obligation's binding was NOT migrated. Every refusal keeps the
+/// old binding in place and forces the obligation unresolved; none is a
+/// silent "no match".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RebindRefusalCode {
+    /// The goal does not declare a rename, so a vanished selector is never
+    /// automatically migrated.
+    TaskNotRename,
+    /// No proof-grade move edge (strong git rename / unique inventory move)
+    /// relates the old path to a candidate path.
+    NoProvenMove,
+    /// The proven destination has no candidate declaration inventory.
+    TargetUnavailable,
+    /// The normalized executable body is not identical under the declared
+    /// name mappings.
+    BodyInequivalent,
+    /// More than one candidate declaration satisfies the identity.
+    AmbiguousCandidate,
+    /// Two obligations would migrate onto the same new declaration.
+    CrossObligationAmbiguous,
+    /// The old→new + body-digest provenance cannot fit the durable bound.
+    ProvenanceTooLarge,
+}
+
+impl RebindRefusalCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskNotRename => "task_not_rename",
+            Self::NoProvenMove => "no_proven_move",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::BodyInequivalent => "body_inequivalent",
+            Self::AmbiguousCandidate => "ambiguous_candidate",
+            Self::CrossObligationAmbiguous => "cross_obligation_ambiguous",
+            Self::ProvenanceTooLarge => "provenance_too_large",
+        }
+    }
+}
+
+/// One typed rebinding refusal (the old obligation stays unresolved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebindRefusal {
+    pub obligation_id: String,
+    pub old_selector: String,
+    pub code: RebindRefusalCode,
 }
 
 /// The outcome of one rebinding pass.
@@ -65,6 +127,8 @@ pub struct TestRebindOutcome {
     /// Required obligations whose old selector is gone and whose mapping was
     /// NOT proven: the caller must force them unresolved (typed refusal).
     pub stale: Vec<String>,
+    /// The typed reason for every `stale` entry.
+    pub refusals: Vec<RebindRefusal>,
     pub rebinds: Vec<TestRebindRecord>,
 }
 
@@ -76,25 +140,41 @@ impl TestRebindOutcome {
     pub fn is_stale(&self, obligation_id: &str) -> bool {
         self.stale.iter().any(|id| id == obligation_id)
     }
+
+    pub fn refusal(&self, obligation_id: &str) -> Option<&RebindRefusal> {
+        self.refusals
+            .iter()
+            .find(|refusal| refusal.obligation_id == obligation_id)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Declaration {
-    path: String,
-    selector: String,
-    executable: String,
-    target: Option<String>,
-    body: String,
+fn refuse(
+    refusals: &mut Vec<RebindRefusal>,
+    obligation_id: &str,
+    old_selector: &str,
+    code: RebindRefusalCode,
+) {
+    refusals.push(RebindRefusal {
+        obligation_id: obligation_id.to_string(),
+        old_selector: old_selector.to_string(),
+        code,
+    });
+}
+
+/// TRUE when `path` is a test-bearing source path some declaration adapter
+/// can prove.
+pub fn supports_test_path(path: &str) -> bool {
+    is_supported_test_path(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Plan {
     obligation_index: usize,
-    old_binding: EvidenceBinding,
     new_binding: EvidenceBinding,
     basis: String,
     old_selector: String,
     new_selector: String,
+    body_digest: String,
     /// Identity of the candidate declarations (cross-obligation uniqueness).
     candidate: Vec<(String, String)>,
 }
@@ -116,123 +196,169 @@ pub fn rebind_test_obligations(
     let renames = rename_edges(evidence, &old_inventory, &new_inventory, &substitutions);
 
     let mut plans: Vec<Plan> = Vec::new();
-    let mut blocked: Vec<String> = Vec::new();
+    let mut refusals: Vec<RebindRefusal> = Vec::new();
     for (index, obligation) in contract.proof_obligations.iter().enumerate() {
         let targets = binding_targets(&obligation.evidence_binding);
         if targets.is_empty() {
             continue;
         }
-        let mut old_declarations: Vec<&Declaration> = targets
+        let mut old_declarations: Vec<&TestDeclaration> = targets
             .iter()
             .filter_map(|target| resolve_declaration(target, &old_inventory))
             .collect();
         old_declarations.sort_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then_with(|| a.selector.cmp(&b.selector))
+            a.semantic_selector
+                .cmp(&b.semantic_selector)
+                .then_with(|| a.executable_selector.cmp(&b.executable_selector))
         });
-        old_declarations.dedup_by(|a, b| a.path == b.path && a.selector == b.selector);
+        old_declarations.dedup_by(|a, b| {
+            a.semantic_selector == b.semantic_selector
+                && a.executable_selector == b.executable_selector
+        });
         if old_declarations.is_empty() {
             continue;
         }
-        // A declaration selector that still exists on the candidate needs no
-        // rebinding; a derived coarse filter alone is not a declaration.
-        let stale: Vec<&Declaration> = old_declarations
+        // A declaration that still exists at the SAME path with the SAME
+        // semantic selector needs no rebinding. A selector that merely
+        // reappears in another file does not count: that is a move, and the
+        // move must be proven by an edge plus body identity.
+        let stale: Vec<&TestDeclaration> = old_declarations
             .into_iter()
             .filter(|declaration| {
-                !new_inventory
-                    .values()
-                    .flatten()
-                    .any(|candidate| candidate.selector == declaration.selector)
+                new_inventory
+                    .get(&declaration.path)
+                    .is_none_or(|candidates| {
+                        !candidates.iter().any(|candidate| {
+                            candidate.semantic_selector == declaration.semantic_selector
+                        })
+                    })
             })
             .collect();
         if stale.is_empty() {
             continue;
         }
         if !goal_is_rename {
-            blocked.push(obligation.id.clone());
+            refuse(
+                &mut refusals,
+                &obligation.id,
+                &stale[0].semantic_selector,
+                RebindRefusalCode::TaskNotRename,
+            );
             continue;
         }
-        let mut mapped: Vec<&Declaration> = Vec::new();
+        let mut mapped: Vec<&TestDeclaration> = Vec::new();
+        let mut digests: Vec<String> = Vec::new();
         let mut basis_parts: Vec<String> = Vec::new();
-        let mut unresolved = false;
+        let mut refusal: Option<RebindRefusalCode> = None;
         for declaration in &stale {
             let (new_path, edge_basis) =
                 match resolve_new_path(declaration, &new_inventory, &renames) {
                     Some(found) => found,
                     None => {
-                        unresolved = true;
+                        refusal = Some(RebindRefusalCode::NoProvenMove);
                         break;
                     }
                 };
             let Some(candidates) = new_inventory.get(&new_path) else {
-                unresolved = true;
+                refusal = Some(RebindRefusalCode::TargetUnavailable);
                 break;
             };
-            let matching: Vec<&Declaration> = candidates
+            let matching: Vec<(&TestDeclaration, String)> = candidates
                 .iter()
-                .filter(|candidate| {
-                    candidate.executable == declaration.executable
-                        || equivalent_body(declaration, candidate, &substitutions)
+                .filter_map(|candidate| {
+                    body_equivalence_digest(declaration, candidate, &substitutions)
+                        .map(|digest| (candidate, digest))
                 })
-                .filter(|candidate| {
+                .filter(|(candidate, _)| {
                     !was_unchanged_elsewhere(declaration, candidate, &old_inventory, &substitutions)
                 })
                 .collect();
             if matching.len() != 1 {
-                unresolved = true;
+                refusal = Some(if matching.is_empty() {
+                    RebindRefusalCode::BodyInequivalent
+                } else {
+                    RebindRefusalCode::AmbiguousCandidate
+                });
                 break;
             }
-            mapped.push(matching[0]);
+            let (candidate, digest) = matching[0].clone();
+            mapped.push(candidate);
             basis_parts.push(format!(
                 "{edge_basis};{}:{}->{}",
-                declaration.path, declaration.selector, matching[0].selector
+                declaration.enclosing_target.as_deref().unwrap_or(""),
+                declaration.semantic_selector,
+                candidate.semantic_selector
             ));
+            digests.push(digest);
         }
-        if unresolved || mapped.is_empty() {
-            blocked.push(obligation.id.clone());
+        if refusal.is_some() || mapped.is_empty() || digests.is_empty() {
+            refuse(
+                &mut refusals,
+                &obligation.id,
+                &stale[0].semantic_selector,
+                refusal.unwrap_or(RebindRefusalCode::BodyInequivalent),
+            );
             continue;
         }
         let new_binding = binding_for(&mapped);
         if new_binding == obligation.evidence_binding {
             continue;
         }
-        let basis = format!("match:unique;body:equivalent;{}", basis_parts.join("; "));
+        let body_digest = digests[0].clone();
+        let basis = format!(
+            "match:unique;body:equivalent;body_digest:{body_digest};{}",
+            basis_parts.join("; ")
+        );
+        // Never let provenance truncation silently drop the old→new/basis
+        // record: an oversized migration refuses typed instead.
+        if basis.len() > faktor_core::contract::MAX_BINDING_UPDATE_BASIS_BYTES {
+            refuse(
+                &mut refusals,
+                &obligation.id,
+                &stale[0].semantic_selector,
+                RebindRefusalCode::ProvenanceTooLarge,
+            );
+            continue;
+        }
         let mut candidate: Vec<(String, String)> = mapped
             .iter()
-            .map(|declaration| (declaration.path.clone(), declaration.executable.clone()))
+            .map(|declaration| {
+                (
+                    declaration.semantic_selector.clone(),
+                    declaration.executable_selector.clone(),
+                )
+            })
             .collect();
         candidate.sort();
         candidate.dedup();
         plans.push(Plan {
             obligation_index: index,
-            old_binding: obligation.evidence_binding.clone(),
             new_binding,
             basis,
             old_selector: stale
                 .iter()
-                .map(|declaration| declaration.selector.clone())
+                .map(|declaration| declaration.semantic_selector.clone())
                 .collect::<Vec<_>>()
                 .join(","),
             new_selector: mapped
                 .iter()
-                .map(|declaration| declaration.selector.clone())
+                .map(|declaration| declaration.semantic_selector.clone())
                 .collect::<Vec<_>>()
                 .join(","),
+            body_digest,
             candidate,
         });
     }
 
     // Cross-obligation uniqueness: two old declarations may never map to the
     // same new declaration. Duplicate candidates make BOTH plans ambiguous.
-    let mut claimed: BTreeMap<(String, String), std::collections::BTreeSet<usize>> =
-        BTreeMap::new();
+    let mut claimed: BTreeMap<(String, String), BTreeSet<usize>> = BTreeMap::new();
     for (index, plan) in plans.iter().enumerate() {
         for candidate in &plan.candidate {
             claimed.entry(candidate.clone()).or_default().insert(index);
         }
     }
-    let ambiguous: std::collections::BTreeSet<usize> = claimed
+    let ambiguous: BTreeSet<usize> = claimed
         .values()
         .filter(|owners| owners.len() > 1)
         .flatten()
@@ -241,7 +367,12 @@ pub fn rebind_test_obligations(
     for (index, plan) in plans.into_iter().enumerate() {
         let obligation = &mut contract.proof_obligations[plan.obligation_index];
         if ambiguous.contains(&index) {
-            blocked.push(obligation.id.clone());
+            refuse(
+                &mut refusals,
+                &obligation.id,
+                &plan.old_selector,
+                RebindRefusalCode::CrossObligationAmbiguous,
+            );
             continue;
         }
         if obligation.rebind_evidence_binding(plan.new_binding, plan.basis.clone()) {
@@ -250,34 +381,33 @@ pub fn rebind_test_obligations(
                 old_selector: plan.old_selector,
                 new_selector: plan.new_selector,
                 basis: plan.basis,
+                body_digest: plan.body_digest,
             });
             outcome.updates.push(obligation.clone());
         }
     }
-    outcome.stale = blocked;
+    outcome.refusals = refusals;
+    outcome.stale = outcome
+        .refusals
+        .iter()
+        .map(|refusal| refusal.obligation_id.clone())
+        .collect();
     outcome.stale.sort();
     outcome.stale.dedup();
     outcome
 }
 
-fn inventory(files: &[TestFileDelta], before: bool) -> BTreeMap<String, Vec<Declaration>> {
-    let mut out: BTreeMap<String, Vec<Declaration>> = BTreeMap::new();
-    for file in files {
+fn inventory(files: &[TestFileDelta], before: bool) -> BTreeMap<String, Vec<TestDeclaration>> {
+    let mut out: BTreeMap<String, Vec<TestDeclaration>> = BTreeMap::new();
+    for file in files.iter().take(REVIEW_MAX_CHANGED_FILES) {
         let content = if before { &file.before } else { &file.after };
         let Some(content) = content else {
             continue;
         };
-        let declarations: Vec<Declaration> =
-            faktor_core::contract_compile::rust_test_declarations_for_path(&file.path, content)
-                .into_iter()
-                .map(|declaration| Declaration {
-                    path: file.path.clone(),
-                    selector: declaration.selector,
-                    executable: declaration.executable,
-                    target: declaration.target,
-                    body: declaration.body,
-                })
-                .collect();
+        let Some(adapter) = adapter_for_path(&file.path) else {
+            continue;
+        };
+        let declarations = adapter.declarations(&file.path, content);
         if !declarations.is_empty() {
             out.insert(file.path.clone(), declarations);
         }
@@ -287,23 +417,33 @@ fn inventory(files: &[TestFileDelta], before: bool) -> BTreeMap<String, Vec<Decl
 
 fn rename_edges(
     evidence: &TestRebindEvidence,
-    old: &BTreeMap<String, Vec<Declaration>>,
-    new: &BTreeMap<String, Vec<Declaration>>,
+    old: &BTreeMap<String, Vec<TestDeclaration>>,
+    new: &BTreeMap<String, Vec<TestDeclaration>>,
     substitutions: &[(String, String)],
 ) -> Vec<TestRenameEdge> {
-    let mut edges = evidence.renames.clone();
+    // A proof-grade edge is a STRONG git rename (the production gatherer
+    // asks for >=50% detection) or the unique inventory move below. A weak
+    // similarity pairing is never proof-authoritative, even when a caller
+    // supplies it.
+    let mut edges: Vec<TestRenameEdge> = evidence
+        .renames
+        .iter()
+        .filter(|edge| proof_grade_rename_edge(edge))
+        .take(REVIEW_MAX_CHANGED_FILES * 2)
+        .cloned()
+        .collect();
     // Inventory fallback: a unique deleted test target and a unique added
-    // test target whose declarations map one-to-one is a proven move even
-    // when git cannot pair an untracked destination.
+    // test target whose declarations map one-to-one (proven body identity)
+    // is a proven move even when git cannot pair an untracked destination.
     let deleted: Vec<&String> = old
         .keys()
         .filter(|path| !new.contains_key(*path))
-        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| is_supported_test_path(path))
         .collect();
     let added: Vec<&String> = new
         .keys()
         .filter(|path| !old.contains_key(*path))
-        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| is_supported_test_path(path))
         .collect();
     if deleted.len() == 1 && added.len() == 1 {
         let from = deleted[0];
@@ -323,26 +463,45 @@ fn rename_edges(
     edges
 }
 
+fn proof_grade_rename_edge(edge: &TestRenameEdge) -> bool {
+    if edge.from.is_empty() || edge.to.is_empty() || edge.from == edge.to {
+        return false;
+    }
+    let basis = edge.basis.trim().to_ascii_lowercase();
+    !basis.is_empty()
+        && !basis.contains("1%")
+        && !basis.contains("1pct")
+        && !basis.contains("pct")
+        && !basis.contains("percent")
+        && !basis.contains("weak")
+        && !basis.contains("similarity")
+}
+
 fn declarations_move_uniquely(
-    old: &[Declaration],
-    new: &[Declaration],
+    old: &[TestDeclaration],
+    new: &[TestDeclaration],
     substitutions: &[(String, String)],
 ) -> bool {
-    let mut mapped = 0usize;
+    let mut claimed: BTreeSet<usize> = BTreeSet::new();
     for declaration in old {
-        let matches: Vec<&Declaration> = new
+        let matches: Vec<usize> = new
             .iter()
-            .filter(|candidate| {
-                candidate.executable == declaration.executable
-                    || equivalent_body(declaration, candidate, substitutions)
+            .enumerate()
+            .filter(|(_, candidate)| {
+                body_equivalence_digest(declaration, candidate, substitutions).is_some()
             })
+            .map(|(index, _)| index)
             .collect();
         if matches.len() != 1 {
             return false;
         }
-        mapped += 1;
+        // Two old declarations may never claim the SAME new declaration: the
+        // move is not one-to-one, so it is not proven.
+        if !claimed.insert(matches[0]) {
+            return false;
+        }
     }
-    mapped == old.len() && mapped == new.len()
+    claimed.len() == old.len() && claimed.len() == new.len()
 }
 
 fn binding_targets(binding: &EvidenceBinding) -> Vec<String> {
@@ -355,12 +514,12 @@ fn binding_targets(binding: &EvidenceBinding) -> Vec<String> {
 
 fn resolve_declaration<'a>(
     target: &str,
-    inventory: &'a BTreeMap<String, Vec<Declaration>>,
-) -> Option<&'a Declaration> {
-    let by_selector: Vec<&Declaration> = inventory
+    inventory: &'a BTreeMap<String, Vec<TestDeclaration>>,
+) -> Option<&'a TestDeclaration> {
+    let by_selector: Vec<&TestDeclaration> = inventory
         .values()
         .flatten()
-        .filter(|declaration| declaration.selector == target)
+        .filter(|declaration| declaration.semantic_selector == target)
         .collect();
     if by_selector.len() == 1 {
         return by_selector.first().copied();
@@ -368,17 +527,17 @@ fn resolve_declaration<'a>(
     if by_selector.len() > 1 {
         return None;
     }
-    let by_executable: Vec<&Declaration> = inventory
+    let by_executable: Vec<&TestDeclaration> = inventory
         .values()
         .flatten()
-        .filter(|declaration| declaration.executable == target)
+        .filter(|declaration| declaration.executable_selector == target)
         .collect();
     (by_executable.len() == 1).then(|| by_executable[0])
 }
 
 fn resolve_new_path(
-    declaration: &Declaration,
-    new: &BTreeMap<String, Vec<Declaration>>,
+    declaration: &TestDeclaration,
+    new: &BTreeMap<String, Vec<TestDeclaration>>,
     renames: &[TestRenameEdge],
 ) -> Option<(String, String)> {
     if new.contains_key(&declaration.path) {
@@ -403,37 +562,37 @@ fn resolve_new_path(
 }
 
 fn was_unchanged_elsewhere(
-    old: &Declaration,
-    candidate: &Declaration,
-    inventory: &BTreeMap<String, Vec<Declaration>>,
+    old: &TestDeclaration,
+    candidate: &TestDeclaration,
+    inventory: &BTreeMap<String, Vec<TestDeclaration>>,
     substitutions: &[(String, String)],
 ) -> bool {
-    if candidate.selector == old.selector {
+    if candidate.semantic_selector == old.semantic_selector {
         return false;
     }
     inventory.values().flatten().any(|other| {
-        other.selector != old.selector
-            && other.executable == candidate.executable
-            && equivalent_body(other, candidate, substitutions)
+        other.semantic_selector != old.semantic_selector
+            && other.executable_selector == candidate.executable_selector
+            && body_equivalence_digest(other, candidate, substitutions).is_some()
     })
 }
 
-fn binding_for(declarations: &[&Declaration]) -> EvidenceBinding {
+fn binding_for(declarations: &[&TestDeclaration]) -> EvidenceBinding {
     let mut targets: Vec<String> = Vec::new();
     for declaration in declarations {
         // Semantic selector FIRST: the claim re-point and the ledger's
         // `selector()` identity must name the test, not its executable
         // filter.
-        if !targets.contains(&declaration.selector) {
-            targets.push(declaration.selector.clone());
+        if !targets.contains(&declaration.semantic_selector) {
+            targets.push(declaration.semantic_selector.clone());
         }
-        if declaration.executable != declaration.selector
-            && !targets.contains(&declaration.executable)
+        if declaration.executable_selector != declaration.semantic_selector
+            && !targets.contains(&declaration.executable_selector)
         {
-            targets.push(declaration.executable.clone());
+            targets.push(declaration.executable_selector.clone());
         }
-        if let Some(target) = &declaration.target {
-            if declaration.executable.contains(target) && !targets.contains(target) {
+        if let Some(target) = &declaration.enclosing_target {
+            if declaration.executable_selector.contains(target) && !targets.contains(target) {
                 targets.push(target.clone());
             }
         }
@@ -474,115 +633,73 @@ fn rename_pairs(goal: &str) -> Vec<(String, String)> {
     }
 }
 
-/// TRUE when the candidate body is the old body under the declared rename
-/// pairs (and the test's own rename). Both sides are tokenized, whitespace is
-/// ignored, and string literals are opaque (never rewritten).
-fn equivalent_body(
-    old: &Declaration,
-    new: &Declaration,
+/// TRUE when `new` is the EXACT old executable body under the declared
+/// symbol rename pairs and the test's own proven name mapping. Returns the
+/// digest of the normalized (mapped) body, which is the durable provenance
+/// recorded on the binding update. Any difference in an assertion, fixture
+/// setup, expected-error attribute, literal or control flow refuses.
+fn body_equivalence_digest(
+    old: &TestDeclaration,
+    new: &TestDeclaration,
     substitutions: &[(String, String)],
-) -> bool {
-    if old.body.is_empty() || new.body.is_empty() {
-        return false;
+) -> Option<String> {
+    if old.body_identity.tokens.is_empty() || new.body_identity.tokens.is_empty() {
+        return None;
     }
     let mut map: BTreeMap<&str, &str> = BTreeMap::new();
     for (from, to) in substitutions {
         map.insert(from.as_str(), to.as_str());
     }
-    if old.executable != new.executable {
-        map.insert(new.executable.as_str(), old.executable.as_str());
+    if old.executable_selector != new.executable_selector {
+        map.insert(
+            new.executable_selector.as_str(),
+            old.executable_selector.as_str(),
+        );
+        // Language adapters whose executable selector is qualified
+        // (`Class#method`, `module::test`) also carry the BARE callable name
+        // in the declaration signature; map that too.
+        let old_tail = callable_tail(&old.executable_selector);
+        let new_tail = callable_tail(&new.executable_selector);
+        if old_tail != new_tail {
+            map.insert(new_tail, old_tail);
+        }
+        // A qualified JVM selector carries the enclosing class, which is
+        // also the declared name of constructors/references in the shared
+        // class context.
+        if let (Some((old_class, _)), Some((new_class, _))) = (
+            old.executable_selector.split_once('#'),
+            new.executable_selector.split_once('#'),
+        ) {
+            if old_class != new_class {
+                map.insert(new_class, old_class);
+            }
+        }
     }
-    let old_tokens = tokens(&old.body);
-    let new_tokens = tokens(&new.body)
-        .into_iter()
+    let mapped: Vec<IdentityToken> = new
+        .body_identity
+        .tokens
+        .iter()
         .map(|token| match token {
-            Token::Ident(name) => Token::Ident(
+            IdentityToken::Ident(name) => IdentityToken::Ident(
                 map.get(name.as_str())
                     .map(|mapped| mapped.to_string())
-                    .unwrap_or(name),
+                    .unwrap_or_else(|| name.clone()),
             ),
-            other => other,
+            other => other.clone(),
         })
-        .collect::<Vec<_>>();
-    old_tokens == new_tokens
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
-    Ident(String),
-    Literal(String),
-    Punct(char),
-}
-
-fn tokens(source: &str) -> Vec<Token> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte.is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-        if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            continue;
-        }
-        if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
-            index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        if byte.is_ascii_alphabetic() || byte == b'_' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
-            }
-            out.push(Token::Ident(source[start..index].to_string()));
-            continue;
-        }
-        if byte.is_ascii_digit() {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric()
-                    || bytes[index] == b'_'
-                    || bytes[index] == b'.')
-            {
-                index += 1;
-            }
-            out.push(Token::Literal(source[start..index].to_string()));
-            continue;
-        }
-        if byte == b'"' {
-            let start = index;
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    index = (index + 2).min(bytes.len());
-                    continue;
-                }
-                if bytes[index] == b'"' {
-                    index += 1;
-                    break;
-                }
-                index += 1;
-            }
-            out.push(Token::Literal(source[start..index].to_string()));
-            continue;
-        }
-        out.push(Token::Punct(byte as char));
-        index += 1;
+        .collect();
+    if mapped != old.body_identity.tokens {
+        return None;
     }
-    out
+    Some(old.body_identity.digest.clone())
+}
+
+fn callable_tail(selector: &str) -> &str {
+    selector
+        .rsplit_once('#')
+        .map(|(_, tail)| tail)
+        .or_else(|| selector.rsplit_once("::").map(|(_, tail)| tail))
+        .unwrap_or(selector)
 }
 
 /// A helper used by tests and the persistence validator: a rebind must always
@@ -631,15 +748,17 @@ mod tests {
     const BEFORE: &str = r#"
 #[test]
 fn totals_add_up() {
-    assert_eq!(compute_total(&[10, 20]), 30);
-    assert_eq!(cart_total(&[1, 2, 3]), 6);
+    let items = fixture_items();
+    assert_eq!(compute_total(&items), 30);
+    assert_eq!(cart_total(&items), 30);
 }
 "#;
     const AFTER_SYMBOL_RENAME: &str = r#"
 #[test]
 fn total_cents_adds_up() {
-    assert_eq!(total_cents(&[10, 20]), 30);
-    assert_eq!(cart_total(&[1, 2, 3]), 6);
+    let items = fixture_items();
+    assert_eq!(total_cents(&items), 30);
+    assert_eq!(cart_total(&items), 30);
 }
 "#;
     const GOAL: &str =
@@ -650,6 +769,41 @@ fn total_cents_adds_up() {
             files: vec![delta("tests/cart.rs", before, after)],
             renames: Vec::new(),
         }
+    }
+
+    fn moved_evidence(before: &str, after: &str) -> TestRebindEvidence {
+        TestRebindEvidence {
+            files: vec![
+                delta("tests/cart.rs", Some(before), None),
+                delta("tests/cart_total.rs", None, Some(after)),
+            ],
+            renames: vec![TestRenameEdge {
+                from: "tests/cart.rs".into(),
+                to: "tests/cart_total.rs".into(),
+                basis: "git_rename".into(),
+            }],
+        }
+    }
+
+    fn assert_unresolved(contract: &EngineeringContract, outcome: &TestRebindOutcome) {
+        assert!(outcome.rebinds.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome.stale,
+            vec![contract.proof_obligations[0].id.clone()]
+        );
+        let refusal = outcome
+            .refusal(&contract.proof_obligations[0].id)
+            .expect("a stale obligation carries a typed refusal");
+        assert!(!refusal.old_selector.is_empty());
+        assert!(!refusal.code.as_str().is_empty());
+        assert!(contract.proof_obligations[0].binding_updates.is_empty());
+        assert_eq!(
+            contract.proof_obligations[0].evidence_binding,
+            EvidenceBinding::TestSelectors(vec![
+                "cart::totals_add_up".into(),
+                "totals_add_up".into()
+            ])
+        );
     }
 
     #[test]
@@ -663,7 +817,7 @@ fn total_cents_adds_up() {
         assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
         assert!(outcome.stale.is_empty());
         let obligation = &contract.proof_obligations[0];
-        assert!(obligation.binding_updates.len() == 1);
+        assert_eq!(obligation.binding_updates.len(), 1);
         let update = &obligation.binding_updates[0];
         assert_eq!(
             update.old_binding,
@@ -685,13 +839,17 @@ fn total_cents_adds_up() {
         );
         assert!(update.basis.contains("same_target"));
         assert!(update.basis.contains("match:unique"));
+        assert!(update.basis.contains("body:equivalent"));
+        let record = &outcome.rebinds[0];
+        assert_eq!(record.body_digest.len(), 64);
+        assert!(update.basis.contains(&record.body_digest));
         assert!(obligation.claim.contains("cart::total_cents_adds_up"));
         assert!(rebind_is_fresh(obligation));
         assert_eq!(outcome.updates.len(), 1);
     }
 
     #[test]
-    fn file_rename_with_git_edge_rebinds_the_new_selector() {
+    fn valid_file_rename_with_identical_body_rebinds() {
         let mut contract = contract();
         let evidence = TestRebindEvidence {
             files: vec![
@@ -720,15 +878,226 @@ fn total_cents_adds_up() {
     }
 
     #[test]
+    fn comments_and_trivia_only_still_prove_identical_body_identity() {
+        let reformatted = r#"
+#[test]
+fn totals_add_up()
+{
+    let items = fixture_items( ); // setup comment
+    assert_eq!( compute_total( &items ), 30 );
+    /* second assertion */ assert_eq!( cart_total( &items ), 30 );
+}
+"#;
+        let mut contract = contract();
+        let outcome =
+            rebind_test_obligations(&mut contract, GOAL, &moved_evidence(BEFORE, reformatted));
+        assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
+        assert!(outcome.stale.is_empty());
+    }
+
+    #[test]
+    fn moved_and_renamed_test_with_identical_body_rebinds() {
+        let after = r#"
+#[test]
+fn total_cents_adds_up() {
+    let items = fixture_items();
+    assert_eq!(compute_total(&items), 30);
+    assert_eq!(cart_total(&items), 30);
+}
+"#;
+        let mut contract = contract();
+        let evidence = TestRebindEvidence {
+            files: vec![
+                delta("tests/cart.rs", Some(BEFORE), None),
+                delta("tests/cart_total.rs", None, Some(after)),
+            ],
+            renames: vec![TestRenameEdge {
+                from: "tests/cart.rs".into(),
+                to: "tests/cart_total.rs".into(),
+                basis: "git_rename".into(),
+            }],
+        };
+        let outcome = rebind_test_obligations(
+            &mut contract,
+            "Move the cart test to cart_total.rs and rename its test.",
+            &evidence,
+        );
+        assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
+        match &contract.proof_obligations[0].binding_updates[0].new_binding {
+            EvidenceBinding::TestSelectors(targets) => {
+                assert!(targets.contains(&"cart_total::total_cents_adds_up".to_string()));
+            }
+            other => panic!("expected a test-selector binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moved_unit_test_file_with_identical_body_rebinds() {
+        let unit = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn totals_add_up() {
+        assert_eq!(compute_total(&[10, 20]), 30);
+    }
+}
+"#;
+        let mut contract = EngineeringContract {
+            proof_obligations: vec![EngineeringContract::obligation_bound(
+                "existing test `cart::tests::totals_add_up` passes after the change",
+                faktor_core::contract::ProofEvidenceKind::TestExecution,
+                ContractOrigin::Native,
+                Requirement::Required,
+                EvidenceBinding::TestSelector("cart::tests::totals_add_up".into()),
+                AcceptedStrength::Supported,
+            )],
+            ..Default::default()
+        };
+        let evidence = TestRebindEvidence {
+            files: vec![
+                delta("src/cart.rs", Some(unit), None),
+                delta("src/cart_total.rs", None, Some(unit)),
+            ],
+            renames: vec![TestRenameEdge {
+                from: "src/cart.rs".into(),
+                to: "src/cart_total.rs".into(),
+                basis: "git_rename".into(),
+            }],
+        };
+        let outcome = rebind_test_obligations(
+            &mut contract,
+            "Rename the cart module without changing behavior.",
+            &evidence,
+        );
+        assert_eq!(outcome.rebinds.len(), 1, "{outcome:?}");
+        assert_eq!(
+            contract.proof_obligations[0].evidence_binding,
+            EvidenceBinding::TestSelector("cart_total::tests::totals_add_up".into())
+        );
+    }
+
+    #[test]
+    fn same_name_vacuous_assertion_never_rebinds() {
+        let weakened = r#"
+#[test]
+fn totals_add_up() {
+    assert!(true);
+}
+"#;
+        let mut contract = contract();
+        let outcome =
+            rebind_test_obligations(&mut contract, GOAL, &moved_evidence(BEFORE, weakened));
+        assert_unresolved(&contract, &outcome);
+        assert_eq!(
+            outcome
+                .refusal(&contract.proof_obligations[0].id)
+                .unwrap()
+                .code,
+            RebindRefusalCode::BodyInequivalent
+        );
+    }
+
+    #[test]
+    fn removed_assertion_never_rebinds() {
+        let weakened = r#"
+#[test]
+fn totals_add_up() {
+    let items = fixture_items();
+    let _ = compute_total(&items);
+}
+"#;
+        let mut contract = contract();
+        let outcome =
+            rebind_test_obligations(&mut contract, GOAL, &moved_evidence(BEFORE, weakened));
+        assert_unresolved(&contract, &outcome);
+    }
+
+    #[test]
+    fn fixture_setup_removed_never_rebinds() {
+        let weakened = r#"
+#[test]
+fn totals_add_up() {
+    assert_eq!(compute_total(&[10, 20]), 30);
+    assert_eq!(cart_total(&[10, 20]), 30);
+}
+"#;
+        let mut contract = contract();
+        let outcome =
+            rebind_test_obligations(&mut contract, GOAL, &moved_evidence(BEFORE, weakened));
+        assert_unresolved(&contract, &outcome);
+    }
+
+    #[test]
+    fn expected_error_to_expected_success_never_rebinds() {
+        let before = r#"
+#[test]
+#[should_panic(expected = "division by zero")]
+fn totals_add_up() {
+    assert_eq!(compute_total(&[10, 20]), 30);
+}
+"#;
+        let after = r#"
+#[test]
+fn totals_add_up() {
+    assert_eq!(compute_total(&[10, 20]), 30);
+}
+"#;
+        let mut contract = contract();
+        let outcome = rebind_test_obligations(&mut contract, GOAL, &moved_evidence(before, after));
+        assert_unresolved(&contract, &outcome);
+    }
+
+    #[test]
+    fn one_percent_similarity_rewrite_with_same_name_never_rebinds() {
+        let before = r#"
+#[test]
+fn totals_add_up() {
+    let items = fixture_items();
+    assert_eq!(compute_total(&items), 30);
+    assert_eq!(cart_total(&items), 30);
+}
+"#;
+        let after = r#"
+#[test]
+fn totals_add_up() {
+    let rows = load_rows();
+    let mut seen = 0usize;
+    for row in rows {
+        seen += row.weight;
+    }
+    assert!(seen > 0);
+}
+"#;
+        let mut contract = contract();
+        let evidence = TestRebindEvidence {
+            files: vec![
+                delta("tests/cart.rs", Some(before), None),
+                delta("tests/cart_total.rs", None, Some(after)),
+            ],
+            renames: vec![TestRenameEdge {
+                from: "tests/cart.rs".into(),
+                to: "tests/cart_total.rs".into(),
+                basis: "git_rename".into(),
+            }],
+        };
+        let outcome = rebind_test_obligations(&mut contract, GOAL, &evidence);
+        assert_unresolved(&contract, &outcome);
+    }
+
+    #[test]
     fn ambiguous_or_duplicate_candidates_stay_unresolved_typed() {
         let duplicate = r#"
 #[test]
 fn total_cents_adds_up() {
-    assert_eq!(total_cents(&[10, 20]), 30);
+    let items = fixture_items();
+    assert_eq!(total_cents(&items), 30);
+    assert_eq!(cart_total(&items), 30);
 }
 #[test]
 fn total_cents_also_adds_up() {
-    assert_eq!(total_cents(&[10, 20]), 30);
+    let items = fixture_items();
+    assert_eq!(total_cents(&items), 30);
+    assert_eq!(cart_total(&items), 30);
 }
 "#;
         let mut contract = contract();
@@ -742,14 +1111,14 @@ fn total_cents_also_adds_up() {
             outcome.stale,
             vec![contract.proof_obligations[0].id.clone()]
         );
-        assert!(contract.proof_obligations[0].binding_updates.is_empty());
         assert_eq!(
-            contract.proof_obligations[0].evidence_binding,
-            EvidenceBinding::TestSelectors(vec![
-                "cart::totals_add_up".into(),
-                "totals_add_up".into()
-            ])
+            outcome
+                .refusal(&contract.proof_obligations[0].id)
+                .unwrap()
+                .code,
+            RebindRefusalCode::AmbiguousCandidate
         );
+        assert!(contract.proof_obligations[0].binding_updates.is_empty());
     }
 
     #[test]
@@ -762,6 +1131,13 @@ fn total_cents_also_adds_up() {
         );
         assert!(outcome.rebinds.is_empty());
         assert_eq!(outcome.stale.len(), 1);
+        assert_eq!(
+            outcome
+                .refusal(&contract.proof_obligations[0].id)
+                .unwrap()
+                .code,
+            RebindRefusalCode::TaskNotRename
+        );
         assert!(contract.proof_obligations[0].binding_updates.is_empty());
     }
 
@@ -770,7 +1146,9 @@ fn total_cents_also_adds_up() {
         let changed = r#"
 #[test]
 fn total_cents_adds_up() {
-    assert_eq!(total_cents(&[10, 20]), 999);
+    let items = fixture_items();
+    assert_eq!(total_cents(&items), 999);
+    assert_eq!(cart_total(&items), 30);
 }
 "#;
         let mut contract = contract();
@@ -778,6 +1156,47 @@ fn total_cents_adds_up() {
             rebind_test_obligations(&mut contract, GOAL, &evidence(Some(BEFORE), Some(changed)));
         assert!(outcome.rebinds.is_empty());
         assert_eq!(outcome.stale.len(), 1);
+    }
+
+    #[test]
+    fn inventory_move_requires_one_to_one_declaration_identity() {
+        let before = r#"
+#[test]
+fn totals_add_up() {
+    assert_eq!(compute_total(&[10, 20]), 30);
+}
+#[test]
+fn totals_add_up_again() {
+    assert_eq!(compute_total(&[10, 20]), 30);
+}
+"#;
+        let after = r#"
+#[test]
+fn total_cents_adds_up() {
+    assert_eq!(total_cents(&[10, 20]), 30);
+}
+#[test]
+fn unrelated_test() {
+    assert!(other());
+}
+"#;
+        let mut contract = contract();
+        let evidence = TestRebindEvidence {
+            files: vec![
+                delta("tests/cart.rs", Some(before), None),
+                delta("tests/cart_total.rs", None, Some(after)),
+            ],
+            renames: Vec::new(),
+        };
+        let outcome = rebind_test_obligations(&mut contract, GOAL, &evidence);
+        assert!(outcome.rebinds.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome
+                .refusal(&contract.proof_obligations[0].id)
+                .unwrap()
+                .code,
+            RebindRefusalCode::NoProvenMove
+        );
     }
 
     #[test]
@@ -796,5 +1215,9 @@ fn total_cents_adds_up() {
         );
         assert!(outcome.rebinds.is_empty(), "{outcome:?}");
         assert_eq!(outcome.stale.len(), 2);
+        assert!(outcome
+            .refusals
+            .iter()
+            .all(|refusal| refusal.code == RebindRefusalCode::CrossObligationAmbiguous));
     }
 }

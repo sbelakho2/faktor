@@ -117,6 +117,28 @@ async fn catalog_probe_is_bounded_and_reports_typed_failure_not_ready() {
 }
 
 #[tokio::test]
+async fn mcp_connect_on_a_stdio_record_is_a_typed_transport_mismatch() {
+    let rig = Rig::new().await;
+    let (status, saved) = rig
+        .post(
+            "/native/mcp/servers",
+            json!({
+                "id": "local", "name": "Local", "command": "npx",
+                "args": ["-y", "some-mcp"], "env": [], "trusted": true,
+                "enabled": true, "transport": "stdio"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, body) = rig
+        .post("/native/mcp/servers/local/connect", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("mcp_transport_mismatch"));
+    assert!(!body.to_string().contains("mcp_remote_unsupported"));
+}
+
+#[tokio::test]
 async fn mcp_auth_token_never_round_trips_and_bounds_are_typed() {
     let rig = Rig::new().await;
     let (status, saved) = rig
@@ -146,6 +168,17 @@ async fn mcp_auth_token_never_round_trips_and_bounds_are_typed() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read["hasToken"], true);
     assert!(!read.to_string().contains("sk-secret-token"));
+    let (status, servers) = rig.get("/native/mcp/servers").await;
+    assert_eq!(status, StatusCode::OK, "{servers}");
+    let remote = servers["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["record"]["id"] == "remote")
+        .expect("saved remote server");
+    assert_eq!(remote["remoteTransport"]["supported"], true);
+    assert_eq!(remote["remoteTransport"]["configured"], true);
+    assert_eq!(remote["record"]["transport"], "streamable_http");
     let (status, revoked) = rig
         .post("/native/mcp/servers/remote/oauth/revoke", json!({}))
         .await;

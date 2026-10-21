@@ -446,7 +446,7 @@ impl AgentRuntime {
         let mut seed = match handle.get_task(task_id)? {
             Some(t) => t,
             None => {
-                let goal = truncate(&handle.title()?, 200);
+                let goal = projected_goal_text(&handle).unwrap_or_default();
                 handle.create_task(faktor_session::Task {
                     task_id,
                     session_id: session,
@@ -1079,9 +1079,11 @@ impl AgentRuntime {
                     .collect();
             }
         }
-        if ledger.goal.is_empty() {
-            ledger.goal = truncate(&handle.title()?, 200);
-        }
+        // The prompt is the authority for the goal: rebuild the redacted
+        // projection (never a raw row secret, never a generic title while a
+        // meaningful prompt exists). With no prompt, the title remains the
+        // only available label.
+        initialize_durable_goal(handle, &mut ledger)?;
         Ok(ledger)
     }
 
@@ -1156,7 +1158,7 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         ledger: &mut TaskLedger,
     ) -> faktor_core::Result<()> {
-        let task = match self.session_task(handle)? {
+        let mut task = match self.session_task(handle)? {
             Some(t) => t,
             None => {
                 // First sighting: create from the durable goal so every
@@ -1170,7 +1172,7 @@ impl AgentRuntime {
                 let created = handle.create_task(Task {
                     task_id,
                     session_id: handle.id(),
-                    goal: ledger.goal.clone(),
+                    goal: durable_goal_text(&ledger.goal),
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
                     attachments: Vec::new(),
@@ -1192,6 +1194,34 @@ impl AgentRuntime {
                 return Ok(());
             }
         };
+        // A row created before the prompt was available (the admission-time
+        // budget seed) carries the generic session title, and a legacy row
+        // may carry a raw credential. The drive-start projection is the
+        // authority: replace a label/secret goal with the redacted objective
+        // BEFORE the baseline contract is compiled from it.
+        let title = handle.title().unwrap_or_default();
+        let goal_is_label = task.goal.trim().is_empty() || task.goal == title;
+        let goal_has_secret = contains_secret(&task.goal);
+        if !task.state.is_terminal() && (goal_is_label || goal_has_secret) {
+            let replacement = if !ledger.goal.is_empty() && (goal_is_label || goal_has_secret) {
+                Some(ledger.goal.clone())
+            } else if goal_has_secret {
+                Some(durable_goal_text(&task.goal))
+            } else {
+                None
+            };
+            if let Some(goal) = replacement.filter(|goal| goal != &task.goal) {
+                task = handle
+                    .update_task(
+                        task.task_id,
+                        TaskPatch {
+                            goal: Some(goal),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or(task);
+            }
+        }
         // Heal spend from durable sources (a crash between a provider call
         // and the last gate sync cannot lose spend) and reflect the row's
         // state in the memory facts — only when absent or stale.
@@ -1305,7 +1335,7 @@ impl AgentRuntime {
                 handle.create_task(Task {
                     task_id,
                     session_id: handle.id(),
-                    goal: ledger.goal.clone(),
+                    goal: durable_goal_text(&ledger.goal),
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
                     attachments: Vec::new(),

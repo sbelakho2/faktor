@@ -30,6 +30,11 @@ pub enum ErrorKind {
     Oversized,
     /// Provider rate limiting; retry after backoff.
     RateLimited,
+    /// The source user prompt had no meaningful non-secret content after
+    /// redaction, so no durable engineering goal exists. Carries the source
+    /// message identity; never a retryable condition and never replaced by
+    /// a generic session title.
+    GoalUnavailableAfterRedaction { source_message_id: i64 },
     /// Scheduler detected a deadlock/starvation cycle.
     Deadlock,
     /// Anything else.
@@ -93,6 +98,17 @@ impl Error {
 
     pub fn oversized(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Oversized, message)
+    }
+
+    /// The typed `goal_unavailable_after_redaction` refusal: the prompt
+    /// carried no meaningful non-secret objective.
+    pub fn goal_unavailable_after_redaction(source_message_id: i64) -> Self {
+        Self::new(
+            ErrorKind::GoalUnavailableAfterRedaction { source_message_id },
+            format!(
+                "goal_unavailable_after_redaction: source message {source_message_id} carries no meaningful non-secret objective"
+            ),
+        )
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

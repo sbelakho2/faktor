@@ -188,6 +188,12 @@ pub enum ProcessOwner {
         workspace: WorkspaceId,
         operation: u64,
     },
+    /// One deterministic engineering solver run (KiCad CLI, ngspice, Gmsh,
+    /// OpenFOAM, ...). `operation` is the solver operation id so a caller can
+    /// reap exactly one engineering tree without touching other children.
+    Engineering {
+        operation: u64,
+    },
     Workspace(WorkspaceId),
     Daemon,
 }

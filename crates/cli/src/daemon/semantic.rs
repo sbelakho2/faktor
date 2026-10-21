@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faktor_core::{CancellationToken, WorkspaceId};
-use faktor_fs::WorkspaceHandle;
+use faktor_fs::{WorkspaceFileService, WorkspaceHandle};
 use faktor_git::WorktreeManager;
 use faktor_index::{IndexService, Symbol as IndexSymbol, SymbolKind as IndexSymbolKind};
 use faktor_lsp::{
@@ -55,6 +55,11 @@ pub struct SemanticSources {
     pub session: Arc<SessionManager>,
     pub supervisor: Arc<ProcessSupervisor>,
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// The daemon's ONE workspace watch service (shared with the index).
+    /// The impact graph subscribes to its event tap, so an out-of-band edit
+    /// advances the whole-workspace material generation even when the query
+    /// named a different file.
+    pub workspaces: Option<Arc<WorkspaceFileService>>,
     /// The daemon's ONE workspace-scoped language-server manager. The
     /// semantic fallback and the native diagnostics/code-action routes share
     /// this instance, so one workspace never spawns two servers.
@@ -77,7 +82,7 @@ impl SemanticSources {
             self.lsp.clone(),
             self.session.clone(),
         ));
-        let mut fallback = GenericSemanticFallback::default()
+        let fallback = GenericSemanticFallback::default()
             .with_lsp(lsp)
             .with_tree_sitter(Arc::new(DaemonTreeSitterMetadata::new(
                 self.session.clone(),
@@ -90,8 +95,14 @@ impl SemanticSources {
             .with_verification(Arc::new(DaemonVerificationMetadata::new(
                 self.session.clone(),
                 self.supervisor.clone(),
-            )))
-            .with_impact(Arc::new(crate::impact::WorkspaceImpact::new(resolver)));
+            )));
+        let impact = match &self.workspaces {
+            Some(workspaces) => {
+                crate::impact::WorkspaceImpact::with_workspaces(resolver, workspaces.clone())
+            }
+            None => crate::impact::WorkspaceImpact::new(resolver),
+        };
+        let mut fallback = fallback.with_impact(Arc::new(impact));
         if let Some(index) = &self.index {
             fallback = fallback.with_index(Arc::new(DaemonIndexMetadata::new(
                 index.clone(),

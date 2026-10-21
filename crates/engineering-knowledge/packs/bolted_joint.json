@@ -1,0 +1,536 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "bolted-joint",
+  "version": "1.0.0",
+  "title": "Bolted joint torque-preload starter",
+  "domain": "machine_design",
+  "provenance": {
+    "kind": "reference",
+    "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+    "edition": "11th",
+    "locator": "Chapter 8, threaded fasteners",
+    "note": "Starter pack authored from general machine-design practice; application-specific values must come from revision-bound sources."
+  },
+  "terminology": [
+    {
+      "id": "term-preload",
+      "term": "preload",
+      "definition": "The clamp force established in a bolted joint by tightening, before external service load is applied.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8",
+        "note": null
+      }
+    },
+    {
+      "id": "term-nut-factor",
+      "term": "nut factor K",
+      "definition": "An empirical dimensionless coefficient lumping thread and underhead friction and geometry into the torque-preload relation T = K F d. It is condition-specific, not a material constant.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Bickford, An Introduction to the Design and Behavior of Bolted Joints",
+        "edition": "4th",
+        "locator": "torque-tension relationships",
+        "note": "The exact K value must come from the joint's test or a qualified source, not from a default."
+      }
+    },
+    {
+      "id": "term-tensile-stress-area",
+      "term": "tensile stress area",
+      "definition": "The effective thread cross-section used to convert bolt axial force to nominal tensile stress.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8, tensile stress area",
+        "note": null
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-torque-preload",
+      "name": "Torque-preload with explicit nut-factor scatter",
+      "equation_ids": [
+        "eq-torque-preload",
+        "eq-tensile-stress-area",
+        "eq-bolt-stress"
+      ],
+      "assumption_ids": [
+        "asm-k-lumps-friction",
+        "asm-quasi-static-tightening",
+        "asm-no-embedment-relaxation"
+      ],
+      "validity_domain_ids": [
+        "val-k-domain",
+        "val-elastic-regime"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8, torque-preload relation",
+        "note": "The model is a closed-form scalar relation; uncertainty in K is propagated explicitly."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-torque-preload",
+      "expression": "T = K * F * d",
+      "dimensional_signature": "torque = dimensionless * force * length",
+      "variables": [
+        {
+          "symbol": "T",
+          "description": "applied tightening torque",
+          "dimension": "M L^2 T^-2"
+        },
+        {
+          "symbol": "K",
+          "description": "condition-specific nut factor",
+          "dimension": "1"
+        },
+        {
+          "symbol": "F",
+          "description": "resulting clamp force",
+          "dimension": "M L T^-2"
+        },
+        {
+          "symbol": "d",
+          "description": "nominal bolt diameter",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8, torque-preload relation",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-tensile-stress-area",
+      "expression": "A_t = (pi / 4) * (d - 0.9382 * p)^2",
+      "dimensional_signature": "area = length^2",
+      "variables": [
+        {
+          "symbol": "A_t",
+          "description": "tensile stress area",
+          "dimension": "L^2"
+        },
+        {
+          "symbol": "d",
+          "description": "nominal major diameter",
+          "dimension": "L"
+        },
+        {
+          "symbol": "p",
+          "description": "thread pitch",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASME B1.1 Unified Inch Screw Threads",
+        "edition": "2019",
+        "locator": "tensile stress area definition",
+        "note": "Metadata only; use the licensed standard text for authoritative clauses."
+      }
+    },
+    {
+      "id": "eq-bolt-stress",
+      "expression": "sigma = F / A_t",
+      "dimensional_signature": "pressure = force / area",
+      "variables": [
+        {
+          "symbol": "sigma",
+          "description": "nominal bolt tensile stress",
+          "dimension": "M L^-1 T^-2"
+        },
+        {
+          "symbol": "F",
+          "description": "clamp force",
+          "dimension": "M L T^-2"
+        },
+        {
+          "symbol": "A_t",
+          "description": "tensile stress area",
+          "dimension": "L^2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8, bolt stress",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-k-lumps-friction",
+      "statement": "Thread friction, underhead friction and thread geometry are lumped into the single condition-specific nut factor K.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Bickford, An Introduction to the Design and Behavior of Bolted Joints",
+        "edition": "4th",
+        "locator": "torque-tension relationships",
+        "note": "Lubricant, coating, surface finish and re-use must match the K source."
+      }
+    },
+    {
+      "id": "asm-quasi-static-tightening",
+      "statement": "Tightening is quasi-static and the reported torque is the torque actually delivered to the fastener.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "ISO 16047 torque/clamp force testing practice",
+        "edition": null,
+        "locator": "test conditions",
+        "note": "Dynamic torque, tool losses and torque-rate effects must be measured, not assumed."
+      }
+    },
+    {
+      "id": "asm-no-embedment-relaxation",
+      "statement": "Embedment, creep and relaxation after tightening are not modeled unless a separate time-dependent analysis is supplied.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "VDI 2230 Part 1 bolted joint calculation",
+        "edition": null,
+        "locator": "joint behavior assumptions",
+        "note": "Missing relaxation data remains unknown; it is not zero."
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-k-domain",
+      "statement": "The nut factor K is valid only inside the range established by the exact joint condition and test source. K outside that range invalidates the preload result.",
+      "temperature": null,
+      "exclusions": [
+        "uncalibrated torque tools",
+        "changed lubricant or coating",
+        "re-used fasteners outside the qualified condition"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 16047 Fasteners - Torque/clamp force testing",
+        "edition": "2005",
+        "locator": "test-condition definition",
+        "note": null
+      }
+    },
+    {
+      "id": "val-elastic-regime",
+      "statement": "The stress conversion is a nominal elastic estimate; yielding, thread stripping and local plasticity require a different model.",
+      "temperature": null,
+      "exclusions": [
+        "gross yielding",
+        "thread stripping",
+        "creep or relaxation regime"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-proof-strength",
+      "property": "bolt proof strength",
+      "authority": "Manufacturer datasheet plus ISO 898-1 property class, revision-bound",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 898-1 Mechanical properties of fasteners",
+        "edition": "2013",
+        "locator": "property classes",
+        "note": "Minimum proof strength is not inferred from a generic material name."
+      }
+    },
+    {
+      "id": "prop-nut-factor",
+      "property": "nut factor K",
+      "authority": "Joint-specific torque/clamp-force test or qualified supplier data, revision-bound",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 16047 Fasteners - Torque/clamp force testing",
+        "edition": "2005",
+        "locator": "test method",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-thread-geometry",
+      "property": "thread pitch and diameter",
+      "authority": "Controlled drawing or licensed thread standard, revision-bound",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ASME B1.1 Unified Inch Screw Threads",
+        "edition": "2019",
+        "locator": "thread dimensions",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-check-proof",
+      "rule": "Compare the calculated nominal bolt stress with the revision-bound proof strength and report utilization.",
+      "check": "sigma <= proof_strength * allowable_utilization",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8, bolt strength",
+        "note": "The allowable utilization is an explicit design decision."
+      }
+    },
+    {
+      "id": "rule-k-provenance",
+      "rule": "Never use a default K without a condition-specific provenance and validity range.",
+      "check": "K source revision and validity range are present",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Bickford, An Introduction to the Design and Behavior of Bolted Joints",
+        "edition": "4th",
+        "locator": "torque-tension scatter",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-tool-calibration",
+      "rule": "Account for torque-tool calibration and delivered-torque uncertainty separately from K scatter.",
+      "check": "torque uncertainty has a calibration provenance",
+      "severity": "recommended",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "ISO 16047 torque/clamp force testing",
+        "edition": "2005",
+        "locator": "test equipment",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-lubrication-control",
+      "rule": "Control and record lubricant, coating, thread condition and washer condition because they change K.",
+      "check": "assembly record matches the K test condition",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "VDI 2230 Part 1 bolted joint calculation",
+        "edition": null,
+        "locator": "assembly condition",
+        "note": null
+      }
+    },
+    {
+      "id": "mfg-torque-traceability",
+      "rule": "Use calibrated torque equipment and lot-traceable fasteners for safety-relevant joints.",
+      "check": "tool calibration and fastener lot are recorded",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "ISO 16047 torque/clamp force testing",
+        "edition": "2005",
+        "locator": "test equipment",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-overpreload",
+      "mode": "bolt overload or yield during tightening",
+      "cause": "torque too high for the actual K, thread friction lower than assumed, or proof strength lower than assumed",
+      "detection": "preload measurement, torque-angle signature, dimensional inspection after yield",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-underpreload",
+      "mode": "insufficient clamp force, loosening or fatigue",
+      "cause": "torque too low, high friction, embedment or relaxation",
+      "detection": "preload audit, vibration test, joint movement inspection",
+      "provenance": {
+        "kind": "reference",
+        "citation": "VDI 2230 Part 1 bolted joint calculation",
+        "edition": null,
+        "locator": "joint failure modes",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-scatter",
+      "signature": "preload scatter far wider than torque-tool uncertainty",
+      "indicates": "K variation from friction, lubrication or thread condition; do not average it away",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 16047 Fasteners - Torque/clamp force testing",
+        "edition": "2005",
+        "locator": "scatter reporting",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-torque-clamp",
+      "method": "Torque/clamp-force test with the production joint condition",
+      "measures": "K distribution, clamp force, friction condition",
+      "standard_ref": "ISO 16047:2005",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 16047 Fasteners - Torque/clamp force testing",
+        "edition": "2005",
+        "locator": "test procedure",
+        "note": "Licensed text is not reproduced; use the standard through a licensed store."
+      }
+    },
+    {
+      "id": "test-ultrasonic-preload",
+      "method": "Ultrasonic bolt elongation measurement",
+      "measures": "installed preload after tightening",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Ultrasonic bolt-load measurement practice",
+        "edition": null,
+        "locator": "field measurement",
+        "note": "Requires material-specific acoustic calibration; unknown calibration stays unavailable."
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-iso-898-1",
+      "standard": "ISO 898-1:2013",
+      "scope": "mechanical properties of fasteners made of carbon and alloy steel",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 898-1:2013",
+        "edition": "2013",
+        "locator": "title and scope metadata",
+        "note": "Licensed standard text must be obtained through a licensed store or connector."
+      }
+    },
+    {
+      "id": "std-iso-16047",
+      "standard": "ISO 16047:2005",
+      "scope": "torque/clamp force testing of fasteners",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 16047:2005",
+        "edition": "2005",
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    },
+    {
+      "id": "std-vdi-2230",
+      "standard": "VDI 2230 Part 1",
+      "scope": "systematic calculation of high-duty bolted joints",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "VDI 2230 Part 1",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-torque-100",
+      "description": "A 12 mm bolt tightened to 100 N*m with K = 0.2 produces a clamp force from T/(K d).",
+      "inputs": [
+        {
+          "name": "torque",
+          "value": 100.0,
+          "unit": "N*m",
+          "note": "applied tightening torque"
+        },
+        {
+          "name": "nut_factor",
+          "value": 0.2,
+          "unit": "1",
+          "note": "condition-specific value supplied by the case"
+        },
+        {
+          "name": "nominal_diameter",
+          "value": 12.0,
+          "unit": "mm",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "preload",
+          "value": 41666.6666666667,
+          "unit": "N",
+          "tolerance": 0.001,
+          "note": "T/(K d), no stress-area assumption involved"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form evaluation of T = K F d",
+        "edition": null,
+        "locator": "worked starter case",
+        "note": "The numeric value follows from the equation and the supplied inputs; it is not a property claim."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-torque-is-preload",
+      "claim": "A torque value fixes preload independently of friction.",
+      "refutation": "T = K F d makes preload inversely proportional to K. Doubling K halves preload for the same torque; K must be measured for the actual joint condition.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Shigley's Mechanical Engineering Design, 11th edition",
+        "edition": "11th",
+        "locator": "Chapter 8",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-unrealistic-k",
+      "trap": "Using an unrealistically low K (for example 0.02) in T = K F d to obtain a dramatic preload.",
+      "why_shallow_fails": "The arithmetic looks correct, but the result is outside the validity of any realistic joint condition and implies an impossible friction state.",
+      "guard": "Require a K validity range with provenance; refuse the analysis when the supplied K lies outside it.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "ISO 16047 torque/clamp force testing",
+        "edition": "2005",
+        "locator": "K scatter and test conditions",
+        "note": null
+      }
+    }
+  ]
+}

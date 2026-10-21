@@ -2235,8 +2235,9 @@ mod scans {
     ///   command's short-lived supervisor (its own CAS).
     /// - `ProcessSupervisor::try_shared`: the documented STANDALONE entries
     ///   (index `open`, hooks `try_new`, verify executor/inventory, the
-    ///   doctor probe) — fallible typed constructors, never a panic; the
-    ///   daemon graph injects its supervisor instead.
+    ///   doctor probe, and the impact graph's Gradle model probe when the
+    ///   caller injects no supervisor) — fallible typed constructors, never a
+    ///   panic; the daemon graph injects its supervisor instead.
     ///
     /// A new (or stale) site anywhere is a red test, never a review nit.
     /// Out-of-line `#[cfg(test)] mod` bodies are skipped (test-only by
@@ -2290,6 +2291,7 @@ mod scans {
             &[
                 ("crates/hooks/src/lib.rs", 1),
                 ("crates/impact/src/manifest.rs", 1),
+                ("crates/impact/src/topology.rs", 1),
                 ("crates/index/src/service/mod.rs", 1),
                 ("crates/verify/src/exec.rs", 1),
                 ("crates/verify/src/inventory.rs", 1),
@@ -5581,7 +5583,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
              the token into the connector SecretString at the same boundary, never stored.",
         ),
         (
-            "crates/server/src/native/foundation_ext.rs",
+            "crates/server/src/native/mcp_surface.rs",
             "NativeMcpAuthBody",
             "MCP OAuth callback body: the access token is moved into the secret vault \
              (SecretVault) in the same handler and never persisted or echoed in plaintext.",

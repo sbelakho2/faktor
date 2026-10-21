@@ -2767,7 +2767,7 @@ impl AgentRuntime {
         // an existing row is patched under the transaction's revision CAS.
         let create = if existing.is_none() {
             let now = handle.now_ms();
-            let goal = truncate(&handle.title()?, 200);
+            let goal = crate::runtime::projected_goal_text(&handle).unwrap_or_default();
             Some(Task {
                 task_id,
                 session_id: session,

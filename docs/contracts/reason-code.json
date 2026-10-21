@@ -78,6 +78,11 @@
       "name": "ProofObligationDisproven",
       "wire": "proof_obligation_disproven",
       "code": "proof_obligation_disproven"
+    },
+    {
+      "name": "ProviderOutputLimitExceeded",
+      "wire": "provider_output_limit_exceeded",
+      "code": "provider_output_limit_exceeded"
     }
   ]
 }

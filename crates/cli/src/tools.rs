@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_agent::{
-    BoardToolGateway, FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx,
+    BoardToolGateway, FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
@@ -1365,6 +1365,16 @@ impl SessionBoardGateway {
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("board session {session}")))
     }
+}
+
+/// Register the coordination-board tools over the daemon's session authority.
+pub(crate) fn register_board_tools(
+    registry: &mut ToolRegistry,
+    sessions: Arc<faktor_session::SessionManager>,
+) {
+    let gateway = Arc::new(SessionBoardGateway::new(sessions));
+    registry.register(faktor_agent::board_post_tool(gateway.clone()));
+    registry.register(faktor_agent::board_read_tool(gateway));
 }
 
 impl BoardToolGateway for SessionBoardGateway {

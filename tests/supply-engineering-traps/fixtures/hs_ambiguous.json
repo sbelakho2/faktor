@@ -1,0 +1,61 @@
+{
+  "facts": {
+    "description": "Aluminium electrolytic capacitor",
+    "composition": [
+      { "material": "aluminium", "share_ppm": 600000 },
+      { "material": "electrolyte", "share_ppm": 300000 }
+    ],
+    "function": "energy storage and filtering",
+    "essential_character": "aluminium electrolytic element"
+  },
+  "candidates": [
+    {
+      "code": "853222",
+      "description": "Aluminium electrolytic capacitors",
+      "criteria": [
+        { "criterion": "composition_at_least", "material": "aluminium", "min_ppm": 500000 },
+        { "criterion": "function_contains", "text": "energy storage" }
+      ],
+      "gir": [
+        {
+          "rule": "g1",
+          "note": "GIR 1 selects the heading whose terms describe the article",
+          "provenance": {
+            "source": "public_tariff",
+            "evidence": { "id": "fixture-gir-1a", "revision": 1, "digest": "fixture-a" },
+            "captured_on": 20000,
+            "method": "benchmark fixture tariff note",
+            "conditions": ["hypothetical tariff revision"],
+            "falsifier": "a binding ruling to the contrary"
+          }
+        }
+      ],
+      "evidence": { "id": "fixture-hs-853222", "revision": 1, "digest": "fixture-b" },
+      "revision": 1
+    },
+    {
+      "code": "853229",
+      "description": "Other electrical capacitors",
+      "criteria": [
+        { "criterion": "composition_at_least", "material": "aluminium", "min_ppm": 500000 },
+        { "criterion": "function_contains", "text": "filtering" }
+      ],
+      "gir": [
+        {
+          "rule": "g1",
+          "note": "GIR 1 also supports the residual capacitor heading on the supplied function text",
+          "provenance": {
+            "source": "public_tariff",
+            "evidence": { "id": "fixture-gir-1b", "revision": 1, "digest": "fixture-c" },
+            "captured_on": 20000,
+            "method": "benchmark fixture tariff note",
+            "conditions": ["hypothetical tariff revision"],
+            "falsifier": "a binding ruling to the contrary"
+          }
+        }
+      ],
+      "evidence": { "id": "fixture-hs-853229", "revision": 1, "digest": "fixture-d" },
+      "revision": 1
+    }
+  ]
+}

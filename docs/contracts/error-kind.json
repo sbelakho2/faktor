@@ -65,6 +65,11 @@
       "retryable": true
     },
     {
+      "name": "GoalUnavailableAfterRedaction",
+      "wire": "goal_unavailable_after_redaction",
+      "retryable": false
+    },
+    {
       "name": "Deadlock",
       "wire": "deadlock",
       "retryable": true

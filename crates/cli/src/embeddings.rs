@@ -127,15 +127,16 @@ fn map_provider_error(e: ProviderError) -> Error {
         ProviderErrorKind::Timeout => ErrorKind::Timeout,
         ProviderErrorKind::RateLimited => ErrorKind::RateLimited,
         ProviderErrorKind::Cancelled => ErrorKind::Cancelled,
-        ProviderErrorKind::BadRequest | ProviderErrorKind::Auth | ProviderErrorKind::Server => {
-            ErrorKind::Provider {
-                code: e
-                    .code
-                    .clone()
-                    .unwrap_or_else(|| format!("{:?}", e.kind).to_lowercase()),
-                retryable: e.retryable,
-            }
-        }
+        ProviderErrorKind::BadRequest
+        | ProviderErrorKind::Auth
+        | ProviderErrorKind::Server
+        | ProviderErrorKind::OutputLimitExceeded => ErrorKind::Provider {
+            code: e
+                .code
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", e.kind).to_lowercase()),
+            retryable: e.retryable,
+        },
         ProviderErrorKind::Malformed => ErrorKind::Malformed,
     };
     let mut mapped = Error::new(kind, format!("embeddings: {}", e.message));

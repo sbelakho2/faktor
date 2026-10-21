@@ -783,6 +783,90 @@ dependencies = [
 ]
 
 [[package]]
+name = "engineering-cad"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "engineering-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "engineering-units",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "engineering-eda"
+version = "0.1.0"
+dependencies = [
+ "engineering-units",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "engineering-knowledge"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "engineering-core",
+ "engineering-units",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "engineering-models"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "engineering-core",
+ "engineering-knowledge",
+ "engineering-units",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "engineering-solvers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "engineering-core",
+ "engineering-eda",
+ "engineering-units",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "engineering-units"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -857,6 +941,7 @@ dependencies = [
 name = "faktor-agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "faktor-cas",
  "faktor-context",
@@ -869,6 +954,7 @@ dependencies = [
  "faktor-instructions",
  "faktor-learning",
  "faktor-memory",
+ "faktor-openai",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",
@@ -1007,6 +1093,14 @@ dependencies = [
  "faktor-session",
  "faktor-snapshot",
  "faktor-store",
+ "faktor-supply-core",
+ "faktor-supply-cost",
+ "faktor-supply-engineering",
+ "faktor-supply-execution",
+ "faktor-supply-logistics",
+ "faktor-supply-planning",
+ "faktor-supply-quality",
+ "faktor-supply-supplier",
  "faktor-terminal",
  "faktor-test-mocks",
  "faktor-updater",
@@ -1394,6 +1488,8 @@ version = "0.1.0"
 dependencies = [
  "faktor-cas",
  "faktor-core",
+ "faktor-provider",
+ "faktor-security",
  "faktor-terminal",
  "faktor-test-mocks",
  "futures",
@@ -1404,6 +1500,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1744,6 +1841,109 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-supply-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-cost"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-engineering"
+version = "0.1.0"
+dependencies = [
+ "engineering-core",
+ "engineering-knowledge",
+ "engineering-units",
+ "faktor-supply-core",
+ "faktor-supply-cost",
+ "faktor-supply-execution",
+ "faktor-supply-supplier",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-engineering-traps"
+version = "0.1.0"
+dependencies = [
+ "engineering-core",
+ "engineering-knowledge",
+ "engineering-models",
+ "engineering-solvers",
+ "engineering-units",
+ "faktor-supply-core",
+ "faktor-supply-cost",
+ "faktor-supply-logistics",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-execution"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "faktor-supply-logistics",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-logistics"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-planning"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-quality"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faktor-supply-supplier"
+version = "0.1.0"
+dependencies = [
+ "faktor-supply-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "faktor-terminal"
 version = "0.1.0"
 dependencies = [
@@ -1941,6 +2141,14 @@ dependencies = [
  "faktor-session",
  "faktor-snapshot",
  "faktor-store",
+ "faktor-supply-core",
+ "faktor-supply-cost",
+ "faktor-supply-engineering",
+ "faktor-supply-execution",
+ "faktor-supply-logistics",
+ "faktor-supply-planning",
+ "faktor-supply-quality",
+ "faktor-supply-supplier",
  "faktor-terminal",
  "faktor-test-mocks",
  "faktor-updater",
@@ -2076,6 +2284,7 @@ dependencies = [
 name = "faktor-verify"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-cas",
  "faktor-core",
  "faktor-fs",

@@ -1,0 +1,18 @@
+[package]
+name = "faktor-supply-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+faktor-supply-core.workspace = true
+faktor-supply-logistics.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

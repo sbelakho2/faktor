@@ -279,14 +279,17 @@ const CHECKS = {
   },
   A22: async () => {
     const auth = control('T-06');
-    const remote = SNAPSHOT.mcp?.servers?.[0]?.remoteTransport?.supported;
-    // Rev8 registers the auth route, but this daemon build negotiates stdio
-    // only: the control must target the exact auth route while the served
-    // snapshot keeps remoteTransport.supported=false (the daemon answers the
-    // call with a typed mcp_oauth_unsupported refusal, never Connected).
+    const servers = SNAPSHOT.mcp?.servers ?? [];
+    const remote = servers.find((server) => server?.record?.transport === 'streamable_http');
+    const stdio = servers.find((server) => server?.record?.transport !== 'streamable_http');
+    // Remote transport is advertised ONLY for a configured streamable_http
+    // server; a stdio record keeps supported=false and never claims the
+    // remote/OAuth capability it does not use.
+    const remoteSupported = remote?.remoteTransport?.supported === true;
+    const stdioHonest = stdio === undefined || stdio.remoteTransport?.supported === false;
     return {
-      pass: auth?.binding.route.path === '/native/mcp/servers/:mcp/auth' && remote === false,
-      observations: [auth?.routeText ?? 'missing', auth?.stateText ?? '', `remoteSupported=${remote}`],
+      pass: auth?.binding.route.path === '/native/mcp/servers/:mcp/auth' && remoteSupported && stdioHonest,
+      observations: [auth?.routeText ?? 'missing', auth?.stateText ?? '', `remoteSupported=${remoteSupported}`, `stdioSupported=${stdio?.remoteTransport?.supported}`],
     };
   },
   A23: async () => {

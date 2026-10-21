@@ -432,6 +432,7 @@ fn provider_error_kind(kind: &ErrorKind) -> ProviderErrorKind {
         | ErrorKind::Conflict
         | ErrorKind::Internal
         | ErrorKind::Oversized
+        | ErrorKind::GoalUnavailableAfterRedaction { .. }
         | ErrorKind::InvalidState { .. } => ProviderErrorKind::BadRequest,
     }
 }

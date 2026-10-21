@@ -1,0 +1,25 @@
+[package]
+name = "faktor-supply-engineering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Closed engineering-to-supply loop: revision-bound requirements, candidate technical evaluation, TCO/qualification and an explicit supply decision."
+
+[dependencies]
+engineering-core.workspace = true
+engineering-knowledge.workspace = true
+engineering-units.workspace = true
+faktor-supply-core.workspace = true
+faktor-supply-cost.workspace = true
+faktor-supply-execution.workspace = true
+faktor-supply-supplier.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

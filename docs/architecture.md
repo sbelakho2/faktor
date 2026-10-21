@@ -167,7 +167,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `snapshot` | Native content-addressed checkpoints: before-content stored once in CAS (dedup free), rollback verifies current == recorded after-hash then atomically writes before; an independently changed file is a `Conflict`, never silently overwritten. |
 | `fs` | File service and watcher: explicit workspace identity on every call, traversal/symlink-safe path resolution, bounded reads, atomic writes, idle unload of heavyweight resources. |
 | `git` | Worktree management and per-repository mutation locks. Every invocation is a supervised child with an explicit owner; reads run concurrently, mutations serialize per repository (never a global Git lock). |
-| `mcp` | JSON-RPC Model Context Protocol client: supervised like terminals, every invocation has a deadline, responses bounded, Content-Length framing. |
+| `mcp` | JSON-RPC Model Context Protocol client: bounded stdio children supervised like terminals (Content-Length framing) plus Streamable HTTP sessions over the checked egress authority (JSON or SSE replies, session ids, initialize/initialized negotiation, bounded deadlines/output). |
 | `lsp` | Workspace-scoped language server integration: one daemon shares servers across sessions on a workspace, per-request id multiplexing, heavy servers unloaded after workspace inactivity. |
 | `sandbox` | Capability-based permission enforcement: canonicalization-safe path checks (symlink escapes and `..` rejected), three-mode network policy. |
 | `index` | Hybrid repository index: lexical inverted index plus tree-sitter symbol index (Rust/Python), incrementally updated, bounded by caps, workspace-isolated. |
@@ -674,10 +674,17 @@ feature).
 
 ### 10.4 MCP / LSP supervision
 
-- **MCP** (faktor-mcp): JSON-RPC over Content-Length framing; processes are
-  supervised exactly like terminals (crashes, hangs, and garbage output
-  never destabilize the agent runtime); every invocation has a deadline;
-  responses are bounded.
+- **MCP** (faktor-mcp): JSON-RPC over Content-Length framing for stdio;
+  processes are supervised exactly like terminals (crashes, hangs, and
+  garbage output never destabilize the agent runtime); every invocation has
+  a deadline; responses are bounded. Streamable HTTP sessions POST JSON-RPC
+  to an https endpoint through `CheckedHttpClient` (destination allowlist,
+  no environment proxy, full-body outbound secret scan); `application/json`
+  and `text/event-stream` replies are both decoded, the `Mcp-Session-Id`
+  header is carried on every request, a 404 for an established session
+  re-initializes once and retries, and an unadvertised capability is a typed
+  refusal instead of a fabricated empty catalog. Bearer credentials live in
+  the vault and are only written to the `Authorization` header.
 - **LSP** (faktor-lsp): language servers are **workspace resources, not
   session resources** — one daemon shares `rust-analyzer` /
   `typescript-language-server` / `pyright` across sessions on the same

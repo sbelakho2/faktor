@@ -103,6 +103,8 @@ use crate::{
 
 mod request;
 pub use request::*;
+mod goal;
+pub(crate) use goal::*;
 mod media;
 mod retrieval;
 pub use retrieval::*;
@@ -110,6 +112,8 @@ mod routing;
 pub use routing::*;
 mod provider_loop;
 pub use provider_loop::*;
+mod output_budget;
+pub use output_budget::*;
 mod tool_loop;
 pub use tool_loop::*;
 mod shell_changes;
@@ -147,12 +151,20 @@ mod media_tests;
 mod retrieval_tests;
 
 #[cfg(test)]
+#[path = "goal_tests.rs"]
+mod goal_tests;
+
+#[cfg(test)]
 #[path = "routing_tests.rs"]
 mod routing_tests;
 
 #[cfg(test)]
 #[path = "provider_loop_tests.rs"]
 mod provider_loop_tests;
+
+#[cfg(test)]
+#[path = "output_budget_tests.rs"]
+mod output_budget_tests;
 
 #[cfg(test)]
 #[path = "tool_loop_tests.rs"]

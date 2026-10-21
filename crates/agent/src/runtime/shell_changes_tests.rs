@@ -2329,8 +2329,10 @@ async fn crash_between_test_rename_and_rebind_recovers_durably() {
         "#[test]\nfn total_cents_adds_up() {\n    assert_eq!(total_cents(&[10, 20]), 30);\n}\n";
     std::fs::write(root.join("tests/cart_total.rs"), after).unwrap();
     std::fs::remove_file(root.join("tests/cart.rs")).unwrap();
-    // The model staged the move before the crash; git's rename detection is
-    // the edge authority the resumed settlement consumes.
+    // The model staged the move before the crash. Strong git rename
+    // detection is the primary edge authority; for a tiny file whose content
+    // changed with the symbol rename, the rebinder's unique inventory pair
+    // (which independently requires exact body identity) is the fallback.
     git(&["add", "-A"]);
 
     // Crash/restart: a fresh manager/runtime over the SAME durable store.
@@ -2359,13 +2361,6 @@ async fn crash_between_test_rename_and_rebind_recovers_durably() {
     let evidence: TestRebindEvidence = runtime
         .test_rebind_evidence(&handle, &ws, &changed, &root)
         .await;
-    assert!(
-        evidence
-            .renames
-            .iter()
-            .any(|edge| edge.from == "tests/cart.rs" && edge.to == "tests/cart_total.rs"),
-        "git rename detection must survive the restart: {evidence:?}"
-    );
     assert!(
         evidence
             .files
@@ -2397,8 +2392,11 @@ async fn crash_between_test_rename_and_rebind_recovers_durably() {
     assert!(
         update
             .basis
-            .contains("git_rename:tests/cart.rs->tests/cart_total.rs"),
-        "the git-proven rename edge must be recorded: {}",
+            .contains("git_rename:tests/cart.rs->tests/cart_total.rs")
+            || update
+                .basis
+                .contains("inventory_rename:tests/cart.rs->tests/cart_total.rs"),
+        "the proven move edge must be recorded: {}",
         update.basis
     );
     match &update.new_binding {
@@ -2408,4 +2406,69 @@ async fn crash_between_test_rename_and_rebind_recovers_durably() {
         }
         other => panic!("expected a test-selector binding, got {other:?}"),
     }
+}
+
+/// A 1%-similarity rewrite at a moved path must NOT be proof-authoritative
+/// rename evidence. The gatherer asks git for STRONG rename detection
+/// (`--find-renames=50%`); even if a future detector paired it, the pure
+/// rebinder still requires exact body identity before migrating a binding.
+#[tokio::test]
+async fn weak_similarity_file_rewrite_is_not_rename_evidence() {
+    use std::process::Command;
+
+    let env = shell_env(vec![]);
+    let root = env.root.clone();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let old: String = (0..80)
+        .map(|index| format!("pub fn old_{index}() -> u32 {{ {index} }}\n"))
+        .collect();
+    std::fs::write(root.join("tests/cart.rs"), &old).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+
+    // Exactly one shared line out of ~80: far below any strong threshold.
+    let new: String = (0..79)
+        .map(|index| format!("pub fn rewritten_{index}() -> u32 {{ {} }}\n", index * 7))
+        .chain(std::iter::once("pub fn old_0() -> u32 { 0 }\n".to_string()))
+        .collect();
+    std::fs::write(root.join("tests/cart_totals.rs"), new).unwrap();
+    std::fs::remove_file(root.join("tests/cart.rs")).unwrap();
+    git(&["add", "-A"]);
+
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let row = handle.row().unwrap();
+    let ws = runtime
+        .deps
+        .workspaces
+        .open(row.workspace_id, root.clone())
+        .unwrap();
+    let changed = vec![
+        "tests/cart.rs".to_string(),
+        "tests/cart_totals.rs".to_string(),
+    ];
+    let evidence = runtime
+        .test_rebind_evidence(&handle, &ws, &changed, &root)
+        .await;
+    assert!(
+        evidence.renames.is_empty(),
+        "a 1%-similarity rewrite must not be rename authority: {evidence:?}"
+    );
 }

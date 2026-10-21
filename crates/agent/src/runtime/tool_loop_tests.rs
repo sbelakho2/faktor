@@ -1934,6 +1934,10 @@ async fn hostile_tool_inputs_whole_payload_scan_catches_deep_secrets_and_boundar
     let caps = ModelCapabilities {
         tools: true,
         context: 8_000_000, // the 1 MiB input rides history; keep the plan under budget
+        // This fixture deliberately carries a 1 MiB tool payload: the
+        // resolved output envelope must admit it so the test exercises the
+        // secret-scan gate instead of the cumulative output ceiling.
+        max_output: 1_000_000,
         ..Default::default()
     };
     let mut huge = String::with_capacity(1024 * 1024 + GHP_SAMPLE.len());

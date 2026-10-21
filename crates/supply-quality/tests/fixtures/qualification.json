@@ -1,0 +1,41 @@
+{
+  "qualification": {
+    "id": "q-fixture",
+    "subject": "supplier 1 / part 1",
+    "revision": 1,
+    "valid_until": 21000,
+    "requirements": [
+      { "id": "g-fai", "spec": { "gate": "fai" }, "mandatory": true, "max_age_days": 100 }
+    ],
+    "evidence": [
+      {
+        "id": "fai-ev",
+        "evidence": { "id": "fai-report", "revision": 1, "digest": "a" },
+        "bound_revision": 1,
+        "captured_on": 19999,
+        "valid_until": null,
+        "payload": {
+          "kind": "fai",
+          "characteristics_total": 12,
+          "characteristics_verified": 12,
+          "open_nonconformances": 0,
+          "ballooned_drawing": true,
+          "performed_on": 19990
+        }
+      }
+    ],
+    "ncrs": [],
+    "approvals": [
+      {
+        "authority": "quality-director",
+        "evidence": { "id": "approval", "revision": 1, "digest": "b" },
+        "approved_revision": 1,
+        "approved_on": 19999,
+        "valid_until": 21000,
+        "conditions": []
+      }
+    ],
+    "suspension": null
+  },
+  "as_of": 20000
+}

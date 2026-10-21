@@ -378,6 +378,7 @@ fn error_kind_rows() -> Vec<(&'static str, faktor_core::error::ErrorKind)> {
         E::Malformed => ("Malformed", E::Malformed),
         E::Oversized => ("Oversized", E::Oversized),
         E::RateLimited => ("RateLimited", E::RateLimited),
+        E::GoalUnavailableAfterRedaction { .. } => ("GoalUnavailableAfterRedaction", E::GoalUnavailableAfterRedaction { source_message_id: 1 }),
         E::Deadlock => ("Deadlock", E::Deadlock),
         E::Internal => ("Internal", E::Internal),
     )
@@ -446,6 +447,7 @@ pub fn provider_error_kind_contract() -> Result<ContractFile, String> {
         P::Server => ("Server", P::Server),
         P::Cancelled => ("Cancelled", P::Cancelled),
         P::Malformed => ("Malformed", P::Malformed),
+        P::OutputLimitExceeded => ("OutputLimitExceeded", P::OutputLimitExceeded),
     );
     let order = serde_enum_wire_order::<P>()?;
     let reps = rows
@@ -574,6 +576,7 @@ pub fn reason_code_contract() -> Result<ContractFile, String> {
         R::RepeatedEvidenceSet => ("RepeatedEvidenceSet", R::RepeatedEvidenceSet),
         R::UnattributedChange => ("UnattributedChange", R::UnattributedChange),
         R::ProofObligationDisproven => ("ProofObligationDisproven", R::ProofObligationDisproven),
+        R::ProviderOutputLimitExceeded => ("ProviderOutputLimitExceeded", R::ProviderOutputLimitExceeded),
     );
     let order = serde_enum_wire_order::<R>()?;
     let reps = rows
@@ -968,14 +971,14 @@ mod tests {
         assert_eq!(task.variants[7].wire, "verified_complete");
 
         let reason = reason_code_contract().unwrap();
-        assert_eq!(reason.variants.len(), 15);
+        assert_eq!(reason.variants.len(), 16);
         assert!(reason
             .variants
             .iter()
             .all(|variant| variant.code.as_deref() == Some(variant.wire.as_str())));
 
         let provider = provider_error_kind_contract().unwrap();
-        assert_eq!(provider.variants.len(), 8);
+        assert_eq!(provider.variants.len(), 9);
         let retryable: Vec<&str> = provider
             .variants
             .iter()
@@ -994,15 +997,16 @@ mod tests {
         );
 
         let errors = error_kind_contract().unwrap();
-        assert_eq!(errors.variants.len(), 14);
+        assert_eq!(errors.variants.len(), 15);
         assert_eq!(errors.variants[0].wire, "not_found");
         assert_eq!(errors.variants[8].wire, "provider");
 
         let codes = error_codes_contract().unwrap();
-        assert_eq!(codes.variants.len(), 14);
+        assert_eq!(codes.variants.len(), 15);
         assert_eq!(codes.variants[0].code, "not_found");
         assert_eq!(codes.variants[0].http_status, 404);
-        assert_eq!(codes.variants[12].code, "deadlock");
+        assert_eq!(codes.variants[12].code, "goal_unavailable_after_redaction");
+        assert_eq!(codes.variants[13].code, "deadlock");
         assert_eq!(codes.variants[10].http_status, 413);
 
         let native = native_dto_contract().unwrap();

@@ -1233,8 +1233,14 @@ impl AgentRuntime {
     ) -> faktor_core::Result<()> {
         let view = handle.ledger_view()?;
         let mut appended = false;
-        if view.head.goal.is_empty()
-            && !ledger.goal.is_empty()
+        // A legacy materialized head may predate the redacted projection and
+        // still carry the session title (the old P1 fallback) or a raw
+        // credential: append the redacted goal so the head (the read/export
+        // surface) carries the objective and is secret-free from this drive.
+        let head_is_label =
+            view.head.goal.is_empty() || view.head.goal == handle.title().unwrap_or_default();
+        if !ledger.goal.is_empty()
+            && (head_is_label || crate::runtime::contains_secret(&view.head.goal))
             && handle
                 .ledger_goal_set(&truncate(&ledger.goal, 4096))?
                 .is_some()

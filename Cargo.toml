@@ -5,8 +5,23 @@ members = [
     "crates/core",
     "crates/commerce",
     "crates/commerce-connectors",
+    "crates/supply-core",
+    "crates/supply-supplier",
+    "crates/supply-cost",
+    "crates/supply-quality",
+    "crates/supply-logistics",
+    "crates/supply-planning",
+    "crates/supply-execution",
+    "crates/supply-engineering",
     "crates/contracts",
     "crates/foundation",
+    "crates/engineering-core",
+    "crates/engineering-units",
+    "crates/engineering-models",
+    "crates/engineering-knowledge",
+    "crates/engineering-solvers",
+    "crates/engineering-eda",
+    "crates/engineering-cad",
     "crates/browser",
     "crates/evidence",
     "crates/semantic",
@@ -69,6 +84,7 @@ members = [
     "tests/acp-official",
     "tests/production-wiring",
     "tests/security",
+    "tests/supply-engineering-traps",
 ]
 
 [workspace.package]
@@ -82,8 +98,23 @@ faktor-core = { path = "crates/core" }
 faktor-acquire = { path = "crates/acquire" }
 faktor-commerce = { path = "crates/commerce" }
 faktor-commerce-connectors = { path = "crates/commerce-connectors" }
+faktor-supply-core = { path = "crates/supply-core" }
+faktor-supply-supplier = { path = "crates/supply-supplier" }
+faktor-supply-cost = { path = "crates/supply-cost" }
+faktor-supply-quality = { path = "crates/supply-quality" }
+faktor-supply-logistics = { path = "crates/supply-logistics" }
+faktor-supply-planning = { path = "crates/supply-planning" }
+faktor-supply-execution = { path = "crates/supply-execution" }
+faktor-supply-engineering = { path = "crates/supply-engineering" }
 faktor-contracts = { path = "crates/contracts" }
 faktor-foundation = { path = "crates/foundation" }
+engineering-core = { path = "crates/engineering-core" }
+engineering-units = { path = "crates/engineering-units" }
+engineering-models = { path = "crates/engineering-models" }
+engineering-knowledge = { path = "crates/engineering-knowledge" }
+engineering-solvers = { path = "crates/engineering-solvers" }
+engineering-eda = { path = "crates/engineering-eda" }
+engineering-cad = { path = "crates/engineering-cad" }
 faktor-semantic = { path = "crates/semantic" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }

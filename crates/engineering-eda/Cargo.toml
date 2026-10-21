@@ -1,0 +1,16 @@
+[package]
+name = "engineering-eda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded KiCad PCB s-expression parsing and DRC report decoding for Faktor Engineering."
+
+[dependencies]
+engineering-units.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

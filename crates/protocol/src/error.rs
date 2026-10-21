@@ -99,6 +99,12 @@ pub fn from_core(e: &faktor_core::error::Error) -> ApiError {
             http_status: 429,
             retryable: true,
         },
+        ErrorKind::GoalUnavailableAfterRedaction { .. } => ApiError {
+            code: "goal_unavailable_after_redaction",
+            message: e.message.clone(),
+            http_status: 409,
+            retryable: false,
+        },
         ErrorKind::Deadlock => ApiError {
             code: "deadlock",
             message: e.message.clone(),
@@ -149,6 +155,14 @@ mod tests {
             (ErrorKind::Malformed, "malformed", 400, false),
             (ErrorKind::Oversized, "oversized", 413, false),
             (ErrorKind::RateLimited, "rate_limited", 429, true),
+            (
+                ErrorKind::GoalUnavailableAfterRedaction {
+                    source_message_id: 7,
+                },
+                "goal_unavailable_after_redaction",
+                409,
+                false,
+            ),
             (ErrorKind::Deadlock, "deadlock", 409, true),
             (ErrorKind::Internal, "internal_error", 500, false),
         ];

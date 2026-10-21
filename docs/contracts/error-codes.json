@@ -89,6 +89,13 @@
       "retryable": true
     },
     {
+      "kind": "GoalUnavailableAfterRedaction",
+      "wire": "goal_unavailable_after_redaction",
+      "code": "goal_unavailable_after_redaction",
+      "http_status": 409,
+      "retryable": false
+    },
+    {
       "kind": "Deadlock",
       "wire": "deadlock",
       "code": "deadlock",

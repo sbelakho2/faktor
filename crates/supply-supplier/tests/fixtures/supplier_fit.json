@@ -1,0 +1,156 @@
+{
+  "profile": {
+    "supplier": 1,
+    "name": "Fixture EMS",
+    "revision": 4,
+    "authorization": {
+      "role": "manufacturer",
+      "status": "unknown",
+      "evidence": null,
+      "valid_until": null,
+      "manufacturer": null
+    },
+    "processes": [
+      {
+        "value": {
+          "status": "known",
+          "value": {
+            "process": "smt",
+            "description": "SMT line with AOI",
+            "facts": [
+              {
+                "key": "smt.placement_accuracy_um",
+                "value": {
+                  "value": { "status": "known", "value": { "type": "number", "value": 35, "unit": "um" } },
+                  "basis": {
+                    "kind": "provenance",
+                    "source": "test_report",
+                    "evidence": { "id": "line-cap", "revision": 1, "digest": "a" },
+                    "captured_on": 20000,
+                    "method": "line capability study",
+                    "conditions": ["line 1"],
+                    "falsifier": "a repeat study outside tolerance"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "process", "revision": 1, "digest": "b" },
+          "captured_on": 20000,
+          "method": "process list",
+          "conditions": ["revision 1"],
+          "falsifier": "a revised process list"
+        }
+      }
+    ],
+    "equipment": [],
+    "capacity": [
+      {
+        "value": {
+          "status": "known",
+          "value": {
+            "site": 1,
+            "process": "smt",
+            "start": 20000,
+            "end": 20030,
+            "capacity": {
+              "value": { "status": "known", "value": 50000 },
+              "basis": {
+                "kind": "provenance",
+                "source": "erp_extract",
+                "evidence": { "id": "capacity", "revision": 1, "digest": "c" },
+                "captured_on": 20000,
+                "method": "ERP capacity",
+                "conditions": ["window 20000..20030"],
+                "falsifier": "a different ERP capacity"
+              }
+            },
+            "committed": {
+              "value": { "status": "known", "value": 10000 },
+              "basis": {
+                "kind": "provenance",
+                "source": "erp_extract",
+                "evidence": { "id": "committed", "revision": 1, "digest": "d" },
+                "captured_on": 20000,
+                "method": "ERP commitments",
+                "conditions": ["window 20000..20030"],
+                "falsifier": "a new booking"
+              }
+            }
+          }
+        },
+        "basis": {
+          "kind": "provenance",
+          "source": "erp_extract",
+          "evidence": { "id": "window", "revision": 1, "digest": "e" },
+          "captured_on": 20000,
+          "method": "capacity window",
+          "conditions": ["window 20000..20030"],
+          "falsifier": "a revised window"
+        }
+      }
+    ],
+    "lot_sizes": {
+      "value": {
+        "status": "known",
+        "value": { "min": 1000, "max": 100000, "multiple": 500 }
+      },
+      "basis": {
+        "kind": "provenance",
+        "source": "supplier_document",
+        "evidence": { "id": "lot", "revision": 1, "digest": "f" },
+        "captured_on": 20000,
+        "method": "lot policy",
+        "conditions": ["revision 1"],
+        "falsifier": "a revised lot policy"
+      }
+    },
+    "tooling": [],
+    "inspection": [],
+    "process_capability": [],
+    "qualifications": [],
+    "traceability": {
+      "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } },
+      "basis": null
+    },
+    "metrics": {
+      "otd_ppm": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null },
+      "defect_ppm": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null },
+      "ncr_ppm": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null },
+      "lead_time_days": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null },
+      "response_hours": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null }
+    },
+    "continuity": [],
+    "responsiveness_hours": { "value": { "status": "unavailable", "unavailable": { "reason": "missing_evidence", "detail": "not supplied" } }, "basis": null },
+    "ownership": null,
+    "site_relationships": []
+  },
+  "requirement": {
+    "allowed_roles": ["manufacturer"],
+    "required_processes": ["smt"],
+    "required_qualifications": [],
+    "facts": [
+      {
+        "key": "smt.placement_accuracy_um",
+        "comparison": "at_most",
+        "expected": { "type": "number", "value": 50, "unit": "um" },
+        "mandatory": true
+      }
+    ],
+    "quantity": 20000,
+    "window_start": 20001,
+    "window_end": 20010,
+    "minimum_cpk": null,
+    "minimum_traceability": null,
+    "maximum_defect_ppm": null,
+    "minimum_otd_ppm": null,
+    "maximum_lead_time_p90_days": null,
+    "maximum_continuity_risk": null,
+    "maximum_response_hours": null,
+    "as_of": 20000
+  }
+}

@@ -48,6 +48,9 @@ fn emitted_error_codes_match_from_core_behavior() {
             "malformed" => ErrorKind::Malformed,
             "oversized" => ErrorKind::Oversized,
             "rate_limited" => ErrorKind::RateLimited,
+            "goal_unavailable_after_redaction" => ErrorKind::GoalUnavailableAfterRedaction {
+                source_message_id: 1,
+            },
             "deadlock" => ErrorKind::Deadlock,
             "internal" => ErrorKind::Internal,
             other => panic!("schema row names an unknown core kind {other}"),

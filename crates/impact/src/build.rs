@@ -23,6 +23,30 @@ use crate::parse::{parse_file, ImportRef, NameRef, OwnerKind, ParsedFile, Symbol
 use crate::topology::UnitKind;
 
 pub const MAX_WALK_DEPTH: usize = 48;
+/// Bounded set of manifest/lock files whose content decides workspace
+/// topology. Their stamps are part of the material reconciliation (a
+/// manifest edit is not a source edit, but it does invalidate the graph).
+const TOPOLOGY_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
+    "pom.xml",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "poetry.lock",
+    "Pipfile",
+    "Pipfile.lock",
+];
 /// Agent Manager state directory name, composed so the retired-token scan
 /// never sees a product name in a skip list.
 const AGENT_STATE_DIR: &str = concat!(".", "ki", "lo");
@@ -59,6 +83,10 @@ pub struct BuildReport {
     /// Adapters that contributed units (cargo, npm, gradle, maven, python,
     /// generic-filesystem).
     pub adapters: Vec<String>,
+    /// Per-adapter native-metadata vs structural-fallback provenance. The
+    /// `degraded` flag on an outcome is the typed fallback marker requested
+    /// by the topology contract.
+    pub adapter_outcomes: Vec<crate::topology::AdapterOutcome>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -79,6 +107,56 @@ pub struct ChangeClassification {
     /// deleted) and therefore require a re-parse.
     pub seeds: Vec<String>,
     pub unchanged: usize,
+    /// The workspace walk hit its file bound, so the absent/deleted set is
+    /// not complete. Callers must rebuild rather than apply a partial seed
+    /// set.
+    pub truncated: bool,
+}
+
+/// Cheap on-disk identity used by whole-workspace reconciliation. Content is
+/// still decided by the blake3 digest in `classify_changes`; this stamp only
+/// selects candidates so an unchanged query never reads every file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    bytes: u64,
+    modified_nanos: i128,
+}
+
+/// True when `path`'s file name is one of the workspace topology manifests
+/// (Cargo.toml/lock, npm lockfiles, Gradle/Maven/Python manifests). The
+/// watch uses this to treat a manifest edit as material even though it has
+/// no source language.
+pub fn is_topology_manifest(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    TOPOLOGY_MANIFESTS.contains(&name)
+}
+
+fn manifest_stamp(root: &Path, relative: &str) -> Option<FileStamp> {
+    let meta = fs::symlink_metadata(root.join(relative)).ok()?;
+    meta.file_type().is_file().then(|| file_stamp(&meta))
+}
+
+fn file_stamp(meta: &fs::Metadata) -> FileStamp {
+    let modified_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0);
+    FileStamp {
+        bytes: meta.len(),
+        modified_nanos,
+    }
+}
+
+/// One bounded workspace candidate walk. `skipped` keeps the human-readable
+/// reasons the build report records; a reconciliation pass only needs the
+/// candidate set and the truncation flag.
+struct CandidateScan {
+    candidates: Vec<String>,
+    skipped: Vec<String>,
+    skipped_count: usize,
+    truncated: bool,
 }
 
 pub struct GraphBuilder {
@@ -86,8 +164,19 @@ pub struct GraphBuilder {
     workspace: Workspace,
     workspace_id: WorkspaceId,
     revision: Revision,
+    /// Discovery options retained so a full rebuild re-reads manifests
+    /// (a Cargo.toml/package.json change is a topology change, not a no-op).
+    topology_options: TopologyOptions,
     records: BTreeMap<String, ParsedFile>,
     files: BTreeMap<String, GraphFile>,
+    /// On-disk stamp per indexed file, used by the whole-workspace
+    /// reconciliation walk. Never part of the serialized graph.
+    file_meta: BTreeMap<String, FileStamp>,
+    /// Stamps of the manifest/lock files the topology was discovered from.
+    /// A change here invalidates the unit graph even when no source file
+    /// changed, so the next refresh re-discovers topology instead of
+    /// silently keeping stale crate/package relationships.
+    manifest_meta: BTreeMap<String, FileStamp>,
     /// Materialized path-level reverse dependency index from the last
     /// assembled graph (dependency path -> dependent paths). Refresh uses it
     /// so invalidation is O(changed + affected), never a full graph walk.
@@ -114,6 +203,7 @@ impl GraphBuilder {
             .canonicalize()
             .map_err(|e| GraphError::Malformed(format!("workspace root: {e}")))?;
         let workspace = manifest::discover_with(&root, &revision, &topology_options)?;
+        let retained_topology = topology_options.clone();
         let mut report = BuildReport {
             degraded: workspace.degraded,
             degraded_reason: workspace.degraded_reason.clone(),
@@ -122,6 +212,7 @@ impl GraphBuilder {
                 .iter()
                 .map(|kind| kind.as_str().to_string())
                 .collect(),
+            adapter_outcomes: workspace.adapter_outcomes.clone(),
             ..BuildReport::default()
         };
         for skipped in &workspace.skipped {
@@ -133,8 +224,11 @@ impl GraphBuilder {
             workspace,
             workspace_id: WorkspaceId::new(1),
             revision,
+            topology_options: retained_topology,
             records: BTreeMap::new(),
             files: BTreeMap::new(),
+            file_meta: BTreeMap::new(),
+            manifest_meta: BTreeMap::new(),
             dependents: BTreeMap::new(),
             options: BuildOptions::default(),
             report,
@@ -173,7 +267,70 @@ impl GraphBuilder {
 
     /// Parse every supported file in the workspace and assemble the graph.
     pub fn build(&mut self) -> Result<Graph, GraphError> {
+        self.build_inner(None)
+    }
+
+    fn build_inner(&mut self, material_generation: Option<u64>) -> Result<Graph, GraphError> {
+        let scan = self.collect_candidates();
+        self.report.files_skipped += scan.skipped_count;
+        self.report.skipped.extend(scan.skipped);
+        if scan.truncated {
+            self.report.truncated = true;
+        }
+        for relative in scan.candidates {
+            self.parse_path(&relative)?;
+        }
+        self.manifest_meta = self.capture_manifests();
+        if let Some(generation) = material_generation {
+            self.revision = material_revision(self.files.values(), generation);
+        }
+        let graph = self.assemble();
+        self.dependents = dependents_from(&graph);
+        Ok(graph)
+    }
+
+    /// Drop every cached record and re-scan the whole workspace. Used when
+    /// the dirty history is lost or a partial invalidation would exceed its
+    /// bound: the rebuilt graph is complete for the current content, never a
+    /// merge of old and new records.
+    pub fn rebuild(&mut self, material_generation: Option<u64>) -> Result<Graph, GraphError> {
+        // Topology is part of the whole-workspace material identity: a
+        // Cargo.toml/package.json edit must re-read the unit graph, not just
+        // reuse the discovery from the previous generation.
+        self.workspace =
+            manifest::discover_with(&self.root, &self.revision, &self.topology_options)?;
+        self.records.clear();
+        self.files.clear();
+        self.file_meta.clear();
+        self.manifest_meta.clear();
+        self.dependents.clear();
+        self.report.files_scanned = 0;
+        self.report.files_parsed = 0;
+        self.report.files_skipped = 0;
+        self.report.bytes = 0;
+        self.report.truncated = false;
+        self.report.skipped.clear();
+        self.report.degraded = self.workspace.degraded;
+        self.report.degraded_reason = self.workspace.degraded_reason.clone();
+        self.report.adapters = self
+            .workspace
+            .adapters
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect();
+        self.report.adapter_outcomes = self.workspace.adapter_outcomes.clone();
+        for skipped in &self.workspace.skipped {
+            self.report.files_skipped += 1;
+            self.report.skipped.push(skipped.clone());
+        }
+        self.build_inner(material_generation)
+    }
+
+    fn collect_candidates(&self) -> CandidateScan {
         let mut candidates = Vec::new();
+        let mut skipped = Vec::new();
+        let mut skipped_count = 0usize;
+        let mut truncated = false;
         let crate_dirs: Vec<String> = self
             .workspace
             .crates
@@ -191,25 +348,23 @@ impl GraphBuilder {
             let dir = match dir.canonicalize() {
                 Ok(path) if path.starts_with(&self.root) => path,
                 Ok(_) => {
-                    self.report.files_skipped += 1;
-                    self.report.skipped.push(format!(
+                    skipped_count += 1;
+                    skipped.push(format!(
                         "{}: unit directory resolves outside the workspace root",
                         info.dir
                     ));
                     continue;
                 }
                 Err(_) => {
-                    self.report.files_skipped += 1;
-                    self.report
-                        .skipped
-                        .push(format!("{}: unit directory is missing", info.dir));
+                    skipped_count += 1;
+                    skipped.push(format!("{}: unit directory is missing", info.dir));
                     continue;
                 }
             };
             let mut stack = vec![(dir, 0usize)];
             while let Some((dir, depth)) = stack.pop() {
                 if depth > MAX_WALK_DEPTH {
-                    self.report.truncated = true;
+                    truncated = true;
                     continue;
                 }
                 let Ok(entries) = fs::read_dir(&dir) else {
@@ -248,7 +403,7 @@ impl GraphBuilder {
                         Err(_) => continue,
                     };
                     if relative.len() > MAX_PATH_BYTES {
-                        self.report.files_skipped += 1;
+                        skipped_count += 1;
                         continue;
                     }
                     if Language::of_path(&relative).is_none() {
@@ -256,9 +411,13 @@ impl GraphBuilder {
                     }
                     // A parent unit must not swallow a nested declared unit
                     // (Cargo member, npm workspace, Gradle/Maven module).
+                    // Only DESCENDANT units are excluded: when the walk is
+                    // already inside a nested unit, its ancestors must not
+                    // hide its own files (nested Maven/Gradle modules).
                     if crate_dirs.iter().any(|d| {
                         !d.is_empty()
                             && *d != info.dir
+                            && (info.dir.is_empty() || d.starts_with(&format!("{}/", info.dir)))
                             && (relative == *d || relative.starts_with(&format!("{d}/")))
                     }) {
                         continue;
@@ -271,14 +430,111 @@ impl GraphBuilder {
         candidates.dedup();
         if candidates.len() > self.options.max_files {
             candidates.truncate(self.options.max_files);
-            self.report.truncated = true;
+            truncated = true;
         }
-        for relative in candidates {
-            self.parse_path(&relative)?;
+        CandidateScan {
+            candidates,
+            skipped,
+            skipped_count,
+            truncated,
         }
-        let graph = self.assemble();
-        self.dependents = dependents_from(&graph);
-        Ok(graph)
+    }
+
+    fn manifest_paths(&self) -> Vec<String> {
+        let mut dirs = BTreeSet::new();
+        dirs.insert(String::new());
+        for info in self.workspace.crates.values() {
+            dirs.insert(info.dir.clone());
+        }
+        let mut paths = Vec::new();
+        for dir in dirs {
+            for name in TOPOLOGY_MANIFESTS {
+                let relative = if dir.is_empty() {
+                    (*name).to_string()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if self
+                    .root
+                    .join(&relative)
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_file())
+                {
+                    paths.push(relative);
+                }
+            }
+        }
+        paths
+    }
+
+    fn capture_manifests(&self) -> BTreeMap<String, FileStamp> {
+        let mut stamps = BTreeMap::new();
+        for path in self.manifest_paths() {
+            if let Some(stamp) = manifest_stamp(&self.root, &path) {
+                stamps.insert(path, stamp);
+            }
+        }
+        stamps
+    }
+
+    /// Whole-workspace reconciliation: walk the same bounded candidate set
+    /// as the build and return every path whose on-disk stamp differs from
+    /// the indexed record (new, modified or deleted). This is the watch's
+    /// fallback for dropped events and the pre-refresh generation check; it
+    /// never re-parses, and `classify_changes` still decides by content
+    /// digest.
+    pub fn scan_changes(&self) -> Result<ChangeClassification, GraphError> {
+        let scan = self.collect_candidates();
+        if scan.truncated {
+            return Ok(ChangeClassification {
+                truncated: true,
+                ..ChangeClassification::default()
+            });
+        }
+        let candidates: BTreeSet<String> = scan.candidates.into_iter().collect();
+        let mut seeds = BTreeSet::new();
+        let mut unchanged = 0usize;
+        for path in &candidates {
+            let Some(file) = self.files.get(path) else {
+                seeds.insert(path.clone());
+                continue;
+            };
+            let stamp = fs::symlink_metadata(self.root.join(path))
+                .ok()
+                .filter(|meta| meta.file_type().is_file())
+                .map(|meta| file_stamp(&meta));
+            match (stamp, self.file_meta.get(path)) {
+                (Some(current), Some(indexed))
+                    if current == *indexed && current.bytes == file.bytes =>
+                {
+                    unchanged += 1;
+                }
+                _ => {
+                    seeds.insert(path.clone());
+                }
+            }
+        }
+        for path in self.files.keys() {
+            if !candidates.contains(path) {
+                seeds.insert(path.clone());
+            }
+        }
+        let manifests = self.capture_manifests();
+        for (path, stamp) in &manifests {
+            if self.manifest_meta.get(path) != Some(stamp) {
+                seeds.insert(path.clone());
+            }
+        }
+        for path in self.manifest_meta.keys() {
+            if !manifests.contains_key(path) {
+                seeds.insert(path.clone());
+            }
+        }
+        Ok(ChangeClassification {
+            seeds: seeds.into_iter().collect(),
+            unchanged,
+            truncated: false,
+        })
     }
 
     fn parse_path(&mut self, relative: &str) -> Result<(), GraphError> {
@@ -292,12 +548,14 @@ impl GraphBuilder {
             Err(_) => {
                 self.records.remove(relative);
                 self.files.remove(relative);
+                self.file_meta.remove(relative);
                 return Ok(());
             }
         };
         if !meta.file_type().is_file() {
             self.records.remove(relative);
             self.files.remove(relative);
+            self.file_meta.remove(relative);
             self.report.files_skipped += 1;
             return Ok(());
         }
@@ -306,6 +564,7 @@ impl GraphBuilder {
             self.report.truncated = true;
             self.records.remove(relative);
             self.files.remove(relative);
+            self.file_meta.remove(relative);
             return Ok(());
         }
         let bytes =
@@ -313,6 +572,7 @@ impl GraphBuilder {
         let Ok(source) = std::str::from_utf8(&bytes) else {
             self.records.remove(relative);
             self.files.remove(relative);
+            self.file_meta.remove(relative);
             self.report.files_skipped += 1;
             return Ok(());
         };
@@ -339,6 +599,8 @@ impl GraphBuilder {
             },
         );
         self.records.insert(relative.to_string(), parsed);
+        self.file_meta
+            .insert(relative.to_string(), file_stamp(&meta));
         Ok(())
     }
 
@@ -369,6 +631,7 @@ impl GraphBuilder {
         Ok(ChangeClassification {
             seeds: seeds.into_iter().collect(),
             unchanged,
+            truncated: false,
         })
     }
 
@@ -989,6 +1252,51 @@ impl GraphBuilder {
     }
 }
 
+/// Bounded refresh policy. A dirty set above the incremental path bound is
+/// never applied partially: the session rebuilds instead. A rebuild is
+/// refused (and the query is marked degraded) when the indexed workspace is
+/// above the rebuild file budget, so no caller mistakes a stale graph for a
+/// complete current-generation answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshPolicy {
+    pub max_incremental_paths: usize,
+    pub max_rebuild_files: usize,
+}
+
+impl Default for RefreshPolicy {
+    fn default() -> Self {
+        Self {
+            max_incremental_paths: MAX_INVALIDATION_FILES,
+            max_rebuild_files: MAX_FILES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshMode {
+    /// The cached graph already represented the requested generation.
+    Unchanged,
+    /// Only the recorded dirty paths (and their reverse dependents) were
+    /// re-examined.
+    Incremental,
+    /// Dirty history was lost or exceeded the incremental bound; the whole
+    /// workspace was re-scanned.
+    Rebuilt,
+    /// The rebuild budget was exceeded. The graph is NOT current and the
+    /// report carries `degraded = true`; this is never silent.
+    Degraded,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshReport {
+    pub generation: u64,
+    pub mode: RefreshMode,
+    pub stats: IncrementalStats,
+    pub lost: bool,
+    pub degraded: bool,
+    pub note: Option<String>,
+}
+
 /// A cached graph with explicit refresh semantics. The product semantic
 /// adapter and the CI generator both build through this type, so there is
 /// exactly one graph authority and one revision binding.
@@ -998,6 +1306,10 @@ pub struct ImpactSession {
     /// Advances only when refresh observes different content, so an
     /// unchanged refresh keeps the same material revision and graph digest.
     material_generation: u64,
+    /// Set when the graph could not be proven current (lost history or a
+    /// rebuild that hit its bound). Propagated into every affected result.
+    material_degraded: bool,
+    material_degraded_reason: Option<String>,
 }
 
 impl ImpactSession {
@@ -1018,12 +1330,38 @@ impl ImpactSession {
         Self::build_for_workspace(root, Revision::default(), workspace_id)
     }
 
+    /// Material build with explicit scan bounds (the rebuild-budget tests and
+    /// operators that must cap a very large workspace).
+    pub fn build_material_for_workspace_with_options(
+        root: &Path,
+        workspace_id: WorkspaceId,
+        options: BuildOptions,
+    ) -> Result<Self, GraphError> {
+        Self::build_for_workspace_with_options(root, Revision::default(), workspace_id, options)
+    }
+
     pub fn build_for_workspace(
         root: &Path,
         revision: Revision,
         workspace_id: WorkspaceId,
     ) -> Result<Self, GraphError> {
-        let mut builder = GraphBuilder::new(root, revision)?.with_workspace_id(workspace_id);
+        Self::build_for_workspace_with_options(
+            root,
+            revision,
+            workspace_id,
+            BuildOptions::default(),
+        )
+    }
+
+    fn build_for_workspace_with_options(
+        root: &Path,
+        revision: Revision,
+        workspace_id: WorkspaceId,
+        options: BuildOptions,
+    ) -> Result<Self, GraphError> {
+        let mut builder = GraphBuilder::new(root, revision)?
+            .with_workspace_id(workspace_id)
+            .with_options(options);
         let mut graph = builder.build()?;
         let material = graph.revision.is_unspecified();
         let material_generation = if material {
@@ -1040,6 +1378,8 @@ impl ImpactSession {
             builder,
             graph,
             material_generation,
+            material_degraded: false,
+            material_degraded_reason: None,
         })
     }
 
@@ -1054,6 +1394,149 @@ impl ImpactSession {
 
     pub fn builder(&self) -> &GraphBuilder {
         &self.builder
+    }
+
+    /// The material generation of the graph currently cached here.
+    pub fn material_generation(&self) -> u64 {
+        self.material_generation
+    }
+
+    /// True when the cached graph could not be proven current on the last
+    /// generation sync. `affected` carries this flag into every result.
+    pub fn material_degraded(&self) -> bool {
+        self.material_degraded
+    }
+
+    pub fn material_degraded_reason(&self) -> Option<&str> {
+        self.material_degraded_reason.as_deref()
+    }
+
+    /// Whole-workspace reconciliation against the indexed state. The caller
+    /// turns the returned seeds into a generation observation; this method
+    /// never mutates the graph.
+    pub fn scan_material_changes(&self) -> Result<ChangeClassification, GraphError> {
+        self.builder.scan_changes()
+    }
+
+    fn mark_degraded(&mut self, reason: String) {
+        self.material_degraded = true;
+        self.material_degraded_reason = Some(reason);
+    }
+
+    fn clear_degraded(&mut self) {
+        self.material_degraded = false;
+        self.material_degraded_reason = None;
+    }
+
+    /// Full re-scan used when the dirty history cannot be applied exactly.
+    /// The graph is replaced only after the complete rebuild succeeds.
+    pub fn rebuild_material(&mut self) -> Result<IncrementalStats, GraphError> {
+        self.material_generation = self.material_generation.saturating_add(1);
+        let generation = self.material_generation;
+        let graph = self.builder.rebuild(Some(generation))?;
+        let truncated = self.builder.report().truncated;
+        self.graph = crate::query::ImpactGraph::new(graph)?;
+        if truncated {
+            self.mark_degraded(format!(
+                "material rebuild hit the file/scan bound ({} files indexed)",
+                self.builder.files.len()
+            ));
+        } else {
+            self.clear_degraded();
+        }
+        Ok(IncrementalStats {
+            files_changed: self.builder.files.len(),
+            files_reparsed: self.builder.files.len(),
+            records: self.builder.records.len(),
+            truncated,
+            ..IncrementalStats::default()
+        })
+    }
+
+    /// Bring the cached graph to `dirty.generation` (a snapshot of the
+    /// whole-workspace authority). A complete refresh is the ONLY path that
+    /// lets the caller advance its cached generation; the authority may have
+    /// moved on while this ran, and the next query will see that newer
+    /// generation.
+    pub fn refresh_from_generation(
+        &mut self,
+        dirty: &crate::generation::DirtyPaths,
+        policy: &RefreshPolicy,
+    ) -> Result<RefreshReport, GraphError> {
+        let non_incremental = dirty.paths.iter().any(|path| {
+            Language::of_path(path).is_none()
+                || self.builder.workspace.crate_for_path(path).is_none()
+        });
+        let rebuild =
+            dirty.lost || non_incremental || dirty.paths.len() > policy.max_incremental_paths;
+        if rebuild {
+            if self.builder.files.len() > policy.max_rebuild_files {
+                let note = format!(
+                    "dirty history {} for generation {} requires a rebuild, but {} indexed files exceed the rebuild budget {}; the cached graph is degraded (not current)",
+                    if dirty.lost {
+                        "was lost"
+                    } else {
+                        "exceeded the incremental bound"
+                    },
+                    dirty.generation,
+                    self.builder.files.len(),
+                    policy.max_rebuild_files
+                );
+                self.mark_degraded(note.clone());
+                return Ok(RefreshReport {
+                    generation: dirty.generation,
+                    mode: RefreshMode::Degraded,
+                    stats: IncrementalStats {
+                        records: self.builder.records.len(),
+                        ..IncrementalStats::default()
+                    },
+                    lost: dirty.lost,
+                    degraded: true,
+                    note: Some(note),
+                });
+            }
+            let stats = self.rebuild_material()?;
+            let degraded = self.material_degraded;
+            return Ok(RefreshReport {
+                generation: dirty.generation,
+                mode: RefreshMode::Rebuilt,
+                stats,
+                lost: dirty.lost,
+                degraded,
+                note: self.material_degraded_reason.clone(),
+            });
+        }
+        if dirty.paths.is_empty() {
+            return Ok(RefreshReport {
+                generation: dirty.generation,
+                mode: RefreshMode::Unchanged,
+                stats: IncrementalStats {
+                    files_unchanged: self.builder.files.len(),
+                    records: self.builder.records.len(),
+                    ..IncrementalStats::default()
+                },
+                lost: false,
+                degraded: self.material_degraded,
+                note: self.material_degraded_reason.clone(),
+            });
+        }
+        let stats = self.refresh_material(&dirty.paths)?;
+        if stats.truncated {
+            self.mark_degraded(format!(
+                "incremental invalidation exceeded the {} file bound; the graph is partial",
+                MAX_INVALIDATION_FILES
+            ));
+        } else {
+            self.clear_degraded();
+        }
+        Ok(RefreshReport {
+            generation: dirty.generation,
+            mode: RefreshMode::Incremental,
+            degraded: self.material_degraded,
+            note: self.material_degraded_reason.clone(),
+            stats,
+            lost: false,
+        })
     }
 
     /// Re-parse only changed files (by content digest) and their reverse
@@ -1106,7 +1589,17 @@ impl ImpactSession {
         changed: &[crate::query::ChangedTarget],
         options: &crate::query::AffectedOptions,
     ) -> Result<crate::query::AffectedResult, GraphError> {
-        self.graph.affected(changed, options)
+        let mut result = self.graph.affected(changed, options)?;
+        if self.material_degraded {
+            result.degraded = true;
+            result.notes.push(
+                self.material_degraded_reason
+                    .clone()
+                    .unwrap_or_else(|| "material graph is not current".to_string()),
+            );
+            result.seal()?;
+        }
+        Ok(result)
     }
 }
 

@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-21T06:49:49.057Z",
-  "commit": "e16619cf69e2c41a0fb200e138138352d8ec457c",
-  "tree": "e26f51f9644babf83eb8939400203dba93066df3",
+  "generated_at": "2026-10-21T14:57:57.236Z",
+  "commit": "e016ddb9db0b20f3cdcc1f35f1bcc30b0cdb2057",
+  "tree": "a14e2400789e2444be9d80df7f300a2cc294abb6",
   "layers": [
     "structural",
     "unit",
@@ -24,8 +24,8 @@
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
-      "builtin-tool": 9,
-      "cli-command": 44,
+      "builtin-tool": 7,
+      "cli-command": 46,
       "config-key": 53,
       "control": 200,
       "invariant": 158,
@@ -39,8 +39,8 @@
     },
     "by_status": {
       "deferred": 558,
-      "proven": 320,
-      "stub": 63
+      "proven": 322,
+      "stub": 61
     },
     "by_lane": {
       "nightly": 512,
@@ -52,8 +52,8 @@
       "agent-evals": 1,
       "contracts": 397,
       "ide-screen-readers": 385,
-      "state-model-crash": 251,
-      "unit-property": 236
+      "state-model-crash": 249,
+      "unit-property": 234
     }
   },
   "rows": [
@@ -2139,6 +2139,43 @@
       }
     },
     {
+      "id": "cli.engineering",
+      "kind": "cli-command",
+      "path": "crates/cli/src/main.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cli.exit-codes.engineering",
+        "cli.help.engineering"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
+      "status": "proven",
+      "meta": {
+        "command": "engineering"
+      },
+      "adversarial": [
+        "help",
+        "unknown-flag",
+        "missing-daemon",
+        "redaction",
+        "idempotence"
+      ],
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "engineering",
+          "help_bytes": 689,
+          "unknown_flag_exit": 2
+        }
+      }
+    },
+    {
       "id": "cli.enterprise",
       "kind": "cli-command",
       "path": "crates/cli/src/main.rs",
@@ -2911,6 +2948,43 @@
         "observed": {
           "command": "sessions",
           "help_bytes": 152,
+          "unknown_flag_exit": 2
+        }
+      }
+    },
+    {
+      "id": "cli.supply",
+      "kind": "cli-command",
+      "path": "crates/cli/src/main.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cli.exit-codes.supply",
+        "cli.help.supply"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
+      "status": "proven",
+      "meta": {
+        "command": "supply"
+      },
+      "adversarial": [
+        "help",
+        "unknown-flag",
+        "missing-daemon",
+        "redaction",
+        "idempotence"
+      ],
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "supply",
+          "help_bytes": 1565,
           "unknown_flag_exit": 2
         }
       }
@@ -18844,7 +18918,7 @@
           "hostile": {
             "case": "query:limit=-1",
             "status": 200,
-            "bytes": 341
+            "bytes": 342
           }
         }
       }
@@ -24944,7 +25018,7 @@
           "hostile": {
             "case": "unicode-boundaries",
             "status": 200,
-            "bytes": 9186
+            "bytes": 9976
           }
         }
       }
@@ -26895,7 +26969,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/ce35eb043461ba9db55eb5ad0df40912"
+              "handle": "vault://provider_key/f03697fc1c2462d0b68842e9df2a8a95"
             }
           },
           {
@@ -32894,76 +32968,6 @@
         "narrow",
         "theme",
         "focus-order"
-      ],
-      "evidence": null
-    },
-    {
-      "id": "tool.board-post",
-      "kind": "builtin-tool",
-      "path": "crates/cli/src",
-      "layers": [
-        "contracts",
-        "state-model-crash",
-        "unit-property"
-      ],
-      "lanes": [
-        "pull",
-        "trusted"
-      ],
-      "test_ids": [
-        "tool.bad-args.board-post",
-        "tool.bounds.board-post",
-        "tool.contract.board-post"
-      ],
-      "evidence_kind": "exact-value",
-      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
-      "status": "stub",
-      "meta": {
-        "tool": "board-post"
-      },
-      "adversarial": [
-        "denied",
-        "timeout",
-        "cancel",
-        "output-cap",
-        "path-escape",
-        "bad-args",
-        "child-cleanup"
-      ],
-      "evidence": null
-    },
-    {
-      "id": "tool.board-read",
-      "kind": "builtin-tool",
-      "path": "crates/cli/src",
-      "layers": [
-        "contracts",
-        "state-model-crash",
-        "unit-property"
-      ],
-      "lanes": [
-        "pull",
-        "trusted"
-      ],
-      "test_ids": [
-        "tool.bad-args.board-read",
-        "tool.bounds.board-read",
-        "tool.contract.board-read"
-      ],
-      "evidence_kind": "exact-value",
-      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
-      "status": "stub",
-      "meta": {
-        "tool": "board-read"
-      },
-      "adversarial": [
-        "denied",
-        "timeout",
-        "cancel",
-        "output-cap",
-        "path-escape",
-        "bad-args",
-        "child-cleanup"
       ],
       "evidence": null
     },

@@ -1,0 +1,66 @@
+{
+  "currency": "USD",
+  "periods": 4,
+  "days_per_period": 7,
+  "periods_per_year": 52,
+  "horizon_start": 20000,
+  "service_level_ppm": 950000,
+  "lead_time_quantile": "p90",
+  "parts": [
+    {
+      "part": 1,
+      "mpn": "MPN-1",
+      "on_hand": 100,
+      "confirmed": [],
+      "lead_time_days": {
+        "value": {
+          "status": "known",
+          "value": { "p10": 7, "p50": 14, "p90": 14, "p99": 20, "sample_size": 30 }
+        },
+        "basis": {
+          "kind": "provenance",
+          "source": "erp_extract",
+          "evidence": { "id": "lead", "revision": 1, "digest": "a" },
+          "captured_on": 20000,
+          "method": "ERP lead times",
+          "conditions": ["last 30 orders"],
+          "falsifier": "a different order history"
+        }
+      },
+      "lot": { "moq": 100, "multiple": 50 },
+      "shelf_life_days": null,
+      "lifecycle": "active",
+      "last_order_day": null,
+      "unit_cost": {
+        "value": { "status": "known", "value": { "micros": 1000000, "currency": "USD" } },
+        "basis": {
+          "kind": "provenance",
+          "source": "erp_extract",
+          "evidence": { "id": "cost", "revision": 1, "digest": "b" },
+          "captured_on": 20000,
+          "method": "standard cost",
+          "conditions": ["standard cost revision 1"],
+          "falsifier": "a revised standard cost"
+        }
+      },
+      "demand_stats": {
+        "value": {
+          "status": "known",
+          "value": { "mean_micros": 100000000, "sigma_micros": 20000000 }
+        },
+        "basis": {
+          "kind": "provenance",
+          "source": "erp_extract",
+          "evidence": { "id": "stats", "revision": 1, "digest": "c" },
+          "captured_on": 20000,
+          "method": "demand history",
+          "conditions": ["52 weeks"],
+          "falsifier": "a changed demand history"
+        }
+      },
+      "suppliers": [ { "supplier": 1, "share_ppm": 1000000 } ]
+    }
+  ],
+  "bom": [],
+  "demand": [ { "part": 1, "period": 0, "quantity": 500 } ]
+}

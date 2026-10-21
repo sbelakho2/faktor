@@ -15,6 +15,8 @@ use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_post_json, EgressError, HttpTransport};
 use faktor_provider::egress::{BudgetComponent, CheckedResponse, ResponseBudget};
 use faktor_provider::sanitize::{auth_shaped_text, ErrorScrubber};
+#[cfg(test)]
+use faktor_provider::transport::MAX_STREAM_BODY_BYTES;
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -36,8 +38,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    CanonicalUsage, ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, Role,
+    CanonicalUsage, ContentKind, GenericAgentRequest, OutputEnvelope, Provider, ProviderChunk,
+    ProviderError, ProviderErrorKind, ProviderStream, Role,
 };
 
 /// Documented Anthropic Messages per-image ceiling (raw bytes): the API
@@ -445,13 +447,23 @@ impl Provider for AnthropicProvider {
         };
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
-        Box::pin(anthropic_stream(
+        // The tool_use argument accumulator is part of the attempt's
+        // cumulative output: every input_json_delta is billed against the
+        // SAME envelope the agent enforces over complete chunks, so a
+        // hostile fragmented call cannot grow memory past the resolved cap
+        // before the agent ever sees a ToolCall.
+        let envelope = OutputEnvelope::from_request(req.max_output, caps.max_output);
+        let tool_argument_bound = usize::try_from(envelope.byte_ceiling)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        Box::pin(anthropic_stream_bounded(
             transport,
             url,
             headers,
             body,
             deadlines,
             Some(cancel),
+            tool_argument_bound,
         ))
     }
 }
@@ -486,6 +498,44 @@ fn drain_tool_calls(calls: &mut std::collections::BTreeMap<u64, ToolSlot>) -> Ve
     out
 }
 
+/// Cumulative tool_use argument bytes across every slot. Every fragment
+/// (and the id/name carried by the block start) counts, so the bound cannot
+/// be bypassed by opening a new slot after the previous one filled up.
+fn tool_argument_bytes(calls: &std::collections::BTreeMap<u64, ToolSlot>) -> u64 {
+    calls.values().fold(0u64, |total, slot| {
+        total
+            .saturating_add(u64::try_from(slot.args.len()).unwrap_or(u64::MAX))
+            .saturating_add(
+                slot.id
+                    .as_ref()
+                    .map_or(0, |id| u64::try_from(id.len()).unwrap_or(u64::MAX)),
+            )
+            .saturating_add(
+                slot.name
+                    .as_ref()
+                    .map_or(0, |name| u64::try_from(name.len()).unwrap_or(u64::MAX)),
+            )
+    })
+}
+
+fn ensure_tool_argument_bound(
+    calls: &std::collections::BTreeMap<u64, ToolSlot>,
+    max_bytes: usize,
+) -> Result<(), ProviderError> {
+    let observed = tool_argument_bytes(calls);
+    if observed > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::OutputLimitExceeded,
+            format!(
+                "anthropic tool_use accumulator reached {observed} bytes, beyond the \
+                 resolved output envelope ({max_bytes} bytes)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn anthropic_stream(
     transport: Arc<dyn HttpTransport>,
     url: String,
@@ -494,7 +544,32 @@ pub(crate) fn anthropic_stream(
     deadlines: StreamDeadlines,
     cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
+    // Direct transport users have no per-request envelope: use the same
+    // whole-body bound the transport already imposes, so accumulation can
+    // never exceed the memory ceiling even without an agent request.
+    anthropic_stream_bounded(
+        transport,
+        url,
+        headers,
+        body,
+        deadlines,
+        cancel,
+        usize::try_from(MAX_STREAM_BODY_BYTES).unwrap_or(usize::MAX),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn anthropic_stream_bounded(
+    transport: Arc<dyn HttpTransport>,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    body: serde_json::Value,
+    deadlines: StreamDeadlines,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
+    max_tool_argument_bytes: usize,
+) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
+    let max_tool_argument_bytes = max_tool_argument_bytes.max(1);
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
     // Registered secret scrubber for this request: credentials the request
@@ -677,6 +752,14 @@ pub(crate) fn anthropic_stream(
                                         .and_then(|n| n.as_str())
                                         .map(|s| s.to_string());
                                     slot.args.clear();
+                                    // The block start is already part of the
+                                    // cumulative cost (a hostile server can
+                                    // front-load an oversized id/name/input).
+                                    if let Err(e) =
+                                        ensure_tool_argument_bound(&calls, max_tool_argument_bytes)
+                                    {
+                                        return Some((Err(e), Stage::Done));
+                                    }
                                 } else if block_type == Some("text") {
                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         if !text.is_empty() {
@@ -725,6 +808,14 @@ pub(crate) fn anthropic_stream(
                                 let index =
                                     value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                                 calls.entry(index).or_default().args.push_str(args);
+                                // Checked on EVERY delta, before the next
+                                // line is read: the accumulator can never
+                                // grow past the resolved attempt envelope.
+                                if let Err(e) =
+                                    ensure_tool_argument_bound(&calls, max_tool_argument_bytes)
+                                {
+                                    return Some((Err(e), Stage::Done));
+                                }
                             }
                         }
                         "message_delta" => {
@@ -1113,6 +1204,54 @@ mod tests {
         assert_eq!(id, "toolu_1");
         assert_eq!(name, "read_file");
         assert_eq!(input["path"], "a.rs");
+    }
+
+    /// A hostile fragmented tool_use stream must trip the adapter's
+    /// cumulative bound BEFORE it can buffer an unbounded argument JSON.
+    #[tokio::test]
+    async fn fragmented_tool_arguments_are_bounded_at_the_resolved_envelope() {
+        let server = MockServer::new();
+        let mut events = vec![
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#.to_string(),
+        ];
+        for _ in 0..8 {
+            events.push(
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#.to_string(),
+            );
+        }
+        events.push(r#"data: {"type":"message_stop"}"#.to_string());
+        let body = events.join("\n\n");
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(anthropic_stream_bounded(
+            Arc::new(PolicyCheckedHttpTransport::permissive()),
+            format!("{base}/v1/messages"),
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+            64,
+        ));
+        let err = loop {
+            match stream.next().await.expect("one item") {
+                Ok(ProviderChunk::ToolCall { .. }) => {
+                    panic!("an over-bound accumulator must never complete a tool call")
+                }
+                Ok(ProviderChunk::Done) => panic!("the stream must fail, not complete"),
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind, ProviderErrorKind::OutputLimitExceeded, "{err:?}");
+        assert!(
+            err.message.contains("64 bytes"),
+            "the typed detail names the resolved bound: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

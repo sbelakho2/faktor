@@ -2,7 +2,7 @@
   "schema": "faktor-frozen-contracts-manifest/v1",
   "generator": "faktor-contracts",
   "algorithm": "sha256",
-  "digest": "sha256:0a6174b747449aaaf8ca26910596943baf6e95441df243c350fc9e0bf7f0c2de",
+  "digest": "sha256:1156cbd6d0097bf22cdbf55e5220d956730e5874cbb2cd9de0af39cda5cc4cb2",
   "files": [
     {
       "path": "docs/contracts/agent-state.json",
@@ -10,11 +10,11 @@
     },
     {
       "path": "docs/contracts/error-codes.json",
-      "sha256": "sha256:e54cd5768f0d8e8a292c91495303a0c1a8c1bd46ea31819ef927afdff6b1cf5e"
+      "sha256": "sha256:e3b73e7275db30cd1575cdeb71c4e7806f25727269cc56212dfac5ed79a72d29"
     },
     {
       "path": "docs/contracts/error-kind.json",
-      "sha256": "sha256:e7d9ccef8863c225caa5a91b8e411a831a90b09634b6422d7ae122d888b2e450"
+      "sha256": "sha256:a87ab52970b4d0351c8d7f5804429c46048a342d88952f2aeca42669b592059d"
     },
     {
       "path": "docs/contracts/event-kind.json",
@@ -26,11 +26,11 @@
     },
     {
       "path": "docs/contracts/provider-error-kind.json",
-      "sha256": "sha256:da58e7c885bcd72f935d7019de8205d7d087c32a25c2cd4609357cd1f5642162"
+      "sha256": "sha256:0709657327725e978577788f0a7add99f5abc85950da3bb676d509b472926e99"
     },
     {
       "path": "docs/contracts/reason-code.json",
-      "sha256": "sha256:0a7090fe8938957154f30e084d7c3f278d8984ebc450f1ca0b71a18c541162af"
+      "sha256": "sha256:488d3d154c16164905e37448ee4dfd48d7b36e1cff9932418a9e182e79a64569"
     },
     {
       "path": "docs/contracts/task-state.json",

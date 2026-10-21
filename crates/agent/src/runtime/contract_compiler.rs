@@ -482,7 +482,11 @@ impl AgentRuntime {
     /// diagnostic and the native contract stands byte-identically.
     pub(crate) async fn compile_baseline_contract(&self, handle: &SessionHandle, task: &Task) {
         let session = handle.id();
-        if task.goal.trim().is_empty() {
+        // Defensive boundary: the contract is a durable, cacheable-prefix
+        // artifact, so it is compiled from the REDACTED semantic goal even
+        // when a legacy task row still carries a raw prompt.
+        let goal = crate::runtime::durable_goal_text(&task.goal);
+        if goal.trim().is_empty() {
             return;
         }
         let root = match self.deps.session.resolve_workspace_root(session) {
@@ -502,10 +506,10 @@ impl AgentRuntime {
                 return;
             }
         };
-        let tokens = faktor_core::contract_compile::intent_tokens(&task.goal);
+        let tokens = faktor_core::contract_compile::intent_tokens(&goal);
         let repository = scan_repository_snapshot(&root, &tokens);
         let request = ContractCompileRequest {
-            goal: task.goal.clone(),
+            goal: goal.clone(),
             repository,
         };
         // The native compile establishes the neutral identity (intent

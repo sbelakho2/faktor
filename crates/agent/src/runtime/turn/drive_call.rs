@@ -663,6 +663,17 @@ impl AgentRuntime {
         max_attempts: u32,
         retry_policy: &faktor_core::retry::RetryPolicy,
     ) -> faktor_core::Result<AttemptFlow> {
+        // Cumulative output enforcement (Faktor-side): the wire cap is only
+        // a REQUEST. One physical attempt owns one counter; durable part
+        // flushes below never reset it, so a provider that ignores the cap
+        // cannot stream/flush without bound.
+        let output_envelope =
+            OutputEnvelope::from_request(request.max_output, st.effective_caps.max_output);
+        let mut output_budget = OutputBudget::new(output_envelope);
+        // The attempt's OWN cancellation token (a child of the turn token):
+        // tripping the envelope cancels this provider attempt without
+        // marking the logical turn cancelled.
+        let attempt_cancel = request.meta.cancellation.clone();
         let mut stream = st.provider.stream(request);
         // Stall watchdog (spec §28, stall vs progress): while the
         // stream is awaited, a bounded tick evaluates the session's
@@ -725,6 +736,19 @@ impl AgentRuntime {
                     }
                     match chunk {
                         Ok(ProviderChunk::Text { text }) => {
+                            if let Err(violation) = output_budget.record_text(&text) {
+                                return self
+                                    .turn_output_limit_end(
+                                        st,
+                                        attempt_identity,
+                                        reservation,
+                                        acct,
+                                        debits,
+                                        violation,
+                                        &attempt_cancel,
+                                    )
+                                    .await;
+                            }
                             st.text_buf.push_str(&text);
                             let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
                             // The chunk buffer is MOVED to the sink (no copy).
@@ -734,13 +758,28 @@ impl AgentRuntime {
                             // chunk (a multi-hour agent would commit millions of
                             // tiny SQLite events). The durable representation is
                             // the message part, flushed in bounded segments so a
-                            // crash loses at most one segment.
+                            // crash loses at most one segment. The cumulative
+                            // output counter above is independent of these
+                            // flush boundaries.
                             if st.text_buf.len() >= STREAM_FLUSH_BYTES {
                                 st.handle.append_text_part(mid, &st.text_buf).await?;
                                 st.text_buf.clear();
                             }
                         }
                         Ok(ProviderChunk::Reasoning { text }) => {
+                            if let Err(violation) = output_budget.record_reasoning(&text) {
+                                return self
+                                    .turn_output_limit_end(
+                                        st,
+                                        attempt_identity,
+                                        reservation,
+                                        acct,
+                                        debits,
+                                        violation,
+                                        &attempt_cancel,
+                                    )
+                                    .await;
+                            }
                             st.reasoning_buf.push_str(&text);
                             let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
                             // The chunk buffer is MOVED to the sink (no copy).
@@ -762,6 +801,30 @@ impl AgentRuntime {
                                     "incomplete tool call {id} without completion"
                                 )));
                             }
+                            // The payload is serialized once: its byte cost is
+                            // part of the attempt envelope, and the SAME bytes
+                            // feed the live frame. A payload beyond the
+                            // envelope is never persisted and never enters
+                            // the pending tool batch.
+                            let input_json = serde_json::to_string(&input).unwrap_or_default();
+                            if let Err(violation) = output_budget.record_tool_call(
+                                &id,
+                                &name,
+                                &input,
+                                input_json.len() as u64,
+                            ) {
+                                return self
+                                    .turn_output_limit_end(
+                                        st,
+                                        attempt_identity,
+                                        reservation,
+                                        acct,
+                                        debits,
+                                        violation,
+                                        &attempt_cancel,
+                                    )
+                                    .await;
+                            }
                             let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
                             st.handle.append_tool_call_part(
                                 mid,
@@ -774,10 +837,7 @@ impl AgentRuntime {
                                 st.handle.id(),
                                 Some(mid),
                                 "tool",
-                                format!(
-                                    "{name}\n{}",
-                                    serde_json::to_string(&input).unwrap_or_default()
-                                ),
+                                format!("{name}\n{input_json}"),
                             );
                             st.tool_calls.push((id, name, input));
                         }
@@ -858,6 +918,24 @@ impl AgentRuntime {
                         }
                         Ok(ProviderChunk::Done) => break,
                         Err(e) => {
+                            if e.kind == ProviderErrorKind::OutputLimitExceeded {
+                                // An adapter-side breach reports the same
+                                // typed refusal; end through the identical
+                                // conservative path (attempt cancelled,
+                                // UNCERTAIN settlement, partial text kept
+                                // with the explicit marker).
+                                return self
+                                    .turn_output_limit_end_detail(
+                                        st,
+                                        attempt_identity,
+                                        reservation,
+                                        acct,
+                                        debits,
+                                        e.message,
+                                        &attempt_cancel,
+                                    )
+                                    .await;
+                            }
                             // POST-dispatch stream failure (attempt
                             // accounting): the provider may have
                             // billed — the machine marks this
@@ -999,6 +1077,124 @@ impl AgentRuntime {
             }
         }
         Ok(AttemptFlow::Settled)
+    }
+
+    /// Terminal handling of a cumulative output-envelope breach: cancel the
+    /// provider attempt, keep the already-accepted partial output (with an
+    /// explicit incomplete marker) and settle conservatively because the
+    /// request DID dispatch (the provider may have billed).
+    #[allow(clippy::too_many_arguments)]
+    async fn turn_output_limit_end(
+        self: &Arc<Self>,
+        st: &mut TurnDriveState<'_>,
+        attempt_identity: ModelCallAttempt,
+        reservation: faktor_session::ReservationId,
+        acct: &mut crate::AttemptAccounting,
+        debits: &mut crate::credits::AttemptDebits,
+        violation: ProviderOutputLimitExceeded,
+        attempt_cancel: &CancellationToken,
+    ) -> faktor_core::Result<AttemptFlow> {
+        tracing::error!(
+            session = %st.handle.id(),
+            provider = %st.provider.id(),
+            model = %st.model,
+            kind = violation.kind.label(),
+            observed_tokens = violation.observed_tokens,
+            observed_bytes = violation.observed_bytes,
+            token_ceiling = violation.envelope.token_ceiling,
+            byte_ceiling = violation.envelope.byte_ceiling,
+            "provider stream exceeded the Faktor-side output envelope; canceling the attempt"
+        );
+        self.turn_output_limit_end_detail(
+            st,
+            attempt_identity,
+            reservation,
+            acct,
+            debits,
+            violation.detail(),
+            attempt_cancel,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn turn_output_limit_end_detail(
+        self: &Arc<Self>,
+        st: &mut TurnDriveState<'_>,
+        attempt_identity: ModelCallAttempt,
+        reservation: faktor_session::ReservationId,
+        acct: &mut crate::AttemptAccounting,
+        debits: &mut crate::credits::AttemptDebits,
+        detail: String,
+        attempt_cancel: &CancellationToken,
+    ) -> faktor_core::Result<AttemptFlow> {
+        // Cancel the PROVIDER attempt only: this token is a child of the
+        // turn token, so the turn itself is not reported as user-cancelled.
+        attempt_cancel.cancel();
+        // Dispatch happened: the reservation may only become UNCERTAIN
+        // (never a refund) and the commercial hold stays durable for
+        // reconciliation.
+        if let Err(e) = acct
+            .fail_after_dispatch("provider_output_limit_exceeded", None)
+            .await
+        {
+            tracing::error!(
+                session = %st.handle.id(),
+                "cannot mark the output-limited attempt uncertain: {e}"
+            );
+        }
+        debits.close_uncertain();
+        self.persist_output_limit_partial(st).await?;
+        let error = ProviderError::new(ProviderErrorKind::OutputLimitExceeded, detail.clone());
+        st.handle.record_provider_call_attempt(
+            attempt_identity,
+            reservation_link(reservation),
+            st.provider.id(),
+            &st.model,
+            "failed",
+            None,
+            None,
+            Some(&error.to_string()),
+        )?;
+        self.with_tracker(st.handle.id(), |t| t.note_output_limit_violation(&detail));
+        self.handle_provider_failure(st.handle, st.op_id, error, &mut st.outcome)
+            .await?;
+        st.outcome.stop_reason = Some(OutcomeReason::new(
+            ReasonCode::ProviderOutputLimitExceeded,
+            detail,
+        ));
+        Ok(AttemptFlow::End)
+    }
+
+    /// Preserve every accepted user-visible/reasoning delta and append the
+    /// explicit truncation marker. The violating chunk is never written.
+    async fn persist_output_limit_partial(
+        &self,
+        st: &mut TurnDriveState<'_>,
+    ) -> faktor_core::Result<()> {
+        let mid = self
+            .ensure_assistant_message(st.handle, &mut st.assistant_message)
+            .await?;
+        if !st.reasoning_buf.is_empty() {
+            st.handle
+                .append_reasoning_part(mid, &st.reasoning_buf)
+                .await?;
+            st.reasoning_buf.clear();
+        }
+        if !st.text_buf.is_empty() {
+            st.handle.append_text_part(mid, &st.text_buf).await?;
+            st.text_buf.clear();
+        }
+        st.handle
+            .append_text_part(mid, OUTPUT_LIMIT_INCOMPLETE_MARKER)
+            .await?;
+        self.emit_chunk(
+            st.handle.id(),
+            Some(mid),
+            "text",
+            OUTPUT_LIMIT_INCOMPLETE_MARKER.to_string(),
+        );
+        Ok(())
     }
 
     /// Settle ONE completed attempt through the budget machine and follow

@@ -464,6 +464,13 @@ impl WorkspaceFileService {
         root: PathBuf,
     ) -> Result<WorkspaceHandle, Error> {
         let (tx, rx) = mpsc::channel(1024);
+        // Independent broadcast tap: the legacy single receiver stays the
+        // IndexService's lossy coalescing channel, while other authorities
+        // (the impact graph's material generation) subscribe without
+        // stealing events from it. A lagging tap is surfaced as `Lagged` and
+        // forces that consumer to reconcile from disk, never to assume clean.
+        let (events_tx, _events_rx) = tokio::sync::broadcast::channel(4096);
+        let tap = events_tx.clone();
         let watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(ev) = res {
@@ -479,11 +486,13 @@ impl WorkspaceFileService {
                         // deadlock writes). Dropped events are recovered by
                         // index rescan (incremental indexing rebuilds from
                         // disk state).
-                        let _ = tx.try_send(FsEvent {
+                        let event = FsEvent {
                             workspace_id,
                             path: p,
                             kind,
-                        });
+                        };
+                        let _ = tx.try_send(event.clone());
+                        let _ = tap.send(event);
                     }
                 }
             },
@@ -570,6 +579,7 @@ impl WorkspaceFileService {
             rooted,
             _watcher: watcher.map(|w| Arc::new(Mutex::new(w))),
             events: Arc::new(Mutex::new(rx)),
+            events_tx: Some(events_tx),
         })
     }
 
@@ -690,6 +700,9 @@ pub struct WorkspaceHandle {
     /// no events: their whole lifetime is one caller operation.
     _watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     events: Arc<Mutex<mpsc::Receiver<FsEvent>>>,
+    /// Broadcast tap for additional consumers (no stealing from `events`).
+    /// `None` on watcher-less scoped handles.
+    events_tx: Option<tokio::sync::broadcast::Sender<FsEvent>>,
 }
 
 impl std::fmt::Debug for WorkspaceHandle {
@@ -757,6 +770,7 @@ impl WorkspaceHandle {
             rooted,
             _watcher: None,
             events: Arc::new(Mutex::new(rx)),
+            events_tx: None,
         })
     }
 
@@ -1179,6 +1193,14 @@ impl WorkspaceHandle {
 
     pub fn events(&self) -> &Mutex<mpsc::Receiver<FsEvent>> {
         &self.events
+    }
+
+    /// Subscribe to a CLONE of every watcher event without consuming the
+    /// legacy [`Self::events`] receiver. A lagging subscriber observes
+    /// `Lagged` and must reconcile from disk; it never silently misses the
+    /// gap. `None` when this handle has no watcher.
+    pub fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<FsEvent>> {
+        self.events_tx.as_ref().map(|tx| tx.subscribe())
     }
 
     /// Identity check helper: every tool call carries its identity; this

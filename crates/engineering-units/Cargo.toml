@@ -1,0 +1,17 @@
+[package]
+name = "engineering-units"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dimension-checked quantities, tolerances, uncertainty and deterministic math kernels for Faktor Engineering."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

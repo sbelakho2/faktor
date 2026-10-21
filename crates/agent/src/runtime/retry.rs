@@ -191,6 +191,8 @@ impl AgentRuntime {
             "silenceMs": silence,
             "stallThresholdMs": t.threshold_ms(),
             "stalled": stalled,
+            "outputLimitViolations": t.output_limit_violations(),
+            "lastOutputLimitViolation": t.last_output_limit_violation(),
         }))
     }
 

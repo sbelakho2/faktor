@@ -20,6 +20,7 @@
 //!   enrichment through the ONE process supervisor.
 
 pub mod build;
+pub mod generation;
 pub mod manifest;
 pub mod model;
 pub mod parse;
@@ -33,7 +34,14 @@ pub mod lsp;
 #[cfg(feature = "lsp")]
 pub use lsp::{enrich_graph, LspOptions, LspStats};
 
-pub use build::{BuildOptions, BuildReport, GraphBuilder, ImpactSession, IncrementalStats};
+pub use build::{
+    is_topology_manifest, BuildOptions, BuildReport, GraphBuilder, ImpactSession, IncrementalStats,
+    RefreshMode, RefreshPolicy, RefreshReport,
+};
+pub use generation::{
+    DirtyPaths, GenerationLimits, MaterialGeneration, DEFAULT_MAX_DIRTY_PATHS,
+    DEFAULT_MAX_GENERATIONS,
+};
 pub use manifest::{CrateInfo, TopologyOptions, Workspace};
 pub use model::{
     crate_id, file_id, module_id, package_id, symbol_id, test_id, EdgeKind, Graph, GraphEdge,
@@ -46,4 +54,6 @@ pub use query::{
     AffectedOptions, AffectedResult, ChangedTarget, ImpactGraph, ImpactReason, ImpactRelation,
     ImpactedNode, QueryStats, DEFAULT_MAX_DEPTH, DEFAULT_MAX_RESULTS,
 };
-pub use topology::{AdapterKind, Unit, UnitKind as TopologyUnitKind};
+pub use topology::{
+    AdapterKind, AdapterMode, AdapterOutcome, NativeProbe, Unit, UnitKind as TopologyUnitKind,
+};

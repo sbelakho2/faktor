@@ -34,6 +34,7 @@ tokio.workspace = true
 serde.workspace = true
 blake3.workspace = true
 serde_json.workspace = true
+base64 = "0.22"
 futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -42,6 +43,10 @@ tempfile.workspace = true
 [dev-dependencies]
 # Unit tests arm the store's deterministic crash seam (queue windows).
 faktor-store = { workspace = true, features = ["fault-injection"] }
+# Hostile OpenAI-compatible stream certificates run the REAL adapter against
+# a loopback mock server (the permissive transport is test-utils gated).
+faktor-openai.workspace = true
+faktor-provider = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

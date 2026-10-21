@@ -1,0 +1,154 @@
+{
+  "currency": "USD",
+  "materials": [
+    {
+      "value": {
+        "status": "known",
+        "value": {
+          "description": "6061-T6 bar",
+          "quantity_per_unit": 2500000,
+          "unit_price": { "micros": 4000000, "currency": "USD" },
+          "yield_rate": 800000
+        }
+      },
+      "basis": {
+        "kind": "provenance",
+        "source": "supplier_document",
+        "evidence": { "id": "mat-1", "revision": 2, "digest": "a" },
+        "captured_on": 20000,
+        "method": "quote line 1",
+        "conditions": ["revision 2"],
+        "falsifier": "a revised material quote"
+      }
+    }
+  ],
+  "process_steps": [
+    {
+      "operation": "CNC",
+      "machine": {
+        "value": { "status": "known", "value": { "rate_per_hour": { "micros": 120000000, "currency": "USD" }, "cycle_seconds": 90 } },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "machine-1", "revision": 2, "digest": "b" },
+          "captured_on": 20000,
+          "method": "quote line 2",
+          "conditions": ["revision 2"],
+          "falsifier": "a revised machine rate"
+        }
+      },
+      "setup": {
+        "value": { "status": "known", "value": { "setup_cost": { "micros": 600000000, "currency": "USD" }, "lot_size": 1000 } },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "setup-1", "revision": 2, "digest": "c" },
+          "captured_on": 20000,
+          "method": "quote line 3",
+          "conditions": ["revision 2"],
+          "falsifier": "a revised setup cost"
+        }
+      },
+      "tooling": {
+        "value": { "status": "known", "value": { "tooling_cost": { "micros": 12000000000, "currency": "USD" }, "amortization_units": 30000 } },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "tooling-1", "revision": 2, "digest": "d" },
+          "captured_on": 20000,
+          "method": "quote line 4",
+          "conditions": ["revision 2"],
+          "falsifier": "a revised tooling quote"
+        }
+      },
+      "labor": {
+        "value": { "status": "known", "value": { "rate_per_hour": { "micros": 30000000, "currency": "USD" }, "minutes_per_unit": 3 } },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "labor-1", "revision": 2, "digest": "e" },
+          "captured_on": 20000,
+          "method": "quote line 5",
+          "conditions": ["revision 2"],
+          "falsifier": "a revised labor rate"
+        }
+      },
+      "yield_rate": {
+        "value": { "status": "known", "value": 950000 },
+        "basis": {
+          "kind": "provenance",
+          "source": "supplier_document",
+          "evidence": { "id": "yield-1", "revision": 2, "digest": "f" },
+          "captured_on": 20000,
+          "method": "quote line 6",
+          "conditions": ["revision 2"],
+          "falsifier": "a measured yield below the quote"
+        }
+      }
+    }
+  ],
+  "inspection": {
+    "value": { "status": "known", "value": { "micros": 250000, "currency": "USD" } },
+    "basis": {
+      "kind": "provenance",
+      "source": "supplier_document",
+      "evidence": { "id": "inspection-1", "revision": 2, "digest": "g" },
+      "captured_on": 20000,
+      "method": "quote line 7",
+      "conditions": ["revision 2"],
+      "falsifier": "a revised inspection price"
+    }
+  },
+  "scrap_rework": {
+    "value": {
+      "status": "known",
+      "value": { "scrap_rate": 20000, "rework_rate": 300000, "rework_cost_per_unit": { "micros": 100000, "currency": "USD" } }
+    },
+    "basis": {
+      "kind": "provenance",
+      "source": "supplier_document",
+      "evidence": { "id": "scrap-1", "revision": 2, "digest": "h" },
+      "captured_on": 20000,
+      "method": "quote line 8",
+      "conditions": ["revision 2"],
+      "falsifier": "measured scrap above the quote"
+    }
+  },
+  "overhead": {
+    "value": { "status": "known", "value": { "rate": 100000, "base": "conversion" } },
+    "basis": {
+      "kind": "provenance",
+      "source": "supplier_document",
+      "evidence": { "id": "overhead-1", "revision": 2, "digest": "i" },
+      "captured_on": 20000,
+      "method": "quote line 9",
+      "conditions": ["revision 2"],
+      "falsifier": "a revised overhead allocation"
+    }
+  },
+  "packaging": {
+    "value": { "status": "known", "value": { "micros": 200000, "currency": "USD" } },
+    "basis": {
+      "kind": "provenance",
+      "source": "supplier_document",
+      "evidence": { "id": "packaging-1", "revision": 2, "digest": "j" },
+      "captured_on": 20000,
+      "method": "quote line 10",
+      "conditions": ["revision 2"],
+      "falsifier": "a revised packaging price"
+    }
+  },
+  "margin": {
+    "value": { "status": "known", "value": 250000 },
+    "basis": {
+      "kind": "provenance",
+      "source": "supplier_document",
+      "evidence": { "id": "margin-1", "revision": 2, "digest": "k" },
+      "captured_on": 20000,
+      "method": "quote line 11",
+      "conditions": ["revision 2"],
+      "falsifier": "a revised margin"
+    }
+  },
+  "margin_mode": "margin_on_price"
+}

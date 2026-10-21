@@ -6,10 +6,13 @@
 //!   durable rows a crash-resumed settlement reads), with base `git show`
 //!   fallback for a rename source that has no checkpoint row;
 //! * git rename detection over the candidate worktree (`git diff
-//!   --find-renames --name-status HEAD`), the rename EDGE authority.
+//!   --find-renames=50% --name-status HEAD`), the rename EDGE authority.
 //!
-//! Neither input is fabricated: a missing side is absent and the mapping
-//! stays unresolved rather than guessing.
+//! A rename edge proves only the path relation. Semantic preservation is
+//! proven separately by the declaration adapters; a weak (1%) similarity
+//! edge is never authority for a proof migration. Neither input is
+//! fabricated: a missing side is absent and the mapping stays unresolved
+//! rather than guessing.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,8 +25,8 @@ use super::*;
 
 impl AgentRuntime {
     /// Gather the rebinding evidence for one candidate snapshot. Bounded:
-    /// only changed Rust files (plus rename-edge endpoints), at most the
-    /// review fetch bound, each side bounded by the review side bound.
+    /// only changed test-bearing files (plus rename-edge endpoints), at most
+    /// the review fetch bound, each side bounded by the review side bound.
     pub(crate) async fn test_rebind_evidence(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -35,7 +38,9 @@ impl AgentRuntime {
         if let Some(supervisor) = &self.deps.supervisor {
             if let Ok(edges) = git_rename_edges(supervisor.clone(), root, handle.id()).await {
                 for (from, to) in edges {
-                    if from.ends_with(".rs") || to.ends_with(".rs") {
+                    if faktor_verify::rebind::supports_test_path(&from)
+                        || faktor_verify::rebind::supports_test_path(&to)
+                    {
                         renames.push(TestRenameEdge {
                             from: from.clone(),
                             to: to.clone(),
@@ -47,14 +52,14 @@ impl AgentRuntime {
         }
         let mut paths: Vec<String> = changed
             .iter()
-            .filter(|path| path.ends_with(".rs"))
+            .filter(|path| faktor_verify::rebind::supports_test_path(path))
             .cloned()
             .collect();
         for edge in &renames {
-            if edge.from.ends_with(".rs") {
+            if faktor_verify::rebind::supports_test_path(&edge.from) {
                 paths.push(edge.from.clone());
             }
-            if edge.to.ends_with(".rs") {
+            if faktor_verify::rebind::supports_test_path(&edge.to) {
                 paths.push(edge.to.clone());
             }
         }
@@ -138,7 +143,7 @@ async fn git_rename_edges(
             root,
             &[
                 "diff",
-                "--find-renames=1%",
+                "--find-renames=50%",
                 "--name-status",
                 "-z",
                 "HEAD",
@@ -164,7 +169,14 @@ fn parse_rename_status(output: &str) -> Vec<(String, String)> {
             b'R' => {
                 let Some(from) = tokens.next() else { break };
                 let Some(to) = tokens.next() else { break };
-                if !from.is_empty() && !to.is_empty() {
+                // Defense in depth: the command already asks for >=50%
+                // detection, but an unexpected low-similarity score is never
+                // proof-authoritative even if git emits one.
+                let score = status
+                    .get(1..)
+                    .and_then(|score| score.parse::<u32>().ok())
+                    .unwrap_or(100);
+                if score >= 50 && !from.is_empty() && !to.is_empty() {
                     out.push((from.to_string(), to.to_string()));
                 }
             }
@@ -179,4 +191,26 @@ fn parse_rename_status(output: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::parse_rename_status;
+
+    #[test]
+    fn rename_status_requires_a_strong_similarity_score() {
+        let output = "R100\0tests/old.rs\0tests/new.rs\0R001\0tests/weak.rs\0tests/weak_new.rs\0";
+        assert_eq!(
+            parse_rename_status(output),
+            vec![("tests/old.rs".to_string(), "tests/new.rs".to_string())],
+            "a 1% pairing must never become proof-authoritative rename evidence"
+        );
+    }
+
+    #[test]
+    fn rename_status_skips_copies_adds_deletes_and_malformed_tails() {
+        let output =
+            "C100\0tests/a.rs\0tests/b.rs\0A\0tests/new.rs\0D\0tests/gone.rs\0R100\0tests/from.rs\0";
+        assert!(parse_rename_status(output).is_empty());
+    }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "engineering-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Faktor Engineering Design Graph, conditional engineering values, analysis receipts and the 11-gate response contract."
+
+[dependencies]
+engineering-units.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

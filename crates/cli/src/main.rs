@@ -37,6 +37,7 @@ mod billing_report;
 mod bootstrap;
 mod config;
 mod embeddings;
+mod engineering;
 mod evidence;
 mod graph;
 mod impact;
@@ -44,10 +45,12 @@ mod mcp_bridge;
 mod payload;
 mod scm_daemon;
 mod sso_auth;
+mod supply;
 #[cfg(test)]
 mod test_http;
 mod tools;
 mod tools_market;
+mod tools_supply_engineering;
 mod worker_node;
 
 use graph::DaemonGraph;
@@ -230,6 +233,22 @@ pub(crate) enum Command {
         data_dir: String,
         #[arg(long, global = true)]
         config: Option<String>,
+    },
+    /// Deterministic Supply kernels over typed JSON: should-cost, TCO,
+    /// supplier fit, qualification, customs, planning, RFQ, bid normalization
+    /// and authorization-gated actions. No model, no network, no side effects.
+    #[command(display_order = 85)]
+    Supply {
+        #[command(subcommand)]
+        action: supply::SupplyAction,
+    },
+    /// Deterministic Engineering kernels over typed JSON: analyse a frozen
+    /// requirement set against supply candidates, or verify a stored
+    /// decision/receipt. No model, no network, no side effects.
+    #[command(display_order = 86)]
+    Engineering {
+        #[command(subcommand)]
+        action: engineering::EngineeringAction,
     },
 }
 
@@ -590,6 +609,18 @@ pub(crate) async fn main() {
             config,
         } => {
             commerce_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
+        }
+        Command::Supply { action } => {
+            if let Err(error) = supply::command(action) {
+                eprintln!("supply: {error}");
+                std::process::exit(1);
+            }
+        }
+        Command::Engineering { action } => {
+            if let Err(error) = engineering::command(action) {
+                eprintln!("engineering: {error}");
+                std::process::exit(1);
+            }
         }
         Command::Worker {
             action,

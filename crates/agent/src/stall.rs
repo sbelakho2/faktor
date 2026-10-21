@@ -213,6 +213,12 @@ pub struct StallTracker {
     /// Status of the last finalized durable verification record (Failed →
     /// later Passed = verification improved).
     last_verification_status: Option<VerificationStatus>,
+    /// Cumulative output-envelope violations observed for this session
+    /// (Faktor-side model-output enforcement). Diagnostics/health only: the
+    /// per-attempt refusal itself is journaled by the turn.
+    output_limit_violations: u64,
+    /// Bounded detail of the newest output-envelope violation.
+    last_output_limit_violation: Option<String>,
 }
 
 use std::collections::{HashMap, VecDeque};
@@ -237,7 +243,28 @@ impl StallTracker {
             criteria_statuses: LruMap::with_cap(CRITERIA_STATUS_CAP),
             failure_fingerprints: LruMap::with_cap(FAILURE_FINGERPRINT_CAP),
             last_verification_status: None,
+            output_limit_violations: 0,
+            last_output_limit_violation: None,
         }
+    }
+
+    /// Diagnostic: one provider output-envelope violation was observed for
+    /// this session. The detail is bounded before it enters the record (the
+    /// caller builds it from numbers and fixed labels, but the bound keeps
+    /// this accessor safe for any future caller).
+    pub fn note_output_limit_violation(&mut self, detail: &str) {
+        self.output_limit_violations = self.output_limit_violations.saturating_add(1);
+        self.last_output_limit_violation = Some(detail.chars().take(512).collect());
+    }
+
+    /// Total output-envelope violations observed (diagnostics/health).
+    pub fn output_limit_violations(&self) -> u64 {
+        self.output_limit_violations
+    }
+
+    /// Bounded detail of the newest output-envelope violation.
+    pub fn last_output_limit_violation(&self) -> Option<&str> {
+        self.last_output_limit_violation.as_deref()
     }
 
     pub fn threshold_ms(&self) -> u64 {

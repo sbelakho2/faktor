@@ -1,0 +1,551 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "passives",
+  "version": "1.0.0",
+  "title": "Capacitor dielectric, ESR and ripple qualification",
+  "domain": "passives",
+  "provenance": {
+    "kind": "reference",
+    "citation": "IEC 60384 fixed capacitor terminology and manufacturer application notes",
+    "edition": null,
+    "locator": "dielectric classes, ESR and ripple current",
+    "note": "Starter pack contains model structure and test methods only; every part value must come from a revision-bound datasheet or measurement."
+  },
+  "terminology": [
+    {
+      "id": "term-cap-dielectric",
+      "term": "dielectric class",
+      "definition": "The ceramic formulation (for example C0G, X7R, X5R, Y5V) that fixes capacitance change over temperature, voltage and time.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384 fixed capacitors for use in electronic equipment",
+        "edition": null,
+        "locator": "dielectric classification",
+        "note": "Class II dielectrics are not interchangeable even at the same nominal capacitance and voltage."
+      }
+    },
+    {
+      "id": "term-cap-esr",
+      "term": "equivalent series resistance (ESR)",
+      "definition": "The resistive part of the capacitor impedance at a stated frequency and temperature; it drives self-heating and ripple voltage.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes",
+        "edition": null,
+        "locator": "ESR and ripple ratings",
+        "note": "ESR is conditional on frequency and temperature; a 100 kHz value is not a DC value."
+      }
+    },
+    {
+      "id": "term-cap-ripple",
+      "term": "rated ripple current",
+      "definition": "The RMS current the capacitor may carry at a stated frequency and case temperature while staying inside its life and temperature limits.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1 endurance and ripple requirements",
+        "edition": null,
+        "locator": "ripple current rating",
+        "note": "Ripple ratings require frequency correction and often a case-temperature derating."
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-cap-thermal-ripple",
+      "name": "ESR self-heating and capacitance derating",
+      "equation_ids": [
+        "eq-cap-ripple-loss",
+        "eq-cap-temperature-rise",
+        "eq-cap-capacitance-tolerance"
+      ],
+      "assumption_ids": [
+        "asm-cap-sinusoidal",
+        "asm-cap-thermal-path"
+      ],
+      "validity_domain_ids": [
+        "val-cap-frequency",
+        "val-cap-temperature"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes and IEC 60384-1 endurance practice",
+        "edition": null,
+        "locator": "ripple current and thermal rise",
+        "note": "The model is an engineering limit model, not a lifetime prediction without a life-test basis."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-cap-ripple-loss",
+      "expression": "P = I_rms^2 * ESR",
+      "dimensional_signature": "power = current^2 * resistance",
+      "variables": [
+        {
+          "symbol": "P",
+          "description": "dissipated power",
+          "dimension": "M L^2 T^-3"
+        },
+        {
+          "symbol": "I_rms",
+          "description": "RMS ripple current",
+          "dimension": "I"
+        },
+        {
+          "symbol": "ESR",
+          "description": "equivalent series resistance at the stated frequency",
+          "dimension": "M L^2 T^-3 I^-2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes",
+        "edition": null,
+        "locator": "ripple current heating",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-cap-temperature-rise",
+      "expression": "dT = P * R_th",
+      "dimensional_signature": "temperature = power * thermal_resistance",
+      "variables": [
+        {
+          "symbol": "dT",
+          "description": "case-to-ambient temperature rise",
+          "dimension": "Theta"
+        },
+        {
+          "symbol": "P",
+          "description": "dissipated power",
+          "dimension": "M L^2 T^-3"
+        },
+        {
+          "symbol": "R_th",
+          "description": "thermal resistance of the mounted part",
+          "dimension": "Theta M^-1 L^-2 T^3"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer thermal application notes",
+        "edition": null,
+        "locator": "case temperature rise",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-cap-capacitance-tolerance",
+      "expression": "C_actual within C_nominal +/- tolerance over the applicability envelope",
+      "dimensional_signature": "capacitance = capacitance",
+      "variables": [
+        {
+          "symbol": "C_actual",
+          "description": "capacitance at the stated bias, frequency and temperature",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        },
+        {
+          "symbol": "C_nominal",
+          "description": "nominal capacitance",
+          "dimension": "M^-1 L^-2 T^4 I^2"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1 capacitance tolerance requirements",
+        "edition": null,
+        "locator": "capacitance measurement conditions",
+        "note": "Class II capacitance is bias and temperature dependent; tolerance is not a constant."
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-cap-sinusoidal",
+      "statement": "The ripple current is sinusoidal and its RMS value is known at the relevant frequency.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Power supply ripple measurement practice",
+        "edition": null,
+        "locator": "RMS measurement",
+        "note": "A non-sinusoidal ripple requires harmonic weighting."
+      }
+    },
+    {
+      "id": "asm-cap-thermal-path",
+      "statement": "The mounted thermal resistance is known or conservatively bounded by the test article.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Capacitor thermal test practice",
+        "edition": null,
+        "locator": "mounted thermal path",
+        "note": "A missing thermal path makes the temperature rise unavailable."
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-cap-frequency",
+      "statement": "ESR and ripple values apply at the stated measurement frequency; extrapolation outside it is invalid.",
+      "temperature": {
+        "min": 233.15,
+        "max": 398.15,
+        "unit": "K"
+      },
+      "exclusions": [
+        "frequency outside the measured band",
+        "DC bias above the datasheet test condition without a bias curve"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer measurement conditions",
+        "edition": null,
+        "locator": "test frequency and bias",
+        "note": null
+      }
+    },
+    {
+      "id": "val-cap-temperature",
+      "statement": "The thermal-rise model applies only inside the measured case-temperature range.",
+      "temperature": {
+        "min": 233.15,
+        "max": 398.15,
+        "unit": "K"
+      },
+      "exclusions": [
+        "operation above the rated category temperature"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1 category temperature ranges",
+        "edition": null,
+        "locator": "category temperature",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-cap-datasheet",
+      "property": "capacitance, voltage rating, ESR, ripple current, case size",
+      "authority": "revision-bound manufacturer datasheet",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "manufacturer_data",
+        "citation": "Manufacturer capacitor datasheet",
+        "edition": null,
+        "locator": "electrical characteristics table",
+        "note": "A headline capacitance without test conditions is not a fact."
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-cap-dielectric",
+      "rule": "Do not substitute a Class II dielectric without checking capacitance change over temperature, DC bias and aging.",
+      "check": "dielectric class and bias/temperature curves are revision-bound",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384 dielectric classification",
+        "edition": null,
+        "locator": "Class II dielectrics",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-cap-esr-ripple",
+      "rule": "Compare ESR and ripple current at the same frequency and temperature; a missing condition is unavailable, not a pass.",
+      "check": "ESR and ripple limits share the measurement conditions",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes",
+        "edition": null,
+        "locator": "ripple current",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-cap-derating",
+      "rule": "Apply the manufacturer's voltage and temperature derating; nominal voltage alone is not a qualification.",
+      "check": "derating curve and category temperature are recorded",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Capacitor application derating practice",
+        "edition": null,
+        "locator": "voltage and temperature derating",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-cap-solder-profile",
+      "rule": "Use the component's specified reflow profile and MSL handling; exceeding it changes ESR and leakage.",
+      "check": "reflow profile and MSL record",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "J-STD-020 moisture sensitivity classification",
+        "edition": null,
+        "locator": "reflow profile",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-cap-esr-rise",
+      "mode": "ESR rise and drying",
+      "cause": "electrolyte loss or dielectric degradation under sustained ripple heating",
+      "detection": "periodic ESR measurement, ripple life test, case temperature rise",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor endurance test practice",
+        "edition": null,
+        "locator": "ESR drift",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-cap-bias-loss",
+      "mode": "capacitance loss under DC bias",
+      "cause": "Class II dielectric polarization and aging",
+      "detection": "bias-dependent capacitance measurement at the operating voltage",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384 Class II dielectric behaviour",
+        "edition": null,
+        "locator": "DC bias",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-cap-crack",
+      "mode": "mechanical crack",
+      "cause": "board flexure, thermal shock or handling",
+      "detection": "visual inspection, acoustic microscopy, flex test",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Ceramic capacitor handling practice",
+        "edition": null,
+        "locator": "mechanical damage",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-cap-esr",
+      "signature": "ESR above the datasheet limit at the operating frequency and temperature",
+      "indicates": "wrong dielectric/part, aging, or a measurement at a different condition",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes",
+        "edition": null,
+        "locator": "ESR measurement",
+        "note": null
+      }
+    },
+    {
+      "id": "diag-cap-ripple-heat",
+      "signature": "case temperature rise above the predicted ripple heating",
+      "indicates": "insufficient ripple rating, poor mounting, or missing thermal path",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Capacitor thermal test practice",
+        "edition": null,
+        "locator": "case temperature",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-cap-esr",
+      "method": "Four-terminal impedance/ESR measurement at the specified frequency and temperature",
+      "measures": "ESR, impedance, capacitance",
+      "standard_ref": "IEC 60384-1 measurement conditions",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1",
+        "edition": null,
+        "locator": "impedance measurement",
+        "note": "Licensed text is not reproduced."
+      }
+    },
+    {
+      "id": "test-cap-ripple-life",
+      "method": "Ripple current life test at rated case temperature with periodic ESR and capacitance measurement",
+      "measures": "ripple current capability, ESR drift, capacitance drift",
+      "standard_ref": "IEC 60384-1 endurance",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1 endurance requirements",
+        "edition": null,
+        "locator": "endurance test",
+        "note": null
+      }
+    },
+    {
+      "id": "test-cap-dielectric",
+      "method": "Verify dielectric class and capacitance over temperature, DC bias and aging",
+      "measures": "dielectric class, capacitance change",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Capacitor qualification practice",
+        "edition": null,
+        "locator": "dielectric verification",
+        "note": null
+      }
+    },
+    {
+      "id": "test-cap-dimensions",
+      "method": "Dimensional inspection of case length, width and height against the footprint",
+      "measures": "case size and terminal dimensions",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Component footprint qualification practice",
+        "edition": null,
+        "locator": "dimensional inspection",
+        "note": null
+      }
+    },
+    {
+      "id": "test-cap-flex",
+      "method": "Board flex and thermal-shock test with crack inspection",
+      "measures": "mechanical robustness",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Ceramic capacitor qualification practice",
+        "edition": null,
+        "locator": "flex test",
+        "note": null
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-iec-60384",
+      "standard": "IEC 60384",
+      "scope": "fixed capacitors for use in electronic equipment",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only; licensed text is not embedded."
+      }
+    },
+    {
+      "id": "std-j-std-020",
+      "standard": "J-STD-020",
+      "scope": "moisture/reflow sensitivity classification",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "J-STD-020",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-cap-esr-heat",
+      "description": "A 1 A RMS ripple through 50 mohm ESR dissipates 50 mW; with a 20 K/W mounted path the case rises 1 K above ambient.",
+      "inputs": [
+        {
+          "name": "ripple_current_rms",
+          "value": 1.0,
+          "unit": "A",
+          "note": null
+        },
+        {
+          "name": "esr",
+          "value": 0.05,
+          "unit": "ohm",
+          "note": null
+        },
+        {
+          "name": "rth",
+          "value": 20.0,
+          "unit": "K/W",
+          "note": "mounted case-to-ambient"
+        }
+      ],
+      "expected": [
+        {
+          "name": "power",
+          "value": 0.05,
+          "unit": "W",
+          "tolerance": 0.0000001,
+          "note": null
+        },
+        {
+          "name": "temperature_rise",
+          "value": 1.0,
+          "unit": "K",
+          "tolerance": 0.0000001,
+          "note": null
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "P = I^2 R and dT = P Rth",
+        "edition": null,
+        "locator": "worked case",
+        "note": "Structure only; no part-specific lifetime is inferred."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "counter-cap-same-cv",
+      "claim": "Any 10 uF 25 V capacitor is interchangeable.",
+      "refutation": "A Y5V part with the same nominal capacitance loses most of it under DC bias and has a much higher ESR and lower ripple rating.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer dielectric comparison data",
+        "edition": null,
+        "locator": "Class II dielectric comparison",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-cap-y5v",
+      "trap": "Matching nominal capacitance and voltage while ignoring dielectric class, ESR and ripple rating.",
+      "why_shallow_fails": "The alternate looks electrically identical at the catalogue headline but fails bias, ripple heating and tolerance requirements.",
+      "guard": "Require dielectric class, ESR at the operating frequency, ripple current at case temperature and case dimensions as separate mandatory facts.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Capacitor manufacturer application notes",
+        "edition": null,
+        "locator": "dielectric selection",
+        "note": null
+      }
+    },
+    {
+      "id": "trap-cap-esr-condition",
+      "trap": "Comparing an ESR measured at a different frequency or temperature.",
+      "why_shallow_fails": "ESR is strongly frequency- and temperature-dependent; the comparison is dimensionally valid but conditionally invalid.",
+      "guard": "Bind the ESR requirement and the candidate fact to the same measurement condition and derive an impedance test when the condition is missing.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60384-1 measurement conditions",
+        "edition": null,
+        "locator": "impedance measurement",
+        "note": null
+      }
+    }
+  ]
+}

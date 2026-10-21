@@ -1382,6 +1382,25 @@ mod tests {
         );
         assert!(evaluation.unresolved_required.is_empty());
         assert!(evaluation.disproven.is_empty());
+        // The OLD selector's real check can never discharge the rebound
+        // obligation: after migration only the new selector is authority.
+        let old_passing = native(
+            ProofEvidenceKind::TestExecution,
+            "rust_test:cart::totals_add_up",
+            true,
+            vec![selector("totals_add_up")],
+        );
+        let evaluation = evaluate_contract_with_stale(
+            &contract,
+            std::slice::from_ref(&old_passing),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            evaluation.contract.proof_obligations[0].state,
+            ClaimState::Unknown
+        );
+        assert_eq!(evaluation.unresolved_required.len(), 1);
         let failing = native(
             ProofEvidenceKind::TestExecution,
             "rust_test:cart::total_cents_adds_up",

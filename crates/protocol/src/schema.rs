@@ -999,6 +999,9 @@ fn error_kinds() -> Vec<ErrorKind> {
         ErrorKind::Malformed,
         ErrorKind::Oversized,
         ErrorKind::RateLimited,
+        ErrorKind::GoalUnavailableAfterRedaction {
+            source_message_id: 1,
+        },
         ErrorKind::Deadlock,
         ErrorKind::Internal,
     ]
@@ -1020,6 +1023,7 @@ fn kind_tag(kind: &ErrorKind) -> &'static str {
         ErrorKind::Malformed => "malformed",
         ErrorKind::Oversized => "oversized",
         ErrorKind::RateLimited => "rate_limited",
+        ErrorKind::GoalUnavailableAfterRedaction { .. } => "goal_unavailable_after_redaction",
         ErrorKind::Deadlock => "deadlock",
         ErrorKind::Internal => "internal",
     }

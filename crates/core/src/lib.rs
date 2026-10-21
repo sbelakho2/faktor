@@ -40,6 +40,7 @@ pub mod op;
 pub mod path;
 pub mod resource;
 pub mod retry;
+mod rust_lex;
 pub mod state;
 pub mod time;
 

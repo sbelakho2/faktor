@@ -1,0 +1,22 @@
+[package]
+name = "engineering-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic engineering models with explicit validity domains, uncertainty and analysis receipts."
+
+[dependencies]
+engineering-core.workspace = true
+engineering-units.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+engineering-knowledge.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

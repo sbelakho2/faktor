@@ -78,6 +78,8 @@ mod tests {
     fn tools_caps() -> ModelCapabilities {
         ModelCapabilities {
             tools: true,
+            context: 131_072,
+            max_output: 65_536,
             ..Default::default()
         }
     }

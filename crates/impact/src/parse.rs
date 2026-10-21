@@ -868,16 +868,20 @@ pub fn parse_javascript(path: &str, source: &str, is_test_file: bool) -> ParsedF
                     let line = token.line;
                     let name = js_call_name(source, &tokens, index + 2)
                         .unwrap_or_else(|| format!("test@{line}"));
+                    let test_id = crate::model::test_id(path, &name, line);
                     out.tests.push(TestDef {
-                        id: crate::model::test_id(path, &name, line),
-                        name,
+                        id: test_id.clone(),
+                        name: name.clone(),
                         line,
                     });
                     if let Some(close) = matching(&tokens, index + 1, "(", ")") {
+                        // The reference owner MUST be the same id as the test
+                        // node: the old fallback id (`test@line`) produced a
+                        // dangling edge whenever the test had a real name.
                         let owner = Owner {
                             kind: OwnerKind::Test,
-                            id: crate::model::test_id(path, &format!("test@{line}"), line),
-                            name: format!("test@{line}"),
+                            id: test_id,
+                            name,
                         };
                         collect_refs(&tokens, index + 2, close, &owner, &mut out.refs);
                     }

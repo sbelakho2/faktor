@@ -2839,6 +2839,12 @@
         "retryable": true
       },
       {
+        "core_kind": "goal_unavailable_after_redaction",
+        "code": "goal_unavailable_after_redaction",
+        "http_status": 409,
+        "retryable": false
+      },
+      {
         "core_kind": "deadlock",
         "code": "deadlock",
         "http_status": 409,

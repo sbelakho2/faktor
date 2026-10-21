@@ -164,6 +164,15 @@ impl Provider for HeaderGateway {
         // passes a non-empty list.
         let body =
             faktor_openai::chat_completions_body(&req, &faktor_openai::OpenAiQuirks::default());
+        // The gateway forwards raw chat traffic: its own tool-argument
+        // accumulator must enforce the SAME resolved envelope as the agent.
+        let envelope = faktor_provider::OutputEnvelope::from_request(
+            req.max_output,
+            faktor_core::model::ModelCapabilities::default().max_output,
+        );
+        let tool_argument_bound = usize::try_from(envelope.byte_ceiling)
+            .unwrap_or(usize::MAX)
+            .max(1);
         let url = format!("{}/chat/completions", self.base_url);
         // An unencodable credential fails the request with a typed terminal
         // error instead of silently dropping the Authorization header (an
@@ -180,7 +189,7 @@ impl Provider for HeaderGateway {
         let transport = self.transport.clone();
         let deadlines = faktor_provider::transport::StreamDeadlines::default();
         let cancel = req.meta.cancellation.clone();
-        Box::pin(faktor_openai::openai_stream(
+        Box::pin(faktor_openai::openai_stream_bounded(
             transport,
             url,
             headers,
@@ -188,6 +197,7 @@ impl Provider for HeaderGateway {
             body,
             deadlines,
             Some(cancel),
+            tool_argument_bound,
         ))
     }
 }

@@ -1,0 +1,10 @@
+{
+  "request": {
+    "action": "create_purchase_order",
+    "scope": "rfq:part-1",
+    "counterparty": 1,
+    "amount": { "micros": 100000000, "currency": "USD" },
+    "as_of": 20000
+  },
+  "grants": []
+}

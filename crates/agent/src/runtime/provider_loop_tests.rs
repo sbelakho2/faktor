@@ -190,7 +190,7 @@ async fn live_chunk_turn_under_full_channel_completes_bounded() {
         .map(|_| ScriptedResponse::Text("y".repeat(100)))
         .chain(std::iter::once(ScriptedResponse::End))
         .collect();
-    let (mut deps, _dir) = deps(scripted_provider(big), vec![]);
+    let (mut deps, _dir) = deps(scripted_provider_with_max_output(big, 1_000_000), vec![]);
     let (sink, mut rx) = ChunkSink::channel();
     deps.chunk_sink = Some(sink);
     let runtime = AgentRuntime::new(deps).unwrap();

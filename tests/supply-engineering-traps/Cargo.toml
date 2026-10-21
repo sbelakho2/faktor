@@ -1,0 +1,22 @@
+[package]
+name = "faktor-supply-engineering-traps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+engineering-core.workspace = true
+engineering-knowledge.workspace = true
+engineering-models.workspace = true
+engineering-solvers.workspace = true
+engineering-units.workspace = true
+faktor-supply-core.workspace = true
+faktor-supply-cost.workspace = true
+faktor-supply-logistics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

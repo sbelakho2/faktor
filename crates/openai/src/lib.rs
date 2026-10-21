@@ -85,8 +85,8 @@ pub(crate) mod argument_accumulation {
     }
 }
 use faktor_provider::{
-    CanonicalUsage, ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk,
-    ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
+    CanonicalUsage, ContentKind, ContentPart, GenericAgentRequest, OutputEnvelope, Provider,
+    ProviderChunk, ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
 /// Documented OpenAI per-image ceiling for chat/responses image parts
@@ -809,7 +809,37 @@ pub fn responses_stream(
     deadlines: StreamDeadlines,
     cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
+    responses_stream_bounded(
+        transport,
+        url,
+        headers,
+        body,
+        deadlines,
+        cancel,
+        DEFAULT_TOOL_ARGUMENT_BOUND_BYTES,
+    )
+}
+
+/// Hard default bound of adapter-side tool-argument accumulation for
+/// callers that do not thread the request's resolved output envelope
+/// (direct transport users/tests). Production provider calls always pass
+/// the tighter per-request [`OutputEnvelope::byte_ceiling`].
+pub const DEFAULT_TOOL_ARGUMENT_BOUND_BYTES: usize = 16 * 1024 * 1024;
+
+/// [`responses_stream`] with an explicit cumulative tool-argument byte
+/// bound. Exceeding it is a typed `OutputLimitExceeded` terminal error
+/// (the same class the agent enforces over complete chunks).
+pub fn responses_stream_bounded(
+    transport: Arc<dyn HttpTransport>,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    body: serde_json::Value,
+    deadlines: StreamDeadlines,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
+    max_tool_argument_bytes: usize,
+) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
+    let max_tool_argument_bytes = max_tool_argument_bytes.max(1);
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
     // Registered secret scrubber for this request: every credential the
@@ -1088,10 +1118,44 @@ pub fn responses_stream(
                         }
                         _ => {}
                     }
+                    if let Err(e) = ensure_tool_argument_bound(&calls, max_tool_argument_bytes) {
+                        return Some((Err(e), Stage::Done));
+                    }
                 }
             }
         },
     )
+}
+
+/// Total bytes accumulated across every in-flight tool-call argument slot.
+fn accumulated_tool_argument_bytes(accs: &[serde_json::Value]) -> usize {
+    accs.iter()
+        .map(|a| {
+            a.get("arguments")
+                .and_then(|v| v.as_str())
+                .map_or(0, str::len)
+        })
+        .sum()
+}
+
+/// Typed terminal refusal when fragmented tool-call arguments exceed the
+/// per-request accumulation envelope. Numbers and the fixed class only —
+/// provider-supplied argument bytes never ride the error.
+fn ensure_tool_argument_bound(
+    accs: &[serde_json::Value],
+    max_tool_argument_bytes: usize,
+) -> Result<(), ProviderError> {
+    let total = accumulated_tool_argument_bytes(accs);
+    if total > max_tool_argument_bytes {
+        return Err(ProviderError::new(
+            ProviderErrorKind::OutputLimitExceeded,
+            format!(
+                "tool-call argument accumulation of {total} bytes exceeds the attempt output \
+                 envelope ({max_tool_argument_bytes} bytes)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Get-or-create the accumulation slot for one function-call item. Slots are
@@ -1448,6 +1512,14 @@ impl Provider for OpenAiProvider {
             return faktor_provider::provider_error_stream(e);
         }
         // The family decides the wire body AND the endpoint + parser pair.
+        // The SAME resolved output envelope the agent enforces also bounds
+        // this adapter's own tool-argument accumulators: a hostile stream
+        // must not be able to grow fragmented arguments without bound before
+        // the agent ever sees a complete call.
+        let output_envelope = OutputEnvelope::from_request(req.max_output, caps.max_output);
+        let tool_argument_bound = usize::try_from(output_envelope.byte_ceiling)
+            .unwrap_or(usize::MAX)
+            .max(1);
         let body = self.wire_body(&req);
         match self.config.family {
             // Native Responses codec: the item-protocol serializer + the
@@ -1455,18 +1527,19 @@ impl Provider for OpenAiProvider {
             // /responses.
             OpenAiFamily::Responses => {
                 let url = format!("{}/responses", self.config.base_url);
-                Box::pin(responses_stream(
+                Box::pin(responses_stream_bounded(
                     transport,
                     url,
                     headers,
                     body,
                     deadlines,
                     Some(cancel),
+                    tool_argument_bound,
                 ))
             }
             OpenAiFamily::Chat => {
                 let url = format!("{}/chat/completions", self.config.base_url);
-                Box::pin(openai_stream(
+                Box::pin(openai_stream_bounded(
                     transport,
                     url,
                     headers,
@@ -1474,6 +1547,7 @@ impl Provider for OpenAiProvider {
                     body,
                     deadlines,
                     Some(cancel),
+                    tool_argument_bound,
                 ))
             }
         }
@@ -1511,7 +1585,35 @@ pub fn openai_stream(
     deadlines: StreamDeadlines,
     cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
+    openai_stream_bounded(
+        transport,
+        url,
+        headers,
+        extra_headers,
+        body,
+        deadlines,
+        cancel,
+        DEFAULT_TOOL_ARGUMENT_BOUND_BYTES,
+    )
+}
+
+/// [`openai_stream`] with an explicit cumulative tool-argument byte bound.
+/// A hostile fragmented `tool_calls` stream is stopped with the typed
+/// `OutputLimitExceeded` error instead of growing its accumulator without
+/// bound.
+#[allow(clippy::too_many_arguments)]
+pub fn openai_stream_bounded(
+    transport: Arc<dyn HttpTransport>,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    extra_headers: ExtraHeaders,
+    body: serde_json::Value,
+    deadlines: StreamDeadlines,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
+    max_tool_argument_bytes: usize,
+) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
+    let max_tool_argument_bytes = max_tool_argument_bytes.max(1);
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
     // Registered secret scrubber for this request (see `responses_stream`).
@@ -1683,6 +1785,11 @@ pub fn openai_stream(
                     match parse_chat_chunk(&value, &mut accs, &mut pending) {
                         Ok((chunk, frame_terminal)) => {
                             terminal = terminal || frame_terminal;
+                            if let Err(e) =
+                                ensure_tool_argument_bound(&accs, max_tool_argument_bytes)
+                            {
+                                return Some((Err(e), Stage::Done));
+                            }
                             let Some(chunk) = chunk else {
                                 continue;
                             };

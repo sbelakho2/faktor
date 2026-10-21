@@ -2011,12 +2011,18 @@ pub enum ReasonCode {
     /// Unsatisfied-but-not-disproven obligations never use this code: they
     /// are disclosed, not blocked.
     ProofObligationDisproven,
+    /// The provider stream breached the Faktor-side cumulative output
+    /// envelope derived from the resolved request `max_output` (text,
+    /// reasoning, tool-call payload or absolute bytes). The attempt was
+    /// cancelled locally and settled conservatively (dispatch occurred);
+    /// no tool call arriving beyond the envelope is executed.
+    ProviderOutputLimitExceeded,
 }
 
 impl ReasonCode {
     /// The complete, ordered code table. The uniqueness test iterates this
     /// array: adding a variant without extending it (or vice versa) fails.
-    pub const ALL: [ReasonCode; 15] = [
+    pub const ALL: [ReasonCode; 16] = [
         ReasonCode::CheckFailed,
         ReasonCode::CheckUnavailable,
         ReasonCode::ReviewBlocked,
@@ -2032,6 +2038,7 @@ impl ReasonCode {
         ReasonCode::RepeatedEvidenceSet,
         ReasonCode::UnattributedChange,
         ReasonCode::ProofObligationDisproven,
+        ReasonCode::ProviderOutputLimitExceeded,
     ];
 
     /// The stable machine code (snake_case; equals the serde spelling).
@@ -2052,6 +2059,7 @@ impl ReasonCode {
             ReasonCode::RepeatedEvidenceSet => "repeated_evidence_set",
             ReasonCode::UnattributedChange => "unattributed_change",
             ReasonCode::ProofObligationDisproven => "proof_obligation_disproven",
+            ReasonCode::ProviderOutputLimitExceeded => "provider_output_limit_exceeded",
         }
     }
 
@@ -2080,6 +2088,9 @@ impl ReasonCode {
             }
             ReasonCode::ProofObligationDisproven => {
                 "a proof obligation of the engineering contract was disproven"
+            }
+            ReasonCode::ProviderOutputLimitExceeded => {
+                "the provider breached the Faktor-side cumulative output envelope"
             }
         }
     }
@@ -2563,7 +2574,7 @@ mod tests {
         // without a table row breaks ALL (serde deserializes it but no
         // machine code exists). Exhaustive via a manual listing — adding a
         // variant here without a row above fails the next match arm.
-        assert_eq!(ReasonCode::ALL.len(), 15);
+        assert_eq!(ReasonCode::ALL.len(), 16);
     }
 
     #[test]

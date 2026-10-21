@@ -934,6 +934,14 @@ impl AgentRuntime {
     /// using it as the goal made the contract compiler analyze the label
     /// instead of the task, leaving every test obligation and risk empty.
     pub(crate) fn latest_user_prompt(handle: &faktor_session::SessionHandle) -> Option<String> {
+        Self::latest_user_prompt_message(handle).map(|(_, text)| text)
+    }
+
+    /// The newest durable user prompt together with its durable message id
+    /// (the `goal_source_message_id` of the goal projection).
+    pub(crate) fn latest_user_prompt_message(
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<(i64, String)> {
         let page = handle.messages_before(None, 8).ok()?;
         for row in page {
             if row.role != "user" {
@@ -945,7 +953,7 @@ impl AgentRuntime {
                 .and_then(|value| value.as_str())
                 .filter(|text| !text.trim().is_empty())
             {
-                return Some(text.to_string());
+                return Some((row.id, text.to_string()));
             }
         }
         None

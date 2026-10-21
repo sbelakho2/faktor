@@ -2078,6 +2078,14 @@ impl CheckedHttpClient {
         Ok(self.inner.post(parsed))
     }
 
+    /// Start a DELETE on a raw URL string (see [`CheckedHttpClient::get`]).
+    /// Used by protocol clients whose session teardown is an explicit
+    /// `DELETE` (MCP Streamable HTTP); the same destination gate applies.
+    pub fn delete(&self, url: &str) -> Result<RequestBuilder, EgressError> {
+        let parsed = parse_fetch_url(url)?;
+        Ok(self.inner.delete(parsed))
+    }
+
     /// Build the request and send it through the gate. The gate runs on the
     /// request's OWN parsed URL immediately before `Client::execute`, and
     /// that same request object is what gets sent (no resolve-then-connect

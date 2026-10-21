@@ -1,8 +1,10 @@
 //! faktor-mcp — JSON-RPC Model Context Protocol client (spec §31).
 //!
-//! MCP processes are supervised like terminals: crashes, hangs, and garbage
-//! output never destabilize the agent runtime. Every invocation has a
+//! Stdio MCP processes are supervised like terminals: crashes, hangs, and
+//! garbage output never destabilize the agent runtime. Every invocation has a
 //! deadline; responses are bounded; the framing is Content-Length JSON-RPC.
+//! Remote Streamable HTTP sessions live in [`remote`] and ride the checked
+//! egress authority (JSON/SSE replies, session ids, vault-resolved bearer).
 //!
 //! Audit P0-40 (unified process supervision): this crate NEVER constructs
 //! its own process machinery. [`McpServer::connect`] receives the shared
@@ -10,6 +12,8 @@
 //! for every server) and spawns the stdio MCP subprocess through
 //! `spawn_detached_with_pipes`, so the child lands in the supervisor's
 //! bounded registry with owner rows and the daemon-shutdown kill scope.
+
+pub mod remote;
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -197,6 +201,10 @@ struct Conn {
     /// the reader bounds accumulated bytes by [`MAX_INITIAL_BYTES`] while
     /// false and by [`MAX_RESPONSE_BYTES`] afterwards.
     handshake_done: bool,
+    /// Capabilities advertised by the server's initialize result. `None`
+    /// when the server did not advertise a capabilities object (older or
+    /// minimal servers): stdio calls stay permissive, exactly as before.
+    capabilities: Option<remote::RemoteCapabilities>,
 }
 
 /// Bound on the dedicated stdin writer's queue: a child that stops draining
@@ -397,6 +405,7 @@ impl McpServer {
             next_id: 1,
             pending: HashMap::new(),
             handshake_done: false,
+            capabilities: None,
         }));
         // Reader thread: incremental Content-Length framing; responses are
         // dispatched by id; EOF/kill cleans up. The thread owns stdout, so
@@ -534,10 +543,16 @@ impl McpServer {
                 Duration::from_secs(10),
             )
             .await?;
-        let _ = result;
-        // The handshake reply was observed: from here the reader applies the
-        // full response bound instead of the initial handshake bound.
-        recover_lock(&self.conn).handshake_done = true;
+        let capabilities = result
+            .get("capabilities")
+            .map(remote::RemoteCapabilities::from_value);
+        {
+            let mut conn = recover_lock(&self.conn);
+            conn.capabilities = capabilities;
+            // The handshake reply was observed: from here the reader applies
+            // the full response bound instead of the initial handshake bound.
+            conn.handshake_done = true;
+        }
         // Notify initialized (fire and forget; never blocks the runtime).
         let _ = self
             .call(
@@ -655,6 +670,37 @@ impl McpServer {
                 .and_then(|e| e.as_bool())
                 .unwrap_or(false),
         })
+    }
+
+    /// Read one MCP resource by URI. A server that does not implement
+    /// `resources/read` returns its error verbatim.
+    pub async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, Error> {
+        self.call(
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+            Duration::from_secs(10),
+        )
+        .await
+    }
+
+    /// Get one MCP prompt by name with optional arguments.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, Error> {
+        let params = match arguments {
+            Some(arguments) => serde_json::json!({ "name": name, "arguments": arguments }),
+            None => serde_json::json!({ "name": name }),
+        };
+        self.call("prompts/get", params, Duration::from_secs(10))
+            .await
+    }
+
+    /// The capabilities advertised during initialize (`None` = the server
+    /// did not advertise them; stdio behavior remains permissive).
+    pub fn capabilities(&self) -> Option<remote::RemoteCapabilities> {
+        recover_lock(&self.conn).capabilities.clone()
     }
 
     pub async fn close(&self) -> Result<(), Error> {
@@ -874,6 +920,103 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Option<(usize, serde_json::Value)>, S
     let body = std::str::from_utf8(&bytes[body_start..total]).map_err(|_| "body not utf8")?;
     let value = serde_json::from_str(body).map_err(|e| format!("invalid jsonrpc: {e}"))?;
     Ok(Some((total, value)))
+}
+
+/// A live MCP connection regardless of transport. The runtime owns this
+/// enum so the native surface never branches on transport strings.
+pub enum McpConnection {
+    Stdio(Arc<McpServer>),
+    Remote(Arc<remote::RemoteMcpServer>),
+}
+
+impl McpConnection {
+    pub fn transport(&self) -> &'static str {
+        match self {
+            McpConnection::Stdio(_) => "stdio",
+            McpConnection::Remote(_) => "streamable_http",
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        match self {
+            McpConnection::Stdio(server) => server.is_alive(),
+            McpConnection::Remote(server) => server.is_alive(),
+        }
+    }
+
+    pub async fn capabilities(&self) -> Option<remote::RemoteCapabilities> {
+        match self {
+            McpConnection::Stdio(server) => server.capabilities(),
+            McpConnection::Remote(server) => Some(server.capabilities().await),
+        }
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<McpTool>, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.list_tools().await,
+            McpConnection::Remote(server) => server.list_tools().await,
+        }
+    }
+
+    pub async fn list_resources(&self) -> Result<Vec<serde_json::Value>, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.list_resources().await,
+            McpConnection::Remote(server) => server.list_resources().await,
+        }
+    }
+
+    pub async fn list_resource_templates(&self) -> Result<Vec<serde_json::Value>, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.list_resource_templates().await,
+            McpConnection::Remote(server) => server.list_resource_templates().await,
+        }
+    }
+
+    pub async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.list_prompts().await,
+            McpConnection::Remote(server) => server.list_prompts().await,
+        }
+    }
+
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<McpResult, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.call_tool(name, arguments, deadline).await,
+            McpConnection::Remote(server) => server.call_tool(name, arguments, deadline).await,
+        }
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.read_resource(uri).await,
+            McpConnection::Remote(server) => server.read_resource(uri).await,
+        }
+    }
+
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, Error> {
+        match self {
+            McpConnection::Stdio(server) => server.get_prompt(name, arguments).await,
+            McpConnection::Remote(server) => server.get_prompt(name, arguments).await,
+        }
+    }
+
+    pub async fn close(&self) {
+        match self {
+            McpConnection::Stdio(server) => {
+                let _ = server.close().await;
+            }
+            McpConnection::Remote(server) => server.close().await,
+        }
+    }
 }
 
 #[cfg(test)]

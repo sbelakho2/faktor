@@ -61,6 +61,7 @@ pub mod native;
 pub mod provider;
 pub mod rebind;
 pub mod review;
+pub mod test_declaration;
 
 pub use claims::{
     evidence_adequacy, op_for_claim, ClaimRequest, ClaimVerificationResult, EvidenceStrength,

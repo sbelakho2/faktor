@@ -822,6 +822,67 @@ pub struct GenericAgentRequest {
     pub meta: RequestMeta,
 }
 
+/// Numerator of the Faktor-side output-ceiling safety factor.
+pub const OUTPUT_LIMIT_SAFETY_NUMERATOR: u64 = 3;
+/// Denominator of the Faktor-side output-ceiling safety factor.
+pub const OUTPUT_LIMIT_SAFETY_DENOMINATOR: u64 = 2;
+/// Flat token headroom added on top of the scaled resolved cap.
+pub const OUTPUT_LIMIT_HEADROOM_TOKENS: u64 = 256;
+/// Absolute-byte ceiling expressed per budgeted token.
+pub const OUTPUT_LIMIT_BYTES_PER_TOKEN: u64 = 8;
+/// Floor of the absolute-byte ceiling (small models still get a usable bound).
+pub const OUTPUT_LIMIT_MIN_BYTES: u64 = 64 * 1024;
+
+/// The hard local envelope of ONE physical provider attempt, derived from
+/// the resolved wire `max_output`:
+///
+/// ```text
+/// token_ceiling = ceil(max_output * 3 / 2) + 256
+/// byte_ceiling  = max(token_ceiling * 8, 64 KiB)
+/// ```
+///
+/// The `3/2` factor and `256` headroom absorb tokenizer disagreement and
+/// per-message structural tokens; the byte ceiling independently bounds
+/// multi-byte UTF-8 / JSON payload bytes. This type lives in the provider
+/// crate because BOTH the agent (cumulative stream accounting) and the
+/// adapters (their own tool-argument accumulators) enforce the same
+/// envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputEnvelope {
+    /// The resolved `max_output` the wire request carried (never zero).
+    pub resolved_max_output: u64,
+    /// Hard cumulative token ceiling (`3/2` cap + headroom).
+    pub token_ceiling: u64,
+    /// Hard cumulative byte ceiling (`8` bytes/token, `64 KiB` floor).
+    pub byte_ceiling: u64,
+}
+
+impl OutputEnvelope {
+    /// Derive the attempt envelope from the resolved wire cap. A zero cap is
+    /// raised to one token: an unbounded stream is never a valid envelope.
+    pub fn from_max_output(max_output: usize) -> Self {
+        let resolved_max_output = u64::try_from(max_output).unwrap_or(u64::MAX).max(1);
+        let token_ceiling = resolved_max_output
+            .saturating_mul(OUTPUT_LIMIT_SAFETY_NUMERATOR)
+            .div_ceil(OUTPUT_LIMIT_SAFETY_DENOMINATOR)
+            .saturating_add(OUTPUT_LIMIT_HEADROOM_TOKENS);
+        let byte_ceiling = token_ceiling
+            .saturating_mul(OUTPUT_LIMIT_BYTES_PER_TOKEN)
+            .max(OUTPUT_LIMIT_MIN_BYTES);
+        Self {
+            resolved_max_output,
+            token_ceiling,
+            byte_ceiling,
+        }
+    }
+
+    /// Derive from the request's resolved cap, falling back to the model
+    /// profile's cap when a caller somehow built a request without one.
+    pub fn from_request(max_output: Option<usize>, fallback_max_output: usize) -> Self {
+        Self::from_max_output(max_output.unwrap_or(fallback_max_output))
+    }
+}
+
 /// The surface a provider-reported cost rode in on.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1102,6 +1163,11 @@ pub enum ProviderErrorKind {
     Server,
     Cancelled,
     Malformed,
+    /// The stream breached the Faktor-side cumulative output envelope
+    /// derived from the resolved request `max_output`. Terminal and never
+    /// retryable: replaying the same request against a provider that just
+    /// ignored its cap would only repeat the violation.
+    OutputLimitExceeded,
 }
 
 impl ProviderErrorKind {

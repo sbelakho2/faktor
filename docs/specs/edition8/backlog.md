@@ -25,7 +25,7 @@ Source: `Faktor_IDE_UI_UX_3.pdf` Revision 8 (17 Oct 2026), product/behaviour pp.
 | K Compaction, memory and efficiency | 12 | 0 | 0 | None. |
 | I Instructions, rules and prompt composition | 11 | 0 | 0 | None. |
 | Q Permissions, autonomy and sandbox | 14 | 0 | 0 | None. |
-| T Tool catalog and MCP | 14 | 1 | 0 | vscode: typed unavailable: Streamable HTTP is not negotiated by this daemon build; stdio is the implemented transport and no HTTP/OAuth state is claimed. jetbrains: the live receipt read the provider collection, not an MCP transport action; remote transport is not exercised. daemon: the MCP save route serves stdio; no streamable-HTTP destination/auth/reconnect path is negotiated. |
+| T Tool catalog and MCP | 14 | 1 | 0 | Remote Streamable HTTP is implemented (checked egress, JSON/SSE, session ids, initialize negotiation, vault bearer, typed capability/auth/timeout/oversize errors) and exercised against a real local HTTP fixture; the IDE surface advertises it only for a configured `streamable_http` record, with no fake OAuth/Connected state. Residual live gap: no external https MCP endpoint or bearer credential is configured in this rig. |
 | S Skills, commands and hooks | 14 | 0 | 0 | None. |
 | X Terminal, browser and language tooling | 13 | 0 | 0 | None. |
 | B Budgets, retries and reliability | 12 | 0 | 0 | None. |

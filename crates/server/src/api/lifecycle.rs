@@ -910,40 +910,39 @@ fn native_foundation_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/native/mcp/servers",
-            get(foundation_ext::native_mcp_servers).post(foundation_ext::native_mcp_server_save),
+            get(mcp_surface::native_mcp_servers).post(mcp_surface::native_mcp_server_save),
         )
         .route(
             "/native/mcp/servers/{id}",
-            delete(foundation_ext::native_mcp_server_delete),
+            delete(mcp_surface::native_mcp_server_delete),
         )
         .route(
             "/native/mcp/servers/{id}/start",
-            post(foundation_ext::native_mcp_server_start),
+            post(mcp_surface::native_mcp_server_start),
         )
         .route(
             "/native/mcp/servers/{id}/stop",
-            post(foundation_ext::native_mcp_server_stop),
+            post(mcp_surface::native_mcp_server_stop),
         )
         .route(
             "/native/mcp/servers/{id}/tools",
-            get(foundation_ext::native_mcp_server_tools),
+            get(mcp_surface::native_mcp_server_tools),
         )
         .route(
             "/native/mcp/servers/{id}/connect",
-            post(foundation_ext::native_mcp_server_connect),
+            post(mcp_surface::native_mcp_server_connect),
         )
         .route(
             "/native/mcp/servers/{id}/resources",
-            get(foundation_ext::native_mcp_server_resources),
+            get(mcp_surface::native_mcp_server_resources),
         )
         .route(
             "/native/mcp/servers/{id}/auth",
-            get(foundation_ext::native_mcp_server_auth_get)
-                .post(foundation_ext::native_mcp_server_auth),
+            get(mcp_surface::native_mcp_server_auth_get).post(mcp_surface::native_mcp_server_auth),
         )
         .route(
             "/native/mcp/servers/{id}/oauth/revoke",
-            post(foundation_ext::native_mcp_server_oauth_revoke),
+            post(mcp_surface::native_mcp_server_oauth_revoke),
         )
         .route("/native/skills", get(foundation_ext::native_skills))
         .route(

@@ -13,10 +13,55 @@ use faktor_core::error::{Error, ErrorKind};
 // renderer and the agent's internal-context renderer.
 use crate::sanitize_ledger_text;
 
+/// The replacement written for every secret span of a durable goal
+/// projection. The marker is deliberately fixed (not kind-specific): the
+/// durable goal is a semantic objective, and the secret's KIND is not part
+/// of it.
+pub const GOAL_REDACTED_SECRET: &str = "[REDACTED_SECRET]";
+
+/// The typed state of the durable goal projection (P1: secret-bearing
+/// prompts must never silently collapse to the session title).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalProjectionState {
+    /// The durable goal is a redacted projection of the user prompt.
+    Available,
+    /// Redaction consumed every meaningful non-secret token: there is no
+    /// engineering goal to compile a contract from. The state name is the
+    /// wire/status code callers match on.
+    GoalUnavailableAfterRedaction,
+}
+
+impl GoalProjectionState {
+    /// The stable status/error code of the unavailable state.
+    pub const UNAVAILABLE_CODE: &'static str = "goal_unavailable_after_redaction";
+
+    pub const fn is_unavailable(self) -> bool {
+        matches!(self, GoalProjectionState::GoalUnavailableAfterRedaction)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct TaskLedger {
     pub goal: String,
+    /// The durable source-message id the goal was projected from. `None`
+    /// for legacy rows and for the no-prompt title fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_source_message_id: Option<i64>,
+    /// The redacted semantic projection of the source prompt. This is the
+    /// FULL (bounded) redacted text; `goal` is the compact operational
+    /// copy rendered into the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_redacted_text: Option<String>,
+    /// `blake3:`-prefixed digest over the projection identity + redacted
+    /// text, so a restart can prove it resumed the same goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_projection_digest: Option<String>,
+    /// Typed projection state (`available` /
+    /// `goal_unavailable_after_redaction`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_projection_state: Option<GoalProjectionState>,
     pub constraints: Vec<String>,
     pub completed_steps: Vec<String>,
     pub open_steps: Vec<String>,
@@ -46,6 +91,13 @@ const MAX_FAILURES: usize = 128;
 const MAX_FILES: usize = 256;
 
 impl TaskLedger {
+    /// TRUE when the durable goal projection is the typed
+    /// `goal_unavailable_after_redaction` state.
+    pub fn goal_unavailable_after_redaction(&self) -> bool {
+        self.goal_projection_state
+            .is_some_and(GoalProjectionState::is_unavailable)
+    }
+
     /// Fold one finished turn into the ledger. Bounded: lists never grow
     /// without limit (oldest entries evicted first).
     pub fn record_turn(&mut self, turn: &TurnSummary) {

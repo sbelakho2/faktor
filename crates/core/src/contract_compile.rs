@@ -2078,14 +2078,22 @@ pub fn rust_test_selectors_for_path(path: &str, content: &str) -> Vec<String> {
 /// libtest filter name that actually runs it (`cargo test --test <target>
 /// <executable>` for integration targets, `cargo test <selector>` for unit
 /// tests); `body` is the bounded function body used by proof rebinding to
-/// prove a symbol rename. `target` is the integration test target (file
-/// stem) when the declaration lives in `tests/<name>.rs`.
+/// prove a symbol rename; `attributes` are the declaration's attribute lines
+/// (`#[test]`, `#[should_panic]`, `#[ignore]`, ...) because they change the
+/// executable meaning of an otherwise identical body. `target` is the
+/// integration test target (file stem) when the declaration lives in
+/// `tests/<name>.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustTestDeclaration {
     pub selector: String,
     pub executable: String,
     pub target: Option<String>,
     pub body: String,
+    /// TRUE when `body` is the COMPLETE brace-balanced function body. An
+    /// unparseable/truncated body is never proof-bearing (the adapters fail
+    /// closed); an empty but complete body is legal.
+    pub body_complete: bool,
+    pub attributes: Vec<String>,
 }
 
 /// Discover the Rust test declarations authored in ONE file. This is the
@@ -2121,6 +2129,8 @@ pub fn rust_test_declarations_for_path(path: &str, content: &str) -> Vec<RustTes
             executable,
             target: target.clone(),
             body: declaration.body,
+            body_complete: declaration.body_complete,
+            attributes: declaration.attributes,
         });
     }
     out.sort_by(|a, b| {
@@ -2269,40 +2279,58 @@ fn is_ident(value: &str) -> bool {
 struct ExtractedTest {
     selector: String,
     body: String,
+    body_complete: bool,
+    attributes: Vec<String>,
 }
 
 /// Extract the test declarations of one Rust file: `module::inline_mods::fn`
-/// plus the bounded body used to prove a symbol rename.
+/// plus the bounded body and the attribute stack used to prove a symbol
+/// rename without ever dropping execution semantics (`#[should_panic]`,
+/// `#[ignore]`).
 fn extract_test_declarations(module: &[String], content: &str) -> Vec<ExtractedTest> {
     let lines: Vec<&str> = content.lines().take(MAX_SCAN_LINES).collect();
     let mut out: Vec<ExtractedTest> = Vec::new();
     let mut mods: Vec<(String, i32)> = Vec::new();
     let mut depth: i32 = 0;
+    let mut scan_state = crate::rust_lex::ScanState::default();
     let mut pending_test_attr = false;
+    let mut attr_block: Vec<String> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        if is_test_attribute(trimmed) {
-            pending_test_attr = true;
-        } else if trimmed.starts_with("#[") {
-            // Attribute stacks (`#[test]` + `#[should_panic]`) keep pending.
-        } else if pending_test_attr {
-            if let Some(name) = fn_name_of(trimmed) {
-                let mut parts = module.to_vec();
-                parts.extend(mods.iter().map(|(name, _)| name.clone()));
-                parts.push(name);
-                out.push(ExtractedTest {
-                    selector: parts.join("::"),
-                    body: rust_test_body(&lines, index),
-                });
+        // Comment/string text is not a declaration: a commented-out
+        // `#[test] fn ...` must never become a proof-bearing declaration.
+        let code_line = scan_state.at_code_boundary();
+        if code_line {
+            if trimmed.starts_with("#[") {
+                if is_test_attribute(trimmed) {
+                    pending_test_attr = true;
+                }
+                attr_block.push(trimmed.to_string());
+            } else if pending_test_attr {
+                if let Some(name) = fn_name_of(trimmed) {
+                    let mut parts = module.to_vec();
+                    parts.extend(mods.iter().map(|(name, _)| name.clone()));
+                    parts.push(name);
+                    let (body, body_complete) = crate::rust_lex::test_body(&lines, index);
+                    out.push(ExtractedTest {
+                        selector: parts.join("::"),
+                        body,
+                        body_complete,
+                        attributes: attr_block.clone(),
+                    });
+                }
+                if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                    pending_test_attr = false;
+                    attr_block.clear();
+                }
+            } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                attr_block.clear();
             }
-            if !trimmed.is_empty() && !trimmed.starts_with("//") {
-                pending_test_attr = false;
+            if let Some(name) = mod_open_name(trimmed) {
+                mods.push((name, depth + 1));
             }
         }
-        if let Some(name) = mod_open_name(trimmed) {
-            mods.push((name, depth + 1));
-        }
-        depth += brace_delta(line);
+        depth += crate::rust_lex::brace_delta(&mut scan_state, line);
         while let Some((_, open_depth)) = mods.last() {
             if *open_depth > depth {
                 mods.pop();
@@ -2314,38 +2342,6 @@ fn extract_test_declarations(module: &[String], content: &str) -> Vec<ExtractedT
     out.sort_by(|a, b| a.selector.cmp(&b.selector));
     out.dedup_by(|a, b| a.selector == b.selector);
     out
-}
-
-/// The bounded body of the function starting at `start`: everything after
-/// the first opening brace through the matching closing brace. Malformed /
-/// unterminated declarations yield the text seen (never a panic).
-fn rust_test_body(lines: &[&str], start: usize) -> String {
-    let mut body = String::new();
-    let mut depth = 0i32;
-    let mut opened = false;
-    for line in lines.iter().skip(start) {
-        body.push_str(line);
-        body.push('\n');
-        let delta = brace_delta(line);
-        if !opened {
-            if line.contains('{') {
-                opened = true;
-                depth = delta;
-                if depth <= 0 {
-                    break;
-                }
-            }
-        } else {
-            depth += delta;
-            if depth <= 0 {
-                break;
-            }
-        }
-    }
-    match body.find('{') {
-        Some(index) => body[index + 1..].to_string(),
-        None => String::new(),
-    }
 }
 
 /// Extract only the test selectors of one Rust file (the semantic identity
@@ -2436,18 +2432,6 @@ fn split_ident(rest: &str) -> Option<(String, &str)> {
         Some(_) => return None,
     }
     Some((name.to_string(), &rest[end..]))
-}
-
-fn brace_delta(line: &str) -> i32 {
-    let mut delta = 0i32;
-    for c in line.chars() {
-        match c {
-            '{' => delta += 1,
-            '}' => delta -= 1,
-            _ => {}
-        }
-    }
-    delta
 }
 
 /// The text-level symbol graph of one Rust source: `fn`/`struct`/`enum`/
@@ -3611,6 +3595,44 @@ mod tests {
         assert_eq!(declarations[0].selector, "tests::adds_works");
         assert_eq!(declarations[0].executable, "tests::adds_works");
         assert!(declarations[0].target.is_none());
+    }
+
+    #[test]
+    fn declarations_capture_the_execution_changing_attribute_stack() {
+        let content = r#"
+#[test]
+#[should_panic(expected = "boom")]
+#[ignore = "manual"]
+fn totals_add_up() {
+    assert_eq!(1 + 1, 2);
+}
+"#;
+        let declarations = rust_test_declarations_for_path("tests/cart.rs", content);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0].attributes,
+            vec![
+                "#[test]".to_string(),
+                "#[should_panic(expected = \"boom\")]".to_string(),
+                "#[ignore = \"manual\"]".to_string(),
+            ]
+        );
+        // A stack with the attributes in a different order is still the same
+        // executable declaration.
+        let reordered = r#"
+#[should_panic(expected = "boom")]
+#[test]
+#[ignore = "manual"]
+fn totals_add_up() {
+    assert_eq!(1 + 1, 2);
+}
+"#;
+        let reordered = rust_test_declarations_for_path("tests/cart.rs", reordered);
+        let mut left = declarations[0].attributes.clone();
+        let mut right = reordered[0].attributes.clone();
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
     }
 
     #[test]

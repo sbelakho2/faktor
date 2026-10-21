@@ -1,0 +1,17 @@
+[package]
+name = "engineering-cad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CAD import surface that honestly refuses unimplemented formats instead of fabricating geometry."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

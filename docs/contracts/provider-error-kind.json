@@ -43,6 +43,11 @@
       "name": "Malformed",
       "wire": "malformed",
       "retryable": false
+    },
+    {
+      "name": "OutputLimitExceeded",
+      "wire": "output_limit_exceeded",
+      "retryable": false
     }
   ]
 }

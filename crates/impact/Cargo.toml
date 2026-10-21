@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 faktor-terminal.workspace = true
+tempfile.workspace = true
 faktor-git = { workspace = true, optional = true }
 faktor-cas = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -23,7 +24,6 @@ lsp = ["dep:faktor-cas", "dep:tokio"]
 runtime = ["git", "lsp"]
 
 [dev-dependencies]
-tempfile = "3"
 faktor-cas.workspace = true
 
 [lints]

@@ -360,6 +360,25 @@ pub(crate) fn scripted_provider(script: Vec<ScriptedResponse>) -> FakeProvider {
     )
 }
 
+/// A scripted provider whose resolved output envelope admits intentionally
+/// LARGE generated payloads (long texts or write_file arguments). Tests that
+/// exercise downstream behavior on big model output must not trip the
+/// cumulative output ceiling, which is a separate, dedicated certificate.
+pub(crate) fn scripted_provider_with_max_output(
+    script: Vec<ScriptedResponse>,
+    max_output: usize,
+) -> FakeProvider {
+    FakeProvider::with_script(
+        "fake",
+        ModelCapabilities {
+            tools: true,
+            max_output,
+            ..Default::default()
+        },
+        script,
+    )
+}
+
 pub(crate) fn new_session(deps: &AgentDeps) -> SessionId {
     // A REAL directory: lifecycle hooks (P1) refuse to run without an
     // anchored session workspace, and `/w` does not exist.
@@ -1339,6 +1358,11 @@ pub(crate) async fn seed_long_history(
     let caps = ModelCapabilities {
         tools: true,
         context: 200_000,
+        // The long-history fixture intentionally emits replies far larger
+        // than a normal model cap; the resolved envelope must therefore be
+        // large enough for the fixture texts (the cumulative output budget
+        // now enforces the wire cap for every turn).
+        max_output: 100_000,
         ..Default::default()
     };
     for i in 0..count {

@@ -1,0 +1,37 @@
+{
+  "facts": {
+    "description": "Aluminium electrolytic capacitor",
+    "composition": [
+      { "material": "aluminium", "share_ppm": 600000 },
+      { "material": "electrolyte", "share_ppm": 300000 }
+    ],
+    "function": "energy storage and filtering",
+    "essential_character": "aluminium electrolytic element"
+  },
+  "candidates": [
+    {
+      "code": "853222",
+      "description": "Aluminium electrolytic capacitors",
+      "criteria": [
+        { "criterion": "composition_at_least", "material": "aluminium", "min_ppm": 500000 },
+        { "criterion": "function_contains", "text": "energy storage" }
+      ],
+      "gir": [
+        {
+          "rule": "g1",
+          "note": "terms of the heading",
+          "provenance": {
+            "source": "public_tariff",
+            "evidence": { "id": "gir-1", "revision": 1, "digest": "a" },
+            "captured_on": 20000,
+            "method": "tariff note",
+            "conditions": ["tariff revision 1"],
+            "falsifier": "a binding ruling to the contrary"
+          }
+        }
+      ],
+      "evidence": { "id": "hs-853222", "revision": 1, "digest": "b" },
+      "revision": 1
+    }
+  ]
+}

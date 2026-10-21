@@ -1,0 +1,27 @@
+[package]
+name = "engineering-solvers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Neutral EngineeringSolver contract and supervised adapters for KiCad CLI, ngspice, Gmsh and OpenFOAM."
+
+[dependencies]
+faktor-core.workspace = true
+faktor-cas.workspace = true
+faktor-terminal.workspace = true
+engineering-core.workspace = true
+engineering-units.workspace = true
+engineering-eda.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,527 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "injection-molding",
+  "version": "1.0.0",
+  "title": "Injection-molding draft and wall DFM starter",
+  "domain": "manufacturing",
+  "provenance": {
+    "kind": "reference",
+    "citation": "ISO 294-4 molding shrinkage practice and general injection-molding DFM practice",
+    "edition": null,
+    "locator": "molding shrinkage and manufacturability",
+    "note": "Starter pack encodes checks with explicit rule inputs; it does not claim a universal draft or wall threshold."
+  },
+  "terminology": [
+    {
+      "id": "term-draft-angle",
+      "term": "draft angle",
+      "definition": "The taper applied to a mold face so the part can be ejected without scuffing or dragging.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "part ejection",
+        "note": "Required draft depends on material, surface texture, feature depth and tool design."
+      }
+    },
+    {
+      "id": "term-nominal-wall",
+      "term": "nominal wall",
+      "definition": "The intended uniform wall thickness of the molded part.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "wall design",
+        "note": null
+      }
+    },
+    {
+      "id": "term-flow-length-ratio",
+      "term": "flow length ratio",
+      "definition": "The melt flow length divided by local wall thickness, used as a screening indicator for fill pressure and short-shot risk.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "flow and fill",
+        "note": "A screening ratio is not a substitute for a mold-flow simulation with material data."
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-moldability-checks",
+      "name": "Draft, wall-uniformity and flow-ratio manufacturability checks",
+      "equation_ids": [
+        "eq-wall-variation",
+        "eq-draft-margin",
+        "eq-flow-ratio"
+      ],
+      "assumption_ids": [
+        "asm-rule-inputs",
+        "asm-thermoplastic",
+        "asm-no-tool-deflection"
+      ],
+      "validity_domain_ids": [
+        "val-tool-specific",
+        "val-material-specific"
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "part and tool design",
+        "note": "Rule thresholds are explicit inputs from the DFM review, never hidden defaults."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-wall-variation",
+      "expression": "wall_variation = (t_max - t_min) / t_nominal",
+      "dimensional_signature": "dimensionless = length / length",
+      "variables": [
+        {
+          "symbol": "t_max",
+          "description": "maximum local wall thickness",
+          "dimension": "L"
+        },
+        {
+          "symbol": "t_min",
+          "description": "minimum local wall thickness",
+          "dimension": "L"
+        },
+        {
+          "symbol": "t_nominal",
+          "description": "nominal wall thickness",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "wall uniformity",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-draft-margin",
+      "expression": "draft_margin = draft_actual - draft_min_required",
+      "dimensional_signature": "angle = angle - angle",
+      "variables": [
+        {
+          "symbol": "draft_actual",
+          "description": "draft angle on the mold face",
+          "dimension": "1"
+        },
+        {
+          "symbol": "draft_min_required",
+          "description": "minimum draft required by the DFM review",
+          "dimension": "1"
+        }
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "draft",
+        "note": "Angles are dimensionless in SI but must still be converted as angles, not silently mixed with radians."
+      }
+    },
+    {
+      "id": "eq-flow-ratio",
+      "expression": "flow_ratio = flow_length / wall_thickness",
+      "dimensional_signature": "dimensionless = length / length",
+      "variables": [
+        {
+          "symbol": "flow_length",
+          "description": "melt flow path length from gate",
+          "dimension": "L"
+        },
+        {
+          "symbol": "wall_thickness",
+          "description": "local wall thickness along the flow path",
+          "dimension": "L"
+        }
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "flow length",
+        "note": null
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-rule-inputs",
+      "statement": "Minimum draft, maximum wall variation and maximum flow ratio are explicit inputs from the material/tool DFM review.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "DFM review",
+        "note": "A missing rule input makes the check unavailable; it is never defaulted."
+      }
+    },
+    {
+      "id": "asm-thermoplastic",
+      "statement": "The part is a thermoplastic injection molding; thermoset, compression and blow molding have different rules.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "process scope",
+        "note": null
+      }
+    },
+    {
+      "id": "asm-no-tool-deflection",
+      "statement": "Tool deflection, core shift, gate freeze and pack pressure are not modeled by these geometric checks.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "tooling",
+        "note": "A passing geometry check is not a moldability proof."
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-tool-specific",
+      "statement": "Draft and wall thresholds are valid only for the specific tool, texture and ejection design that supplied them.",
+      "temperature": null,
+      "exclusions": [
+        "deep features with textured walls",
+        "undercuts requiring side actions",
+        "tool deflection"
+      ],
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "tool design",
+        "note": null
+      }
+    },
+    {
+      "id": "val-material-specific",
+      "statement": "Flow ratio and wall rules must use the actual material grade's processing window.",
+      "temperature": null,
+      "exclusions": [
+        "glass-fiber anisotropy",
+        "flame-retardant grades with different flow",
+        "regrind without qualification"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 294-4 molding shrinkage standard",
+        "edition": "2018",
+        "locator": "material and process conditions",
+        "note": null
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-shrinkage",
+      "property": "molding shrinkage",
+      "authority": "Material datasheet or ISO 294-4 test, revision-bound",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 294-4 Plastics - Injection moulding of test specimens",
+        "edition": "2018",
+        "locator": "shrinkage determination",
+        "note": "Shrinkage depends on direction, thickness and process; a single generic number is not enough."
+      }
+    },
+    {
+      "id": "prop-processing-window",
+      "property": "melt and mold temperature window",
+      "authority": "Material datasheet, revision-bound",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "Material supplier processing guide",
+        "edition": null,
+        "locator": "processing conditions",
+        "note": null
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-draft",
+      "rule": "Every ejectable face needs the minimum draft specified by the tool/material DFM review; textured or deep faces require more.",
+      "check": "draft_actual >= draft_min_required",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "draft",
+        "note": "There is no universal draft number; the rule input carries its source."
+      }
+    },
+    {
+      "id": "rule-wall-uniformity",
+      "rule": "Wall thickness variation must stay within the maximum ratio agreed at DFM review to limit sink, warp and cycle variation.",
+      "check": "wall_variation <= wall_variation_max",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "wall design",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-flow-ratio",
+      "rule": "Check the flow length ratio against the material-specific limit; escalate to mold-flow simulation when it is exceeded.",
+      "check": "flow_ratio <= flow_ratio_max",
+      "severity": "recommended",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "flow",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-texture-draft",
+      "rule": "Textured surfaces require additional draft because the texture depth increases ejection resistance.",
+      "check": "texture-specific draft allowance applied",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "surface texture",
+        "note": null
+      }
+    },
+    {
+      "id": "mfg-first-article",
+      "rule": "Verify wall thickness and draft on the first article, not only on the CAD model.",
+      "check": "first-article dimensional report includes wall and draft",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Injection-molding first-article inspection practice",
+        "edition": null,
+        "locator": "inspection",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-drag-scuff",
+      "mode": "drag, scuffing or ejection damage",
+      "cause": "insufficient draft, texture, undercut or excessive ejection force",
+      "detection": "visual inspection, surface roughness, mold-trial ejection force",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "ejection",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-sink-warp",
+      "mode": "sink, warp or dimensional instability",
+      "cause": "non-uniform wall thickness, inadequate packing or anisotropic shrinkage",
+      "detection": "first-article metrology, flatness and parallelism checks, mold-flow comparison",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 294-4 molding shrinkage standard",
+        "edition": "2018",
+        "locator": "shrinkage",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-short-shot",
+      "signature": "short shot at the end of a long thin flow path",
+      "indicates": "flow length ratio or injection pressure outside the material process window",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "fill",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-first-article",
+      "method": "First-article dimensional inspection including wall thickness and draft",
+      "measures": "as-molded geometry, draft, wall variation",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "First-article inspection practice",
+        "edition": null,
+        "locator": "dimensional report",
+        "note": null
+      }
+    },
+    {
+      "id": "test-mold-trial",
+      "method": "Mold trial with short-shot and pressure-drop study",
+      "measures": "fill behavior, flow ratio margin, ejection behavior",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Mold trial practice",
+        "edition": null,
+        "locator": "process validation",
+        "note": null
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-iso-294-4",
+      "standard": "ISO 294-4:2018",
+      "scope": "determination of molding shrinkage of thermoplastics",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 294-4:2018",
+        "edition": "2018",
+        "locator": "title and scope metadata",
+        "note": "Metadata only; licensed text is not embedded."
+      }
+    },
+    {
+      "id": "std-iso-527",
+      "standard": "ISO 527-1:2019",
+      "scope": "determination of tensile properties of plastics",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "ISO 527-1:2019",
+        "edition": "2019",
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-mold-wall-draft",
+      "description": "A nominal 2.5 mm wall varies from 2.2 mm to 2.9 mm with 0.5 degrees of draft against a 1.0 degree requirement.",
+      "inputs": [
+        {
+          "name": "nominal_wall",
+          "value": 2.5,
+          "unit": "mm",
+          "note": null
+        },
+        {
+          "name": "min_wall",
+          "value": 2.2,
+          "unit": "mm",
+          "note": null
+        },
+        {
+          "name": "max_wall",
+          "value": 2.9,
+          "unit": "mm",
+          "note": null
+        },
+        {
+          "name": "draft_actual",
+          "value": 0.5,
+          "unit": "deg",
+          "note": null
+        },
+        {
+          "name": "draft_min_required",
+          "value": 1.0,
+          "unit": "deg",
+          "note": "value supplied by the DFM review"
+        },
+        {
+          "name": "flow_length",
+          "value": 120.0,
+          "unit": "mm",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "wall_variation",
+          "value": 0.28,
+          "unit": "1",
+          "tolerance": 0.000001,
+          "note": "(2.9 - 2.2) / 2.5"
+        },
+        {
+          "name": "draft_margin",
+          "value": -0.5,
+          "unit": "deg",
+          "tolerance": 0.000001,
+          "note": "0.5 - 1.0"
+        },
+        {
+          "name": "flow_ratio",
+          "value": 48.0,
+          "unit": "1",
+          "tolerance": 0.000001,
+          "note": "120 mm / 2.5 mm"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form evaluation of the DFM checks",
+        "edition": null,
+        "locator": "worked starter case",
+        "note": "The numeric values follow from the inputs; the rule thresholds are explicit inputs."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-zero-draft",
+      "claim": "A vertical wall with zero draft is manufacturable because CAD can represent it.",
+      "refutation": "A zero-draft face has no ejection clearance; friction and texture can cause drag, scuffing or ejection damage even if the nominal geometry closes.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "ejection",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-draft-units",
+      "trap": "Comparing a draft angle in radians with a minimum expressed in degrees, or dropping the angle unit because it is dimensionless in SI.",
+      "why_shallow_fails": "0.5 radians is about 28.6 degrees, not 0.5 degrees; the dimensional check passes but the physical verdict is wrong.",
+      "guard": "Carry angle units through conversion and report both the converted value and the rule source.",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "General injection-molding DFM practice",
+        "edition": null,
+        "locator": "draft",
+        "note": null
+      }
+    }
+  ]
+}

@@ -37,9 +37,9 @@ pub struct McpServerRecord {
     pub trust_origin: String,
     pub trusted: bool,
     pub enabled: bool,
-    /// `stdio` or `streamable_http`. Remote transport remains typed
-    /// unsupported by the runtime until a negotiated adapter exists; auth
-    /// and bounds are still durable and enforced where the transport is.
+    /// `stdio` or `streamable_http`. Remote Streamable HTTP sessions are
+    /// owned by the daemon's checked egress authority; auth and bounds are
+    /// durable and enforced at connect time.
     pub transport: String,
     pub endpoint: Option<String>,
     pub auth_state: String,
@@ -1026,9 +1026,9 @@ fn validate_mcp_endpoint(endpoint: &str) -> Result<String, FoundationError> {
     let parsed = url::Url::parse(endpoint).map_err(|_| {
         FoundationError::Malformed("MCP endpoint must be an absolute http(s) URL".into())
     })?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+    if parsed.scheme() != "https" || parsed.host().is_none() {
         return Err(FoundationError::Malformed(
-            "MCP endpoint must be an absolute http(s) URL".into(),
+            "MCP endpoint must be an absolute https URL".into(),
         ));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {

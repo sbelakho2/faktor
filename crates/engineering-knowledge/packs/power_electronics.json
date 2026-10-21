@@ -1,0 +1,580 @@
+{
+  "schema": "faktor.engineering.knowledge-pack/v1",
+  "id": "power-electronics",
+  "version": "1.0.0",
+  "title": "MOSFET conduction loss and thermal chain starter",
+  "domain": "power_electronics",
+  "provenance": {
+    "kind": "reference",
+    "citation": "IEC 60747 semiconductor device terminology and JEDEC JESD51 thermal measurement practice",
+    "edition": null,
+    "locator": "device and thermal terminology",
+    "note": "Starter pack contains model structure only; every device value must come from a revision-bound datasheet."
+  },
+  "terminology": [
+    {
+      "id": "term-rds-on",
+      "term": "Rds(on)",
+      "definition": "Drain-source on-state resistance at a stated gate voltage, drain current and junction temperature.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60747-8 semiconductor devices",
+        "edition": null,
+        "locator": "device parameter definitions",
+        "note": "Conditional on gate drive and temperature; it is not a universal constant."
+      }
+    },
+    {
+      "id": "term-thermal-chain",
+      "term": "junction-to-ambient thermal resistance chain",
+      "definition": "The series path Rth(j-c) + Rth(c-s) + Rth(s-a), including the interface and mounting conditions.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal resistance definitions",
+        "note": null
+      }
+    },
+    {
+      "id": "term-thermal-runaway",
+      "term": "thermal runaway",
+      "definition": "A self-heating instability where the temperature-dependent loss grows faster than the thermal path can remove it.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Power semiconductor thermal design practice",
+        "edition": null,
+        "locator": "steady-state thermal stability",
+        "note": "The instability threshold must be evaluated with the actual Rds(on) temperature coefficient and thermal path."
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "model-conduction-thermal",
+      "name": "Coupled conduction loss and steady-state thermal chain",
+      "equation_ids": [
+        "eq-conduction-loss",
+        "eq-thermal-chain",
+        "eq-rds-temperature"
+      ],
+      "assumption_ids": [
+        "asm-conduction-only",
+        "asm-linear-rds-temperature",
+        "asm-constant-thermal-resistance"
+      ],
+      "validity_domain_ids": [
+        "val-datasheet-range",
+        "val-thermal-path-complete"
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "IEC 60747-8 and JEDEC JESD51 model structure",
+        "edition": null,
+        "locator": "conduction loss and thermal resistance",
+        "note": "The coupled fixed point is solved explicitly; no iterative black box is hidden."
+      }
+    }
+  ],
+  "equations": [
+    {
+      "id": "eq-conduction-loss",
+      "expression": "P = I_rms^2 * R_ds(on)",
+      "dimensional_signature": "power = current^2 * resistance",
+      "variables": [
+        {
+          "symbol": "P",
+          "description": "conduction loss",
+          "dimension": "M L^2 T^-3"
+        },
+        {
+          "symbol": "I_rms",
+          "description": "RMS drain current",
+          "dimension": "I"
+        },
+        {
+          "symbol": "R_ds(on)",
+          "description": "on-state resistance at junction temperature",
+          "dimension": "M L^2 T^-3 I^-2"
+        }
+      ],
+      "provenance": {
+        "kind": "reference",
+        "citation": "IEC 60747-8 semiconductor device model structure",
+        "edition": null,
+        "locator": "conduction loss",
+        "note": null
+      }
+    },
+    {
+      "id": "eq-thermal-chain",
+      "expression": "T_j = T_a + P * (R_th(j-c) + R_th(c-s) + R_th(s-a))",
+      "dimensional_signature": "temperature = temperature + power * thermal_resistance",
+      "variables": [
+        {
+          "symbol": "T_j",
+          "description": "junction temperature",
+          "dimension": "Theta"
+        },
+        {
+          "symbol": "T_a",
+          "description": "ambient temperature",
+          "dimension": "Theta"
+        },
+        {
+          "symbol": "P",
+          "description": "dissipated power",
+          "dimension": "M L^2 T^-3"
+        },
+        {
+          "symbol": "R_th",
+          "description": "thermal resistance",
+          "dimension": "Theta T^3 L^-2 M^-1"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal resistance chain",
+        "note": "R_th(c-s) must include the actual interface material and mounting condition."
+      }
+    },
+    {
+      "id": "eq-rds-temperature",
+      "expression": "R_ds(on)(T_j) = R_ds(on)(T_ref) * (1 + alpha * (T_j - T_ref))",
+      "dimensional_signature": "resistance = resistance * dimensionless",
+      "variables": [
+        {
+          "symbol": "R_ds(on)",
+          "description": "on-state resistance",
+          "dimension": "M L^2 T^-3 I^-2"
+        },
+        {
+          "symbol": "alpha",
+          "description": "linear temperature coefficient",
+          "dimension": "Theta^-1"
+        },
+        {
+          "symbol": "T_j",
+          "description": "junction temperature",
+          "dimension": "Theta"
+        },
+        {
+          "symbol": "T_ref",
+          "description": "datasheet reference temperature",
+          "dimension": "Theta"
+        }
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60747-8 device parameter definitions",
+        "edition": null,
+        "locator": "temperature dependence",
+        "note": "A single linear coefficient is a local model; the datasheet curve defines its validity."
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "asm-conduction-only",
+      "statement": "Only conduction loss is modeled; switching, gate-drive, body-diode, avalanche and leakage losses are excluded unless separately supplied.",
+      "provenance": {
+        "kind": "reference",
+        "citation": "IEC 60747-8 semiconductor device model structure",
+        "edition": null,
+        "locator": "loss components",
+        "note": "Excluded losses are not zero by assumption in a complete design; they are outside this model."
+      }
+    },
+    {
+      "id": "asm-linear-rds-temperature",
+      "statement": "Rds(on) varies linearly with junction temperature over the selected interval using the supplied alpha.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer datasheet Rds(on) vs temperature curve",
+        "edition": null,
+        "locator": "device parameter curve",
+        "note": "Outside the datasheet interval the linear coefficient is not valid."
+      }
+    },
+    {
+      "id": "asm-constant-thermal-resistance",
+      "statement": "The thermal resistances are constant and represent the actual mounting, interface material, heatsink and airflow condition.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal resistance measurement conditions",
+        "note": "A datasheet Rth without its measurement condition is not a design value."
+      }
+    }
+  ],
+  "validity_domains": [
+    {
+      "id": "val-datasheet-range",
+      "statement": "Junction temperature, current and gate voltage must remain inside the revision-bound manufacturer datasheet range used for Rds(on) and alpha.",
+      "temperature": null,
+      "exclusions": [
+        "avalanche operation",
+        "gate voltage below the datasheet test condition",
+        "junction temperature outside the datasheet curve"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer MOSFET datasheet",
+        "edition": null,
+        "locator": "absolute maximum ratings and characteristics",
+        "note": null
+      }
+    },
+    {
+      "id": "val-thermal-path-complete",
+      "statement": "The thermal chain is only valid when junction-to-case, case-to-sink (interface) and sink-to-ambient resistances are all sourced for the actual assembly.",
+      "temperature": null,
+      "exclusions": [
+        "missing thermal interface resistance",
+        "natural convection assumed where forced convection is required",
+        "transient heating"
+      ],
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal path",
+        "note": "A missing contact resistance is unknown, never zero."
+      }
+    }
+  ],
+  "property_sources": [
+    {
+      "id": "prop-rds",
+      "property": "Rds(on) and temperature coefficient alpha",
+      "authority": "Revision-bound manufacturer datasheet at the stated gate voltage and current",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60747-8 and manufacturer datasheet",
+        "edition": null,
+        "locator": "device characteristics",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-rth",
+      "property": "junction-to-case and junction-to-ambient thermal resistance",
+      "authority": "Revision-bound datasheet plus JESD51 measurement condition",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal resistance",
+        "note": null
+      }
+    },
+    {
+      "id": "prop-contact-rth",
+      "property": "case-to-sink thermal resistance",
+      "authority": "Interface material datasheet with pressure, thickness and voiding condition",
+      "revision_bound": true,
+      "provenance": {
+        "kind": "standard",
+        "citation": "Thermal interface material datasheet",
+        "edition": null,
+        "locator": "thermal impedance vs pressure",
+        "note": "A missing interface resistance makes the junction temperature unavailable."
+      }
+    }
+  ],
+  "design_rules": [
+    {
+      "id": "rule-contact-resistance",
+      "rule": "Include the case-to-sink interface resistance; do not treat a missing interface value as zero.",
+      "check": "R_th(c-s) has a revision-bound source",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal path",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-tj-margin",
+      "rule": "Compare the converged junction temperature with the datasheet maximum and report margin as unavailable when either is missing.",
+      "check": "T_j < T_j(max) with revision-bound values",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer MOSFET datasheet",
+        "edition": null,
+        "locator": "absolute maximum ratings",
+        "note": null
+      }
+    },
+    {
+      "id": "rule-runaway-check",
+      "rule": "Check the steady-state thermal stability denominator before solving; a non-positive denominator is a runaway condition, not a numeric result.",
+      "check": "1 - R_th * I_rms^2 * R_ref * alpha > 0",
+      "severity": "required",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Power semiconductor thermal design practice",
+        "edition": null,
+        "locator": "steady-state thermal stability",
+        "note": null
+      }
+    }
+  ],
+  "manufacturing_rules": [
+    {
+      "id": "mfg-interface-control",
+      "rule": "Control interface material thickness, application pressure and voiding because they dominate Rth(c-s).",
+      "check": "assembly instruction and first-article thermal measurement",
+      "severity": "required",
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Thermal interface material application practice",
+        "edition": null,
+        "locator": "assembly process",
+        "note": null
+      }
+    },
+    {
+      "id": "mfg-mounting-torque",
+      "rule": "Respect the device mounting torque and flatness specification; excess or uneven pressure damages the package or interface.",
+      "check": "mounting torque and heatsink flatness records",
+      "severity": "required",
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer package mounting guidelines",
+        "edition": null,
+        "locator": "mounting",
+        "note": null
+      }
+    }
+  ],
+  "failure_modes": [
+    {
+      "id": "fail-thermal-runaway",
+      "mode": "thermal runaway",
+      "cause": "self-heating raises Rds(on), which raises loss faster than the thermal path removes it",
+      "detection": "stability denominator check, thermal imaging, current-limited test",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Power semiconductor thermal design practice",
+        "edition": null,
+        "locator": "steady-state thermal stability",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-interface-degradation",
+      "mode": "thermal interface degradation or dry-out",
+      "cause": "pump-out, voiding, contamination or inadequate mounting pressure",
+      "detection": "rising case-to-ambient delta, thermal cycling test, teardown inspection",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal path",
+        "note": null
+      }
+    },
+    {
+      "id": "fail-overcurrent",
+      "mode": "overcurrent or short-circuit stress",
+      "cause": "load fault, gate-drive fault or insufficient current limiting",
+      "detection": "current sensing, desaturation detection, fuse coordination",
+      "provenance": {
+        "kind": "reference",
+        "citation": "Power electronics protection practice",
+        "edition": null,
+        "locator": "protection",
+        "note": null
+      }
+    }
+  ],
+  "diagnostic_signatures": [
+    {
+      "id": "diag-rds-drift",
+      "signature": "Rds(on) or conduction loss drifting upward with temperature",
+      "indicates": "positive temperature coefficient self-heating; check the coupled solution and stability denominator",
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer MOSFET datasheet",
+        "edition": null,
+        "locator": "Rds(on) vs temperature",
+        "note": null
+      }
+    }
+  ],
+  "test_methods": [
+    {
+      "id": "test-jesd51",
+      "method": "JESD51 thermal resistance measurement on the actual package and board",
+      "measures": "junction-to-case and junction-to-ambient thermal resistance",
+      "standard_ref": "JEDEC JESD51",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "measurement procedure",
+        "note": "Licensed text is not reproduced."
+      }
+    },
+    {
+      "id": "test-load-thermal",
+      "method": "Loaded thermal soak with case, sink and ambient temperature logging",
+      "measures": "steady-state temperature rise and thermal path consistency",
+      "standard_ref": null,
+      "provenance": {
+        "kind": "engineering_practice",
+        "citation": "Power electronics validation practice",
+        "edition": null,
+        "locator": "thermal soak",
+        "note": null
+      }
+    }
+  ],
+  "standards_mappings": [
+    {
+      "id": "std-iec-60747",
+      "standard": "IEC 60747-8",
+      "scope": "discrete semiconductor devices, field-effect transistors",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IEC 60747-8",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only; licensed text is not embedded."
+      }
+    },
+    {
+      "id": "std-jesd51",
+      "standard": "JEDEC JESD51",
+      "scope": "thermal measurement of semiconductor packages",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51",
+        "edition": null,
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    },
+    {
+      "id": "std-ipc-2221",
+      "standard": "IPC-2221B",
+      "scope": "generic PCB design, including thermal copper considerations",
+      "access": "metadata_only",
+      "provenance": {
+        "kind": "standard",
+        "citation": "IPC-2221B",
+        "edition": "B",
+        "locator": "title and scope metadata",
+        "note": "Metadata only."
+      }
+    }
+  ],
+  "worked_cases": [
+    {
+      "id": "case-mosfet-20a",
+      "description": "A 20 A RMS MOSFET with 10 mohm at 25 degC, alpha 0.004 /K, and a 2.0 K/W total thermal path reaches a self-consistent junction temperature.",
+      "inputs": [
+        {
+          "name": "drain_current_rms",
+          "value": 20.0,
+          "unit": "A",
+          "note": null
+        },
+        {
+          "name": "rds_on_25c",
+          "value": 0.01,
+          "unit": "ohm",
+          "note": null
+        },
+        {
+          "name": "alpha",
+          "value": 0.004,
+          "unit": "1/K",
+          "note": null
+        },
+        {
+          "name": "rth_total",
+          "value": 2.0,
+          "unit": "K/W",
+          "note": "sum of junction-case, case-sink and sink-ambient"
+        },
+        {
+          "name": "ambient",
+          "value": 25.0,
+          "unit": "degC",
+          "note": null
+        }
+      ],
+      "expected": [
+        {
+          "name": "conduction_loss",
+          "value": 4.13223140495868,
+          "unit": "W",
+          "tolerance": 0.00001,
+          "note": "self-consistent solution"
+        },
+        {
+          "name": "junction_temperature",
+          "value": 33.2644628099174,
+          "unit": "degC",
+          "tolerance": 0.00001,
+          "note": "T_a + P R_th"
+        },
+        {
+          "name": "rds_on_hot",
+          "value": 0.0103305785123967,
+          "unit": "ohm",
+          "tolerance": 0.000000001,
+          "note": "R_25 (1 + alpha (T_j - T_ref))"
+        }
+      ],
+      "provenance": {
+        "kind": "calculation",
+        "citation": "Closed-form solution of the coupled conduction-thermal fixed point",
+        "edition": null,
+        "locator": "worked starter case",
+        "note": "Values follow from the equations and supplied inputs, not from a hidden device database."
+      }
+    }
+  ],
+  "counterexamples": [
+    {
+      "id": "cex-rds-at-25c",
+      "claim": "Using Rds(on) at 25 degC in the loss equation is accurate enough for a hot junction.",
+      "refutation": "The loss and Rds(on) are coupled. Solving T_j = T_a + P(T_j) R_th changes both the loss and the hot resistance; evaluating only at 25 degC systematically understates temperature.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "Manufacturer MOSFET datasheet Rds(on) vs temperature",
+        "edition": null,
+        "locator": "temperature dependence",
+        "note": null
+      }
+    }
+  ],
+  "known_traps": [
+    {
+      "id": "trap-missing-contact-resistance",
+      "trap": "Summing only junction-to-case and sink-to-ambient thermal resistance, or silently treating the missing case-to-sink interface as zero.",
+      "why_shallow_fails": "The arithmetic and units look correct, but the omitted interface can dominate the temperature rise. A missing value is unknown, not zero.",
+      "guard": "Require a revision-bound Rth(c-s) or return a typed unavailable junction temperature.",
+      "provenance": {
+        "kind": "standard",
+        "citation": "JEDEC JESD51 thermal measurement standards",
+        "edition": null,
+        "locator": "thermal path",
+        "note": null
+      }
+    }
+  ]
+}

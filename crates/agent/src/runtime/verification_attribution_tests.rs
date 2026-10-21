@@ -2999,7 +2999,8 @@ async fn review_model_request_is_isolated_and_carries_the_diff_package() {
         ScriptedResponse::End,
     ];
     let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
-    let fake_rec = RecordingProvider::new(Arc::new(scripted_provider(t2)));
+    let fake_rec =
+        RecordingProvider::new(Arc::new(scripted_provider_with_max_output(t2, 1_000_000)));
     let review_rec =
         RecordingProvider::new(mock_review_provider(r#"{"verdict":"clean","findings":[]}"#));
     let (t2_deps, _d2) = snapshot_review_deps(
@@ -3106,7 +3107,9 @@ async fn risky_change_with_oversized_diff_never_reviewed_partially() {
         &manager,
         &snapshots,
         &cas,
-        vec![Arc::new(scripted_provider(script))],
+        vec![Arc::new(scripted_provider_with_max_output(
+            script, 1_000_000,
+        ))],
         vec![checkpoint_write_tool()],
         crate::FixedRoutingPolicy::passthrough(),
     );

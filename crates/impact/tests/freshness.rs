@@ -5,7 +5,10 @@
 use std::fs;
 use std::path::Path;
 
-use faktor_impact::{AffectedOptions, ChangedTarget, ImpactSession, Revision, DEFAULT_MAX_DEPTH};
+use faktor_impact::{
+    AffectedOptions, BuildOptions, ChangedTarget, GenerationLimits, ImpactSession,
+    MaterialGeneration, RefreshMode, RefreshPolicy, Revision, DEFAULT_MAX_DEPTH,
+};
 
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
@@ -218,4 +221,349 @@ fn rapid_double_edit_settles_on_the_last_content() {
     );
     assert!(references(&session, "b/src/lib.rs"));
     assert!(!references(&session, "c/src/lib.rs"));
+}
+
+/// The generation authority — not the paths a query happens to name — is
+/// what makes an out-of-band edit visible. The scan only selects candidates;
+/// the refresh still proves the change by content digest.
+#[test]
+fn generation_sync_refreshes_an_out_of_band_edit() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::new();
+
+    let (affected_by_b, names_b) = affected_names(&session, "b/src/lib.rs", "target");
+    assert!(affected_by_b, "initial graph must depend on b: {names_b:?}");
+
+    // Out-of-band: the query will be seeded by b, but app is the edited file.
+    write(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    let scan = session.scan_material_changes().unwrap();
+    assert!(
+        scan.seeds.iter().any(|path| path == "app/src/lib.rs"),
+        "the whole-workspace scan must see the out-of-band edit: {scan:?}"
+    );
+    assert!(scan.seeds.iter().all(|path| path == "app/src/lib.rs"));
+    generation.observe(scan.seeds);
+    let dirty = generation.dirty_since(0);
+    assert!(!dirty.lost);
+    let report = session
+        .refresh_from_generation(&dirty, &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Incremental);
+    assert_eq!(report.generation, 1);
+    assert!(!report.degraded);
+
+    let (affected_by_b_again, names_b) = affected_names(&session, "b/src/lib.rs", "target");
+    assert!(
+        !affected_by_b_again,
+        "the stale b relationship must be gone: {names_b:?}"
+    );
+    let (affected_by_c, names_c) = affected_names(&session, "c/src/lib.rs", "target");
+    assert!(
+        affected_by_c,
+        "the out-of-band c relationship must be present: {names_c:?}"
+    );
+    assert!(references(&session, "c/src/lib.rs"));
+    assert!(!references(&session, "b/src/lib.rs"));
+
+    // The same generation is a cheap no-op: no re-parse, no digest change.
+    let digest = session.graph().graph().digest.clone();
+    let current = generation.current();
+    let noop = session
+        .refresh_from_generation(&generation.dirty_since(current), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(noop.mode, RefreshMode::Unchanged);
+    assert_eq!(noop.stats.files_reparsed, 0);
+    assert_eq!(session.graph().graph().digest, digest);
+}
+
+#[test]
+fn rapid_multi_file_edits_are_one_generation_and_settle_on_disk_content() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::new();
+
+    write(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub fn target() -> u32 { 1 }\npub fn extra() -> u32 { 2 }\n",
+    );
+    let scan = session.scan_material_changes().unwrap();
+    assert_eq!(scan.seeds.len(), 2, "both edits are dirty: {scan:?}");
+    generation.observe(scan.seeds);
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Incremental);
+    assert_eq!(report.stats.files_changed, 2);
+    assert!(report.stats.files_reparsed <= 2);
+    assert!(references(&session, "c/src/lib.rs"));
+    assert!(!references(&session, "b/src/lib.rs"));
+    assert!(
+        session
+            .graph()
+            .node("symbol:b/src/lib.rs#extra@2")
+            .is_some(),
+        "the second file edit must be indexed"
+    );
+}
+
+#[test]
+fn dirty_history_overflow_rebuilds_the_whole_workspace() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::with_limits(GenerationLimits {
+        max_generations: 1,
+        max_dirty_paths: 1024,
+    });
+
+    write(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub fn target() -> u32 { 1 }\npub fn rebound() -> u32 { 3 }\n",
+    );
+    // Two observations while the cached graph is still at generation 0:
+    // the first generation is dropped, so the exact dirty set is lost.
+    generation.observe(["app/src/lib.rs"]);
+    generation.observe(["b/src/lib.rs"]);
+    let dirty = generation.dirty_since(0);
+    assert!(dirty.lost, "bounded history overflow must be typed lost");
+    let report = session
+        .refresh_from_generation(&dirty, &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Rebuilt);
+    assert!(report.lost);
+    assert!(references(&session, "c/src/lib.rs"));
+    assert!(
+        session
+            .graph()
+            .node("symbol:b/src/lib.rs#rebound@2")
+            .is_some(),
+        "the rebuild must include every file, not a partial dirty view"
+    );
+}
+
+#[test]
+fn explicit_history_loss_rebuilds_and_never_returns_a_silent_partial() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::new();
+
+    write(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    generation.observe(["app/src/lib.rs"]);
+    generation.mark_history_lost();
+    let dirty = generation.dirty_since(0);
+    assert!(dirty.lost);
+    let report = session
+        .refresh_from_generation(&dirty, &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Rebuilt);
+    assert!(references(&session, "c/src/lib.rs"));
+}
+
+/// The REBUILD policy budget is a typed refusal, not a silent partial: a
+/// rebuild that would exceed `max_rebuild_files` leaves the old graph in
+/// place, reports `Degraded` with a reason, and every affected result
+/// carries the degraded flag/note.
+#[test]
+fn rebuild_policy_budget_exceeded_is_a_typed_degraded_refusal() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::new();
+    generation.observe(["app/src/lib.rs"]);
+    generation.mark_history_lost();
+    let policy = RefreshPolicy {
+        max_incremental_paths: 8,
+        max_rebuild_files: 1,
+    };
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &policy)
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Degraded, "{report:?}");
+    assert!(report.degraded);
+    assert!(
+        report
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("exceed")),
+        "the refusal must name the budget: {report:?}"
+    );
+
+    let result = session
+        .affected(
+            &[ChangedTarget::file("app/src/lib.rs")],
+            &AffectedOptions::default(),
+        )
+        .unwrap();
+    assert!(result.degraded, "the query must never look complete");
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|note| note.contains("not current") || note.contains("budget")),
+        "the typed reason must ride the result: {result:?}"
+    );
+}
+
+#[test]
+fn rebuild_budget_exhaustion_is_a_typed_degraded_flag() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material_for_workspace_with_options(
+        root,
+        faktor_core::id::WorkspaceId::new(1),
+        BuildOptions {
+            max_files: 2,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(session.builder().report().truncated);
+    let generation = MaterialGeneration::new();
+    generation.observe(["app/src/lib.rs"]);
+    generation.mark_history_lost();
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Rebuilt);
+    assert!(report.degraded, "truncated rebuild must be degraded");
+    assert!(report
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("bound")));
+
+    let result = session
+        .affected(
+            &[ChangedTarget::file("app/src/lib.rs")],
+            &AffectedOptions::default(),
+        )
+        .unwrap();
+    assert!(result.degraded);
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|note| note.contains("bound") || note.contains("not current")),
+        "the degraded flag must carry its reason: {result:?}"
+    );
+}
+
+/// Bounded 10k-file probe: a single edit must re-parse a bounded set, and an
+/// unchanged generation must not rebuild. Ignored in CI long-test lanes.
+#[test]
+#[ignore = "[perf] impact 10k-file incremental generation refresh"]
+fn perf_10k_files_incremental_refresh_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "Cargo.toml", "[workspace]\nmembers = [\"big\"]\n");
+    write(
+        root,
+        "big/Cargo.toml",
+        "[package]\nname = \"big\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "big/src/lib.rs", "pub fn root() -> u32 { 1 }\n");
+    for index in 0..10_000 {
+        write(
+            root,
+            &format!("big/src/f{index:05}.rs"),
+            &format!("pub fn f{index}() -> u32 {{ {index} }}\n"),
+        );
+    }
+    let mut session = ImpactSession::build_material(root).unwrap();
+    assert_eq!(session.graph().graph().stats.files, 10_001);
+    let generation = MaterialGeneration::new();
+
+    let changed = "big/src/f00042.rs";
+    write(
+        root,
+        changed,
+        "pub fn f42() -> u32 { 42 }\npub fn extra() -> u32 { 43 }\n",
+    );
+    let started = std::time::Instant::now();
+    let scan = session.scan_material_changes().unwrap();
+    assert_eq!(scan.seeds, vec![changed.to_string()]);
+    generation.observe(scan.seeds);
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Incremental);
+    assert!(
+        report.stats.files_reparsed <= 8,
+        "10k-file refresh must stay bounded: {report:?}"
+    );
+    assert!(session
+        .graph()
+        .node("symbol:big/src/f00042.rs#extra@2")
+        .is_some());
+
+    let noop_started = std::time::Instant::now();
+    for _ in 0..20 {
+        let dirty = generation.dirty_since(generation.current());
+        let report = session
+            .refresh_from_generation(&dirty, &RefreshPolicy::default())
+            .unwrap();
+        assert_eq!(report.mode, RefreshMode::Unchanged);
+        assert_eq!(report.stats.files_reparsed, 0);
+    }
+    println!(
+        "[perf] 10k files: edit scan+refresh {:?}, 20 no-op generation checks {:?}",
+        started.elapsed(),
+        noop_started.elapsed()
+    );
+}
+
+#[test]
+fn manifest_edit_invalidates_topology_without_a_source_change() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::new();
+
+    let depends_on = |session: &ImpactSession, from: &str, to: &str| {
+        session.graph().graph().edges.iter().any(|edge| {
+            edge.from == from && edge.to == to && edge.kind == faktor_impact::EdgeKind::DependsOn
+        })
+    };
+    assert!(depends_on(&session, "crate:app", "crate:b"));
+
+    write(
+        root,
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nc = { path = \"../c\" }\n",
+    );
+    let scan = session.scan_material_changes().unwrap();
+    assert!(
+        scan.seeds.iter().any(|path| path == "app/Cargo.toml"),
+        "the manifest stamp must be part of the whole-workspace scan: {scan:?}"
+    );
+    generation.observe(scan.seeds);
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Rebuilt);
+    assert!(!depends_on(&session, "crate:app", "crate:b"));
+    assert!(depends_on(&session, "crate:app", "crate:c"));
 }

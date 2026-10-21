@@ -30,7 +30,8 @@ use serde::Deserialize;
 
 use crate::model::{GraphError, Revision};
 use crate::topology::{
-    self, AdapterKind, Topology, Unit, UnitKind, MAX_ADAPTER_BYTES, MAX_ADAPTER_UNITS,
+    self, AdapterKind, AdapterOutcome, NativeProbe, Topology, Unit, UnitKind, MAX_ADAPTER_BYTES,
+    MAX_ADAPTER_UNITS,
 };
 
 pub use crate::topology::{Unit as TopologyUnit, UnitKind as TopologyUnitKind};
@@ -68,9 +69,12 @@ pub struct Workspace {
     pub adapters: Vec<AdapterKind>,
     pub workspace_members: BTreeSet<String>,
     pub default_members: BTreeSet<String>,
-    /// True only when the documented Cargo-unavailable fallback ran.
+    /// True when any adapter used its documented structural fallback.
     pub degraded: bool,
     pub degraded_reason: Option<String>,
+    /// Per-adapter native/fallback provenance (one entry per contributing
+    /// adapter family).
+    pub adapter_outcomes: Vec<AdapterOutcome>,
 }
 
 impl Workspace {
@@ -133,6 +137,10 @@ pub struct TopologyOptions {
     pub cargo_metadata: bool,
     /// Compose non-Cargo adapters even when Cargo metadata succeeded.
     pub adapters: bool,
+    /// Use each ecosystem's native metadata (npm lockfile graph, supervised
+    /// Gradle model, PEP 621/installed Python metadata). `false` forces the
+    /// documented bounded structural fallbacks, which are marked degraded.
+    pub native_metadata: bool,
     pub metadata_timeout: Duration,
     pub metadata_max_bytes: usize,
 }
@@ -143,6 +151,7 @@ impl Default for TopologyOptions {
             supervisor: None,
             cargo_metadata: true,
             adapters: true,
+            native_metadata: true,
             metadata_timeout: DEFAULT_METADATA_TIMEOUT,
             metadata_max_bytes: DEFAULT_METADATA_BYTES,
         }
@@ -153,6 +162,7 @@ impl TopologyOptions {
     pub fn parser_only() -> Self {
         Self {
             cargo_metadata: false,
+            native_metadata: false,
             ..Self::default()
         }
     }
@@ -413,6 +423,10 @@ fn discover_topology(root: &Path, options: &TopologyOptions) -> Result<Workspace
                     members = metadata.members;
                     defaults = metadata.defaults;
                     topology.adapters.push(AdapterKind::Cargo);
+                    topology.outcomes.push(AdapterOutcome::native(
+                        AdapterKind::Cargo,
+                        "supervised cargo metadata --no-deps",
+                    ));
                 }
                 Err(MetadataFailure::Unavailable(reason)) => {
                     degraded = true;
@@ -425,6 +439,10 @@ fn discover_topology(root: &Path, options: &TopologyOptions) -> Result<Workspace
                     members = fallback.members;
                     defaults = fallback.defaults;
                     topology.adapters.push(AdapterKind::Cargo);
+                    topology.outcomes.push(AdapterOutcome::fallback(
+                        AdapterKind::Cargo,
+                        format!("cargo metadata unavailable: {reason}"),
+                    ));
                 }
                 Err(MetadataFailure::Failed(reason)) => {
                     return Err(GraphError::Malformed(format!(
@@ -442,28 +460,55 @@ fn discover_topology(root: &Path, options: &TopologyOptions) -> Result<Workspace
             members = fallback.members;
             defaults = fallback.defaults;
             topology.adapters.push(AdapterKind::Cargo);
+            topology.outcomes.push(AdapterOutcome::fallback(
+                AdapterKind::Cargo,
+                "cargo metadata disabled; bounded manifest fallback",
+            ));
         }
     }
 
     if options.adapters {
+        let probe = NativeProbe {
+            supervisor: options.supervisor.clone(),
+            timeout: options.metadata_timeout,
+            max_bytes: options.metadata_max_bytes,
+            enabled: options.native_metadata,
+            gradle_command: None,
+        };
         for adapter in [
-            topology::discover_npm(root),
-            topology::discover_gradle(root),
-            topology::discover_maven(root),
-            topology::discover_python(root),
+            topology::discover_npm_native(root, &probe),
+            topology::discover_gradle_native(root, &probe),
+            topology::discover_maven_native(root, &probe),
+            topology::discover_python_native(root, &probe),
         ] {
-            if !adapter.units.is_empty() {
-                for unit in adapter.units.into_values() {
-                    topology.insert(unit);
+            for unit in adapter.units.into_values() {
+                topology.insert(unit);
+            }
+            topology.skipped.extend(adapter.skipped);
+            for kind in adapter.adapters {
+                if !topology.adapters.contains(&kind) {
+                    topology.adapters.push(kind);
                 }
-                topology.skipped.extend(adapter.skipped);
-                for kind in adapter.adapters {
-                    if !topology.adapters.contains(&kind) {
-                        topology.adapters.push(kind);
-                    }
+            }
+            for outcome in adapter.outcomes {
+                if !topology.outcomes.iter().any(|existing| {
+                    existing.adapter == outcome.adapter && existing.mode == outcome.mode
+                }) {
+                    topology.outcomes.push(outcome);
                 }
             }
         }
+    }
+    if topology.outcomes.iter().any(|outcome| outcome.degraded) && !degraded {
+        degraded = true;
+        degraded_reason = Some(
+            topology
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.degraded)
+                .map(|outcome| format!("{}: {}", outcome.adapter.as_str(), outcome.detail))
+                .unwrap_or_else(|| "an adapter used its structural fallback".into()),
+        );
     }
 
     if topology.units.is_empty() {
@@ -502,6 +547,7 @@ fn discover_topology(root: &Path, options: &TopologyOptions) -> Result<Workspace
         packages: BTreeSet::new(),
         skipped: topology.skipped,
         adapters: topology.adapters,
+        adapter_outcomes: topology.outcomes,
         workspace_members: members,
         default_members: defaults,
         degraded,

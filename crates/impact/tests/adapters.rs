@@ -509,3 +509,420 @@ fn documented_parser_fallback_is_typed_and_degrades_loudly() {
         EdgeKind::DependsOn
     ));
 }
+
+#[test]
+fn npm_native_lock_graph_preserves_workspaces_and_is_marked_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"lock-root","private":true,"workspaces":["packages/*"]}"#,
+    );
+    write(
+        root,
+        "package-lock.json",
+        r#"{
+          "name": "lock-root", "lockfileVersion": 3, "requires": true,
+          "packages": {
+            "": { "name": "lock-root", "workspaces": ["packages/*"] },
+            "node_modules/@lock/lib": { "resolved": "packages/lib", "link": true },
+            "node_modules/@lock/app": { "resolved": "packages/app", "link": true },
+            "packages/lib": { "name": "@lock/lib", "version": "1.0.0" },
+            "packages/app": {
+              "name": "@lock/app", "version": "1.0.0",
+              "dependencies": { "@lock/lib": "1.0.0", "left-pad": "^1.3.0" },
+              "devDependencies": { "vitest": "^1.0.0" }
+            }
+          }
+        }"#,
+    );
+    write(
+        root,
+        "packages/lib/index.js",
+        "export const add = (a,b) => a+b;\n",
+    );
+    write(
+        root,
+        "packages/lib/test/add.test.js",
+        "import { add } from '../index.js';\ntest('add', () => add(1,2));\n",
+    );
+    write(root, "packages/app/index.js", "export const x = 1;\n");
+    let mut builder = GraphBuilder::new(root, Revision::default()).unwrap();
+    let report = builder.report().clone();
+    let npm = report
+        .adapter_outcomes
+        .iter()
+        .find(|outcome| outcome.adapter == faktor_impact::AdapterKind::Npm)
+        .expect("npm outcome");
+    assert!(
+        !npm.degraded && npm.mode == faktor_impact::AdapterMode::NativeMetadata,
+        "the package-lock graph must serve natively: {npm:?}"
+    );
+    let graph = builder.build().unwrap();
+    assert!(has_edge(
+        &graph,
+        "package:@lock/app",
+        "package:@lock/lib",
+        EdgeKind::DependsOn
+    ));
+    assert!(has_edge(
+        &graph,
+        "package:@lock/app",
+        "package:left-pad",
+        EdgeKind::DependsOn
+    ));
+    assert!(graph
+        .files
+        .iter()
+        .any(|file| file.path == "packages/lib/test/add.test.js" && file.test_target));
+    let impacted = faktor_impact::ImpactGraph::new(graph)
+        .unwrap()
+        .affected(
+            &[ChangedTarget::file("packages/lib/index.js")],
+            &AffectedOptions::default(),
+        )
+        .unwrap();
+    assert!(impacted.tests.iter().any(|test| test.name == "add"));
+}
+
+#[test]
+fn npm_lock_hostile_keys_are_refused_and_structural_fallback_is_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"hostile-lock","workspaces":["packages/*"]}"#,
+    );
+    write(
+        root,
+        "package-lock.json",
+        r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": { "name": "hostile-lock" },
+            "../escape": { "name": "escape" },
+            "packages/ok": { "name": "ok", "dependencies": { "../nope": "1" } }
+          }
+        }"#,
+    );
+    write(root, "packages/ok/package.json", r#"{"name":"ok"}"#);
+    let mut builder = GraphBuilder::new(root, Revision::default()).unwrap();
+    let graph = builder.build().unwrap();
+    assert!(graph.nodes.iter().all(|node| node.name != "escape"));
+    let report = builder.report().clone();
+    assert!(report
+        .skipped
+        .iter()
+        .any(|skip| skip.contains("escapes") || skip.contains("missing")));
+    assert!(!graph.nodes.iter().any(|node| node.name == "../nope"));
+
+    let options = TopologyOptions {
+        native_metadata: false,
+        ..TopologyOptions::default()
+    };
+    let structural = GraphBuilder::new_with_topology(root, Revision::default(), options).unwrap();
+    let report = structural.report().clone();
+    let npm = report
+        .adapter_outcomes
+        .iter()
+        .find(|outcome| outcome.adapter == faktor_impact::AdapterKind::Npm)
+        .expect("npm fallback outcome");
+    assert!(
+        npm.degraded,
+        "structural npm inference is degraded: {npm:?}"
+    );
+    assert!(report.degraded);
+}
+
+#[test]
+fn maven_recursive_poms_resolve_parents_properties_and_nested_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write(
+        &root,
+        "pom.xml",
+        r#"<project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>com.example</groupId><artifactId>root</artifactId><version>2.0.0</version>
+          <packaging>pom</packaging>
+          <modules><module>lib</module><module>app</module></modules>
+          <properties><lib.artifact>lib</lib.artifact></properties>
+        </project>"#,
+    );
+    write(
+        &root,
+        "lib/pom.xml",
+        r#"<project>
+          <modelVersion>4.0.0</modelVersion>
+          <parent><groupId>com.example</groupId><artifactId>root</artifactId><version>2.0.0</version></parent>
+          <artifactId>lib</artifactId>
+          <packaging>pom</packaging>
+          <modules><module>core</module></modules>
+        </project>"#,
+    );
+    write(
+        &root,
+        "lib/core/pom.xml",
+        r#"<project>
+          <modelVersion>4.0.0</modelVersion>
+          <parent><groupId>com.example</groupId><artifactId>lib</artifactId><version>2.0.0</version><relativePath>../pom.xml</relativePath></parent>
+          <artifactId>core</artifactId>
+        </project>"#,
+    );
+    write(
+        &root,
+        "app/pom.xml",
+        r#"<project>
+          <modelVersion>4.0.0</modelVersion>
+          <parent><groupId>com.example</groupId><artifactId>root</artifactId><version>2.0.0</version></parent>
+          <artifactId>app</artifactId>
+          <dependencies>
+            <dependency><groupId>${project.groupId}</groupId><artifactId>${lib.artifact}</artifactId><version>${project.version}</version></dependency>
+          </dependencies>
+        </project>"#,
+    );
+    write(&root, "lib/core/src/main/java/Core.java", "class Core {}\n");
+    write(
+        &root,
+        "lib/core/src/test/java/CoreTest.java",
+        "class CoreTest { @Test void works() {} }\n",
+    );
+    let mut builder = GraphBuilder::new(&root, Revision::default()).unwrap();
+    let report = builder.report().clone();
+    let maven = report
+        .adapter_outcomes
+        .iter()
+        .find(|outcome| outcome.adapter == faktor_impact::AdapterKind::Maven)
+        .expect("maven outcome");
+    assert!(
+        maven.degraded,
+        "the recursive pom model is the documented fallback: {maven:?}"
+    );
+    let graph = builder.build().unwrap();
+    assert!(has_node(&graph, "package:root", NodeKind::Package));
+    assert!(has_node(&graph, "package:lib", NodeKind::Package));
+    assert!(has_node(&graph, "package:core", NodeKind::Package));
+    assert!(has_node(&graph, "package:app", NodeKind::Package));
+    assert!(has_edge(
+        &graph,
+        "package:app",
+        "package:lib",
+        EdgeKind::DependsOn
+    ));
+    assert!(graph
+        .files
+        .iter()
+        .any(
+            |file| file.path.ends_with("lib/core/src/test/java/CoreTest.java") && file.test_target
+        ));
+}
+
+#[test]
+fn maven_modules_outside_the_workspace_are_refused() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    write(
+        &root,
+        "pom.xml",
+        r#"<project><groupId>g</groupId><artifactId>root</artifactId><version>1</version>
+        <modules><module>../outside</module><module>ok</module></modules></project>"#,
+    );
+    write(
+        parent.path(),
+        "outside/pom.xml",
+        r#"<project><groupId>g</groupId><artifactId>outside</artifactId><version>1</version></project>"#,
+    );
+    write(
+        &root,
+        "ok/pom.xml",
+        r#"<project><groupId>g</groupId><artifactId>ok</artifactId><version>1</version></project>"#,
+    );
+    let mut builder = GraphBuilder::new(&root, Revision::default()).unwrap();
+    let graph = builder.build().unwrap();
+    assert!(graph.nodes.iter().all(|node| node.name != "outside"));
+    assert!(has_node(&graph, "package:ok", NodeKind::Package));
+    let report = builder.report().clone();
+    assert!(report
+        .skipped
+        .iter()
+        .any(|skip| skip.contains("escapes the workspace root")));
+}
+
+#[test]
+fn python_installed_metadata_resolves_dynamic_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "pyproject.toml",
+        r#"[project]
+name = "dynamic-pkg"
+version = "1.0.0"
+dynamic = ["dependencies"]
+"#,
+    );
+    write(
+        root,
+        "dynamic_pkg-1.0.0.dist-info/METADATA",
+        "Metadata-Version: 2.1\nName: dynamic-pkg\nVersion: 1.0.0\nRequires-Dist: requests>=2\nRequires-Dist: pydantic; extra == \"dev\"\n\nbody\n",
+    );
+    write(
+        root,
+        "dynamic_pkg/module.py",
+        "def add(a, b):\n    return a + b\n",
+    );
+    write(
+        root,
+        "tests/test_module.py",
+        "from dynamic_pkg.module import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+    );
+    let mut builder = GraphBuilder::new(root, Revision::default()).unwrap();
+    let report = builder.report().clone();
+    let python = report
+        .adapter_outcomes
+        .iter()
+        .find(|outcome| outcome.adapter == faktor_impact::AdapterKind::Python)
+        .expect("python outcome");
+    assert!(
+        !python.degraded,
+        "installed metadata must serve the dependency set: {python:?}"
+    );
+    let graph = builder.build().unwrap();
+    assert!(has_node(&graph, "package:dynamic-pkg", NodeKind::Package));
+    assert!(has_node(&graph, "package:requests", NodeKind::Package));
+    assert!(has_node(&graph, "package:pydantic", NodeKind::Package));
+    assert!(graph
+        .edges
+        .iter()
+        .any(|edge| edge.from == "package:dynamic-pkg" && edge.kind == EdgeKind::DependsOn));
+    let impacted = faktor_impact::ImpactGraph::new(graph)
+        .unwrap()
+        .affected(
+            &[ChangedTarget::file("dynamic_pkg/module.py")],
+            &AffectedOptions::default(),
+        )
+        .unwrap();
+    assert!(impacted.tests.iter().any(|test| test.name == "test_add"));
+}
+
+#[test]
+fn gradle_native_probe_is_supervised_bounded_and_degraded_when_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "settings.gradle",
+        "rootProject.name = 'native'\ninclude ':lib', ':app'\n",
+    );
+    write(root, "lib/build.gradle", "plugins { id 'java' }\n");
+    write(
+        root,
+        "app/build.gradle",
+        "plugins { id 'java' }\ndependencies { implementation project(':lib') }\n",
+    );
+    write(root, "lib/src/main/java/Lib.java", "class Lib {}\n");
+    write(root, "app/src/main/java/App.java", "class App {}\n");
+    let cas_root = tempfile::tempdir().unwrap();
+    let supervisor =
+        ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(cas_root.path().join("cas"))));
+    let options = TopologyOptions {
+        supervisor: Some(Arc::clone(&supervisor)),
+        ..TopologyOptions::default()
+    };
+    let mut builder = GraphBuilder::new_with_topology(root, Revision::default(), options).unwrap();
+    let report = builder.report().clone();
+    let gradle = report
+        .adapter_outcomes
+        .iter()
+        .find(|outcome| outcome.adapter == faktor_impact::AdapterKind::Gradle)
+        .expect("gradle outcome");
+    let graph = builder.build().unwrap();
+    assert!(has_node(&graph, "package:lib", NodeKind::Package));
+    assert!(has_node(&graph, "package:app", NodeKind::Package));
+    assert!(has_edge(
+        &graph,
+        "package:app",
+        "package:lib",
+        EdgeKind::DependsOn
+    ));
+    if gradle.mode == faktor_impact::AdapterMode::NativeMetadata {
+        assert!(!gradle.degraded, "{gradle:?}");
+    } else {
+        assert!(gradle.degraded, "{gradle:?}");
+        assert!(
+            gradle.detail.contains("unavailable") || gradle.detail.contains("exited"),
+            "{gradle:?}"
+        );
+    }
+    // A supervised probe never leaves a child behind.
+    let spawns: Vec<_> = supervisor
+        .recent_spawns()
+        .into_iter()
+        .filter(|spawn| spawn.argv.starts_with("gradle "))
+        .collect();
+    for spawn in spawns {
+        assert!(
+            spawn.exited_ms.is_some(),
+            "gradle probe must be reaped, not orphaned: {spawn:?}"
+        );
+        assert!(
+            spawn.argv.contains("--no-daemon"),
+            "gradle must not start a daemon: {spawn:?}"
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    supervisor.reap();
+    assert_eq!(
+        supervisor.registered(),
+        0,
+        "no probe child may outlive the build"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hostile_gradle_metadata_paths_are_refused_without_an_orphan() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "settings.gradle", "include ':ok'\n");
+    write(root, "ok/build.gradle", "plugins { id 'java' }\n");
+    let script = dir.path().join("fake-gradle");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' 'FAKTOR_TOPOLOGY:[{\"name\":\"ok\",\"path\":\":ok\",\"dir\":\"../escape\",\"deps\":[]}]'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let cas_root = tempfile::tempdir().unwrap();
+    let supervisor =
+        ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(cas_root.path().join("cas"))));
+    let probe = faktor_impact::NativeProbe {
+        supervisor: Some(Arc::clone(&supervisor)),
+        timeout: std::time::Duration::from_secs(5),
+        max_bytes: 1024 * 1024,
+        enabled: true,
+        gradle_command: Some(script.to_string_lossy().into_owned()),
+    };
+    let topology = faktor_impact::topology::discover_gradle_native(root, &probe);
+    let outcome = topology.outcomes.first().expect("outcome");
+    assert!(
+        outcome.degraded,
+        "hostile metadata must fall back: {outcome:?}"
+    );
+    assert!(outcome.detail.contains("escapes"), "{outcome:?}");
+    assert!(
+        topology
+            .units
+            .values()
+            .all(|unit| !unit.dir.contains("escape")),
+        "a hostile native directory must never become a unit: {topology:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    supervisor.reap();
+    assert_eq!(supervisor.registered(), 0, "the fake probe must be reaped");
+}

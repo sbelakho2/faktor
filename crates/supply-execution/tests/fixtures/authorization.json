@@ -1,0 +1,23 @@
+{
+  "request": {
+    "action": "send_rfq",
+    "scope": "rfq:part-1",
+    "counterparty": 1,
+    "amount": null,
+    "as_of": 20000
+  },
+  "grants": [
+    {
+      "id": "grant-1",
+      "action": "send_rfq",
+      "scope": "rfq:part-1",
+      "counterparty": 1,
+      "max_amount": { "micros": 0, "currency": "USD" },
+      "valid_from": 19999,
+      "valid_until": 20100,
+      "revision": 1,
+      "granted_by": "procurement-director",
+      "evidence": { "id": "grant-sig", "revision": 1, "digest": "a" }
+    }
+  ]
+}

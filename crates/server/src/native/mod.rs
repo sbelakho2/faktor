@@ -51,6 +51,9 @@ pub(crate) mod worktrees_api;
 pub use foundation::install_call_receipt_sink;
 /// Edition 5 lifecycle surfaces (MCP/skills/hooks/memory/session ops).
 pub(crate) mod foundation_ext;
+/// Native MCP lifecycle (stdio + Streamable HTTP) and catalog surface.
+pub(crate) mod mcp_surface;
+pub use mcp_surface::McpRuntime;
 pub(crate) mod foundation_r8;
 #[cfg(test)]
 #[path = "foundation_rev8_contracts_tests.rs"]

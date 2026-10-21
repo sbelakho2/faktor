@@ -198,26 +198,13 @@ impl<'a> TurnDriveState<'a> {
         let drive_semantic_risk: u8 = 10;
         // The durable task state starts from the user's own goal. The prompt
         // is the authority; the title is only a label and is often generic
-        // ("task", "cli run"). Using the title here made the contract
-        // compiler analyze a label with no obligations or risks.
-        if ledger.goal.is_empty() {
-            match AgentRuntime::latest_user_prompt(handle) {
-                Some(prompt) => {
-                    // A prompt carrying a detectable credential never
-                    // becomes the durable goal: the system contract is a
-                    // cacheable prefix and the compactor archives it, so
-                    // copying the secret there would duplicate it beyond
-                    // the user turn. Fall back to the non-secret title.
-                    let policy = faktor_security::SecretPolicy::default();
-                    if faktor_security::scan_secrets(&prompt, &policy).is_empty() {
-                        ledger.goal = truncate(&prompt, 200).to_string();
-                    } else {
-                        ledger.goal = truncate(&handle.title()?, 200).to_string();
-                    }
-                }
-                None => ledger.goal = truncate(&handle.title()?, 200).to_string(),
-            }
-        }
+        // ("task", "cli run"). A prompt carrying a credential is projected:
+        // every secret span is replaced by a fixed marker while the
+        // non-secret objective survives. When redaction leaves nothing
+        // meaningful the drive refuses typed
+        // (`goal_unavailable_after_redaction`) instead of silently adopting
+        // the title as the engineering goal.
+        initialize_durable_goal(handle, &mut ledger)?;
         // Typed durable ledger (audits 27/71-72): heal the typed entry
         // stream from the legacy blob/task rows when it predates them
         // (goal/criteria first-seen seeding) and record instruction-epoch

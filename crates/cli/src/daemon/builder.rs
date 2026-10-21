@@ -1435,6 +1435,7 @@ pub(crate) fn build_daemon_core(
         session: session.clone(),
         supervisor: supervisor.clone(),
         embedder: semantic_embedder,
+        workspaces: Some(workspaces.clone()),
         lsp: Arc::new(faktor_lsp::LspManager::new(supervisor.clone())),
     };
     let semantic =
@@ -1502,11 +1503,10 @@ pub(crate) fn build_daemon_core(
     tools.register(tools::list_dir_tool());
     tools.register(tools::search_tool());
     tools.register(tools::run_command_tool());
-    // Coordination board: the tools are agent-crate definitions, the board
-    // authority is THIS daemon's session manager (run-family scoped).
-    let board_gateway = Arc::new(tools::SessionBoardGateway::new(session.clone()));
-    tools.register(faktor_agent::board_post_tool(board_gateway.clone()));
-    tools.register(faktor_agent::board_read_tool(board_gateway));
+    // Coordination board + the closed Engineering -> Supply loop. The loop
+    // tools are deterministic CPU kernels and never send or order anything.
+    tools::register_board_tools(&mut tools, session.clone());
+    tools_supply_engineering::register(&mut tools);
     // Faktor Acquire (docs/acquire.md §4): the `source_market` tool enters
     // the registry LAZILY with the deterministic activation policy and the
     // §4 phase mask — until a signal/product URL/`/source on` activates it,
