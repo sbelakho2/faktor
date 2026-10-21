@@ -467,7 +467,9 @@ fn perf_approval_ledger_verify_decide_authorize() {
     let temp = tempfile::tempdir().unwrap();
     let (authority, key) = authority(temp.path());
     let now = faktor_approval::unix_now_ms();
-    let count: usize = 200;
+    // The open-approval queue is intentionally capped at 128; decide each
+    // batch before proposing the next one.
+    let count: usize = 100;
 
     let started = std::time::Instant::now();
     let mut requests = Vec::with_capacity(count);
