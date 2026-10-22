@@ -72,20 +72,18 @@ fn key() -> ReceiptSigner {
 }
 
 #[test]
-fn signed_kernel_receipt_passes_and_is_canonical() {
+fn signed_kernel_receipt_passes_and_canonical_digest_is_content_bound() {
     let signer = key();
     let receipt = kernel(&signer);
     receipt.verify_attestation().unwrap();
-    assert_eq!(
-        receipt.canonical_digest().unwrap(),
-        receipt.canonical_digest().unwrap()
-    );
+    let canonical = receipt.canonical_digest().unwrap();
+    // Breaks if canonicalization ignores results or changes across a serde trip.
+    let mut forged = receipt.clone();
+    forged.results[0].value = ReceiptValue::Text("forged".to_string());
+    assert_ne!(canonical, forged.canonical_digest().unwrap());
     let decoded: AnalysisReceipt =
         serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
-    assert_eq!(
-        decoded.canonical_digest().unwrap(),
-        receipt.canonical_digest().unwrap()
-    );
+    assert_eq!(decoded.canonical_digest().unwrap(), canonical);
     decoded.verify_attestation().unwrap();
 }
 
@@ -114,7 +112,12 @@ fn tampered_result_digest_is_refused() {
 fn tampered_solver_version_is_refused() {
     let mut receipt = kernel(&key());
     receipt.identity.solver_version = "9.9.9".to_string();
-    assert!(receipt.verify_attestation().is_err());
+    // Breaks if identity fields are excluded from the canonical signed digest.
+    assert!(matches!(
+        receipt.verify_attestation(),
+        Err(engineering_core::CoreError::InvalidReceiptAttestation { ref reason })
+            if reason.contains("canonical receipt digest")
+    ));
 }
 
 #[test]
@@ -179,7 +182,11 @@ fn external_solver_receipt_attests_adapter_and_output_digest() {
     {
         *output_digest = Digest::of_text("rewritten output");
     }
-    assert!(receipt.verify_attestation().is_err());
+    // Breaks if the adapter's captured output digest is outside the signed canonical form.
+    assert!(matches!(
+        receipt.verify_attestation(),
+        Err(engineering_core::CoreError::InvalidReceiptAttestation { .. })
+    ));
 }
 
 #[cfg(unix)]
@@ -221,7 +228,11 @@ fn property_revisions_and_boundary_conditions_are_in_the_signed_digest() {
     receipt
         .property_revisions
         .push(PropertyRevision::new("proof_strength", RevisionId::new(2)).unwrap());
-    assert!(receipt.verify_attestation().is_err());
+    // Breaks if a post-signing property revision is excluded from the canonical digest.
+    assert!(matches!(
+        receipt.verify_attestation(),
+        Err(engineering_core::CoreError::InvalidReceiptAttestation { .. })
+    ));
 }
 
 #[cfg(unix)]

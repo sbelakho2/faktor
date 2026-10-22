@@ -193,11 +193,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_bytes_are_handled() {
-        let bytes = vec![0xFF, 0xFE, 0x00, 0x80, 0xC3, 0x28];
-        let s = String::from_utf8_lossy(&bytes);
-        let t = Estimator.estimate_tokens(&s);
-        assert!(t > 0);
+    fn estimator_is_exact_at_character_boundaries_and_bounded_on_a_hostile_body() {
+        let e = Estimator;
+        // Catches an undercharging/saturating estimator: the documented
+        // max(chars/3+1, ceil(chars*10/34)) is pinned at the edge.
+        for (text, expected) in [("", 0), ("a", 1), ("abc", 2), ("abcd", 2), ("abcdef", 3)] {
+            assert_eq!(e.estimate_tokens(text), expected, "{text:?}");
+        }
+        let chars = 4 * 1024 * 1024;
+        let big = "a".repeat(chars);
+        assert_eq!(e.estimate_tokens(&big), chars / 3 + 1);
     }
 
     #[test]

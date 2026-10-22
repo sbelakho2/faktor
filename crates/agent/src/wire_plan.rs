@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf probe: 10k messages / ~1M tokens through the real planner"]
+    #[ignore = "[perf] perf probe: 10k messages / ~1M tokens through the real planner"]
     fn perf_probe_ten_thousand_messages_one_million_tokens() {
         // 10k messages, each ~100+ tokens (≈660 ASCII chars): ~1M tokens.
         let history: Vec<RequestMessage> = (0..10_000)
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf probe: 10k messages + 256 evidence snippets through the real planner"]
+    #[ignore = "[perf] perf probe: 10k messages + 256 evidence snippets through the real planner"]
     fn perf_probe_evidence_dedupe_against_one_million_token_history() {
         // The dedupe haystack is bounded by the planner's own history
         // window, but it must be built LAZILY (no evidence = no scan) and

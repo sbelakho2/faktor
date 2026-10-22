@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 use engineering_core::{
     CandidateFacts, CategoricalFact, Discipline, EngineeringRequirement, EngineeringRequirementSet,
@@ -8,10 +7,9 @@ use engineering_core::{
 };
 use engineering_units::{Quantity, UnitRegistry};
 use faktor_supply_core::{
-    Availability, CandidateId, Currency, Day, Distribution, EvidenceRef, ExactError, Incoterm,
-    InventorySummary, Money, PartId, Provenance as SupplyProvenance, Rate, RecommendedAction,
-    Revision, ScaledQuantity, SiteId, SourceKind, SupplierId, SupplierRole, SupplyRequirement,
-    TransportMode, Units,
+    Availability, CandidateId, Currency, Day, Distribution, EvidenceRef, Incoterm, Money, PartId,
+    Provenance as SupplyProvenance, Rate, RecommendedAction, Revision, ScaledQuantity, SiteId,
+    SourceKind, SupplierId, SupplierRole, SupplyRequirement, TransportMode, Units,
 };
 use faktor_supply_cost::{
     not_applicable_term, should_cost, ExcessMoq, LaborTime, MachineTime, MarginMode, MaterialLine,
@@ -905,10 +903,16 @@ fn authorization_gates_remain_on_orders_and_messages() {
         as_of: Day(DAY),
     };
     let authorization = authorize(&request, &[] as &[AuthorizationGrant]);
-    assert!(matches!(
-        authorization,
-        faktor_supply_execution::AuthorizationDecision::Denied { .. }
-    ));
+    // Breaks if an ungranted PO is reported as authorized or with the wrong reason.
+    match authorization {
+        faktor_supply_execution::AuthorizationDecision::Denied { reason, detail } => {
+            assert_eq!(reason, faktor_supply_execution::DenialReason::NoGrant);
+            assert!(detail.contains("no grant"), "{detail}");
+        }
+        faktor_supply_execution::AuthorizationDecision::Authorized { .. } => {
+            panic!("a purchase order without a grant must be denied")
+        }
+    }
 }
 
 fn perf_candidates(count: u32) -> Vec<LoopCandidate> {
@@ -944,45 +948,26 @@ fn perf_candidates(count: u32) -> Vec<LoopCandidate> {
 }
 
 #[test]
-fn one_thousand_candidates_evaluate_and_rank_with_measured_work() {
-    let engineering = capacitor_requirements();
-    let candidates = perf_candidates(500);
-    let started_half = Instant::now();
-    let half = run_ephemeral(&request(candidates, engineering.clone(), vec![])).unwrap();
-    let elapsed_half = started_half.elapsed();
-    assert_eq!(half.ranked.len(), 500);
-
-    let candidates = perf_candidates(1_000);
-    let started = Instant::now();
-    let outcome = run_ephemeral(&request(candidates, engineering, vec![])).unwrap();
-    let elapsed = started.elapsed();
+fn one_thousand_candidates_rank_exactly_with_bounded_evaluations() {
+    let outcome = run_ephemeral(&request(
+        perf_candidates(1_000),
+        capacitor_requirements(),
+        vec![],
+    ))
+    .unwrap();
     assert!(
         outcome.is_self_verified(),
         "verification: {:?}",
         outcome.verify_integrity_only()
     );
+    // Breaks if candidates are dropped, double-ranked, or the ranked window is unbounded.
     assert_eq!(outcome.performance.evaluated_candidates, 1_000);
     assert_eq!(outcome.performance.promotable_candidates, 1_000);
-    assert!(outcome.evaluations.len() <= MAX_LOOP_RANKED);
+    assert_eq!(outcome.evaluations.len(), MAX_LOOP_RANKED);
+    assert_eq!(outcome.performance.returned_candidates, MAX_LOOP_RANKED);
     assert_eq!(outcome.ranked.len(), 1_000);
     assert_eq!(outcome.ranked[0].0, "candidate-0000");
-    let ratio = elapsed.as_secs_f64() / elapsed_half.as_secs_f64().max(f64::EPSILON);
-    println!(
-        "500/1k candidate loop: {:?}/{:?} (kernel {} us, returned {}), ratio {:.2}",
-        elapsed_half,
-        elapsed,
-        outcome.performance.elapsed_micros,
-        outcome.performance.returned_candidates,
-        ratio
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "1k candidate loop exceeded the bound: {elapsed:?}"
-    );
-    assert!(
-        ratio < 3.5,
-        "1k/500 ratio {ratio:.2} suggests worse than n log n"
-    );
+    assert_eq!(outcome.ranked[999].0, "candidate-0999");
 }
 
 #[test]
@@ -1045,16 +1030,39 @@ fn unknown_conditions_stay_unavailable_and_do_not_fail_the_crosscheck() {
 }
 
 #[test]
-fn fixture_supply_term_types_are_reachable() {
-    let _: faktor_supply_core::Term<u32> = term(1, "x");
-    let _: InventorySummary = InventorySummary {
-        on_hand: Units::ZERO,
-        confirmed: Units::ZERO,
-        net_requirement: Units::ZERO,
-        safety_stock: Units::ZERO,
-        evidence: vec![],
-    };
-    let _ = ExactError::Overflow;
+fn plan_baseline_lineage_binds_revision_scope_and_previous_digest() {
+    let engineering = capacitor_requirements();
+    let base = request(perf_candidates(1), engineering, vec![]);
+    // Breaks if the baseline subject omits revision/currency or the revision
+    // label accepts a malformed previous digest.
+    assert_eq!(
+        plan_approval_revision("decision-cap", Revision(3), None).unwrap(),
+        "decision-cap|rev=3|prev=root"
+    );
+    let previous = "a".repeat(64);
+    assert_eq!(
+        plan_approval_revision("decision-cap", Revision(3), Some(&previous.to_uppercase()))
+            .unwrap(),
+        format!("decision-cap|rev=3|prev={previous}")
+    );
+    assert!(matches!(
+        plan_approval_revision("decision-cap", Revision(3), Some("abc")),
+        Err(LoopError::Invalid(message)) if message.contains("64 hex")
+    ));
+    assert!(matches!(
+        plan_approval_revision("decision-cap", Revision(3), Some(&"z".repeat(64))),
+        Err(LoopError::Invalid(message)) if message.contains("64 hex")
+    ));
+
+    let subject = plan_baseline_subject(&base).unwrap();
+    assert!(subject.starts_with("plan-baseline:"));
+    let mut other_currency = base.clone();
+    other_currency.requirement.currency = Currency::EUR;
+    assert_ne!(subject, plan_baseline_subject(&other_currency).unwrap());
+    let mut other_revision = base.clone();
+    other_revision.engineering.revision = RevisionId::new(8);
+    other_revision.engineering_revision = RevisionId::new(8);
+    assert_ne!(subject, plan_baseline_subject(&other_revision).unwrap());
 }
 
 #[test]

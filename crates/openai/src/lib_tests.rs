@@ -520,8 +520,22 @@ mod openai_contract_tests {
         let base = server.base_url().await;
         let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
-        let first = stream.next().await.unwrap();
-        assert!(first.is_err(), "malformed SSE must be an error");
+        let first = stream.next().await.expect("one terminal item");
+        // Fails if a malformed frame is classified as network/retryable or
+        // the parser keeps yielding chunks after the terminal error.
+        let err = first.expect_err("malformed SSE must be an error");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed, "{err:?}");
+        assert!(
+            !err.retryable,
+            "malformed JSON must never be retried: {err:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("stream must terminate")
+                .is_none(),
+            "no events may survive the malformed terminal error"
+        );
     }
 
     #[tokio::test]

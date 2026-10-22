@@ -1562,6 +1562,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_hop_chain_is_bounded_at_eight_and_reads_nothing_past_it() {
+        // Fails if the walk forgets to charge hops: a 9-link chain would be
+        // followed (an unbounded loop risk) instead of a typed refusal.
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("real"), b"secret").unwrap();
+        symlink("real", h.root().join("l0")).unwrap();
+        for i in 1..9 {
+            symlink(format!("l{}", i - 1), h.root().join(format!("l{i}"))).unwrap();
+        }
+        assert_eq!(h.read(Path::new("l7"), 64).unwrap().bytes, b"secret");
+        let err = h.read(Path::new("l8"), 64).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(
+            err.message.contains("8-hop bound"),
+            "the refusal names the bound: {err:?}"
+        );
+    }
+
     /// P1-C: the delete is rooted, not resolve-then-`std::fs::remove_file`.
     /// The old two-step (`resolve` to an absolute path, then unlink that
     /// path string) followed a parent directory swapped for an outside

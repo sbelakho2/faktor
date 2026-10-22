@@ -271,12 +271,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_surface_via_caps_not_names() {
-        let cfg = GatewayConfig::openrouter(None);
+    async fn prefix_routing_is_first_match_and_leaves_unmatched_models_verbatim() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: base,
+            api_key: None,
+            extra_headers: ExtraHeaders::empty(),
+            // A first match must win even when a later prefix is longer.
+            route_prefixes: vec![
+                ("a/".into(), "first-model".into()),
+                ("a/b".into(), "second-model".into()),
+            ],
+            default_caps: ModelCapabilities::default(),
+        };
         let provider = permissive_for_tests(cfg);
-        let caps = provider.capabilities("anthropic/claude-x");
-        assert!(caps.tools);
-        assert!(caps.vision);
+        let drain = |model: &'static str| {
+            let provider = provider.clone();
+            async move {
+                let mut stream = provider.stream(req(model));
+                while let Some(chunk) = stream.next().await {
+                    if let Ok(ProviderChunk::Done) = chunk {
+                        break;
+                    }
+                }
+            }
+        };
+        drain("a/b/c").await;
+        let (_, _, body) = server.last_request().expect("first request");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+        // Fails if routing uses the last/longest match or mutates the model
+        // outside the configured prefix.
+        assert_eq!(body["model"], "first-model");
+        drain("z/model").await;
+        let (_, _, body) = server.last_request().expect("second request");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(body["model"], "z/model");
     }
 
     #[tokio::test]

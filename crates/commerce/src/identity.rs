@@ -680,26 +680,62 @@ mod tests {
     }
 
     #[test]
-    fn normalizer_never_panics_on_adversarial_suffix_soup() {
-        for raw in [
-            "TR",
-            "-TR",
-            "TR-",
-            "A-TR-TR-TR-TR-TR",
-            "A-%%%%",
-            "A-1.2.3%",
-            "A-",
-            "-",
-            "A--B",
-            "A//B",
-            "A++B",
-            "%%%",
-            "1",
-            "%",
-            "A-999999999999999999999999999999999V",
+    fn adversarial_suffix_soup_has_exact_canonical_forms_and_typed_errors() {
+        // Every unrecognized separator/token stays in the base; no silent
+        // split may change the purchasable identity.
+        for (raw, canonical, base) in [
+            ("TR", "TR", "TR"),
+            ("-TR", "-TR", "-TR"),
+            ("TR-", "TR-", "TR-"),
+            ("A-%%%%", "A-%%%%", "A-%%%%"),
+            ("A-1.2.3%", "A-1.2.3%", "A-1.2.3%"),
+            ("A-", "A-", "A-"),
+            ("A--B", "A--B", "A--B"),
+            ("A//B", "A//B", "A//B"),
+            ("A++B", "A++B", "A++B"),
+            ("1", "1", "1"),
         ] {
-            let result = normalize_part_number(raw);
-            assert!(result.is_ok() || result.is_err(), "no panic for {raw:?}");
+            let part = normalize_part_number(raw).expect(raw);
+            assert_eq!(part.canonical(), canonical, "{raw:?}");
+            assert_eq!(part.base(), base, "{raw:?}");
+            assert!(part.suffixes().is_empty(), "{raw:?}: {:?}", part.suffixes());
+        }
+        // Four separated packaging tokens are preserved (right-to-left peel,
+        // then re-ordered), never silently truncated into the base.
+        let capped = normalize_part_number("A-TR-TR-TR-TR-TR").expect("suffix soup");
+        assert_eq!(capped.canonical(), "A-TR-TR-TR-TR-TR");
+        assert_eq!(
+            capped.base(),
+            "A-TR",
+            "the fifth TR exceeds MAX_SUFFIX_TOKENS"
+        );
+        assert_eq!(capped.suffixes().len(), 4);
+        for suffix in capped.suffixes() {
+            assert_eq!(
+                suffix.kind,
+                SuffixKind::Packaging(PackagingType::TapeAndReel)
+            );
+            assert_eq!(suffix.text, "TR");
+        }
+        // A glued voltage is recognized only as the exact trailing token.
+        let voltage =
+            normalize_part_number("A-999999999999999999999999999999999V").expect("voltage");
+        assert_eq!(voltage.canonical(), "A-999999999999999999999999999999999V");
+        assert_eq!(voltage.base(), "A");
+        assert_eq!(
+            voltage.suffixes(),
+            &[SuffixToken {
+                kind: SuffixKind::Voltage,
+                text: "999999999999999999999999999999999V".into(),
+            }]
+        );
+        // Symbol-only input is a typed refusal, not "no panic".
+        for raw in ["-", "%", "%%%"] {
+            assert_eq!(
+                normalize_part_number(raw).unwrap_err(),
+                PartNumberError::NoAlphanumeric,
+                "{raw:?}"
+            );
         }
     }
 

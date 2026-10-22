@@ -518,21 +518,44 @@ mod tests {
     }
 
     #[test]
-    fn hostile_nesting_is_bounded() {
-        // 10k nested arrays: the balanced-scan must not blow the stack.
+    fn hostile_nesting_is_bounded_and_shallow_json_is_exact() {
+        // Break caught: a repair path that recurses without the JSON depth
+        // bound (stack overflow/accepts hostile nesting) or that silently
+        // drops the value shape for shallow input.
         let deep = format!("{}1{}", "[".repeat(10_000), "]".repeat(10_000));
-        let r = repair_json(&deep);
-        assert!(r.is_some() || r.is_none());
+        assert_eq!(
+            repair_json(&deep),
+            None,
+            "10k nested arrays must be refused by the bounded parser"
+        );
+        assert_eq!(
+            repair_json("[[[1]]]"),
+            Some(serde_json::json!([[[1]]])),
+            "shallow arrays must survive byte-exactly"
+        );
     }
 
     #[test]
-    fn native_call_validation() {
-        assert!(validate_native_call("read_file", &serde_json::json!({"path": "a"})).is_ok());
-        assert!(validate_native_call("", &serde_json::json!({})).is_err());
-        assert!(
-            validate_native_call("x", &serde_json::json!({"big": "y".repeat(100_000)})).is_err()
+    fn native_call_validation_names_the_exact_refusal() {
+        // Break caught: collapsing malformed and oversized calls into one
+        // untyped failure, or accepting an empty/overlong tool name.
+        assert_eq!(
+            validate_native_call("read_file", &serde_json::json!({"path": "a"})).unwrap(),
+            ()
         );
-        assert!(validate_native_call(&"n".repeat(300), &serde_json::json!({})).is_err());
+        let err = validate_native_call("", &serde_json::json!({})).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert_eq!(err.message, "tool call with empty name");
+        let err = validate_native_call(&"n".repeat(257), &serde_json::json!({})).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert_eq!(err.message, "tool call name too long");
+        let err = validate_native_call("x", &serde_json::json!({"big": "y".repeat(100_000)}))
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        assert!(
+            err.message.starts_with("tool input ") && err.message.ends_with("exceeds 64KiB bound"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -544,12 +567,19 @@ mod tests {
     }
 
     #[test]
-    fn repair_is_single_pass_by_construction() {
-        // The repair pipeline is a fixed sequence; assert the public API has
-        // no retry loop by checking it returns after one call.
-        let text = r#"{"name":"x","input":{"a":1,}}"#;
-        let a = repair_json(text);
-        let b = repair_json(text);
-        assert_eq!(a, b, "repair must be deterministic (single pass)");
+    fn repair_is_bounded_and_exact_for_two_defect_shapes() {
+        // Break caught: a repair pass that reinterprets a truncated payload
+        // as valid JSON, or that refuses the documented single-quote +
+        // trailing-comma repair.
+        assert_eq!(
+            repair_json(r#"{'a': 1,}"#),
+            Some(serde_json::json!({"a": 1})),
+            "single-quoted key plus trailing comma must repair exactly once"
+        );
+        assert_eq!(
+            repair_json(r#"{"a":1"#),
+            None,
+            "an unbalanced object must never be completed by repair"
+        );
     }
 }

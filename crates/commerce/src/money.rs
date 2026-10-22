@@ -766,10 +766,20 @@ mod tests {
     }
 
     #[test]
-    fn display_is_the_canonical_decimal() {
-        assert_eq!(
-            Money::from_micros(Currency::CNY, 3_700).to_string(),
-            "0.003700 CNY"
-        );
+    fn display_is_exact_at_both_i64_extremes_and_round_trips() {
+        for (micros, rendered) in [
+            (0, "0.000000 CNY"),
+            (-1, "-0.000001 CNY"),
+            (3_700, "0.003700 CNY"),
+            (i64::MAX, "9223372036854.775807 CNY"),
+            (i64::MIN, "-9223372036854.775808 CNY"),
+        ] {
+            let money = Money::from_micros(Currency::CNY, micros);
+            // Fails if display goes through binary floating point
+            // (rounded/scientific) or special-cases the sign/zero wrongly.
+            assert_eq!(money.to_string(), rendered);
+            let amount = rendered.trim_end_matches(" CNY");
+            assert_eq!(Money::parse(Currency::CNY, amount).unwrap(), money);
+        }
     }
 }

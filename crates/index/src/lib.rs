@@ -634,16 +634,6 @@ fn extract_symbols(rel: &Path, text: &str) -> Vec<Symbol> {
     }
 }
 
-#[cfg(test)]
-fn rust_symbols(text: &str) -> Vec<Symbol> {
-    extract_rust(text)
-}
-
-#[cfg(test)]
-fn python_symbols(text: &str) -> Vec<Symbol> {
-    extract_python(text)
-}
-
 fn extract_typescript(text: &str) -> Vec<Symbol> {
     extract_jsts(text, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
 }
@@ -1680,12 +1670,29 @@ module.exports = Cart;
             .is_empty());
     }
 
-    // Keep the helper fns referenced for coverage parity.
     #[test]
-    fn helper_parity() {
-        assert_eq!(rust_symbols("fn x() {}").len(), 1);
-        assert_eq!(python_symbols("def y():\n    pass").len(), 1);
-        let _ = tempdir();
+    fn symbol_extraction_ignores_commented_and_raw_string_declarations() {
+        // Catches a line/text scanner that treats commented-out or quoted
+        // source as declarations: only the real test symbol may survive.
+        let src = r##"
+// fn commented_out() {}
+/* #[test] fn block_commented() {} */
+const FIXTURE: &str = r#"#[test] fn raw_string_fake() {}"#;
+
+#[test]
+fn real_test() { assert_eq!(1, 1); }
+"##;
+        let syms = parse_symbols(Path::new("lib.rs"), src);
+        let names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["FIXTURE", "real_test"]),
+            "extracted symbols: {syms:?}"
+        );
+        assert_eq!(
+            syms.iter().find(|s| s.name == "real_test").map(|s| s.kind),
+            Some(SymbolKind::Test)
+        );
     }
 
     // ------------------------------------------------- audit P2 determinism
@@ -1947,20 +1954,5 @@ module.exports = Cart;
             "the oldest restored resident is the eviction victim: {paths:?}"
         );
         assert_eq!(paths.len(), CAP);
-    }
-}
-
-#[cfg(test)]
-mod dbg_ts {
-    use super::*;
-
-    #[test]
-    fn dbg_test_attr() {
-        let src = "#[test]\nfn test_distance() {\n    let p = Point::new(3.0, 4.0);\n    assert_eq!(p.distance(), 5.0);\n}\n";
-        let syms = extract_rust(src);
-        eprintln!("SYMS: {syms:?}");
-        assert!(syms
-            .iter()
-            .any(|s| s.name == "test_distance" && s.kind == SymbolKind::Test));
     }
 }

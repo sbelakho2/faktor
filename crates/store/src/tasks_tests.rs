@@ -125,10 +125,16 @@ mod task_tests {
             .finish_tool_run(s.id, op, "completed", "applied")
             .unwrap();
         assert!(store.pending_tool_runs(s.id).unwrap().is_empty());
-        assert!(store
-            .record_tool_postcondition(s.id, op, &serde_json::json!({}))
-            .is_err());
-        assert!(store.bump_tool_run_attempt(s.id, op).is_err());
+        // Catches a setter that mutates a terminal row: both refusals are
+        // typed and name the missing running row.
+        assert!(matches!(
+            store.record_tool_postcondition(s.id, op, &serde_json::json!({})),
+            Err(StoreError::Migration(ref m)) if m.contains("no running row")
+        ));
+        assert!(matches!(
+            store.bump_tool_run_attempt(s.id, op),
+            Err(StoreError::Migration(ref m)) if m.contains("no running row")
+        ));
     }
 
     #[test]

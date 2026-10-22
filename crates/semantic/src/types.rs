@@ -2297,23 +2297,37 @@ mod tests {
     }
 
     #[test]
-    fn hostile_provider_ids_rejected() {
-        for raw in [
-            "",
-            " ",
-            "has space",
-            "semi;colon",
-            "nl\n",
-            "x".repeat(129).as_str(),
-        ] {
+    fn hostile_provider_ids_rejected_with_exact_typed_reason_at_the_boundary() {
+        for raw in ["", " ", "has space", "semi;colon", "nl\n"] {
+            let err = SemanticProviderId::parse(raw).unwrap_err();
+            // Catches a parser that maps every hostile id to the same error
+            // or accepts a delimiter it must not.
             assert!(
-                SemanticProviderId::parse(raw).is_err(),
-                "{raw:?} must not be a provider id"
+                matches!(err, SemanticError::Malformed(_)),
+                "{raw:?}: {err:?}"
             );
         }
-        assert!(SemanticProviderId::parse("vendor.provider-1_ok").is_ok());
-        assert!(serde_json::from_str::<SemanticProviderId>("\"good-id\"").is_ok());
-        assert!(serde_json::from_str::<SemanticProviderId>("\"bad id\"").is_err());
+        let oversized = "x".repeat(MAX_PROVIDER_ID_BYTES + 1);
+        assert!(matches!(
+            SemanticProviderId::parse(&oversized),
+            Err(SemanticError::Oversized {
+                max: MAX_PROVIDER_ID_BYTES,
+                actual
+            }) if actual == MAX_PROVIDER_ID_BYTES + 1
+        ));
+        let boundary = "a".repeat(MAX_PROVIDER_ID_BYTES);
+        assert_eq!(
+            SemanticProviderId::parse(&boundary).unwrap().as_str(),
+            boundary
+        );
+        assert_eq!(
+            SemanticProviderId::parse("vendor.provider-1_ok")
+                .unwrap()
+                .as_str(),
+            "vendor.provider-1_ok"
+        );
+        let err = serde_json::from_str::<SemanticProviderId>("\"bad id\"").unwrap_err();
+        assert!(err.to_string().contains("provider id"), "{err}");
     }
 
     #[test]
@@ -2354,11 +2368,33 @@ mod tests {
     }
 
     #[test]
-    fn hostile_entity_ids_rejected() {
-        assert!(SemanticEntityId::parse("").is_err());
-        assert!(SemanticEntityId::parse("ok.id:1").is_ok());
-        assert!(SemanticEntityId::parse("ctrl\n").is_err());
-        assert!(SemanticEntityId::parse(&"x".repeat(257)).is_err());
+    fn hostile_entity_ids_rejected_with_exact_typed_reason_at_the_boundary() {
+        // Catches a lenient parser that trims/accepts control characters or
+        // an off-by-one that rejects the exact 256-byte boundary.
+        assert!(matches!(
+            SemanticEntityId::parse(""),
+            Err(SemanticError::Malformed(_))
+        ));
+        assert!(matches!(
+            SemanticEntityId::parse("ctrl\n"),
+            Err(SemanticError::Malformed(_))
+        ));
+        assert!(matches!(
+            SemanticEntityId::parse(&"x".repeat(MAX_ENTITY_ID_BYTES + 1)),
+            Err(SemanticError::Oversized {
+                max: MAX_ENTITY_ID_BYTES,
+                actual
+            }) if actual == MAX_ENTITY_ID_BYTES + 1
+        ));
+        let boundary = "x".repeat(MAX_ENTITY_ID_BYTES);
+        assert_eq!(
+            SemanticEntityId::parse(&boundary).unwrap().as_str(),
+            boundary
+        );
+        assert_eq!(
+            SemanticEntityId::parse("ok.id:1").unwrap().as_str(),
+            "ok.id:1"
+        );
     }
 
     #[test]

@@ -165,7 +165,16 @@ mod tests {
         // Tamper with the blob on disk; CAS must refuse to serve it.
         let path = dir.path().join("cas").join(h.cas_path());
         std::fs::write(&path, b"corrupted").unwrap();
-        assert!(s.artifact_blob(h, 1 << 20).is_err());
+        // Break caught: serving tampered bytes (or classifying corruption
+        // as NotFound/Malformed) instead of a typed store integrity failure.
+        let err = s.artifact_blob(h, 1 << 20).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Store);
+        assert!(
+            err.message.starts_with("session cas: ")
+                && (err.message.contains("failed hash verification")
+                    || err.message.contains("zstd error")),
+            "tampered blob must surface as a CAS integrity failure: {err:?}"
+        );
     }
 
     #[test]

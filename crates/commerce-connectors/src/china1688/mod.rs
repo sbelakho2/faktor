@@ -1900,9 +1900,4 @@ mod tests {
             _ => panic!("disabled config must be refused"),
         }
     }
-
-    #[test]
-    fn currency_is_cny() {
-        assert_eq!(CURRENCY, Currency::CNY);
-    }
 }

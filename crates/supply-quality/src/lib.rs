@@ -1945,7 +1945,14 @@ mod tests {
     fn closing_an_ncr_without_evidence_is_refused_at_validation() {
         let mut qualification = full_qualification();
         qualification.ncrs[0].corrective_action_evidence = None;
-        assert!(qualification.validate().is_err());
+        // Breaks if an NCR can be closed by assertion rather than evidence.
+        assert!(matches!(
+            qualification.validate(),
+            Err(ExactError::OutOfBounds {
+                what: "NCR",
+                detail,
+            }) if detail.contains("corrective-action evidence")
+        ));
     }
 
     #[test]
@@ -2169,7 +2176,14 @@ mod tests {
         let mut qualification = full_qualification();
         let gate = qualification.requirements[0].clone();
         qualification.requirements.push(gate);
-        assert!(qualification.validate().is_err());
+        // Breaks if duplicate gate ids are accepted or reported untyped.
+        assert!(matches!(
+            qualification.validate(),
+            Err(ExactError::OutOfBounds {
+                what: "gate ids",
+                ..
+            })
+        ));
 
         let mut approval = full_qualification();
         approval.approvals[0].approved_revision = Revision(99);

@@ -2041,13 +2041,27 @@ pub(crate) mod tests {
     fn file_change_event_requires_executing_state() {
         let (_d, m) = test_manager();
         let s = session(&m);
-        // From Idle, FileChanged -> ExecutingTool is illegal.
-        assert!(s.record_file_change("/a.rs", None).is_err());
-        s.submit_prompt("x", &[]).unwrap();
-        assert!(
-            s.record_file_change("/a.rs", None).is_err(),
-            "Preparing cannot record a file change"
-        );
+        // Break caught: a FileChanged event that lands outside ExecutingTool
+        // or an error that loses the exact (from, to) pair.
+        let cases = [(AgentState::Idle, 2u64), (AgentState::Preparing, 3u64)];
+        for (from, events) in cases {
+            if from == AgentState::Preparing {
+                s.submit_prompt("x", &[]).unwrap();
+            }
+            let err = s.record_file_change("/a.rs", None).unwrap_err();
+            assert_eq!(
+                err.kind,
+                faktor_core::ErrorKind::InvalidState {
+                    from,
+                    to: AgentState::ExecutingTool,
+                }
+            );
+            assert_eq!(
+                s.last_event_seq().unwrap().unwrap().raw(),
+                events - 1,
+                "a refused file change writes no event"
+            );
+        }
     }
 
     #[test]

@@ -914,6 +914,8 @@ mod tests {
 
     #[test]
     fn declared_order_parser_is_strict() {
+        // Break caught: parsing a structural/unparsable serde message into
+        // a fake variant list (which would let the frozen gate drift).
         assert_eq!(
             parse_declared_order(
                 "unknown variant `probe`, expected `a` or `b` at line 1 column 2",
@@ -938,16 +940,25 @@ mod tests {
             .is_err(),
             "a report about another value must not parse"
         );
-        assert!(
+        assert_eq!(
             parse_declared_order(
                 "invalid type: string \"x\", expected internally tagged enum Part",
                 "probe"
-            )
-            .is_err(),
+            ),
+            Err(
+                "serde did not report `probe` as an unknown variant: invalid type: string \
+                 \"x\", expected internally tagged enum Part"
+                    .to_string()
+            ),
             "a structural error must not parse as a variant list"
         );
-        assert!(
-            parse_declared_order("unknown variant `probe`, expected `a b`", "probe").is_err(),
+        assert_eq!(
+            parse_declared_order("unknown variant `probe`, expected `a b`", "probe"),
+            Err(
+                "serde's unknown-variant report carries an unparsable entry \"`a b`\": \
+                 unknown variant `probe`, expected `a b`"
+                    .to_string()
+            ),
             "an unparsable entry must fail loudly"
         );
     }

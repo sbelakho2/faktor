@@ -2469,7 +2469,14 @@ mod tests {
         profile.authorization.role = SupplierRole::AuthorizedDistributor;
         profile.authorization.status = AuthorizationStatus::Authorized;
         profile.authorization.evidence = None;
-        assert!(profile.validate().is_err());
+        // Breaks if an authorized role can exist without evidence.
+        assert!(matches!(
+            profile.validate(),
+            Err(ExactError::OutOfBounds {
+                what: "authorization",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2490,7 +2497,14 @@ mod tests {
     fn fake_approved_qualification_is_refused() {
         let mut profile = profile();
         profile.qualifications[0].evidence = None;
-        assert!(profile.validate().is_err());
+        // Breaks if an approved qualification can be claimed without evidence.
+        assert!(matches!(
+            profile.validate(),
+            Err(ExactError::OutOfBounds {
+                what: "qualification",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2755,10 +2769,28 @@ mod tests {
         )];
         let report = assess(&profile, &requirement()).unwrap();
         assert_eq!(report.verdict, FitVerdict::Fit);
-        assert!(report
+        // Breaks if a tooling money term is dropped or truncated to the wrong unit.
+        let tooling = report
             .checks
             .iter()
-            .any(|check| check.area == CheckArea::Tooling));
+            .find(|check| check.area == CheckArea::Tooling)
+            .expect("tooling check");
+        assert!(
+            matches!(&tooling.outcome, CheckOutcome::Satisfied { detail }
+                if detail == "1 tooling records evidenced"),
+            "{:?}",
+            tooling.outcome
+        );
+        assert_eq!(
+            profile.tooling[0]
+                .as_known()
+                .unwrap()
+                .cost
+                .as_known()
+                .unwrap()
+                .micros(),
+            1_200_000_000
+        );
 
         let mut requirement = requirement();
         requirement.minimum_otd_ppm = Some(MAX_PPM);

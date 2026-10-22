@@ -260,8 +260,22 @@ mod tests {
 
     #[test]
     fn placement_spec_is_strict_on_the_wire() {
+        // Break caught: a deny_unknown_fields regression that silently
+        // accepts an attacker-controlled placement field, or a missing-field
+        // default that mints a job with no payload digest.
         let mut value = serde_json::to_value(spec()).unwrap();
         value["unknown_field"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<PlacementSpec>(value).is_err());
+        let err = serde_json::from_value::<PlacementSpec>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `unknown_field`"),
+            "{err}"
+        );
+        let mut missing = serde_json::to_value(spec()).unwrap();
+        missing.as_object_mut().unwrap().remove("payload_digest");
+        let err = serde_json::from_value::<PlacementSpec>(missing).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `payload_digest`"),
+            "{err}"
+        );
     }
 }

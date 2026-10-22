@@ -820,7 +820,13 @@ async fn end_session_kills_session_owned_processes() {
         Some(0),
         "killed child must not report a clean exit: {output:?}"
     );
-    assert!(handle.state().unwrap().is_terminal() || true);
+    // Break caught: end_session that closes the lifecycle row without
+    // landing the journal/state machine on the terminal Completed state.
+    assert_eq!(
+        handle.state().unwrap(),
+        AgentState::Completed,
+        "end_session must land the state on Completed"
+    );
     let lifecycle = handle.lifecycle().unwrap();
     assert_eq!(lifecycle, faktor_core::state::SessionLifecycle::Closed);
 }

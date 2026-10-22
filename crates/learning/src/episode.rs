@@ -832,10 +832,15 @@ mod tests {
     }
 
     #[test]
-    fn episode_id_zero_is_rejected_on_deserialize() {
-        assert!(serde_json::from_str::<EpisodeId>("0").is_err());
-        assert!(serde_json::from_str::<EpisodeId>("-1").is_err());
-        assert!(serde_json::from_str::<EpisodeId>("12.5").is_err());
+    fn episode_id_zero_is_rejected_on_deserialize_with_the_exact_reason() {
+        // Catches a Deserialize that accepts zero or a negative/fractional
+        // value by truncation: each refusal names the violated rule.
+        let err = serde_json::from_str::<EpisodeId>("0").unwrap_err();
+        assert!(err.to_string().contains("EpisodeId cannot be 0"), "{err}");
+        let err = serde_json::from_str::<EpisodeId>("-1").unwrap_err();
+        assert!(err.to_string().contains("invalid value"), "{err}");
+        let err = serde_json::from_str::<EpisodeId>("12.5").unwrap_err();
+        assert!(err.to_string().contains("invalid type"), "{err}");
         assert_eq!(
             serde_json::from_str::<EpisodeId>("12").unwrap(),
             EpisodeId::new(12)

@@ -1665,10 +1665,10 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_failure_is_loud() {
-        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(
-            "http://127.0.0.1:1".into(),
-        )));
-        assert!(provider.discover_models().await.is_err());
+        let url = "http://127.0.0.1:1";
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(url.into())));
+        let err = provider.discover_models().await.unwrap_err();
+        assert!(err.kind == ErrorKind::Network && err.retryable, "{err:?}");
     }
 
     #[tokio::test]

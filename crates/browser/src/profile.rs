@@ -278,6 +278,25 @@ mod tests {
     }
 
     #[test]
+    fn traversal_refusal_leaves_outside_files_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("profiles");
+        let store = ProfileStore::open(root.clone()).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("marker"), b"keep").unwrap();
+        for name in ["../victim", "../../victim", "a/../../victim"] {
+            // Fails if the name is merely rejected after a path join/remove,
+            // or if a mixed segment passes validation.
+            assert!(store.profile_dir(name).is_err(), "{name:?}");
+            assert!(store.wipe(name).is_err(), "{name:?}");
+            assert!(store.cookie_store_path(name).is_err(), "{name:?}");
+            assert_eq!(std::fs::read(victim.join("marker")).unwrap(), b"keep");
+        }
+        assert!(!root.join("victim").exists());
+    }
+
+    #[test]
     fn incognito_dirs_are_removed_on_drop() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ProfileStore::open(tmp.path().join("profiles")).unwrap();

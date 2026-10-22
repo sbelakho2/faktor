@@ -2037,7 +2037,14 @@ mod tests {
             segs.project_rules.hash,
             FileHash::from(*blake3::hash(render_project_rules("rules").as_bytes()).as_bytes())
         );
-        assert_eq!(segs.evidence.hash, segs.evidence.hash);
+        let expected_evidence =
+            format!("{}{}", render_evidence(&ev, &history), render_errors("err"));
+        assert_eq!(segs.evidence.bytes, expected_evidence.len());
+        assert_eq!(
+            segs.evidence.hash.to_hex(),
+            "d24c7e6fc2a129797fc0f74297b0e37a61ff1cf67223de80ed973a5509a4e3b0",
+            "the evidence segment digest is the byte truth of the rendered block"
+        );
         // Exact plan math: total == estimate(system) + Σ messages + tools.
         let expected = est.estimate_tokens(&plan.system)
             + estimate_messages(&GenericTokenCounter, &plan.messages).count as usize

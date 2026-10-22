@@ -127,6 +127,7 @@ use faktor_core::error::Error;
 /// Hard bound on reparse hops per walk (parity with `super::unix`): at most
 /// 8 symlink/junction hops may be followed while resolving ONE path, so a
 /// reparse loop fails loudly instead of hanging.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const MAX_SYMLINK_HOPS: usize = 8;
 
 /// Hard bound on the number of components one walk may consume (parity with
@@ -2318,11 +2319,6 @@ mod tests {
 
     fn text(c: &[u16]) -> String {
         String::from_utf16_lossy(c)
-    }
-
-    #[test]
-    fn hop_bound_is_eight_like_unix() {
-        assert_eq!(MAX_SYMLINK_HOPS, 8);
     }
 
     #[test]

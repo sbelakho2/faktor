@@ -22,7 +22,7 @@ impl faktor_agent::PermissionRequester for AuditAllow {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "live Ollama coding-task audit"]
+#[ignore = "[live] live Ollama coding-task audit"]
 async fn indep_coding_task_audit() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("faktor_agent=debug,faktor_openai=debug")

@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn dxf_and_iges_detection_is_bounded() {
+    fn dxf_and_iges_detection_is_content_bound_and_header_bounded() {
         let (_dir, dxf) = write_temp("drawing.dxf", b"0\nSECTION\n2\nENTITIES\n0\nENDSEC\n");
         assert_eq!(detect_format(&dxf).unwrap(), CadFormat::Dxf);
         let (_dir2, iges) = write_temp(
@@ -258,6 +258,20 @@ mod tests {
             b"                                                                        S      1\n",
         );
         assert_eq!(detect_format(&iges).unwrap(), CadFormat::Iges);
+
+        // Breaks if the extension alone wins or the sniff scans past MAX_HEADER_BYTES.
+        let (_dir3, late) = write_temp(
+            "late.dxf",
+            &[b'x'; MAX_HEADER_BYTES]
+                .into_iter()
+                .chain(b"0\nSECTION\n".iter().copied())
+                .collect::<Vec<u8>>(),
+        );
+        assert_eq!(detect_format(&late).unwrap(), CadFormat::Unknown);
+        let (_dir4, binary_iges) = write_temp("binary.iges", &[0xff, b'S', b' ']);
+        assert_eq!(detect_format(&binary_iges).unwrap(), CadFormat::Unknown);
+        let (_dir5, empty_iges) = write_temp("empty.iges", b"");
+        assert_eq!(detect_format(&empty_iges).unwrap(), CadFormat::Unknown);
     }
 
     #[test]

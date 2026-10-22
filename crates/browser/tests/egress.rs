@@ -313,12 +313,20 @@ async fn shutdown_stops_accepting_connections() {
 }
 
 #[tokio::test]
-async fn broker_refuses_a_non_loopback_bind() {
-    let config = BrokerConfig {
-        bind: "0.0.0.0:0".parse().unwrap(),
-        ..BrokerConfig::default()
-    };
-    assert!(EgressBroker::start(config).await.is_err());
+async fn broker_bind_refusal_is_typed_and_names_the_non_loopback_address() {
+    for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.10:8080"] {
+        let config = BrokerConfig {
+            bind: bind.parse().unwrap(),
+            ..BrokerConfig::default()
+        };
+        // Fails if a wildcard/global bind is accepted, or refused with a
+        // generic error that does not identify the offending literal.
+        let err = EgressBroker::start(config).await.unwrap_err();
+        assert_eq!(err.code(), "invalid_config");
+        let detail = format!("{err:?}");
+        assert!(detail.contains("must bind loopback"), "{detail}");
+        assert!(detail.contains(bind), "{detail}");
+    }
 }
 
 #[tokio::test]

@@ -257,8 +257,15 @@ mod shell_ownership_tests {
             changed_paths: vec!["**".to_string()],
             ..Default::default()
         };
-        assert!(
-            faktor_session::budget::check_change_budget(&budget, &observations).is_err(),
+        // Break caught: a budget check that accepts the shell-only "**"
+        // wildcard (state Unknown/over-broad) or reports the wrong path.
+        assert_eq!(
+            faktor_session::budget::check_change_budget(&budget, &observations),
+            Err(vec![
+                faktor_session::budget::ChangeBudgetViolation::PathOutsideAllowed {
+                    path: "**".into()
+                }
+            ]),
             "a docs-only task must refuse the generic shell BEFORE execution"
         );
     }

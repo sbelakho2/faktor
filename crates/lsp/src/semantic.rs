@@ -1156,28 +1156,56 @@ mod tests {
     }
 
     #[test]
-    fn hostile_results_are_malformed_not_panics() {
+    fn hostile_results_are_malformed_with_the_exact_wire_reason() {
+        // Catches a lenient/panicking parser: each hostile shape names the
+        // precise violation instead of a generic is_err.
         let bad = [
-            json!("not a location"),
-            json!({"uri": 42, "range": {}}),
-            json!({"uri": "file:///a", "range": {
-                "start": {"line": 9, "character": 0},
-                "end": {"line": 1, "character": 0}
-            }}),
-            json!({"uri": "file:///a", "range": {
-                "start": {"line": -1, "character": 0},
-                "end": {"line": 1, "character": 0}
-            }}),
+            (
+                json!("not a location"),
+                "definition must be a Location, LocationLink, array or null",
+            ),
+            (
+                json!({"uri": 42, "range": {}}),
+                "`uri` is missing or not a string",
+            ),
+            (
+                json!({"uri": "file:///a", "range": {
+                    "start": {"line": 9, "character": 0},
+                    "end": {"line": 1, "character": 0}
+                }}),
+                "range start is after range end",
+            ),
+            (
+                json!({"uri": "file:///a", "range": {
+                    "start": {"line": -1, "character": 0},
+                    "end": {"line": 1, "character": 0}
+                }}),
+                "`line` is missing or not a non-negative integer",
+            ),
         ];
-        for value in bad {
-            assert!(
-                parse_definition_response(&value).is_err(),
-                "hostile value must be refused: {value}"
+        for (value, expected) in bad {
+            assert_eq!(
+                parse_definition_response(&value).unwrap_err().0,
+                expected,
+                "hostile value {value}"
             );
         }
-        assert!(parse_references_response(&json!({"uri": "x"})).is_err());
-        assert!(parse_workspace_symbols_response(&json!([{"name": "x"}])).is_err());
-        assert!(parse_incoming_calls(&json!([[1, 2]])).is_err());
+        assert_eq!(
+            parse_references_response(&json!({"uri": "x"}))
+                .unwrap_err()
+                .0,
+            "references must be an array or null"
+        );
+        assert_eq!(
+            parse_workspace_symbols_response(&json!([{"name": "x"}]))
+                .unwrap_err()
+                .0,
+            "symbol kind is missing or not an integer"
+        );
+        assert_eq!(
+            parse_incoming_calls(&json!([[1, 2]])).unwrap_err().0,
+            "incoming call `from` item is missing"
+        );
     }
 
     #[test]
@@ -1206,21 +1234,47 @@ mod tests {
     }
 
     #[test]
-    fn opaque_data_and_strings_are_bounded() {
-        let mut symbol = json!({
-            "name": "x",
-            "kind": 12,
-            "location": { "uri": "file:///a.rs" }
-        });
-        symbol["data"] = Value::String("d".repeat(MAX_DATA_BYTES + 1));
-        assert!(WorkspaceSymbol::from_value(&symbol).is_err());
+    fn opaque_data_and_strings_are_bounded_at_the_exact_edge() {
+        let make_symbol = |data: Value| {
+            json!({
+                "name": "x",
+                "kind": 12,
+                "location": { "uri": "file:///a.rs" },
+                "data": data
+            })
+        };
+        // JSON encodes a string with two quote bytes, so the largest data
+        // string is MAX_DATA_BYTES - 2; one more byte must be refused.
+        let at_cap = "d".repeat(MAX_DATA_BYTES - 2);
+        let parsed = WorkspaceSymbol::from_value(&make_symbol(json!(at_cap))).unwrap();
+        assert_eq!(parsed.data, Some(json!(at_cap)));
+        // Catches an off-by-one or silent truncation of the opaque payload.
+        let err = WorkspaceSymbol::from_value(&make_symbol(json!("d".repeat(MAX_DATA_BYTES - 1))))
+            .unwrap_err();
+        assert_eq!(
+            err.0,
+            format!("`data` exceeds the {MAX_DATA_BYTES}-byte bound")
+        );
 
-        let long_uri = format!("file:///{}", "a".repeat(MAX_URI_BYTES));
-        let value = json!({
-            "uri": long_uri,
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
-        });
-        assert!(Location::from_reference(&value).is_err());
+        let make_location = |uri: String| {
+            json!({
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
+            })
+        };
+        let boundary = "u".repeat(MAX_URI_BYTES);
+        assert_eq!(
+            Location::from_reference(&make_location(boundary.clone()))
+                .unwrap()
+                .uri,
+            boundary
+        );
+        let err =
+            Location::from_reference(&make_location("u".repeat(MAX_URI_BYTES + 1))).unwrap_err();
+        assert_eq!(
+            err.0,
+            format!("`uri` exceeds the {MAX_URI_BYTES}-byte bound")
+        );
     }
 
     #[test]

@@ -388,11 +388,26 @@ mod tests {
 
     #[test]
     fn hostile_scope_patterns_rejected() {
-        assert!(ScopePattern::new("").is_err());
-        assert!(ScopePattern::new("a".repeat(MAX_SCOPE_CHARS + 1)).is_err());
-        assert!(ScopePattern::new("a\nb").is_err());
-        assert!(ScopePattern::new("///").is_err());
-        assert!(ScopePattern::new("src").is_ok());
+        // Break caught: accepting empty/overlong/control scopes or a
+        // slash-only pattern (which would silently normalize to "*"-like
+        // root authority).
+        assert_eq!(
+            ScopePattern::new("").unwrap_err(),
+            format!("scope pattern must be 1..={MAX_SCOPE_CHARS} characters")
+        );
+        assert_eq!(
+            ScopePattern::new("a".repeat(MAX_SCOPE_CHARS + 1)).unwrap_err(),
+            format!("scope pattern must be 1..={MAX_SCOPE_CHARS} characters")
+        );
+        assert_eq!(
+            ScopePattern::new("a\nb").unwrap_err(),
+            "scope pattern contains control characters"
+        );
+        assert_eq!(
+            ScopePattern::new("///").unwrap_err(),
+            "scope pattern cannot be only slashes"
+        );
+        assert_eq!(ScopePattern::new("src/").unwrap().as_str(), "src");
     }
 
     #[test]
@@ -413,11 +428,16 @@ mod tests {
 
     #[test]
     fn union_grant_is_bounded_and_typed() {
+        // Break caught: an unbounded union that lets a policy set grow past
+        // the grant cap (or reports the cap without the exact bound).
         let mut s = CapabilitySet::new();
         for i in 0..MAX_GRANTS_PER_SET {
             s.grant(rw(&format!("p{i}"))).unwrap();
         }
-        assert!(s.grant(rw("extra")).is_err(), "bounded sets refuse to grow");
+        assert_eq!(
+            s.grant(rw("extra")).unwrap_err(),
+            format!("capability set exceeds {MAX_GRANTS_PER_SET} grants")
+        );
         // The same grant twice is a no-op, not growth.
         let mut t = set(vec![rw("src")]);
         t.grant(rw("src")).unwrap();
@@ -464,13 +484,17 @@ mod tests {
 
     #[test]
     fn no_free_form_strings_in_permission_positions() {
-        // The lattice API only accepts typed LatticeCap + ScopePattern.
-        // A "prose policy" cannot even be expressed: strings only enter as
-        // bounded scope patterns and are validated before construction.
+        // Break caught: a serde shape that accepts a prose permission
+        // string (e.g. "write_workspace:*") instead of the typed grant.
         let typed = CapabilitySet::from_grants(vec![rw("src")]).unwrap();
-        let serialized = serde_json::to_string(&typed).unwrap();
-        let back: CapabilitySet = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(typed, back);
+        let wire = serde_json::to_value(&typed).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!([{"cap": "write_workspace", "scope": "src"}])
+        );
+        let err = serde_json::from_value::<CapabilitySet>(serde_json::json!("write_workspace:*"))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid type: string"), "{err}");
     }
 
     #[test]

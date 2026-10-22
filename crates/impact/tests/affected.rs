@@ -377,7 +377,7 @@ fn this_repository_symbol_change_finds_real_callers_and_tests() {
         .unwrap();
     let test_names: Vec<&str> = result.tests.iter().map(|node| node.name.as_str()).collect();
     assert!(
-        test_names.contains(&"hostile_entity_ids_rejected"),
+        test_names.contains(&"hostile_entity_ids_rejected_with_exact_typed_reason_at_the_boundary"),
         "expected the hand-verified semantic test in {test_names:?}"
     );
     assert!(

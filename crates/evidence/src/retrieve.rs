@@ -930,8 +930,15 @@ mod tests {
 
     #[test]
     fn policy_of_exposes_the_envelope_policy() {
-        let store = store_with(1, b"abc", open(9));
+        // Break caught: a retrieval path that ignores the envelope's byte
+        // ceiling (serving 3 bytes under a 2-byte policy) or that reports a
+        // policy other than the one the envelope carries.
+        let store = store_with(1, b"abc", open(2));
         let stored = store.get(EvidenceId(1)).unwrap().unwrap();
-        assert_eq!(policy_of(&stored), open(9));
+        assert_eq!(policy_of(&stored), open(2));
+        match read(&store, 1, RetrievalSelector::All).unwrap_err() {
+            EvidenceError::Oversized { max, actual } => assert_eq!((max, actual), (2, 3)),
+            other => panic!("expected Oversized, got {other:?}"),
+        }
     }
 }

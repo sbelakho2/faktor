@@ -354,9 +354,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_events_are_ignored() {
-        let mut tracker = ConsoleTracker::new(2);
-        assert!(!tracker.apply(&event("Network.requestWillBeSent", json!({})), 0));
+    fn unknown_events_do_not_consume_capacity_dropped_or_sequence() {
+        let mut tracker = ConsoleTracker::new(1);
+        for _ in 0..100 {
+            assert!(!tracker.apply(
+                &event(
+                    "Network.requestWillBeSent",
+                    json!({"type": "error", "args": [{"value": "not console"}]}),
+                ),
+                5,
+            ));
+        }
+        // Fails if an unknown CDP method is classified as console output,
+        // consuming ring capacity or the monotonic sequence.
         assert!(tracker.records().is_empty());
+        assert_eq!(tracker.dropped(), 0);
+        assert!(tracker.apply(
+            &event(
+                "Runtime.consoleAPICalled",
+                json!({"type": "error", "args": [{"value": "boom"}]}),
+            ),
+            6,
+        ));
+        let rows = tracker.records();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence, 1);
+        assert_eq!(rows[0].level, "error");
+        assert_eq!(rows[0].text, "boom");
+        assert_eq!(rows[0].timestamp_ms, 6);
     }
 }

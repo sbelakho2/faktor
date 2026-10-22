@@ -2440,7 +2440,11 @@ mod tests {
     fn candidate_without_gir_provenance_is_refused() {
         let mut request = classification_request();
         request.candidates[0].gir.clear();
-        assert!(classify(&request).is_err());
+        // Breaks if an unprovenanced HS candidate reaches classification.
+        assert!(matches!(
+            classify(&request),
+            Err(LogisticsError::Unavailable(message)) if message.contains("interpretive rules")
+        ));
     }
 
     #[test]
@@ -2456,7 +2460,11 @@ mod tests {
                 share_ppm: 700_000,
             },
         ]);
-        assert!(classify(&request).is_err());
+        // Breaks if composition shares are normalized or accepted above 100%.
+        assert!(matches!(
+            classify(&request),
+            Err(LogisticsError::Unavailable(message)) if message.contains("exceed 100%")
+        ));
     }
 
     fn tariff() -> TariffSchedule {

@@ -206,11 +206,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_one() {
-        assert_eq!(WORKER_PROTOCOL_VERSION, 1);
-    }
-
-    #[test]
     fn superseded_lease_names_both_generations() {
         let e = WorkerError::SupersededLease {
             job: "job_1".into(),

@@ -49,7 +49,7 @@ fn append_events(
 }
 
 #[test]
-#[ignore = "scale probe (100k durable rows)"]
+#[ignore = "[perf] scale probe (100k durable rows)"]
 fn scale_100k_events() {
     let (dir, store) = temp_store();
     let root = dir.path().join("store");
@@ -98,7 +98,7 @@ fn scale_100k_events() {
 }
 
 #[test]
-#[ignore = "scale probe (100k durable facts)"]
+#[ignore = "[perf] scale probe (100k durable facts)"]
 fn scale_100k_facts() {
     let (dir, store) = temp_store();
     let root = dir.path().join("store");
@@ -261,7 +261,7 @@ fn scale_100k_facts() {
 }
 
 #[test]
-#[ignore = "scale probe (10k checkpoint rows + restart storm)"]
+#[ignore = "[perf] scale probe (10k checkpoint rows + restart storm)"]
 fn scale_10k_checkpoints_and_restart_storm() {
     let (dir, mut store) = temp_store();
     let root = dir.path().join("store");

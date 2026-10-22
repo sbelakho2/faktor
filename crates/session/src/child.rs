@@ -980,8 +980,14 @@ mod tests {
         let err = s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap_err();
         assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict);
         assert!(err.message.contains("cap"), "{}", err.message);
-        // Unknown seqs are not found.
-        assert!(s.orchestrator_ctl_ack(9999).is_err());
+        // Break caught: acking a control row that does not exist (which
+        // would silently create/mutate durable state).
+        let err = s.orchestrator_ctl_ack(9999).unwrap_err();
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::NotFound);
+        assert_eq!(
+            err.message,
+            format!("control row 9999 of session {}", s.id())
+        );
     }
 
     #[test]

@@ -471,7 +471,14 @@ mod tests {
 
     /// Op ids referenced only to keep the typed helper honest.
     #[test]
-    fn op_id_roundtrip_sanity() {
+    fn op_id_accessor_preserves_extremes_and_zero_is_typed() {
+        // Break caught: a width-losing op-id accessor (u32 truncation) or a
+        // fallible constructor that panics on hostile zero.
         assert_eq!(OpId::new(7).raw(), 7);
+        assert_eq!(OpId::new(u64::MAX).raw(), u64::MAX);
+        assert_eq!(OpId::new(u64::MAX).to_string(), u64::MAX.to_string());
+        let err = OpId::try_from(0).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert_eq!(err.message, "OpId cannot be 0");
     }
 }

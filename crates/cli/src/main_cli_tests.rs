@@ -1703,3 +1703,34 @@ fn cli_provider_resolution_refuses_zero_several_and_unknown_before_any_effect() 
         "anthropic"
     );
 }
+
+#[test]
+fn malformed_cli_arguments_refuse_before_any_filesystem_effect() {
+    // Fails if clap validation is bypassed/loosened: a non-numeric port or
+    // an unknown flag would reach the daemon construction and create state.
+    let dir = tempfile::tempdir().unwrap();
+    let before = std::fs::read_dir(dir.path()).unwrap().count();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let err = Cli::try_parse_from([
+        "faktor",
+        "serve",
+        "--port",
+        "not-a-port",
+        "--data-dir",
+        data_dir.as_str(),
+    ])
+    .err()
+    .expect("a non-numeric port must be refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    let err = Cli::try_parse_from([
+        "faktor",
+        "doctor",
+        "--data-dir",
+        data_dir.as_str(),
+        "--not-a-flag",
+    ])
+    .err()
+    .expect("an unknown flag must be refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
+}

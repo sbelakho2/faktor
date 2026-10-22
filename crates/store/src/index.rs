@@ -299,8 +299,17 @@ mod typed_ledger_tests {
             .unwrap());
         // put on a nonexistent workspace violates the FK loudly (the index
         // service only ever attaches workspaces that resolve in the store).
-        let err = store.index_state_put(WorkspaceId::new(42), "{}", 0, "x");
-        assert!(err.is_err(), "FK must reject unknown workspaces");
+        match store.index_state_put(WorkspaceId::new(42), "{}", 0, "x") {
+            Err(StoreError::Sqlite(err)) => assert!(
+                err.to_string().contains("FOREIGN KEY constraint failed"),
+                "expected an FK refusal, got {err}"
+            ),
+            other => panic!("expected Sqlite FK refusal, got {other:?}"),
+        }
+        assert!(store
+            .index_state_get(WorkspaceId::new(42))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

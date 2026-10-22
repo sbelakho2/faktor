@@ -312,10 +312,16 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_seq_detected_by_store_is_not_a_journal_silence() {
-        // This is enforced in faktor-store; here we verify the marker types
-        // used for that check exist and compare correctly.
-        assert!(EventSeq::new(2) != EventSeq::new(3));
+    fn next_sequence_never_reuses_the_previous_row() {
+        // Break caught: a next-seq helper that returns the current sequence
+        // (duplicate) or wraps at the signed boundary instead of refusing.
+        let next = JournalInvariants::checked_next_seq(Some(EventSeq::new(2))).unwrap();
+        assert_eq!(next.raw(), 3);
+        assert_ne!(next, EventSeq::new(2));
+        assert_eq!(
+            JournalInvariants::checked_next_seq(Some(EventSeq::new(u64::MAX))),
+            None
+        );
     }
 }
 

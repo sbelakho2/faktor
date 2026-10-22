@@ -147,7 +147,7 @@ fn production_daemon_wires_real_native_semantic_adapters_not_the_empty_default()
 /// LIVE probe: real `rust-analyzer` + THIS repository. Run with
 /// `cargo test -p faktor-tests-production-wiring --test semantic_native -- --ignored`.
 #[test]
-#[ignore = "live: starts the real rust-analyzer and indexes this repository"]
+#[ignore = "[live] live: starts the real rust-analyzer and indexes this repository"]
 fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -320,7 +320,7 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
 /// index over THIS repository, with O(log n) lexical/symbol retrieval and
 /// O(V+E) impact traversal. Run with `--ignored`.
 #[test]
-#[ignore = "perf: builds the real index over this repository"]
+#[ignore = "[perf] perf: builds the real index over this repository"]
 fn real_repository_index_and_impact_are_measured_and_not_quadratic() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

@@ -1283,9 +1283,20 @@ mod tests {
         // An op envelope pointed at another session is rejected loudly.
         let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         meta.session_id = SessionId::new(999);
-        assert!(s
+        let op_id = meta.operation_id;
+        let before_events = s.last_event_seq().unwrap().unwrap().raw();
+        let err = s
             .start_tool_run(meta, "read", serde_json::json!({}))
-            .is_err());
+            .unwrap_err();
+        // Break caught: accepting a foreign op envelope (cross-session
+        // authority leak) or reporting it as a generic failure.
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
+        assert_eq!(
+            err.message,
+            format!("op {op_id} belongs to session 999, not {}", s.id())
+        );
+        assert!(s.pending_tool_runs().unwrap().is_empty());
+        assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), before_events);
     }
 
     #[test]
@@ -2121,7 +2132,15 @@ mod tests {
         }
         let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         let big_args = serde_json::json!({ "blob": "x".repeat(MAX_TOOL_ARGS_BYTES + 1) });
-        assert!(s.start_tool_run(meta, "run", big_args).is_err());
+        let size = serde_json::to_vec(&big_args).unwrap().len();
+        let err = s.start_tool_run(meta, "run", big_args).unwrap_err();
+        // Break caught: an oversized tool invocation that is stored/truncated
+        // or reported as a generic failure.
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        assert_eq!(
+            err.message,
+            format!("tool args of {size} bytes exceed MAX_TOOL_ARGS_BYTES")
+        );
         assert!(s.pending_tool_runs().unwrap().is_empty());
     }
 
@@ -2140,18 +2159,29 @@ mod tests {
         }
         // Deadline already in the past.
         let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
+        let op = meta.operation_id;
         meta.deadline = Deadline::at(m.now_ms() - 1);
-        assert!(s
+        let err = s
             .start_tool_run(meta, "read", serde_json::json!({}))
-            .is_err());
+            .unwrap_err();
+        // Break caught: starting an expired operation or misclassifying the
+        // refusal as retryable/cancelled.
+        assert_eq!(err.kind, faktor_core::ErrorKind::Timeout);
+        assert!(
+            err.message
+                .starts_with(&format!("operation {op} deadline exceeded at ")),
+            "{err:?}"
+        );
         // Cancelled token.
         let token = CancellationToken::new();
         token.cancel();
         let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         meta.cancellation = token;
-        assert!(s
+        let err = s
             .start_tool_run(meta, "read", serde_json::json!({}))
-            .is_err());
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Cancelled);
+        assert_eq!(err.message, "operation cancelled");
         assert!(s.pending_tool_runs().unwrap().is_empty());
     }
 
@@ -2163,11 +2193,15 @@ mod tests {
         let id = s
             .record_provider_call(op, "ollama", "qwen3.8", "ok", Some(100), Some(50), None)
             .unwrap();
-        assert!(id > 0);
+        assert_eq!(id, 1, "the first durable provider_call row is id 1");
         let huge = "p".repeat(300);
-        assert!(s
+        let err = s
             .record_provider_call(op, &huge, "m", "ok", None, None, None)
-            .is_err());
+            .unwrap_err();
+        // Break caught: a 300-byte provider name that reaches durable storage
+        // (unbounded metadata) or a generic error classification.
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        assert_eq!(err.message, "provider/model name too long");
     }
 
     #[test]

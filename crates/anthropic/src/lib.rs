@@ -1459,15 +1459,45 @@ mod tests {
         let provider =
             AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
-        let first = stream.next().await.unwrap();
-        assert!(first.is_err());
+        // Fails if malformed JSON is retried, downgraded to a network error,
+        // or followed by more chunks on the same stream.
+        let err = stream
+            .next()
+            .await
+            .expect("one terminal item")
+            .expect_err("malformed SSE must be an error");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("stream must terminate")
+                .is_none(),
+            "no events may survive the malformed terminal error"
+        );
     }
 
     #[test]
-    fn caps_default_and_override() {
+    fn capability_authority_is_declared_generic_and_exact_rows_are_known() {
+        use faktor_core::model::CapabilityAuthority;
         let p = AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None));
-        assert!(p.capabilities("any").tools);
-        assert_eq!(p.capabilities("any").context, 200_000);
+        let generic = p.capability_resolution("unlisted-claude");
+        // Fails if the family default is mislabeled Known (or gated Unknown).
+        assert_eq!(generic.authority, CapabilityAuthority::DeclaredGeneric);
+        assert_eq!(generic.caps.context, 200_000);
+        assert!(generic.effective().tools);
+        let exact = ModelCapabilities {
+            context: 8_192,
+            max_output: 1_024,
+            tools: false,
+            ..ModelCapabilities::default()
+        };
+        let p = AnthropicProvider::permissive_for_tests(
+            AnthropicConfig::new(None).with_model("claude-small", exact.clone()),
+        );
+        let known = p.capability_resolution("claude-small");
+        assert_eq!(known.authority, CapabilityAuthority::Known);
+        assert_eq!(known.effective(), exact);
     }
 
     #[tokio::test]

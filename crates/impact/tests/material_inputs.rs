@@ -98,25 +98,35 @@ fn inventory_is_canonical_ordered_and_matches_file_digests() {
     let mut unsorted = graph.clone();
     unsorted.material_inputs.reverse();
     assert!(
-        unsorted.validate().is_err(),
-        "an unsorted inventory must be refused"
+        matches!(
+            unsorted.validate(),
+            Err(faktor_impact::GraphError::Unsorted(_))
+        ),
+        "an unsorted inventory must be refused typed: {:?}",
+        unsorted.validate()
     );
 
     let mut digest = graph.clone();
     digest.material_inputs[0].digest = "not-a-digest".into();
-    assert!(
-        digest.validate().is_err(),
-        "an invalid inventory digest must be refused"
-    );
+    match digest.validate() {
+        Err(faktor_impact::GraphError::Malformed(message)) => assert!(
+            message.contains("invalid digest"),
+            "an invalid inventory digest must name the digest: {message}"
+        ),
+        other => panic!("expected Malformed invalid digest, got {other:?}"),
+    }
 
     let mut missing = graph.clone();
     missing
         .material_inputs
         .retain(|input| input.path != "lib/a.ts");
-    assert!(
-        missing.validate().is_err(),
-        "a published inventory that omits a graph file must be refused"
-    );
+    match missing.validate() {
+        Err(faktor_impact::GraphError::Malformed(message)) => assert!(
+            message.contains("does not publish graph file"),
+            "an omitted graph file must name the missing input: {message}"
+        ),
+        other => panic!("expected Malformed missing input, got {other:?}"),
+    }
 }
 
 #[test]

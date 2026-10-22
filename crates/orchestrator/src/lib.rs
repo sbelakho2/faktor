@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_plans_accepted() {
+    fn valid_plans_are_accepted_only_within_the_exact_goal_bound() {
         let read_only = plan(
             OwnershipModel::NoWrites,
             vec![
@@ -1145,44 +1145,25 @@ mod tests {
                 wi("review", WorkKind::Review, &["explore"]),
             ],
         );
-        read_only
-            .validate()
-            .expect("read-only plan should validate");
+        assert_eq!(read_only.validate(), Ok(()));
+        // Break caught: accepting a plan while silently rewriting ownership,
+        // or an off-by-one goal bound.
+        let owners = read_only.compile_ownerships().unwrap();
+        assert_eq!(owners.len(), 3);
+        assert_eq!(owners["analysis"], OwnershipSpec::NoWrites);
+        assert_eq!(owners["review"], OwnershipSpec::NoWrites);
 
-        let writing = raw_plan(vec![
-            WorkItem::with_ownership(
-                "impl-a",
-                "impl a",
-                WorkKind::Implementation,
-                OwnershipSpec::Paths {
-                    paths: vec!["src/a".to_string()],
-                },
-            ),
-            WorkItem::with_ownership(
-                "verif-b",
-                "verify b",
-                WorkKind::Verification,
-                OwnershipSpec::Paths {
-                    paths: vec!["src/b".to_string()],
-                },
-            ),
-        ]);
-        writing.validate().expect("writing plan should validate");
-
-        let isolated = raw_plan(vec![WorkItem::new(
-            "impl",
-            "implement",
-            WorkKind::Implementation,
-        )]);
-        isolated.validate().expect("isolated plan should validate");
-
-        let empty = TaskPlan {
-            goal: "".to_string(),
-            non_goals: vec![],
-            constraints: vec![],
-            work_items: vec![],
-        };
-        empty.validate().expect("empty plan should validate");
+        let mut boundary = raw_plan(vec![wi("a", WorkKind::Analysis, &[])]);
+        boundary.goal = "g".repeat(MAX_GOAL_CHARS);
+        assert_eq!(boundary.validate(), Ok(()));
+        boundary.goal.push('g');
+        assert_eq!(
+            boundary.validate(),
+            Err(vec![format!(
+                "goal exceeds {MAX_GOAL_CHARS} characters ({} given)",
+                MAX_GOAL_CHARS + 1
+            )])
+        );
     }
 
     #[test]

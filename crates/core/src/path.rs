@@ -377,10 +377,15 @@ mod tests {
 
     #[test]
     fn overlength_paths_are_refused() {
+        // Break caught: an off-by-one cap (accepting max+1) or a constructor
+        // that truncates the at-cap path instead of returning it byte-exact.
         let long = "a".repeat(MAX_NORMALIZED_WORKSPACE_PATH_BYTES + 1);
         reject(&long, PathViolationKind::TooLong);
         let at_cap = "a".repeat(MAX_NORMALIZED_WORKSPACE_PATH_BYTES);
-        assert!(NormalizedWorkspacePath::new(&at_cap).is_ok());
+        assert_eq!(
+            NormalizedWorkspacePath::new(&at_cap).unwrap().as_str(),
+            at_cap
+        );
     }
 
     #[test]

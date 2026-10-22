@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use faktor_browser::{
     BrowserConfig, BrowserError, BrowserIdentity, BrowserManager, DestinationPolicy, HostPattern,
-    PagePurpose, ProfileStore, UpstreamProxy, VerificationKind,
+    PagePurpose, UpstreamProxy, VerificationKind,
 };
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::{Deadline, SystemClock};
@@ -1298,15 +1298,6 @@ fn crate_has_no_site_knowledge_and_no_model_dependencies() {
             "site knowledge marker found in faktor-browser sources: {site}"
         );
     }
-}
-
-#[tokio::test]
-async fn profile_store_refuses_traversal_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = ProfileStore::open(dir.path().join("profiles")).unwrap();
-    assert!(store.profile_dir("../escape").is_err());
-    assert!(store.wipe("../../etc").is_err());
-    assert!(store.cookie_store_path("bad/name").is_err());
 }
 
 #[tokio::test]

@@ -1161,7 +1161,13 @@ mod tests {
         s.force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
             .unwrap();
         let err = s.replay_journal().unwrap_err();
+        // Break caught: a replay that reports corruption but not the exact
+        // sequence/transition that was violated.
         assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
+        assert!(
+            err.message.contains("at seq 3") && err.message.contains("Preparing -> Streaming"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1182,7 +1188,14 @@ mod tests {
             )
             .unwrap();
         let err = s.recover_all().unwrap_err();
+        // Break caught: silently defaulting an unknown recovery strategy
+        // (blind replay) or losing the malformed-payload classification.
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert!(
+            err.message.contains("invalid recovery strategy")
+                && err.message.contains("unknown variant `delete_everything`"),
+            "{err:?}"
+        );
     }
 
     #[test]

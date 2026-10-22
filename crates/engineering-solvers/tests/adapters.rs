@@ -153,7 +153,13 @@ async fn kicad_stats_export_runs_for_real_or_is_typed_unavailable() {
                 .any(|result| result.name == "board_statistics"));
             assert!(!receipt.artifacts.is_empty());
         }
-        SolverOutcome::Unavailable { .. } => {}
+        SolverOutcome::Unavailable {
+            reason, missing, ..
+        } => {
+            // Breaks if an absent tool is reported as an empty/unavailable success.
+            assert!(!reason.trim().is_empty());
+            assert!(missing.iter().any(|item| item.contains("kicad-cli")));
+        }
         other => panic!("unexpected KiCad stats outcome: {other:?}"),
     }
 }
@@ -256,13 +262,20 @@ async fn openfoam_detection_is_typed_when_absent() {
     let fixture = Fixture::new();
     let solver = OpenFoamSolver::new();
     let detection = solver.detect(&fixture.context()).await;
-    if !detection.available() {
-        match detection.state {
-            engineering_solvers::ToolState::Unavailable { reason, missing } => {
-                eprintln!("live: openfoam unavailable: {reason}");
-                assert!(!missing.is_empty());
-            }
-            engineering_solvers::ToolState::Available { .. } => unreachable!(),
+    match &detection.state {
+        engineering_solvers::ToolState::Unavailable { reason, missing } => {
+            // Breaks if an absent external tool is silently treated as available.
+            assert!(!reason.trim().is_empty(), "typed refusal needs a reason");
+            assert!(matches!(
+                missing.as_slice(),
+                [program]
+                    if program == "foamRun"
+                        || program == "simpleFoam"
+                        || program == "pimpleFoam"
+            ));
+        }
+        engineering_solvers::ToolState::Available { version } => {
+            assert!(!version.trim().is_empty());
         }
     }
 }

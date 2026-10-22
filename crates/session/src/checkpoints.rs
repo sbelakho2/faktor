@@ -185,10 +185,16 @@ mod tests {
         let (before, after) = hashes(1, 2);
         let id = s.put_checkpoint(0, "a.rs", before, after).unwrap();
         s.mark_checkpoint_restored(id).unwrap();
-        // The store marks; unknown ids are silently ignored by the store, so
-        // we verify the restored_ms is durable on the known row.
-        let rows = s.checkpoints_of().unwrap();
-        assert!(rows[0].restored_ms.is_some());
+        let marked = s.checkpoints_of().unwrap();
+        assert_eq!(marked.len(), 1);
+        let first_ms = marked[0].restored_ms.expect("known row is marked");
+        // Break caught: an unknown-id mark that inserts/clears a row, or
+        // that silently resets the known row's audit timestamp.
+        s.mark_checkpoint_restored(id + 10_000).unwrap();
+        let after_unknown = s.checkpoints_of().unwrap();
+        assert_eq!(after_unknown.len(), 1);
+        assert_eq!(after_unknown[0].restored_ms, Some(first_ms));
+        assert_eq!(after_unknown[0].path, "a.rs");
     }
 
     #[test]

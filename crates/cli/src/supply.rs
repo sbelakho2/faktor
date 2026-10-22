@@ -401,7 +401,6 @@ struct AuthorizeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faktor_supply_core::{EvidenceRef, PartId, Revision, SupplierId};
 
     fn fixture(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -452,10 +451,29 @@ mod tests {
     }
 
     #[test]
-    fn transport_types_are_available_to_the_cli_module() {
-        let _: PartId = PartId(1);
-        let _: SupplierId = SupplierId(1);
-        let _: Revision = Revision(1);
-        let _: EvidenceRef = EvidenceRef::new("x", Revision(1), None).unwrap();
+    fn oversized_supply_document_is_refused_at_the_exact_bound_without_reading_it() {
+        // Fails if the bounded reader is dropped/raised: MAX+1 bytes would
+        // then be parsed and could materialize an unbounded request. The
+        // source file must remain byte-identical after refusal.
+        let path = std::env::temp_dir().join(format!(
+            "faktor-supply-oversize-{}.json",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SUPPLY_INPUT_BYTES + 1).unwrap();
+        drop(file);
+        let err = execute(&SupplyAction::ShouldCost {
+            input: Some(path.to_string_lossy().to_string()),
+        })
+        .unwrap_err();
+        assert!(
+            err.contains(&format!("{MAX_SUPPLY_INPUT_BYTES}-byte bound")),
+            "got {err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_SUPPLY_INPUT_BYTES + 1
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

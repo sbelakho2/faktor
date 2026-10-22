@@ -112,7 +112,7 @@ fn journal_timestamps_absorb_forward_and_backward_wall_clock_jumps_across_restar
 }
 
 #[test]
-#[ignore = "scale probe (10k compaction operations)"]
+#[ignore = "[perf] scale probe (10k compaction operations)"]
 fn scale_10k_compaction_operations_under_a_backward_clock() {
     let clock = Arc::new(TestClock::new(2_000_000));
     let (_dir, manager) = temp_manager(clock.clone());
@@ -170,7 +170,7 @@ fn scale_10k_compaction_operations_under_a_backward_clock() {
 }
 
 #[test]
-#[ignore = "scale probe (large checkpoint read)"]
+#[ignore = "[perf] scale probe (large checkpoint read)"]
 fn scale_large_context_checkpoint_reads() {
     let (_dir, manager) = temp_manager(Arc::new(TestClock::new(1_000_000)));
     let ws = manager.create_workspace("/w").unwrap();

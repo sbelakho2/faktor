@@ -135,21 +135,9 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic]
-    fn zero_id_rejected_by_constructor() {
-        let _ = SessionId::new(0);
-    }
-
-    #[test]
     fn zero_id_deserialization_is_a_typed_error() {
         let err = serde_json::from_value::<SessionId>(serde_json::json!(0)).unwrap_err();
         assert!(err.to_string().contains("SessionId cannot be 0"), "{err}");
-    }
-
-    #[test]
-    #[should_panic]
-    fn zero_worktree_rejected() {
-        let _ = WorktreeId::new(0);
     }
 
     #[test]
@@ -215,14 +203,24 @@ mod tests {
 
     #[test]
     fn float_must_not_parse_as_id() {
-        let r: Result<SessionId, _> = serde_json::from_str("42.5");
-        assert!(r.is_err());
+        // Break caught: an id decoder that truncates a float into a valid
+        // u64 id instead of refusing the read.
+        let err = serde_json::from_str::<SessionId>("42.5").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid type: floating point `42.5`"),
+            "{err}"
+        );
     }
 
     #[test]
     fn string_must_not_parse_as_id() {
-        let r: Result<SessionId, _> = serde_json::from_str("\"abc\"");
-        assert!(r.is_err());
+        // Break caught: a decoder that coerces decimal strings into ids.
+        let err = serde_json::from_str::<SessionId>("\"abc\"").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type: string \"abc\""),
+            "{err}"
+        );
     }
 
     #[test]

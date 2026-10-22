@@ -119,6 +119,7 @@ fn cas_err(e: faktor_cas::CasError) -> faktor_core::error::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::error::ErrorKind;
     use tempfile::tempdir;
 
     fn fixture() -> (tempfile::TempDir, Arc<Cas>, SessionId) {
@@ -154,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn tampered_cas_blob_detected_by_verify() {
+    fn tampered_cas_blob_is_a_typed_store_error_and_never_returns_bytes() {
         let (_d, cas, session) = fixture();
         let w = ArtifactWriter::new(cas.clone(), session);
         let r = w.store("log", &vec![1u8; 9000], 4096).unwrap();
@@ -165,8 +166,16 @@ mod tests {
         let hash_hex = artifact.strip_prefix("artifact://").unwrap();
         let path = cas.root().join(&hash_hex[..2]).join(&hash_hex[2..]);
         std::fs::write(path, b"corrupted").unwrap();
-        assert!(w.read_ref(&artifact).is_err(), "corruption must error");
-        assert!(w.verify(&artifact).is_err() || !w.verify(&artifact).unwrap());
+        // Catches a reader that returns Ok(partial) or a verify that returns
+        // Ok(false) instead of surfacing the corruption as a typed failure.
+        let err = w.read_ref(&artifact).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Store, "{err:?}");
+        assert!(
+            err.message.starts_with("cas:") && err.message.contains("zstd"),
+            "the CAS corruption must surface as a typed store error: {err}"
+        );
+        let err = w.verify(&artifact).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Store, "{err:?}");
     }
 
     #[test]
@@ -185,13 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn malformed_refs_are_rejected() {
+    fn malformed_refs_are_rejected_with_the_exact_reason() {
         let (_d, cas, session) = fixture();
         let w = ArtifactWriter::new(cas.clone(), session);
-        assert!(w.read_ref("artifact://zz").is_err());
-        assert!(w.read_ref("https://evil.com/x").is_err());
-        assert!(w.read_ref("").is_err());
-        assert!(w.read_ref("artifact://").is_err());
+        // Catches a reader that treats any string as a ref or returns a
+        // generic store error: the prefix and hex grammar fail separately.
+        for (raw, expected) in [
+            ("artifact://zz", "bad artifact hash"),
+            ("https://evil.com/x", "bad artifact reference"),
+            ("", "bad artifact reference"),
+            ("artifact://", "bad artifact hash"),
+        ] {
+            let err = w.read_ref(raw).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Malformed, "{raw:?}: {err:?}");
+            assert_eq!(err.message, expected, "{raw:?}: {err}");
+        }
     }
 
     #[test]

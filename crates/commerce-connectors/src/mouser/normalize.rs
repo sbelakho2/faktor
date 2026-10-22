@@ -510,6 +510,30 @@ mod tests {
     }
 
     #[test]
+    fn schema_directive_keys_never_supply_or_override_a_price() {
+        let body = br##"{
+            "Errors": [],
+            "SearchResults": {"NumberOfResult": 1, "Parts": [{
+                "MouserPartNumber": "M-1",
+                "ManufacturerPartNumber": "X-1",
+                "Description": "cap",
+                "PriceBreaks": [],
+                "$ref": "#/PriceBreaks/0/Price",
+                "$schema": {"Price": "0.01", "Currency": "USD"},
+                "constructor": {"prototype": {"price": "0.01"}},
+                "__proto__": {"price": "0.01"}
+            }]}
+        }"##;
+        let response = parse_search_response(body).expect("unknown keys are data, not code");
+        let offer = first_offer(&response, &source(), &ctx()).expect("offer");
+        // Fails if unknown schema/prototype-shaped keys are interpreted as
+        // extraction results instead of inert JSON members.
+        assert!(offer.price_breaks.is_empty());
+        assert_eq!(offer.price_visibility, PriceVisibility::Unknown);
+        assert_eq!(offer.cheapest_unit_price(), None);
+    }
+
+    #[test]
     fn bidi_mpn_is_refused_not_sanitized() {
         let body = crate::testing::fixture("mouser/unicode_hostile.json").expect("fixture");
         let response = parse_search_response(body.as_bytes()).expect("parse");

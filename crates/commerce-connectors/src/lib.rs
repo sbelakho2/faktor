@@ -164,18 +164,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_trait_is_object_safe() {
-        fn assert_object_safe(_connector: &dyn SiteConnector) {}
-        let _ = assert_object_safe;
-    }
-
-    #[test]
-    fn capability_levels_are_ordered() {
-        assert!(CapabilityLevel::Unsupported < CapabilityLevel::Fallback);
-        assert!(CapabilityLevel::Fallback < CapabilityLevel::Supported);
-        assert!(CapabilityLevel::Supported < CapabilityLevel::Authoritative);
-        assert!(!CapabilityLevel::Unsupported.is_supported());
-        assert!(CapabilityLevel::Fallback.is_supported());
+    fn capability_matrix_is_per_field_and_never_infers_support() {
+        let source = SourceId::new("probe").expect("source");
+        let unsupported = ConnectorCapabilities::unsupported(source.clone());
+        for capability in [
+            Capability::Discovery,
+            Capability::ExactProduct,
+            Capability::QuantityPricing,
+            Capability::Stock,
+            Capability::Packaging,
+            Capability::AccountPricing,
+            Capability::SupplierData,
+            Capability::Bulk,
+        ] {
+            // Fails if any capability is reported supported for a stub, or
+            // one field's level leaks into another capability.
+            assert_eq!(unsupported.level(capability), CapabilityLevel::Unsupported);
+            assert!(!unsupported.supports(capability));
+        }
+        let mixed = ConnectorCapabilities {
+            discovery: CapabilityLevel::Fallback,
+            exact_product: CapabilityLevel::Authoritative,
+            account_pricing: CapabilityLevel::Supported,
+            ..ConnectorCapabilities::unsupported(source)
+        };
+        assert!(mixed.supports(Capability::Discovery));
+        assert!(mixed.supports(Capability::ExactProduct));
+        assert!(mixed.supports(Capability::AccountPricing));
+        assert!(!mixed.supports(Capability::Stock));
+        assert!(!mixed.supports(Capability::Bulk));
+        for (level, label, supported) in [
+            (CapabilityLevel::Unsupported, "unsupported", false),
+            (CapabilityLevel::Fallback, "fallback", true),
+            (CapabilityLevel::Supported, "supported", true),
+            (CapabilityLevel::Authoritative, "authoritative", true),
+        ] {
+            assert_eq!(level.as_str(), label);
+            assert_eq!(level.is_supported(), supported);
+        }
     }
 
     #[test]

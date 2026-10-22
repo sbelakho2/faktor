@@ -19,7 +19,16 @@ impl Digest {
     }
 
     pub fn of_json<T: Serialize>(value: &T) -> CoreResult<Self> {
-        let bytes = serde_json::to_vec(value).map_err(|error| CoreError::Serialization {
+        // Canonical JSON: object keys are sorted recursively, so the digest is
+        // independent of insertion order even when the workspace unifies
+        // `serde_json/preserve_order` through another crate. Array order stays
+        // significant (it is content).
+        let mut canonical =
+            serde_json::to_value(value).map_err(|error| CoreError::Serialization {
+                reason: error.to_string(),
+            })?;
+        canonicalize_json(&mut canonical);
+        let bytes = serde_json::to_vec(&canonical).map_err(|error| CoreError::Serialization {
             reason: error.to_string(),
         })?;
         Ok(Self::of_bytes(&bytes))
@@ -99,6 +108,26 @@ impl schemars::JsonSchema for Digest {
     }
 }
 
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (_, child) in &mut entries {
+                canonicalize_json(child);
+            }
+            map.extend(entries);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,11 +146,27 @@ mod tests {
     }
 
     #[test]
-    fn json_digest_is_stable_across_serialization() {
-        let value = vec![1u64, 2, 3];
+    fn json_digest_is_order_independent_but_content_bound() {
+        // Breaks if the digest ignores map content or depends on key order.
+        let first: serde_json::Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        let second: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
         assert_eq!(
-            Digest::of_json(&value).unwrap(),
-            Digest::of_json(&value).unwrap()
+            Digest::of_json(&first).unwrap(),
+            Digest::of_json(&second).unwrap()
+        );
+        let nested_first: serde_json::Value =
+            serde_json::from_str(r#"{"z":{"b":2,"a":1},"a":[{"y":2,"x":1}]}"#).unwrap();
+        let nested_second: serde_json::Value =
+            serde_json::from_str(r#"{"a":[{"x":1,"y":2}],"z":{"a":1,"b":2}}"#).unwrap();
+        assert_eq!(
+            Digest::of_json(&nested_first).unwrap(),
+            Digest::of_json(&nested_second).unwrap(),
+            "nested object order must not change the digest"
+        );
+        let changed: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":3}"#).unwrap();
+        assert_ne!(
+            Digest::of_json(&first).unwrap(),
+            Digest::of_json(&changed).unwrap()
         );
     }
 }

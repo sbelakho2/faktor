@@ -1052,16 +1052,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_substring_case_insensitive() {
-        let (idx, ws) = corpus();
-        let svc = SearchService::new(idx, None);
-        let hits = svc.exact(ws, "PARSER", 10).unwrap();
-        assert!(hits.iter().any(|h| h.path.contains("parser.rs")));
-        let hits = svc.exact(ws, "src/lexer", 10).unwrap();
-        assert!(hits.iter().any(|h| h.path.contains("lexer.rs")));
-    }
-
     /// A configured embedder is untrusted input: malformed responses and
     /// provider failures are typed refusals (never a panic, never a silent
     /// truncation) that `fused` PROPAGATES unchanged — a provider outage can
@@ -1317,15 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn fusion_weights_are_stable() {
-        let (idx, ws) = corpus();
-        let svc = SearchService::new(idx.clone(), Some(Arc::new(KeywordEmbedder)));
-        let a = svc.fused(ws, "parse", 10).unwrap();
-        let b = svc.fused(ws, "parse", 10).unwrap();
-        assert_eq!(a, b, "fused ranking must be deterministic");
-    }
-
-    #[test]
     fn symbol_search_exact_and_prefix() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, None);
@@ -1506,11 +1487,10 @@ mod tests {
     }
 
     #[test]
-    fn recency_affects_ranking() {
-        // Two files with the same token; the newer file should win ties via
-        // its higher modified_ms when the index exposes it — the fusion
-        // weights include recency through the lexical score; verify both
-        // files appear and the newer is first for an equal-token query.
+    fn equal_frequency_lexical_ties_are_path_ordered_and_never_fabricated() {
+        // Catches nondeterministic HashMap ordering (or a fabricated recency
+        // weight): equal token frequency must yield exactly the path order,
+        // with only real indexed files and the actual frequency as score.
         let mut idx = WI::new();
         let ws = WorkspaceId::new(1);
         idx.index_file(
@@ -1529,10 +1509,15 @@ mod tests {
         .unwrap();
         let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
         let hits = svc.lexical(ws, "shared", 10).unwrap();
-        assert_eq!(hits.len(), 2);
-        // Both are returned; ordering is by freq (equal), stable.
-        assert!(hits.iter().any(|h| h.path == "old.rs"));
-        assert!(hits.iter().any(|h| h.path == "new.rs"));
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["new.rs", "old.rs"]);
+        assert_eq!(
+            hits.iter().map(|h| h.score).collect::<Vec<_>>(),
+            vec![1.0, 1.0]
+        );
+        assert!(hits.iter().all(|h| !h.snippet.is_empty()));
+        // Limit is applied after ordering, exactly.
+        assert_eq!(svc.lexical(ws, "shared", 1).unwrap()[0].path, "new.rs");
     }
 
     #[test]

@@ -264,25 +264,49 @@ mod tests {
         let start = WorkspaceIndexState::NotStarted;
         start.check_transition(0, &b(1), 1).unwrap();
         assert!(
-            start.check_transition(0, &b(2), 2).is_err(),
+            matches!(
+                start.check_transition(0, &b(2), 2),
+                Err(StateError::Illegal { .. })
+            ),
             "first build is gen 1"
         );
         assert!(
-            start.check_transition(0, &r(1), 1).is_err(),
+            matches!(
+                start.check_transition(0, &r(1), 1),
+                Err(StateError::Illegal { .. })
+            ),
             "no Ready without Building"
         );
         b(1).check_transition(1, &r(1), 1).unwrap();
-        b(1).check_transition(1, &r(2), 2).unwrap_err();
+        assert!(matches!(
+            b(1).check_transition(1, &r(2), 2),
+            Err(StateError::Illegal { .. })
+        ));
         // Ready -> Ready(N+1) only through Building: direct hop illegal.
-        r(1).check_transition(1, &r(2), 2).unwrap_err();
-        r(1).check_transition(1, &b(2), 2).unwrap_err();
+        assert!(matches!(
+            r(1).check_transition(1, &r(2), 2),
+            Err(StateError::Illegal { .. })
+        ));
+        assert!(matches!(
+            r(1).check_transition(1, &b(2), 2),
+            Err(StateError::Illegal { .. })
+        ));
         // Watcher event: Ready -> Dirty same gen; then Dirty -> Building N+1.
         r(1).check_transition(1, &d(1), 1).unwrap();
-        assert!(r(1).check_transition(1, &d(2), 2).is_err());
+        assert!(matches!(
+            r(1).check_transition(1, &d(2), 2),
+            Err(StateError::Illegal { .. })
+        ));
         d(1).check_transition(1, &b(2), 2).unwrap();
         d(2).check_transition(2, &b(3), 3).unwrap();
-        d(2).check_transition(2, &b(2), 2).unwrap_err();
-        d(2).check_transition(2, &b(4), 4).unwrap_err();
+        assert!(matches!(
+            d(2).check_transition(2, &b(2), 2),
+            Err(StateError::Illegal { .. })
+        ));
+        assert!(matches!(
+            d(2).check_transition(2, &b(4), 4),
+            Err(StateError::Illegal { .. })
+        ));
     }
 
     #[test]

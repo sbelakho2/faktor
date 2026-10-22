@@ -504,7 +504,6 @@ pub fn unavailable<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::Availability;
 
     fn requirement() -> SupplyRequirement {
         SupplyRequirement {
@@ -635,12 +634,23 @@ mod tests {
     }
 
     #[test]
-    fn unknowns_can_be_constructed_without_basis() {
-        let value: Availability<Money> = unavailable(
+    fn a_deserialized_known_zero_cannot_forge_an_unknown() {
+        // Breaks if serde lets a known zero (or a basis-free claim) bypass Term::validate.
+        let forged: crate::basis::Term<Money> = serde_json::from_str(
+            r#"{"value":{"status":"known","value":{"micros":0,"currency":"USD"}},"basis":null}"#,
+        )
+        .unwrap();
+        assert!(forged.is_known());
+        assert!(matches!(
+            forged.validate(),
+            Err(crate::ExactError::OutOfBounds { what: "term", .. })
+        ));
+        let unknown: crate::basis::Term<Money> = crate::basis::Term::unknown(
             crate::basis::UnavailableReason::NotProvided,
             "supplier did not quote",
         );
-        assert!(!value.is_known());
-        assert!(value.validate().is_ok());
+        assert!(!unknown.is_known());
+        assert!(unknown.validate().is_ok());
+        assert!(unknown.value.as_known().is_none());
     }
 }

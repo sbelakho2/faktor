@@ -662,16 +662,34 @@ mod tests {
     #[test]
     fn malformed_role_and_seq_rejected() {
         let (_d, s) = seeded_session();
-        assert!(s.put_message(1, "root", serde_json::json!({})).is_err());
-        assert!(s.put_message(0, "user", serde_json::json!({})).is_err());
-        assert!(s.put_message(-1, "user", serde_json::json!({})).is_err());
+        let before = s.message_count().unwrap();
+        // Break caught: accepting a prose role or a non-positive seq, or
+        // reporting malformed input without the offending value.
+        for (seq, role, message) in [
+            (1, "root", "invalid role \"root\""),
+            (0, "user", "message seq must be > 0, got 0"),
+            (-1, "user", "message seq must be > 0, got -1"),
+        ] {
+            let err = s.put_message(seq, role, serde_json::json!({})).unwrap_err();
+            assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+            assert_eq!(err.message, message);
+        }
+        assert_eq!(s.message_count().unwrap(), before, "no rejected write");
     }
 
     #[test]
     fn oversized_message_rejected_before_write() {
         let (_d, s) = seeded_session();
         let big = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_BYTES + 1) });
-        assert!(s.put_message(7, "user", big).is_err());
+        let size = serde_json::to_vec(&big).unwrap().len();
+        let err = s.put_message(7, "user", big).unwrap_err();
+        // Break caught: an oversized message that is truncated/classified
+        // as Malformed instead of a typed Oversized refusal before the write.
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        assert_eq!(
+            err.message,
+            format!("message payload of {size} bytes exceeds MAX_MESSAGE_BYTES")
+        );
         assert_eq!(
             s.message_count().unwrap(),
             2,

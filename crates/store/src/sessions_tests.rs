@@ -930,8 +930,11 @@ fn turn_record_lifecycle_exclusive_active_and_envelope() {
         store.turn_record_of(s.id, b).unwrap().unwrap().status,
         TURN_RECORD_COMPLETED
     );
-    // Invalid statuses are rejected loudly.
-    assert!(store.finish_turn_record(s.id, b, "bogus").is_err());
+    // Invalid statuses are rejected loudly with the offending value named.
+    assert!(matches!(
+        store.finish_turn_record(s.id, b, "bogus"),
+        Err(StoreError::Migration(ref m)) if m.contains("invalid status") && m.contains("bogus")
+    ));
     // Unknown op: no record.
     assert!(store.turn_record_of(s.id, OpId::new(99)).unwrap().is_none());
 }

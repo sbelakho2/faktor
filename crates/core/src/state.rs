@@ -2367,18 +2367,23 @@ mod tests {
 
     #[test]
     fn terminal_states_are_truly_terminal() {
-        // Completed and FailedPermanent end the SESSION (only reachable via
-        // end_session / permanent failure). Cancelled is a TURN outcome and
-        // the session stays usable.
+        // Break caught: a terminal state that silently accepts any successor
+        // or reports a different (from, to) pair than the attempted hop.
         for t in [AgentState::Completed, AgentState::FailedPermanent] {
-            let mut m = StateMachine::new(t);
             for s in [
                 AgentState::Idle,
                 AgentState::Preparing,
                 AgentState::Streaming,
                 AgentState::Suspended,
             ] {
-                assert!(m.transition(s).is_err(), "{t:?} -> {s:?} must fail");
+                let mut m = StateMachine::new(t);
+                let err = m.transition(s).unwrap_err();
+                assert_eq!(
+                    err.kind,
+                    ErrorKind::InvalidState { from: t, to: s },
+                    "{t:?} -> {s:?} must be typed and refused"
+                );
+                assert_eq!(m.state(), t, "a rejected hop must not move state");
             }
         }
     }
@@ -2447,12 +2452,17 @@ mod tests {
 
     #[test]
     fn skipping_states_is_rejected() {
-        // Streaming -> UpdatingMemory skips Validating: illegal.
-        let mut m = StateMachine::new(AgentState::Streaming);
-        assert!(m.transition(AgentState::UpdatingMemory).is_err());
-        // WaitingForModel -> ExecutingTool skips Streaming: illegal.
-        let mut m = StateMachine::new(AgentState::WaitingForModel);
-        assert!(m.transition(AgentState::ExecutingTool).is_err());
+        // Break caught: a machine that treats any forward state as legal
+        // (skipping mandatory phases) or leaves the old state after refusal.
+        for (from, to) in [
+            (AgentState::Streaming, AgentState::UpdatingMemory),
+            (AgentState::WaitingForModel, AgentState::ExecutingTool),
+        ] {
+            let mut m = StateMachine::new(from);
+            let err = m.transition(to).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::InvalidState { from, to });
+            assert_eq!(m.state(), from);
+        }
     }
 
     #[test]

@@ -2069,34 +2069,29 @@ mod tests {
 
     #[test]
     fn zero_yield_is_typed_arithmetic_not_infinite_cost() {
-        let mut input = basic_input();
-        input.materials[0] = term(
-            MaterialLine {
-                description: "bad".to_string(),
-                quantity_per_unit: ScaledQuantity::new(1_000_000).unwrap(),
-                unit_price: money("1.00"),
-                yield_rate: Rate::ZERO,
-            },
-            "bad-material",
-        );
+        // Breaks if a zero route yield is divided through (infinite cost) or
+        // if a zero material yield is silently treated as a zero-cost line.
+        let mut route = basic_input();
+        route.process_steps[0].yield_rate = term(Rate::ZERO, "zero-route");
         assert!(matches!(
-            should_cost(&input),
-            Err(CostError::ZeroQuantity("process yield")) | Err(CostError::ZeroQuantity(_)) | Ok(_)
+            should_cost(&route),
+            Err(CostError::ZeroQuantity("process yield"))
         ));
-        // Material yield zero is only discovered in the arithmetic kernel; the
-        // input validation does not invent a useful value.
-        let mut manual = basic_input();
-        if let Some(material) = manual.materials[0].value.as_known().cloned() {
-            let mut material = material;
-            material.yield_rate = Rate::ZERO;
-            manual.materials[0] = term(material, "zero-yield");
+
+        let mut material = basic_input();
+        if let Some(line) = material.materials[0].value.as_known().cloned() {
+            let mut line = line;
+            line.yield_rate = Rate::ZERO;
+            material.materials[0] = term(line, "zero-material-yield");
         }
-        let result = should_cost(&manual).unwrap();
+        let result = should_cost(&material).unwrap();
         assert!(result.ex_works.as_known().is_none());
-        assert!(matches!(
-            result.line(CostTerm::Material).unwrap().amount,
-            Availability::Unavailable { .. }
-        ));
+        match &result.line(CostTerm::Material).unwrap().amount {
+            Availability::Unavailable { unavailable } => {
+                assert_eq!(unavailable.reason, UnavailableReason::Arithmetic)
+            }
+            other => panic!("zero yield must make the material line unavailable: {other:?}"),
+        }
     }
 
     #[test]

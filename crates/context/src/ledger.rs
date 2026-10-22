@@ -589,7 +589,11 @@ mod tests {
         for _ in 0..100 {
             l.record_turn(&turn(7)); // same content every time
         }
-        assert!(l.completed_steps.iter().filter(|s| *s == "did 7").count() <= 1);
+        // Exactly one: a broken ledger that drops every turn must not pass.
+        assert_eq!(
+            l.completed_steps.iter().filter(|s| *s == "did 7").count(),
+            1
+        );
     }
 
     #[test]

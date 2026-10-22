@@ -1798,31 +1798,45 @@ pub use management::*;
 #[cfg(test)]
 mod tests {
     #[test]
-    fn tmp_probe_remember_read() {
+    fn store_adapter_remember_is_deduplicated_durable_and_session_scoped() {
         let dir = tempfile::tempdir().unwrap();
+        let session;
+        {
+            let store = Arc::new(faktor_store::Store::open(dir.path(), true).unwrap());
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            session = s.id;
+            let mem = SessionMemory::new(store.clone(), session);
+            mem.remember("decision", "framework", "rust").unwrap();
+            mem.remember("decision", "framework", "rust+tokio").unwrap();
+            mem.remember("preference", "edition", "2021").unwrap();
+            // Catches a repo adapter that appends instead of upserting.
+            assert_eq!(mem.facts().unwrap().len(), 2);
+            assert_eq!(mem.by_kind("decision").unwrap().len(), 1);
+            assert_eq!(
+                mem.latest("decision", "framework").unwrap().as_deref(),
+                Some("rust+tokio")
+            );
+            // Catches a session-scope leak through the workspace store.
+            let other = store.create_session(ws, "other", "p", "m").unwrap();
+            let other_mem = SessionMemory::new(store.clone(), other.id);
+            assert!(other_mem.facts().unwrap().is_empty());
+        }
+        // Reopen: the adapter's writes are durable, not RAM-only.
         let store = Arc::new(faktor_store::Store::open(dir.path(), true).unwrap());
-        let ws = store.create_workspace("/w").unwrap();
-        let s = store.create_session(ws, "t", "p", "m").unwrap();
-        eprintln!("PROBE sid={}", s.id);
-        store.upsert_memory_fact(s.id, "k", "key", "v").unwrap();
-        let n = store.memory_fact_count(s.id).unwrap();
-        eprintln!("PROBE count={n}");
-        let (rows, more) = store.memory_facts_page(s.id, None, 10).unwrap();
-        eprintln!("PROBE direct rows={} more={more}", rows.len());
-        let mem = SessionMemory::new(store.clone(), s.id);
-        mem.remember("k2", "key2", "v2").unwrap();
-        let n2 = store.memory_fact_count(s.id).unwrap();
-        eprintln!("PROBE count after remember={n2}");
-        let (rows2, more2) = store.memory_facts_page(s.id, None, 10).unwrap();
-        eprintln!(
-            "PROBE direct rows after remember={} more={more2}",
-            rows2.len()
+        let facts = SessionMemory::new(store, session).facts().unwrap();
+        let mut keyed: Vec<(&str, &str, &str)> = facts
+            .iter()
+            .map(|f| (f.kind.as_str(), f.key.as_str(), f.value.as_str()))
+            .collect();
+        keyed.sort();
+        assert_eq!(
+            keyed,
+            vec![
+                ("decision", "framework", "rust+tokio"),
+                ("preference", "edition", "2021")
+            ]
         );
-        let fs = mem.facts().unwrap();
-        eprintln!("PROBE mem.facts len={}", fs.len());
-        let f2 = mem.by_kind("k2").unwrap();
-        eprintln!("PROBE by_kind len={}", f2.len());
-        assert_eq!(fs.len(), 2);
     }
 
     use super::*;

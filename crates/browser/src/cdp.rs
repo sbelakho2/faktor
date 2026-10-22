@@ -689,12 +689,32 @@ mod tests {
     }
 
     #[test]
-    fn cdp_config_defaults_are_bounded() {
-        let config = CdpConfig::default();
-        assert!(config.max_message_bytes > 0);
-        assert!(config.event_capacity > 0);
-        assert!(config.critical_event_capacity > 0);
-        assert!(config.validate().is_ok());
+    fn cdp_boundaries_are_inclusive_and_the_next_byte_is_invalid_config() {
+        let config = CdpConfig {
+            max_message_bytes: CDP_MAX_MESSAGE_CEILING_BYTES,
+            event_capacity: CDP_MAX_CAPACITY_CEILING,
+            critical_event_capacity: CDP_MAX_CAPACITY_CEILING,
+        };
+        // Fails if the ceiling is rejected (>= instead of >) or the next
+        // value is admitted.
+        assert_eq!(config.validate(), Ok(()));
+        for bad in [
+            CdpConfig {
+                max_message_bytes: CDP_MAX_MESSAGE_CEILING_BYTES + 1,
+                ..config.clone()
+            },
+            CdpConfig {
+                event_capacity: CDP_MAX_CAPACITY_CEILING + 1,
+                ..config.clone()
+            },
+            CdpConfig {
+                critical_event_capacity: CDP_MAX_CAPACITY_CEILING + 1,
+                ..config.clone()
+            },
+        ] {
+            assert_eq!(bad.validate().unwrap_err().code(), "invalid_config");
+        }
+        assert_eq!(CdpConfig::default().max_message_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

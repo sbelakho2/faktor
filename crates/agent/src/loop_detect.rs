@@ -464,13 +464,20 @@ mod tests {
     }
 
     #[test]
-    fn same_call_different_tool_does_not_trip() {
+    fn loop_identity_is_tool_plus_arguments_not_arguments_alone() {
+        // Break caught: keying the loop window on arguments only, which
+        // would trip three DIFFERENT tools that happen to share a payload.
         let mut d = LoopDetector::new(3);
         let args = serde_json::json!({"path": "x"});
-        d.record_tool_call("read_file", &args);
-        d.record_tool_call("grep", &args);
-        d.record_tool_call("write_file", &args);
+        assert!(!d.record_tool_call("read_file", &args));
+        assert!(!d.record_tool_call("grep", &args));
+        assert!(!d.record_tool_call("write_file", &args));
         assert_eq!(d.trips, 0);
+        assert_eq!(d.len(), 3);
+        // The third identical (tool, args) pair is the one that trips.
+        assert!(!d.record_tool_call("read_file", &args));
+        assert!(d.record_tool_call("read_file", &args));
+        assert_eq!(d.trips, 1);
     }
 
     #[test]
@@ -510,10 +517,18 @@ mod tests {
     }
 
     #[test]
-    fn json_normalization_is_stable() {
+    fn json_normalization_is_exact_and_collision_resistant() {
+        // Break caught: a normalizer that is merely reflexive (same object
+        // compared to itself) or that erases nested/array distinctions.
         let a = serde_json::json!({"z": [1, 2], "a": {"y": "s", "x": null}});
         let b = serde_json::json!({"a": {"x": null, "y": "s"}, "z": [1, 2]});
+        assert_eq!(normalize_value(&a), r#"{a:{x:null,y:"s"},z:[1,2]}"#);
         assert_eq!(normalize_value(&a), normalize_value(&b));
+        assert_ne!(
+            normalize_value(&a),
+            normalize_value(&serde_json::json!({"z": [2, 1], "a": {"y": "s", "x": null}})),
+            "array order is semantic and must never be normalized away"
+        );
     }
 
     #[test]

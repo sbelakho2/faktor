@@ -1482,8 +1482,8 @@ mod tests {
     }
 
     #[test]
-    fn rollback_wrong_identity_rejected() {
-        let (_d, cps, h, _id, session) = fixture();
+    fn rollback_wrong_identity_rejected_before_any_mutation() {
+        let (_d, cps, h, id, session) = fixture();
         let wrong =
             WorkspaceIdentity::new(WorkspaceId::new(99), WorktreeId::new(1), TaskId::new(1));
         fs::write(h.root().join("f.txt"), b"x").unwrap();
@@ -1493,7 +1493,17 @@ mod tests {
         let cid = cps
             .after_write(session, "f.txt", before, after, 1, after_content)
             .unwrap();
-        assert!(cps.rollback(&h, &wrong, session, cid).is_err());
+        fs::write(h.root().join("f.txt"), b"y").unwrap();
+        // Catches an identity check after restore (file would have become x)
+        // or a generic refusal: exactly Permission, with the file untouched.
+        let err = cps.rollback(&h, &wrong, session, cid).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(err.message.contains("workspace identity mismatch"), "{err}");
+        assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"y");
+        // The checkpoint is still valid for its OWN identity.
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
+        assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"x");
     }
 
     #[test]

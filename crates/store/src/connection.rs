@@ -2802,23 +2802,30 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_db_file_is_detected_on_open() {
+    fn corrupt_db_file_is_detected_on_open_and_never_reads_as_empty() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("faktor-plus.db"),
-            b"this is not a sqlite database at all - definitely not valid magic header bytes",
-        )
-        .unwrap();
+        let db = dir.path().join("faktor-plus.db");
+        let garbage =
+            b"this is not a sqlite database at all - definitely not valid magic header bytes";
+        std::fs::write(&db, garbage).unwrap();
+        // Catches a recovery that reinitializes hostile bytes or a lazy open
+        // whose failed read is reported as an empty healthy store.
         match Store::open(dir.path(), true) {
-            Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
-            other => panic!("corrupt db must fail cleanly, got {other:?}"),
+            Err(StoreError::Sqlite(err)) => {
+                assert!(err.to_string().contains("not a database"), "{err}");
+            }
+            other => panic!("corrupt db must be a typed Sqlite refusal, got {other:?}"),
         }
-        // Without integrity_check it may open (SQLite lazy), but any query
-        // must error, not panic.
-        let s = Store::open(dir.path(), false);
-        if let Ok(s) = s {
-            let r = s.list_sessions(None);
-            assert!(r.is_err() || r.is_ok(), "never panic");
+        assert_eq!(std::fs::read(&db).unwrap(), garbage);
+        if let Ok(store) = Store::open(dir.path(), false) {
+            let read = store.list_sessions(None);
+            assert!(
+                matches!(
+                    read,
+                    Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_))
+                ),
+                "a corrupt database must never read as an empty store: {read:?}"
+            );
         }
     }
 
@@ -3017,10 +3024,37 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_smoke() {
-        let (_d, store) = tmp_store();
-        let d = store.diagnostics().unwrap();
-        assert_eq!(d["journal_mode"], "wal");
+    fn diagnostics_reports_exact_durable_counts_and_never_hides_a_torn_journal() {
+        let (d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "hi"}))
+            .unwrap();
+        let diag = store.diagnostics().unwrap();
+        // Catches a doctor shim that reports zero/stale counts or a bogus
+        // integrity verdict for a healthy durable state.
+        assert_eq!(diag["journal_mode"], "wal");
+        assert_eq!(diag["sessions"], 1);
+        assert_eq!(diag["events"], 1);
+        assert_eq!(diag["messages"], 1);
+        assert_eq!(diag["integrity"], serde_json::json!([]));
+        // Page integrity is NOT journal consistency: deleting the seed row
+        // keeps pages clean but must be visible to the authority sweep.
+        store
+            .raw_conn()
+            .execute(
+                "DELETE FROM event WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        let diag = store.diagnostics().unwrap();
+        assert_eq!(diag["events"], 0);
+        assert_eq!(diag["integrity"], serde_json::json!([]));
+        assert_eq!(store.journal_consistency_issues().unwrap().len(), 1);
+        drop(store);
+        let reopened = Store::open(d.path(), true).unwrap();
+        assert_eq!(reopened.diagnostics().unwrap()["sessions"], 1);
     }
 
     #[test]

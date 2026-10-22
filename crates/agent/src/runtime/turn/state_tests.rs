@@ -340,9 +340,32 @@ fn agent_cards_reflect_state() {
     let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
     let session = new_session(runtime.deps());
-    let cards = runtime.cards().unwrap();
-    let card = cards.iter().find(|c| c.session_id == session).unwrap();
-    assert!(card.status == "waiting" || card.status == "completed" || card.status == "running");
+    let card = runtime
+        .cards()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.session_id == session)
+        .expect("the durable session has a card");
+    // Break caught: a status projection that reports any running-ish string
+    // for an idle session or forgets the title.
+    assert_eq!(card.status, "waiting");
+    assert_eq!(card.title, "test session");
+
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle.submit_prompt("next turn", &[]).unwrap();
+    let card = runtime
+        .cards()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.session_id == session)
+        .unwrap();
+    assert_eq!(card.status, "running", "Preparing is an active turn");
+    assert_eq!(handle.state().unwrap(), AgentState::Preparing);
 }
 
 // ---- legacy VerifyHash containment migration (audit P1-F) ----

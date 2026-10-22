@@ -1025,17 +1025,24 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn framing_roundtrip() {
-        let msg = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}});
+    fn content_length_is_bytes_and_consumes_exactly_one_frame() {
+        let msg = serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"text": "é"}});
         let body = msg.to_string();
+        assert_ne!(body.len(), body.chars().count(), "body must be multibyte");
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        // Fails if Content-Length is counted in chars (parse would see a
+        // truncated UTF-8 body) or if consumption runs past one frame.
         let (consumed, parsed) = parse_frame(frame.as_bytes()).unwrap().unwrap();
         assert_eq!(consumed, frame.len());
         assert_eq!(parsed, msg);
-        // Multiple frames concatenated: parse consumes exactly the first.
-        let double = format!("{frame}{frame}");
-        let (consumed, _) = parse_frame(double.as_bytes()).unwrap().unwrap();
-        assert_eq!(consumed, frame.len());
+        let mut double = frame.clone().into_bytes();
+        double.extend_from_slice(frame.as_bytes());
+        let (first, parsed) = parse_frame(&double).unwrap().unwrap();
+        assert_eq!(first, frame.len());
+        assert_eq!(parsed, msg);
+        let (second, parsed) = parse_frame(&double[first..]).unwrap().unwrap();
+        assert_eq!(second, frame.len());
+        assert_eq!(parsed, msg);
     }
 
     #[test]
@@ -1155,19 +1162,38 @@ mod tests {
             args: vec!["garbage".into()],
             env: vec![],
         };
-        let server = McpServer::connect(cfg, sup.clone()).await;
-        // Either initialize fails (timeout → error) or the server is dead;
-        // never a hang.
-        let _ = server;
+        let err = match McpServer::connect(cfg, sup.clone()).await {
+            Ok(_) => panic!("garbage framing must fail the handshake"),
+            Err(err) => err,
+        };
+        // Fails if garbage is reported as a timeout, retried, or leaves the
+        // child registered after the failed connect.
+        assert_eq!(
+            err.kind,
+            ErrorKind::Provider {
+                code: "mcp".into(),
+                retryable: false
+            },
+            "{err:?}"
+        );
+        assert!(err.message.contains("parse error"), "{err:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        sup.reap();
+        assert_eq!(sup.registered(), 0, "failed connect must not orphan");
     }
 
     #[test]
-    fn response_bound_is_enforced() {
-        // A hostile 17MB frame is rejected by the parser.
-        let body = "x".repeat(MAX_RESPONSE_BYTES + 1);
-        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        let r = parse_frame(frame.as_bytes());
-        assert!(r.is_err());
+    fn response_bound_is_exact_and_checked_from_the_header_alone() {
+        let at_cap = format!("Content-Length: {MAX_RESPONSE_BYTES}\r\n\r\n");
+        // At the cap with no body yet is incomplete, never an error.
+        assert_eq!(parse_frame(at_cap.as_bytes()).unwrap(), None);
+        let over = format!("Content-Length: {}\r\n\r\n", MAX_RESPONSE_BYTES + 1);
+        // Fails if the bound is off by one or only enforced after buffering
+        // the declared body.
+        assert_eq!(
+            parse_frame(over.as_bytes()).unwrap_err(),
+            "declared Content-Length exceeds bound"
+        );
     }
 
     /// The INITIAL handshake read is bounded by `MAX_INITIAL_BYTES`, not the

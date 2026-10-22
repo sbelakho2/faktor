@@ -158,9 +158,8 @@ pub fn stock_from_text(raw: &str) -> StockState {
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
         .take_while(|c| c.is_ascii_digit() || *c == ',')
-        .filter(|c| *c != ',')
         .collect();
-    if let Ok(value) = digits.parse::<u64>() {
+    if let Some(value) = normalize::parse_grouped_u64(&digits) {
         if let Ok(Some(quantity)) = normalize::nonzero_quantity(value) {
             return StockState::InStock { quantity };
         }
@@ -183,13 +182,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_map_to_semantic_fields() {
-        assert_eq!(field_for_label("起订量"), Some(Field::MinimumOrder));
-        assert_eq!(field_for_label("价格："), Some(Field::Price));
-        assert_eq!(field_for_label("型号"), Some(Field::Model));
-        assert_eq!(field_for_label("厂家"), Some(Field::Manufacturer));
-        assert_eq!(field_for_label("库存"), Some(Field::Stock));
-        assert_eq!(field_for_label("未知标签"), None);
+    fn lookalike_labels_do_not_map_and_exact_labels_keep_their_field() {
+        for (label, field) in [
+            ("起订量", Field::MinimumOrder),
+            ("价格：", Field::Price),
+            ("价格:", Field::Price),
+            (" 型号 ", Field::Model),
+            ("厂家", Field::Manufacturer),
+            ("库存", Field::Stock),
+        ] {
+            assert_eq!(field_for_label(label), Some(field), "{label:?}");
+        }
+        for spoof in [
+            "价 格",
+            "价格: ¥1.00",
+            "价　格",
+            "價格",
+            "库存量",
+            "起订",
+            "型号\x00",
+            "",
+        ] {
+            // Fails if matching is substring/prefix/Unicode-normalized
+            // instead of the curated exact label set.
+            assert_eq!(field_for_label(spoof), None, "{spoof:?}");
+        }
+    }
+
+    #[test]
+    fn stock_text_never_fabricates_from_fullwidth_or_overflowing_digits() {
+        assert_eq!(
+            stock_from_text("库存 1,234 件"),
+            StockState::InStock {
+                quantity: NonZeroQuantity::new(1234).expect("qty")
+            }
+        );
+        assert_eq!(stock_from_text("缺货"), StockState::OutOfStock);
+        for spoof in [
+            "库存 １２００ 件",
+            "库存 999999999999999999999999999 件",
+            "库存 12,34 件",
+            "库存 0,123 件",
+        ] {
+            // Fails if a non-ASCII/overflowing count is coerced into stock.
+            assert_eq!(stock_from_text(spoof), StockState::Unknown, "{spoof:?}");
+        }
     }
 
     #[test]

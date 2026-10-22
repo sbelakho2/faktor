@@ -894,10 +894,18 @@ mod tests {
     }
 
     #[test]
-    fn bound_args_rejects_oversized() {
-        let big = serde_json::json!({"payload": "x".repeat(10_000)});
-        assert!(bound_args(&big, 100).is_err());
-        assert!(bound_args(&big, 100_000).is_ok());
+    fn bound_args_enforces_the_exact_byte_boundary() {
+        // Break caught: an off-by-one bound (accepting max+1) or a bound
+        // that classifies the refusal as Malformed instead of Oversized.
+        let args = serde_json::json!({"payload": "x".repeat(10_000)});
+        let exact = serde_json::to_vec(&args).unwrap().len();
+        assert_eq!(bound_args(&args, exact).unwrap(), args);
+        let err = bound_args(&args, exact - 1).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        assert_eq!(
+            err.message,
+            format!("tool args {exact} bytes exceed bound {}", exact - 1)
+        );
     }
 
     #[test]

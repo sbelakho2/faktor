@@ -205,14 +205,17 @@ fn branch_name_validation_corpus() {
         "refs/heads/",
     ];
     for branch in invalid {
-        assert!(
-            crate::validate_branch(branch).is_err(),
+        let err = crate::validate_branch(branch).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Malformed,
             "case invalid {branch:?}: must be refused typed"
         );
     }
     let long = "a".repeat(129);
-    assert!(
-        crate::validate_branch(&long).is_err(),
+    assert_eq!(
+        crate::validate_branch(&long).unwrap_err().kind,
+        ErrorKind::Malformed,
         "case 129-bytes: over-long branch names must be refused"
     );
     let valid = [
@@ -252,14 +255,16 @@ fn branch_name_validation_corpus() {
 fn worktree_and_remote_name_corpora() {
     let bad_names = ["", "..", "a..b", "a/b", "a b", "a\tb", "name/../x"];
     for name in bad_names {
-        assert!(
-            crate::validate_name(name).is_err(),
+        assert_eq!(
+            crate::validate_name(name).unwrap_err().kind,
+            ErrorKind::Malformed,
             "case worktree-invalid {name:?}: must be refused"
         );
     }
     let long = "n".repeat(65);
-    assert!(
-        crate::validate_name(&long).is_err(),
+    assert_eq!(
+        crate::validate_name(&long).unwrap_err().kind,
+        ErrorKind::Malformed,
         "case worktree-65: over-long names must be refused"
     );
     for name in ["wt-1", "a_b.c", "UPPER", "caf\u{e9}", "a\\b"] {
@@ -290,8 +295,9 @@ fn worktree_and_remote_name_corpora() {
         "a[b",
     ];
     for remote in bad_remotes {
-        assert!(
-            crate::validate_remote(remote).is_err(),
+        assert_eq!(
+            crate::validate_remote(remote).unwrap_err().kind,
+            ErrorKind::Malformed,
             "case remote-invalid {remote:?}: must be refused"
         );
     }
@@ -301,8 +307,9 @@ fn worktree_and_remote_name_corpora() {
             "case remote-valid {remote:?}: must be accepted"
         );
     }
-    assert!(
-        crate::validate_remote(&"r".repeat(129)).is_err(),
+    assert_eq!(
+        crate::validate_remote(&"r".repeat(129)).unwrap_err().kind,
+        ErrorKind::Malformed,
         "case remote-129: over-long remote names must be refused"
     );
 }
@@ -501,5 +508,60 @@ fn fresh_malformed_lease_is_not_reconciled() {
         std::fs::read(&path).unwrap(),
         garbage,
         "case malformed-residue: the residue must be left intact"
+    );
+}
+
+/// Branch/worktree names are validated BEFORE any reservation: a hostile
+/// spelling is a typed `Malformed` error, no worktree directory is created,
+/// and the durable metadata is byte-unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_branch_and_worktree_names_are_malformed_before_any_reservation() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        hostile_branch_and_worktree_names_are_malformed_before_any_reservation_inner(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("hostile branch/name test exceeded its 25s hard test timeout"));
+}
+
+async fn hostile_branch_and_worktree_names_are_malformed_before_any_reservation_inner() {
+    let (_d, _sup, mgr, repo) = crate::tests::fixture().await;
+    let meta = crate::meta_path(&repo);
+    let before = std::fs::read(&meta).ok();
+    for (branch, name) in [
+        ("../escape", "wt-evil"),
+        ("a b", "wt-evil"),
+        ("x; rm -rf /", "wt-evil"),
+        ("-leading", "wt-evil"),
+        ("a..b", "wt-evil"),
+        ("tab\tname", "wt-evil"),
+        ("ctrl\x07", "wt-evil"),
+        ("ok-branch", "../esc"),
+        ("ok-branch", "a/b"),
+        ("ok-branch", "with space"),
+        ("ok-branch", "a..b"),
+    ] {
+        let err = mgr
+            .create(&repo, branch, name, faktor_core::SessionId::new(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Malformed,
+            "{branch:?}/{name:?}: {err:?}"
+        );
+        assert!(
+            err.message.contains("branch name") || err.message.contains("worktree name"),
+            "{err}"
+        );
+    }
+    assert!(
+        !repo.join(".worktrees").exists(),
+        "refused create must not mkdir"
+    );
+    assert_eq!(
+        std::fs::read(&meta).ok(),
+        before,
+        "metadata must not change"
     );
 }

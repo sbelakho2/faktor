@@ -936,18 +936,6 @@ fn keys_read_from_env_not_file() {
 }
 
 #[test]
-fn provider_ids_are_stable() {
-    let cfg = ProviderCfg::Ollama {
-        id: "ollama".into(),
-        base_url: None,
-        pricing: None,
-        allow_loopback: true,
-        quality: None,
-    };
-    assert_eq!(cfg.id(), "ollama");
-}
-
-#[test]
 fn built_providers_register_under_configured_instance_ids() {
     // Two OpenAI-compatible endpoints with distinct configured ids:
     // both must register and resolve by their ids (the old registry

@@ -1364,22 +1364,44 @@ mod tests {
     }
 
     #[test]
-    fn fresh_event_table_rejects_non_positive_seq() {
+    fn fresh_event_table_refuses_non_positive_seq_with_the_exact_check_and_no_row() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
         let ws = store.create_workspace("/w").unwrap();
         let session = store.create_session(ws, "t", "p", "m").unwrap();
         let conn = store.raw_conn();
         for hostile in [0i64, -1, i64::MIN] {
-            let r = conn.execute(
-                "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
-                 VALUES (?1, ?2, NULL, 'model_started', '\"streaming\"', 0, NULL, 1)",
-                params![hostile, session.id.raw() as i64],
-            );
-            assert!(
-                r.is_err(),
-                "fresh schema must reject event.seq = {hostile}: {r:?}"
-            );
+            let err = conn
+                .execute(
+                    "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
+                     VALUES (?1, ?2, NULL, 'model_started', '\"streaming\"', 0, NULL, 1)",
+                    params![hostile, session.id.raw() as i64],
+                )
+                .unwrap_err();
+            // Catches a dropped CHECK: the refusal must be the schema check,
+            // and the hostile row must not land.
+            match err {
+                rusqlite::Error::SqliteFailure(_, Some(message)) => assert!(
+                    message.contains("CHECK constraint failed"),
+                    "case seq={hostile}: {message}"
+                ),
+                other => panic!("case seq={hostile}: expected CHECK failure, got {other:?}"),
+            }
         }
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE session_id = ?1",
+                params![session.id.raw() as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only the session_created seed may exist");
+        // The smallest legal seq is still accepted by the schema.
+        conn.execute(
+            "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
+             VALUES (2, ?1, NULL, 'model_started', '\"streaming\"', 0, NULL, 1)",
+            params![session.id.raw() as i64],
+        )
+        .unwrap();
     }
 }

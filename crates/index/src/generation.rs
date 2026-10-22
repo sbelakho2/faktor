@@ -445,14 +445,31 @@ mod tests {
     }
 
     #[test]
-    fn hostile_envelope_fails_loudly() {
-        for evil in [
-            b"not json".as_slice(),
-            b"{}".as_slice(),
-            br#"{"format":999,"generation":1}"#,
-            br#"{"format":1,"workspace":7,"generation":3,"data":[]}"#,
-        ] {
-            assert!(GenerationFile::from_bytes(evil).is_err(), "{evil:?}");
+    fn hostile_envelope_fails_loudly_with_the_specific_decode_reason() {
+        // Catches a decoder that silently defaults a missing/unknown field:
+        // each shape must name its own refusal, not a generic parse failure.
+        let cases: &[(&[u8], &str)] = &[
+            (b"not json", "generation decode"),
+            (b"{}", "missing field"),
+            (
+                br#"{"format":999,"workspace":1,"generation":1,"built_ms":0,"fingerprint":[],"data":{"files":{},"postings":{},"symbols":{},"token_count":0}}"#,
+                "format 999 unsupported",
+            ),
+            (
+                br#"{"format":1,"workspace":7,"generation":3,"data":[]}"#,
+                "generation decode",
+            ),
+            (
+                br#"{"format":2,"workspace":0,"generation":3,"built_ms":0,"fingerprint":[],"data":{"files":{},"postings":{},"symbols":{},"token_count":0}}"#,
+                "workspace 0 is malformed",
+            ),
+        ];
+        for (evil, needle) in cases {
+            let err = GenerationFile::from_bytes(evil).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "case {evil:?}: expected {needle:?} in {err:?}"
+            );
         }
     }
 

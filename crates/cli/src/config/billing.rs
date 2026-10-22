@@ -586,8 +586,24 @@ mod tests {
     }
 
     #[test]
-    fn disabled_section_with_subscription_still_validates_shape_only() {
+    fn disabled_section_refuses_malformed_subscription_shapes_but_skips_plan_lookup() {
+        // Fails if `enabled:false` short-circuits parsing (accepting an
+        // unknown field or a duplicate subsection) before shape validation.
+        for body in [
+            r#"{"enabled":false,"subscription":{"plan_id":"absent","bogus":true}}"#,
+            r#"{"enabled":false,"subscription":"absent"}"#,
+            r#"{"enabled":false,"subscription":{"plan_id":1}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<BillingCfg>(body).is_err(),
+                "disabled billing must still refuse malformed shape: {body}"
+            );
+        }
+        // Shape-only means exactly that: a disabled section naming a plan
+        // absent from the table parses and validates, but never starts a
+        // service (the daemon's disabled parity is tested at wiring level).
         let cfg = enabled(r#"{"enabled":false,"subscription":{"plan_id":"absent"}}"#);
+        assert!(!cfg.enabled);
         cfg.validate().unwrap();
     }
 }

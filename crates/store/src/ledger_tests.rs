@@ -10,12 +10,34 @@ pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
-fn truncated_db_is_rejected() {
+fn truncated_db_is_rejected_without_being_silently_reinitialized() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("faktor-plus.db"), b"SQLite format 3\x00").unwrap();
+    let db = dir.path().join("faktor-plus.db");
+    let truncated = b"SQLite format 3\x00";
+    std::fs::write(&db, truncated).unwrap();
+    // Catches a recovery path that replaces the hostile file with a fresh
+    // empty schema: the exact sqlite refusal is pinned and the bytes stay.
     match Store::open(dir.path(), true) {
-        Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
-        other => panic!("truncated db must fail cleanly, got {other:?}"),
+        Err(StoreError::Sqlite(err)) => {
+            assert!(
+                err.to_string().contains("not a database"),
+                "expected a not-a-database refusal, got {err}"
+            );
+        }
+        other => panic!("truncated db must be a typed Sqlite refusal, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), truncated);
+    // The lazy open may succeed at the connection level, but no read may
+    // ever masquerade as an empty healthy store.
+    if let Ok(store) = Store::open(dir.path(), false) {
+        let read = store.list_sessions(None);
+        assert!(
+            matches!(
+                read,
+                Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_))
+            ),
+            "a truncated database must never read as an empty store: {read:?}"
+        );
     }
 }
 
@@ -395,11 +417,19 @@ fn expected_state_mismatch_same() {
 fn alloc_op_ids_rejects_zero_count_and_sequence_exhaustion() {
     let (_d, store) = tmp_store();
     let hw0 = store.op_id_seq_high_water().unwrap();
-    assert!(store.alloc_op_ids(SessionId::new(1), 0).is_err());
+    // Catches a zero/overflow reservation that returns a generic error or
+    // moves the sequence: both are typed Conflicts with the exact reason.
+    assert!(matches!(
+        store.alloc_op_ids(SessionId::new(1), 0),
+        Err(StoreError::Conflict(ref m)) if m.contains("non-zero")
+    ));
     // A reservation crossing the signed INTEGER column ceiling is
     // refused and writes nothing (checked before the UPDATE).
     let overflow = i64::MAX as u64 - hw0 + 1;
-    assert!(store.alloc_op_ids(SessionId::new(1), overflow).is_err());
+    assert!(matches!(
+        store.alloc_op_ids(SessionId::new(1), overflow),
+        Err(StoreError::Conflict(ref m)) if m.contains("exhausted")
+    ));
     assert_eq!(
         store.op_id_seq_high_water().unwrap(),
         hw0,

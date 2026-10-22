@@ -182,6 +182,20 @@ fn denial_is_typed_and_blocks_the_action() {
         .unwrap_err();
     assert!(matches!(error, ApprovalError::Denied { .. }));
     assert_eq!(error.code(), "approval_denied");
+    // Breaks if a denial is projected as an approval or forks the audit chain.
+    assert_eq!(authority.status(&request.id).unwrap().status, "denied");
+    let view = &authority.list().unwrap()[0];
+    assert!(matches!(
+        view.decision.as_ref().unwrap().outcome,
+        DecisionOutcome::Denied { .. }
+    ));
+    let entries = authority.audit(Some(&request.id)).unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "denial records exactly request + decision"
+    );
+    assert_eq!(entries[1].prev_digest, entries[0].digest);
 }
 
 #[test]

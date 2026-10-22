@@ -53,7 +53,7 @@ fn wire_text(turns: &[RecentTurn]) -> String {
 }
 
 #[tokio::test]
-#[ignore = "scale probe (10k forced compaction cycles)"]
+#[ignore = "[perf] scale probe (10k forced compaction cycles)"]
 async fn scale_10k_forced_compactions() {
     let dir = tempfile::tempdir().unwrap();
     let manager =
@@ -210,7 +210,7 @@ async fn scale_10k_forced_compactions() {
 }
 
 #[tokio::test]
-#[ignore = "scale probe (10k-turn durable session)"]
+#[ignore = "[perf] scale probe (10k-turn durable session)"]
 async fn scale_10k_turn_session() {
     let dir = tempfile::tempdir().unwrap();
     let manager =

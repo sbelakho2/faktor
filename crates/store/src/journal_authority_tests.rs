@@ -11,46 +11,59 @@ pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-/// (d) evidence: the doctor journal sweep at 5k sessions. The sweep runs
-/// the per-session authority per session; THIS measurement pins what that
-/// costs at scale (before/after the batched rewrite).
+/// The doctor sweep must flag EXACTLY the torn session at scale and never
+/// spill an issue onto a healthy neighbour.
 #[test]
-fn journal_sweep_measurement() {
+fn journal_sweep_flags_exactly_the_torn_session_and_never_its_neighbours() {
     let (_d, store) = tmp_store();
     let ws = store.create_workspace("/w").unwrap();
+    let healthy: Vec<_> = (0..32)
+        .map(|i| {
+            store
+                .create_session(ws, &format!("healthy-{i}"), "p", "m")
+                .unwrap()
+        })
+        .collect();
+    let torn = store.create_session(ws, "torn", "p", "m").unwrap();
+    store
+        .append_event(
+            torn.id,
+            None,
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            now_ms(),
+            None,
+        )
+        .unwrap();
     {
         let conn = store.raw_conn();
-        let tx = conn.unchecked_transaction().unwrap();
-        for sid in 1..=5_000i64 {
-            tx.execute(
-                "INSERT INTO session(id, workspace_id, title, provider, model, state,
-                                     created_ms, updated_ms)
-                 VALUES (?1, ?2, 't', 'p', 'm', '\"idle\"', 1, 1)",
-                params![sid, ws.raw() as i64],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO event(seq, session_id, kind, state, ts_ms)
-                 VALUES (1, ?1, 'session_created', '\"idle\"', 1)",
-                params![sid],
-            )
-            .unwrap();
-            for seq in 2..=5i64 {
-                tx.execute(
-                    "INSERT INTO event(seq, session_id, kind, state, ts_ms)
-                     VALUES (?1, ?2, 'auth_state_changed', '\"idle\"', ?1)",
-                    params![seq, sid],
-                )
-                .unwrap();
-            }
-        }
-        tx.commit().unwrap();
+        conn.execute(
+            "DELETE FROM event WHERE session_id = ?1 AND seq = 1",
+            params![torn.id.raw() as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE event SET seq = 1 WHERE session_id = ?1 AND seq = 2",
+            params![torn.id.raw() as i64],
+        )
+        .unwrap();
     }
-    let started = std::time::Instant::now();
     let issues = store.journal_consistency_issues().unwrap();
-    let elapsed = started.elapsed();
-    assert!(issues.is_empty(), "{issues:?}");
-    println!("journal sweep 5k sessions x 5 events: {elapsed:?}");
+    // Catches a sweep that crosses session boundaries or under/over-reports.
+    assert_eq!(issues.len(), 2, "{issues:?}");
+    for issue in &issues {
+        assert!(
+            issue.contains(&format!("session {}:", torn.id.raw())),
+            "issue must name the torn session: {issue}"
+        );
+    }
+    for healthy in &healthy {
+        let needle = format!("session {}:", healthy.id.raw());
+        assert!(
+            issues.iter().all(|issue| !issue.contains(&needle)),
+            "healthy session {needle} must not be flagged: {issues:?}"
+        );
+    }
 }
 
 #[test]

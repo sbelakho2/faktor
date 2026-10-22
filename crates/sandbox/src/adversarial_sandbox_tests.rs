@@ -230,9 +230,11 @@ fn filesystem_projection_is_enforcement_honest() {
         };
         assert_eq!(policy.spawn_profile().filesystem, tag, "{read:?}/{write:?}");
     }
-    // Determinism and serde round-trip of the projection (it is evidence).
+    // Determinism (independent rebuild) and serde round-trip of the
+    // projection (it is evidence).
     let policy = locked(FilesystemGuarantee::Required);
-    assert_eq!(policy.spawn_profile(), policy.spawn_profile());
+    let reprojected = locked(FilesystemGuarantee::Required);
+    assert_eq!(policy.spawn_profile(), reprojected.spawn_profile());
     let back: SpawnProfile =
         serde_json::from_value(serde_json::to_value(policy.spawn_profile()).unwrap()).unwrap();
     assert_eq!(back, policy.spawn_profile());

@@ -735,18 +735,30 @@ mod tests {
     }
 
     #[test]
-    fn assumption_carries_falsifier_and_provenance() {
-        let assumption = Assumption::new(
-            "a1",
-            "freight rate holds for 30 days",
-            "carrier quote was captured today",
-            provenance(),
-            "a carrier re-quote above the assumed rate",
-        )
-        .unwrap();
-        assert!(assumption.validate().is_ok());
-        let term = Term::assumption(10_u32, assumption);
-        assert!(term.validate().is_ok());
+    fn a_falsifier_free_or_evidence_free_assumption_is_refused() {
+        // Breaks if an assumption can launder an unfalsifiable claim into a known term.
+        assert!(matches!(
+            Assumption::new(
+                "a1",
+                "freight rate holds for 30 days",
+                "carrier quote was captured today",
+                provenance(),
+                "",
+            ),
+            Err(ExactError::OutOfBounds {
+                what: "assumption falsifier",
+                ..
+            })
+        ));
+        let mut provenance = provenance();
+        provenance.falsifier.clear();
+        assert!(matches!(
+            Assumption::new("a2", "claim", "rationale", provenance, "falsifier"),
+            Err(ExactError::OutOfBounds {
+                what: "provenance falsifier",
+                ..
+            })
+        ));
     }
 
     #[test]

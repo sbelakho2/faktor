@@ -505,7 +505,13 @@ mod tests {
         assert_eq!(first.body.as_bytes(), second.body.as_bytes());
 
         let hits = [("p".to_string(), 1u32), ("p".to_string(), 1)];
-        assert_eq!(render_search(&hits), render_search(&hits));
+        // Break caught: a renderer that emits duplicate hits (or a
+        // non-canonical grammar/body) while still being "deterministic".
+        let first_search = render_search(&hits);
+        assert_eq!(first_search.body, "p|1");
+        assert_eq!(first_search.grammar, SEARCH_GRAMMAR);
+        let second_hits = hits.to_vec();
+        assert_eq!(render_search(&second_hits), first_search);
 
         let failed = [("t".to_string(), "m".to_string())];
         assert_eq!(

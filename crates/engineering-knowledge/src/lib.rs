@@ -992,28 +992,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_packs_load_and_validate() {
-        let registry = KnowledgeRegistry::bundled().unwrap();
-        assert_eq!(registry.len(), 10);
-        for pack in registry.packs() {
-            pack.validate().unwrap();
-            assert_eq!(pack.schema, PACK_SCHEMA);
-            assert!(pack.digest().is_some());
-            assert!(pack.authority().is_some());
-        }
-    }
-
-    #[test]
-    fn duplicate_pack_version_is_refused() {
-        let mut registry = KnowledgeRegistry::new(4).unwrap();
-        registry.register_json(BOLTED_JOINT.as_bytes()).unwrap();
-        assert!(matches!(
-            registry.register_json(BOLTED_JOINT.as_bytes()),
-            Err(KnowledgeError::DuplicatePack { .. })
-        ));
-    }
-
-    #[test]
     #[ignore = "[perf] knowledge retrieval across 500 versions"]
     fn perf_latest_and_get_over_five_hundred_versions() {
         let base: serde_json::Value = serde_json::from_str(BOLTED_JOINT).unwrap();

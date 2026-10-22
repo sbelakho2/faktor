@@ -3099,13 +3099,6 @@ mod tests {
     /// not in the tool layer).
     const SCHEMA_BYTES: usize = 1095;
     const SCHEMA_MAX_BYTES: usize = 1536;
-    const SCHEMA_MAX_TOKENS: usize = SCHEMA_MAX_BYTES / 4;
-
-    #[test]
-    fn schema_token_budget_is_small_and_stable() {
-        let bytes = serde_json::to_vec(&source_market_schema()).unwrap();
-        assert!(bytes.len() / 4 <= SCHEMA_MAX_TOKENS);
-    }
 
     #[test]
     fn per_op_validation_failures_are_typed() {

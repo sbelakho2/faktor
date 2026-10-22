@@ -1091,8 +1091,22 @@ mod tests {
         let provider =
             GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("gemini-x"));
-        let first = stream.next().await.unwrap();
-        assert!(first.is_err());
+        // Fails if a malformed frame is classified as retryable or the
+        // parser keeps streaming after the terminal error.
+        let err = stream
+            .next()
+            .await
+            .expect("one terminal item")
+            .expect_err("malformed SSE must be an error");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("stream must terminate")
+                .is_none(),
+            "no events may survive the malformed terminal error"
+        );
     }
 
     #[tokio::test]

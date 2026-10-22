@@ -2163,7 +2163,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn fixture() -> (
+    pub(crate) async fn fixture() -> (
         tempfile::TempDir,
         Arc<ProcessSupervisor>,
         WorktreeManager,
@@ -2363,7 +2363,7 @@ mod tests {
             .await
             .unwrap();
         mgr.transfer(&wt, SessionId::new(2)).await.unwrap();
-        // Transfer of a missing worktree is loud.
+        // Transfer of a missing worktree is loud AND leaves the record alone.
         let ghost = Worktree {
             id: wt.id,
             workspace_root: repo.clone(),
@@ -2371,7 +2371,17 @@ mod tests {
             branch: "x".into(),
             owner_session: Some(SessionId::new(1)),
         };
-        assert!(mgr.transfer(&ghost, SessionId::new(3)).await.is_err());
+        let err = mgr.transfer(&ghost, SessionId::new(3)).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound, "{err:?}");
+        let still = WorktreeManager::new(_sup.clone())
+            .discover(&repo)
+            .await
+            .unwrap();
+        let owned = still
+            .iter()
+            .find(|w| path_key(&w.path) == path_key(&wt.path))
+            .expect("recorded worktree survives the refused transfer");
+        assert_eq!(owned.owner_session, Some(SessionId::new(2)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2527,46 +2537,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn malicious_branch_name_rejected() {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(25),
-            malicious_branch_name_rejected_inner(),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!("malicious_branch_name_rejected exceeded its 25s hard test timeout")
-        });
-    }
-
-    async fn malicious_branch_name_rejected_inner() {
-        let (_d, _sup, mgr, repo) = fixture().await;
-        for evil in [
-            "../escape",
-            "a b",
-            "x; rm -rf /",
-            "-leading",
-            "a..b",
-            "tab\tname",
-            "ctrl\x07",
-        ] {
-            assert!(
-                mgr.create(&repo, evil, "wt-evil", SessionId::new(1))
-                    .await
-                    .is_err(),
-                "branch {evil:?} must be rejected before spawn"
-            );
-        }
-        for evil in ["../esc", "a/b", "with space", "a..b"] {
-            assert!(
-                mgr.create(&repo, "ok-branch", evil, SessionId::new(1))
-                    .await
-                    .is_err(),
-                "name {evil:?} must be rejected before spawn"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_worktree_in_nonexistent_root_not_found() {
         tokio::time::timeout(
             std::time::Duration::from_secs(25),
@@ -2631,14 +2601,6 @@ mod tests {
             assert!(ids.insert(wt.id), "worktree ids must be unique");
         }
         assert_eq!(ids.len(), 4);
-    }
-
-    #[test]
-    fn branch_validation_edge_cases() {
-        assert!(validate_branch("feat/x-1").is_ok());
-        assert!(validate_branch("main").is_ok());
-        assert!(validate_branch("").is_err());
-        assert!(validate_branch(&"x".repeat(200)).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -414,15 +414,24 @@ mod tests {
 
     #[test]
     fn hostile_routing_mode_values_are_rejected() {
-        for bad in [
-            serde_json::json!("auto"),
-            serde_json::json!({"pinned": {"provider": "p"}}), // model missing
-            serde_json::json!({"economy": {}}),
-            serde_json::json!(42),
+        // Break caught: a routing-mode decoder that silently defaults to
+        // Economy for an unknown/prose value or accepts a pin without a model.
+        for (bad, expected) in [
+            (serde_json::json!("auto"), "unknown variant `auto`"),
+            (
+                serde_json::json!({"pinned": {"provider": "p"}}),
+                "missing field `model`",
+            ),
+            (
+                serde_json::json!({"economy": {}}),
+                "invalid type: map, expected unit",
+            ),
+            (serde_json::json!(42), "invalid type: integer `42`"),
         ] {
+            let err = serde_json::from_value::<RoutingMode>(bad).unwrap_err();
             assert!(
-                serde_json::from_value::<RoutingMode>(bad).is_err(),
-                "hostile routing mode must be rejected"
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
             );
         }
     }

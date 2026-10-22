@@ -1158,7 +1158,15 @@ mod tests {
 
     #[test]
     fn parse_duplicate_within_endpoints_fails() {
-        assert!(NetworkGate::parse(["example.com", "EXAMPLE.com"]).is_err());
+        // Fails if the gate silently keeps the LAST duplicate rule (a
+        // policy-confusion bug) or fails without naming the offending entry.
+        let err = NetworkGate::parse(["example.com", "EXAMPLE.com"]).unwrap_err();
+        assert_eq!(err.line, 2);
+        assert_eq!(err.entry, "EXAMPLE.com");
+        assert!(
+            err.reason.starts_with("duplicate rule:"),
+            "typed duplicate reason, got {err:?}"
+        );
     }
 
     #[test]
@@ -1417,9 +1425,16 @@ mod tests {
                 shell: "os_isolated".into(),
             }
         );
-        // Deterministic: the same policy projects the same profile, and the
-        // profile round-trips through serde (it is recorded as evidence).
-        assert_eq!(locked.spawn_profile(), locked.spawn_profile());
+        // Deterministic: an independently rebuilt identical policy projects
+        // the same profile, and the profile round-trips through serde (it is
+        // recorded as evidence).
+        let reprojected = SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        assert_eq!(locked.spawn_profile(), reprojected.spawn_profile());
         let json = serde_json::to_value(locked.spawn_profile()).unwrap();
         let back: SpawnProfile = serde_json::from_value(json).unwrap();
         assert_eq!(back, locked.spawn_profile());

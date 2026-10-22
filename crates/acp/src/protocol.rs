@@ -853,8 +853,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_body_is_a_parse_error_not_a_hang() {
+    fn zero_length_body_is_a_recoverable_json_error_at_the_declared_boundary() {
         let frame = b"Content-Length: 0\r\n\r\n";
-        assert!(parse_frame(frame).is_err());
+        // Fails if an empty body is treated as "incomplete" (hang) or as a
+        // fatal framing error that desyncs the following valid frame.
+        let err = parse_frame_detailed(frame).unwrap_err();
+        assert!(!err.fatal, "{err:?}");
+        assert_eq!(err.consumed, frame.len());
+        assert!(err.message.starts_with("invalid JSON body"), "{err:?}");
     }
 }

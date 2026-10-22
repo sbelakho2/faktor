@@ -1,8 +1,5 @@
 use std::time::{Duration, Instant};
 
-use faktor_supply_engineering_traps::fixtures::{
-    convergence_pathology, manufactured_solution_study, mesh_fixture_probe,
-};
 use faktor_supply_engineering_traps::{
     case_ids, evaluate_answer, negative_control, oracle_expectation, run_case, run_suite,
     BenchError, ExpectedKind, Observation, SuiteReport, SutOutcome, MAX_BOUNDARIES, MAX_CASES,
@@ -134,6 +131,17 @@ fn oracle_is_independent_and_sut_has_no_metric_api() {
     let lib_source = std::fs::read_to_string(format!("{manifest}/src/lib.rs")).expect("lib source");
     assert!(!lib_source.contains("pub struct Metrics"));
     assert!(!lib_source.contains("with_physics"));
+    // Every case has exactly one independent expectation: no aliasing lets a
+    // case score itself against another case's oracle.
+    let ids = case_ids();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "duplicate case id");
+    for id in ids {
+        assert!(
+            oracle_expectation(id).is_some(),
+            "case {id} has no independent oracle expectation"
+        );
+    }
     let suite = run_suite().expect("suite");
     let value = serde_json::to_value(&suite).expect("json value");
     for case in value["cases"].as_array().expect("cases") {
@@ -390,14 +398,5 @@ fn suite_completes_inside_a_fixed_time_budget() {
     );
 }
 
-#[test]
-fn adversarial_fixtures_are_refused_or_detected() {
-    let probe = mesh_fixture_probe();
-    assert!(probe.ok(), "mesh fixtures: {probe:?}");
-    assert!(convergence_pathology(&[0.40, 0.35, 0.36, 0.22]).is_some());
-    assert!(convergence_pathology(&[0.40, 0.20, 0.10, 0.095]).is_some());
-    assert!(convergence_pathology(&[0.4, f64::NAN, 0.1]).is_some());
-    let study = manufactured_solution_study().expect("manufactured solution");
-    assert_eq!(study.len(), 5);
-    assert!(study.windows(2).all(|pair| pair[1].1 < pair[0].1));
-}
+// Mesh and manufactured-solution adversarial coverage lives in the fixture
+// unit tests, which exercise the same real parser without a duplicate suite run.

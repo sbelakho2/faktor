@@ -4,7 +4,9 @@
     "fault",
     "security",
     "release",
-    "visual"
+    "visual",
+    "perf",
+    "live"
   ],
   "required_nightly_lanes": [
     "fault",
@@ -97,6 +99,210 @@
       "fn": "read_path_before_after",
       "tag": "fault",
       "reason": "operator-run query-planner audit benchmark; excluded from CI by design and executed manually when the plan shape changes (the source marks it \"manual audit benchmark\")"
+    },
+    {
+      "file": "crates/agent/src/outcome_ledger_tests.rs",
+      "fn": "outcome_metrics_snapshot_probe_beats_the_historical_page_walk",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/agent/src/runtime/extreme_scale_probes.rs",
+      "fn": "scale_10k_forced_compactions",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/agent/src/runtime/extreme_scale_probes.rs",
+      "fn": "scale_10k_turn_session",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/agent/src/wire_plan.rs",
+      "fn": "perf_probe_evidence_dedupe_against_one_million_token_history",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/agent/src/wire_plan.rs",
+      "fn": "perf_probe_ten_thousand_messages_one_million_tokens",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/approval/tests/approval.rs",
+      "fn": "perf_approval_ledger_verify_decide_authorize",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/cli/src/indep_coding_audit.rs",
+      "fn": "indep_coding_task_audit",
+      "tag": "live",
+      "reason": "manual live-environment test: needs the real tool/service and this repository; run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/engineering-knowledge/src/lib.rs",
+      "fn": "perf_latest_and_get_over_five_hundred_versions",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/impact/src/query.rs",
+      "fn": "perf_crate_lookup_is_linear_in_path_depth",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/impact/tests/freshness.rs",
+      "fn": "perf_10k_files_incremental_refresh_is_bounded",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/impact/tests/live_rust_analyzer.rs",
+      "fn": "fault_live_rust_analyzer_relationships",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/impact/tests/live_rust_analyzer.rs",
+      "fn": "fault_live_rust_analyzer_this_repository",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/orchestrator/src/merge_tests.rs",
+      "fn": "perf_base_map_reads_do_not_scan_the_fact_table",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/server/src/native/concurrency_probe_tests.rs",
+      "fn": "target_shape_128sessions_200children_64streams_32readers",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/src/board.rs",
+      "fn": "perf_board_read_is_type_scoped_at_100k_history_rows",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/src/child.rs",
+      "fn": "fault_probe_200_children_10k_steering_messages",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/session/src/extreme_scale_probes.rs",
+      "fn": "scale_10k_compaction_operations_under_a_backward_clock",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/src/extreme_scale_probes.rs",
+      "fn": "scale_large_context_checkpoint_reads",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/src/handle.rs",
+      "fn": "perf_delete_message_batches_parts_reads",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/tests/concurrency_probe.rs",
+      "fn": "journal_append_and_tail_catch_up_are_linear_at_100k",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/session/tests/concurrency_probe.rs",
+      "fn": "session_resolution_p95_under_64_way_concurrency",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/store/src/extreme_scale_probes.rs",
+      "fn": "scale_100k_events",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/store/src/extreme_scale_probes.rs",
+      "fn": "scale_100k_facts",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/store/src/extreme_scale_probes.rs",
+      "fn": "scale_10k_checkpoints_and_restart_storm",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/store/src/messages.rs",
+      "fn": "fault_transcript_search_scan_is_streaming_and_prefiltered",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/store/src/messages.rs",
+      "fn": "messages_page_parts_batch_is_much_cheaper_than_per_row_reads",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/store/src/session_listing_tests.rs",
+      "fn": "fault_history_walk_is_keyset_bounded_at_one_million_sessions",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/supply-execution/src/lib.rs",
+      "fn": "perf_thousand_quotes_compare_in_n_log_n",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/supply-planning/src/lib.rs",
+      "fn": "perf_ten_thousand_part_bom_chain_is_linear",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "crates/supply-supplier/src/lib.rs",
+      "fn": "perf_supplier_matching_is_index_bound",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "tests/longrun/tests/extreme_scale.rs",
+      "fn": "extreme_long_task_10k_turns_10k_compactions_100k_facts",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "tests/production-wiring/tests/semantic_native.rs",
+      "fn": "live_rust_analyzer_returns_real_definitions_references_and_affected_files",
+      "tag": "live",
+      "reason": "manual live-environment test: needs the real tool/service and this repository; run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "tests/production-wiring/tests/semantic_native.rs",
+      "fn": "real_repository_index_and_impact_are_measured_and_not_quadratic",
+      "tag": "perf",
+      "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "tests/quality/src/memory_pager_plan_tests.rs",
+      "fn": "fault_memory_pagers_and_counts_stay_index_backed_at_1m_churn",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
     }
   ],
   "non_test": [
@@ -104,6 +310,11 @@
       "file": "crates/git/src/guard.rs",
       "fn": "windows_lease_holder_helper",
       "reason": "re-exec helper process (carries #[test] + #[ignore] only to be drivable), not a test; exercised by the Windows multiprocess lease tests"
+    },
+    {
+      "file": "crates/core/src/contract_compile.rs",
+      "fn": "totals_add_up",
+      "reason": "source-text fixture inside a test (`#[ignore = \"manual\"]` inside a raw string), not an ignored test"
     }
   ]
 }

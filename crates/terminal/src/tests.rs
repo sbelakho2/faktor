@@ -1527,29 +1527,27 @@ async fn missing_command_is_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dbg_50_spawns() {
+async fn fifty_spawns_are_reaped_once_and_leave_no_registered_owner() {
     let (_d, sup) = supervisor();
     let mut ids = std::collections::HashSet::new();
     for _ in 0..50 {
         let h = sup.spawn(sh("true")).unwrap();
-        ids.insert(h.id);
+        assert!(ids.insert(h.id), "a live child id was reused");
     }
-    eprintln!("dbg: spawned 50, registered={}", sup.registered());
-    for i in 0..80 {
-        std::thread::sleep(Duration::from_millis(50));
-        let r = sup.reap();
-        if !r.is_empty() {
-            eprintln!("dbg: first reap at iter {i}, count={}", r.len());
-        }
-        if r.len() >= 50 {
-            break;
-        }
+    let mut reaped = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Fails if a reaped child keeps its registry owner (an orphan by
+    // ownership) or a registration is reaped twice (double-release).
+    while std::time::Instant::now() < deadline && sup.registered() != 0 {
+        reaped += sup.reap().len();
+        std::thread::sleep(Duration::from_millis(10));
     }
-    eprintln!(
-        "dbg: final reaped={} registered={}",
-        sup.reap().len(),
-        sup.registered()
+    reaped += sup.reap().len();
+    assert_eq!(
+        reaped, 50,
+        "every spawned child must be reaped exactly once"
     );
+    assert_eq!(sup.registered(), 0, "no registration may outlive reaping");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1639,11 +1639,14 @@ mod tests {
         input.service_level_ppm = 500_000;
         let result = plan(&input).unwrap();
         let parent = &result.parts[0];
-        assert!(parent
-            .planned_orders
-            .iter()
-            .all(|order| order.receipt_period != 0));
-        assert!(parent.projected_end.is_known());
+        // Breaks if confirmed supply is ignored, double-counted, or reordered.
+        assert_eq!(parent.confirmed[0].get(), 900);
+        assert!(
+            parent.planned_orders.is_empty(),
+            "{:?}",
+            parent.planned_orders
+        );
+        assert_eq!(parent.projected_end.as_known().unwrap().get(), 0);
     }
 
     #[test]

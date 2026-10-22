@@ -240,13 +240,3 @@ fn the_manifest_has_no_http_client_outside_dev_dependencies() {
         "test doubles belong in dev-dependencies"
     );
 }
-
-#[test]
-fn the_workspace_membership_is_declared() {
-    let workspace =
-        fs::read_to_string(manifest_dir().join("../../Cargo.toml")).expect("workspace readable");
-    assert!(
-        workspace.contains("\"crates/acquire\""),
-        "faktor-acquire must be a workspace member"
-    );
-}

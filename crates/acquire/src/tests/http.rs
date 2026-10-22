@@ -336,6 +336,23 @@ async fn cancellation_stops_an_in_flight_request() {
 }
 
 #[tokio::test]
+async fn cancellation_before_start_leaves_quota_and_transport_untouched() {
+    let transport = Arc::new(ScriptedTransport::new([ScriptedResponse::json(
+        r#"{"ok":true}"#,
+    )]));
+    let (ctx, _clock) = ctx_for(transport.clone());
+    ctx.cancellation().cancel();
+    let err = fetch_direct_http(&ctx, &HttpFetch::get(TEST_URL))
+        .await
+        .unwrap_err();
+    // Fails if cancellation is checked after quota consumption or after
+    // the transport is entered: both must remain exactly untouched.
+    assert_eq!(err, AcquisitionError::Cancelled);
+    assert_eq!(ctx.with_quota_state(|quota| quota.used), 0);
+    assert_eq!(transport.request_count(), 0);
+}
+
+#[tokio::test]
 async fn a_past_deadline_refuses_before_the_transport() {
     let transport = Arc::new(ScriptedTransport::new([ScriptedResponse::json("{}")]));
     let (ctx, _clock) = ctx_for(transport.clone());

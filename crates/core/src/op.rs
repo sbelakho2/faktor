@@ -232,11 +232,14 @@ mod tests {
     }
 
     #[test]
-    fn system_clock_is_monotonic_enough() {
+    fn system_clock_is_epoch_based_and_non_decreasing() {
+        // Break caught: a stub clock returning 0 or a pre-epoch constant,
+        // which would make every deadline look already expired.
         let c = SystemClock;
         let a = c.now_ms();
         let b = c.now_ms();
-        assert!(b >= a);
+        assert!(a > 1_600_000_000_000, "clock must be real epoch ms: {a}");
+        assert!(b >= a, "clock moved backwards: {a} then {b}");
     }
 
     #[test]

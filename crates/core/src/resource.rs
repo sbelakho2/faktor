@@ -144,8 +144,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "resource release without matching acquire")]
     fn double_release_is_loud() {
+        // Break caught: a double release that silently saturates at zero
+        // (masking an ownership bug) instead of panicking.
         let limits = ResourceLimits::default();
         let mut g = ResourceGauge::new();
         g.try_acquire(ResourceClass::Git, &limits).unwrap();

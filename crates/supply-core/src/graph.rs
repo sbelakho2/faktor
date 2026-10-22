@@ -1582,11 +1582,20 @@ mod tests {
     }
 
     #[test]
-    fn traversal_handles_a_cycle_without_looping() {
+    fn traversal_is_depth_bounded_and_visits_each_node_once() {
         let mut graph = SupplyGraph::new(Revision(1));
         let part_key = graph.add_node(part(1)).unwrap();
         let supplier_key = graph
             .add_node(supplier(1, SupplierRole::Manufacturer))
+            .unwrap();
+        let process = graph
+            .add_node(Node::Process(Process {
+                id: ProcessId(1),
+                name: "SMT".to_string(),
+                kind: ProcessKind::Smt,
+                capability: "0402..QFN".to_string(),
+                revision: Revision(1),
+            }))
             .unwrap();
         graph
             .add_edge(Edge {
@@ -1595,9 +1604,26 @@ mod tests {
                 kind: EdgeKind::Supplies,
             })
             .unwrap();
-        graph.traverse(part_key, MAX_TRAVERSAL_DEPTH);
-        graph.traverse(supplier_key, MAX_TRAVERSAL_DEPTH);
-        let _ = graph.canonical_bytes();
+        graph
+            .add_edge(Edge {
+                from: part_key,
+                to: process,
+                kind: EdgeKind::RequiresProcess,
+            })
+            .unwrap();
+        // Breaks if traversal revisits nodes, ignores depth, or fails to clamp MAX.
+        assert_eq!(
+            graph.traverse(supplier_key, MAX_TRAVERSAL_DEPTH),
+            vec![(supplier_key, 0), (part_key, 1), (process, 2)]
+        );
+        assert_eq!(
+            graph.traverse(supplier_key, 1),
+            vec![(supplier_key, 0), (part_key, 1)]
+        );
+        assert_eq!(
+            graph.traverse(supplier_key, usize::MAX),
+            graph.traverse(supplier_key, MAX_TRAVERSAL_DEPTH)
+        );
     }
 
     #[test]

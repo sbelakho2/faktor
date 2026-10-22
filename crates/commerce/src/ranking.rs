@@ -590,43 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn ranking_pipeline_drops_the_per_candidate_query_and_quantity_work() {
-        let offers: Vec<CommercialOffer> = (0..10_000).map(|i| offer(i, 4, 8)).collect();
-        let query = query();
-        let ctx = RankingContext::at_quantity(crate::quantity::Quantity::new(100).unwrap());
-        let mut old_best = u64::MAX;
-        let mut new_best = u64::MAX;
-        for _ in 0..2 {
-            let started = std::time::Instant::now();
-            for offer in &offers {
-                let pctx = pricing_ctx(&query, &ctx);
-                // The pre-fix ranking path: a fresh QueryView + full match
-                // (including a quantity quote), then its own scope/quote.
-                let signals = crate::matching::match_offer(&query, offer, 0).signals;
-                let _ = crate::quote::selected_scope(offer, &pctx);
-                let _ = crate::quote::resolve_quote(offer, &pctx, ctx.quantity);
-                std::hint::black_box(signals);
-            }
-            old_best = old_best.min(started.elapsed().as_nanos() as u64);
-
-            let started = std::time::Instant::now();
-            let view = QueryView::new(&query);
-            for offer in &offers {
-                let pctx = pricing_ctx(&query, &ctx);
-                let signals = match_signals_in_view(&view, offer);
-                let _ = crate::quote::resolve_quote_scoped(offer, &pctx, ctx.quantity);
-                std::hint::black_box(signals);
-            }
-            new_best = new_best.min(started.elapsed().as_nanos() as u64);
-        }
-        println!(
-            "PROBE rank_pipeline_10k old_ns={old_best} new_ns={new_best} \
-             reduction_pct={}",
-            (old_best.saturating_sub(new_best)) * 100 / old_best.max(1)
-        );
-    }
-
-    #[test]
     fn ranking_builds_the_query_view_once_for_10k_candidates() {
         let offers: Vec<CommercialOffer> = (0..10_000).map(|i| offer(i, 4, 8)).collect();
         let query = query();

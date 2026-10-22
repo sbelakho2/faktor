@@ -623,16 +623,36 @@ fn nested_wire_objects_refuse_unknown_fields_like_the_strict_schema() {
 
 #[test]
 fn oversized_or_unbounded_candidate_text_is_refused_at_validation() {
+    // Breaks if validation accepts oversized hostile text or an unbounded list.
     let mut request = example_request();
     request.candidates[0].processes = vec!["x".repeat(faktor_supply_core::MAX_TEXT_BYTES + 1)];
-    assert!(request.validate().is_err());
+    assert!(matches!(
+        request.validate(),
+        Err(crate::LoopError::Supply(
+            faktor_supply_core::ExactError::OutOfBounds {
+                what: "candidate process",
+                ..
+            }
+        ))
+    ));
 
     let mut request = example_request();
     request.candidates[0].processes =
         vec!["smt".to_string(); crate::MAX_LOOP_CANDIDATE_PROCESSES + 1];
-    assert!(request.validate().is_err());
+    assert!(matches!(
+        request.validate(),
+        Err(crate::LoopError::Invalid(message)) if message.contains("processes")
+    ));
 
     let mut request = example_request();
     request.negotiation.destination_country = "X".repeat(129);
-    assert!(request.validate().is_err());
+    assert!(matches!(
+        request.validate(),
+        Err(crate::LoopError::Supply(
+            faktor_supply_core::ExactError::OutOfBounds {
+                what: "negotiation destination country",
+                ..
+            }
+        ))
+    ));
 }

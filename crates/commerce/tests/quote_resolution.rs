@@ -368,6 +368,48 @@ fn ambiguous_variant_mapping_never_selects_the_cheapest_sku() {
 }
 
 #[test]
+fn variant_and_packaging_ambiguity_stays_typed_and_never_picks_the_cheapest() {
+    let mut offer = base_offer();
+    offer.variants = vec![
+        variant("v-cheap", None, vec![tier(1, "10.00")]),
+        variant("v-wanted", None, vec![tier(1, "20.00")]),
+    ];
+    offer.packaging = vec![
+        packaging_option(PackagingType::TapeAndReel, vec![tier(1, "1.00")]),
+        packaging_option(PackagingType::TapeAndReel, vec![tier(1, "2.00")]),
+    ];
+    let unspecified = resolve_quote(&offer, &ctx(), qty(10));
+    // Fails if variant ambiguity is resolved by price/order or packaging is
+    // consulted before the variant decision.
+    assert_eq!(unspecified.status, QuoteStatus::VariantAmbiguous);
+    assert!(unspecified.quote.is_none());
+    assert_eq!(unspecified.candidates.len(), 2);
+    assert_eq!(unspecified.price_range.expect("range").min, money("10.00"));
+
+    let selected = PricingContext {
+        variant: VariantRequest::Id("v-wanted"),
+        packaging: Some(PackagingType::TapeAndReel),
+        ..ctx()
+    };
+    let ambiguous = resolve_quote(&offer, &selected, qty(10));
+    assert_eq!(ambiguous.status, QuoteStatus::PackagingAmbiguous);
+    assert_eq!(
+        ambiguous.variant_id,
+        Some(VariantId::new("v-wanted").expect("id"))
+    );
+    assert_eq!(
+        ambiguous.packaging_candidates,
+        vec![PackagingType::TapeAndReel, PackagingType::TapeAndReel]
+    );
+    assert!(ambiguous.quote.is_none(), "never quote the cheapest pack");
+    // The selected variant's price list wins over either packaging tier, so
+    // both ambiguous candidates expose exactly the variant's 20.00.
+    let range = ambiguous.price_range.expect("range");
+    assert_eq!(range.min, money("20.00"));
+    assert_eq!(range.max, money("20.00"));
+}
+
+#[test]
 fn offer_level_prices_apply_when_variants_carry_no_prices() {
     let mut offer = spec_example_offer();
     offer.variants = vec![
@@ -862,35 +904,37 @@ fn duplicate_variant_ids_and_attributes_are_rejected() {
 }
 
 #[test]
-fn truncated_and_byte_mutated_documents_never_panic() {
+fn truncated_documents_are_eof_and_structural_mutation_is_syntax_never_partial() {
+    use serde_json::error::Category;
     let offer = spec_example_offer();
-    let json = serde_json::to_string(&offer).expect("serialize");
-    for end in 0..json.len() {
-        if let Some(slice) = json.get(..end) {
-            let _ = serde_json::from_str::<CommercialOffer>(slice);
-        }
+    let full = serde_json::to_string(&offer).expect("serialize");
+    assert_eq!(
+        serde_json::from_str::<CommercialOffer>(&full).expect("full document"),
+        offer
+    );
+    for end in 0..full.len() {
+        let slice = &full[..end];
+        // Fails if a truncated document is accepted as a default/partial
+        // value or misreported as a semantic/type error.
+        let err = serde_json::from_str::<CommercialOffer>(slice)
+            .expect_err("every proper prefix is truncated");
+        assert_eq!(err.classify(), Category::Eof, "prefix {end}");
     }
-    let bytes = json.as_bytes();
-    for index in 0..bytes.len() {
-        let mut mutated = bytes.to_vec();
-        mutated[index] = b'\x00';
-        if let Ok(text) = std::str::from_utf8(&mutated) {
-            let _ = serde_json::from_str::<CommercialOffer>(text);
-        }
+    for (label, mutated) in [
+        ("object-to-array", format!("[{}", &full[1..])),
+        ("unterminated-key", full.replacen('"', "'", 1)),
+        ("trailing-garbage", format!("{full}x")),
+    ] {
+        let err = serde_json::from_str::<CommercialOffer>(&mutated)
+            .expect_err("structural mutation must be rejected");
+        assert_eq!(err.classify(), Category::Syntax, "{label}");
     }
     let resolution = price_at_quantity(&offer, VariantRequest::None, qty(5000));
     let json = serde_json::to_string(&resolution).expect("serialize");
     for end in 0..json.len() {
-        if let Some(slice) = json.get(..end) {
-            let _ = serde_json::from_str::<QuoteResolution>(slice);
-        }
-    }
-    let money = Money::from_micros(Currency::CNY, i64::MAX);
-    let json = serde_json::to_string(&money).expect("serialize");
-    for end in 0..json.len() {
-        if let Some(slice) = json.get(..end) {
-            let _ = serde_json::from_str::<Money>(slice);
-        }
+        let err = serde_json::from_str::<QuoteResolution>(&json[..end])
+            .expect_err("truncated resolution");
+        assert_eq!(err.classify(), Category::Eof, "resolution prefix {end}");
     }
 }
 

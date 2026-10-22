@@ -3774,8 +3774,11 @@ pub(crate) async fn crash_after_run_base_recorded_restarts_cleanly() {
     assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err}");
     assert!(env.executor.active_run().is_none(), "the slot was released");
     assert_eq!(owner_digest(&env), before);
-    assert!(
-        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run").is_err() || true
+    // Break caught: a pre-spawn crash that still leaves child registry
+    // rows (phantom durable children) for the failed run.
+    assert_eq!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run").unwrap(),
+        Vec::new()
     );
     env.executor.set_settlement_crash_seam(None);
     let run_id = start_two_child_run(&env, "fresh start after base crash");

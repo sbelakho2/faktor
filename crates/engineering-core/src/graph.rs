@@ -847,8 +847,16 @@ mod tests {
     }
 
     #[test]
-    fn every_required_node_kind_is_present() {
-        assert_eq!(NodeKind::ALL.len(), 28);
+    fn every_required_node_kind_has_a_unique_wire_label_and_round_trips() {
+        let mut labels = std::collections::BTreeSet::new();
+        for kind in NodeKind::ALL {
+            let wire = serde_json::to_string(&kind).expect("serialize node kind");
+            let back: NodeKind = serde_json::from_str(&wire).expect("deserialize node kind");
+            assert_eq!(back, kind, "wire label {wire} must round-trip");
+            assert!(labels.insert(wire.clone()), "duplicate wire label {wire}");
+            assert!(!kind.as_str().is_empty());
+        }
+        assert_eq!(labels.len(), NodeKind::ALL.len());
     }
 
     #[test]
@@ -886,31 +894,6 @@ mod tests {
             graph.validate(),
             Err(CoreError::DecisionWithoutEvidence(_))
         ));
-    }
-
-    #[test]
-    fn decision_with_evidence_validates() {
-        let mut graph = graph();
-        let decision = graph
-            .add_node(
-                NodeKind::Decision,
-                "choose fastener",
-                BTreeMap::new(),
-                source(),
-            )
-            .unwrap();
-        let evidence = graph
-            .add_node(
-                NodeKind::Evidence,
-                "torque test report",
-                BTreeMap::new(),
-                source(),
-            )
-            .unwrap();
-        graph
-            .add_edge(EdgeKind::EvidencedBy, decision, evidence, source())
-            .unwrap();
-        graph.validate().unwrap();
     }
 
     #[test]

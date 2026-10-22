@@ -1660,6 +1660,63 @@ fn parallel_registrations_of_one_token_yield_exactly_one_winner() {
     }
 }
 
+/// Claim forgery: a valid worker token with a fabricated lease id is refused
+/// typed, lands no result, and does not consume or corrupt the real lease.
+#[test]
+fn forged_lease_claim_is_refused_typed_and_leaves_the_real_lease_live() {
+    for (label, h) in harnesses() {
+        let token = h.register("wrk_1", &["rust"]);
+        let job = h.schedule("forged-claim", &digest("a"));
+        let real = job.lease.as_ref().unwrap().lease_id.clone();
+        let forged = WorkerLeaseId::try_new("lease_attacker").unwrap();
+        let err = h
+            .plane
+            .submit_result(
+                &org("org_1"),
+                &worker_id("wrk_1"),
+                &token,
+                WORKER_PROTOCOL_VERSION,
+                &job.job.job_id,
+                JobGeneration::FIRST,
+                &forged,
+                &digest("a"),
+                JobResultOutcome::Succeeded,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::UnknownLease { ref lease, .. } if lease == &forged),
+            "{label}: {err}"
+        );
+        assert!(
+            h.store
+                .result(&job.job.job_id, JobGeneration::FIRST)
+                .unwrap()
+                .is_none(),
+            "{label}: a forged claim must never land a result"
+        );
+        h.plane
+            .submit_result(
+                &org("org_1"),
+                &worker_id("wrk_1"),
+                &token,
+                WORKER_PROTOCOL_VERSION,
+                &job.job.job_id,
+                JobGeneration::FIRST,
+                &real,
+                &digest("a"),
+                JobResultOutcome::Succeeded,
+            )
+            .unwrap();
+        assert!(
+            h.store
+                .result(&job.job.job_id, JobGeneration::FIRST)
+                .unwrap()
+                .is_some(),
+            "{label}: the refusal must not consume the real lease"
+        );
+    }
+}
+
 // ---------------------------------------------- audit P1: lease/journal atomicity
 
 /// Audit P1: the `lease_accepted` journal row commits in the SAME transaction

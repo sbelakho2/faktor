@@ -159,7 +159,16 @@ mod tests {
             ev(2, EventKind::PromptReceived, AgentState::Preparing),
             ev(3, EventKind::ModelStarted, AgentState::Streaming),
         ];
-        assert!(replay(&events).is_err(), "skipped states are corruption");
+        let err = replay(&events).unwrap_err();
+        // Break caught: replay that accepts Streaming directly from
+        // Preparing, or that reports corruption without the offending seq.
+        assert!(
+            matches!(&err, SessionError::Internal(m)
+                if m.contains("journal corruption")
+                    && m.contains("at seq 3")
+                    && m.contains("Preparing -> Streaming")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -242,7 +251,14 @@ mod tests {
             ev(2, EventKind::TurnCompleted, AgentState::Completed),
             ev(3, EventKind::PromptReceived, AgentState::Preparing),
         ];
-        assert!(replay(&events).is_err(), "terminal must be terminal");
+        let err = replay(&events).unwrap_err();
+        // Break caught: replay that resurrects a terminal session.
+        assert!(
+            matches!(&err, SessionError::Internal(m)
+                if m.contains("at seq 3")
+                    && m.contains("Completed -> Preparing")),
+            "{err}"
+        );
     }
 
     #[test]

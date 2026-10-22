@@ -281,6 +281,39 @@ mod scans {
         code
     }
 
+    /// Mask comments and literals but keep every masked RUN distinguishable
+    /// (a unique marker at the run start). Test-body comparisons then cannot
+    /// turn `bound["a"]` and `bound["b"]` into the same all-space token,
+    /// while assertion text INSIDE a fixture string still cannot match.
+    fn mask_runs_unique(src: &str) -> String {
+        let code = code_mask(src);
+        let mut out = src.as_bytes().to_vec();
+        let mut index = 0usize;
+        let mut i = 0usize;
+        while i < out.len() {
+            if code[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < out.len() && !code[i] {
+                i += 1;
+            }
+            for byte in out.iter_mut().take(i).skip(start) {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            let slot = index % (26 * 26);
+            index += 1;
+            out[start] = b'A' + (slot / 26) as u8;
+            if start + 1 < i && out[start + 1] != b'\n' {
+                out[start + 1] = b'a' + (slot % 26) as u8;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// Three-valued evaluation of a `cfg(…)` predicate.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Tv {
@@ -9772,5 +9805,907 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "approval test-token authority violations:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Test quality: mechanical joke-test scan.
+    //
+    // The audit's failure mode is a test that cannot fail for ANY
+    // implementation: a tautology (`assert!(true)`, `x || !x`,
+    // `is_ok() || is_err()`), a self-equality (`assert_eq!(x, x)`), an
+    // assertion-free body (construct/read-back with no expectation), a
+    // constant checked against its own literal, or a refusal-named test
+    // that only asserts the happy path. This scan is deliberately
+    // MECHANICAL: only shapes whose truth is independent of the
+    // implementation are refused. Assertions delegated to a named helper
+    // (`assert_*`, `reject`, `refuse`, `require`, …) count as evidence, so
+    // data-driven contract helpers are not false positives.
+    //
+    // Exemptions are exact and justified:
+    // * `#[ignore]` manual probes are not CI evidence (their tags are
+    //   checked separately by the certification ignored-test scan).
+    // * panic-regression tests (`*never_panic*`, `*does_not_panic*`) have
+    //   the panic itself as the failure mode; they are inherently
+    //   assertion-free.
+    // * external ABI pins (Windows flags/limits) assert OS-defined values,
+    //   which are not this repository's implementation choices.
+    // ------------------------------------------------------------------
+
+    /// True when `rel` is test code for the joke-test scan (Cargo
+    /// integration tests, unit-test-looking sources, Kotlin test sources,
+    /// the VS Code selftest scripts). Fixture trees are data, never tests.
+    fn is_quality_test_file(rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        if rel.contains("/fixtures/") || rel.contains("/testdata/") {
+            return false;
+        }
+        if rel.starts_with("crates/") || rel.starts_with("tests/") {
+            return rel.ends_with(".rs");
+        }
+        if rel.starts_with("apps/") {
+            return (rel.ends_with(".kt") || rel.ends_with(".kts"))
+                && (rel.contains("/src/test/") || rel.ends_with("Test.kt"))
+                || (rel.starts_with("apps/vscode/scripts/") && rel.ends_with(".mjs"));
+        }
+        false
+    }
+
+    fn walk_test_quality_files() -> Vec<String> {
+        let root = repo_root();
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("crates"), root.join("tests"), root.join("apps")];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if file_type.is_dir() {
+                    if matches!(
+                        name.as_ref(),
+                        "target"
+                            | "fixtures"
+                            | "testdata"
+                            | "node_modules"
+                            | "build"
+                            | "out"
+                            | ".gradle"
+                            | "bin"
+                            | "obj"
+                    ) || name.starts_with('.')
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let rel = normalize_rel(&rel);
+                    if is_quality_test_file(&rel) {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Strip all whitespace (used to compare assertion operands).
+    fn compact(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Mask only comments; strings stay visible. Used for JS/Kotlin, whose
+    /// test names are string literals.
+    fn comment_mask(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = src.as_bytes().to_vec();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if matches!(bytes[i], b'"' | b'\'' | b'`') {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    if bytes[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// Find the byte index of the `close` balancing the `open` at `from`.
+    fn matching_delimiter(src: &str, from: usize, open: u8, close: u8) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut i = from;
+        while i < bytes.len() {
+            if bytes[i] == open {
+                depth += 1;
+            } else if bytes[i] == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Every `macro!(args)` call in masked code: (offset, argument text).
+    /// Nested parentheses are respected; the returned text excludes the
+    /// surrounding parentheses.
+    fn macro_calls<'a>(code: &'a str, name: &str) -> Vec<(usize, &'a str)> {
+        let mut out = Vec::new();
+        let mut search = 0usize;
+        while let Some(found) = code[search..].find(name) {
+            let at = search + found;
+            let preceding = code[..at].chars().next_back();
+            if preceding.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                search = at + name.len();
+                continue;
+            }
+            let mut cursor = at + name.len();
+            let bytes = code.as_bytes();
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'(' {
+                if let Some(end) = matching_delimiter(code, cursor, b'(', b')') {
+                    out.push((at, &code[cursor + 1..end]));
+                    search = end + 1;
+                    continue;
+                }
+            }
+            search = at + name.len();
+        }
+        out
+    }
+
+    /// Split a macro argument list on top-level commas.
+    fn top_level_args(args: &str) -> Vec<&str> {
+        let bytes = args.as_bytes();
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(&args[start..i]);
+                    start = i + 1;
+                }
+                b'"' => {}
+                _ => {}
+            }
+        }
+        if start < args.len() {
+            out.push(&args[start..]);
+        }
+        out
+    }
+
+    /// Mechanically true assertions. Each entry names the class.
+    fn tautological_assertions(code: &str, base_line: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for (at, args) in macro_calls(code, "assert!") {
+            let compacted = compact(args);
+            if compacted == "true" {
+                out.push(format!(
+                    "assert!(true) at line {}",
+                    (base_line + line_of(code, at) - 1)
+                ));
+                continue;
+            }
+            if let Some((left, right)) = compacted.split_once("||") {
+                let left = left.trim();
+                let right = right.trim();
+                if let Some(inner) = right.strip_prefix('!') {
+                    if !left.is_empty() && inner == left {
+                        out.push(format!(
+                            "self-negation disjunction at line {}",
+                            (base_line + line_of(code, at) - 1)
+                        ));
+                    }
+                }
+                if left.ends_with(".is_ok()") && right.ends_with(".is_err()") {
+                    out.push(format!(
+                        "is_ok()||is_err() tautology at line {}",
+                        (base_line + line_of(code, at) - 1)
+                    ));
+                }
+            }
+            if let Some((left, right)) = compacted.split_once("==") {
+                if !left.is_empty() && left == right {
+                    out.push(format!(
+                        "self-equality at line {}",
+                        (base_line + line_of(code, at) - 1)
+                    ));
+                }
+            }
+        }
+        for (at, args) in macro_calls(code, "assert_eq!") {
+            let parts = top_level_args(args);
+            if parts.len() >= 2 {
+                let left = compact(parts[0]);
+                let right = compact(parts[1]);
+                // A repeated CALL is a determinism probe (it can fail for a
+                // nondeterministic implementation); a repeated value/path is
+                // the reflexive tautology this scan refuses.
+                if !left.is_empty() && left == right && !left.contains('(') {
+                    out.push(format!(
+                        "assert_eq! self-equality at line {}",
+                        (base_line + line_of(code, at) - 1)
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Tokens that witness a real expectation (or the possibility of
+    /// failure). A test with none of these cannot fail for any
+    /// implementation.
+    const ASSERTIVE_TOKENS: &[&str] = &[
+        "assert!",
+        "assert",
+        "assert_eq!",
+        "assert_ne!",
+        "debug_assert",
+        "assert_matches!",
+        "assert_",
+        "assert(",
+        "assertTrue",
+        "assertFalse",
+        "assertEquals",
+        "assertNull",
+        "assertNotNull",
+        "assertThrows",
+        "assertThat",
+        "expect(",
+        "shouldBe",
+        "panic!",
+        "unreachable!",
+        "fail(",
+        "reject",
+        "refuse",
+        "require",
+        "ensure",
+        "verify",
+        "check_",
+        "must_",
+        "invariant",
+        "unwrap_err",
+        "expect_err",
+        "?;",
+    ];
+
+    fn is_assertive(body: &str) -> bool {
+        ASSERTIVE_TOKENS.iter().any(|token| body.contains(token))
+    }
+
+    /// True when the body delegates to any function/method other than
+    /// `unwrap`/`expect`. Such a test may assert inside the helper; the
+    /// mechanical scanner cannot prove otherwise, so it is sampled by
+    /// review instead of being flagged (every entry in the audit's sampled
+    /// set was inspected with its helper).
+    fn has_delegated_call(body: &str) -> bool {
+        let bytes = body.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'!')
+                {
+                    i += 1;
+                }
+                let callee = &body[start..i];
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len()
+                    && bytes[j] == b'('
+                    && !matches!(
+                        callee,
+                        "unwrap"
+                            | "expect"
+                            | "Some"
+                            | "Ok"
+                            | "Err"
+                            | "None"
+                            | "new"
+                            | "default"
+                            | "from"
+                            | "into"
+                            | "String"
+                            | "Vec"
+                            | "Box"
+                            | "Arc"
+                            | "Rc"
+                            | "clone"
+                            | "to_owned"
+                            | "to_string"
+                            | "parse"
+                            | "format"
+                            | "vec"
+                    )
+                {
+                    return true;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn is_unwrap_only(body: &str) -> bool {
+        (body.contains(".unwrap(") || body.contains(".expect("))
+            && !ASSERTIVE_TOKENS
+                .iter()
+                .filter(|token| !matches!(**token, "expect(" | "?;"))
+                .any(|token| body.contains(token))
+    }
+
+    /// A compile-time constant expression: no calls other than `.len()`,
+    /// no unwrap/parse/constructor, and an uppercase/path head. A call
+    /// whose result is asserted is behavior, not a constant pin.
+    fn constant_operand(operand: &str) -> bool {
+        let compacted = compact(operand);
+        let without_len = compacted.replace(".len()", "");
+        if without_len.contains('(')
+            || without_len.contains("unwrap")
+            || without_len.contains("expect")
+            || without_len.contains('"')
+        {
+            return false;
+        }
+        let head = compacted
+            .trim_start_matches('(')
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .next()
+            .unwrap_or_default();
+        head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) || compacted.contains("::")
+    }
+
+    /// A body whose only statements are assertions on compile-time
+    /// constants pins its own definition rather than behavior.
+    fn is_constant_only(body: &str) -> bool {
+        let mut assertions = 0usize;
+        let mut rest = body.to_string();
+        for name in [
+            "assert_eq!",
+            "assert_ne!",
+            "assert!",
+            "debug_assert_eq!",
+            "debug_assert!",
+        ] {
+            for (at, args) in macro_calls(&rest.clone(), name) {
+                assertions += 1;
+                let end = at + name.len() + 1 + args.len() + 1;
+                let start = at;
+                let mut replacement = String::with_capacity(rest.len());
+                replacement.push_str(&rest[..start]);
+                replacement.push_str(&" ".repeat(end - start));
+                replacement.push_str(&rest[end..]);
+                rest = replacement;
+            }
+        }
+        if assertions == 0 || !compact(&rest).trim_matches(['{', '}', ';']).is_empty() {
+            return false;
+        }
+        let mut first_operands = Vec::new();
+        for name in ["assert_eq!", "assert_ne!", "assert!"] {
+            for (_, args) in macro_calls(body, name) {
+                first_operands.push(
+                    top_level_args(args)
+                        .first()
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        !first_operands.is_empty()
+            && first_operands
+                .iter()
+                .all(|operand| constant_operand(operand))
+    }
+
+    /// External ABI pins: OS-defined flag values, not implementation
+    /// choices. Exact (file, test) pairs, asserted load-bearing by the
+    /// accompanying test below.
+    const ABI_CONSTANT_PINS: &[(&str, &str)] = &[
+        (
+            "crates/terminal/src/containment_policy_tests.rs",
+            "windows_creation_is_suspended_until_assigned",
+        ),
+        ("crates/winjob/src/lib.rs", "frozen_winnt_abi_values"),
+    ];
+
+    fn abi_pin(rel: &str, test: &str) -> bool {
+        ABI_CONSTANT_PINS.contains(&(rel, test))
+    }
+
+    /// Test names whose failure mode is the panic itself; no assertion is
+    /// possible or needed.
+    fn panic_regression_name(name: &str) -> bool {
+        name.contains("never_panic")
+            || name.contains("does_not_panic")
+            || name.contains("no_longer_panics")
+            || name.contains("doesnt_panic")
+    }
+
+    /// Refusal vocabulary: a test with this name claims to prove a
+    /// rejection, so a body that only asserts the happy path is lying.
+    fn refusal_name(name: &str) -> bool {
+        [
+            "refus",
+            "reject",
+            "deny",
+            "invalid",
+            "forbid",
+            "hostile",
+            "malformed",
+            "corrupt",
+            "escape",
+            "traversal",
+            "must_not",
+            "never_accept",
+            "never_pick",
+            "never_win",
+            "never_select",
+            "fail",
+        ]
+        .iter()
+        .any(|token| name.contains(token))
+    }
+
+    /// True only when EVERY assertion in the body is a bare success
+    /// predicate (so a refusal-named test never proves the failure).
+    fn only_success_assertions(body: &str) -> bool {
+        let mut assertions = 0usize;
+        for name in ["assert!", "assert_eq!", "assert_ne!"] {
+            for (_, args) in macro_calls(body, name) {
+                assertions += 1;
+                let compacted = compact(args);
+                let success = (compacted.contains(".is_ok()")
+                    || compacted.contains(".is_some()")
+                    || compacted.starts_with("Ok(")
+                    || compacted.starts_with("Some("))
+                    && !compacted.contains("is_err")
+                    && !compacted.contains("Err(")
+                    && !compacted.contains("unwrap_err");
+                if !success {
+                    return false;
+                }
+            }
+        }
+        assertions > 0
+    }
+
+    fn has_error_expectation(body: &str) -> bool {
+        [
+            "is_err(",
+            "Err(",
+            "unwrap_err",
+            "expect_err",
+            "refus",
+            "reject",
+            "deny",
+            "panic!",
+            "should_panic",
+        ]
+        .iter()
+        .any(|token| body.contains(token))
+    }
+
+    /// Extract Rust test functions: (line, name, attributes, body).
+    fn rust_test_bodies(code: &str) -> Vec<(usize, String, String, String)> {
+        let mut out = Vec::new();
+        let mut search = 0usize;
+        while let Some(found) = code[search..].find("#[") {
+            let attr_at = search + found;
+            let rest = &code[attr_at + 2..];
+            let is_test = rest.starts_with("test]")
+                || rest.starts_with("test_case")
+                || rest.starts_with("tokio::test")
+                || rest.starts_with("rstest");
+            if !is_test {
+                search = attr_at + 2;
+                continue;
+            }
+            let Some(fn_found) = code[attr_at..].find("fn ") else {
+                break;
+            };
+            let fn_at = attr_at + fn_found;
+            let after = &code[fn_at + 3..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                search = fn_at + 3;
+                continue;
+            }
+            let Some(body_open) = code[fn_at..].find('{') else {
+                break;
+            };
+            let body_at = fn_at + body_open;
+            let Some(body_end) = matching_delimiter(code, body_at, b'{', b'}') else {
+                break;
+            };
+            let attrs = code[attr_at..fn_at].to_string();
+            out.push((
+                line_of(code, attr_at),
+                name,
+                attrs,
+                code[body_at + 1..body_end].to_string(),
+            ));
+            search = body_end + 1;
+        }
+        out
+    }
+
+    /// Brace matcher for JS/Kotlin: strings and template literals are
+    /// skipped, so braces in messages never truncate a test body.
+    fn matching_delimiter_js(src: &str, from: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut i = from;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b'"' | b'\'' | b'`' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == quote {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Extract JS/MJS `test("name", …)` / `it("name", …)` bodies from a
+    /// comment-masked source.
+    fn js_test_bodies(code: &str) -> Vec<(usize, String, String, String)> {
+        let mut out = Vec::new();
+        let mut search = 0usize;
+        while let Some(found) = code[search..].find("test(") {
+            let at = search + found;
+            let after = &code[at + 5..];
+            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                search = at + 5;
+                continue;
+            };
+            let Some(end_quote) = after[1..].find(quote) else {
+                break;
+            };
+            let name = after[1..1 + end_quote].to_string();
+            let name_end = at + 6 + end_quote;
+            let Some(open) = code[name_end..].find('{') else {
+                break;
+            };
+            let body_at = name_end + open;
+            let Some(body_end) = matching_delimiter_js(code, body_at) else {
+                break;
+            };
+            out.push((
+                line_of(code, at),
+                name,
+                String::new(),
+                code[body_at + 1..body_end].to_string(),
+            ));
+            search = body_end + 1;
+        }
+        out
+    }
+
+    /// Extract Kotlin `@Test fun name() { … }` bodies from a
+    /// comment-masked source.
+    fn kotlin_test_bodies(code: &str) -> Vec<(usize, String, String, String)> {
+        let mut out = Vec::new();
+        let mut search = 0usize;
+        while let Some(found) = code[search..].find("@Test") {
+            let at = search + found;
+            let Some(fn_found) = code[at..].find("fun ") else {
+                break;
+            };
+            let fn_at = at + fn_found;
+            let after = &code[fn_at + 4..];
+            let name: String = after
+                .trim_start_matches('`')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ' ')
+                .collect();
+            let Some(open) = code[fn_at..].find('{') else {
+                break;
+            };
+            let body_at = fn_at + open;
+            let Some(body_end) = matching_delimiter_js(code, body_at) else {
+                break;
+            };
+            out.push((
+                line_of(code, at),
+                name.trim().to_string(),
+                String::new(),
+                code[body_at + 1..body_end].to_string(),
+            ));
+            search = body_end + 1;
+        }
+        out
+    }
+
+    /// Tautologies in JS/Kotlin assertion dialects.
+    fn text_tautologies(body: &str, base_line: usize) -> Vec<String> {
+        let compacted = compact(body);
+        let mut out = Vec::new();
+        for needle in [
+            "expect(true).toBe(true)",
+            "expect(true).toEqual(true)",
+            "assertTrue(true)",
+            "assert.ok(true)",
+        ] {
+            if compacted.contains(needle) {
+                out.push(format!("{needle} at line {base_line}"));
+            }
+        }
+        if let Some(at) = compacted.find("assertEquals(") {
+            if let Some(end) = matching_delimiter(&compacted, at + "assertEquals".len(), b'(', b')')
+            {
+                let args = top_level_args(&compacted[at + "assertEquals".len() + 1..end]);
+                if args.len() >= 2 && compact(args[0]) == compact(args[1]) {
+                    out.push(format!("assertEquals self-equality at line {base_line}"));
+                }
+            }
+        }
+        if let Some(at) = compacted.find("expect(") {
+            if let Some(end) = matching_delimiter(&compacted, at + "expect".len(), b'(', b')') {
+                let subject = &compacted[at + "expect".len() + 1..end];
+                if let Some(matcher) = compacted[end..].strip_prefix(".toBe(") {
+                    if let Some(close) = matching_delimiter(matcher, 0, b'(', b')') {
+                        let expected = &matcher[1..close];
+                        if !subject.is_empty() && subject == expected {
+                            out.push(format!("expect self-equality at line {base_line}"));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every mechanical joke-test offender in one file.
+    fn joke_test_offenders(rel: &str, src: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let (rust_code, text_code) = if rel.ends_with(".rs") {
+            (mask_runs_unique(src), comment_mask(src))
+        } else {
+            let masked = comment_mask(src);
+            (masked.clone(), masked)
+        };
+        let tests = if rel.ends_with(".rs") {
+            rust_test_bodies(&rust_code)
+        } else if rel.ends_with(".mjs") {
+            js_test_bodies(&text_code)
+        } else {
+            kotlin_test_bodies(&text_code)
+        };
+        let mut out = Vec::new();
+        for (line, name, attrs, body) in tests {
+            out.extend(
+                tautological_assertions(&body, line)
+                    .into_iter()
+                    .map(|finding| format!("{rel}:{line}: {name}: {finding}")),
+            );
+            if !rel.ends_with(".rs") {
+                out.extend(
+                    text_tautologies(&body, line)
+                        .into_iter()
+                        .map(|finding| format!("{rel}:{line}: {name}: {finding}")),
+                );
+            }
+            if attrs.contains("ignore") {
+                continue;
+            }
+            if attrs.contains("should_panic") || panic_regression_name(&name) {
+                continue;
+            }
+            if !is_assertive(&body) {
+                if has_delegated_call(&body) {
+                    continue;
+                }
+                if is_unwrap_only(&body) {
+                    out.push(format!(
+                        "{rel}:{line}: {name}: success-only test (unwrap/expect, no expectation)"
+                    ));
+                } else if !body.contains('?') {
+                    out.push(format!("{rel}:{line}: {name}: assertion-free test body"));
+                }
+                continue;
+            }
+            if is_constant_only(&body) && !abi_pin(&rel, &name) {
+                out.push(format!(
+                    "{rel}:{line}: {name}: constant checked against its own definition"
+                ));
+            }
+            if refusal_name(&name)
+                && !has_error_expectation(&body)
+                && only_success_assertions(&body)
+            {
+                out.push(format!(
+                    "{rel}:{line}: {name}: refusal-named test asserts only the success path"
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn joke_test_scan_fires_on_every_mechanical_class() {
+        let planted = r#"
+#[test]
+fn literal_true() { assert!(true); }
+#[test]
+fn self_equality() {
+    let value = 1;
+    assert_eq!(value, value);
+}
+#[test]
+fn self_negation() {
+    let flag = true;
+    assert!(flag || !flag);
+}
+#[test]
+fn ok_or_err() {
+    let result: Result<(), ()> = Ok(());
+    assert!(result.is_ok() || result.is_err());
+}
+#[test]
+fn assertion_free() {
+    let value = 41;
+    let _ = value + 1;
+}
+#[test]
+fn unwrap_only() {
+    let value = Some(1).unwrap();
+    let _ = value;
+}
+#[test]
+fn constant_pin() {
+    assert_eq!(SCHEMA_VERSION, 7);
+}
+#[test]
+fn refuses_bad_input() {
+    assert!(parse("bad").is_ok());
+}
+"#;
+        let offenders = joke_test_offenders("crates/demo/src/lib.rs", planted);
+        for class in [
+            "assert!(true)",
+            "self-equality",
+            "self-negation",
+            "is_ok()||is_err()",
+            "assertion-free",
+            "success-only",
+            "constant checked against its own definition",
+            "refusal-named test asserts only the success path",
+        ] {
+            assert!(
+                offenders.iter().any(|line| line.contains(class)),
+                "planted {class} must fire: {offenders:#?}"
+            );
+        }
+        let clean = r#"
+#[test]
+fn refuses_bad_input_with_the_typed_error() {
+    let error = parse("bad").unwrap_err();
+    assert_eq!(error.code, 7);
+    assert_eq!(state().count(), 0);
+}
+#[test]
+fn derives_the_exact_owner_key() {
+    let first = principal(1).owner_key();
+    let second = principal(1).owner_key();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 64);
+}
+"#;
+        let offenders = joke_test_offenders("crates/demo/src/clean.rs", clean);
+        assert!(
+            offenders.is_empty(),
+            "a typed adversarial test must not fire: {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn no_mechanical_joke_tests_in_the_repository() {
+        let files = walk_test_quality_files();
+        let mut offenders = Vec::new();
+        let mut tests = 0usize;
+        for rel in &files {
+            let src = match std::fs::read_to_string(repo_root().join(rel)) {
+                Ok(src) => src,
+                Err(_) => continue,
+            };
+            if rel.ends_with(".rs") {
+                tests += rust_test_bodies(&mask_runs_unique(&src)).len();
+            } else if rel.ends_with(".mjs") {
+                tests += js_test_bodies(&comment_mask(&src)).len();
+            } else {
+                tests += kotlin_test_bodies(&comment_mask(&src)).len();
+            }
+            offenders.extend(joke_test_offenders(rel, &src));
+        }
+        assert!(
+            tests >= 7_000,
+            "joke-test scan found only {tests} tests across {} files; the walk is broken",
+            files.len()
+        );
+        assert_no_offenders("mechanical joke tests", &offenders, files.len(), 700);
     }
 }

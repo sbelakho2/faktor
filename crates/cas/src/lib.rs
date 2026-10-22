@@ -1299,11 +1299,25 @@ mod tests {
     }
 
     #[test]
-    fn put_bounded_rejects_oversized_before_hashing() {
+    fn put_bounded_refuses_oversized_exactly_without_publishing_and_accepts_the_boundary() {
         let (_d, cas) = tmp_cas();
         let big = vec![0u8; 10_000];
-        assert!(cas.put_bounded(&big, 9_999).is_err());
-        assert!(cas.put_bounded(&big, 10_000).is_ok());
+        // Catches a bound checked after hashing/compression or a refusal that
+        // still writes: the error must carry both sizes and publish nothing.
+        let err = cas.put_bounded(&big, 9_999).unwrap_err();
+        match err {
+            CasError::Oversized { max, actual } => assert_eq!((max, actual), (9_999, 10_000)),
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+        assert_eq!(cas.blob_count(), 0, "a refused put must not publish a blob");
+        let expected = FileHash::from(blake3::hash(&big).into());
+        assert_eq!(cas.put_bounded(&big, 10_000).unwrap(), expected);
+        assert_eq!(cas.blob_count(), 1);
+        assert_eq!(cas.get_verified_now(expected).unwrap(), big);
+        assert!(matches!(
+            cas.put_bounded(b"x", 0),
+            Err(CasError::Oversized { max: 0, actual: 1 })
+        ));
     }
 
     #[test]

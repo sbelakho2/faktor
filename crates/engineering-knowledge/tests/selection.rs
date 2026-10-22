@@ -221,21 +221,26 @@ fn caller_edits_to_the_selection_are_refused() {
 }
 
 #[test]
-fn material_and_conditions_are_part_of_the_decision() {
-    let mut request = request(
-        "bolt-material",
+fn registered_exclusions_force_typed_research_not_a_caller_override() {
+    // Breaks if exclusions are recorded but not enforced, or if a caller
+    // condition silently replaces the registered domain.
+    let selection = select(&request(
+        "bolt-excluded",
         Discipline::Mechanical,
         "preload",
-        &["qualified nut factor"],
+        &["uncalibrated torque tools", "gross yielding"],
         None,
-    );
-    request.material = Some("unqualified lubricant".to_string());
-    let selection = select(&request);
-    // The shipped bolted-joint domains do not restrict material, so this is
-    // still selected; the decision records the material in its request.
-    assert!(selection.is_all_selected());
-    assert_eq!(
-        selection.requests[0].material.as_deref(),
-        Some("unqualified lubricant")
-    );
+    ));
+    assert!(!selection.is_all_selected());
+    match &selection.selections[0] {
+        RequirementSelection::ResearchRequired {
+            reason,
+            sources_required,
+            ..
+        } => {
+            assert!(reason.contains("excluded"), "{reason}");
+            assert!(!sources_required.is_empty());
+        }
+        other => panic!("expected research-required, got {other:?}"),
+    }
 }

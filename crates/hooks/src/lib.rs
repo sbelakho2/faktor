@@ -1376,29 +1376,43 @@ mod tests {
     }
 
     #[test]
-    fn hostile_registrations_rejected() {
+    fn hostile_registrations_rejected_with_exact_reason_and_no_policy_mutation() {
         let r = HookRegistry::try_new().unwrap();
-        assert!(r
-            .register(HookSpec {
-                id: String::new(),
-                ..Default::default()
-            })
-            .is_err());
-        assert!(r
-            .register(HookSpec {
-                id: "d".into(),
-                command: "x".into(),
-                deadline_ms: 0,
-                ..Default::default()
-            })
-            .is_err());
+        let cases = [
+            (
+                HookSpec {
+                    id: String::new(),
+                    ..Default::default()
+                },
+                "hook id must be 1..=128 bytes",
+            ),
+            (
+                HookSpec {
+                    id: "d".into(),
+                    command: "x".into(),
+                    deadline_ms: 0,
+                    ..Default::default()
+                },
+                "hook deadline must be in (0, 300000] ms",
+            ),
+        ];
+        for (spec, expected) in cases {
+            // Catches an is_err-only policy that half-registers or returns a
+            // generic error: the exact reason and the empty registry are pinned.
+            assert_eq!(r.register(spec).unwrap_err(), expected);
+            assert!(
+                r.specs().is_empty(),
+                "a refused registration must not mutate"
+            );
+        }
         let ok = HookSpec {
             id: "d".into(),
             command: "true".into(),
             ..Default::default()
         };
         r.register(ok.clone()).unwrap();
-        assert!(r.register(ok).is_err(), "duplicate id rejected");
+        assert_eq!(r.register(ok).unwrap_err(), "duplicate hook id d");
+        assert_eq!(r.specs().len(), 1);
     }
 
     #[test]
@@ -1409,59 +1423,111 @@ mod tests {
             command: "true".into(),
             ..Default::default()
         };
-        for hostile in [
-            HookSpec {
-                stdout_cap: usize::MAX,
-                ..base.clone()
-            },
-            HookSpec {
-                stderr_cap: usize::MAX,
-                ..base.clone()
-            },
-            HookSpec {
-                stdout_cap: 0,
-                ..base.clone()
-            },
-            HookSpec {
-                args: vec!["a".into(); MAX_HOOK_ARGS + 1],
-                ..base.clone()
-            },
-            HookSpec {
-                args: vec!["a".repeat(MAX_HOOK_ARG_BYTES + 1)],
-                ..base.clone()
-            },
-            HookSpec {
-                args: vec!["a\0b".into()],
-                ..base.clone()
-            },
-            HookSpec {
-                env: vec![("PATH".into(), "x".into()); MAX_HOOK_ENV + 1],
-                ..base.clone()
-            },
-            HookSpec {
-                env: vec![("BAD=NAME".into(), "x".into())],
-                ..base.clone()
-            },
-            HookSpec {
-                env: vec![("GOOD".into(), "x\0y".into())],
-                ..base.clone()
-            },
-            HookSpec {
-                env: vec![("GOOD".into(), "v".repeat(MAX_HOOK_ENV_VALUE_BYTES + 1))],
-                ..base.clone()
-            },
-            HookSpec {
-                command: "tr\0ue".into(),
-                ..base.clone()
-            },
-            HookSpec {
-                events: vec![HookEvent::PreTool; HookEvent::ALL.len() + 1],
-                ..base
-            },
-        ] {
+        let caps = format!("hook output caps must be in 1..={MAX_HOOK_OUTPUT_CAP} bytes");
+        let args = format!("a hook may carry at most {MAX_HOOK_ARGS} args");
+        let arg_bytes = format!("hook args must be at most {MAX_HOOK_ARG_BYTES} bytes without NUL");
+        let env_count = format!("a hook may carry at most {MAX_HOOK_ENV} env entries");
+        let env_shape = format!(
+            "hook env entries must be NAME=VALUE with a 1..={MAX_HOOK_ENV_NAME_BYTES} \
+             ASCII name and a value of at most {MAX_HOOK_ENV_VALUE_BYTES} bytes without NUL"
+        );
+        let event_cap = format!(
+            "a hook may subscribe to at most {} event kinds",
+            HookEvent::ALL.len()
+        );
+        let cases = vec![
+            (
+                HookSpec {
+                    stdout_cap: usize::MAX,
+                    ..base.clone()
+                },
+                caps.clone(),
+            ),
+            (
+                HookSpec {
+                    stderr_cap: usize::MAX,
+                    ..base.clone()
+                },
+                caps.clone(),
+            ),
+            (
+                HookSpec {
+                    stdout_cap: 0,
+                    ..base.clone()
+                },
+                caps,
+            ),
+            (
+                HookSpec {
+                    args: vec!["a".into(); MAX_HOOK_ARGS + 1],
+                    ..base.clone()
+                },
+                args,
+            ),
+            (
+                HookSpec {
+                    args: vec!["a".repeat(MAX_HOOK_ARG_BYTES + 1)],
+                    ..base.clone()
+                },
+                arg_bytes.clone(),
+            ),
+            (
+                HookSpec {
+                    args: vec!["a\0b".into()],
+                    ..base.clone()
+                },
+                arg_bytes,
+            ),
+            (
+                HookSpec {
+                    env: vec![("PATH".into(), "x".into()); MAX_HOOK_ENV + 1],
+                    ..base.clone()
+                },
+                env_count,
+            ),
+            (
+                HookSpec {
+                    env: vec![("BAD=NAME".into(), "x".into())],
+                    ..base.clone()
+                },
+                env_shape.clone(),
+            ),
+            (
+                HookSpec {
+                    env: vec![("GOOD".into(), "x\0y".into())],
+                    ..base.clone()
+                },
+                env_shape.clone(),
+            ),
+            (
+                HookSpec {
+                    env: vec![("GOOD".into(), "v".repeat(MAX_HOOK_ENV_VALUE_BYTES + 1))],
+                    ..base.clone()
+                },
+                env_shape,
+            ),
+            (
+                HookSpec {
+                    command: "tr\0ue".into(),
+                    ..base.clone()
+                },
+                "hook command must not contain NUL".to_string(),
+            ),
+            (
+                HookSpec {
+                    events: vec![HookEvent::PreTool; HookEvent::ALL.len() + 1],
+                    ..base
+                },
+                event_cap,
+            ),
+        ];
+        for (spec, expected) in cases {
+            // Catches validation after insertion (the policy set would hold a
+            // hostile spec) or a generic refusal without the exact bound.
+            assert_eq!(r.register(spec).unwrap_err(), expected);
             assert!(
-                r.register(hostile).is_err(),
-                "hostile hook spec must be refused"
+                r.specs().is_empty(),
+                "a hostile spec must leave the registry untouched"
             );
         }
     }

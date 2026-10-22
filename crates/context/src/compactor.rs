@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_100k_tokens_stays_allocation_free() {
+    fn deterministic_prune_at_100k_tokens_keeps_the_newest_suffix_under_the_hard_cap() {
         let body = "x".repeat(296);
         let history: Vec<RecentTurn> = (0..1000)
             .map(|i| RecentTurn {
@@ -2096,15 +2096,22 @@ mod tests {
         let compactor = Compactor::deterministic_only();
         let ledger = TaskLedger::default();
         let req = CompactionRequest::new(100_000, 50_000);
-        let mut best = u64::MAX;
-        let mut after = 0usize;
-        for _ in 0..9 {
-            let started = std::time::Instant::now();
-            let plan = compactor.deterministic_prune(&history, &ledger, &req);
-            best = best.min(started.elapsed().as_nanos() as u64);
-            after = plan.after_tokens;
-        }
-        println!("PROBE compaction_100k_tokens best_ns={best} after_tokens={after}");
+        let plan = compactor.deterministic_prune(&history, &ledger, &req);
+        // Catches a compactor that accepts a tiny (<1%) reduction, drops the
+        // newest turn, or lets archive chunks exceed the wire bound.
+        assert!(plan.accepted, "{plan:?}");
+        assert!(plan.after_tokens <= req.hard_cap());
+        assert!(plan.after_tokens < plan.before_tokens);
+        assert_eq!(
+            plan.kept_recent.last().map(|t| &t.text),
+            history.last().map(|t| &t.text),
+            "the newest turn must survive a 100k-token prune"
+        );
+        assert!(!plan.archive_chunks.is_empty());
+        assert!(plan
+            .archive_chunks
+            .iter()
+            .all(|chunk| !chunk.is_empty() && chunk.len() <= ARCHIVE_CHUNK_BYTES));
     }
     /// The strict summary schema is enforced deterministically: duplicate
     /// lines collapse, duplicate fact ids keep the first, and lines that

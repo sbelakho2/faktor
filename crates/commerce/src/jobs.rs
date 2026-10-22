@@ -1078,7 +1078,9 @@ mod tests {
     #[test]
     fn owner_key_is_deterministic_and_separates_every_identity_axis() {
         let base = principal(1, 1, None);
-        assert_eq!(base.owner_key(), base.owner_key());
+        // An independently constructed identical identity must derive the
+        // same key; this catches hidden per-instance state in the hasher.
+        assert_eq!(principal(1, 1, None).owner_key(), base.owner_key());
         assert_eq!(base.owner_key().len(), 64);
         assert!(base.owner_key().chars().all(|c| c.is_ascii_hexdigit()));
 
