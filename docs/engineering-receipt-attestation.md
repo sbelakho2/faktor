@@ -171,3 +171,67 @@ research requests. The response records the full selection; analysis
 receipts bind its digest (`selection_digest`) inside the signed canonical
 digest, so a stored decision cannot be re-pointed at a different model
 selection after execution.
+
+## Human-approved model-validity overrides
+
+A `ModelValidityOverride` is applied only through
+`ModelSelector::select_with_approvals` (or the single-override wrapper) with a
+live `ApprovalToken` minted by `ApprovalAuthority`. The selector records every
+applied override in `ApplicabilitySelection::overrides` as a
+`ModelOverrideBinding`:
+
+- requirement-set id, revision and canonical digest;
+- catalog digest;
+- the digest of the selection core the override produced;
+- the approval binding digest, approval request id, human key fingerprint and
+  decision instant;
+- the exact `ModelValidityOverride` record.
+
+The receipt's canonical signed digest includes `model_overrides`, so gate 6
+(executed analysis) and gate 7 (independent cross-check) require each signed
+receipt's binding list to equal the response theory selection's list exactly.
+An override applied to the response but absent from the signed receipt, an
+override added only to a receipt, a tampered override record, or an unsigned
+substitute is a typed gate violation. `LoopOutcome::verify_with_verifier`
+performs the same equality check, so a stored supply decision cannot be
+re-pointed at an unsigned override after execution.
+
+## Supply plan baseline identity
+
+`SupplyPlanProceed` approvals bind to an immutable baseline subject computed
+from the engineering requirement-set identity/revision/digest and the stable
+supply requirement id/part/currency. The mutable `decision_id` is deliberately
+excluded from that identity and carried in the approval revision label
+together with the supply revision and the previous approved decision digest.
+
+Consequences:
+
+- changing the decision id cannot create a fresh unapproved baseline when an
+  approved baseline already exists for the same scope;
+- changing the approved content requires a fresh human decision bound to the
+  new result digest;
+- a re-approval must name the previous approved decision digest
+  (`prev=<digest>`); an approval without that lineage is refused;
+- the durable audit chain shows the previous digest and the new decision id on
+  the re-approval request.
+
+## Approval ledger rollback boundary
+
+The approval ledger is hash-chained and has a local head
+(`<data-dir>/approval/ledger.head`). A monotonic anchor is written with an
+independent atomic replace to
+`<data-dir>/approval-anchor/ledger.anchor`, outside the approval directory.
+Verification requires the anchor to exist for a non-empty ledger, requires the
+anchored sequence/digest to exist in the chain, and fails typed
+(`approval_ledger_rollback`) when the ledger regresses behind it. Anchor loss,
+corruption or an anchor behind the verified ledger is a typed
+`approval_anchor_degraded` refusal, never silent trust. Every legitimate
+append advances both the local head and the anchor.
+
+Threat boundary: this prevents a ledger-only rollback (including restoring a
+valid prefix) from being read as absence. It does not prevent an attacker with
+full write access to the daemon user's entire data directory from rolling back
+the ledger, local head, anchor and operator registry together. That residual
+is inherent to same-user storage; closing it requires an external trust
+anchor (for example an OS keychain or append-only remote witness) that the
+daemon account cannot rewrite.

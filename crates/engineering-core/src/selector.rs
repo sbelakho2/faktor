@@ -30,6 +30,10 @@ pub const MAX_CATALOG_MODELS: usize = 128;
 pub const MAX_VALIDITY_DOMAINS: usize = 16;
 pub const MAX_SELECTION_REQUESTS: usize = 128;
 pub const MAX_SELECTION_TEXT: usize = 2_048;
+/// Maximum human-approved model-validity overrides recorded in one selection.
+pub const MAX_MODEL_OVERRIDES: usize = 16;
+
+const SELECTION_CORE_SCHEMA: &str = "faktor.engineering.applicability-selection-core/v1";
 
 /// Provenance of a registered model or validity domain. Knowledge packs use
 /// free-form provenance kinds ("reference", "standard", ...), preserved here
@@ -523,6 +527,176 @@ impl ModelValidityOverride {
     }
 }
 
+/// The signed, replayable record of one applied model-validity override.
+///
+/// The selector stays the only authority for model choice: this binding records
+/// the exact human approval that admitted a model outside its registered
+/// validity envelope, together with the requirement-set/catalog identity that
+/// approval was minted for and the digest of the selection it produced. It is
+/// carried inside the canonical signed analysis receipt, so verification can
+/// refuse an override that the signer did not commit to.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOverrideBinding {
+    /// Requirement set whose model choice was overridden.
+    pub requirement_set_id: String,
+    /// Requirement set revision the approval binds to.
+    pub requirement_set_revision: crate::value::RevisionId,
+    /// Canonical digest of that requirement set.
+    pub requirement_set_digest: Digest,
+    /// Digest of the catalog the override was applied against.
+    pub catalog_digest: Digest,
+    /// Digest of the selection core that this override produced.
+    pub selection_digest: Digest,
+    /// The approval binding digest a human signed (set + catalog + override).
+    pub approval_digest: Digest,
+    /// Durable approval request id that carries the human decision.
+    pub approval_request_id: String,
+    /// Fingerprint of the human operator key that approved the override.
+    pub approval_key_id: String,
+    /// Decision instant recorded by the approval ledger.
+    pub approval_decided_at_ms: u64,
+    /// The exact override record the human approved.
+    pub override_record: ModelValidityOverride,
+}
+
+impl ModelOverrideBinding {
+    /// Validate the binding's own shape and internal consistency. The
+    /// requirement-set digest is recomputed by the selector when the approval
+    /// is minted; verification checks that this binding is byte-identical to
+    /// the one inside the signed receipt.
+    pub fn validate(&self) -> CoreResult<()> {
+        self.override_record.validate()?;
+        if self.requirement_set_id != self.override_record.requirement_set_id
+            || self.requirement_set_revision != self.override_record.requirement_set_revision
+            || self.requirement_set_digest != self.override_record.requirement_set_digest
+        {
+            return Err(CoreError::InvalidSelection {
+                reason: "override binding does not match its recorded requirement set".to_string(),
+            });
+        }
+        if self.approval_request_id.trim().is_empty()
+            || self.approval_request_id.len() > 256
+            || self.approval_key_id.trim().is_empty()
+            || self.approval_key_id.len() > 256
+        {
+            return Err(CoreError::InvalidSelection {
+                reason: "override binding needs a bounded approval request id and key id"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct SelectionCore<'a> {
+    schema: &'static str,
+    catalog: &'a ModelCatalog,
+    requests: &'a [SelectionRequest],
+    selections: &'a [RequirementSelection],
+    overrides: Vec<OverrideCore<'a>>,
+}
+
+#[derive(Serialize)]
+struct OverrideCore<'a> {
+    requirement_set_id: &'a str,
+    requirement_set_revision: crate::value::RevisionId,
+    requirement_set_digest: Digest,
+    catalog_digest: Digest,
+    approval_digest: Digest,
+    approval_request_id: &'a str,
+    approval_key_id: &'a str,
+    approval_decided_at_ms: u64,
+    override_record: &'a ModelValidityOverride,
+}
+
+fn selection_core_digest(
+    catalog: &ModelCatalog,
+    requests: &[SelectionRequest],
+    selections: &[RequirementSelection],
+    overrides: &[ModelOverrideBinding],
+) -> CoreResult<Digest> {
+    let overrides = overrides
+        .iter()
+        .map(|binding| OverrideCore {
+            requirement_set_id: &binding.requirement_set_id,
+            requirement_set_revision: binding.requirement_set_revision,
+            requirement_set_digest: binding.requirement_set_digest,
+            catalog_digest: binding.catalog_digest,
+            approval_digest: binding.approval_digest,
+            approval_request_id: &binding.approval_request_id,
+            approval_key_id: &binding.approval_key_id,
+            approval_decided_at_ms: binding.approval_decided_at_ms,
+            override_record: &binding.override_record,
+        })
+        .collect();
+    Digest::of_json(&SelectionCore {
+        schema: SELECTION_CORE_SCHEMA,
+        catalog,
+        requests,
+        selections,
+        overrides,
+    })
+}
+
+fn apply_override(
+    catalog: &ModelCatalog,
+    request: &SelectionRequest,
+    selection_override: &ModelValidityOverride,
+) -> CoreResult<RequirementSelection> {
+    selection_override.validate()?;
+    if selection_override.requirement_id != request.requirement_id {
+        return Err(CoreError::InvalidSelection {
+            reason: format!(
+                "override targets requirement {}, not {}",
+                selection_override.requirement_id, request.requirement_id
+            ),
+        });
+    }
+    let model =
+        catalog
+            .get(&selection_override.model_id)
+            .ok_or_else(|| CoreError::InvalidSelection {
+                reason: format!(
+                    "override names unknown model {}",
+                    selection_override.model_id
+                ),
+            })?;
+    Ok(RequirementSelection::Selected {
+        requirement_id: request.requirement_id.clone(),
+        models: vec![SelectedModel {
+            requirement_id: request.requirement_id.clone(),
+            model_id: model.model_id.clone(),
+            source_model_id: model.source_model_id.clone(),
+            version: model.version.clone(),
+            pack_id: model.pack_id.clone(),
+            pack_version: model.pack_version.clone(),
+            pack_digest: model.pack_digest,
+            equation_ids: model.equation_ids.clone(),
+            validity_domain_ids: model
+                .domains
+                .iter()
+                .map(|domain| domain.id.clone())
+                .collect(),
+            validity: model.domains.clone(),
+            rationale: format!(
+                "human-approved validity override: {}",
+                selection_override.rationale
+            ),
+            provenance: model.provenance.clone(),
+        }],
+        rationale: format!(
+            "human-approved validity override: {}",
+            selection_override.rationale
+        ),
+        alternatives_considered: vec![
+            "the normal applicability selector was overridden by a recorded human decision"
+                .to_string(),
+        ],
+    })
+}
+
 #[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementSelection {
@@ -567,6 +741,12 @@ pub struct ApplicabilitySelection {
     pub catalog: ModelCatalog,
     pub requests: Vec<SelectionRequest>,
     pub selections: Vec<RequirementSelection>,
+    /// Human-approved model-validity overrides applied to this selection.
+    /// Every override is bound to the set, catalog, resulting selection digest
+    /// and approval digest; a selection with overrides replays only from this
+    /// recorded evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<ModelOverrideBinding>,
 }
 
 impl ApplicabilitySelection {
@@ -592,14 +772,87 @@ impl ApplicabilitySelection {
                 }
             }
         }
-        let recomputed = ModelSelector::select(&self.catalog, &self.requests)?;
-        if recomputed.selections != self.selections {
+        if self.overrides.len() > MAX_MODEL_OVERRIDES {
             return Err(CoreError::InvalidSelection {
-                reason: "recorded applicability outcomes do not match the selector's result"
-                    .to_string(),
+                reason: format!("selection records more than {MAX_MODEL_OVERRIDES} overrides"),
+            });
+        }
+        let catalog_digest = self.catalog.digest()?;
+        let mut by_requirement: BTreeSet<&str> = BTreeSet::new();
+        for binding in &self.overrides {
+            binding.validate()?;
+            if binding.catalog_digest != catalog_digest {
+                return Err(CoreError::InvalidSelection {
+                    reason: format!(
+                        "override targets catalog {}, not the recorded catalog {}",
+                        binding.catalog_digest.to_hex(),
+                        catalog_digest.to_hex()
+                    ),
+                });
+            }
+            if !by_requirement.insert(binding.override_record.requirement_id.as_str()) {
+                return Err(CoreError::InvalidSelection {
+                    reason: format!(
+                        "requirement {} has more than one recorded override",
+                        binding.override_record.requirement_id
+                    ),
+                });
+            }
+        }
+        let core_digest = self.selection_core_digest()?;
+        for binding in &self.overrides {
+            if binding.selection_digest != core_digest {
+                return Err(CoreError::InvalidSelection {
+                    reason: "override binding does not commit to this selection digest".to_string(),
+                });
+            }
+        }
+        if self.overrides.is_empty() {
+            let recomputed = ModelSelector::select(&self.catalog, &self.requests)?;
+            if recomputed.selections != self.selections {
+                return Err(CoreError::InvalidSelection {
+                    reason: "recorded applicability outcomes do not match the selector's result"
+                        .to_string(),
+                });
+            }
+            return Ok(());
+        }
+        let mut expected = Vec::with_capacity(self.requests.len());
+        for request in &self.requests {
+            let binding = self
+                .overrides
+                .iter()
+                .find(|binding| binding.override_record.requirement_id == request.requirement_id);
+            match binding {
+                Some(binding) => expected.push(apply_override(
+                    &self.catalog,
+                    request,
+                    &binding.override_record,
+                )?),
+                None => expected.push(ModelSelector::select_one(&self.catalog, request)),
+            }
+        }
+        if expected != self.selections {
+            return Err(CoreError::InvalidSelection {
+                reason:
+                    "recorded override outcomes do not replay from the recorded override evidence"
+                        .to_string(),
             });
         }
         Ok(())
+    }
+
+    /// Digest of everything that makes the selection claim, excluding the
+    /// per-binding `selection_digest` fields that commit to it. Override
+    /// bindings include this digest, so a signed receipt cannot be re-pointed
+    /// at a different applied selection.
+    pub fn selection_core_digest(&self) -> CoreResult<Digest> {
+        selection_core_digest(
+            &self.catalog,
+            &self.requests,
+            &self.selections,
+            &self.overrides,
+        )
     }
 
     pub fn is_all_selected(&self) -> bool {
@@ -676,7 +929,7 @@ impl ModelSelector {
         catalog: &ModelCatalog,
         requests: &[SelectionRequest],
     ) -> CoreResult<ApplicabilitySelection> {
-        Self::select_inner(catalog, requests, None, None)
+        Self::select_inner(catalog, requests, None, &[])
     }
 
     /// Select models with an explicit, human-approved override for at most
@@ -689,17 +942,34 @@ impl ModelSelector {
         requirements: &EngineeringRequirementSet,
         approval: Option<(&ModelValidityOverride, &faktor_approval::ApprovalToken)>,
     ) -> CoreResult<ApplicabilitySelection> {
-        if approval.is_none() {
+        match approval {
+            Some(approval) => {
+                Self::select_with_approvals(catalog, requests, requirements, &[approval])
+            }
+            None => Self::select(catalog, requests),
+        }
+    }
+
+    /// Select models with explicit, human-approved overrides. Each approval
+    /// and override record is bound into the returned selection and therefore
+    /// into every canonical signed receipt that carries it.
+    pub fn select_with_approvals(
+        catalog: &ModelCatalog,
+        requests: &[SelectionRequest],
+        requirements: &EngineeringRequirementSet,
+        approvals: &[(&ModelValidityOverride, &faktor_approval::ApprovalToken)],
+    ) -> CoreResult<ApplicabilitySelection> {
+        if approvals.is_empty() {
             return Self::select(catalog, requests);
         }
-        Self::select_inner(catalog, requests, Some(requirements), approval)
+        Self::select_inner(catalog, requests, Some(requirements), approvals)
     }
 
     fn select_inner(
         catalog: &ModelCatalog,
         requests: &[SelectionRequest],
         requirements: Option<&EngineeringRequirementSet>,
-        approval: Option<(&ModelValidityOverride, &faktor_approval::ApprovalToken)>,
+        approvals: &[(&ModelValidityOverride, &faktor_approval::ApprovalToken)],
     ) -> CoreResult<ApplicabilitySelection> {
         catalog.validate()?;
         if requests.is_empty() || requests.len() > MAX_SELECTION_REQUESTS {
@@ -707,72 +977,82 @@ impl ModelSelector {
                 reason: format!("selection needs 1..={MAX_SELECTION_REQUESTS} requests"),
             });
         }
+        if approvals.len() > MAX_MODEL_OVERRIDES {
+            return Err(CoreError::InvalidSelection {
+                reason: format!("selection accepts at most {MAX_MODEL_OVERRIDES} overrides"),
+            });
+        }
+        let mut seen_overrides = BTreeSet::new();
+        for (selection_override, _) in approvals {
+            if !seen_overrides.insert(selection_override.requirement_id.clone()) {
+                return Err(CoreError::InvalidSelection {
+                    reason: format!(
+                        "requirement {} has more than one model override",
+                        selection_override.requirement_id
+                    ),
+                });
+            }
+        }
+        let catalog_digest = catalog.digest()?;
         let mut selections = Vec::with_capacity(requests.len());
+        let mut applied: Vec<ModelOverrideBinding> = Vec::new();
+        let mut used_approvals = 0usize;
         for request in requests {
             request.validate()?;
-            if let Some((selection_override, token)) = approval {
-                if selection_override.requirement_id == request.requirement_id {
-                    let requirements = requirements.ok_or_else(|| CoreError::InvalidSelection {
-                        reason: "a model override needs the live requirement set binding"
-                            .to_string(),
-                    })?;
-                    let digest = selection_override.digest(requirements, catalog)?;
-                    token.require(&faktor_approval::ApprovalCheck::new(
-                        faktor_approval::ApprovalKind::EngineeringModelValidityOverride,
-                        requirements.id.clone(),
-                        requirements.revision.get().to_string(),
-                        digest.to_hex(),
-                    ))?;
-                    let model = catalog.get(&selection_override.model_id).ok_or_else(|| {
-                        CoreError::InvalidSelection {
-                            reason: format!(
-                                "override names unknown model {}",
-                                selection_override.model_id
-                            ),
-                        }
-                    })?;
-                    selections.push(RequirementSelection::Selected {
-                        requirement_id: request.requirement_id.clone(),
-                        models: vec![SelectedModel {
-                            requirement_id: request.requirement_id.clone(),
-                            model_id: model.model_id.clone(),
-                            source_model_id: model.source_model_id.clone(),
-                            version: model.version.clone(),
-                            pack_id: model.pack_id.clone(),
-                            pack_version: model.pack_version.clone(),
-                            pack_digest: model.pack_digest,
-                            equation_ids: model.equation_ids.clone(),
-                            validity_domain_ids: model
-                                .domains
-                                .iter()
-                                .map(|domain| domain.id.clone())
-                                .collect(),
-                            validity: model.domains.clone(),
-                            rationale: format!(
-                                "human-approved validity override: {}",
-                                selection_override.rationale
-                            ),
-                            provenance: model.provenance.clone(),
-                        }],
-                        rationale: format!(
-                            "human-approved validity override: {}",
-                            selection_override.rationale
-                        ),
-                        alternatives_considered: vec![
-                            "the normal applicability selector was overridden by a recorded human decision"
-                                .to_string(),
-                        ],
-                    });
-                    continue;
-                }
+            let matching = approvals
+                .iter()
+                .find(|(selection_override, _)| {
+                    selection_override.requirement_id == request.requirement_id
+                })
+                .copied();
+            if let Some((selection_override, token)) = matching {
+                let requirements = requirements.ok_or_else(|| CoreError::InvalidSelection {
+                    reason: "a model override needs the live requirement set binding".to_string(),
+                })?;
+                let digest = selection_override.digest(requirements, catalog)?;
+                token.require(&faktor_approval::ApprovalCheck::new(
+                    faktor_approval::ApprovalKind::EngineeringModelValidityOverride,
+                    requirements.id.clone(),
+                    requirements.revision.get().to_string(),
+                    digest.to_hex(),
+                ))?;
+                selections.push(apply_override(catalog, request, selection_override)?);
+                applied.push(ModelOverrideBinding {
+                    requirement_set_id: requirements.id.clone(),
+                    requirement_set_revision: requirements.revision,
+                    requirement_set_digest: Digest::of_json(requirements)?,
+                    catalog_digest,
+                    selection_digest: Digest::from_bytes([0; 32]),
+                    approval_digest: digest,
+                    approval_request_id: token.request_id().to_string(),
+                    approval_key_id: token.decision_key_id().to_string(),
+                    approval_decided_at_ms: token.decided_at_ms(),
+                    override_record: selection_override.clone(),
+                });
+                used_approvals += 1;
+            } else {
+                selections.push(Self::select_one(catalog, request));
             }
-            selections.push(Self::select_one(catalog, request));
         }
-        Ok(ApplicabilitySelection {
+        if used_approvals != approvals.len() {
+            return Err(CoreError::InvalidSelection {
+                reason: "a model override names a requirement that is not requested".to_string(),
+            });
+        }
+        let selection_digest = selection_core_digest(catalog, requests, &selections, &applied)?;
+        for binding in &mut applied {
+            binding.selection_digest = selection_digest;
+        }
+        let selection = ApplicabilitySelection {
             catalog: catalog.clone(),
             requests: requests.to_vec(),
             selections,
-        })
+            overrides: applied,
+        };
+        if !selection.overrides.is_empty() {
+            selection.validate()?;
+        }
+        Ok(selection)
     }
 
     fn select_one(catalog: &ModelCatalog, request: &SelectionRequest) -> RequirementSelection {

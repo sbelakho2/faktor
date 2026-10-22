@@ -365,7 +365,10 @@ fn committed_head_detects_tail_truncation_of_the_ledger() {
         now + 2,
     );
     assert!(
-        matches!(error, Err(ApprovalError::Store(_))),
+        matches!(
+            error,
+            Err(ApprovalError::Store(_) | ApprovalError::LedgerRollback { .. })
+        ),
         "a tail-truncated ledger must be refused, not read as a shorter history: {error:?}"
     );
     assert!(temp.path().join("approval/ledger.head").exists());
@@ -588,6 +591,101 @@ fn replayed_or_reassigned_decisions_fail_signature_and_operator_binding() {
         authority.authorize(&wrong_subject, now + 3),
         Err(ApprovalError::Stale { .. } | ApprovalError::ApprovalRequired { .. })
     ));
+}
+
+#[test]
+fn independent_anchor_detects_a_ledger_and_local_head_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, _key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    authority
+        .propose(draft("agent-1", &"3".repeat(64), "7"), now)
+        .unwrap();
+    authority
+        .propose(draft("agent-1", &"4".repeat(64), "8"), now + 1)
+        .unwrap();
+
+    let ledger = faktor_approval::ledger_path(temp.path());
+    let text = std::fs::read_to_string(&ledger).unwrap();
+    let first_line = text.lines().next().unwrap().to_string();
+    let first: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+    std::fs::write(&ledger, format!("{first_line}\n")).unwrap();
+    // Roll the local head back too: only the anchor outside approval/ can
+    // still detect this valid-prefix truncation.
+    let head = serde_json::json!({
+        "schema": "faktor.approval.ledger-head/v1",
+        "seq": first["seq"],
+        "digest": first["digest"],
+    });
+    std::fs::write(
+        faktor_approval::ledger_head_path(temp.path()),
+        serde_json::to_vec(&head).unwrap(),
+    )
+    .unwrap();
+    let anchor_path = faktor_approval::ledger_anchor_path(temp.path());
+    assert!(
+        anchor_path.exists(),
+        "the monotonic anchor must live outside the ledger file"
+    );
+
+    let error = faktor_approval::ApprovalLedger::load(temp.path()).unwrap_err();
+    assert!(
+        matches!(error, ApprovalError::LedgerRollback { .. }),
+        "a valid prefix rolled back with the local head must still fail typed against the independent anchor: {error}"
+    );
+    assert_eq!(error.code(), "approval_ledger_rollback");
+}
+
+#[test]
+fn legitimate_append_advances_ledger_head_and_anchor_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, _key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    authority
+        .propose(draft("agent-1", &"5".repeat(64), "7"), now)
+        .unwrap();
+    let anchor_path = faktor_approval::ledger_anchor_path(temp.path());
+    let first_anchor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let ledger = faktor_approval::ApprovalLedger::load(temp.path()).unwrap();
+    assert_eq!(first_anchor["seq"], ledger.entries.last().unwrap().seq);
+    assert_eq!(
+        first_anchor["digest"],
+        ledger.entries.last().unwrap().digest
+    );
+
+    authority
+        .propose(draft("agent-1", &"6".repeat(64), "8"), now + 1)
+        .unwrap();
+    let second_anchor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let ledger = faktor_approval::ApprovalLedger::load(temp.path()).unwrap();
+    assert_eq!(second_anchor["seq"], 2);
+    assert_eq!(second_anchor["seq"], ledger.entries.last().unwrap().seq);
+    assert_eq!(
+        second_anchor["digest"],
+        ledger.entries.last().unwrap().digest
+    );
+}
+
+#[test]
+fn anchor_loss_is_a_typed_degraded_state_not_silent_trust() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, _key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    authority
+        .propose(draft("agent-1", &"7".repeat(64), "7"), now)
+        .unwrap();
+    std::fs::remove_file(faktor_approval::ledger_anchor_path(temp.path())).unwrap();
+    let error = authority.list().unwrap_err();
+    assert!(
+        matches!(error, ApprovalError::AnchorDegraded { .. }),
+        "a missing anchor must be a typed degraded refusal: {error}"
+    );
+    assert_eq!(error.code(), "approval_anchor_degraded");
+    // A read-only load must not recreate the anchor and silently trust the
+    // unanchored ledger.
+    assert!(!faktor_approval::ledger_anchor_path(temp.path()).exists());
 }
 
 #[test]

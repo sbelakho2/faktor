@@ -883,6 +883,25 @@ pub enum ApprovalError {
     /// Durable ledger/registry failure (never treated as absence).
     #[error("approval_store: {0}")]
     Store(String),
+    /// The independent monotonic ledger anchor is missing or unusable.
+    #[error("approval_anchor_degraded: {reason} ({path})")]
+    AnchorDegraded {
+        /// Anchor path.
+        path: String,
+        /// Why the anchor cannot be trusted.
+        reason: String,
+    },
+    /// The ledger is a valid prefix but has regressed behind the independent
+    /// monotonic anchor.
+    #[error("approval_ledger_rollback: anchor commits to entry {anchor_seq} but only {ledger_len} entries remain ({path})")]
+    LedgerRollback {
+        /// Anchor sequence.
+        anchor_seq: u64,
+        /// Observed ledger length.
+        ledger_len: usize,
+        /// Anchor path.
+        path: String,
+    },
     /// Another writer holds the ledger lock.
     #[error("approval_store_busy: {0}")]
     Busy(String),
@@ -910,6 +929,8 @@ impl ApprovalError {
             Self::SignatureMismatch(_) => "approval_signature_invalid",
             Self::Invalid(_) => "approval_invalid",
             Self::Store(_) => "approval_store_error",
+            Self::AnchorDegraded { .. } => "approval_anchor_degraded",
+            Self::LedgerRollback { .. } => "approval_ledger_rollback",
             Self::Busy(_) => "approval_store_busy",
             Self::Conflict(_) => "approval_conflict",
             Self::NotFound(_) => "approval_not_found",
@@ -988,6 +1009,19 @@ impl ApprovalError {
             }
             Self::UntrustedOperator { key_id } => {
                 object.insert("key_id".into(), key_id.clone().into());
+            }
+            Self::AnchorDegraded { path, reason } => {
+                object.insert("path".into(), path.clone().into());
+                object.insert("reason".into(), reason.clone().into());
+            }
+            Self::LedgerRollback {
+                anchor_seq,
+                ledger_len,
+                path,
+            } => {
+                object.insert("anchor_seq".into(), (*anchor_seq).into());
+                object.insert("ledger_len".into(), (*ledger_len).into());
+                object.insert("path".into(), path.clone().into());
             }
             _ => {}
         }

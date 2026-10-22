@@ -143,6 +143,7 @@ fn example_request() -> LoopRequest {
         },
         relaxations: vec![],
         should_cost_overrides: vec![],
+        model_overrides: vec![],
     }
 }
 

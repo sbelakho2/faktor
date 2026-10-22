@@ -26,20 +26,21 @@ use engineering_core::{
     CounterexampleProbe, CounterexampleSearch, CrossCheck, DerivedTest, Digest, DimensionChecks,
     Discipline, EngineeringRequirementSet, EngineeringResponse, EngineeringValue,
     EngineeringVerdict, ExecutedAnalysis, FalsifiableTest, FalsifiableVerification, Formulation,
-    Gate, GateId, KnowledgeAuthority, ModelCatalog, ModelSelection, ModelSelector, NodeId,
-    OutcomeState, ProbeOutcome, PropertyRevision, Provenance, ProvenanceKind, RealizationCategory,
-    RealizationConsequence, RealizationConsequences, ReceiptContent, ReceiptResult, ReceiptSigner,
-    ReceiptValue, ReceiptVerifier, RequirementEvidence, RequirementSelection, RevisionId,
-    SelectionProvenance, SelectionRequest, TheorySelection, UncertaintyContribution,
-    UncertaintyStatement, ValidityDomain, ValidityEnvelopes, ValueState,
+    Gate, GateId, KnowledgeAuthority, ModelCatalog, ModelOverrideBinding, ModelSelection,
+    ModelSelector, ModelValidityOverride, NodeId, OutcomeState, ProbeOutcome, PropertyRevision,
+    Provenance, ProvenanceKind, RealizationCategory, RealizationConsequence,
+    RealizationConsequences, ReceiptContent, ReceiptResult, ReceiptSigner, ReceiptValue,
+    ReceiptVerifier, RequirementEvidence, RequirementSelection, RevisionId, SelectionProvenance,
+    SelectionRequest, TheorySelection, UncertaintyContribution, UncertaintyStatement,
+    ValidityDomain, ValidityEnvelopes, ValueState,
 };
 use engineering_knowledge::{KnowledgeError, KnowledgePack, KnowledgeRegistry};
 use engineering_units::{Quantity, Uncertainty};
 use faktor_supply_core::{
     validate_text, Assumption, Availability, Basis, Candidate, CandidateId, CapabilitySummary,
-    CommercialTermsSummary, Counterfactual, Day, EvidenceRef, ExactError, FitAssessment, Incoterm,
-    InventorySummary, LandedCostSummary, LogisticsSummary, Money, PartId, ProcessKind, Rate,
-    RecommendedAction, Revision, RiskLevel, RiskSummary, SiteId, SupplierId, SupplierRole,
+    CommercialTermsSummary, Counterfactual, Currency, Day, EvidenceRef, ExactError, FitAssessment,
+    Incoterm, InventorySummary, LandedCostSummary, LogisticsSummary, Money, PartId, ProcessKind,
+    Rate, RecommendedAction, Revision, RiskLevel, RiskSummary, SiteId, SupplierId, SupplierRole,
     SupplyDecision, SupplyRequirement, TransportMode, UnavailableReason, UncertaintyClass,
     UncertaintyNote, Units, MAX_CANDIDATES, MAX_CONFLICTS, MAX_COUNTERFACTUALS,
     MAX_DECISION_ASSUMPTIONS, MAX_DECISION_EVIDENCE, MAX_ID_BYTES, MAX_MISSING_ITEMS,
@@ -70,6 +71,8 @@ pub const MAX_LOOP_KNOWLEDGE_DOMAINS: usize = 16;
 pub const MAX_LOOP_RELAXATIONS: usize = 16;
 /// Maximum should-cost assumption overrides.
 pub const MAX_LOOP_SHOULD_COST_OVERRIDES: usize = 16;
+/// Maximum human-approved model-validity overrides.
+pub const MAX_LOOP_MODEL_OVERRIDES: usize = engineering_core::MAX_MODEL_OVERRIDES;
 /// Maximum process labels on one candidate.
 pub const MAX_LOOP_CANDIDATE_PROCESSES: usize = 64;
 
@@ -300,6 +303,11 @@ pub struct LoopRequest {
     #[serde(default)]
     #[schemars(length(max = MAX_LOOP_SHOULD_COST_OVERRIDES))]
     pub should_cost_overrides: Vec<ShouldCostOverride>,
+    /// Optional model-validity overrides, each human-approved and bound into
+    /// the signed engineering response/receipts.
+    #[serde(default)]
+    #[schemars(length(max = MAX_LOOP_MODEL_OVERRIDES))]
+    pub model_overrides: Vec<engineering_core::ModelValidityOverride>,
 }
 
 impl LoopRequest {
@@ -390,6 +398,32 @@ impl LoopRequest {
             return Err(LoopError::Invalid(format!(
                 "assumptions exceed {MAX_DECISION_ASSUMPTIONS}"
             )));
+        }
+        if self.model_overrides.len() > MAX_LOOP_MODEL_OVERRIDES {
+            return Err(LoopError::Invalid(format!(
+                "model overrides exceed {MAX_LOOP_MODEL_OVERRIDES}"
+            )));
+        }
+        let mut overridden_requirements = BTreeSet::new();
+        for model_override in &self.model_overrides {
+            model_override.validate()?;
+            if !overridden_requirements.insert(model_override.requirement_id.clone()) {
+                return Err(LoopError::Invalid(format!(
+                    "requirement {} has more than one model override",
+                    model_override.requirement_id
+                )));
+            }
+            if !self
+                .engineering
+                .requirements
+                .iter()
+                .any(|requirement| requirement.id == model_override.requirement_id)
+            {
+                return Err(LoopError::Invalid(format!(
+                    "model override targets unknown requirement {}",
+                    model_override.requirement_id
+                )));
+            }
         }
         for assumption in &self.assumptions {
             assumption.validate()?;
@@ -707,23 +741,29 @@ impl LoopOutcome {
             &self.knowledge,
         )?;
         let model_digest = Digest::of_json(&self.knowledge.to_vec())?;
-        let selected_digest = match self.response.as_ref() {
+        let selected = match self.response.as_ref() {
             Some(response) => match &response.theory.state {
-                engineering_core::GateState::Established(theory) => match &theory.selection {
-                    Some(selection) => Some(selection.digest()?),
-                    None => None,
-                },
+                engineering_core::GateState::Established(theory) => theory.selection.as_ref(),
                 _ => None,
             },
             None => None,
         };
+        let selected_digest = selected.map(ApplicabilitySelection::digest).transpose()?;
+        let selected_overrides = selected
+            .map(|selection| selection.overrides.as_slice())
+            .unwrap_or(&[]);
         let selection_binding = match (&self.response, selected_digest) {
             (Some(_), Some(digest)) => {
                 self.receipt.selection_digest == Some(digest)
                     && self.cross_check.selection_digest == Some(digest)
+                    && self.receipt.model_overrides == selected_overrides
+                    && self.cross_check.model_overrides == selected_overrides
             }
             (Some(_), None) => false,
-            (None, None) => true,
+            (None, None) => {
+                self.receipt.model_overrides.is_empty()
+                    && self.cross_check.model_overrides.is_empty()
+            }
             (None, Some(_)) => false,
         };
         let receipt_binding = self.receipt.input_digest == self.binding.input_digest
@@ -952,6 +992,35 @@ fn run_with_authority_opt(
         });
     }
 
+    let model_catalog = if request.model_overrides.is_empty() {
+        None
+    } else {
+        Some(build_model_catalog(&requirements, &packs)?)
+    };
+    let mut model_approvals = Vec::new();
+    if let Some(catalog) = &model_catalog {
+        for model_override in &request.model_overrides {
+            let digest = model_override.digest(&requirements, catalog)?;
+            let check = faktor_approval::ApprovalCheck::new(
+                faktor_approval::ApprovalKind::EngineeringModelValidityOverride,
+                requirements.id.clone(),
+                requirements.revision.get().to_string(),
+                digest.to_hex(),
+            );
+            let authority =
+                authority.ok_or_else(|| faktor_approval::ApprovalError::ApprovalRequired {
+                    kind: check.kind,
+                    subject: check.subject.clone(),
+                    bound_revision: check.bound_revision.clone(),
+                    bound_digest: check.bound_digest.clone(),
+                })?;
+            model_approvals.push((
+                model_override.clone(),
+                authority.authorize(&check, faktor_approval::unix_now_ms())?,
+            ));
+        }
+    }
+
     let mut approved_overrides: BTreeMap<&str, &ShouldCostInput> = BTreeMap::new();
     for should_cost_override in &request.should_cost_overrides {
         let check = faktor_approval::ApprovalCheck::new(
@@ -1063,6 +1132,8 @@ fn run_with_authority_opt(
         &package,
         &normalization,
         &packs,
+        model_catalog.as_ref(),
+        &model_approvals,
         signer,
         &verifier,
         started,
@@ -1162,10 +1233,135 @@ fn run_with_authority_opt(
     Ok(outcome)
 }
 
+const PLAN_BASELINE_SCHEMA: &str = "faktor.supply.plan-baseline/v1";
+const PLAN_BASELINE_SUBJECT_PREFIX: &str = "plan-baseline:";
+
+/// Immutable identity of a supply plan baseline. It intentionally excludes
+/// the caller-supplied `decision_id`: renaming the decision must not create a
+/// fresh baseline or reset the approval lineage. Scope is the engineering set
+/// identity/revision/digest plus the stable supply requirement identity.
+pub fn plan_baseline_subject(request: &LoopRequest) -> LoopResult<String> {
+    #[derive(Serialize)]
+    struct Scope<'a> {
+        schema: &'static str,
+        engineering_id: &'a str,
+        engineering_revision: RevisionId,
+        engineering_digest: Digest,
+        requirement_id: &'a str,
+        part: Option<PartId>,
+        currency: Currency,
+    }
+    let scope = Scope {
+        schema: PLAN_BASELINE_SCHEMA,
+        engineering_id: &request.engineering.id,
+        engineering_revision: request.engineering.revision,
+        engineering_digest: Digest::of_json(&request.engineering)?,
+        requirement_id: &request.requirement.id,
+        part: request.requirement.part,
+        currency: request.requirement.currency,
+    };
+    let digest = Digest::of_json(&scope)?;
+    Ok(format!("{PLAN_BASELINE_SUBJECT_PREFIX}{}", digest.to_hex()))
+}
+
+/// The approval revision labels a plan decision with its original decision
+/// id, supply revision and (for a re-approval) the previous approved decision
+/// digest. A changed baseline therefore cannot reuse an older approval, and a
+/// new decision id must be explicitly re-approved with this lineage.
+pub fn plan_approval_revision(
+    decision_id: &str,
+    revision: Revision,
+    previous_decision_digest: Option<&str>,
+) -> LoopResult<String> {
+    let previous = match previous_decision_digest {
+        Some(digest) => {
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(LoopError::Invalid(
+                    "previous decision digest must be 64 hex characters".to_string(),
+                ));
+            }
+            digest.to_ascii_lowercase()
+        }
+        None => "root".to_string(),
+    };
+    let revision_label = format!("{decision_id}|rev={}|prev={previous}", revision.get());
+    Ok(revision_label)
+}
+
+/// The exact approval check for a supply plan baseline. A first approval uses
+/// `previous_decision_digest = None`; a re-approval must reference the previous
+/// approved decision digest.
+pub fn plan_baseline_check(
+    request: &LoopRequest,
+    result_digest: &Digest,
+    previous_decision_digest: Option<&str>,
+) -> LoopResult<faktor_approval::ApprovalCheck> {
+    Ok(faktor_approval::ApprovalCheck::new(
+        faktor_approval::ApprovalKind::SupplyPlanProceed,
+        plan_baseline_subject(request)?,
+        plan_approval_revision(
+            &request.decision_id,
+            request.revision,
+            previous_decision_digest,
+        )?,
+        result_digest.to_hex(),
+    ))
+}
+
+fn plan_revision_belongs_to(token_revision: &str, decision_id: &str, revision: Revision) -> bool {
+    token_revision.starts_with(&format!("{decision_id}|rev={}|prev=", revision.get()))
+}
+
+fn plan_revision_previous(token_revision: &str) -> Option<&str> {
+    token_revision
+        .rsplit_once("|prev=")
+        .map(|(_, previous)| previous)
+}
+
+/// The last *lineage-valid* approved baseline digest before `request_id` in
+/// ledger order (or the latest when `request_id` is `None`). Legacy approvals
+/// keyed by decision id have no encoded lineage and seed the chain; canonical
+/// approvals are accepted into the chain only when their `prev=` label names
+/// the preceding valid baseline (or `root` for the first one).
+fn previous_valid_baseline<'a>(
+    views: &'a [faktor_approval::ApprovalView],
+    request_id: Option<&str>,
+    canonical_subject: &str,
+    legacy_subject: &str,
+) -> Option<&'a str> {
+    let mut previous = None;
+    for view in views {
+        if Some(view.request.id.as_str()) == request_id {
+            break;
+        }
+        if view.request.kind != faktor_approval::ApprovalKind::SupplyPlanProceed
+            || (view.request.subject != canonical_subject && view.request.subject != legacy_subject)
+        {
+            continue;
+        }
+        if !matches!(
+            view.decision.as_ref().map(|decision| &decision.outcome),
+            Some(faktor_approval::DecisionOutcome::Approved)
+        ) {
+            continue;
+        }
+        if view.request.subject == canonical_subject {
+            let expected = previous.unwrap_or("root");
+            if plan_revision_previous(&view.request.bound_revision) != Some(expected) {
+                continue;
+            }
+        }
+        previous = Some(view.request.bound_digest.as_str());
+    }
+    previous
+}
+
 /// A `Proceed` recommendation that changes an already human-approved plan
-/// baseline is itself consequential. The latest approved `SupplyPlanProceed`
-/// for this decision id is the baseline; a different result digest requires a
-/// fresh human approval bound to that exact digest and revision.
+/// baseline is itself consequential. Approvals are bound to the immutable
+/// baseline scope (not the mutable decision id); a changed baseline or a new
+/// decision id needs a fresh human approval whose revision names the previous
+/// approved decision digest. A fresh decision with no prior baseline anywhere
+/// in the ledger remains a recommendation, not an approved baseline.
 fn authorize_plan_baseline(
     authority: &faktor_approval::ApprovalAuthority,
     request: &LoopRequest,
@@ -1179,34 +1375,95 @@ fn authorize_plan_baseline(
         return Ok(());
     }
     let now = faktor_approval::unix_now_ms();
-    let baseline = authority.latest_authorized(
+    let subject = plan_baseline_subject(request)?;
+    let canonical = authority.latest_authorized(
+        faktor_approval::ApprovalKind::SupplyPlanProceed,
+        &subject,
+        now,
+    )?;
+    let legacy = authority.latest_authorized(
         faktor_approval::ApprovalKind::SupplyPlanProceed,
         &request.decision_id,
         now,
     )?;
-    if let Some(token) = &baseline {
+    if let Some(token) = &legacy {
         if token.bound_revision() == request.revision.get().to_string()
             && token.bound_digest() == result_digest.to_hex()
         {
             return Ok(());
         }
     }
-    let prior = authority.latest_request(
+    let views = authority.list()?;
+    if let Some(token) = &canonical {
+        let expected_previous = previous_valid_baseline(
+            &views,
+            Some(token.request_id()),
+            &subject,
+            &request.decision_id,
+        )
+        .unwrap_or("root");
+        if token.bound_digest() == result_digest.to_hex()
+            && plan_revision_belongs_to(
+                token.bound_revision(),
+                &request.decision_id,
+                request.revision,
+            )
+            && plan_revision_previous(token.bound_revision()) == Some(expected_previous)
+        {
+            return Ok(());
+        }
+    }
+    let mut prior_approved_digest =
+        previous_valid_baseline(&views, None, &subject, &request.decision_id)
+            .map(str::to_string)
+            .or_else(|| {
+                canonical
+                    .as_ref()
+                    .or(legacy.as_ref())
+                    .map(|token| token.bound_digest().to_string())
+            });
+    let mut any_prior = canonical.is_some() || legacy.is_some();
+    for view in &views {
+        if view.request.kind == faktor_approval::ApprovalKind::SupplyPlanProceed {
+            any_prior = true;
+        }
+    }
+    let prior_scope =
+        authority.latest_request(faktor_approval::ApprovalKind::SupplyPlanProceed, &subject)?;
+    let prior_legacy = authority.latest_request(
         faktor_approval::ApprovalKind::SupplyPlanProceed,
         &request.decision_id,
     )?;
-    if prior.is_none() {
+    any_prior |= prior_scope.is_some() || prior_legacy.is_some();
+    if prior_approved_digest.is_none() {
+        if let Some(prior) = prior_scope.as_ref().or(prior_legacy.as_ref()) {
+            prior_approved_digest = Some(prior.bound_digest.clone());
+        }
+    }
+    if !any_prior {
         // A new decision is a recommendation, not yet an approved baseline.
         return Ok(());
     }
-    let check = faktor_approval::ApprovalCheck::new(
-        faktor_approval::ApprovalKind::SupplyPlanProceed,
-        request.decision_id.clone(),
-        request.revision.get().to_string(),
-        result_digest.to_hex(),
-    );
-    authority.authorize(&check, now)?;
-    Ok(())
+    let check = plan_baseline_check(request, result_digest, prior_approved_digest.as_deref())?;
+    match authority.authorize(&check, now) {
+        Ok(_) => Ok(()),
+        Err(faktor_approval::ApprovalError::ApprovalRequired { .. }) => {
+            if let Some(prior) = prior_scope.as_ref().or(prior_legacy.as_ref()) {
+                Err(faktor_approval::ApprovalError::Stale {
+                    request_id: prior.id.clone(),
+                    expected_digest: check.bound_digest.clone(),
+                    actual_digest: prior.bound_digest.clone(),
+                    expected_revision: check.bound_revision.clone(),
+                    actual_revision: prior.bound_revision.clone(),
+                }
+                .into())
+            } else {
+                authority.authorize(&check, now)?;
+                Ok(())
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn index_candidates(candidates: &[LoopCandidate]) -> BTreeMap<&str, &LoopCandidate> {
@@ -1662,6 +1919,8 @@ fn build_decision(
     package: &RfqPackage,
     normalization: &NormalizationContext,
     packs: &[&KnowledgePack],
+    model_catalog: Option<&ModelCatalog>,
+    model_approvals: &[(ModelValidityOverride, faktor_approval::ApprovalToken)],
     signer: &ReceiptSigner,
     verifier: &ReceiptVerifier,
     started: Instant,
@@ -1898,6 +2157,8 @@ fn build_decision(
             &evidence,
             &assumptions,
             packs,
+            model_catalog,
+            model_approvals,
             signer,
         )?),
         _ => None,
@@ -2095,15 +2356,15 @@ fn build_decision(
         conflicts,
     };
 
-    let selection_digest = match response.as_ref() {
+    let (selection_digest, model_overrides) = match response.as_ref() {
         Some(response) => match &response.theory.state {
             engineering_core::GateState::Established(theory) => match &theory.selection {
-                Some(selection) => Some(selection.digest()?),
-                None => None,
+                Some(selection) => (Some(selection.digest()?), selection.overrides.clone()),
+                None => (None, Vec::new()),
             },
-            _ => None,
+            _ => (None, Vec::new()),
         },
-        None => None,
+        None => (None, Vec::new()),
     };
     let (receipt, cross_check) = build_receipts(
         request,
@@ -2112,6 +2373,7 @@ fn build_decision(
         authorities,
         &evidence,
         selection_digest,
+        &model_overrides,
         signer,
         started,
     )?;
@@ -2134,6 +2396,7 @@ fn build_receipts(
     authorities: &[AuthorityRef],
     evidence: &[EvidenceRef],
     selection_digest: Option<Digest>,
+    model_overrides: &[ModelOverrideBinding],
     signer: &ReceiptSigner,
     started: Instant,
 ) -> LoopResult<(AnalysisReceipt, AnalysisReceipt)> {
@@ -2159,6 +2422,7 @@ fn build_receipts(
     let mut content = ReceiptContent::new(input_digest, model_digest, settings_digest)
         .with_boundary_condition("supply_revision", boundary);
     content.selection_digest = selection_digest;
+    content.model_overrides = model_overrides.to_vec();
     let mut results = Vec::new();
     for evaluation in evaluations.iter().take(MAX_LOOP_RANKED) {
         results.push(ReceiptResult {
@@ -2236,16 +2500,6 @@ fn build_receipts(
         )));
     }
     Ok((receipt, cross_check))
-}
-
-fn build_applicability_selection(
-    requirements: &EngineeringRequirementSet,
-    candidate: &CandidateFacts,
-    packs: &[&KnowledgePack],
-) -> LoopResult<ApplicabilitySelection> {
-    let catalog = build_model_catalog(requirements, packs)?;
-    let requests = selection_requests(requirements, candidate);
-    Ok(ModelSelector::select(&catalog, &requests)?)
 }
 
 fn build_model_catalog(
@@ -2501,6 +2755,8 @@ fn build_response(
     evidence: &[EvidenceRef],
     assumptions: &[Assumption],
     packs: &[&KnowledgePack],
+    model_catalog: Option<&ModelCatalog>,
+    model_approvals: &[(ModelValidityOverride, faktor_approval::ApprovalToken)],
     signer: &ReceiptSigner,
 ) -> LoopResult<EngineeringResponse> {
     let candidate = request
@@ -2574,7 +2830,26 @@ fn build_response(
     let knowledge = KnowledgeAuthority {
         packs: authorities.to_vec(),
     };
-    let selection = build_applicability_selection(requirements, &candidate.facts, packs)?;
+    let catalog = match model_catalog {
+        Some(catalog) => catalog.clone(),
+        None => build_model_catalog(requirements, packs)?,
+    };
+    let requests = selection_requests(requirements, &candidate.facts);
+    let selection = if model_approvals.is_empty() {
+        ModelSelector::select(&catalog, &requests)?
+    } else {
+        let approvals: Vec<(&ModelValidityOverride, &faktor_approval::ApprovalToken)> =
+            model_approvals
+                .iter()
+                .map(|(model_override, token)| (model_override, token))
+                .collect();
+        ModelSelector::select_with_approvals(&catalog, &requests, requirements, &approvals)?
+    };
+    if !selection.overrides.is_empty() && !selection.is_all_selected() {
+        return Err(LoopError::Invalid(
+            "a model override must still select a governing model for every request".to_string(),
+        ));
+    }
     let (theory, validity) = if selection.is_all_selected() {
         let models = selection
             .unique_models()
@@ -2759,6 +3034,7 @@ fn build_response(
         authorities,
         evidence,
         selection_digest,
+        &selection.overrides,
         signer,
         Instant::now(),
     )?;

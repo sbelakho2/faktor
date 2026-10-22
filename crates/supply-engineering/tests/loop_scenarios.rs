@@ -460,6 +460,7 @@ fn request(
         },
         relaxations,
         should_cost_overrides: vec![],
+        model_overrides: vec![],
     }
 }
 
@@ -1440,6 +1441,263 @@ fn an_expired_plan_baseline_is_not_treated_as_absence() {
             )
         ),
         "an expired baseline must force a fresh decision, not act as absence: {error}"
+    );
+}
+
+#[test]
+fn a_model_validity_override_is_bound_into_the_supply_response_and_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(directory.path(), "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        directory.path(),
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms().max(1),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(directory.path()).unwrap();
+    let signer = ReceiptSigner::generate();
+    let engineering = capacitor_requirements();
+    let model_override = engineering_core::ModelValidityOverride {
+        requirement_set_id: engineering.id.clone(),
+        requirement_set_revision: engineering.revision,
+        requirement_set_digest: engineering_core::Digest::of_json(&engineering).unwrap(),
+        requirement_id: "capacitance".to_string(),
+        model_id: "model-cap".to_string(),
+        rationale: "fixture human-approved validity override".to_string(),
+    };
+    let mut overridden = request(perf_candidates(1), engineering, vec![]);
+    overridden.model_overrides = vec![model_override.clone()];
+
+    let error = run_with_signer(&overridden, &signer).unwrap_err();
+    let LoopError::Approval(faktor_approval::ApprovalError::ApprovalRequired {
+        subject,
+        bound_revision,
+        bound_digest,
+        ..
+    }) = error
+    else {
+        panic!("a model override without authority must require a human approval: {error}");
+    };
+    let approval = authority
+        .propose(
+            ApprovalDraft {
+                kind: ApprovalKind::EngineeringModelValidityOverride,
+                subject,
+                evidence: vec!["out-of-envelope fixture".to_string()],
+                proposed_change: "accept model-cap under the approved rationale".to_string(),
+                risk: RiskLevel::High,
+                requester: Principal::new("engineering-agent", PrincipalKind::Agent).unwrap(),
+                bound_revision,
+                bound_digest,
+                expires_at_ms: faktor_approval::unix_now_ms() + 60_000,
+            },
+            faktor_approval::unix_now_ms(),
+        )
+        .unwrap();
+    authority
+        .decide(
+            &approval.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed the override".to_string(),
+            faktor_approval::unix_now_ms() + 1,
+        )
+        .unwrap();
+    let outcome = run_with_authority(&overridden, &signer, &authority).unwrap();
+    let verifier = ReceiptVerifier::trusting_key_id(&signer.key_id()).unwrap();
+    assert!(outcome.is_verified(&verifier));
+    let selection = match &outcome.response.as_ref().unwrap().theory.state {
+        GateState::Established(theory) => theory.selection.as_ref().unwrap(),
+        _ => panic!("the override response must establish theory"),
+    };
+    assert_eq!(selection.overrides.len(), 1);
+    assert_eq!(outcome.receipt.model_overrides, selection.overrides);
+    assert_eq!(outcome.cross_check.model_overrides, selection.overrides);
+    assert!(outcome.receipt.verify_attestation().is_ok());
+    let mut unsigned = outcome.clone();
+    unsigned.receipt.model_overrides.clear();
+    assert!(
+        unsigned.verify_with_verifier(&verifier).is_err(),
+        "verification must reject an override missing from the signed payload"
+    );
+}
+
+#[test]
+fn replaying_an_approved_baseline_under_a_new_decision_id_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(directory.path(), "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        directory.path(),
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms().max(1),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(directory.path()).unwrap();
+    let signer = ReceiptSigner::generate();
+    let engineering = capacitor_requirements();
+    let first = request(perf_candidates(1), engineering, vec![]);
+    let outcome = run_with_authority(&first, &signer, &authority).unwrap();
+    let digest = outcome.binding.result_digest.to_hex();
+    approve_plan(
+        &authority,
+        &key,
+        &first.decision_id,
+        &first.revision.get().to_string(),
+        &digest,
+        faktor_approval::unix_now_ms(),
+    );
+
+    let mut replay = first.clone();
+    replay.decision_id = "decision-cap-renamed".to_string();
+    let error = run_with_authority(&replay, &signer, &authority).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoopError::Approval(
+                faktor_approval::ApprovalError::Stale { .. }
+                    | faktor_approval::ApprovalError::ApprovalRequired { .. }
+            )
+        ),
+        "an approved baseline must not be re-bound under a new decision id: {error}"
+    );
+}
+
+#[test]
+fn re_approval_of_a_changed_baseline_must_reference_the_previous_decision_digest() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(directory.path(), "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        directory.path(),
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms().max(1),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(directory.path()).unwrap();
+    let signer = ReceiptSigner::generate();
+    let engineering = capacitor_requirements();
+    let first = request(perf_candidates(1), engineering.clone(), vec![]);
+    let outcome = run_with_authority(&first, &signer, &authority).unwrap();
+    let digest_a = outcome.binding.result_digest.to_hex();
+    approve_plan(
+        &authority,
+        &key,
+        &first.decision_id,
+        &first.revision.get().to_string(),
+        &digest_a,
+        faktor_approval::unix_now_ms(),
+    );
+
+    let mut candidates = perf_candidates(1);
+    candidates[0].tco.as_mut().unwrap().ex_works_unit =
+        term(Money::parse("2.00", CUR).unwrap(), "lineage-price-b");
+    let changed = request(candidates, engineering, vec![]);
+    let error = run_with_authority(&changed, &signer, &authority).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoopError::Approval(faktor_approval::ApprovalError::Stale { .. })
+        ),
+        "a changed baseline must require a new human decision: {error}"
+    );
+    let observed = run_with_ephemeral_authority(&changed, &signer).unwrap();
+    let digest_b = observed.binding.result_digest.to_hex();
+
+    // An approval that does not name the previous approved digest is not the
+    // re-approval the gate asks for.
+    let unlineaged = authority
+        .propose(
+            ApprovalDraft {
+                kind: ApprovalKind::SupplyPlanProceed,
+                subject: plan_baseline_subject(&changed).unwrap(),
+                evidence: vec!["closed-loop decision".to_string()],
+                proposed_change: format!("proceed with the changed plan bound to {digest_b}"),
+                risk: RiskLevel::High,
+                requester: Principal::new("supply-agent", PrincipalKind::Agent).unwrap(),
+                bound_revision: plan_approval_revision(
+                    &changed.decision_id,
+                    changed.revision,
+                    None,
+                )
+                .unwrap(),
+                bound_digest: digest_b.clone(),
+                expires_at_ms: faktor_approval::unix_now_ms() + 60_000,
+            },
+            faktor_approval::unix_now_ms(),
+        )
+        .unwrap();
+    authority
+        .decide(
+            &unlineaged.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed".to_string(),
+            faktor_approval::unix_now_ms() + 1,
+        )
+        .unwrap();
+    let error = run_with_authority(&changed, &signer, &authority).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoopError::Approval(
+                faktor_approval::ApprovalError::Stale { .. }
+                    | faktor_approval::ApprovalError::ApprovalRequired { .. }
+            )
+        ),
+        "a re-approval without the previous decision digest must be refused: {error}"
+    );
+
+    let reapproval = authority
+        .propose(
+            ApprovalDraft {
+                kind: ApprovalKind::SupplyPlanProceed,
+                subject: plan_baseline_subject(&changed).unwrap(),
+                evidence: vec![format!("previous decision {digest_a}")],
+                proposed_change: format!(
+                    "proceed with the changed plan bound to {digest_b} after {digest_a}"
+                ),
+                risk: RiskLevel::High,
+                requester: Principal::new("supply-agent", PrincipalKind::Agent).unwrap(),
+                bound_revision: plan_approval_revision(
+                    &changed.decision_id,
+                    changed.revision,
+                    Some(&digest_a),
+                )
+                .unwrap(),
+                bound_digest: digest_b,
+                expires_at_ms: faktor_approval::unix_now_ms() + 60_000,
+            },
+            faktor_approval::unix_now_ms(),
+        )
+        .unwrap();
+    authority
+        .decide(
+            &reapproval.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed the baseline change and its lineage".to_string(),
+            faktor_approval::unix_now_ms() + 1,
+        )
+        .unwrap();
+    run_with_authority(&changed, &signer, &authority).unwrap();
+
+    let entries = authority.audit(Some(&reapproval.id)).unwrap();
+    assert!(
+        entries.iter().any(|entry| matches!(
+            &entry.body,
+            faktor_approval::LedgerBody::Requested { request }
+                if request.bound_revision.contains(&format!("prev={digest_a}"))
+                    && request.evidence.iter().any(|item| item.contains(&digest_a))
+        )),
+        "the audit chain must show the previous decision digest on the re-approval"
     );
 }
 

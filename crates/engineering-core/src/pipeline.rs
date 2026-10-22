@@ -483,6 +483,8 @@ pub fn run(
     let signer = ReceiptSigner::from_seed(*Digest::of_bytes(request.id.as_bytes()).as_bytes());
     for report in &kernels {
         let mut receipt = report.receipt.clone();
+        receipt.model_overrides = selection.overrides.clone();
+        receipt.attestation = None;
         signer.sign_receipt(&mut receipt)?;
         receipts.push(receipt);
     }

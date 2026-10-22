@@ -22,17 +22,25 @@
 //!
 //! ```text
 //! <data-dir>/approval/ledger.jsonl      append-only request/decision chain
-//! <data-dir>/approval/ledger.head       committed tail anchor (anti-truncation)
+//! <data-dir>/approval/ledger.head       local committed tail head
+//! <data-dir>/approval-anchor/ledger.anchor  monotonic anchor (outside ledger dir)
 //! <data-dir>/approval/operators.json    human-operator public-key registry
 //! <data-dir>/approval/operators/*.key   owner-only (0600) signing seeds
 //! ```
 //!
 //! Every ledger entry commits to the previous digest, its sequence number
 //! and the canonical JSON body; re-opening verifies the whole chain and the
-//! committed head, and refuses typed on corruption or tail truncation. The decision signature commits to the
-//! request digest, request id, outcome, human principal, rationale and
-//! decision time, so a decision cannot be replayed for another request or
-//! altered after the fact.
+//! local head, and then checks the monotonic anchor in a sibling directory.
+//! A ledger-only rollback (including a valid-prefix truncation) fails typed;
+//! a missing/unreadable anchor is a typed degraded state, never silently
+//! trusted. An attacker with full same-user write access can still roll back
+//! both the ledger and the anchor together (and the operator registry); the
+//! anchor makes a partial rollback detectable, not a full same-user rollback
+//! preventable. Use an OS keychain or external append-only trust store if the
+//! threat model includes the daemon's own account. The decision signature
+//! commits to the request digest, request id, outcome, human principal,
+//! rationale and decision time, so a decision cannot be replayed for another
+//! request or altered after the fact.
 
 mod authority;
 mod model;
@@ -50,4 +58,6 @@ pub use operator::{
     load_operator_key, operator_key_path, operator_key_paths, register_operator_key,
     save_operator_key, OperatorKey, OPERATOR_DIRECTORY, OPERATOR_REGISTRY_FILE,
 };
-pub use store::{ledger_head_path, ledger_path, ApprovalLedger, LedgerBody, LedgerEntry};
+pub use store::{
+    ledger_anchor_path, ledger_head_path, ledger_path, ApprovalLedger, LedgerBody, LedgerEntry,
+};

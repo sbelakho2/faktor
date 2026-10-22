@@ -487,6 +487,7 @@ impl EngineeringResponse {
         self.assess_dimensions(&mut out);
         self.assess_execution(&mut out, verifier);
         self.assess_cross_check(&mut out, verifier);
+        self.assess_override_bindings(&mut out);
         self.assess_uncertainty(&mut out);
         self.assess_counterexamples(&mut out);
         self.assess_realization(&mut out);
@@ -1047,6 +1048,48 @@ impl EngineeringResponse {
                 format!("cross-check unavailable: {}", gap.reason),
             ),
             GateState::ResearchRequired(request) => out.research_required.push(request.clone()),
+        }
+    }
+
+    /// Every applied model-validity override must appear byte-identically in
+    /// the signed executed and cross-check receipts. An override that was
+    /// applied to the response selection but not committed to by the signer
+    /// (or an override added to a receipt that the selection did not apply)
+    /// is a typed gate violation. This closes the signature gap around the
+    /// selector: override evidence cannot live only in the unsigned response.
+    fn assess_override_bindings(&self, out: &mut ResponseAssessment) {
+        let expected = match &self.theory.state {
+            GateState::Established(theory) => theory
+                .selection
+                .as_ref()
+                .map(|selection| selection.overrides.as_slice())
+                .unwrap_or(&[]),
+            _ => &[],
+        };
+        for (gate, receipts) in [
+            (
+                GateId::ExecutedAnalysis,
+                match &self.executed_analysis.state {
+                    GateState::Established(value) => value.receipts.as_slice(),
+                    _ => &[],
+                },
+            ),
+            (
+                GateId::CrossCheck,
+                match &self.cross_check.state {
+                    GateState::Established(value) => value.receipts.as_slice(),
+                    _ => &[],
+                },
+            ),
+        ] {
+            for receipt in receipts {
+                if receipt.model_overrides != expected {
+                    out.violation(
+                        gate,
+                        "signed receipt override binding does not match the response applicability selection",
+                    );
+                }
+            }
         }
     }
 

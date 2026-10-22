@@ -20,11 +20,16 @@ use crate::operator::approval_dir;
 
 /// Ledger filename inside the approval directory.
 pub const LEDGER_FILE: &str = "ledger.jsonl";
-/// Committed-head anchor filename inside the approval directory.
+/// Local head file inside the approval directory (legacy/anti-truncation).
 pub const LEDGER_HEAD_FILE: &str = "ledger.head";
+/// Monotonic anchor filename outside the approval directory.
+pub const LEDGER_ANCHOR_FILE: &str = "ledger.anchor";
+/// Anchor directory, a sibling of (never inside) the approval directory.
+pub const LEDGER_ANCHOR_DIR: &str = "approval-anchor";
 const LEDGER_DOMAIN: &[u8] = b"faktor.approval.ledger/v1";
 const LEDGER_SCHEMA: &str = "faktor.approval.ledger-entry/v1";
 const LEDGER_HEAD_SCHEMA: &str = "faktor.approval.ledger-head/v1";
+const LEDGER_ANCHOR_SCHEMA: &str = "faktor.approval.ledger-anchor/v1";
 const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LEDGER_HEAD_BYTES: u64 = 1_024;
 const LOCK_FILE: &str = ".ledger.lock";
@@ -37,9 +42,15 @@ pub fn ledger_path(data_dir: &Path) -> PathBuf {
     approval_dir(data_dir).join(LEDGER_FILE)
 }
 
-/// The committed-head anchor path inside a data dir.
+/// The local committed-head path inside a data dir.
 pub fn ledger_head_path(data_dir: &Path) -> PathBuf {
     approval_dir(data_dir).join(LEDGER_HEAD_FILE)
+}
+
+/// The monotonic anchor path, deliberately outside the approval directory so
+/// rolling back every file under `approval/` does not roll back this counter.
+pub fn ledger_anchor_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(LEDGER_ANCHOR_DIR).join(LEDGER_ANCHOR_FILE)
 }
 
 /// The last durably committed chain position. The hash chain detects edits
@@ -48,6 +59,18 @@ pub fn ledger_head_path(data_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LedgerHead {
+    schema: String,
+    seq: u64,
+    digest: String,
+}
+
+/// A monotonic head counter stored outside the ledger's own directory. A
+/// same-user attacker can rewrite it too (see the crate docs); the honest
+/// guarantee is detection of a ledger-only rollback, not prevention of a full
+/// same-user rollback of both stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerAnchor {
     schema: String,
     seq: u64,
     digest: String,
@@ -99,14 +122,21 @@ pub struct ApprovalLedger {
 }
 
 impl ApprovalLedger {
-    /// Load and verify the whole chain. A missing file is an honest empty
-    /// ledger; a malformed or truncated file is a typed refusal.
+    /// Load and verify the whole chain. A missing ledger file is an honest
+    /// empty ledger only when the external anchor also records no committed
+    /// history; a malformed, truncated or rolled-back file is a typed refusal.
     pub fn load(data_dir: &Path) -> Result<Self, ApprovalError> {
+        Self::load_inner(data_dir, false)
+    }
+
+    fn load_inner(data_dir: &Path, heal_anchor: bool) -> Result<Self, ApprovalError> {
         let path = ledger_path(data_dir);
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
+                let ledger = Self::default();
+                verify_anchor(data_dir, &ledger, false)?;
+                return Ok(ledger);
             }
             Err(error) => return Err(ApprovalError::Store(error.to_string())),
         };
@@ -235,15 +265,18 @@ impl ApprovalLedger {
             expected_seq += 1;
             ledger.entries.push(entry);
         }
+        verify_anchor(data_dir, &ledger, heal_anchor)?;
         verify_committed_head(data_dir, &ledger)?;
         Ok(ledger)
     }
 
     /// Begin a locked read/write transaction. The chain is verified exactly
     /// once per operation; the lock is held until the transaction is dropped.
+    /// A writer may reconcile an interrupted append (anchor behind a fully
+    /// verified ledger).
     pub(crate) fn begin(data_dir: &Path) -> Result<LedgerTransaction, ApprovalError> {
         let lock = LedgerLock::acquire(data_dir)?;
-        let ledger = Self::load(data_dir)?;
+        let ledger = Self::load_inner(data_dir, true)?;
         Ok(LedgerTransaction {
             _lock: lock,
             data_dir: data_dir.to_path_buf(),
@@ -448,7 +481,142 @@ fn write_committed_head(data_dir: &Path, seq: u64, digest: &str) -> Result<(), A
         .map_err(|error| ApprovalError::Store(format!("ledger head encode: {error}")))?;
     faktor_fs::atomic::atomic_replace(&ledger_head_path(data_dir), &bytes)
         .map_err(|error| ApprovalError::Store(format!("ledger head: {error}")))?;
+    write_anchor(data_dir, seq, digest)
+}
+
+fn write_anchor(data_dir: &Path, seq: u64, digest: &str) -> Result<(), ApprovalError> {
+    let path = ledger_anchor_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApprovalError::Store(format!("ledger anchor dir: {error}")))?;
+    }
+    let anchor = LedgerAnchor {
+        schema: LEDGER_ANCHOR_SCHEMA.to_string(),
+        seq,
+        digest: digest.to_string(),
+    };
+    let bytes = serde_json::to_vec(&anchor)
+        .map_err(|error| ApprovalError::Store(format!("ledger anchor encode: {error}")))?;
+    faktor_fs::atomic::atomic_replace(&path, &bytes)
+        .map_err(|error| ApprovalError::Store(format!("ledger anchor: {error}")))?;
     Ok(())
+}
+
+fn verify_anchor(
+    data_dir: &Path,
+    ledger: &ApprovalLedger,
+    heal_interrupted_append: bool,
+) -> Result<(), ApprovalError> {
+    let path = ledger_anchor_path(data_dir);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if ledger.entries.is_empty() {
+                return Ok(());
+            }
+            return Err(ApprovalError::AnchorDegraded {
+                path: path.display().to_string(),
+                reason: "the monotonic ledger anchor is missing; refusing to trust a ledger whose head is no longer independently anchored"
+                    .to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(ApprovalError::AnchorDegraded {
+                path: path.display().to_string(),
+                reason: error.to_string(),
+            })
+        }
+    };
+    if raw.len() as u64 > MAX_LEDGER_HEAD_BYTES {
+        return Err(ApprovalError::AnchorDegraded {
+            path: path.display().to_string(),
+            reason: "ledger anchor exceeds its bound".to_string(),
+        });
+    }
+    let anchor: LedgerAnchor =
+        serde_json::from_slice(&raw).map_err(|error| ApprovalError::AnchorDegraded {
+            path: path.display().to_string(),
+            reason: format!("ledger anchor is not valid JSON: {error}"),
+        })?;
+    if anchor.schema != LEDGER_ANCHOR_SCHEMA {
+        return Err(ApprovalError::AnchorDegraded {
+            path: path.display().to_string(),
+            reason: format!(
+                "ledger anchor schema {:?} is not {LEDGER_ANCHOR_SCHEMA:?}",
+                anchor.schema
+            ),
+        });
+    }
+    if anchor.seq == 0
+        || anchor.digest.len() != 64
+        || !anchor.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApprovalError::AnchorDegraded {
+            path: path.display().to_string(),
+            reason: "ledger anchor is malformed".to_string(),
+        });
+    }
+    let committed = anchor.seq as usize;
+    if committed > ledger.entries.len() {
+        return Err(ApprovalError::LedgerRollback {
+            anchor_seq: anchor.seq,
+            ledger_len: ledger.entries.len(),
+            path: path.display().to_string(),
+        });
+    }
+    let Some(entry) = ledger.entries.get(committed.saturating_sub(1)) else {
+        return Err(ApprovalError::LedgerRollback {
+            anchor_seq: anchor.seq,
+            ledger_len: ledger.entries.len(),
+            path: path.display().to_string(),
+        });
+    };
+    if entry.digest != anchor.digest {
+        return Err(ApprovalError::LedgerRollback {
+            anchor_seq: anchor.seq,
+            ledger_len: ledger.entries.len(),
+            path: path.display().to_string(),
+        });
+    }
+    if committed < ledger.entries.len() {
+        if heal_interrupted_append && local_head_matches_tail(data_dir, ledger)? {
+            if let Some(last) = ledger.entries.last() {
+                write_anchor(data_dir, last.seq, &last.digest)?;
+                return Ok(());
+            }
+        }
+        return Err(ApprovalError::AnchorDegraded {
+            path: path.display().to_string(),
+            reason: format!(
+                "ledger anchor commits to entry {} while the verified chain has {} entries; an interrupted append or a rolled-back anchor needs explicit reconciliation",
+                anchor.seq,
+                ledger.entries.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn local_head_matches_tail(
+    data_dir: &Path,
+    ledger: &ApprovalLedger,
+) -> Result<bool, ApprovalError> {
+    let Some(last) = ledger.entries.last() else {
+        return Ok(false);
+    };
+    let path = ledger_head_path(data_dir);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(ApprovalError::Store(error.to_string())),
+    };
+    if raw.len() as u64 > MAX_LEDGER_HEAD_BYTES {
+        return Ok(false);
+    }
+    let Ok(head) = serde_json::from_slice::<LedgerHead>(&raw) else {
+        return Ok(false);
+    };
+    Ok(head.schema == LEDGER_HEAD_SCHEMA && head.seq == last.seq && head.digest == last.digest)
 }
 
 fn verify_committed_head(data_dir: &Path, ledger: &ApprovalLedger) -> Result<(), ApprovalError> {

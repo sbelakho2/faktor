@@ -114,6 +114,10 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn slice_is_empty<T>(values: &[T]) -> bool {
+    values.is_empty()
+}
+
 /// Canonical bytes signed by the attestation: a domain tag, the receipt
 /// digest and the signing instant, so a signature cannot be replayed as
 /// another message or moved outside its key-validity window.
@@ -380,6 +384,8 @@ impl AnalysisReceipt {
             executed: bool,
             execution: &'a crate::receipt::ExecutionEvidence,
             selection_digest: Option<Digest>,
+            #[serde(skip_serializing_if = "slice_is_empty")]
+            model_overrides: &'a [crate::selector::ModelOverrideBinding],
         }
         let canonical = Canonical {
             schema: "faktor.engineering.analysis-receipt/v1",
@@ -399,6 +405,7 @@ impl AnalysisReceipt {
             executed: self.executed,
             execution: &self.execution,
             selection_digest: self.selection_digest,
+            model_overrides: &self.model_overrides,
         };
         Digest::of_json(&canonical)
     }

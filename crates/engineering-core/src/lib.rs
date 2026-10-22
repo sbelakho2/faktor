@@ -59,9 +59,10 @@ pub use requirements::{
     MAX_REQUIREMENT_EVIDENCE, MAX_REQUIREMENT_MODELS,
 };
 pub use selector::{
-    ApplicabilitySelection, CatalogModel, ModelCatalog, ModelSelector, ModelValidityOverride,
-    RequirementSelection, SelectedModel, SelectionProvenance, SelectionRequest, ValidityDomain,
-    MAX_CATALOG_MODELS, MAX_SELECTION_REQUESTS, MAX_VALIDITY_DOMAINS,
+    ApplicabilitySelection, CatalogModel, ModelCatalog, ModelOverrideBinding, ModelSelector,
+    ModelValidityOverride, RequirementSelection, SelectedModel, SelectionProvenance,
+    SelectionRequest, ValidityDomain, MAX_CATALOG_MODELS, MAX_MODEL_OVERRIDES,
+    MAX_SELECTION_REQUESTS, MAX_VALIDITY_DOMAINS,
 };
 pub use value::{
     quantity_in, Applicability, EngineeringValue, MaterialRef, Orientation, Provenance,

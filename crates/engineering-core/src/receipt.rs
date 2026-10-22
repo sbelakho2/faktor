@@ -257,6 +257,11 @@ pub struct AnalysisReceipt {
     /// it into the canonical signed digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_digest: Option<Digest>,
+    /// Human-approved model-validity overrides applied by the selection.
+    /// Every override is bound into the canonical signed digest, so a
+    /// verifier refuses an override that the signer did not commit to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_overrides: Vec<crate::selector::ModelOverrideBinding>,
     /// Ed25519 attestation over [`AnalysisReceipt::canonical_digest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation: Option<crate::attestation::ReceiptAttestation>,
@@ -280,6 +285,9 @@ pub struct ReceiptContent {
     pub repeatability: Repeatability,
     /// Optional digest of the selected model/applicability record.
     pub selection_digest: Option<Digest>,
+    /// Human-approved model-validity overrides applied by the selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_overrides: Vec<crate::selector::ModelOverrideBinding>,
 }
 
 impl ReceiptContent {
@@ -298,6 +306,7 @@ impl ReceiptContent {
             artifacts: Vec::new(),
             repeatability: Repeatability::deterministic(),
             selection_digest: None,
+            model_overrides: Vec::new(),
         }
     }
 
@@ -349,6 +358,14 @@ impl ReceiptContent {
         self.selection_digest = Some(digest);
         self
     }
+
+    pub fn with_model_overrides(
+        mut self,
+        overrides: Vec<crate::selector::ModelOverrideBinding>,
+    ) -> Self {
+        self.model_overrides = overrides;
+        self
+    }
 }
 
 impl AnalysisReceipt {
@@ -384,6 +401,7 @@ impl AnalysisReceipt {
                 result_digest,
             },
             selection_digest: content.selection_digest,
+            model_overrides: content.model_overrides,
             attestation: None,
         };
         receipt.validate()?;
@@ -424,6 +442,7 @@ impl AnalysisReceipt {
                 deadline_ms: process.deadline_ms,
             },
             selection_digest: content.selection_digest,
+            model_overrides: content.model_overrides,
             attestation: None,
         };
         receipt.validate()?;
@@ -457,6 +476,9 @@ impl AnalysisReceipt {
         }
         for artifact in &self.artifacts {
             artifact.validate()?;
+        }
+        for binding in &self.model_overrides {
+            binding.validate()?;
         }
         self.repeatability.validate()?;
         match (&self.identity.kind, &self.execution) {
