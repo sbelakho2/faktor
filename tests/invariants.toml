@@ -2303,3 +2303,18 @@ mutation_command = "node scripts/mutation-run.mjs INV-SANDBOX-FIRST-RUN-AUDIT-CO
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-APPROVAL-HUMAN-ONLY"
+statement = "Durable approval decisions are human-operator only: an Agent principal, a requester deciding its own request, and a decision signed by an unregistered key are all refused typed, and the same refusals are re-verified when a durable ledger is loaded."
+owner = "crates/approval human-operator authority"
+authority = "crates/approval/src/authority.rs decide/verify_decision_with principal-kind and requester-separation guards"
+script_check = ""
+unit_test = "agents_cannot_decide_and_a_requester_cannot_self_approve"
+production_wiring = "human_approval_is_revision_bound_and_authorizes_only_the_exact_digest"
+fault = ""
+mutation_witness = "agents_cannot_decide_and_a_requester_cannot_self_approve"
+mutation_command = "node scripts/mutation-run.mjs INV-APPROVAL-HUMAN-ONLY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

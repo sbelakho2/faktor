@@ -525,6 +525,10 @@ const SCRIPT_ALLOWLIST = new Map(
       'generates the 72-screen/144-host-contract registries from docs/specs/edition8/registry.json for both hosts; generation is a source-authoring step and the generated files are committed and gated, so it is not run by CI.',
     'scripts/dogfood.sh':
       'executor root of the DOGFOOD program: it IS the run plan every other script is classified against, so it cannot invoke itself; it is run explicitly by operators and its registered gates run in the certificate/PR lanes through scripts/dogfood.mjs.',
+    'scripts/intelligence/merge.mjs':
+      'intelligence-eval result merger: post-processes external hidden-suite result files produced by run.mjs; requires operator eval artifacts and is not part of the offline dogfood suite.',
+    'scripts/intelligence/report.mjs':
+      'intelligence-eval result reporter: renders operator-owned run.mjs/merge.mjs result files; requires eval artifacts and is not part of the offline dogfood suite.',
   }),
 );
 
@@ -539,6 +543,8 @@ const DOCS_ALLOWLIST = new Map(
       'query-planner audit notes owned by the storage/query workstream; the normative contract lives in docs/architecture.md and the audit is intentionally not part of the product index.',
     'docs/ui-terminology.md':
       'normative Work/Inspect/History vocabulary law; enforced by the dogfood internal-identifier label rule below and by the panel wording; not yet linked from the architecture index.',
+    'docs/engineering-receipt-attestation.md':
+      'normative Engineering receipt-signing and model-applicability contract; enforced by crates/engineering-* tests and cited from their crate docs, not part of the architecture index.',
   }),
 );
 
@@ -1291,7 +1297,7 @@ const UIUX_CONTRACT = [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/ApprovalCards.kt', 'Allow'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/ApprovalCards.kt', 'Deny'],
     ],
-    tests: { jetbrains: ['approval renderer: authority reason only when present, exact fallback + payload'] },
+    tests: { jetbrains: ['approval renderer: requester-stated reason is labelled, no inferred target, exact fallback'] },
   },
   // ------------------------------------------------------------------ T22
   {

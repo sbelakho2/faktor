@@ -110,6 +110,21 @@
    ]
   },
   {
+   "crate": "faktor-approval",
+   "class": "release-critical",
+   "owners": [
+    "INV-APPROVAL-HUMAN-ONLY"
+   ],
+   "authority": "planted mutation INV-APPROVAL-HUMAN-ONLY",
+   "capabilities": [
+    {
+     "id": "approval.human_only",
+     "unit": "agents_cannot_decide_and_a_requester_cannot_self_approve",
+     "mutation": "INV-APPROVAL-HUMAN-ONLY"
+    }
+   ]
+  },
+  {
    "crate": "faktor-browser",
    "class": "release-critical",
    "owners": [

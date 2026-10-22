@@ -1,0 +1,12 @@
+{
+  "id": "INV-APPROVAL-HUMAN-ONLY",
+  "file": "crates/approval/src/authority.rs",
+  "find": "        if principal.kind != crate::model::PrincipalKind::HumanOperator {\n            return Err(ApprovalError::AgentApproval {\n                principal: principal.id,\n            });\n        }",
+  "replace": "        if principal.kind != crate::model::PrincipalKind::HumanOperator {\n        }",
+  "gate": "cargo test -p faktor-approval --test approval agents_cannot_decide_and_a_requester_cannot_self_approve",
+  "expect": "FAILED",
+  "capabilities": [
+    "approval.human_only"
+  ],
+  "note": "Dropping the human-operator refusal lets an Agent principal reach the decision path; the dedicated oracle must fail because agents can never approve."
+}

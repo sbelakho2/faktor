@@ -1235,7 +1235,7 @@ internal class Edition8ScreenPanel(
                             permission.capability,
                             permission.detail
                         )
-                        val review = "Review request #${entry.id}: " +
+                        val review = "Review request ${entry.id}: " +
                             "${bound(approvalHeadlineOf(entry), 240)} — no decision was sent; " +
                             "use the approval card's Allow/Deny"
                         val open = host.openApprovals

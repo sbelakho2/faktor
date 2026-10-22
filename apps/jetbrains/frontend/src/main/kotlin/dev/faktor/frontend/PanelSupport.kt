@@ -297,7 +297,6 @@ internal fun escapeHtml(text: String): String = text
     .replace("<", "&lt;")
     .replace(">", "&gt;")
     .replace("\"", "&quot;")
-    .replace("'", "&#39;")
 
 /**
  * Insert zero-width break opportunities after path/identifier separators so

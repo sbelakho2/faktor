@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-22T22:54:46.229Z",
-  "commit": "014c2d20fe3bf35bb2ad4bda9f63c9f8b1051ae6",
-  "tree": "53d9065014ceb2ac7aa22885d6d2fa8729467239",
+  "generated_at": "2026-10-22T23:52:37.071Z",
+  "commit": "751a98320b223145a48197ab47efd4fa1e883f11",
+  "tree": "cd8daa8a476454026a941cc7e581f9cd284751e8",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 949,
+    "rows": 950,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 47,
       "config-key": 53,
       "control": 200,
-      "invariant": 158,
+      "invariant": 159,
       "jetbrains-contribution": 1,
       "native-route": 270,
       "provider-adapter": 6,
@@ -38,22 +38,23 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 558,
-      "proven": 323,
+      "deferred": 559,
+      "failed": 1,
+      "proven": 322,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 512,
-      "pull": 618,
-      "trusted": 948,
+      "nightly": 513,
+      "pull": 619,
+      "trusted": 949,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 405,
       "ide-screen-readers": 385,
-      "state-model-crash": 256,
-      "unit-property": 241
+      "state-model-crash": 257,
+      "unit-property": 242
     }
   },
   "rows": [
@@ -1240,7 +1241,7 @@
       ],
       "evidence_kind": "state-model",
       "oracle": "Overflow/negative/malformed cursors and duplicate concurrent streams are typed and bounded; no 5xx, no panic, no event duplication across one session.",
-      "status": "proven",
+      "status": "failed",
       "meta": {
         "report_row": "widen-ordering"
       },
@@ -1250,7 +1251,7 @@
         "corruption"
       ],
       "evidence": {
-        "passed": true,
+        "passed": false,
         "cases": [
           {
             "name": "cursor-18446744073709551616",
@@ -1294,9 +1295,9 @@
           },
           {
             "name": "stream-auth-before-data",
-            "passed": true,
+            "passed": false,
             "observed": {
-              "status": 401
+              "status": null
             }
           }
         ]
@@ -12707,6 +12708,37 @@
         "mutation": "node scripts/mutation-run.mjs INV-ADMISSION-RECOVERY-LANDING",
         "unit_test": "recovery_completion_lands_the_byte_exact_receipt_and_replays",
         "wiring_test": "crash_after_claim_before_mutation_reclaims_and_retries_once"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-APPROVAL-HUMAN-ONLY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "agents_cannot_decide_and_a_requester_cannot_self_approve",
+        "human_approval_is_revision_bound_and_authorizes_only_the_exact_digest"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-APPROVAL-HUMAN-ONLY",
+        "unit_test": "agents_cannot_decide_and_a_requester_cannot_self_approve",
+        "wiring_test": "human_approval_is_revision_bound_and_authorizes_only_the_exact_digest"
       },
       "adversarial": [
         "planted-mutation",
@@ -27006,7 +27038,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/9b34bc59bad814cd4ad0f7bd52ac6557"
+              "handle": "vault://provider_key/5ff6e68859158d96d8f5fd48640cc836"
             }
           },
           {
