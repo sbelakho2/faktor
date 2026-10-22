@@ -174,7 +174,7 @@ fi
 EXTRA_JVM_ARGS=""
 SMOKE_SELECTION=()
 SELFTEST_CHECKSUM=0
-KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork ControlExercise Acceptance Edition8ControlExercise Edition8Acceptance Edition8Workflow Edition8Evidence Edition8DaemonDogfood Edition8LiveAcceptance Visual"
+KNOWN_SMOKES="Backend NativeBridge Frontend ControlPlaneCredential JetBrainsParity HostMatrix EdtWork ControlExercise Acceptance Edition8ControlExercise Edition8Acceptance Edition8Workflow Edition8Evidence Edition8DaemonDogfood Edition8LiveAcceptance UxAudit Visual"
 while [ $# -gt 0 ]; do
   case "$1" in
     --selftest-checksum)
@@ -281,7 +281,8 @@ $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8AcceptanceSmoke.
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8WorkflowSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8Evidence.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8DaemonDogfood.kt
-$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8LiveAcceptance.kt"
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8LiveAcceptance.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/Edition8UxAudit.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5CatalogData.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5Catalog.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/Edition5ConfigSource.kt
@@ -570,6 +571,15 @@ fi
 if smoke_selected Edition8Evidence; then
   echo "[compile-and-smoke] running Edition8Evidence (optical/contrast/a11y evidence)"
   run_smoke Edition8Evidence dev.faktor.frontend.Edition8Evidence || exit $?
+fi
+
+if smoke_selected UxAudit; then
+  echo "[compile-and-smoke] running Edition8UxAudit (72-screen UX metrics + screenshots)"
+  java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $EXTRA_JVM_ARGS -cp "$SMOKE_JAR" \
+    dev.faktor.frontend.Edition8UxAudit "${FAKTOR_UX_AUDIT_DIR:-$ROOT/target/ux-audit/current}" 2>"$WORK/UxAudit.stderr" || {
+    report_toolchain_failure "Edition8UxAudit" "$WORK/UxAudit.stderr" "$?"
+    exit 1
+  }
 fi
 
 if smoke_selected HostMatrix || smoke_selected Visual; then

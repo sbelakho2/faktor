@@ -366,6 +366,16 @@ section_capabilities() {
     CAPABILITIES_OUT_DIR="$OUT_DIR" node scripts/capabilities-manifest.mjs
 }
 
+# Capability/wiring matrix: UI action -> handler -> service, setting ->
+# consumer, native route -> client, descriptor -> runtime consumer. The
+# scanner's planted-violation selftest runs first; the tree scan then fails
+# on any unrecorded surface. `--check` records unwired/stored-only entries as
+# warnings (the release gate can require zero).
+section_wiring_matrix() {
+    node scripts/programme/check-registry.mjs --selftest || return 1
+    node scripts/programme/check-registry.mjs --check --no-probe
+}
+
 # Prove the certification-evidence verifier: the full marker rejection
 # matrix, evidence commit/tree binding, the ed25519 signature allowlist and
 # the .woodpecker marker/command drift check (scripts/certification/evidence.mjs).
@@ -667,9 +677,11 @@ else
     if command -v node >/dev/null 2>&1; then
         add_section section_jetbrains_parity jetbrains-parity "JetBrains parity artifact regeneration"
         add_section section_capabilities capabilities "capability manifest + docs drift"
+        add_section section_wiring_matrix wiring-matrix "capability/wiring matrix + planted violations"
         add_section section_evidence_selftest evidence-selftest "certification evidence verifier selftest"
     else
         add_skip capabilities-manifest "node is unavailable on this host; capability labels stay unknown"
+        add_skip wiring-matrix "node is unavailable on this host; UI/setting/route wiring cannot be checked"
         add_skip evidence-selftest "node is unavailable on this host; certified evidence cannot be verified"
     fi
     add_section section_signing_selftest signing-selftest "OS signing drivers selftest (unsigned markers + digest refusals)"

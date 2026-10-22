@@ -1598,9 +1598,37 @@ pub(crate) async fn native_memory_records_retention(
         Ok(scope) => scope,
         Err(e) => return memory_error(e),
     };
-    let days = req
-        .older_than_days
-        .unwrap_or(u64::from(MemoryPolicy::default().retention_days));
+    // The daemon descriptor is the fallback retention period when the
+    // caller does not name one. 0 is the descriptor's explicit "retain until
+    // explicit deletion": an automatic pass becomes a bounded no-op, never a
+    // surprise 90-day deletion.
+    let configured_days = state.deps.foundation.as_deref().and_then(|foundation| {
+        foundation
+            .config
+            .u64_value("faktor.memory.retentionDays")
+            .ok()
+            .flatten()
+    });
+    if req.older_than_days.is_none() && configured_days == Some(0) {
+        return Json(serde_json::json!({
+            "dryRun": req.dry_run.unwrap_or(true),
+            "scope": scope.kind(),
+            "scopeId": scope.id(),
+            "retentionDays": 0,
+            "disabled": true,
+            "cutoffMs": serde_json::Value::Null,
+            "wouldDelete": 0,
+            "deleted": 0,
+            "candidates": [],
+            "scanned": 0,
+            "truncated": false,
+            "note": "automatic retention is disabled by faktor.memory.retentionDays=0; pass olderThanDays for an explicit pass",
+        }))
+        .into_response();
+    }
+    let days = req.older_than_days.unwrap_or_else(|| {
+        configured_days.unwrap_or(u64::from(MemoryPolicy::default().retention_days))
+    });
     if days > u64::from(faktor_memory::MAX_MEMORY_POLICY_DAYS) {
         return malformed("olderThanDays exceeds the bound");
     }
@@ -1617,6 +1645,7 @@ pub(crate) async fn native_memory_records_retention(
             "dryRun": dry_run,
             "scope": scope.kind(),
             "scopeId": scope.id(),
+            "retentionDays": days,
             "cutoffMs": plan.cutoff_ms,
             "wouldDelete": if dry_run { plan.records.len() } else { 0 },
             "deleted": if dry_run { 0 } else { plan.records.len() },

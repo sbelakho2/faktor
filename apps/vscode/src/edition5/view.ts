@@ -27,6 +27,8 @@ export interface E5ControlView {
   readonly applyState: E5ApplyState | null;
   readonly source: string | null;
   readonly options: readonly string[];
+  /** Q-06/Q-07 only: the exact pending request id this render is bound to. */
+  readonly approvalRequestId: string | null;
 }
 
 export interface E5Row {
@@ -280,12 +282,21 @@ export function controlView(
     state = 'disabled';
     stateText = `Locked by ${config.lock_source ?? config.source}; the served effective value is read-only.`;
   }
+  // Q-06/Q-07 are decisions over ONE exact request: bind the id from THIS
+  // render (never a click-time "first pending" lookup). The panel refuses the
+  // decision when that id is no longer live in the current snapshot.
+  const approvalRequestId =
+    control.id === 'Q-06' || control.id === 'Q-07'
+      ? (snapshot?.approvals?.pending?.[0]?.request_id ?? null)
+      : null;
   const valueText =
-    config !== null
-      ? `${jsonText(config.value)} · ${config.source}`
-      : binding.input === 'readonly'
-        ? 'Read-only served value'
-        : 'Inherit (not configured)';
+    approvalRequestId !== null
+      ? `Exact pending request #${approvalRequestId}`
+      : config !== null
+        ? `${jsonText(config.value)} · ${config.source}`
+        : binding.input === 'readonly'
+          ? 'Read-only served value'
+          : 'Inherit (not configured)';
   return {
     control,
     binding,
@@ -298,6 +309,7 @@ export function controlView(
     applyState: config === null ? null : config.apply_state,
     source: config === null ? null : config.source,
     options,
+    approvalRequestId,
   };
 }
 
@@ -345,11 +357,19 @@ export function ageText(ms: number | null): string {
 
 // --------------------------------------------------------------- screen rows
 
+const MAX_ROW_VALUE_CHARS = 4096;
+const MAX_ROW_LABEL_CHARS = 256;
+
+/** Served row text is display DATA; bound it before the DOM (see E8). */
+function boundedRow(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
 function row(key: string, label: string, value: string | null, state: E5Row['state'] = 'served'): E5Row {
   return {
     key,
-    label,
-    value: value === null || value.length === 0 ? 'Unavailable' : value,
+    label: boundedRow(label, MAX_ROW_LABEL_CHARS),
+    value: value === null || value.length === 0 ? 'Unavailable' : boundedRow(value, MAX_ROW_VALUE_CHARS),
     state: value === null || value.length === 0 ? 'unavailable' : state,
   };
 }

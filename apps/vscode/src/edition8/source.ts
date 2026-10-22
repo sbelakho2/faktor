@@ -6,6 +6,7 @@
 // names the failed route. Session-scoped reads are skipped (recorded as
 // unavailable, not empty) when the host has no bound session.
 
+import { createHash } from 'node:crypto';
 import { NativeApiError, NativeClient } from '../nativeClient.ts';
 import {
   E8_SOURCE_KEYS,
@@ -113,7 +114,36 @@ function firstRunTask(runs: Json | null): string | null {
   return null;
 }
 
+export interface E8ConfigLookup {
+  readonly values: readonly E8ConfigValue[];
+  readonly index: ReadonlyMap<string, E8ConfigValue>;
+}
+
+const CONFIG_LOOKUP = new WeakMap<object, E8ConfigLookup>();
+const EMPTY_CONFIG_LOOKUP: E8ConfigLookup = { values: [], index: new Map() };
+
+function configLookup(config: Json | null): E8ConfigLookup {
+  if (!isObject(config)) return EMPTY_CONFIG_LOOKUP;
+  const cached = CONFIG_LOOKUP.get(config);
+  if (cached !== undefined) return cached;
+  const values = readConfigValues(config);
+  const lookup: E8ConfigLookup = {
+    values,
+    index: new Map(values.map((entry) => [entry.key, entry])),
+  };
+  CONFIG_LOOKUP.set(config, lookup);
+  return lookup;
+}
+
 export function configValues(config: Json | null): readonly E8ConfigValue[] {
+  return configLookup(config).values;
+}
+
+export function configValueMap(config: Json | null): ReadonlyMap<string, E8ConfigValue> {
+  return configLookup(config).index;
+}
+
+function readConfigValues(config: Json | null): readonly E8ConfigValue[] {
   if (!isObject(config)) return [];
   const raw = config.values;
   const rows: E8ConfigValue[] = [];
@@ -149,6 +179,41 @@ export function configValues(config: Json | null): readonly E8ConfigValue[] {
   return rows;
 }
 
+function stableJson(value: Json): string {
+  return JSON.stringify(value, (key, entry) => (key === 'snapshotMs' ? undefined : entry));
+}
+
+function dataRevision(
+  sources: Record<string, E8Source>,
+  session: string | null,
+  options: E8SnapshotOptions,
+): string {
+  const hash = createHash('sha256');
+  hash.update(session ?? '');
+  hash.update('\0');
+  hash.update(options.workspace ?? '');
+  hash.update('\0');
+  hash.update(options.worktree ?? '');
+  hash.update('\0');
+  hash.update(options.daemon ?? '');
+  hash.update('\0');
+  hash.update(String(options.generation ?? ''));
+  for (const key of E8_SOURCE_KEYS) {
+    const source = sources[key];
+    if (source === undefined) {
+      hash.update(`${key}\0missing\0`);
+      continue;
+    }
+    hash.update(key);
+    hash.update('\0');
+    hash.update(source.state);
+    hash.update('\0');
+    if (source.data !== null) hash.update(stableJson(source.data));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
 export function configSnapshot(config: Json | null): E8ConfigSnapshot | null {
   if (!isObject(config)) return null;
   const revision = config.revision;
@@ -178,22 +243,24 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     readJson(native, 'GET', '/models', null, sources, 'models'),
     readJson(native, 'GET', '/capabilities', null, sources, 'capabilities'),
     readJson(native, 'GET', '/native/config/snapshot', null, sources, 'config'),
-    readJson(native, 'GET', '/native/config/descriptors', null, sources, 'descriptors'),
+    skip(sources, 'descriptors', 'GET', '/native/config/descriptors', 'The effective config snapshot is authoritative; Revision 8 does not render the descriptor catalog.'),
     readJson(native, 'GET', '/native/providers/connections', null, sources, 'connections'),
     readJson(native, 'GET', '/native/providers', null, sources, 'providers'),
   ]);
   const [health, ready, models, capabilities, config, descriptors, connections, providers] = critical;
   const selected = firstModel(models);
-  const parameters =
+  const parametersPromise =
     selected === null
-      ? skip(
-          sources,
-          'parameters',
-          'GET',
-          '/native/model-parameters',
-          'No served model is available; the exact-model capability sheet cannot be read.',
+      ? Promise.resolve(
+          skip(
+            sources,
+            'parameters',
+            'GET',
+            '/native/model-parameters',
+            'No served model is available; the exact-model capability sheet cannot be read.',
+          ),
         )
-      : await readJson(
+      : readJson(
           native,
           'GET',
           `/native/model-parameters?provider=${encodeURIComponent(selected.provider)}&model=${encodeURIComponent(selected.model)}`,
@@ -202,20 +269,20 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
           'parameters',
         );
 
-  const other = await Promise.all([
+  const otherPromise = Promise.all([
     sessionPath === null
       ? skip(sources, 'receipts', 'GET', '/native/call-receipts', 'No conversation is bound; call receipts are session-scoped.')
-      : readJson(native, 'GET', `/native/call-receipts?session=${encodeURIComponent(session as string)}&limit=50`, null, sources, 'receipts'),
+      : readJson(native, 'GET', `/native/call-receipts?session=${encodeURIComponent(session as string)}&limit=1`, null, sources, 'receipts'),
     readJson(native, 'GET', '/native/permissions/policy', null, sources, 'policy'),
     readJson(native, 'GET', '/native/permissions/audit?limit=50', null, sources, 'permissionAudit'),
     sessionPath === null
       ? skip(sources, 'approvals', 'GET', '/native/permissions', 'No conversation is bound; pending approvals are session-scoped.')
       : readJson(native, 'GET', `/native/permissions?session=${encodeURIComponent(session as string)}`, null, sources, 'approvals'),
     readJson(native, 'GET', '/native/mcp/servers', null, sources, 'mcp'),
-    readJson(native, 'GET', '/native/tools', null, sources, 'tools'),
+    readJson(native, 'GET', '/native/tools?include_schema=false', null, sources, 'tools'),
     readJson(native, 'GET', '/native/skills', null, sources, 'skills'),
     readJson(native, 'GET', '/native/hooks', null, sources, 'hooks'),
-    readJson(native, 'GET', '/native/hooks/audit?limit=50', null, sources, 'hookAudit'),
+    readJson(native, 'GET', '/native/hooks/audit?limit=1', null, sources, 'hookAudit'),
     sessionPath === null
       ? skip(sources, 'memory', 'GET', '/native/memory/records', 'No conversation is bound; memory is session/project-scoped.')
       : readJson(native, 'GET', `/native/memory/records?session=${encodeURIComponent(session as string)}&scope=all&limit=200`, null, sources, 'memory'),
@@ -227,7 +294,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     sessionPath === null
       ? skip(sources, 'sessionUsage', 'GET', '/native/session/{id}/usage', 'No conversation is bound; run usage is session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/usage`, null, sources, 'sessionUsage'),
-    readJson(native, 'GET', '/native/outcomes?limit=50', null, sources, 'outcomes'),
+    readJson(native, 'GET', '/native/outcomes?limit=1', null, sources, 'outcomes'),
     sessionPath === null
       ? skip(sources, 'verification', 'GET', '/native/session/{id}/verification', 'No conversation is bound; verification is session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/verification`, null, sources, 'verification'),
@@ -257,7 +324,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
       ? skip(sources, 'semantic', 'GET', '/native/semantic/status', 'Semantic retrieval status is read after a session binds.')
       : readJson(native, 'GET', '/native/semantic/status', null, sources, 'semantic'),
     sessionPath === null
-      ? readJson(native, 'GET', '/native/agents', null, sources, 'agents')
+      ? skip(sources, 'agents', 'GET', '/native/session/{id}/agents', 'No conversation is bound; agents are session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/agents`, null, sources, 'agents'),
     sessionPath === null
       ? skip(sources, 'board', 'GET', '/native/session/{id}/board', 'No conversation is bound; the coordination board is session-scoped.')
@@ -265,15 +332,17 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     sessionPath === null
       ? skip(sources, 'tournaments', 'GET', '/native/session/{id}/tournaments', 'No conversation is bound; model comparisons are session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/tournaments`, null, sources, 'tournaments'),
-    readJson(native, 'GET', '/native/terminals', null, sources, 'terminals'),
+    sessionPath === null
+      ? skip(sources, 'terminals', 'GET', '/native/terminals', 'No conversation is bound; terminal ownership is session-scoped.')
+      : readJson(native, 'GET', `/native/terminals?session=${encodeURIComponent(session as string)}`, null, sources, 'terminals'),
     readJson(native, 'GET', '/native/telemetry', null, sources, 'telemetry'),
   ]);
 
-  const r8 = await Promise.all([
-    readJson(native, 'GET', '/native/presets?limit=200', null, sources, 'presets'),
-    readJson(native, 'GET', '/native/instructions/records?limit=200', null, sources, 'instructions'),
+  const r8Promise = Promise.all([
+    readJson(native, 'GET', '/native/presets?limit=20', null, sources, 'presets'),
+    readJson(native, 'GET', '/native/instructions/records?limit=30', null, sources, 'instructions'),
     readJson(native, 'GET', '/native/runtime/status', null, sources, 'runtime'),
-    readJson(native, 'GET', '/native/config/provenance?limit=500', null, sources, 'provenance'),
+    readJson(native, 'GET', '/native/config/provenance?limit=40', null, sources, 'provenance'),
     readJson(native, 'GET', '/native/browser/adapters', null, sources, 'browserAdapters'),
     sessionPath === null
       ? skip(sources, 'browserSessions', 'GET', '/native/browser/sessions?session=', 'No conversation is bound; browser sessions are session-scoped.')
@@ -288,12 +357,22 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     readJson(native, 'GET', '/native/sessions/parallel', null, sources, 'parallelSessions'),
   ]);
 
+  const [other, r8, parameters] = await Promise.all([otherPromise, r8Promise, parametersPromise]);
+
   const tasks = other[18];
   const taskId = firstTask(tasks) ?? firstRunTask(other[17]);
-  const budget =
+  const budgetPromise =
     sessionPath === null || taskId === null
-      ? skip(sources, 'budget', 'GET', '/native/session/{id}/budget', 'No task identity is served; the task budget is Unavailable.')
-      : await readJson(
+      ? Promise.resolve(
+          skip(
+            sources,
+            'budget',
+            'GET',
+            '/native/session/{id}/budget',
+            'No task identity is served; the task budget is Unavailable.',
+          ),
+        )
+      : readJson(
           native,
           'GET',
           `${sessionPath}/budget?taskId=${encodeURIComponent(taskId)}`,
@@ -301,16 +380,18 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
           sources,
           'budget',
         );
-  const proof =
+  const proofPromise =
     sessionPath === null || taskId === null
-      ? skip(
-          sources,
-          'proof',
-          'GET',
-          '/native/tasks/{id}/proof',
-          'No completed task identity is served; engineering proof is Unavailable, never verified.',
+      ? Promise.resolve(
+          skip(
+            sources,
+            'proof',
+            'GET',
+            '/native/tasks/{id}/proof',
+            'No completed task identity is served; engineering proof is Unavailable, never verified.',
+          ),
         )
-      : await readJson(
+      : readJson(
           native,
           'GET',
           `/native/tasks/${encodeURIComponent(taskId)}/proof?session=${encodeURIComponent(session as string)}`,
@@ -318,22 +399,13 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
           sources,
           'proof',
         );
+  const [budget, proof] = await Promise.all([budgetPromise, proofPromise]);
 
   const sessionSearch =
     session === null
       ? skip(sources, 'search', 'GET', '/native/transcript/search', 'No conversation is bound; transcript search is session-scoped.')
-      : await readJson(
-          native,
-          'GET',
-          `/native/transcript/search?session=${encodeURIComponent(session as string)}&q=&regex=false&case=false`,
-          null,
-          sources,
-          'search',
-        );
+      : skip(sources, 'search', 'GET', '/native/transcript/search', 'No search query has been issued; Find is user-initiated and the daemon refuses an empty needle.');
   const transcript = other[19];
-  // The empty search query is a valid cursor read for some daemons and a
-  // typed refusal for others; either answer is preserved (never replaced by
-  // []). Transcript turns are the served conversation, not search results.
 
   const criticalFailed = ['health', 'ready', 'models', 'config'].filter(
     (key) => sources[key]?.state !== 'ready',
@@ -349,6 +421,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
   const snapshot: E8Snapshot = {
     schema: 'faktor-edition8-ui/v1',
     revision: String(options.generation ?? previous?.revision ?? '0'),
+    data_revision: dataRevision(sources, session, options),
     generated_at_ms: now,
     stale: stale && previous !== null,
     stale_age_ms: staleAge,

@@ -134,7 +134,11 @@ function read(root, rel) {
 
 /** Daemon config keys declared by the descriptor authority. */
 export function discoverConfigKeys(root = ROOT) {
-  const text = read(root, 'crates/foundation/src/config.rs');
+  const full = read(root, 'crates/foundation/src/config.rs');
+  // A descriptor built inside `#[cfg(test)]` is a test fixture, not a
+  // daemon surface. Keep the production prefix only.
+  const testAt = full.search(/\n#\[cfg\(test\)\]/);
+  const text = testAt === -1 ? full : full.slice(0, testAt);
   const keys = new Set();
   for (const match of text.matchAll(/"((?:faktor|native)\.[A-Za-z0-9_.-]+)"/g)) {
     keys.add(match[1]);

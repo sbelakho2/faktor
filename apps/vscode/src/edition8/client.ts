@@ -14,7 +14,7 @@ import {
 } from './contract.ts';
 import { bindingOf8 } from './bindings.ts';
 import { resolveRoute } from './routes.ts';
-import { configValues, loadEdition8Snapshot } from './source.ts';
+import { configValueMap, loadEdition8Snapshot } from './source.ts';
 import { contextDraftSources } from './hostDraft.ts';
 
 export interface E8ReadOptions {
@@ -36,6 +36,12 @@ export interface E8Backend {
     controlId: string,
     payload: Readonly<Record<string, Json>>,
     snapshot: E8Snapshot | null,
+  ) => Promise<E8ActionResult>;
+  /** One exact native request for a command that has no control binding. */
+  readonly request: (
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    path: string,
+    body?: Json,
   ) => Promise<E8ActionResult>;
 }
 
@@ -564,6 +570,43 @@ export class Edition8Client implements E8Backend {
     }
   }
 
+  async request(
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    path: string,
+    body?: Json,
+  ): Promise<E8ActionResult> {
+    try {
+      const raw =
+        method === 'GET'
+          ? await this.native.edition5Json<Json>('GET', path, null, (value) => value)
+          : await this.native.edition5Json<Json>(method, path, body ?? null, (value) => value);
+      return {
+        ok: true,
+        message: `${method} ${path}`,
+        method,
+        path,
+        body: raw,
+        errorCode: null,
+        unresolved: null,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message:
+          error instanceof NativeApiError
+            ? `${error.code}: ${error.message}`
+            : error instanceof Error
+              ? error.message
+              : String(error),
+        method,
+        path,
+        body: null,
+        errorCode: error instanceof NativeApiError ? error.code : 'transport',
+        unresolved: null,
+      };
+    }
+  }
+
   async execute(
     controlId: string,
     payload: Readonly<Record<string, Json>>,
@@ -686,5 +729,5 @@ export class Edition8Client implements E8Backend {
 /** Config lookup used by the panel and tests. */
 export function servedConfigValue(snapshot: E8Snapshot | null, key: string): E8ConfigValue | null {
   if (snapshot === null) return null;
-  return configValues(snapshot.config).find((entry) => entry.key === key) ?? null;
+  return configValueMap(snapshot.config).get(key) ?? null;
 }

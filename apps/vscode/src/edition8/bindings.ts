@@ -124,10 +124,9 @@ function labelFor(control: E8Control, kind: E8RouteKind): string {
   return 'Inspect served state';
 }
 
-function optionsFor(control: E8Control, optionsSource: E5OptionsSource, snapshot: E8Snapshot | null): readonly string[] {
-  const e5 = bindingFor(control as never);
-  if (e5.options.length > 0) return e5.options;
-  if (snapshot === null || optionsSource === null) return [];
+const OPTIONS_CACHE = new WeakMap<E8Snapshot, Map<E5OptionsSource, readonly string[]>>();
+
+function optionsFor(optionsSource: E5OptionsSource, snapshot: E8Snapshot): readonly string[] {
   switch (optionsSource) {
     case 'models':
       // Model controls write the bare model id (the provider is a SEPARATE
@@ -295,11 +294,17 @@ export function sampleValue8(binding: E8Binding, options: readonly string[] = []
 
 export function optionsForBinding(binding: E8Binding, snapshot: E8Snapshot | null): readonly string[] {
   if (binding.options.length > 0) return binding.options;
-  return optionsFor(
-    E8_CONTROLS.find((control) => control.id === binding.controlId) as E8Control,
-    binding.optionsSource,
-    snapshot,
-  );
+  if (snapshot === null || binding.optionsSource === null) return [];
+  let bySource = OPTIONS_CACHE.get(snapshot);
+  if (bySource === undefined) {
+    bySource = new Map();
+    OPTIONS_CACHE.set(snapshot, bySource);
+  }
+  const cached = bySource.get(binding.optionsSource);
+  if (cached !== undefined) return cached;
+  const options = optionsFor(binding.optionsSource, snapshot);
+  bySource.set(binding.optionsSource, options);
+  return options;
 }
 
 export function resolvedRoute(binding: E8Binding, snapshot: E8Snapshot | null, payload: Readonly<Record<string, Json>>): {

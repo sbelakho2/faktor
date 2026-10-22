@@ -760,6 +760,25 @@ async fn edition5_foundation_surfaces_are_wired_over_http() {
     let (status, tools) = rig.get("/native/tools?q=read&limit=5").await;
     assert_eq!(status, StatusCode::OK);
     assert!(tools["tools"].is_array());
+    assert!(
+        tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("inputSchema").is_some()),
+        "the default tool catalog keeps the historical schema rows"
+    );
+    let (status, projected) = rig
+        .get("/native/tools?q=read&limit=5&include_schema=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{projected}");
+    let full_rows = tools["tools"].as_array().unwrap();
+    let rows = projected["tools"].as_array().unwrap();
+    assert_eq!(rows.len(), full_rows.len());
+    assert!(
+        rows.iter().all(|tool| tool.get("inputSchema").is_none()),
+        "the picker projection must not serialize multi-KiB schemas"
+    );
     let (status, _skills) = rig.get("/native/skills?q=a").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _hooks) = rig.get("/native/hooks?q=a&limit=5").await;
@@ -1023,4 +1042,167 @@ async fn lsp_routes_are_typed_when_no_language_server_manager_is_wired() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "lsp_disabled");
+}
+
+#[tokio::test]
+async fn settings_that_claim_effect_are_consumed_by_their_routes() {
+    let rig = Rig::new().await;
+    let (status, snapshot) = rig.get("/native/config/snapshot").await;
+    assert_eq!(status, StatusCode::OK);
+    let revision = snapshot["revision"].as_u64().unwrap();
+    let (status, receipt) = rig
+        .post(
+            "/native/config/commit",
+            json!({
+                "expected_revision": revision,
+                "changes": [
+                    {"key": "faktor.model.contextLimit", "scope": "user", "value": 4096},
+                    {"key": "faktor.transcript.searchLimit", "scope": "user", "value": 3},
+                    {"key": "faktor.sessions.maxParallel", "scope": "user", "value": 1},
+                    {"key": "faktor.session.titleSearch", "scope": "user", "value": false},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+
+    // F046: a larger requested capacity is capped by the durable override.
+    let (status, preview) = rig
+        .post(
+            &format!("/native/session/{}/context/preview", rig.session),
+            json!({"operationId": "op-cap", "capacity": 32768}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["capacity"], 4096);
+
+    // Transcript paging names the configured bound and never exceeds it.
+    let (status, search) = rig
+        .get(&format!(
+            "/native/transcript/search?session={}&q=never&limit=200",
+            rig.session
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert_eq!(search["limit"], 3);
+
+    // Title search OFF is a typed refusal, not an empty-looking success.
+    let (status, refused) = rig.get("/native/sessions?q=r8-native").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "title_search_disabled");
+
+    // The parallel view bounds its listing and says so.
+    let handle = rig
+        .deps
+        .session
+        .get_session(faktor_core::id::SessionId::new(rig.session))
+        .unwrap()
+        .unwrap();
+    let workspace = handle.row().unwrap().workspace_id;
+    rig.deps
+        .session
+        .create_session(workspace, "second", "fake", "m")
+        .unwrap();
+    let (status, parallel) = rig.get("/native/sessions/parallel").await;
+    assert_eq!(status, StatusCode::OK, "{parallel}");
+    assert_eq!(parallel["maxParallel"], 1);
+    assert_eq!(parallel["totalSessions"], 2);
+    assert_eq!(parallel["truncated"], true);
+    assert!(parallel["sessions"].as_array().unwrap().len() <= 1);
+
+    // Re-enabling title search makes the same query work again.
+    let revision = receipt["saved_revision"].as_u64().unwrap();
+    let (status, receipt) = rig
+        .post(
+            "/native/config/commit",
+            json!({
+                "expected_revision": revision,
+                "changes": [
+                    {"key": "faktor.session.titleSearch", "scope": "user", "value": true},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let (status, sessions) = rig.get("/native/sessions?q=r8-native").await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    assert!(!sessions["sessions"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stored_only_settings_are_locked_and_refuse_a_save() {
+    let rig = Rig::new().await;
+    let (status, descriptors) = rig.get("/native/config/descriptors").await;
+    assert_eq!(status, StatusCode::OK);
+    for key in [
+        "faktor.generation.temperature",
+        "faktor.diagnostics.logLevel",
+        "faktor.agent.maxConsecutiveFailures",
+    ] {
+        let row = descriptors["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["key"] == key)
+            .unwrap_or_else(|| panic!("{key} descriptor"));
+        assert_eq!(row["writable"], false, "{key}");
+        assert_eq!(row["runtimeConsumer"]["state"], "stored_only", "{key}");
+        assert!(
+            row["runtimeConsumer"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{key}"
+        );
+    }
+    let (status, snapshot) = rig.get("/native/config/snapshot").await;
+    assert_eq!(status, StatusCode::OK);
+    let revision = snapshot["revision"].as_u64().unwrap();
+    let (status, refused) = rig
+        .post(
+            "/native/config/commit",
+            json!({
+                "expected_revision": revision,
+                "changes": [
+                    {"key": "faktor.diagnostics.logLevel", "scope": "user", "value": "debug"},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["fieldErrors"][0]["code"], "read_only");
+    assert!(refused["fieldErrors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("stored only"));
+}
+
+#[tokio::test]
+async fn retention_zero_disables_automatic_deletion_instead_of_using_90_days() {
+    let rig = Rig::new().await;
+    let (status, snapshot) = rig.get("/native/config/snapshot").await;
+    assert_eq!(status, StatusCode::OK);
+    let revision = snapshot["revision"].as_u64().unwrap();
+    let (status, receipt) = rig
+        .post(
+            "/native/config/commit",
+            json!({
+                "expected_revision": revision,
+                "changes": [
+                    {"key": "faktor.memory.retentionDays", "scope": "user", "value": 0},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let (status, pass) = rig
+        .post(
+            "/native/memory/records/retention",
+            json!({"session": rig.session.to_string()}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{pass}");
+    assert_eq!(pass["retentionDays"], 0);
+    assert_eq!(pass["disabled"], true);
+    assert_eq!(pass["wouldDelete"], 0);
+    assert_eq!(pass["deleted"], 0);
 }

@@ -671,6 +671,18 @@ class FaktorChatPanel(
                 else -> "scope $scope is separate: no implicit stop was issued"
             }
         },
+        openApprovals = {
+            SwingUtilities.invokeLater {
+                selectCluster("Inspect")
+                for (i in 0 until inspectTabs.tabCount) {
+                    if (inspectTabs.getTitleAt(i) == "Agents") inspectTabs.selectedIndex = i
+                }
+                for (i in 0 until agentsTabs.tabCount) {
+                    if (agentsTabs.getTitleAt(i) == "Approvals") agentsTabs.selectedIndex = i
+                }
+            }
+            "opened the approval cards; no decision was sent"
+        },
         replyApproval = { id, session, decision ->
             val ack = service.replyPermission(session, id, decision)
             "permission $id $decision acknowledged=${ack.ok}"

@@ -37,9 +37,13 @@ import {
   transcriptFromMessages,
 } from '../../apps/vscode/src/state.ts';
 import { CoalescingRefreshScheduler } from '../../apps/vscode/src/refreshScheduler.ts';
-import { E8_CONTROLS } from '../../apps/vscode/src/generated/edition8Registry.ts';
+import { E8_CONTROLS, E8_SCREENS } from '../../apps/vscode/src/generated/edition8Registry.ts';
 import { bindingOf } from '../../apps/vscode/src/edition5/bindings.ts';
 import { buildPatch, EMPTY_DRAFT, stageControl } from '../../apps/vscode/src/edition5/view.ts';
+import { allControlViews, diffView, EMPTY_VIEW_CACHE } from '../../apps/vscode/src/edition8/host.ts';
+import { screenView } from '../../apps/vscode/src/edition8/view.ts';
+import { renderEdition8Html } from '../../apps/vscode/src/edition8/html.ts';
+import { edition8Snapshot } from '../../apps/vscode/scripts/fixtures/edition8.mjs';
 import { buildRegistry } from './registry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -356,9 +360,151 @@ function coalesce(frameCount) {
   return runs;
 }
 
+function scaledEdition8Snapshot() {
+  const snapshot = structuredClone(edition8Snapshot());
+  const values = { ...snapshot.config.values };
+  for (let index = 0; index < 470; index += 1) {
+    const key = `faktor.scale.value${index}`;
+    values[key] = {
+      key,
+      value: index % 3 === 0 ? `text-${index}` : index,
+      scope: 'user',
+      source: 'default',
+      locked: false,
+      apply_timing: 'next_call',
+      apply_state: 'NextCall',
+    };
+  }
+  snapshot.config = { ...snapshot.config, values };
+  snapshot.approvals = {
+    permissions: Array.from({ length: 128 }, (_, index) => ({
+      id: String(9000 + index),
+      session_id: 's1',
+      capability: index % 2 === 0 ? 'shell' : 'file_write',
+      detail: JSON.stringify({ command: `echo ${index}`, path: `/tmp/file-${index}.txt` }),
+    })),
+  };
+  snapshot.sessions = {
+    sessions: Array.from({ length: 1000 }, (_, index) => ({
+      id: String(index + 1),
+      title: `Conversation ${index} with a representative title`,
+      state: 'open',
+      model: 'gpt-5-codex',
+      updated_ms: 1_700_000_000_000 - index,
+      active: index === 0,
+    })),
+  };
+  snapshot.memory = {
+    facts: Array.from({ length: 1000 }, (_, index) => ({
+      id: `m-${index}`,
+      title: `fact ${index}`,
+      scope: 'session',
+      source: 'user',
+      version: 1,
+      text: `durable fact ${index} with content`,
+    })),
+  };
+  snapshot.memory.records = snapshot.memory.facts;
+  snapshot.models = Array.from({ length: 200 }, (_, index) => ({
+    provider: `provider-${index % 7}`,
+    model: `model-${index}`,
+    availability: index % 5 === 0 ? 'unavailable' : 'available',
+    capabilityAuthority: 'known',
+  }));
+  snapshot.provenance = {
+    rows: Array.from({ length: 500 }, (_, index) => ({
+      key: `faktor.scale.value${index}`,
+      effective: { source: 'default' },
+      applyTiming: 'next_call',
+    })),
+    conflicts: [],
+  };
+  snapshot.data_revision = 'perf-scale-rev-1';
+  return snapshot;
+}
+const e8Snapshot = scaledEdition8Snapshot();
+const e8State = { snapshot: e8Snapshot, loading: false, error: null, focusControl: null };
+const e8ScreenIds = E8_SCREENS.map((screen) => screen.id);
+screenView(e8ScreenIds[0], e8State);
+allControlViews(e8Snapshot);
+diffView(e8State, e8ScreenIds, EMPTY_VIEW_CACHE);
+const e8OpenSamples = [];
+let e8OpenRows = 0;
+let e8OpenControls = 0;
+for (const screenId of e8ScreenIds) {
+  const start = performance.now();
+  const view = screenView(screenId, e8State);
+  e8OpenSamples.push(performance.now() - start);
+  e8OpenRows += view.rows.length;
+  e8OpenControls += view.controls.length;
+}
+const e8ControlSamples = Array.from({ length: 20 }, () => {
+  const start = performance.now();
+  allControlViews(e8Snapshot);
+  return performance.now() - start;
+});
+const e8ColdSamples = [];
+const e8WarmSamples = [];
+let e8ColdPatches = 0;
+let e8ColdBytes = 0;
+let e8WarmPatches = 0;
+let e8WarmBytes = 0;
+for (let index = 0; index < 10; index += 1) {
+  let start = performance.now();
+  const cold = diffView(e8State, e8ScreenIds, EMPTY_VIEW_CACHE);
+  e8ColdSamples.push(performance.now() - start);
+  e8ColdPatches = cold.patches.length;
+  e8ColdBytes = Buffer.byteLength(JSON.stringify(cold.patches));
+  start = performance.now();
+  const warm = diffView(e8State, e8ScreenIds, cold.cache);
+  e8WarmSamples.push(performance.now() - start);
+  e8WarmPatches = warm.patches.length;
+  e8WarmBytes = Buffer.byteLength(JSON.stringify(warm.patches));
+}
+const changedSnapshot = structuredClone(e8Snapshot);
+changedSnapshot.data_revision = 'perf-scale-rev-2';
+changedSnapshot.approvals = {
+  permissions: changedSnapshot.approvals.permissions.map((entry, index) =>
+    index === 0 ? { ...entry, detail: JSON.stringify({ command: 'changed-detail-marker' }) } : entry,
+  ),
+};
+const changedState = { snapshot: changedSnapshot, loading: false, error: null, focusControl: null };
+const changedDiff = diffView(changedState, e8ScreenIds, diffView(e8State, e8ScreenIds, EMPTY_VIEW_CACHE).cache);
+const changedApprovalPatch = changedDiff.patches.find((patch) => patch.screen === 'S14');
+const changedApprovalRows = changedApprovalPatch?.rows?.length ?? 0;
+const changedApprovalText = changedApprovalPatch?.rows?.some((row) => row.value.includes('changed-detail-marker')) === true;
+const clockSnapshot = {
+  ...e8Snapshot,
+  generated_at_ms: e8Snapshot.generated_at_ms + 5_000,
+};
+const clockDiff = diffView(
+  { snapshot: clockSnapshot, loading: false, error: null, focusControl: null },
+  e8ScreenIds,
+  changedDiff.cache,
+);
+const clockPatch = clockDiff.patches.find((patch) => patch.screen === 'S56');
+const clockRows = clockPatch?.rows ?? [];
+const clockFresh =
+  clockRows.some((row) => row.value.includes(new Date(clockSnapshot.generated_at_ms).toISOString())) &&
+  !clockRows.some((row) => row.value.includes(new Date(e8Snapshot.generated_at_ms).toISOString()));
+
+const e8HtmlStart = performance.now();
+const e8Html = renderEdition8Html({
+  nonce: 'perf',
+  cspSource: 'vscode-resource:',
+  scriptUri: 'edition8.js',
+  styleUri: 'edition8.css',
+  state: e8State,
+  initialScreen: 'S29',
+  host: 'vscode',
+  mode: 'settings',
+});
+const e8HtmlMs = performance.now() - e8HtmlStart;
+const e8HtmlBytes = Buffer.byteLength(e8Html);
+
 const permissionRows = Array.from({ length: 2000 }, (_, index) => ({
   id: String(index + 1),
-  session_id: '7',
+  sessionId: '7',
   capability: index % 2 === 0 ? 'shell' : 'file_read',
   detail: JSON.stringify({ command: `echo ${index}` }),
 }));
@@ -472,6 +618,64 @@ const workloads = [
       page100kSamples.every((value) => Number.isFinite(value) && value < 200),
     detail: `100k newest-first messages -> ${transcript100k.length} entries; ${page100kSamples.length} pages; newest retained`,
     id: 'transcript-100k',
+  },
+  {
+    samples: e8OpenSamples,
+    metric: {
+      screens: e8ScreenIds.length,
+      config_values: Object.keys(e8Snapshot.config.values).length,
+      approvals: e8Snapshot.approvals.permissions.length,
+      sessions: e8Snapshot.sessions.sessions.length,
+      rows: e8OpenRows,
+      controls: e8OpenControls,
+      total_ms: e8OpenSamples.reduce((sum, value) => sum + value, 0),
+    },
+    passed:
+      percentile(e8OpenSamples, 0.5) <= 0.25 &&
+      e8OpenRows > 0 &&
+      e8OpenControls > 0,
+    detail: `72 screens, 498 settings, 128 approvals: ${e8OpenRows} rows / ${e8OpenControls} control views; p50 ${percentile(e8OpenSamples, 0.5).toFixed(3)}ms p95 ${percentile(e8OpenSamples, 0.95).toFixed(3)}ms`,
+    id: 'screen-open-72',
+  },
+  {
+    samples: [...e8ColdSamples, ...e8WarmSamples],
+    metric: {
+      cold_p95_ms: percentile(e8ColdSamples, 0.95),
+      warm_p95_ms: percentile(e8WarmSamples, 0.95),
+      cold_patches: e8ColdPatches,
+      warm_patches: e8WarmPatches,
+      cold_bytes: e8ColdBytes,
+      warm_bytes: e8WarmBytes,
+      control_p95_ms: percentile(e8ControlSamples, 0.95),
+      changed_patches: changedDiff.patches.length,
+      changed_approval_rows: changedApprovalRows,
+      clock_patch: clockPatch !== undefined,
+      clock_fresh: clockFresh,
+      html_ms: e8HtmlMs,
+      html_bytes: e8HtmlBytes,
+    },
+    passed:
+      percentile(e8ColdSamples, 0.95) <= 40 &&
+      percentile(e8WarmSamples, 0.95) <= 15 &&
+      percentile(e8ControlSamples, 0.95) <= 5 &&
+      e8ColdPatches === e8ScreenIds.length &&
+      e8WarmPatches === 0 &&
+      e8ColdBytes > 0 &&
+      e8WarmBytes <= 2 &&
+      changedDiff.patches.length > 0 &&
+      changedApprovalPatch !== undefined &&
+      changedApprovalRows === 11 &&
+      changedApprovalText &&
+      clockPatch !== undefined &&
+      clockFresh &&
+      e8HtmlBytes <= 1_500_000,
+    detail:
+      `72-screen diff cold ${percentile(e8ColdSamples, 0.95).toFixed(2)}ms/${e8ColdBytes}B ` +
+      `-> unchanged ${percentile(e8WarmSamples, 0.95).toFixed(2)}ms/${e8WarmBytes}B; ` +
+      `200 controls ${percentile(e8ControlSamples, 0.95).toFixed(3)}ms; ` +
+      `changed digest ${changedDiff.patches.length} patches (S14 rows ${changedApprovalRows}); ` +
+      `clock-only S56 patch ${clockPatch !== undefined ? 'yes' : 'NO'}; settings HTML ${e8HtmlBytes}B/${e8HtmlMs.toFixed(2)}ms`,
+    id: 'screen-diff-72',
   },
   {
     samples: concurrentSamples,

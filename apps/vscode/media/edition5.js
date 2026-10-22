@@ -272,6 +272,9 @@
     if (button.getAttribute('data-lifecycle')) {
       extra.action = button.getAttribute('data-lifecycle');
     }
+    if (button.getAttribute('data-request-id')) {
+      extra.request_id = button.getAttribute('data-request-id');
+    }
     vscode.postMessage({
       type: 'e5Action',
       command: action,
@@ -382,7 +385,8 @@
     }
     var activateButton = target.closest('[data-activate]');
     if (activateButton && !activateButton.disabled) {
-      activate(activateButton.getAttribute('data-activate'), {});
+      var bound = activateButton.getAttribute('data-request-id');
+      activate(activateButton.getAttribute('data-activate'), bound ? { request_id: bound } : {});
       return;
     }
     var inspectButton = target.closest('[data-inspect]');

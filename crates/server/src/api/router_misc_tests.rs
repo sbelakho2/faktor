@@ -363,6 +363,32 @@ async fn native_bootstrap_strict_dtos_and_cursor_stream() {
         faktor_core::capability::PermissionDecision::Allow
     );
     assert!(permissions.pending_ids().is_empty(), "authority drains");
+    // Replay/forgery after resolution: a duplicate Allow cannot re-open the
+    // request, and a later Deny cannot flip the human decision. Both are the
+    // same typed refusal and neither mints a future authorization.
+    for replay in [&right, &wrong] {
+        let resp = client
+            .post(format!("{base}/native/permission/reply"))
+            .bearer_auth(token.as_str())
+            .json(replay)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "a resolved request is never replayable: {replay}"
+        );
+        let error: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            error["error"]["code"], "conflict",
+            "replay refusal is typed: {error}"
+        );
+    }
+    assert!(
+        permissions.pending_ids().is_empty(),
+        "replay authorizes nothing"
+    );
 
     // The native SSE stream replays the durable journal from cursor 0.
     let resp = client

@@ -216,6 +216,7 @@ async fn session_listing_reads_the_table_once_per_page() {
         State(state.clone()),
         headers,
         Ok(Query(super::NativeSessionListQuery {
+            q: None,
             before_revision: None,
             before_id: None,
             before_ms: None,
@@ -256,6 +257,7 @@ async fn session_listing_serves_the_durable_creation_time() {
         State(state.clone()),
         headers,
         Ok(Query(super::NativeSessionListQuery {
+            q: None,
             before_revision: None,
             before_id: None,
             before_ms: None,
@@ -309,6 +311,7 @@ async fn session_listing_walk_is_bound_to_the_durable_snapshot_revision() {
         State(state.clone()),
         headers.clone(),
         Ok(Query(super::NativeSessionListQuery {
+            q: None,
             before_revision: None,
             before_id: None,
             before_ms: None,
@@ -348,6 +351,7 @@ async fn session_listing_walk_is_bound_to_the_durable_snapshot_revision() {
             State(state.clone()),
             headers.clone(),
             Ok(Query(super::NativeSessionListQuery {
+                q: None,
                 before_revision: next["beforeRevision"].as_i64(),
                 before_id: next["beforeId"].as_u64(),
                 before_ms: next["beforeMs"].as_i64(),
@@ -388,6 +392,7 @@ async fn session_listing_walk_is_bound_to_the_durable_snapshot_revision() {
         State(state.clone()),
         headers,
         Ok(Query(super::NativeSessionListQuery {
+            q: None,
             before_revision: None,
             before_id: None,
             before_ms: None,

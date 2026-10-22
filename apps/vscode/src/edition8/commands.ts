@@ -273,8 +273,48 @@ export async function trustExecutable(deps: Edition8PanelDeps): Promise<void> {
     'Trust this path',
   );
   if (choice === undefined) return;
+  const backend = backendOrWarn(deps);
+  if (backend === null) return;
+  // The durable trust record is the daemon's; a local "acknowledged" note
+  // would be a fake state. Read -> confirm -> check are the three real steps.
+  const existing = await backend.request(
+    'GET',
+    `/native/runtime/trust?path=${encodeURIComponent(pathValue)}`,
+  );
+  if (existing.ok) {
+    const state = stringAt(existing.body, 'signatureState') ?? 'recorded';
+    void vscode.window.showInformationMessage(
+      `This executable path already has a durable trust record (${state}). Replaced files are detected by the next check.`,
+    );
+    return;
+  }
+  if (existing.errorCode !== 'not_found') {
+    void vscode.window.showWarningMessage(`Runtime trust unavailable: ${existing.message}`);
+    return;
+  }
+  const confirmed = await backend.request('POST', '/native/runtime/trust', {
+    executablePath: pathValue,
+    publisher: 'Host',
+  });
+  if (!confirmed.ok) {
+    void vscode.window.showWarningMessage(`Runtime trust was not recorded: ${confirmed.message}`);
+    return;
+  }
+  const check = await backend.request('POST', '/native/runtime/trust/check', {
+    executablePath: pathValue,
+  });
+  if (!check.ok) {
+    void vscode.window.showWarningMessage(
+      `Trust was recorded but the immediate check failed: ${check.message}`,
+    );
+    return;
+  }
+  const signature = stringAt(confirmed.body, 'signatureState') ?? 'unverified';
+  const startAllowed = isObject(check.body) && check.body.state === 'match';
   void vscode.window.showInformationMessage(
-    'Path trust acknowledged in this host. This does not claim a verified checksum or signature; the Diagnostics screen continues to show Not recorded / Not verified.',
+    `Durable path trust recorded (signature ${signature}). Immediate check: ${
+      startAllowed ? 'match — start allowed' : 'mismatch — start refused'
+    }.`,
   );
 }
 

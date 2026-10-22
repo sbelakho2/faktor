@@ -35,6 +35,7 @@ export interface E8BindingTuple {
 export interface E8Snapshot {
   readonly schema: 'faktor-edition8-ui/v1';
   readonly revision: string;
+  readonly data_revision?: string;
   readonly generated_at_ms: number;
   readonly stale: boolean;
   readonly stale_age_ms: number | null;

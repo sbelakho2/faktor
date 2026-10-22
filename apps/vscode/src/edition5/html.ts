@@ -136,7 +136,7 @@ function controlMarkup(view: E5ScreenView['controls'][number]): string {
       <p id="e5-desc-${control.id}" class="e5-help">${esc(view.valueText)}${view.source === null ? '' : ` · source ${esc(view.source)}`}</p>
     </div>
     <div class="e5-control-actions">
-      <button type="button" class="e5-primary" data-activate="${control.id}"${disabledAction}>${esc(binding.actionLabel)}</button>
+      <button type="button" class="e5-primary" data-activate="${control.id}"${view.approvalRequestId === null ? '' : ` data-request-id="${esc(view.approvalRequestId)}"`}${disabledAction || ((control.id === 'Q-06' || control.id === 'Q-07') && view.approvalRequestId === null) ? ' disabled' : ''}>${esc(binding.actionLabel)}</button>
       <button type="button" class="e5-secondary" data-inspect="${control.id}">Details</button>
       <button type="button" class="e5-secondary" data-unstage="${control.id}"${binding.configKey === null ? ' disabled' : ''}>Reset this override</button>
     </div>
@@ -261,15 +261,19 @@ function policyToolbar(): string {
 
 function approvalToolbar(view: E5ScreenView): string {
   const firstPending = view.rows.find((row) => row.key.startsWith('approval-') && !row.key.startsWith('approval-history-'));
+  // Bind the buttons to the request id that produced THIS render. The panel
+  // refuses when that exact request is no longer live instead of replying to
+  // whatever request happens to be first at click time.
+  const requestId = firstPending === undefined ? '' : firstPending.key.slice('approval-'.length);
   const allowOnce = view.controls.find((entry) => entry.control.id === 'Q-06');
-  const canReply = allowOnce?.state !== 'disabled';
+  const canReply = allowOnce?.state !== 'disabled' && requestId.length > 0;
   const remember = view.controls.find((entry) => entry.control.id === 'Q-07');
   return `<section class="e5-toolbar" aria-label="Approval dock">
     <div class="e5-toolbar-head"><h3>Exact waiter</h3><span class="e5-muted">${firstPending === undefined ? 'No request is pending.' : 'One reply addresses this generation only.'}</span></div>
     <div class="e5-inline-form">
-      <button type="button" class="e5-primary" data-action="approval.reply" data-decision="allow_once"${canReply ? '' : ' disabled'}>Allow once</button>
-      <button type="button" class="e5-danger" data-action="approval.reply" data-decision="deny"${canReply ? '' : ' disabled'}>Deny</button>
-      <button type="button" class="e5-secondary" data-action="approval.remember"${remember?.state === 'disabled' ? ' disabled' : ''}>Remember…</button>
+      <button type="button" class="e5-primary" data-action="approval.reply" data-decision="allow_once" data-request-id="${esc(requestId)}"${canReply ? '' : ' disabled'}>Allow once</button>
+      <button type="button" class="e5-danger" data-action="approval.reply" data-decision="deny" data-request-id="${esc(requestId)}"${canReply ? '' : ' disabled'}>Deny</button>
+      <button type="button" class="e5-secondary" data-action="approval.remember" data-request-id="${esc(requestId)}"${remember?.state === 'disabled' || requestId.length === 0 ? ' disabled' : ''}>Remember…</button>
       <button type="button" class="e5-secondary" data-action="approval.refresh">Refresh</button>
     </div>
   </section>`;

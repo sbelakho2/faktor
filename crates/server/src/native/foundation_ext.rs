@@ -73,23 +73,22 @@ fn session_u64(id: SessionId) -> u64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeSessionListQuery {
     #[serde(default)]
-    q: Option<String>,
+    pub(crate) q: Option<String>,
     #[serde(default)]
-    workspace: Option<String>,
+    pub(crate) workspace: Option<String>,
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: Option<String>,
     #[serde(default)]
-    archived: Option<bool>,
+    pub(crate) archived: Option<bool>,
     #[serde(default)]
-    pinned: Option<bool>,
+    pub(crate) pinned: Option<bool>,
     #[serde(default)]
-    limit: Option<u64>,
+    pub(crate) limit: Option<u64>,
 }
 
 /// `GET /native/sessions?q=&workspace=&state=&archived=&pinned=&limit=` —
 /// one SQL listing + one metadata read, filtered and bounded. Archived
 /// sessions are hidden unless `archived=true`; `q` searches durable titles.
-#[allow(dead_code)] // filtered/parallel listing contract; the primary route owns GET /native/sessions.
 pub(crate) async fn native_sessions_filtered(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,6 +107,22 @@ pub(crate) async fn native_sessions_filtered(
     };
     let limit = q.limit.unwrap_or(1000).clamp(1, 1000);
     let rows = if let Some(query) = q.q.as_deref().filter(|s| !s.trim().is_empty()) {
+        // `faktor.session.titleSearch` is a real switch, not a decoration:
+        // with it off, a title query refuses typed instead of returning an
+        // empty list that looks like "no matches".
+        let enabled = foundation
+            .config
+            .value("faktor.session.titleSearch")
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            return conflict(
+                "title_search_disabled",
+                "title search is disabled by faktor.session.titleSearch; enable it or clear q",
+            );
+        }
         match state
             .deps
             .session
@@ -205,10 +220,27 @@ pub(crate) async fn native_sessions_parallel(
         Ok(meta) => meta,
         Err(e) => return foundation_error(e),
     };
+    let max_parallel = foundation
+        .config
+        .u64_value("faktor.sessions.maxParallel")
+        .ok()
+        .flatten()
+        .map(|value| value.clamp(1, 1_000) as usize)
+        .unwrap_or(16);
     let mut active = 0usize;
     let mut by_workspace: BTreeMap<u64, usize> = BTreeMap::new();
     let mut sessions = Vec::new();
-    for row in rows.iter().take(1000) {
+    let truncated = rows.len() > max_parallel;
+    // Counts cover the WHOLE listing; only the rows are bounded. A truncated
+    // page must never make the active/workspace totals look smaller.
+    for row in rows.iter() {
+        if row.state.is_active() {
+            active += 1;
+        }
+        *by_workspace.entry(row.workspace_id.raw()).or_insert(0) += 1;
+        if sessions.len() >= max_parallel {
+            continue;
+        }
         let m = meta
             .get(&session_u64(row.id))
             .cloned()
@@ -218,10 +250,6 @@ pub(crate) async fn native_sessions_parallel(
                 archived: false,
                 updated_ms: 0,
             });
-        if row.state.is_active() {
-            active += 1;
-        }
-        *by_workspace.entry(row.workspace_id.raw()).or_insert(0) += 1;
         sessions.push(serde_json::json!({
             "id": row.id.to_string(),
             "title": row.title,
@@ -238,6 +266,9 @@ pub(crate) async fn native_sessions_parallel(
     Json(serde_json::json!({
         "sessions": sessions,
         "activeRuns": active,
+        "totalSessions": rows.len(),
+        "maxParallel": max_parallel,
+        "truncated": truncated,
         "byWorkspace": by_workspace
             .into_iter()
             .map(|(id, count)| serde_json::json!({ "workspaceId": id, "sessions": count }))
@@ -362,7 +393,23 @@ pub(crate) async fn native_transcript_search(
         Ok(h) => h,
         Err(r) => return r,
     };
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    // F: the transcript page bound is a durable setting, not a hard-coded
+    // 50. A request may ask for less; it can never exceed the setting or the
+    // contract's own 200-row ceiling.
+    let configured_limit = match foundation(&state) {
+        Ok(foundation) => foundation
+            .config
+            .u64_value("faktor.transcript.searchLimit")
+            .ok()
+            .flatten()
+            .unwrap_or(50),
+        Err(_) => 50,
+    };
+    let limit = q
+        .limit
+        .unwrap_or(configured_limit)
+        .min(configured_limit)
+        .clamp(1, 200);
     // A miss walks the whole session window in SQLite (50k rows measured
     // ~65 ms single-request). Run the synchronous scan on the blocking pool
     // so the scan can never pin a Tokio worker for its whole duration; the
@@ -431,6 +478,7 @@ pub(crate) async fn native_transcript_search(
             Json(serde_json::json!({
                 "sessionId": handle.id().to_string(),
                 "query": q.q,
+                "limit": limit,
                 "matches": matches,
                 "hasMore": rows.len() as u64 == limit,
             }))
@@ -1653,6 +1701,8 @@ pub(crate) struct NativeToolQuery {
     q: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    #[serde(default)]
+    include_schema: Option<bool>,
 }
 
 /// `GET /native/tools?q=&limit=` — bounded built-in + live MCP catalog with
@@ -1670,6 +1720,7 @@ pub(crate) async fn native_tools(
         Err(_) => return wire_status(malformed_body("invalid query parameters")),
     };
     let limit = q.limit.unwrap_or(200).clamp(1, 500) as usize;
+    let include_schema = q.include_schema.unwrap_or(true);
     let needle = q.q.as_deref().unwrap_or("").to_ascii_lowercase();
     let registry = &state.deps.agent.deps().tools;
     let mut out = Vec::new();
@@ -1678,14 +1729,23 @@ pub(crate) async fn native_tools(
             continue;
         }
         if let Some(tool) = registry.get(&name) {
-            out.push(serde_json::json!({
+            // A lazy tool is registered and callable, but the model only sees
+            // its complete schema after a deterministic activation signal.
+            // The catalog must say that instead of the old unconditional
+            // "ready" (which made Supply/Engineering/approval look eager).
+            let lazy = registry.is_lazy(&name);
+            let mut row = serde_json::json!({
                 "name": name,
                 "namespace": "builtin",
                 "description": tool.description,
-                "inputSchema": tool.input_schema,
                 "source": "builtin",
-                "health": "ready",
-            }));
+                "health": if lazy { "available_when_activated" } else { "ready" },
+                "exposure": if lazy { "lazy" } else { "normal" },
+            });
+            if include_schema {
+                row["inputSchema"] = tool.input_schema.clone();
+            }
+            out.push(row);
         }
         if out.len() >= limit {
             break;
@@ -1713,14 +1773,18 @@ pub(crate) async fn native_tools(
                         {
                             continue;
                         }
-                        out.push(serde_json::json!({
+                        let mut row = serde_json::json!({
                             "name": namespaced,
                             "namespace": format!("mcp:{}", record.name),
                             "description": tool.get("description").cloned().unwrap_or_default(),
-                            "inputSchema": tool.get("inputSchema").cloned().unwrap_or_default(),
                             "source": "mcp",
                             "health": "ready",
-                        }));
+                        });
+                        if include_schema {
+                            row["inputSchema"] =
+                                tool.get("inputSchema").cloned().unwrap_or_default();
+                        }
+                        out.push(row);
                         if out.len() >= limit {
                             break;
                         }

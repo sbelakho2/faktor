@@ -105,6 +105,7 @@ pub(crate) async fn native_config_descriptors(
                 "allowedScopes": d.allowed_scopes,
                 "writable": d.writable,
                 "applyTiming": d.apply_timing,
+                "runtimeConsumer": faktor_foundation::config_consumers::runtime_consumer(&d.key),
                 "secretReferenceOnly": d.secret_reference_only,
                 "aliasGroup": d.alias_group,
                 "effective": effective,
@@ -893,19 +894,51 @@ pub(crate) struct NativeManifestBody {
     sources: Vec<Source>,
 }
 
+/// The served model's context window, when the provider registry knows it.
+/// A served model with a conservative default still CAPS the manifest; the
+/// setting override can only make the context smaller, never larger.
+fn served_context_capacity(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+    model: Option<&str>,
+) -> Result<Option<u64>, FoundationError> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    // The session row is the durable provider authority: an unreadable row
+    // refuses typed instead of silently dropping the served-model cap.
+    let provider = handle.provider().map_err(|error| {
+        FoundationError::Store(format!("session provider unavailable: {error}"))
+    })?;
+    let Some(caps) = state
+        .deps
+        .agent
+        .deps()
+        .providers
+        .capabilities(&provider, model)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(caps.context as u64))
+}
+
 fn manifest_from_body(
     foundation: &Foundation,
     sid: SessionId,
     body: NativeManifestBody,
+    served_capacity: Option<u64>,
 ) -> Result<Manifest, FoundationError> {
     let config = &foundation.config;
     let model = body.model.clone().unwrap_or_else(|| "unknown".to_string());
-    let capacity = match body.capacity {
-        Some(c) => c,
-        None => config
-            .u64_value("faktor.model.contextLimit")?
-            .unwrap_or(32_768),
-    };
+    // F046: the configured override is a CAP, not a replacement. A client
+    // that sends a larger capacity (or no capacity) can never claim more
+    // context than the durable setting and the served model allow.
+    let configured_limit = config.u64_value("faktor.model.contextLimit")?;
+    let capacity = [body.capacity, configured_limit, served_capacity]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(32_768);
     let output_reserve = match body.output_reserve {
         Some(v) => v,
         None => config
@@ -992,7 +1025,11 @@ pub(crate) async fn native_context_preview(
         Ok(f) => f,
         Err(r) => return r,
     };
-    match manifest_from_body(foundation, handle.id(), body) {
+    let served_capacity = match served_context_capacity(&state, &handle, body.model.as_deref()) {
+        Ok(capacity) => capacity,
+        Err(error) => return foundation_error(error),
+    };
+    match manifest_from_body(foundation, handle.id(), body, served_capacity) {
         Err(e) => foundation_error(e),
         Ok(manifest) => match manifest.validate() {
             Ok(()) => Json(manifest.usage()).into_response(),
@@ -1036,7 +1073,15 @@ pub(crate) async fn native_context_capture(
         Ok(f) => f,
         Err(r) => return r,
     };
-    let manifest = match manifest_from_body(foundation, sid, body) {
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(handle) => handle,
+        Err(r) => return *r,
+    };
+    let served_capacity = match served_context_capacity(&state, &handle, body.model.as_deref()) {
+        Ok(capacity) => capacity,
+        Err(error) => return foundation_error(error),
+    };
+    let manifest = match manifest_from_body(foundation, sid, body, served_capacity) {
         Ok(m) => m,
         Err(e) => return foundation_error(e),
     };
@@ -1600,7 +1645,18 @@ pub(crate) async fn native_diagnostics_preview(
         Ok(f) => f,
         Err(r) => return r,
     };
-    let facts = diagnostics_facts(&state, foundation);
+    let settings_count = foundation
+        .config
+        .snapshot()
+        .map(|snapshot| snapshot.values.len())
+        .unwrap_or(0);
+    let providers_count = state.deps.agent.deps().providers.all().len()
+        + foundation
+            .providers
+            .list()
+            .map(|connections| connections.len())
+            .unwrap_or(0);
+    let tools_count = state.deps.agent.deps().tools.names().len().min(500);
     Json(serde_json::json!({
         "categories": [
             "runtime_version", "runtime_paths", "binary_checksum", "component_health",
@@ -1608,9 +1664,9 @@ pub(crate) async fn native_diagnostics_preview(
         ],
         "omittedCategories": faktor_foundation::diagnostics::OMITTED_CATEGORIES,
         "maxBytes": foundation.diagnostics_cap(),
-        "settingsCount": facts.settings.len(),
-        "providersCount": facts.providers.len(),
-        "toolsCount": facts.tools.len(),
+        "settingsCount": settings_count,
+        "providersCount": providers_count,
+        "toolsCount": tools_count,
     }))
     .into_response()
 }

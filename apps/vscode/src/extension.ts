@@ -192,6 +192,7 @@ import {
   ControlPlaneResolution,
   ControlPlaneScope,
   controlPlaneAuthSessionValid,
+  controlPlaneEndpointValid,
   controlPlaneScopeValid,
   controlPlaneTokenForClient,
   logoutControlPlane,
@@ -542,6 +543,13 @@ function reportError(error: unknown, kind: UserErrorKind = 'unexpected'): void {
 // and then deleted; its value is NEVER handed to the native client (the
 // daemon-password `bearerToken` path is separate and unchanged).
 
+/** One input-box refusal: never echoes a credential-bearing endpoint. */
+function controlPlaneEndpointInputError(value: string): string | null {
+  return controlPlaneEndpointValid(value)
+    ? null
+    : 'Enter an http(s) endpoint without embedded credentials, query or fragment.';
+}
+
 function controlPlaneNotice(level: 'info' | 'error', text: string): void {
   if (lastControlPlaneNotice === text) {
     return;
@@ -635,6 +643,7 @@ async function ensureControlPlaneScope(hasLegacy: boolean): Promise<ControlPlane
       'Cloud control-plane endpoint the credential belongs to (required; there is no default endpoint)',
     value: machineSetting('controlPlaneEndpoint', ''),
     ignoreFocusOut: true,
+    validateInput: controlPlaneEndpointInputError,
   });
   if (endpoint === undefined || endpoint.trim().length === 0) {
     return null;
@@ -721,6 +730,7 @@ async function controlPlaneSignIn(context: vscode.ExtensionContext): Promise<voi
       'stored credential)',
     value: current?.endpoint ?? DEFAULT_CONTROL_PLANE_ENDPOINT,
     ignoreFocusOut: true,
+    validateInput: controlPlaneEndpointInputError,
   });
   if (endpoint === undefined || endpoint.trim().length === 0) {
     return;
@@ -2855,6 +2865,19 @@ async function replyPermissionEntry(
   permissionId: string,
   decision: 'allow' | 'deny',
 ): Promise<void> {
+  // The host re-checks the rendered pending set before forwarding a decision:
+  // a stale/forged webview id, or an id owned by another session, is refused
+  // locally and never reaches the daemon. The daemon still enforces the live
+  // waiter + owning session as the final authority.
+  const pending = store.snapshot().permissions.find((entry) => entry.id === permissionId);
+  if (!pending || pending.sessionId !== sessionId) {
+    chatProvider?.postPermissionResult(
+      permissionId,
+      false,
+      'this request is not in the current pending list; refresh and review the exact request',
+    );
+    return;
+  }
   const client = active.client;
   if (!client) {
     const reason = 'no active service connection';

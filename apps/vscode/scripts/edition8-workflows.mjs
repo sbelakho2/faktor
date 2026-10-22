@@ -99,7 +99,7 @@ async function driveScreen(screen, fixture = snapshot) {
       const activated = await activateControl(backend, state, sample.control.id, {
         session: 's1',
         id: 'openai-main',
-        request_id: 'perm-1',
+        request_id: '7',
         terminal: 'term-1',
         task: 'task-1',
         sequence: '1',

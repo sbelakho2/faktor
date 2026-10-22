@@ -644,7 +644,7 @@ pub(crate) async fn native_runtime_trust_check(
         Ok(f) => f,
         Err(r) => return r,
     };
-    Json(foundation.runtime_trust.check(&req.executable_path)).into_response()
+    Json(foundation.runtime_trust.check_fresh(&req.executable_path)).into_response()
 }
 
 /// `GET /native/runtime/status` — readiness/trust facts for S34/S35/S56.
@@ -1375,6 +1375,7 @@ pub(crate) async fn native_config_provenance(
             "allowedScopes": descriptor.allowed_scopes,
             "writable": descriptor.writable,
             "applyTiming": descriptor.apply_timing,
+            "runtimeConsumer": faktor_foundation::config_consumers::runtime_consumer(key),
             "effective": effective,
         }));
         if rows.len() >= limit {

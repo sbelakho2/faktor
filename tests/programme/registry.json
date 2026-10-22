@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-22T16:31:37.945Z",
-  "commit": "471595ef0e2db3f4d28d1a248ccec6e34ec2d10e",
-  "tree": "10e80e674f0ce7fdd23e79e3f84218f5c07d8018",
+  "generated_at": "2026-10-22T22:54:46.229Z",
+  "commit": "014c2d20fe3bf35bb2ad4bda9f63c9f8b1051ae6",
+  "tree": "53d9065014ceb2ac7aa22885d6d2fa8729467239",
   "layers": [
     "structural",
     "unit",
@@ -19,12 +19,12 @@
     "release"
   ],
   "counts": {
-    "rows": 942,
+    "rows": 949,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
-      "builtin-tool": 7,
+      "builtin-tool": 14,
       "cli-command": 47,
       "config-key": 53,
       "control": 200,
@@ -40,20 +40,20 @@
     "by_status": {
       "deferred": 558,
       "proven": 323,
-      "stub": 61
+      "stub": 68
     },
     "by_lane": {
       "nightly": 512,
-      "pull": 611,
-      "trusted": 941,
+      "pull": 618,
+      "trusted": 948,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 398,
+      "contracts": 405,
       "ide-screen-readers": 385,
-      "state-model-crash": 249,
-      "unit-property": 234
+      "state-model-crash": 256,
+      "unit-property": 241
     }
   },
   "rows": [
@@ -18579,7 +18579,7 @@
           "hostile": {
             "case": "query:limit=18446744073709551616",
             "status": 200,
-            "bytes": 27157
+            "bytes": 32495
           }
         }
       }
@@ -18767,7 +18767,7 @@
           "hostile": {
             "case": "query:path=%2e%2e%2fescape",
             "status": 200,
-            "bytes": 9167
+            "bytes": 9156
           }
         }
       }
@@ -21417,7 +21417,7 @@
           "hostile": {
             "case": "query:path=%2e%2e%2fescape",
             "status": 200,
-            "bytes": 790
+            "bytes": 727
           }
         }
       }
@@ -23249,7 +23249,7 @@
           "hostile": {
             "case": "query:limit=-1",
             "status": 200,
-            "bytes": 239
+            "bytes": 292
           }
         }
       }
@@ -25055,7 +25055,7 @@
           "hostile": {
             "case": "unicode-boundaries",
             "status": 200,
-            "bytes": 209398
+            "bytes": 209402
           }
         }
       }
@@ -27006,7 +27006,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/938d7329bad17ce652ecd7348179f371"
+              "handle": "vault://provider_key/9b34bc59bad814cd4ad0f7bd52ac6557"
             }
           },
           {
@@ -33009,6 +33009,146 @@
       "evidence": null
     },
     {
+      "id": "tool.approval-request",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.approval-request",
+        "tool.bounds.approval-request",
+        "tool.contract.approval-request"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "approval-request"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.approval-status",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.approval-status",
+        "tool.bounds.approval-status",
+        "tool.contract.approval-status"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "approval-status"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.board-post",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.board-post",
+        "tool.bounds.board-post",
+        "tool.contract.board-post"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "board-post"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.board-read",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.board-read",
+        "tool.bounds.board-read",
+        "tool.contract.board-read"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "board-read"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
       "id": "tool.edit-file",
       "kind": "builtin-tool",
       "path": "crates/cli/src",
@@ -33031,6 +33171,76 @@
       "status": "stub",
       "meta": {
         "tool": "edit-file"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.engineering-analyse",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.engineering-analyse",
+        "tool.bounds.engineering-analyse",
+        "tool.contract.engineering-analyse"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "engineering-analyse"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.engineering-verify",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.engineering-verify",
+        "tool.bounds.engineering-verify",
+        "tool.contract.engineering-verify"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "engineering-verify"
       },
       "adversarial": [
         "denied",
@@ -33206,6 +33416,41 @@
       "status": "stub",
       "meta": {
         "tool": "source-market"
+      },
+      "adversarial": [
+        "denied",
+        "timeout",
+        "cancel",
+        "output-cap",
+        "path-escape",
+        "bad-args",
+        "child-cleanup"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "tool.supply-decision",
+      "kind": "builtin-tool",
+      "path": "crates/cli/src",
+      "layers": [
+        "contracts",
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "tool.bad-args.supply-decision",
+        "tool.bounds.supply-decision",
+        "tool.contract.supply-decision"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Bad arguments are refused before any effect; permission/sandbox gates precede it; output is bounded and treated as data; an unknown effect is never re-run.",
+      "status": "stub",
+      "meta": {
+        "tool": "supply-decision"
       },
       "adversarial": [
         "denied",

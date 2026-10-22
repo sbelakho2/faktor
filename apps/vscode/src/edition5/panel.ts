@@ -20,7 +20,7 @@ import {
 } from './host.ts';
 import { E5_SCREENS } from '../generated/edition5Registry.ts';
 import { E5_BINDINGS } from './bindings.ts';
-import { validateMcpPayload, validateSteerText, type E5Payload } from './commands.ts';
+import { pendingApprovalById, validateMcpPayload, validateSteerText, type E5Payload } from './commands.ts';
 import type { Json } from './contract.ts';
 
 export interface Edition5PanelDeps {
@@ -70,6 +70,9 @@ function payloadOf(value: unknown): E5Payload {
   const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_PAYLOAD_KEYS);
   for (const [key, entry] of entries) {
     if (key.length === 0 || key.length > 128) continue;
+    // A webview payload is untrusted data: never let it mutate the prototype
+    // of the JSON envelope the host forwards to the daemon.
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (entry === null || ['string', 'number', 'boolean'].includes(typeof entry)) {
       if (typeof entry === 'string' && entry.length > MAX_STAGED_STRING) continue;
       out[key] = entry as Json;
@@ -319,6 +322,19 @@ export class Edition5Panel {
             payload.value = value;
           }
         }
+        const binding = E5_BINDINGS.get(controlId);
+        if (
+          (binding?.command === 'approval.reply' || binding?.command === 'approval.remember') &&
+          (typeof payload.request_id !== 'string' || payload.request_id.length === 0)
+        ) {
+          this.post({
+            type: 'e5ActionResult',
+            ok: false,
+            message:
+              'Select the exact pending request before deciding; no first-pending guess was sent.',
+          });
+          return;
+        }
         const activated = await activateControl(backend, this.state, controlId, payload);
         this.state = activated.state;
         if (activated.result.kind === 'host') {
@@ -347,6 +363,29 @@ export class Edition5Panel {
           return;
         }
         const payload: Record<string, Json> = { ...payloadOf(message.payload) };
+        // Approval decisions are bound to the request id rendered on the
+        // button. A stale render (request resolved/expired, or a newer first
+        // row) is a typed refusal, never a decision for an unseen request.
+        if (command === 'approval.reply' || command === 'approval.remember') {
+          const request = pendingApprovalById(this.state.snapshot, payload.request_id);
+          if (request === null) {
+            this.post({
+              type: 'e5ActionResult',
+              ok: false,
+              message:
+                'That approval request is no longer pending; refresh the list and review the current request. No decision was sent.',
+            });
+            return;
+          }
+          payload.session = request.session;
+          payload.generation = request.generation;
+          payload.action = command === 'approval.reply'
+            ? (payload.decision === 'deny' ? 'deny' : 'allow_once')
+            : 'remember';
+          if (command === 'approval.reply') {
+            payload.decision = payload.decision === 'deny' ? 'deny' : 'allow_once';
+          }
+        }
         if (this.state.snapshot?.binding?.session != null && payload.session === undefined) {
           payload.session = this.state.snapshot.binding.session;
         }

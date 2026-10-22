@@ -206,6 +206,12 @@ object JetBrainsHostMatrixSmoke {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        // An assertion failure in an offscreen Swing harness would otherwise
+        // leave the non-daemon AWT event thread alive forever after main dies.
+        Thread.setDefaultUncaughtExceptionHandler { _, error ->
+            error.printStackTrace()
+            kotlin.system.exitProcess(1)
+        }
         // The smoke harness passes the faktor-cli binary as a program
         // argument; only an explicit `*.zip` argument may select ZIP mode.
         val fromArgs = args.firstOrNull {
@@ -1108,6 +1114,14 @@ object JetBrainsHostMatrixSmoke {
 
     private fun collectInteractive(component: Component): List<Component> {
         val out = ArrayList<Component>()
+        fun effectivelyVisible(node: Component): Boolean {
+            var current: Component? = node
+            while (current != null) {
+                if (!current.isVisible) return false
+                current = current.parent
+            }
+            return true
+        }
         fun walk(node: Component) {
             if (node is javax.swing.AbstractButton ||
                 node is javax.swing.JTextField ||
@@ -1115,7 +1129,7 @@ object JetBrainsHostMatrixSmoke {
                 node is javax.swing.JComboBox<*> ||
                 node is javax.swing.JList<*>
             ) {
-                if (node.isEnabled) out.add(node)
+                if (node.isEnabled && effectivelyVisible(node)) out.add(node)
             }
             if (node is java.awt.Container) {
                 for (child in node.components) walk(child)

@@ -656,6 +656,34 @@ Precedence is served highest-first; a managed lock is never relaxed by
 project text, and repository instructions remain DATA, not executable
 authority.
 
+### Configuration descriptors and runtime truth (settings)
+
+`GET /native/config/descriptors`, `GET /native/config/snapshot`,
+`GET /native/config/search`, `GET /native/config/provenance`, `POST
+/native/config/preview` and `POST /native/config/commit` are the settings
+surface. Every descriptor carries `runtimeConsumer`:
+
+- `{"state":"applied","consumer":"<module>"}` — a production path reads the
+  key and the descriptor is writable;
+- `{"state":"stored_only","reason":"..."}` — the value is durable/exported
+  for compatibility but this build has NO runtime consumer. The descriptor
+  is `writable:false` and a commit naming it is a typed 409 `read_only`
+  whose `fieldErrors[].message` names the reason. A settings screen must
+  render this as unavailable, never as "saved";
+- `{"state":"unknown"}` — an unclassified descriptor (fail closed;
+  read-only), and the wiring-matrix gate fails.
+
+`applyTiming` is honest: `effective`/`next_call`/`next_task` values are
+read by the request/task path, `restart_required` values are overlaid onto
+the daemon config at boot (retry, efficiency, compaction model, embedding
+provider/model and sandbox shell), and a key that cannot be applied is
+stored-only rather than advertised as a live control. `faktor.model.contextLimit`
+is a CAP applied to every context manifest (the served model capacity is
+the other bound); `faktor.transcript.searchLimit`, `faktor.session.titleSearch`,
+`faktor.sessions.maxParallel`, `faktor.budget.*` and
+`faktor.permissions.maximumChildren` are consumed by their listing/task
+routes.
+
 ### Control-plane surface (disabled by default)
 
 With no `[cloud]` section the feature state is `cloud_disabled`, but it is

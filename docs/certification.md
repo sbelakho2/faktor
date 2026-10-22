@@ -64,7 +64,7 @@ the reason instead of running it. Such a manifest can never be
 
 1. `cargo fmt --check`
 2. `cargo check --workspace`
-3. capability manifest + docs drift (`node scripts/capabilities-manifest.mjs`, skipped when node is absent)
+3. capability manifest + docs drift (`node scripts/capabilities-manifest.mjs`, skipped when node is absent); wiring matrix (`node scripts/programme/check-registry.mjs --check --no-probe`, which includes UI action→handler→service, setting→consumer, route→client and descriptor→consumer checks with a planted-violation selftest)
 4. certification-evidence verifier selftest (`node scripts/certification/evidence.mjs selftest`: marker rejection matrix, lane-token auth/forgery matrix + helper parity, commit/tree binding, signature allowlist, `.woodpecker` marker/command drift; skipped when node is absent)
 5. `cargo clippy --workspace --all-targets -- -D warnings`
 6. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
@@ -104,7 +104,7 @@ when CI migrated (historical note only, no workflow files remain under
 | Job | Agent | Content |
 | --- | --- | --- |
 | `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run), the test gate wrapped in the bounded, recorded flake-tolerance runner (§2.1.1); `doctor` smoke |
-| `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; frozen-contract drift gate (`cargo run -p faktor-contracts -- check` regenerates every vocabulary from the compiled serde implementation and fails on any rename/reorder in `docs/contracts/`); license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips |
+| `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; frozen-contract drift gate (`cargo run -p faktor-contracts -- check` regenerates every vocabulary from the compiled serde implementation and fails on any rename/reorder in `docs/contracts/`); license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips; wiring-matrix registry gate (`check-registry --check`, release fails any recorded `unwired` surface) |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
 | `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; lockfile-pinned `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
 | `vscode-e2e` | linux/amd64 | pinned VS Code tarball (version+commit+sha256 in `scripts/vscode-e2e.sh`) + real Extension Host smoke after `vscode`: extension activates, commands registered, compiled webview provider HTML carries the strict CSP and composer/attachment surface (no pixel comparison); per-cell timeout derived from a same-run bounded Electron cold-start calibration with staged `progress.log` markers and typed timeout/kill reasons |

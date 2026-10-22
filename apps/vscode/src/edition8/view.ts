@@ -2,6 +2,7 @@
 // per-control state. No VS Code or DOM imports, so selftest and the
 // exercise/visual harnesses drive the same decisions as the panel.
 
+import { pendingApprovalIds } from './approval.ts';
 import {
   E8_CONTROLS,
   E8_SCREENS,
@@ -22,11 +23,11 @@ import {
   type Json,
 } from './contract.ts';
 import {
-  bindingFor8,
+  bindingOf8,
   optionsForBinding,
   type E8Binding,
 } from './bindings.ts';
-import { configValues } from './source.ts';
+import { configValueMap, configValues, type E8ConfigLookup } from './source.ts';
 
 export type E8Destination = 'work' | 'inspect' | 'history' | 'settings';
 
@@ -45,6 +46,8 @@ export interface E8ControlView {
   readonly source: string | null;
   readonly scope: string | null;
   readonly options: readonly string[];
+  /** Q-06 only: the exact live request ids this decision may address. */
+  readonly approvalIds: readonly string[];
   readonly routeText: string;
 }
 
@@ -81,29 +84,58 @@ const SHELL_GROUPS = new Set(['Work', 'Inspect and proof', 'History']);
 // editor-sized Settings surface (S33/S57 are settings tabs).
 const WORK_SETUP = new Set(['S34', 'S35', 'S36', 'S37', 'S38', 'S39']);
 
+const SCREEN_INDEX = new Map(E8_SCREENS.map((screen) => [screen.id, screen]));
+const CONTROL_INDEX = new Map(E8_CONTROLS.map((control) => [control.id, control]));
+const DESTINATION_INDEX = new Map<string, E8Destination>();
+
 export function destinationOf(screen: E8Screen): E8Destination {
-  if (WORK_SETUP.has(screen.id)) return 'work';
-  if (screen.group === 'Work') return 'work';
-  if (screen.group === 'Inspect and proof') return 'inspect';
-  if (screen.group === 'History') return 'history';
-  return 'settings';
+  const cached = DESTINATION_INDEX.get(screen.id);
+  if (cached !== undefined) return cached;
+  const destination: E8Destination = WORK_SETUP.has(screen.id)
+    ? 'work'
+    : screen.group === 'Work'
+      ? 'work'
+      : screen.group === 'Inspect and proof'
+        ? 'inspect'
+        : screen.group === 'History'
+          ? 'history'
+          : 'settings';
+  DESTINATION_INDEX.set(screen.id, destination);
+  return destination;
 }
 
 export function screensFor(destination: E8Destination): readonly E8Screen[] {
-  return E8_SCREENS.filter((screen) => destinationOf(screen) === destination);
+  if (destination === 'work') return SCREENS_WORK;
+  if (destination === 'inspect') return SCREENS_INSPECT;
+  if (destination === 'history') return SCREENS_HISTORY;
+  return SCREENS_SETTINGS;
 }
 
 export function screenById(screenId: string): E8Screen {
-  const screen = E8_SCREENS.find((entry) => entry.id === screenId);
+  const screen = SCREEN_INDEX.get(screenId);
   if (screen === undefined) throw new Error(`edition8: unknown screen ${screenId}`);
   return screen;
 }
 
+const SCREEN_CONTROLS = new Map<string, readonly E8Control[]>(
+  E8_SCREENS.map((screen) => [
+    screen.id,
+    screen.controls
+      .map((id) => CONTROL_INDEX.get(id))
+      .filter((control): control is E8Control => control !== undefined),
+  ]),
+);
+
 export function controlsForScreen(screenId: string): readonly E8Control[] {
-  return screenById(screenId).controls
-    .map((id) => E8_CONTROLS.find((control) => control.id === id))
-    .filter((control): control is E8Control => control !== undefined);
+  const controls = SCREEN_CONTROLS.get(screenId);
+  if (controls === undefined) throw new Error(`edition8: unknown screen ${screenId}`);
+  return controls;
 }
+
+const SCREENS_WORK = E8_SCREENS.filter((screen) => destinationOf(screen) === 'work');
+const SCREENS_INSPECT = E8_SCREENS.filter((screen) => destinationOf(screen) === 'inspect');
+const SCREENS_HISTORY = E8_SCREENS.filter((screen) => destinationOf(screen) === 'history');
+const SCREENS_SETTINGS = E8_SCREENS.filter((screen) => destinationOf(screen) === 'settings');
 
 export function isShellScreen(screenId: string): boolean {
   return WORK_SETUP.has(screenId) || (SHELL_GROUPS.has(screenById(screenId).group) && destinationOf(screenById(screenId)) !== 'settings');
@@ -111,18 +143,31 @@ export function isShellScreen(screenId: string): boolean {
 
 // ------------------------------------------------------------- config value
 
-function configValueFor(values: readonly E8ConfigValue[], key: string | null): E8ConfigValue | null {
+function configValueFor(lookup: E8ConfigLookup, key: string | null): E8ConfigValue | null {
   if (key === null) return null;
-  const exact = values.find((value) => value.key === key);
+  const exact = lookup.index.get(key);
   if (exact !== undefined) return exact;
   const bracket = key.lastIndexOf('].');
   if (bracket >= 0) {
     const suffix = key.slice(bracket + 2);
-    const candidates = values.filter((value) => value.key.endsWith(`.${suffix}`));
+    const candidates = lookup.values.filter((value) => value.key.endsWith(`.${suffix}`));
     if (candidates.length === 1) return candidates[0];
   }
   return null;
 }
+
+function lookupFor(snapshot: E8Snapshot | null): E8ConfigLookup {
+  if (snapshot === null) return EMPTY_LOOKUP;
+  const cached = SNAPSHOT_LOOKUP.get(snapshot);
+  if (cached !== undefined) return cached;
+  const values = configValues(snapshot.config);
+  const lookup: E8ConfigLookup = { values, index: configValueMap(snapshot.config) };
+  SNAPSHOT_LOOKUP.set(snapshot, lookup);
+  return lookup;
+}
+
+const SNAPSHOT_LOOKUP = new WeakMap<E8Snapshot, E8ConfigLookup>();
+const EMPTY_LOOKUP: E8ConfigLookup = { values: [], index: new Map() };
 
 function jsonText(value: Json | null): string {
   if (value === null || value === undefined) return 'Inherit (not configured)';
@@ -146,7 +191,7 @@ function prerequisite(controlId: string, snapshot: E8Snapshot | null): string | 
   if (GATED_CONTROLS.has(controlId) && text(snapshot.parameters, 'authority', 'capabilityAuthority') === 'unknown') {
     return 'The served capability authority is unknown; this gated control is disabled rather than guessed.';
   }
-  const sessionRequired = bindingFor8(E8_CONTROLS.find((entry) => entry.id === controlId) as E8Control).route.path.includes(':session');
+  const sessionRequired = bindingOf8(controlId).route.path.includes(':session');
   if (sessionRequired && snapshot.binding?.session === null) {
     return 'No conversation is bound; open or create a conversation first.';
   }
@@ -231,10 +276,10 @@ export function controlView(
   loading: boolean,
   error: string | null,
 ): E8ControlView {
-  const binding = bindingFor8(control);
-  const values = snapshot === null ? [] : configValues(snapshot.config);
-  const config = configValueFor(values, binding.configKey);
+  const binding = bindingOf8(control.id);
+  const config = configValueFor(lookupFor(snapshot), binding.configKey);
   const options = optionsForBinding(binding, snapshot);
+  const approvalIds = control.id === 'Q-06' ? pendingApprovalIds(snapshot) : [];
   let state: E8ControlState = 'available';
   let stateText = '';
   if (binding.kind === 'missing') {
@@ -284,11 +329,25 @@ export function controlView(
     source: config === null ? null : config.source,
     scope: config === null ? null : config.scope,
     options,
+    approvalIds,
     routeText: `${binding.route.method} ${binding.route.path}`,
   };
 }
 
 // --------------------------------------------------------------- screen rows
+
+const MAX_ROW_VALUE_CHARS = 4096;
+const MAX_ROW_LABEL_CHARS = 256;
+
+/**
+ * One served row is display DATA. A hostile/oversized daemon result is
+ * bounded before it becomes a DOM text node (160 rows x 4 KiB, never the
+ * whole 8 MiB response), so a large supply/engineering/provider payload can
+ * not freeze the webview.
+ */
+function boundedRow(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
 
 function row(
   key: string,
@@ -299,8 +358,8 @@ function row(
 ): E8Row {
   return {
     key,
-    label,
-    value: value === null || value.length === 0 ? 'Unavailable' : value,
+    label: boundedRow(label, MAX_ROW_LABEL_CHARS),
+    value: value === null || value.length === 0 ? 'Unavailable' : boundedRow(value, MAX_ROW_VALUE_CHARS),
     state: value === null || value.length === 0 ? 'unavailable' : state,
     ...(openScreen === undefined ? {} : { openScreen }),
   };
@@ -384,9 +443,10 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
   ) => {
     if (rows.length < 160) rows.push(row(key, label, value, state, openScreen));
   };
-  const values = configValues(snapshot.config);
+  const lookup = lookupFor(snapshot);
+  const values = lookup.values;
   const config = (key: string): string | null => {
-    const found = values.find((entry) => entry.key === key);
+    const found = lookup.index.get(key);
     return found === undefined ? null : `${jsonText(found.value)} · ${found.source}`;
   };
   const shell = (): string | null => config('faktor.sandbox.shell');

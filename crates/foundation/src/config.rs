@@ -269,11 +269,11 @@ fn rev8_descriptors() -> Vec<Descriptor> {
     add(Descriptor::new(
         "faktor.compaction.model",
         "Compaction model",
-        "Served provider/model used for compaction summaries; unset inherits the session model. Validated against the served registry before use.",
+        "Served provider/model used for compaction summaries; unset inherits the session model. Applied at the next daemon restart (the compaction authority is built at boot).",
         "context",
         ValueKind::Text { max_bytes: 256 },
         Value::String(String::new()),
-        ApplyTiming::NextTask,
+        ApplyTiming::RestartRequired,
     ));
     out
 }
@@ -642,11 +642,11 @@ pub fn default_descriptors() -> BTreeMap<String, Descriptor> {
     add(Descriptor::new(
         "faktor.sessions.maxParallel",
         "Maximum parallel sessions",
-        "Bounded number of simultaneously listed parallel conversations.",
+        "Bounded number of listed parallel conversations; a larger listing is truncated with truncated:true.",
         "sessions",
         ValueKind::Integer { min: 1, max: 1_000 },
         Value::Number(16.into()),
-        ApplyTiming::RestartRequired,
+        ApplyTiming::Effective,
     ));
     add(Descriptor::new(
         "faktor.memory.captureMode",
@@ -756,6 +756,15 @@ pub fn default_descriptors() -> BTreeMap<String, Descriptor> {
     )
     .secret());
     add_runtime_descriptors(&mut m);
+    // A descriptor with no runtime consumer is a stored compatibility value,
+    // never a writable control: the settings UI must not offer a save that
+    // cannot have an effect. The consumer table is the one authority (and is
+    // checked against the tree by the wiring matrix gate).
+    for descriptor in m.values_mut() {
+        if !crate::config_consumers::runtime_consumer(&descriptor.key).is_applied() {
+            descriptor.writable = false;
+        }
+    }
     m
 }
 
@@ -1163,11 +1172,26 @@ impl ConfigService {
                 });
             }
             if !descriptor.writable {
+                let message = match crate::config_consumers::runtime_consumer(&descriptor.key) {
+                    crate::config_consumers::RuntimeConsumer::StoredOnly { reason } => {
+                        format!(
+                            "{} is stored only in this build and cannot be applied: {reason}",
+                            descriptor.key
+                        )
+                    }
+                    crate::config_consumers::RuntimeConsumer::Unknown => format!(
+                        "{} has no classified runtime consumer; refusing a write that could not apply",
+                        descriptor.key
+                    ),
+                    crate::config_consumers::RuntimeConsumer::Applied { .. } => {
+                        format!("{} is read-only", descriptor.key)
+                    }
+                };
                 errors.push(FieldError {
                     key: change.key.clone(),
                     scope: Some(change.scope),
                     code: "read_only".into(),
-                    message: format!("{} is read-only", descriptor.key),
+                    message,
                 });
             }
             if !descriptor.allowed_scopes.contains(&change.scope) {
@@ -1287,6 +1311,28 @@ impl ConfigService {
                 scope: None,
                 code: "cross_field".into(),
                 message: "output + safety reserves exceed the bounded capacity domain".into(),
+            });
+        }
+        let embedding = |key: &str| {
+            merged
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+        };
+        let provider_set = embedding("faktor.retrieval.embeddingProvider");
+        let model_set = embedding("faktor.retrieval.embeddingModel");
+        if provider_set != model_set {
+            errors.push(FieldError {
+                key: if provider_set {
+                    "faktor.retrieval.embeddingProvider".into()
+                } else {
+                    "faktor.retrieval.embeddingModel".into()
+                },
+                scope: None,
+                code: "cross_field".into(),
+                message: "embedding provider and model must be set together (or both cleared)"
+                    .into(),
             });
         }
         errors
@@ -2171,13 +2217,26 @@ mod tests {
 
     #[test]
     fn export_never_contains_secret_material_and_import_is_one_patch() {
-        let (_dir, svc) = service();
+        let secret = || {
+            Descriptor::new(
+                "provider.test.credential",
+                "Provider credential",
+                "Opaque vault reference for the test provider connection.",
+                "providers",
+                ValueKind::SecretReference,
+                Value::Null,
+                ApplyTiming::RestartRequired,
+            )
+            .secret()
+        };
+        let (_dir, mut svc) = service();
+        svc.upsert_descriptor(secret());
         let rev = svc.snapshot().unwrap().revision;
         svc.commit(&patch(
             rev,
             vec![
                 Change {
-                    key: "faktor.providers.credentialRef".into(),
+                    key: "provider.test.credential".into(),
                     scope: Scope::User,
                     value: Some(Value::String("vault://provider/abc".into())),
                 },
@@ -2194,8 +2253,9 @@ mod tests {
         assert!(!raw.contains("vault://provider/abc"));
         assert!(bundle
             .omitted_secrets
-            .contains(&"faktor.providers.credentialRef".into()));
-        let (_target_dir, target) = service();
+            .contains(&"provider.test.credential".into()));
+        let (_target_dir, mut target) = service();
+        target.upsert_descriptor(secret());
         let receipt = target.import(&bundle, None).unwrap();
         assert!(receipt.saved_revision > 0);
         assert_eq!(

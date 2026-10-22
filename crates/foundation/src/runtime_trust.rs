@@ -9,8 +9,14 @@
 //! All hashing is bounded (256 MiB) and streamed, so a hostile enormous
 //! path cannot exhaust memory.
 
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
+use std::time::SystemTime;
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -123,13 +129,121 @@ pub fn digest_executable(raw: &str) -> Result<(String, u64), FoundationError> {
     Ok((hasher.finalize().to_hex().to_string(), total))
 }
 
+#[cfg(unix)]
+const MAX_DIGEST_CACHE: usize = 8;
+
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct DigestFence {
+    len: u64,
+    inode: u64,
+    modified: SystemTime,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CachedDigest {
+    fence: DigestFence,
+    digest: String,
+    bytes: u64,
+}
+
+#[cfg(unix)]
+fn insert_digest(
+    cache: &mut HashMap<String, CachedDigest>,
+    path: &str,
+    fence: DigestFence,
+    digest: String,
+    bytes: u64,
+) {
+    if !cache.contains_key(path) && cache.len() >= MAX_DIGEST_CACHE {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        path.to_string(),
+        CachedDigest {
+            fence,
+            digest,
+            bytes,
+        },
+    );
+}
+
+#[cfg(unix)]
+fn digest_fence(metadata: &std::fs::Metadata) -> DigestFence {
+    use std::os::unix::fs::MetadataExt;
+    DigestFence {
+        len: metadata.len(),
+        inode: metadata.ino(),
+        modified: SystemTime::UNIX_EPOCH
+            + std::time::Duration::new(
+                metadata.ctime().max(0) as u64,
+                metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
+            ),
+    }
+}
+
 pub struct RuntimeTrustService {
     db: FoundationDb,
+    #[cfg(unix)]
+    digests: Mutex<HashMap<String, CachedDigest>>,
 }
 
 impl RuntimeTrustService {
     pub fn new(db: FoundationDb) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(unix)]
+            digests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn digest(&self, path: &str, fresh: bool) -> Result<(String, u64), FoundationError> {
+        validate_path(path)?;
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| FoundationError::NotFound(format!("executable {path:?}: {e}")))?;
+        if !metadata.is_file() {
+            return Err(FoundationError::Malformed(format!(
+                "executable {path:?} is not a regular file"
+            )));
+        }
+        if metadata.len() > MAX_EXECUTABLE_BYTES {
+            return Err(FoundationError::Oversized(format!(
+                "executable {path:?} is {} bytes; the bound is {MAX_EXECUTABLE_BYTES}",
+                metadata.len()
+            )));
+        }
+        #[cfg(unix)]
+        let fence = digest_fence(&metadata);
+        #[cfg(unix)]
+        if !fresh {
+            let mut cache = self
+                .digests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.get(path) {
+                if cached.fence == fence {
+                    return Ok((cached.digest.clone(), cached.bytes));
+                }
+            }
+            let (digest, bytes) = digest_executable(path)?;
+            insert_digest(&mut cache, path, fence, digest.clone(), bytes);
+            return Ok((digest, bytes));
+        }
+        #[cfg(not(unix))]
+        let _ = fresh;
+        let (digest, bytes) = digest_executable(path)?;
+        #[cfg(unix)]
+        {
+            let mut cache = self
+                .digests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            insert_digest(&mut cache, path, fence, digest.clone(), bytes);
+        }
+        Ok((digest, bytes))
     }
 
     pub fn record(&self, path: &str) -> Result<Option<TrustRecord>, FoundationError> {
@@ -162,7 +276,7 @@ impl RuntimeTrustService {
                 )));
             }
         }
-        let (checksum, _) = digest_executable(path)?;
+        let (checksum, _) = self.digest(path, true)?;
         let now = now_ms();
         self.db.write("runtime trust confirm", |conn| {
             conn.execute(
@@ -192,6 +306,14 @@ impl RuntimeTrustService {
     /// Compare the CURRENT bytes at the exact path with the recorded digest.
     /// A missing file, mismatched digest or absent record is explicit.
     pub fn check(&self, path: &str) -> TrustReport {
+        self.check_with(path, false)
+    }
+
+    pub fn check_fresh(&self, path: &str) -> TrustReport {
+        self.check_with(path, true)
+    }
+
+    fn check_with(&self, path: &str, fresh: bool) -> TrustReport {
         let recorded = match self.record(path) {
             Ok(record) => record,
             Err(e) => {
@@ -207,7 +329,19 @@ impl RuntimeTrustService {
                 }
             }
         };
-        let (observed, bytes) = match digest_executable(path) {
+        if recorded.is_none() && !fresh {
+            return TrustReport {
+                executable_path: path.to_string(),
+                state: TrustState::Unrecorded,
+                start_allowed: false,
+                recorded: None,
+                observed_checksum: None,
+                observed_bytes: None,
+                signature_state: "unverified".into(),
+                reason: "this exact path has not been confirmed on this machine".into(),
+            };
+        }
+        let (observed, bytes) = match self.digest(path, fresh) {
             Ok((digest, bytes)) => (Some(digest), Some(bytes)),
             Err(e) => {
                 return TrustReport {
@@ -295,6 +429,10 @@ mod tests {
         assert_eq!(unrecorded.state, TrustState::Unrecorded);
         assert!(!unrecorded.start_allowed);
         assert_eq!(unrecorded.signature_state, "unverified");
+        assert!(unrecorded.observed_checksum.is_none());
+        let explicit = svc.check_fresh(&path);
+        assert_eq!(explicit.state, TrustState::Unrecorded);
+        assert!(explicit.observed_checksum.is_some());
 
         let record = svc.confirm(&path, Some("Faktor Release")).unwrap();
         assert_eq!(record.signature_state, "unverified");
@@ -318,6 +456,22 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("other")).unwrap();
         let other = exe(&dir.path().join("other"), b"v1");
         assert_eq!(svc.check(&other).state, TrustState::Unrecorded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_rewrite_invalidates_the_status_digest_cache() {
+        let (dir, svc) = service();
+        let path = exe(dir.path(), b"aaaa");
+        svc.confirm(&path, None).unwrap();
+        assert_eq!(svc.check(&path).state, TrustState::Match);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"bbbb").unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(svc.check(&path).state, TrustState::Mismatch);
     }
 
     #[test]

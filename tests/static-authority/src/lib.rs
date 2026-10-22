@@ -1752,6 +1752,173 @@ mod scans {
         );
     }
 
+    /// Inline event-handler attributes (`onclick="..."`, ...) and
+    /// `javascript:` URLs are injection features in a webview document; the
+    /// sanctioned shape is `addEventListener` in an external nonce script.
+    fn inline_handler_offenders(rel: &str, source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            let mut hit: Option<&str> = if lower.contains("javascript:") {
+                Some("javascript: URL")
+            } else {
+                None
+            };
+            if hit.is_none() {
+                let bytes = lower.as_bytes();
+                let mut i = 0usize;
+                while i + 4 < bytes.len() {
+                    let boundary =
+                        i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                    if boundary
+                        && bytes[i] == b'o'
+                        && bytes[i + 1] == b'n'
+                        && bytes[i + 2].is_ascii_alphabetic()
+                    {
+                        let mut end = i + 2;
+                        while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+                            end += 1;
+                        }
+                        if end - (i + 2) >= 3 {
+                            let mut cursor = end;
+                            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                                cursor += 1;
+                            }
+                            if cursor < bytes.len() && bytes[cursor] == b'=' {
+                                cursor += 1;
+                                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                                    cursor += 1;
+                                }
+                                if cursor < bytes.len()
+                                    && (bytes[cursor] == b'"' || bytes[cursor] == b'\'')
+                                {
+                                    hit = Some("inline event handler");
+                                    break;
+                                }
+                            }
+                        }
+                        i = end;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            if let Some(kind) = hit {
+                out.push(format!(
+                    "{rel}:{}: {kind}  [event handlers and javascript: URLs must not appear in a webview document]",
+                    index + 1
+                ));
+            }
+        }
+        out
+    }
+
+    /// An approval decision expressed as a literal `allow` next to a reply
+    /// call is an auto-approval: decisions must come from an explicit
+    /// per-request user control and be bound to that request id.
+    fn approval_auto_allow_offenders(rel: &str, source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            let is_reply_call = line.contains("replyApproval")
+                || line.contains("replyPermission")
+                || line.contains("permissionReply");
+            if !is_reply_call {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            let literal_allow = lower.contains("\"allow\"")
+                || lower.contains("'allow'")
+                || lower.contains("\"allow_once\"")
+                || lower.contains("'allow_once'");
+            if literal_allow {
+                out.push(format!(
+                    "{rel}:{}: approval reply carries a literal allow  [decisions must be an explicit \
+                     user choice bound to the rendered request id]",
+                    index + 1
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn webview_sources_have_no_inline_handlers_or_literal_auto_allow() {
+        let mut inline = Vec::new();
+        let mut approval = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_webview_sources() {
+            let Ok(source) = std::fs::read_to_string(repo_root().join(&rel)) else {
+                continue;
+            };
+            scanned += 1;
+            inline.extend(inline_handler_offenders(&rel, &source));
+            approval.extend(approval_auto_allow_offenders(&rel, &source));
+        }
+        assert!(scanned >= 40, "webview scan found only {scanned} files");
+        assert_no_offenders(
+            "webview inline-handler scan: runtime webview sources must attach handlers in external \
+             nonce scripts, never inline attributes or javascript: URLs",
+            &inline,
+            scanned,
+            40,
+        );
+        assert_no_offenders(
+            "approval auto-allow scan: no reply call may carry a literal allow; the decision must be \
+             an explicit user choice bound to the rendered request id",
+            &approval,
+            scanned,
+            40,
+        );
+        assert!(
+            !inline_handler_offenders(
+                "apps/vscode/src/evil.ts",
+                "<button onclick=\"allow()\">Allow</button>\n"
+            )
+            .is_empty(),
+            "a planted inline handler must fire"
+        );
+        assert!(
+            !inline_handler_offenders(
+                "apps/vscode/src/evil.ts",
+                "<a href=\"javascript:allow()\">x</a>\n"
+            )
+            .is_empty(),
+            "a planted javascript: URL must fire"
+        );
+        assert!(
+            inline_handler_offenders(
+                "apps/vscode/src/ok.ts",
+                "button.addEventListener('click', allow);\n"
+            )
+            .is_empty(),
+            "the sanctioned addEventListener shape must pass"
+        );
+        assert!(
+            !approval_auto_allow_offenders(
+                "apps/jetbrains/frontend/src/evil.kt",
+                "host.replyApproval?.invoke(permission.first, permission.second, \"allow\")\n"
+            )
+            .is_empty(),
+            "a planted literal auto-allow must fire"
+        );
+        assert!(
+            approval_auto_allow_offenders(
+                "apps/jetbrains/frontend/src/ok.kt",
+                "openApprovals = { approvalSurfaces++; \"no decision was sent\" }\n"
+            )
+            .is_empty(),
+            "the review-only approval surface must pass"
+        );
+    }
+
     // ------------------------------------------------------------------
     // scan 2d: export/artifact secret hygiene is not opt-out
     // ------------------------------------------------------------------

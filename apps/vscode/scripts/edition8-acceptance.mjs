@@ -249,7 +249,7 @@ const CHECKS = {
   A17: async () => {
     const approval = control('Q-06');
     const ids = (SNAPSHOT.approvals?.permissions ?? []).map((entry) => entry.id);
-    return { pass: approval?.binding.route.path === '/native/permission/reply' && ids.length === 1 && ids[0] === 'perm-1', observations: [`ids=${ids.join(',')}`, approval?.routeText ?? ''] };
+    return { pass: approval?.binding.route.path === '/native/permission/reply' && ids.length === 1 && ids[0] === '7', observations: [`ids=${ids.join(',')}`, approval?.routeText ?? ''] };
   },
   A18: async () => {
     const remember = control('Q-07');

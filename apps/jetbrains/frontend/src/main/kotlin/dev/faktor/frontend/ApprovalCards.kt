@@ -28,6 +28,21 @@ internal const val APPROVAL_SUPPORTING = "Review the action, target and stated r
 /** D14: the fallback subline when the payload carries no authority reason. */
 internal const val APPROVAL_FALLBACK_REASON = "Action requested for this run."
 
+/**
+ * The reason member of the capability payload is supplied by the requester
+ * (an agent), not by the daemon authority. It is rendered as a quoted,
+ * unverified statement so agent text can never impersonate authority copy.
+ */
+internal const val APPROVAL_STATED_REASON_PREFIX = "Requester-stated reason (not verified): "
+
+/**
+ * The exact payload is review DATA. Past this bound it is truncated in the
+ * display and Allow is disabled: a hostile megabyte payload must not freeze
+ * the EDT, and a human cannot review what is not shown. Deny stays available.
+ */
+internal const val APPROVAL_DETAIL_DISPLAY_MAX = 64 * 1024
+internal const val APPROVAL_DETAIL_RENDER_MAX = 4096
+
 /** The bounded Work attention card renders at most this many requests. */
 internal const val MAX_WORK_APPROVAL_CARDS = 3
 
@@ -53,10 +68,11 @@ internal fun approvalDetailObject(detail: String): JsonValue.Obj? {
 }
 
 /**
- * The AUTHORITY reason of one native detail payload: an explicit
- * `reason`/`purpose`/`why` string member of a JSON OBJECT, surfaced verbatim
- * (bounded). Nothing is inferred from other fields, and a detail that is not
- * a JSON object returns null.
+ * The REQUESTER-STATED reason of one native detail payload: an explicit
+ * `reason`/`purpose`/`why` string member of a JSON OBJECT, surfaced bounded
+ * and always labelled unverified by the card. It is agent text, never
+ * authority copy; nothing is inferred from other fields, and a detail that is
+ * not a JSON object returns null.
  */
 internal fun approvalAuthorityReason(detail: String): String? {
     val obj = approvalDetailObject(detail) ?: return null
@@ -67,34 +83,33 @@ internal fun approvalAuthorityReason(detail: String): String? {
     return null
 }
 
-/** The copy the reason line renders: authority reason or the exact fallback. */
+/**
+ * The copy the reason line renders: the requester-stated reason explicitly
+ * labelled as unverified, or the exact fallback. The detail is agent input,
+ * never authority copy.
+ */
 internal fun approvalReasonText(permission: NativePermissionEntry): String =
-    approvalAuthorityReason(permission.detail) ?: APPROVAL_FALLBACK_REASON
+    approvalAuthorityReason(permission.detail)?.let { APPROVAL_STATED_REASON_PREFIX + it }
+        ?: APPROVAL_FALLBACK_REASON
 
 /**
- * The decision target of one request: the most decision-relevant JSON member
- * (`command`/`path`/`destination`/`tool`) when the detail is an object, else
- * the legacy string scan over the same keys. Empty stays missing.
+ * The decision target of one request: the most decision-relevant TOP-LEVEL
+ * JSON member (`command`/`path`/`destination`/`tool`) when the detail is an
+ * object. Text that is not a JSON object carries no trustworthy target, and
+ * a nested/attacker-planted member is never scanned out of prose.
  */
 internal fun approvalTargetOf(permission: NativePermissionEntry): String? {
-    val obj = approvalDetailObject(permission.detail)
-    if (obj != null) {
-        for (key in APPROVAL_TARGET_KEYS) {
-            val value = (obj.fields[key] as? JsonValue.Str)?.value
-            if (value != null && value.isNotEmpty()) return value
-        }
-        return null
+    val obj = approvalDetailObject(permission.detail) ?: return null
+    for (key in APPROVAL_TARGET_KEYS) {
+        val value = (obj.fields[key] as? JsonValue.Str)?.value
+        if (value != null && value.isNotEmpty()) return bound(value, 400)
     }
-    return Regex("\"(?:command|path|destination|tool)\"\\s*:\\s*\"([^\"]+)\"")
-        .find(permission.detail)
-        ?.groupValues
-        ?.get(1)
-        ?.takeIf { it.isNotEmpty() }
+    return null
 }
 
 /** Human decision headline: what the run wants to do, and to what. */
 internal fun approvalHeadlineOf(permission: NativePermissionEntry): String {
-    val kind = permission.capability.lowercase()
+    val kind = bound(permission.capability.lowercase(), 128)
     val what = when {
         kind.contains("shell") || kind.contains("execute") -> "Run a shell command"
         kind.contains("write") -> "Write files in this workspace"
@@ -103,7 +118,7 @@ internal fun approvalHeadlineOf(permission: NativePermissionEntry): String {
         kind.contains("browser") -> "Control the browser"
         kind.contains("git") || kind.contains("scm") -> "Run Git operations"
         kind.contains("mcp") -> "Call an external tool service"
-        else -> "Use " + permission.capability
+        else -> "Use " + bound(permission.capability, 200)
     }
     val target = approvalTargetOf(permission)
     return if (target.isNullOrEmpty()) what else "$what: $target"
@@ -156,11 +171,13 @@ internal class ApprovalRequestCard(
     val allowButton: JButton,
     val denyButton: JButton,
     val detailsButton: JButton,
-    val refreshButton: JButton?
+    val refreshButton: JButton?,
+    /** An oversized payload keeps Allow disabled; Deny stays available. */
+    private val allowBlocked: Boolean = false
 ) {
     /** Enables/disables both decision buttons for this exact request. */
     fun setPending(pending: Boolean) {
-        allowButton.isEnabled = !pending
+        allowButton.isEnabled = !pending && !allowBlocked
         denyButton.isEnabled = !pending
     }
 }
@@ -197,11 +214,11 @@ internal fun approvalRequestCard(
     body.add(headline)
     val infoBits = ArrayList<String>()
     infoBits.add(
-        "capability " + (permission.capability.ifBlank { "unavailable" })
+        "capability " + bound(permission.capability.ifBlank { "unavailable" }, 200)
     )
     if (!target.isNullOrEmpty()) infoBits.add("target $target")
     infoBits.add(
-        "conversation " + (permission.sessionId.ifBlank { "unavailable" })
+        "conversation " + bound(permission.sessionId.ifBlank { "unavailable" }, 64)
     )
     val info = wrappedMutedLabel(infoBits.joinToString(" · "))
     if (!target.isNullOrEmpty()) {
@@ -212,12 +229,27 @@ internal fun approvalRequestCard(
     reasonLabel.foreground = textForeground()
     reasonLabel.accessibleContext.accessibleName = "Stated reason: $reason"
     body.add(reasonLabel)
+    val oversizedDetail = permission.detail.length > APPROVAL_DETAIL_DISPLAY_MAX
     if (permission.detail.isNotEmpty()) {
-        // The EXACT payload (no truncation, no reformatting).
+        // The exact payload within the review bound; past it the display is
+        // bounded and Allow is disabled (Deny remains available).
         val payload = compactArea(2, monospace = true)
-        payload.text = permission.detail
+        payload.text =
+            if (oversizedDetail) {
+                permission.detail.take(APPROVAL_DETAIL_RENDER_MAX) + "… (payload exceeds the review bound)"
+            } else {
+                permission.detail
+            }
         payload.accessibleContext.accessibleName = "Request payload"
         body.add(payload)
+        if (oversizedDetail) {
+            val warning = WrappedLabel(
+                "The request payload exceeds the ${APPROVAL_DETAIL_DISPLAY_MAX}-character review bound; " +
+                    "Allow is disabled. Deny or refresh to re-read the request."
+            )
+            warning.foreground = semanticForeground(SemanticState.NEGATIVE)
+            body.add(warning)
+        }
     }
     if (refusal != null) {
         val refusalLabel = WrappedLabel("Reply refused: $refusal")
@@ -230,6 +262,7 @@ internal fun approvalRequestCard(
         )
     }
     val allow = primaryButton("Allow")
+    allow.isEnabled = !oversizedDetail
     allow.accessibleContext.accessibleName =
         "Allow approval request ${permission.id}: $headlineText"
     val deny = secondaryButton("Deny")
@@ -238,8 +271,8 @@ internal fun approvalRequestCard(
     val details = secondaryButton("Details")
     details.accessibleContext.accessibleName = "Details for approval request ${permission.id}"
     val disclosure = WrappedLabel(
-        "Request ${permission.id} · capability ${permission.capability} · " +
-            "conversation ${permission.sessionId}"
+        "Request ${bound(permission.id, 64)} · capability ${bound(permission.capability, 200)} · " +
+            "conversation ${bound(permission.sessionId, 64)}"
     )
     disclosure.font = monospacePanelFont()
     disclosure.foreground = mutedForeground()
@@ -252,7 +285,9 @@ internal fun approvalRequestCard(
         body.repaint()
     }
     val claim: (String) -> Unit = { decision ->
-        if (!gate.pending(permission.id) && gate.tryBegin(permission.id)) {
+        if (decision == "allow" && oversizedDetail) {
+            // The review bound is a hard gate, not just a disabled button.
+        } else if (!gate.pending(permission.id) && gate.tryBegin(permission.id)) {
             allow.isEnabled = false
             deny.isEnabled = false
             onReply(decision)
@@ -276,7 +311,7 @@ internal fun approvalRequestCard(
     }
     body.add(actions)
     body.add(disclosure)
-    val card = ApprovalRequestCard(body, allow, deny, details, refresh)
+    val card = ApprovalRequestCard(body, allow, deny, details, refresh, oversizedDetail)
     card.setPending(gate.pending(permission.id))
     body.accessibleContext.accessibleName =
         "$APPROVAL_HEADLINE request ${permission.id}"

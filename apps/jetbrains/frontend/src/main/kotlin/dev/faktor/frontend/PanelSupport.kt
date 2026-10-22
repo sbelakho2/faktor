@@ -324,7 +324,7 @@ internal fun breakableText(text: String): String {
  * unbroken tokens (paths, hashes) get zero-width break opportunities. The
  * untruncated text stays available as the tooltip.
  */
-internal class WrappedLabel(
+internal open class WrappedLabel(
     text: String = "",
     private val preferredWidthCap: Int = Int.MAX_VALUE
 ) : JLabel() {
@@ -406,8 +406,26 @@ internal class WrappedLabel(
      * cap it so a label column does not swallow the whole form.
      */
     override fun getPreferredSize(): Dimension {
+        // A parent may ask for the preferred height after assigning a width
+        // but before the posted component-resized event runs. Re-wrap here so
+        // the returned height matches the lines that will actually paint.
+        // Before the first bounds pass use the parent width, not the tiny
+        // 220px fallback: otherwise a long label reserves a huge height and
+        // the page shows a blank gap above the next section.
+        val available = when {
+            width > 0 -> width
+            parent != null && parent.width > 0 -> parent.width
+            else -> 0
+        }
+        if (available > 0 && available != wrappedWidth) refreshAt(available)
         val base = super.getPreferredSize()
         return Dimension(Math.min(base.width, preferredWidthCap), base.height)
+    }
+
+    override fun setFont(font: Font?) {
+        super.setFont(font)
+        wrappedWidth = -1
+        refresh()
     }
 
     /**
@@ -420,8 +438,9 @@ internal class WrappedLabel(
      * body-margin/width-style arithmetic (the old `style='width:...'` hint
      * under-measured the margins and cut words at the right edge at 240px).
      */
-    private fun refresh() {
-        val available = if (width > 0) width else 220
+    private fun refresh() = refreshAt(if (width > 0) width else 220)
+
+    private fun refreshAt(available: Int) {
         if (available == wrappedWidth) return
         wrappedWidth = available
         val maxWidth = (available - Spacing.L - Spacing.XS).coerceAtLeast(40)
@@ -434,6 +453,11 @@ internal class WrappedLabel(
             rendering = false
         }
         toolTipText = fullText.ifEmpty { null }
+        // The line count changes the preferred height. Clear the cached
+        // preferred sizes up the chain so a parent BoxLayout/PageLayout does
+        // not reserve the old (taller) height and paint a blank gap.
+        revalidate()
+        parent?.revalidate()
     }
 
     companion object {
@@ -585,13 +609,37 @@ internal class FixedWrapLabel(text: String, private val wrapWidth: Int = Spacing
  * column already tracks the viewport width, so no horizontal scrollbar is
  * needed; the scrollbar only appears when the content overflows.
  */
-internal fun pageScroll(content: JComponent): javax.swing.JScrollPane =
-    javax.swing.JScrollPane(content).apply {
+internal fun pageScroll(content: JComponent): javax.swing.JScrollPane {
+    val view: JComponent = if (content is javax.swing.Scrollable) {
+        content
+    } else {
+        WidthTrackingView(content)
+    }
+    return javax.swing.JScrollPane(view).apply {
         border = null
         verticalScrollBar.unitIncrement = Spacing.L
         horizontalScrollBarPolicy =
             javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
     }
+}
+
+/**
+ * A BorderLayout body that follows the scroll viewport width. Without this,
+ * a plain JPanel keeps its (wider) preferred width, and a long row is clipped
+ * at the right edge instead of shrinking its wrapped label.
+ */
+private class WidthTrackingView(content: JComponent) : JPanel(BorderLayout()), javax.swing.Scrollable {
+    init {
+        isOpaque = false
+        add(content, BorderLayout.CENTER)
+    }
+
+    override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
+    override fun getScrollableUnitIncrement(visibleRect: java.awt.Rectangle?, orientation: Int, direction: Int): Int = Spacing.L
+    override fun getScrollableBlockIncrement(visibleRect: java.awt.Rectangle?, orientation: Int, direction: Int): Int = 64
+    override fun getScrollableTracksViewportWidth(): Boolean = true
+    override fun getScrollableTracksViewportHeight(): Boolean = false
+}
 
 /**
  * A page/card body column on the shared spacing scale: vertical BoxLayout
@@ -712,15 +760,38 @@ internal fun statusChip(text: String, state: SemanticState): JLabel {
     // DIM must stay readable: `Label.disabledForeground` can be nearly the
     // panel surface color, so dim chips use the muted text tone instead.
     val tone = if (state == SemanticState.DIM) mutedForeground() else semanticForeground(state)
-    return JLabel(text).apply {
+    return object : JLabel(text) {
+        private val fillColor = mix(panelSurface(), tone, 0.10f)
+
+        // The old chip used FaktorRoundedBorder's fill, but Swing paints a
+        // component's border AFTER its text, so the fill covered the status
+        // (the white empty pill in every screenshot). Fill under the text
+        // and leave only the outline to the border.
+        override fun paintComponent(g: java.awt.Graphics) {
+            val g2 = g.create() as java.awt.Graphics2D
+            try {
+                g2.setRenderingHint(
+                    java.awt.RenderingHints.KEY_ANTIALIASING,
+                    java.awt.RenderingHints.VALUE_ANTIALIAS_ON
+                )
+                g2.color = fillColor
+                val arc = Radii.CHIP * 2
+                g2.fillRoundRect(0, 0, width - 1, height - 1, arc, arc)
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }.apply {
         font = sectionTitleFont()
         foreground = tone
         isOpaque = false
+        alignmentX = Component.LEFT_ALIGNMENT
         border = FaktorRoundedBorder(
             lineColor = tone,
             radius = Radii.CHIP,
-            fill = mix(panelSurface(), tone, 0.10f),
-            padding = Insets(1, Spacing.S, 1, Spacing.S)
+            fill = null,
+            padding = Insets(3, Spacing.S, 3, Spacing.S)
         )
     }
 }
@@ -887,6 +958,26 @@ internal class FaktorToggleButton(text: String) : JToggleButton(text) {
         } finally {
             foreground = previous
         }
+    }
+}
+
+/**
+ * A themed checkbox with the same 24px hit-target floor as the secondary
+ * buttons: the bare platform box is only 23px at 100% text, so the floor
+ * grows the ACTUAL clickable bounds without padding the row or changing the
+ * visual density (the glyph stays centred; the floor still yields to font
+ * metrics at IDE zoom).
+ */
+internal class FaktorCheckBox(text: String) : javax.swing.JCheckBox(text) {
+
+    init {
+        font = uiPanelFont()
+        isFocusPainted = false
+    }
+
+    override fun getPreferredSize(): Dimension {
+        val base = super.getPreferredSize()
+        return Dimension(base.width, Math.max(24, base.height))
     }
 }
 

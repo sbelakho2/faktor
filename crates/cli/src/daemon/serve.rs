@@ -1082,6 +1082,12 @@ pub(crate) async fn serve_impl(
         )
     })?);
     let config = apply_saved_provider_connections(&config, &foundation)?;
+    // Restart-required settings saved from the UI are consumed HERE, before
+    // the graph captures the retry/efficiency/compaction/embedding/sandbox
+    // policy. A setting with no consumer is locked read-only by the
+    // descriptor table instead of pretending to apply.
+    let config =
+        crate::daemon::foundation_settings::apply_saved_runtime_settings(config, &foundation)?;
     let updater = build_daemon_updater(&config, &data_dir)?;
     let graph =
         build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)

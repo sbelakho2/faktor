@@ -1,0 +1,229 @@
+{
+  "schema": "faktor-wiring-matrix/v1",
+  "note": "Wired surfaces are derived. Unwired entries are explicit, reasoned exceptions: release mode fails while any remain.",
+  "routes": {
+    "DELETE /native/session/{id}/worktrees/{worktree_id}": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "GET /native/browser/artifacts/{id}": {
+      "state": "unwired",
+      "reason": "browser artifact bytes endpoint; captures are recorded but no IDE surface downloads artifact bytes."
+    },
+    "GET /native/browser/artifacts/{id}/bytes": {
+      "state": "unwired",
+      "reason": "browser artifact bytes endpoint; captures are recorded but no IDE surface downloads artifact bytes."
+    },
+    "GET /native/enterprise/artifacts": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/enterprise/audit": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/enterprise/deletion-jobs": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/enterprise/deletion-jobs/{id}": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/enterprise/settings": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/enterprise/tombstones/{scope_key}": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "GET /native/memory/policy": {
+      "state": "unwired",
+      "reason": "memory policy/retention endpoint; memory facts are managed through session records and no policy UI calls it."
+    },
+    "GET /native/orgs/{id}/members": {
+      "state": "unwired",
+      "reason": "no Faktor-owned client calls this route in this build; it remains a daemon/test surface."
+    },
+    "GET /native/presets/binding": {
+      "state": "unwired",
+      "reason": "preset binding read; the IDE binds presets through task start, not this read route."
+    },
+    "GET /native/session/{id}/lineage": {
+      "state": "unwired",
+      "reason": "session lineage endpoint; no lineage panel calls it."
+    },
+    "GET /native/session/{id}/worktrees": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "POST /native/approvals/{id}/decide": {
+      "state": "unwired",
+      "reason": "approval authority endpoint; approval tools call the authority directly and no IDE decide surface is wired yet."
+    },
+    "POST /native/config/reset": {
+      "state": "unwired",
+      "reason": "operator/admin recovery endpoint; no Faktor-owned client calls it, so it is not offered as a control."
+    },
+    "POST /native/config/rollback": {
+      "state": "unwired",
+      "reason": "operator/admin recovery endpoint; no Faktor-owned client calls it, so it is not offered as a control."
+    },
+    "POST /native/config/runtime-ack": {
+      "state": "unwired",
+      "reason": "operator/admin recovery endpoint; no Faktor-owned client calls it, so it is not offered as a control."
+    },
+    "POST /native/enterprise/artifacts": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "POST /native/enterprise/artifacts/{id}/eligible": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "POST /native/enterprise/deletion-jobs": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "POST /native/enterprise/deletion-jobs/{id}/advance": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "POST /native/enterprise/retention/gc": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "POST /native/invitations/accept": {
+      "state": "unwired",
+      "reason": "no Faktor-owned client calls this route in this build; it remains a daemon/test surface."
+    },
+    "POST /native/memory/retention": {
+      "state": "unwired",
+      "reason": "memory policy/retention endpoint; memory facts are managed through session records and no policy UI calls it."
+    },
+    "POST /native/models/compare": {
+      "state": "unwired",
+      "reason": "model comparison endpoint; the F045 comparison surface is not implemented in either IDE."
+    },
+    "POST /native/orgs/{id}/members": {
+      "state": "unwired",
+      "reason": "no Faktor-owned client calls this route in this build; it remains a daemon/test surface."
+    },
+    "POST /native/session/{id}/changes/accept-hunks": {
+      "state": "unwired",
+      "reason": "per-hunk acceptance endpoint; the current review surface applies whole files, so no client calls it."
+    },
+    "POST /native/session/{id}/terminals/{terminal_id}/resize": {
+      "state": "unwired",
+      "reason": "terminal resize endpoint; neither IDE sends terminal dimensions today."
+    },
+    "POST /native/session/{id}/worktrees": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "POST /native/session/{id}/worktrees/repair": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "POST /native/session/{id}/worktrees/{worktree_id}/transfer": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "POST /native/session/{id}/worktrees/{worktree_id}/validate": {
+      "state": "unwired",
+      "reason": "session/worktree administration endpoint; the current IDE uses workspace registration and does not call this route."
+    },
+    "POST /native/sso/callback": {
+      "state": "unwired",
+      "reason": "control-plane sign-in handshake; the IDE talks to the configured control-plane endpoint, not this daemon proxy route."
+    },
+    "POST /native/sso/start": {
+      "state": "unwired",
+      "reason": "control-plane sign-in handshake; the IDE talks to the configured control-plane endpoint, not this daemon proxy route."
+    },
+    "POST /native/updater/apply": {
+      "state": "unwired",
+      "reason": "updater lifecycle endpoint; the IDE reads /native/updater/status and the updater CLI drives the updater service locally."
+    },
+    "POST /native/updater/downgrade": {
+      "state": "unwired",
+      "reason": "updater lifecycle endpoint; the IDE reads /native/updater/status and the updater CLI drives the updater service locally."
+    },
+    "POST /native/updater/rollback": {
+      "state": "unwired",
+      "reason": "updater lifecycle endpoint; the IDE reads /native/updater/status and the updater CLI drives the updater service locally."
+    },
+    "POST /native/updater/stage": {
+      "state": "unwired",
+      "reason": "updater lifecycle endpoint; the IDE reads /native/updater/status and the updater CLI drives the updater service locally."
+    },
+    "POST /native/workers/tokens": {
+      "state": "unwired",
+      "reason": "worker-plane/admin endpoint used by remote worker nodes or the worker CLI; no Faktor-owned IDE client calls it."
+    },
+    "PUT /native/enterprise/settings": {
+      "state": "unwired",
+      "reason": "enterprise admin/service endpoint; the IDE reads /native/enterprise/status and /native/enterprise/effective-config, and the enterprise service is driven directly by its own lifecycle/tests."
+    },
+    "PUT /native/instructions/source": {
+      "state": "unwired",
+      "reason": "instruction source update endpoint; the instruction bundle import surface uses the bundle routes instead."
+    },
+    "PUT /native/memory/policy": {
+      "state": "unwired",
+      "reason": "memory policy/retention endpoint; memory facts are managed through session records and no policy UI calls it."
+    }
+  },
+  "configEvidence": {
+    "faktor.runtime.binaryPath": "crates/foundation/src/config.rs::add_runtime_descriptors",
+    "faktor.runtime.dataDir": "crates/foundation/src/config.rs::add_runtime_descriptors",
+    "faktor.runtime.installRoot": "crates/foundation/src/config.rs::add_runtime_descriptors"
+  },
+  "configUnwired": {
+    "faktor.agent.maxConsecutiveFailures": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.generation.temperature": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.generation.topP": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.generation.maxOutput": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.budget.warnAtPercent": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.retrieval.strategy": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.permissions.childRoles": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.sandbox.network": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.memory.captureMode": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.diagnostics.logLevel": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    },
+    "faktor.providers.credentialRef": {
+      "state": "unwired",
+      "reason": "stored-only descriptor; read-only in this build"
+    }
+  }
+}

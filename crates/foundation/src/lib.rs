@@ -19,6 +19,7 @@
 
 pub mod browser;
 pub mod config;
+pub mod config_consumers;
 pub mod context;
 pub mod customization;
 pub mod db;

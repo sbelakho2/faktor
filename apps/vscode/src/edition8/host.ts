@@ -410,9 +410,14 @@ function rowsSignature(view: E8ScreenView): string {
 export interface E8ViewCache {
   readonly controls: ReadonlyMap<string, string>;
   readonly rows: ReadonlyMap<string, string>;
+  readonly views?: ReadonlyMap<string, E8ScreenView>;
+  readonly dataRevision?: string;
+  readonly stateKey?: string;
 }
 
 export const EMPTY_VIEW_CACHE: E8ViewCache = { controls: new Map(), rows: new Map() };
+
+const VOLATILE_SCREENS = new Set(['S56']);
 
 /** Only changed controls/rows are posted; unchanged cards keep their DOM. */
 export function diffView(
@@ -423,8 +428,18 @@ export function diffView(
   const controlSignatures = new Map<string, string>();
   const rowSignatures = new Map<string, string>();
   const patches: E8ViewPatch[] = [];
+  const revision = state.snapshot?.data_revision ?? null;
+  const stateKey = [
+    state.loading ? 'loading' : 'idle',
+    state.error ?? '',
+    Math.floor((state.snapshot?.stale_age_ms ?? 0) / 1000),
+  ].join('|');
+  const reuse = revision !== null && cache.dataRevision === revision && cache.stateKey === stateKey;
+  const views = new Map<string, E8ScreenView>(reuse ? cache.views : undefined);
   for (const screenId of screenIds) {
-    const view = screenView(screenId, state);
+    const cachedView = reuse && !VOLATILE_SCREENS.has(screenId) ? cache.views?.get(screenId) : undefined;
+    const view = cachedView ?? screenView(screenId, state);
+    views.set(screenId, view);
     const controls: E8ControlPatch[] = [];
     for (const control of view.controls) {
       const signature = signatureOf(control);
@@ -460,7 +475,13 @@ export function diffView(
     });
   }
   return {
-    cache: { controls: controlSignatures, rows: rowSignatures },
+    cache: {
+      controls: controlSignatures,
+      rows: rowSignatures,
+      views,
+      ...(revision === null ? {} : { dataRevision: revision }),
+      stateKey,
+    },
     patches,
   };
 }

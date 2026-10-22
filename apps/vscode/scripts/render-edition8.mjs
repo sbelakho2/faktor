@@ -19,6 +19,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { E8_SCREENS, E8_CONTROLS } from '../src/generated/edition8Registry.ts';
 import { renderEdition8Html } from '../src/edition8/html.ts';
+import { destinationOf } from '../src/edition8/view.ts';
 import { connect, findChrome, launchChrome, sleep } from './render-webview.mjs';
 import { edition8Snapshot, edition8EmptySnapshot, edition8StaleSnapshot } from './fixtures/edition8.mjs';
 
@@ -28,7 +29,6 @@ const ROOT = resolve(HERE, '..', '..', '..');
 const OUT = resolve(ROOT, 'target/certification/edition8');
 const PLATFORM = platform();
 const WRITE = process.argv.includes('--write');
-const SHELL_GROUPS = new Set(['Work', 'Inspect and proof', 'History']);
 const WIDTHS = [240, 320, 480, 720];
 const THEMES = {
   dark: `
@@ -55,7 +55,7 @@ function hash(bytes) {
 }
 
 function modeFor(screen) {
-  return SHELL_GROUPS.has(screen.group) ? 'shell' : 'settings';
+  return destinationOf(screen) === 'settings' ? 'settings' : 'shell';
 }
 
 function pageHtml(screen, snapshot, theme, textScale = 1) {
@@ -376,6 +376,7 @@ async function main() {
       `contrast min ${document.contrast.min} (${contrastRatios.length}), optical dx ${document.optical.max_dx}/dy ${document.optical.max_dy} (${opticalDx.length}) · failures ${failures.length}`,
   );
   for (const failure of failures.slice(0, 25)) console.error(`FAIL ${failure}`);
+  child.child.kill('SIGKILL');
   if (failures.length > 0) process.exit(1);
 }
 

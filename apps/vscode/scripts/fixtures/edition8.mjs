@@ -108,7 +108,7 @@ const sources = {
   receipts: source('GET', '/native/call-receipts', { receipts: [{ id: 'r-1', model: 'openai/gpt-5-codex', state: 'completed' }] }),
   policy: source('GET', '/native/permissions/policy', { revision: 4, preset: 'ask', rules: [], sandbox_state: { state: 'ask' } }),
   permissionAudit: source('GET', '/native/permissions/audit', { facts: [{ id: 'f-1', decision: 'ask' }] }),
-  approvals: source('GET', '/native/permissions', { permissions: [{ id: 'perm-1', session_id: 's1', capability: 'shell.exec', detail: 'npm test' }] }),
+  approvals: source('GET', '/native/permissions', { permissions: [{ id: '7', session_id: 's1', capability: 'shell.exec', detail: 'npm test' }] }),
   mcp: source('GET', '/native/mcp/servers', {
     servers: [
       {

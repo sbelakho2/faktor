@@ -4,6 +4,7 @@
 use super::*;
 
 pub mod builder;
+pub(crate) mod foundation_settings;
 pub mod semantic;
 pub mod serve;
 pub mod wiring;

@@ -653,6 +653,12 @@ pub(crate) async fn native_task_run_start(
             }
         }
     }
+    // F: every durable run setting the settings UI offers is consumed here,
+    // at task admission, before any plan/model effect. The run defaults only
+    // fill an absent request; an explicit per-run value always wins.
+    if let Err(e) = apply_run_settings(&state, &handle, &mut req) {
+        return wire_status(e);
+    }
     // Per-run routing overrides are refused until the daemon's routing
     // policy — the single routing authority — can honor them: a parsed-but-
     // ignored policy field would silently claim a mode the run never used.
@@ -2046,6 +2052,97 @@ mod engineering_contract_dto_tests {
     }
 }
 
+fn config_u64(state: &AppState, key: &str) -> Option<u64> {
+    state
+        .deps
+        .foundation
+        .as_deref()
+        .and_then(|foundation| foundation.config.u64_value(key).ok().flatten())
+}
+
+fn config_string(state: &AppState, key: &str) -> Option<String> {
+    state.deps.foundation.as_deref().and_then(|foundation| {
+        foundation
+            .config
+            .string_value(key)
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Apply the durable run defaults/bounds at the task-start boundary.
+///
+/// - `faktor.run.defaultProvider`/`defaultModel` fill an ABSENT model; a
+///   provider that differs from the session's provider is a typed conflict
+///   (the run cannot silently switch the conversation's provider).
+/// - `faktor.budget.maxTokens`/`maxCostMicro` are default caps when the
+///   request names none.
+/// - `faktor.permissions.maximumChildren` bounds the number of child work
+///   items admitted for one task.
+fn apply_run_settings(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+    req: &mut StartTaskRunRequest,
+) -> Result<(), ApiError> {
+    if req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        // The run provider cannot switch a conversation's provider; it is a
+        // real constraint even when no run-default model is set.
+        if let Some(provider) = config_string(state, "faktor.run.defaultProvider") {
+            let session_provider = handle.provider().map_err(|e| ApiError {
+                code: "internal",
+                message: format!("session provider unreadable: {e}"),
+                http_status: 500,
+                retryable: false,
+            })?;
+            if provider != session_provider {
+                return Err(ApiError {
+                    code: "run_default_provider_mismatch",
+                    message: format!(
+                        "faktor.run.defaultProvider is {provider:?} but this session uses {session_provider:?}; create a conversation with that provider instead of switching mid-run"
+                    ),
+                    http_status: 409,
+                    retryable: false,
+                });
+            }
+        }
+        if let Some(model) = config_string(state, "faktor.run.defaultModel") {
+            req.model = Some(model);
+        }
+    }
+    if req.max_tokens.is_none_or(|value| value == 0) {
+        req.max_tokens = config_u64(state, "faktor.budget.maxTokens").filter(|value| *value > 0);
+    }
+    if req.max_cost_micro.is_none_or(|value| value == 0) {
+        req.max_cost_micro =
+            config_u64(state, "faktor.budget.maxCostMicro").filter(|value| *value > 0);
+    }
+    if let Some(items) = req.work_items.as_ref() {
+        let maximum = config_u64(state, "faktor.permissions.maximumChildren")
+            .unwrap_or(4)
+            .min(64) as usize;
+        if items.len() > maximum {
+            return Err(ApiError {
+                code: "child_limit_exceeded",
+                message: format!(
+                    "the plan names {} work items but faktor.permissions.maximumChildren is {maximum}",
+                    items.len()
+                ),
+                http_status: 409,
+                retryable: false,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The resolved B-09 turn bound: the per-session setting wins, else the
 /// served workspace descriptor; an absent value leaves the daemon default.
 pub(crate) fn session_turn_cap(
@@ -2338,4 +2435,164 @@ pub(crate) async fn native_models_compare(
         "candidates": candidates,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod run_settings_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    fn state_with_foundation(root: &std::path::Path) -> AppState {
+        let mut deps = crate::api::tests::test_deps(root);
+        let foundation =
+            Arc::new(faktor_foundation::Foundation::open(root.join("foundation.db")).unwrap());
+        deps.foundation = Some(foundation);
+        AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(RwLock::new(None)),
+            terminal_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn commit(state: &AppState, key: &str, value: serde_json::Value) {
+        let foundation = state.deps.foundation.as_deref().unwrap();
+        let snapshot = foundation.config.snapshot().unwrap();
+        foundation
+            .config
+            .commit(&faktor_foundation::config::Patch {
+                expected_revision: snapshot.revision,
+                changes: vec![faktor_foundation::config::Change {
+                    key: key.into(),
+                    scope: faktor_foundation::config::Scope::User,
+                    value: Some(value),
+                }],
+            })
+            .unwrap();
+    }
+
+    fn request() -> StartTaskRunRequest {
+        serde_json::from_value(serde_json::json!({
+            "goal": "g",
+            "submission_id": "123e4567-e89b-12d3-a456-426614174000",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn run_defaults_and_caps_fill_an_absent_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_foundation(dir.path());
+        commit(
+            &state,
+            "faktor.run.defaultProvider",
+            serde_json::json!("fake"),
+        );
+        commit(&state, "faktor.run.defaultModel", serde_json::json!("m"));
+        commit(&state, "faktor.budget.maxTokens", serde_json::json!(1234));
+        commit(
+            &state,
+            "faktor.budget.maxCostMicro",
+            serde_json::json!(5000),
+        );
+        let ws = state
+            .deps
+            .session
+            .create_workspace(&dir.path().to_string_lossy())
+            .unwrap();
+        let handle = state
+            .deps
+            .session
+            .create_session(ws, "t", "fake", "m")
+            .unwrap();
+        let mut req = request();
+        apply_run_settings(&state, &handle, &mut req).unwrap();
+        assert_eq!(req.model.as_deref(), Some("m"));
+        assert_eq!(req.max_tokens, Some(1234));
+        assert_eq!(req.max_cost_micro, Some(5000));
+    }
+
+    #[test]
+    fn an_explicit_request_value_wins_over_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_foundation(dir.path());
+        commit(&state, "faktor.run.defaultModel", serde_json::json!("m"));
+        commit(&state, "faktor.budget.maxTokens", serde_json::json!(1234));
+        let ws = state
+            .deps
+            .session
+            .create_workspace(&dir.path().to_string_lossy())
+            .unwrap();
+        let handle = state
+            .deps
+            .session
+            .create_session(ws, "t", "fake", "m")
+            .unwrap();
+        let mut req = request();
+        req.model = Some("other".into());
+        req.max_tokens = Some(7);
+        apply_run_settings(&state, &handle, &mut req).unwrap();
+        assert_eq!(req.model.as_deref(), Some("other"));
+        assert_eq!(req.max_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_foreign_run_provider_refuses_instead_of_switching_mid_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_foundation(dir.path());
+        commit(
+            &state,
+            "faktor.run.defaultProvider",
+            serde_json::json!("other"),
+        );
+        let ws = state
+            .deps
+            .session
+            .create_workspace(&dir.path().to_string_lossy())
+            .unwrap();
+        let handle = state
+            .deps
+            .session
+            .create_session(ws, "t", "fake", "m")
+            .unwrap();
+        let mut req = request();
+        let error = apply_run_settings(&state, &handle, &mut req).unwrap_err();
+        assert_eq!(error.code, "run_default_provider_mismatch");
+        assert_eq!(error.http_status, 409);
+    }
+
+    #[test]
+    fn the_child_bound_refuses_an_oversized_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_foundation(dir.path());
+        commit(
+            &state,
+            "faktor.permissions.maximumChildren",
+            serde_json::json!(1),
+        );
+        let ws = state
+            .deps
+            .session
+            .create_workspace(&dir.path().to_string_lossy())
+            .unwrap();
+        let handle = state
+            .deps
+            .session
+            .create_session(ws, "t", "fake", "m")
+            .unwrap();
+        let mut req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
+            "goal": "g",
+            "submission_id": "123e4567-e89b-12d3-a456-426614174000",
+            "work_items": [
+                {"id": "a", "kind": "Analysis", "ownership": "no_writes"},
+                {"id": "b", "kind": "Analysis", "ownership": "no_writes"},
+            ],
+        }))
+        .unwrap();
+        let error = apply_run_settings(&state, &handle, &mut req).unwrap_err();
+        assert_eq!(error.code, "child_limit_exceeded");
+        assert_eq!(error.http_status, 409);
+    }
 }

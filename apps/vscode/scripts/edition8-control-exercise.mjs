@@ -44,8 +44,8 @@ const typedPayload = {
   kind: 'project',
   key: 'build-command',
   query: 'daemon',
-  request_id: 'perm-1',
-  permission_id: 'perm-1',
+  request_id: '7',
+  permission_id: '7',
   decision: 'deny',
 };
 

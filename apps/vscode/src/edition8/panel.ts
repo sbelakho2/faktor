@@ -22,7 +22,8 @@ import {
 import { E8_SCREENS } from '../generated/edition8Registry.ts';
 import { E8_BINDINGS, bindingOf8 } from './bindings.ts';
 import type { Json } from './contract.ts';
-import { isShellScreen } from './view.ts';
+import { destinationOf, isShellScreen } from './view.ts';
+import { exactPendingApprovalId, pendingApprovalIds } from './approval.ts';
 
 export interface Edition8PanelDeps {
   readonly backend: () => E8Backend | null;
@@ -38,6 +39,7 @@ export interface Edition8PanelDeps {
 interface PanelMessage {
   readonly type?: unknown;
   readonly controlId?: unknown;
+  readonly command?: unknown;
   readonly screen?: unknown;
   readonly raw?: unknown;
   readonly useSample?: unknown;
@@ -72,6 +74,9 @@ function payloadOf(value: unknown): Record<string, Json> {
   const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_PAYLOAD_KEYS);
   for (const [key, entry] of entries) {
     if (key.length === 0 || key.length > 128) continue;
+    // A webview payload is untrusted data: never let it mutate the prototype
+    // of the JSON envelope the host forwards to the daemon.
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (entry === null || ['string', 'number', 'boolean'].includes(typeof entry)) {
       if (typeof entry === 'string' && entry.length > MAX_STAGED_STRING) continue;
       out[key] = entry as Json;
@@ -195,6 +200,13 @@ class Edition8Controller {
         await this.refresh();
         this.post({ type: 'e8Notice', message: 'Served state refreshed from the daemon.' });
         return;
+      case 'e8HostCommand': {
+        const command = text(message.command, 64);
+        if (command === 'faktor.openChat' || command === 'faktor.startServer' || command === 'faktor.trustExecutable8') {
+          await vscode.commands.executeCommand(command);
+        }
+        return;
+      }
       case 'e8SelectScreen': {
         const screen = text(message.screen, 16);
         if (screen !== null && E8_SCREENS.some((entry) => entry.id === screen)) {
@@ -289,6 +301,30 @@ class Edition8Controller {
         const payload: Record<string, Json> = { ...payloadOf(message.payload) };
         if (this.state.snapshot?.binding?.session !== null && payload.session === undefined) {
           payload.session = this.state.snapshot?.binding?.session ?? null;
+        }
+        if (controlId === 'Q-06') {
+          if (payload.decision !== 'allow' && payload.decision !== 'deny') {
+            this.post({ type: 'e8Error', message: 'Choose Allow once or Deny before sending a decision. Nothing was sent.' });
+            return;
+          }
+          // The decision addresses the EXACT request the operator selected
+          // in the current served list. Never fall back to "first pending":
+          // a stale render or a newly arrived request must refuse, not
+          // approve an unseen action.
+          const exact = exactPendingApprovalId(
+            payload.permission_id,
+            pendingApprovalIds(this.state.snapshot).map((id) => ({ id })),
+          );
+          if (exact === null) {
+            this.post({
+              type: 'e8Error',
+              message:
+                'A live pending request must be selected explicitly; nothing was sent. ' +
+                'Refresh the list and review the exact request on its approval card.',
+            });
+            return;
+          }
+          payload.permission_id = exact;
         }
         if (binding.configKey !== null && payload.key === undefined) payload.key = binding.configKey;
         if (binding.route.path.includes(':id') && payload.id === undefined) {
@@ -409,15 +445,16 @@ export class Edition8Panel {
     const nonce = randomBytes(16).toString('hex');
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.css'));
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.js'));
+    const entry = E8_SCREENS.find((candidate) => candidate.id === screen) ?? E8_SCREENS.find((candidate) => candidate.id === 'S29')!;
     return renderEdition8Html({
       nonce,
       cspSource: webview.cspSource,
       scriptUri: scriptUri.toString(),
       styleUri: styleUri.toString(),
       state: { snapshot: this.controller.state.snapshot, loading: this.controller.state.loading, error: this.controller.state.error, focusControl: null },
-      initialScreen: screen,
+      initialScreen: entry.id,
       host: 'vscode',
-      mode: 'settings',
+      mode: destinationOf(entry) === 'settings' ? 'settings' : 'shell',
     });
   }
 }

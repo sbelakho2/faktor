@@ -4,6 +4,19 @@ Generated: 2026-10-19T18:46:50Z · registry commit `50280d2e6069f405d5f802546f4e
 
 One row per **feature**, not per control. Edition 8 controls are deduped into the feature that owns their behaviour; screens, workflows, acceptance scenarios, invariants, routes, CLI commands, config keys, providers, adapters, tools and IDE contributions are mapped to exactly one feature below or marked non-feature/internal. No live feature test was executed for this artifact.
 
+> **Current-state correction (2026-10-22).** This is a dated 2026-10-19 run, not the
+> current registry authority. The registry now has **949 surfaces** (14 builtin
+> tools, including board/Supply/Engineering/approval lazy tools; 47 CLI
+> commands). The current wiring truth is `tests/programme/registry.json` +
+> `tests/programme/wiring-matrix.json`, checked by
+> `node scripts/programme/check-registry.mjs --check`. That check records **43
+> native routes with no Faktor-owned client** (operator/admin, updater, worker,
+> SSO, enterprise, approval-decide, worktree and memory-policy surfaces) and
+> **11 stored-only config keys** that are read-only in this build. Remote MCP
+> Streamable HTTP is implemented (`crates/mcp/src/remote.rs`) but the recorded
+> live rig had no remote endpoint; browser, cloud, workers, commerce and the
+> updater remain disabled-by-default with typed refusals, not simulated states.
+
 ## Totals
 
 - **315 features** in **12 live-test groups**; every feature belongs to exactly one group.

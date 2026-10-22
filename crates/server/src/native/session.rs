@@ -1516,6 +1516,10 @@ pub(crate) async fn native_create_session(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeSessionListQuery {
+    /// Durable title search. A non-empty `q` delegates to the filtered
+    /// listing so this route and the settings switch have one implementation.
+    #[serde(default)]
+    q: Option<String>,
     #[serde(default, rename = "beforeRevision")]
     before_revision: Option<i64>,
     #[serde(default, rename = "beforeId")]
@@ -1556,6 +1560,25 @@ pub(crate) async fn native_list_sessions(
         Ok(query) => query,
         Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
+    if q.q.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        // The filtered route owns durable title search (and the
+        // `faktor.session.titleSearch` switch); delegate instead of
+        // maintaining a second search implementation.
+        let filtered = super::foundation_ext::NativeSessionListQuery {
+            q: q.q,
+            workspace: None,
+            state: None,
+            archived: None,
+            pinned: None,
+            limit: q.limit,
+        };
+        return super::foundation_ext::native_sessions_filtered(
+            State(state),
+            headers,
+            Ok(Query(filtered)),
+        )
+        .await;
+    }
     let cursor = match (q.before_revision, q.before_id) {
         (None, None) => None,
         (Some(revision), Some(id)) if revision >= 0 => {

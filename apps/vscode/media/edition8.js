@@ -27,14 +27,29 @@
   var selected = null;
   var applyInFlight = false;
   var noticeText = '';
+  var flashTimer = null;
+  var confirmTimers = new Map();
+  var gPending = 0;
   var probes = { patches: 0, controls: 0, rows: 0, fullRebuilds: 0, text: 0 };
   window.__faktorE8Probe = probes;
 
-  function setNotice(text) {
-    if (text === noticeText) return;
-    noticeText = text;
-    var node = document.getElementById('e8-notice');
-    if (node) node.textContent = text;
+  function setNotice(text, level) {
+    noticeText = text || '';
+    var flash = document.getElementById('e8-flash');
+    if (!flash) return;
+    flash.textContent = noticeText;
+    flash.setAttribute('data-level', level || 'info');
+    flash.hidden = noticeText.length === 0;
+    if (flashTimer !== null) {
+      clearTimeout(flashTimer);
+      flashTimer = null;
+    }
+    if (noticeText.length > 0 && level !== 'error') {
+      flashTimer = setTimeout(function () {
+        flash.hidden = true;
+        flashTimer = null;
+      }, 10000);
+    }
   }
 
   function controlCard(id) {
@@ -58,7 +73,7 @@
     }
     var help = document.getElementById('e8-desc-' + patch.id);
     if (help) {
-      help.textContent = patch.valueText;
+      help.textContent = patch.valueText === 'Inherit (not configured)' ? '' : patch.valueText;
       probes.text += 1;
     }
     var select = card.querySelector('select[data-input="' + patch.id + '"]');
@@ -76,7 +91,13 @@
         select.appendChild(choice);
       }
       var wanted = typeof patch.value === 'string' ? patch.value : current;
-      if (patch.options.indexOf(wanted) >= 0) {
+      if (wanted !== '' && patch.options.indexOf(wanted) < 0) {
+        var served = document.createElement('option');
+        served.value = wanted;
+        served.textContent = wanted + ' (served value)';
+        served.selected = true;
+        select.appendChild(served);
+      } else if (patch.options.indexOf(wanted) >= 0) {
         select.value = wanted;
       } else if (current === '' || patch.options.indexOf(current) >= 0) {
         select.value = current;
@@ -87,12 +108,14 @@
       activate.disabled = patch.disabled;
       activate.setAttribute('aria-disabled', patch.disabled ? 'true' : 'false');
     }
+    var primary = document.querySelector('[data-primary-control="' + patch.id + '"]');
+    if (primary) {
+      primary.disabled = patch.disabled;
+      primary.setAttribute('aria-disabled', patch.disabled ? 'true' : 'false');
+      if (patch.stateText) primary.title = patch.stateText;
+    }
     var inputs = card.querySelectorAll('[data-input="' + patch.id + '"]');
     for (var input of inputs) input.disabled = patch.disabled;
-  }
-
-  function rowNode(key) {
-    return document.querySelector('[data-row-key="' + key + '"]');
   }
 
   function renderRows(screenId, signature, rows) {
@@ -144,7 +167,9 @@
       if (screen) {
         var status = screen.querySelector('.e8-status');
         if (status && typeof message.status === 'string') {
-          status.textContent = message.status;
+          var textNode = status.querySelector('[data-status-text]');
+          if (textNode) textNode.textContent = message.status;
+          else status.textContent = message.status;
           status.setAttribute('data-level', message.statusLevel || 'quiet');
         }
       }
@@ -156,36 +181,82 @@
     return JSON.stringify(value);
   }
 
+  function hasChanges() {
+    return staged.size > 0 || unstaged.size > 0;
+  }
+
+  function selectScreen(screenId, moveFocus) {
+    var screen = screens.get(screenId);
+    if (!screen) return false;
+    selected = screenId;
+    var destination = screen.getAttribute('data-destination');
+    for (var [key, panel] of destinations) panel.hidden = key !== destination;
+    for (var [id, node] of screens) node.hidden = id !== screenId;
+    for (var [linkId, linkNode] of links) linkNode.setAttribute('aria-current', linkId === screenId ? 'page' : 'false');
+    for (var tab of tabs) {
+      tab.setAttribute('aria-current', tab.getAttribute('data-destination') === destination ? 'page' : 'false');
+    }
+    var browser = screen.closest('.e8-destination');
+    if (browser) {
+      for (var openBrowser of browser.querySelectorAll('.e8-browser[open]')) openBrowser.open = false;
+    }
+    footerPatch();
+    var heading = document.getElementById('e8-screen-title-' + screenId);
+    if (moveFocus && heading) {
+      heading.focus({ preventScroll: true });
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+    vscode.postMessage({ type: 'e8SelectScreen', screen: screenId });
+    return true;
+  }
+
   function footerPatch() {
     var list = document.getElementById('e8-patch-list');
     var count = document.getElementById('e8-staged-count');
-    if (!list || !count) return;
+    var footer = document.getElementById('e8-footer');
+    if (!list || !count || !footer) return;
     var entries = Array.from(staged.values());
-    count.textContent = entries.length === 0 && unstaged.size === 0
+    var changes = entries.length > 0 || unstaged.size > 0;
+    count.textContent = !changes
       ? 'No staged changes'
       : entries.length + ' staged \u00b7 ' + unstaged.size + ' reset';
+    footer.hidden = !(changes || applyInFlight);
     var signature = entries
       .map(function (entry) { return entry.controlId + '=' + JSON.stringify(entry.value); })
       .concat(Array.from(unstaged).map(function (id) { return id + '=unset'; }))
       .sort()
       .join('|');
-    if (list.getAttribute('data-signature') === signature) return;
-    list.setAttribute('data-signature', signature);
-    list.textContent = '';
-    for (var entry of entries.slice().sort(function (a, b) { return a.controlId.localeCompare(b.controlId); })) {
-      var chip = document.createElement('span');
-      chip.className = 'e8-chip';
-      chip.textContent = entry.controlId + ' \u00b7 ' + entry.key + ' = ' + display(entry.value);
-      list.appendChild(chip);
+    if (list.getAttribute('data-signature') !== signature) {
+      list.setAttribute('data-signature', signature);
+      list.textContent = '';
+      for (var entry of entries.slice().sort(function (a, b) { return a.controlId.localeCompare(b.controlId); })) {
+        var chip = document.createElement('span');
+        chip.className = 'e8-chip';
+        chip.textContent = entry.controlId + ' \u00b7 ' + entry.key + ' = ' + display(entry.value);
+        list.appendChild(chip);
+      }
+      for (var id of Array.from(unstaged).sort()) {
+        var chip2 = document.createElement('span');
+        chip2.className = 'e8-chip e8-chip-reset';
+        chip2.textContent = id + ' \u00b7 reset to inherited';
+        list.appendChild(chip2);
+      }
     }
-    for (var id of Array.from(unstaged).sort()) {
-      var chip2 = document.createElement('span');
-      chip2.className = 'e8-chip e8-chip-reset';
-      chip2.textContent = id + ' \u00b7 reset to inherited';
-      list.appendChild(chip2);
+    var screen = selected === null ? null : screens.get(selected);
+    var primaryApply = screen ? screen.querySelector('[data-primary-apply]') : null;
+    var footerApply = document.getElementById('e8-apply');
+    if (primaryApply) {
+      primaryApply.disabled = applyInFlight || !changes;
+      primaryApply.setAttribute('aria-disabled', primaryApply.disabled ? 'true' : 'false');
+      if (footerApply) footerApply.hidden = true;
+    } else if (footerApply) {
+      footerApply.hidden = false;
+      footerApply.disabled = applyInFlight || !changes;
     }
-    var apply = document.getElementById('e8-apply');
-    if (apply) apply.disabled = applyInFlight || (entries.length === 0 && unstaged.size === 0);
+    var reset = document.getElementById('e8-reset');
+    if (reset) reset.disabled = applyInFlight || !changes;
+    var defaults = document.getElementById('e8-defaults');
+    if (defaults) defaults.disabled = applyInFlight;
   }
 
   function applyDraft(message) {
@@ -194,26 +265,9 @@
       for (var entry of message.set) staged.set(entry.controlId, entry);
     }
     if (Array.isArray(message.unset)) unstaged = new Set(message.unset);
-    if (message.error) setNotice(message.error);
-    if (message.notice) setNotice(message.notice);
+    if (message.error) setNotice(message.error, 'error');
+    if (message.notice) setNotice(message.notice, 'info');
     footerPatch();
-  }
-
-  function selectScreen(screenId) {
-    var screen = screens.get(screenId);
-    if (!screen) return false;
-    selected = screenId;
-    var destination = screen.getAttribute('data-destination');
-    for (var [key, panel] of destinations) panel.hidden = key !== destination;
-    for (var [id, node] of screens) node.hidden = id !== screenId;
-    for (var [id, link] of links) link.setAttribute('aria-current', id === screenId ? 'page' : 'false');
-    for (var tab of tabs) {
-      tab.setAttribute('aria-current', tab.getAttribute('data-destination') === destination ? 'page' : 'false');
-    }
-    vscode.postMessage({ type: 'e8SelectScreen', screen: screenId });
-    var heading = document.getElementById('e8-screen-title-' + screenId);
-    if (heading) heading.focus({ preventScroll: true });
-    return true;
   }
 
   function actionPayload(id) {
@@ -229,9 +283,136 @@
     return { value: raw, text: raw, query: raw };
   }
 
-  function activate(id) {
+  function activate(id, extra, scope) {
     var payload = actionPayload(id);
+    // Q-06 exists on more than one rendered screen; only the controls in the
+    // screen that owns the clicked button may supply the request id.
+    var screen = scope && scope.closest ? scope.closest('.e8-screen') : null;
+    var find = function (selector) {
+      return screen ? screen.querySelector(selector) : document.querySelector(selector);
+    };
+    var requestField = find('[data-approval-request="' + id + '"]');
+    var decisionField = find('[data-approval-decision="' + id + '"]');
+    if (requestField) {
+      // A decision must name the exact live request rendered in THIS list;
+      // there is no "first pending" fallback and no textarea override.
+      if (!requestField.value) {
+        setNotice('Choose the exact pending request before sending a decision. Nothing was sent.', 'error');
+        requestField.focus();
+        return;
+      }
+      payload.permission_id = requestField.value;
+      delete payload.request_id;
+      delete payload.id;
+    }
+    if (extra && extra.decision) {
+      payload.decision = extra.decision;
+    } else if (decisionField) {
+      if (!decisionField.value) {
+        setNotice('Choose Allow once or Deny before sending a decision. Nothing was sent.', 'error');
+        decisionField.focus();
+        return;
+      }
+      payload.decision = decisionField.value;
+    }
+    if (extra) {
+      for (var key of Object.keys(extra)) {
+        if (key !== 'decision') payload[key] = extra[key];
+      }
+    }
     vscode.postMessage({ type: 'e8Activate', controlId: id, payload: payload });
+  }
+
+  function clearConfirm(button) {
+    var timer = confirmTimers.get(button);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      confirmTimers.delete(button);
+    }
+    if (button.getAttribute('data-confirm-pending') === 'true') {
+      var original = button.getAttribute('data-original-label');
+      if (original !== null) button.textContent = original;
+      button.removeAttribute('data-original-label');
+      button.removeAttribute('data-confirm-pending');
+    }
+  }
+
+  function clearAllConfirms() {
+    for (var button of Array.from(confirmTimers.keys())) clearConfirm(button);
+    for (var pending of Array.from(document.querySelectorAll('[data-confirm-pending="true"]'))) clearConfirm(pending);
+  }
+
+  function confirmThen(button, action) {
+    if (button.getAttribute('data-confirm-pending') === 'true') {
+      clearConfirm(button);
+      action();
+      return;
+    }
+    if (button.getAttribute('data-confirm') !== null) {
+      button.setAttribute('data-original-label', button.textContent || '');
+      button.setAttribute('data-confirm-pending', 'true');
+      button.textContent = 'Confirm: ' + (button.getAttribute('data-confirm-label') || 'Continue');
+      setNotice('Review the effect, then click again to confirm. Nothing has been sent yet.', 'warning');
+      var timer = setTimeout(function () { clearConfirm(button); }, 8000);
+      confirmTimers.set(button, timer);
+      return;
+    }
+    action();
+  }
+
+  function flushActiveInput() {
+    var active = document.activeElement;
+    if (active && active.getAttribute && active.getAttribute('data-input')) {
+      active.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+
+  function postApply() {
+    if (applyInFlight || !hasChanges()) return;
+    flushActiveInput();
+    applyInFlight = true;
+    footerPatch();
+    setNotice('Applying staged changes; the draft is preserved until the daemon acknowledges.', 'info');
+    vscode.postMessage({
+      type: 'e8Apply',
+      set: Array.from(staged.values()),
+      unset: Array.from(unstaged),
+    });
+  }
+
+  function openBrowser(focusSearch) {
+    if (selected === null) return;
+    var screen = screens.get(selected);
+    if (!screen) return;
+    var destination = screen.closest('.e8-destination');
+    var browser = destination ? destination.querySelector('.e8-browser') : null;
+    if (!browser) return;
+    browser.open = true;
+    if (focusSearch) {
+      var filter = browser.querySelector('[data-screen-filter]');
+      if (filter) filter.focus();
+    }
+  }
+
+  function filterScreens(value) {
+    var query = value.trim().toLowerCase();
+    var destination = selected === null ? null : screens.get(selected)?.closest('.e8-destination');
+    if (!destination) destination = document.querySelector('.e8-destination');
+    if (!destination) return;
+    var any = false;
+    for (var group of destination.querySelectorAll('[data-screen-group]')) {
+      var shown = 0;
+      for (var link of group.querySelectorAll('[data-screen-link]')) {
+        var haystack = (link.getAttribute('data-screen-search') || link.textContent || '').toLowerCase();
+        var match = query.length === 0 || haystack.indexOf(query) >= 0;
+        link.hidden = !match;
+        if (match) shown += 1;
+      }
+      group.hidden = shown === 0;
+      if (shown > 0) any = true;
+    }
+    var empty = destination.querySelector('.e8-filter-empty');
+    if (empty) empty.hidden = any;
   }
 
   document.addEventListener('click', function (event) {
@@ -240,7 +421,7 @@
     var link = target.closest('[data-screen-link]');
     if (link) {
       event.preventDefault();
-      selectScreen(link.getAttribute('data-screen-link'));
+      selectScreen(link.getAttribute('data-screen-link'), true);
       return;
     }
     var open = target.closest('[data-open-screen]');
@@ -250,32 +431,52 @@
       if (!screens.has(targetScreen)) {
         vscode.postMessage({ type: 'e8OpenScreen', screen: targetScreen });
       } else {
-        selectScreen(targetScreen);
+        selectScreen(targetScreen, true);
       }
       return;
     }
     var tab = target.closest('.e8-tab');
     if (tab) {
       event.preventDefault();
+      if (tab.getAttribute('aria-current') === 'page') return;
       var destination = tab.getAttribute('data-destination');
       var first = document.querySelector('[data-destination-panel="' + destination + '"] [data-screen]');
-      if (first) selectScreen(first.getAttribute('data-screen'));
+      if (first) selectScreen(first.getAttribute('data-screen'), true);
+      return;
+    }
+    var primaryApply = target.closest('[data-primary-apply]');
+    if (primaryApply) {
+      event.preventDefault();
+      postApply();
+      return;
+    }
+    var primaryControl = target.closest('[data-primary-control]');
+    if (primaryControl) {
+      event.preventDefault();
+      var primaryId = primaryControl.getAttribute('data-primary-control');
+      var decision = primaryControl.getAttribute('data-primary-decision');
+      confirmThen(primaryControl, function () {
+        activate(primaryId, decision ? { decision: decision } : {}, primaryControl);
+      });
       return;
     }
     var activateButton = target.closest('[data-activate]');
     if (activateButton) {
       event.preventDefault();
-      activate(activateButton.getAttribute('data-activate'));
+      var activateId = activateButton.getAttribute('data-activate');
+      confirmThen(activateButton, function () { activate(activateId, null, activateButton); });
       return;
     }
     var inspect = target.closest('[data-inspect]');
     if (inspect) {
       event.preventDefault();
-      var id = inspect.getAttribute('data-inspect');
-      var card = controlCard(id);
-      if (card) {
-        var details = card.querySelector('details');
-        if (details) details.open = !details.open;
+      var inspectId = inspect.getAttribute('data-inspect');
+      var inspectCard = controlCard(inspectId);
+      if (inspectCard) {
+        var details = inspectCard.querySelector('.e8-control-details');
+        if (details) details.open = true;
+        var reason = inspectCard.querySelector('.e8-control-state');
+        if (reason) reason.scrollIntoView({ block: 'nearest' });
       }
       return;
     }
@@ -285,7 +486,13 @@
       vscode.postMessage({ type: 'e8Unstage', controlId: unstageButton.getAttribute('data-unstage') });
       return;
     }
-    if (target.closest('#e8-refresh')) {
+    var hostCommand = target.closest('[data-host-command]');
+    if (hostCommand) {
+      event.preventDefault();
+      vscode.postMessage({ type: 'e8HostCommand', command: hostCommand.getAttribute('data-host-command') });
+      return;
+    }
+    if (target.closest('#e8-refresh') || target.closest('[data-retry]')) {
       event.preventDefault();
       vscode.postMessage({ type: 'e8Refresh' });
       return;
@@ -295,46 +502,105 @@
       vscode.postMessage({ type: 'e8Reset' });
       return;
     }
-    if (target.closest('#e8-defaults')) {
+    var defaults = target.closest('#e8-defaults');
+    if (defaults) {
       event.preventDefault();
-      vscode.postMessage({ type: 'e8Defaults' });
+      confirmThen(defaults, function () {
+        vscode.postMessage({ type: 'e8Defaults' });
+      });
       return;
     }
     if (target.closest('#e8-apply')) {
       event.preventDefault();
-      if (applyInFlight) return;
-      applyInFlight = true;
-      footerPatch();
-      vscode.postMessage({
-        type: 'e8Apply',
-        set: Array.from(staged.values()),
-        unset: Array.from(unstaged),
-      });
+      postApply();
       return;
     }
   });
 
+  document.addEventListener('input', function (event) {
+    var target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.getAttribute('data-screen-filter') !== null) {
+      filterScreens(target.value || '');
+    }
+  });
+
   document.addEventListener('keydown', function (event) {
+    var active = document.activeElement;
+    var tag = active && active.tagName ? active.tagName : '';
+    var typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (active && active.isContentEditable === true);
+
+    if (event.key === 'k' && (event.metaKey || event.ctrlKey) && !event.altKey) {
+      event.preventDefault();
+      openBrowser(true);
+      return;
+    }
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      if (hasChanges()) {
+        event.preventDefault();
+        postApply();
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      var pending = document.querySelector('[data-confirm-pending="true"]');
+      if (pending) {
+        clearAllConfirms();
+        event.preventDefault();
+        setNotice('Confirmation cancelled. Nothing was sent.', 'info');
+        return;
+      }
+      var openDetails = Array.from(document.querySelectorAll('details[open]')).filter(function (node) {
+        return node.getClientRects().length > 0;
+      });
+      if (openDetails.length > 0) {
+        var top = openDetails[openDetails.length - 1];
+        top.open = false;
+        var summary = top.querySelector(':scope > summary');
+        if (summary) summary.focus({ preventScroll: true });
+        event.preventDefault();
+      }
+      return;
+    }
+    if (event.altKey && !event.ctrlKey && !event.metaKey) {
+      if (event.key === 'r' || event.key === 'R') {
+        event.preventDefault();
+        vscode.postMessage({ type: 'e8Refresh' });
+        return;
+      }
+      var index = ['1', '2', '3', '4'].indexOf(event.key);
+      if (index >= 0 && tabs[index]) {
+        event.preventDefault();
+        tabs[index].click();
+        return;
+      }
+    }
+    if (!typing && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      if (event.key === 'g') {
+        gPending = Date.now();
+        return;
+      }
+      if (gPending > 0 && Date.now() - gPending < 1200) {
+        var destination = event.key === 'w' ? 'work' : event.key === 'i' ? 'inspect' : event.key === 'h' ? 'history' : event.key === 's' ? 'settings' : '';
+        gPending = 0;
+        if (destination.length > 0) {
+          event.preventDefault();
+          var destinationTab = tabs.find(function (tab) { return tab.getAttribute('data-destination') === destination; });
+          if (destinationTab) {
+            destinationTab.click();
+          } else if (destination === 'settings') {
+            vscode.postMessage({ type: 'e8OpenScreen', screen: 'S29' });
+          }
+        }
+        return;
+      }
+    }
     if (event.key === 'Enter' || event.key === ' ') {
       var openRow = document.activeElement;
       if (openRow && openRow.getAttribute && openRow.getAttribute('data-open-screen')) {
         event.preventDefault();
         var rowScreen = openRow.getAttribute('data-open-screen');
-        if (screens.has(rowScreen)) selectScreen(rowScreen);
-      }
-    }
-    if (event.key === 'Escape') {
-      var details = document.querySelector('details[open]');
-      if (details) {
-        details.open = false;
-        event.preventDefault();
-      }
-    }
-    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-      var focused = document.activeElement;
-      if (focused && focused.getAttribute && focused.getAttribute('data-activate')) {
-        event.preventDefault();
-        activate(focused.getAttribute('data-activate'));
+        if (screens.has(rowScreen)) selectScreen(rowScreen, true);
       }
     }
   });
@@ -360,7 +626,7 @@
         applyPatch(message);
         return;
       case 'e8Notice':
-        setNotice(message.message || '');
+        setNotice(message.message || '', 'info');
         return;
       case 'e8Header': {
         var header = document.getElementById('e8-header-status');
@@ -375,17 +641,17 @@
         return;
       }
       case 'e8Error':
-        setNotice(message.message || '');
+        setNotice(message.message || '', 'error');
         return;
       case 'e8ActionResult':
         if (applyInFlight) {
           applyInFlight = false;
           footerPatch();
         }
-        setNotice(message.message || '');
+        setNotice(message.message || '', message.ok === false ? 'error' : 'info');
         return;
       case 'e8SelectScreen':
-        if (typeof message.screen === 'string' && screens.has(message.screen)) selectScreen(message.screen);
+        if (typeof message.screen === 'string' && screens.has(message.screen)) selectScreen(message.screen, false);
         return;
       default:
         return;
@@ -393,7 +659,7 @@
   });
 
   if (window.__faktorE8Initial) {
-    selectScreen(window.__faktorE8Initial);
+    selectScreen(window.__faktorE8Initial, false);
   }
   footerPatch();
   vscode.postMessage({ type: 'e8Ready' });

@@ -2184,30 +2184,50 @@
   // key and owning conversation id stay behind "View details".
 
   /**
-   * The AUTHORITY reason of one native detail payload: an explicit
-   * `reason`/`purpose`/`why` string field, surfaced verbatim and bounded.
-   * Nothing is inferred from other fields, and a detail that is not a JSON
-   * object carries no authority reason at all.
+   * Display-safe approval text: invisible C0/C1 controls, bidi overrides and
+   * zero-width joiners can remap what the human reads, so they never reach a
+   * decision card. The gated native action itself is unchanged.
    */
-  function permissionAuthorityReason(detail) {
+  function permissionVisible(value) {
+    return String(value)
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '')
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, '');
+  }
+
+  /** The parsed detail payload ONLY when it is a JSON object. */
+  function permissionDetailObject(detail) {
     if (typeof detail !== 'string' || detail.length === 0 || detail.charAt(0) !== '{') {
       return null;
     }
-    return cachedRender('reason', hash128(detail), detail, function () {
-      var parsed;
-      try {
-        parsed = JSON.parse(detail);
-      } catch (error) {
-        return null;
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    var parsed;
+    try {
+      parsed = JSON.parse(detail);
+    } catch (error) {
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  }
+
+  /**
+   * The REQUESTER-STATED reason of one native detail payload: an explicit
+   * `reason`/`purpose`/`why` string member of a JSON OBJECT. It is agent
+   * text, rendered with an explicit unverified label by the card; nothing is
+   * inferred from other fields or from prose.
+   */
+  function permissionStatedReason(detail) {
+    return cachedRender('reason', hash128(String(detail)), String(detail), function () {
+      var parsed = permissionDetailObject(detail);
+      if (parsed === null) {
         return null;
       }
       var keys = ['reason', 'purpose', 'why'];
       for (var i = 0; i < keys.length; i++) {
         var value = parsed[keys[i]];
         if (typeof value === 'string' && value.trim().length > 0) {
-          return value.trim().slice(0, MAX_PERMISSION_REASON_CHARS);
+          return permissionVisible(value).trim().slice(0, MAX_PERMISSION_REASON_CHARS);
         }
       }
       return null;
@@ -2216,7 +2236,8 @@
 
   /** Human decision headline: what the agent wants to do, and to what. */
   function permissionHeadline(permission) {
-    var kind = String(permission.capability == null ? '' : permission.capability).toLowerCase();
+    var capability = permissionVisible(permission.capability == null ? '' : permission.capability);
+    var kind = capability.toLowerCase();
     var what;
     if (kind.indexOf('shell') !== -1 || kind.indexOf('execute') !== -1) {
       what = 'Run a shell command';
@@ -2233,25 +2254,28 @@
     } else if (kind.indexOf('mcp') !== -1) {
       what = 'Call an external tool service';
     } else {
-      what = 'Use ' + String(permission.capability == null ? 'a capability' : permission.capability);
+      what = 'Use ' + (capability.length > 0 ? capability : 'a capability');
     }
-    var detail = String(permission.detail == null ? '' : permission.detail);
-    // The native detail is often a JSON payload naming the exact tool,
-    // path, command or destination; the most decision-relevant key wins
-    // (command before path/destination before the generic tool name).
+    var detail = permissionVisible(permission.detail == null ? '' : permission.detail);
+    // Only a TOP-LEVEL string member of the detail object is a trustworthy
+    // target. A regex over raw prose could promote a nested/planted key and
+    // display a different command than the one the daemon gated.
     var target = null;
+    var parsed = permissionDetailObject(permission.detail);
     var targetKeys = ['command', 'path', 'destination', 'tool'];
-    for (var k = 0; k < targetKeys.length && target === null; k++) {
-      var match = new RegExp('"' + targetKeys[k] + '"\\s*:\\s*"([^"]+)"').exec(detail);
-      if (match) {
-        target = match[1];
+    if (parsed !== null) {
+      for (var k = 0; k < targetKeys.length && target === null; k++) {
+        var value = parsed[targetKeys[k]];
+        if (typeof value === 'string' && value.length > 0) {
+          target = permissionVisible(value).slice(0, 200);
+        }
       }
     }
     return {
       headline: target ? what + ': ' + target : what,
       target: target,
       detail: detail,
-      reason: permissionAuthorityReason(detail),
+      reason: permissionStatedReason(permission.detail),
     };
   }
 
@@ -2445,7 +2469,7 @@
         line(
           item,
           info.reason !== null
-            ? info.reason
+            ? 'Requester-stated reason (not verified): ' + info.reason
             : 'Action requested for this run. \u00b7 ' + whyBits.join(' \u00b7 '),
           'muted permission-why',
         );

@@ -65,18 +65,18 @@ const STATUSES = ['exists', 'partial', 'missing'];
 // `--check` refuses a partial without one. Entries are removed only when the
 // implementation/evidence closes the gap (never to make the counts green).
 const PARTIAL = {
-  // A real capability gap found by independent audit 2026-10-19: the daemon
-  // has no Streamable-HTTP MCP transport (stdio only). The VS Code receipt is
-  // a typed unavailable, and the JetBrains receipt reads the provider
-  // collection rather than an MCP transport action. Remote destination,
-  // OAuth and reconnect semantics are therefore NOT implemented here.
+  // Capability truth updated 2026-10-22: the daemon now HAS a Streamable-HTTP
+  // MCP client (`crates/mcp/src/remote.rs`) and connect/OAuth routes. The
+  // recorded live receipts predate that wiring and used no remote endpoint,
+  // so the control stays PARTIAL until a remote smoke is recorded — not
+  // because the transport is absent.
   'T-04': {
     vscode:
-      'typed unavailable: Streamable HTTP is not negotiated by this daemon build; stdio is the implemented transport and no HTTP/OAuth state is claimed.',
+      'partial: the Streamable HTTP transport and connect/OAuth routes exist, but the recorded live receipt had no remote endpoint and did not exercise them; stdio is the exercised transport.',
     jetbrains:
-      'the live receipt read the provider collection, not an MCP transport action; remote transport is not exercised.',
+      'the live receipt read the provider collection, not an MCP transport action; remote transport is implemented but not exercised.',
     daemon:
-      'the MCP save route serves stdio; no streamable-HTTP destination/auth/reconnect path is negotiated.',
+      'the MCP save/connect routes include streamable-HTTP transport, destination and OAuth handling; the recorded live receipt did not exercise a remote endpoint.',
   },
 };
 

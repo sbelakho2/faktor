@@ -118,21 +118,44 @@ object FaktorSettingsRules {
             "unknown mutation mode \"$value\"; offered: " + MUTATION_MODES.joinToString(", ")
         }
 
-    /** Empty endpoint allowed (the default); non-empty must be an http(s) URL. */
+    /** Invisible layout/spoofing characters that never belong in a URL. */
+    private val ENDPOINT_INVISIBLE: Set<Char> = buildSet {
+        addAll((0x200B..0x200F).map { it.toChar() })
+        addAll((0x202A..0x202E).map { it.toChar() })
+        addAll((0x2060..0x2064).map { it.toChar() })
+        addAll((0x2066..0x2069).map { it.toChar() })
+        add('\uFEFF')
+    }
+
+    /**
+     * Empty endpoint allowed (the default); non-empty must be an http(s) URL
+     * with a host and NO embedded credentials, query or fragment. The error
+     * never echoes the value: a pasted `https://user:pass@host` must not be
+     * copied into a visible validation line or a log.
+     */
     fun endpointError(value: String): String? {
         val text = value.trim()
         if (text.isEmpty()) return null
+        if (text.any { it.isISOControl() || it in ENDPOINT_INVISIBLE }) {
+            return "the control-plane endpoint carries control or bidi formatting characters"
+        }
         val uri = try {
             URI(text)
         } catch (e: Exception) {
-            return "the control-plane endpoint is not a valid URL: $text"
+            return "the control-plane endpoint is not a valid URL"
         }
         val scheme = uri.scheme?.lowercase()
         if (scheme != "http" && scheme != "https") {
-            return "the control-plane endpoint must use http or https: $text"
+            return "the control-plane endpoint must use http or https"
+        }
+        if (uri.userInfo != null || uri.rawUserInfo != null) {
+            return "the control-plane endpoint must not embed credentials"
+        }
+        if (uri.query != null || uri.fragment != null) {
+            return "the control-plane endpoint must not carry a query or fragment"
         }
         if (uri.host.isNullOrEmpty()) {
-            return "the control-plane endpoint must name a host: $text"
+            return "the control-plane endpoint must name a host"
         }
         return null
     }
@@ -175,7 +198,14 @@ class FaktorSettingsController(private val store: FaktorSettingsStore) {
         model = FaktorSettingsRules.storedOrNull(store.read(FaktorSettingKeys.RUN_MODEL)),
         mutationMode = FaktorSettingsRules.storedOrNull(store.read(FaktorSettingKeys.RUN_MUTATION_MODE))
             ?: FaktorSettingsSnapshot.DEFAULT_MUTATION_MODE,
-        controlPlaneEndpoint = store.read(FaktorSettingKeys.CONTROL_PLANE_ENDPOINT)?.trim().orEmpty(),
+        // A legacy persisted endpoint with embedded credentials/query/bidi is
+        // NOT rendered back into the panel or reused; it reads as unset until
+        // the operator enters a clean http(s) coordinate.
+        controlPlaneEndpoint = store.read(FaktorSettingKeys.CONTROL_PLANE_ENDPOINT)
+            ?.trim()
+            .orEmpty()
+            .takeIf { it.isEmpty() || FaktorSettingsRules.endpointError(it) == null }
+            .orEmpty(),
         controlPlaneOrganization = store.read(FaktorSettingKeys.CONTROL_PLANE_ORGANIZATION)?.trim().orEmpty()
     )
 

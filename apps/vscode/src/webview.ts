@@ -299,6 +299,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       `img-src ${webview.cspSource} data:`,
       `script-src 'nonce-${nonce}'`,
       "connect-src 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
     ].join('; ');
     return `<!DOCTYPE html>
 <html lang="en">

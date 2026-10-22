@@ -14,6 +14,7 @@ import dev.faktor.backend.NativeClient
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.view
 import java.awt.BorderLayout
 import java.awt.CardLayout
@@ -63,6 +64,12 @@ internal class Edition8Host(
     val startTask: ((String, Map<String, String>) -> String)? = null,
     val stopScope: ((String) -> String)? = null,
     val replyApproval: ((String, String, String) -> String)? = null,
+    /**
+     * Open the REVIEW surface that owns the per-request Allow/Deny controls.
+     * This callback can only navigate: it has no permission reply and can
+     * therefore never approve anything on its own.
+     */
+    val openApprovals: (() -> String)? = null,
     val openDiff: ((String) -> String)? = null,
     val openTerminal: (() -> String)? = null,
     val inlineCodeAction: (() -> String)? = null,
@@ -73,7 +80,31 @@ internal class Edition8Host(
 ) {
     val work = Edition8Work()
 
+    /**
+     * The browser shell installs an in-dialog navigator and a real Back
+     * action. Keeping these as overrides means a screen never opens a second
+     * modal copy of itself (the old nested-dialog dead end) and Back always
+     * returns to the surface that invoked it.
+     */
+    internal var navigator: ((String) -> Unit)? = null
+    internal var backHandler: (() -> Unit)? = null
+
     fun daemon(): Edition8Daemon = Edition8Daemon(client, sessionId, taskId, work)
+
+    fun navigateTo(screenId: String) {
+        (navigator ?: navigate)?.invoke(screenId)
+    }
+
+    fun canGoBack(): Boolean = backHandler != null || navigate != null
+
+    fun goBack(): Boolean {
+        backHandler?.invoke()?.let { return true }
+        if (navigate != null) {
+            navigate.invoke("S01")
+            return true
+        }
+        return false
+    }
 
     fun shutdown() = work.close()
 }
@@ -104,6 +135,124 @@ internal val HOST_CONTROLS: Set<String> = setOf(
 /** Screens whose served proof receipts are rendered below the controls. */
 internal val PROOF_SCREENS: Set<String> = setOf("S45", "S46", "S48")
 
+/**
+ * Screens whose primary action is the one atomic settings Apply. Keeping the
+ * apply button as the only primary removes the old pair of competing
+ * primaries ("Save Connection" plus "Apply settings"), and the button is
+ * disabled until a value actually changes.
+ */
+internal val APPLY_PRIMARY_SCREENS: Set<String> = setOf(
+    "S03", "S04", "S05", "S12", "S13", "S16", "S18", "S21",
+    "S28", "S29", "S57", "S60", "S64"
+)
+
+/** User-facing Rev8 copy; control IDs and screen IDs stay unchanged. */
+internal object Edition8Copy {
+
+    fun primaryLabel(screen: Edition8Screen): String = when (screen.id) {
+        "S14" -> "Review Approval"
+        "S29", "S64" -> "Apply Settings"
+        "S54" -> "Refresh"
+        "S02" -> "Open Tuning"
+        "S06" -> "Open Agent"
+        "S09" -> "Open Context"
+        "S57" -> "Keep Fail-Closed"
+        "S55", "S68" -> "Open Sign-In Settings"
+        "S60" -> "Save Resolved Settings"
+        "S10" -> "Review Context"
+        "S11" -> "Review Rules"
+        "S15" -> "Add MCP Server"
+        "S16" -> "Save MCP Server"
+        "S17" -> "Review Skills"
+        "S23", "S50" -> "Review Agents"
+        "S25" -> "Review Checkpoints"
+        "S26", "S71", "S72" -> "Review Conversations"
+        "S33" -> "Review Options"
+        "S39" -> "Review Task"
+        "S40" -> "Review Question"
+        "S47", "S48" -> "Review Proof"
+        "S52" -> "Review Board"
+        "S59" -> "Review Queue"
+        "S66" -> "Delete Memory"
+        "S69" -> "Open Instructions"
+        "S03" -> "Save Connection"
+        "S04" -> "Save Local Inference"
+        "S05" -> "Apply Tuning"
+        "S07" -> "Review Agent"
+        "S08", "S62" -> "Open Sources"
+        "S12" -> "Save Memory"
+        "S13" -> "Apply Policy"
+        "S18" -> "Save Hook"
+        "S21" -> "Apply Defaults"
+        "S28" -> "Apply"
+        "S35" -> "Confirm Path"
+        "S41" -> "Review Missing Evidence"
+        "S45" -> "Open AC-03 Details"
+        "S46" -> "Open Full Output"
+        "S70" -> "Stop Run"
+        else -> screen.primaryAction
+            .substringBefore(" · JetBrains:")
+            .removePrefix("VS Code: ")
+            .replace(" (composer)", "")
+            .trim()
+    }
+
+    fun applyLabel(screen: Edition8Screen): String = when (screen.id) {
+        "S03" -> "Save Connection"
+        "S04" -> "Save Local Inference"
+        "S05" -> "Apply Tuning"
+        "S12" -> "Save Memory"
+        "S13" -> "Apply Policy"
+        "S16" -> "Save MCP Server"
+        "S18" -> "Save Hook"
+        "S21" -> "Apply Defaults"
+        "S28" -> "Apply"
+        "S29", "S64" -> "Apply Settings"
+        "S57" -> "Keep Fail-Closed"
+        "S60" -> "Save Resolved Settings"
+        else -> "Apply Changes"
+    }
+
+    fun hasPrimary(screen: Edition8Screen): Boolean = true
+
+    fun formTitle(screen: Edition8Screen, editable: Boolean): String = when {
+        !editable -> "Details"
+        screen.group == "Settings and diagnostics" -> "Settings"
+        screen.group == "Models and providers" -> "Provider settings"
+        screen.id in APPLY_PRIMARY_SCREENS -> "Settings"
+        else -> "Options"
+    }
+
+    fun summary(screen: Edition8Screen): String = when (screen.id) {
+        "S01" -> "One task. Proof stays separate from the chat claim."
+        "S03" -> "Connect once; the daemon must acknowledge the pair."
+        "S14" -> "Allow once = this request only; deny stops this request."
+        "S24" -> "Review before accepting; unverified changes stay visible."
+        "S29" -> "Staged locally. Apply commits one atomic patch."
+        "S34" -> "Start once; trust, model and isolation are separate."
+        "S36" -> "Describe one task; admission captures its bounds."
+        "S45" -> "Acceptance, evidence, integration and finish stay separate."
+        "S53", "S54" -> "Four cost categories; unavailable is not zero."
+        "S58" -> "Narrow host width: one primary, no horizontal scroll."
+        "S61" -> "No conversations yet; start the first task."
+        "S70" -> "Choose the scope you mean; issued effects cannot be undone."
+        else -> when (screen.group) {
+            "Setup and start" -> "Start once; trust and isolation are separate facts."
+            "Work" -> "One task at a time; a chat claim never becomes proof."
+            "Inspect and proof" -> "Acceptance, evidence, integration and finish stay separate."
+            "Agents" -> "Bounded delegation; steering applies to the next turn."
+            "History" -> "Durable conversations, newest first."
+            "Usage" -> "Four cost categories; unavailable is not zero."
+            "Models and providers" -> "A model is captured only after the daemon acknowledges it."
+            "Context" -> "Usage comes from the durable context manifest."
+            "Instructions and memory" -> "Rules and memory are scoped; precedence names the winner."
+            "Permissions and tools" -> "Approvals are per request; rules cover future matches."
+            "Settings and diagnostics" -> "Staged locally; Apply commits one atomic patch."
+            else -> "Revision 8 native surface."
+        }
+    }
+}
+
 internal object Edition8ScreenRegistry {
 
     val screenIds: List<String> = Edition8Registry.screens.map { it.id }
@@ -131,65 +280,95 @@ internal object Edition8ScreenRegistry {
 internal class Edition8ControlRow(
     val control: Edition8Control,
     private val panel: Edition8ScreenPanel
-) : JPanel(GridBagLayout()) {
+) : JPanel() {
 
     val field: JTextField? =
         if (control.configKeys.isNotEmpty() || control.id == "X-06") JTextField(24) else null
-    val toggle: JCheckBox? = if (isToggle(control) && control.configKeys.isNotEmpty()) JCheckBox() else null
-    val probe: JButton = if (control.endpoints.any { it.state == "exists" } ||
-        control.configKeys.isEmpty()
-    ) {
-        secondaryButton("Read")
+    val toggle: JCheckBox? = if (isToggle(control) && control.configKeys.isNotEmpty()) {
+        // FaktorCheckBox carries the 24px hit-target floor in its actual
+        // preferred bounds (the bare platform box is only 23px at 100%).
+        FaktorCheckBox("Enabled")
     } else {
-        secondaryButton("Read")
+        null
     }
-    private val stateLabel = JLabel(Edition8Stated.initial(control))
+    val probe: JButton = secondaryButton(if (control.id in HOST_CONTROLS) "Open" else "Read")
+    private val stateLabel = WrappedLabel(Edition8Stated.initial(control))
+    private var stateText = Edition8Stated.initial(control)
     private val configKey: String? = control.configKeys.firstOrNull()
 
     init {
         isOpaque = false
-        border = BorderFactory.createEmptyBorder(0, 0, Spacing.S, 0)
-        val label = FixedWrapLabel("${control.id}  ${control.name}")
-        label.font = label.font.deriveFont(label.font.style or java.awt.Font.BOLD)
-        val detail = wrappedMutedLabel("${control.control} · ${control.applyTiming}")
-        val left = JPanel().apply {
-            isOpaque = false
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            add(label)
-            add(detail)
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        border = BorderFactory.createEmptyBorder(0, 0, Spacing.M, 0)
+
+        val label = WrappedLabel("${control.id} · ${control.name}").apply {
+            font = sectionTitleFont()
+            foreground = textForeground()
+            alignmentX = Component.LEFT_ALIGNMENT
         }
-        val center = JPanel().apply {
+        val detail = wrappedMutedLabel(
+            bound(
+                control.control + if (control.configKeys.isNotEmpty()) " · saved with Apply" else "",
+                220
+            )
+        )
+        val header = JPanel(BorderLayout(Spacing.S, 0)).apply {
             isOpaque = false
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            when {
-                toggle != null -> add(wrapRow(toggle))
-                field != null -> {
-                    field.name = "edition8-field-${control.id}"
-                    field.a11y(
-                        "${control.id} ${control.name}",
-                        "Value for ${control.control}. ${control.applyTiming}."
-                    )
-                    field.text = if (control.id == "X-06") {
-                        "https://example.com/"
-                    } else {
-                        control.defaultValue.takeUnless { it.equals("none", true) } ?: ""
-                    }
-                    if (configKey != null && panel.daemon.draft.isLocked(configKey)) {
-                        field.isEnabled = false
-                        field.toolTipText = "Set by managed policy; read-only"
-                    }
-                    add(field)
-                }
-                else -> add(mutedLabel("Read-only contract"))
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(label, BorderLayout.CENTER)
+            add(probe, BorderLayout.EAST)
+        }
+        add(header)
+        add(detail)
+
+        if (field != null) {
+            field.name = "edition8-field-${control.id}"
+            field.a11y(
+                "${control.id} ${control.name}",
+                "Value for ${control.control}. ${control.applyTiming}."
+            )
+            field.text = initialFieldValue()
+            field.toolTipText = if (field.text.isNullOrBlank()) {
+                "No value is loaded yet. Read the screen or enter a value; Apply commits one patch."
+            } else {
+                control.defaultValue
             }
-            add(stateLabel)
+            if (configKey != null && panel.daemon.draft.isLocked(configKey)) {
+                field.isEnabled = false
+                field.toolTipText = "Set by managed policy; read-only"
+            }
+            field.alignmentX = Component.LEFT_ALIGNMENT
+            add(vSpace(Spacing.XS))
+            add(field)
         }
+        if (toggle != null) {
+            toggle.alignmentX = Component.LEFT_ALIGNMENT
+            add(vSpace(Spacing.XS))
+            add(toggle)
+        }
+
+        stateLabel.font = uiPanelFont()
+        stateLabel.foreground = mutedForeground()
+        stateLabel.alignmentX = Component.LEFT_ALIGNMENT
+        stateLabel.a11y(
+            "State for ${control.id} ${control.name}",
+            "The last acknowledged state of this control."
+        )
+        add(vSpace(Spacing.XS))
+        add(stateLabel)
+
         probe.name = "edition8-activate-${control.id}"
         probe.a11y(
             "${control.id} ${control.name}: ${control.control}",
             "Reads or applies ${control.name}. ${control.behavior}"
         )
         probe.addActionListener { panel.activate(this) }
+        // A field/toggle is the control; a separate per-row Read button beside
+        // every editable value was a duplicate action. Keep the registered
+        // handler for the full control contract, but expose one action per
+        // read-only row and one Apply for staged edits.
+        probe.isVisible = field == null && toggle == null
+
         val fieldListener = object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent?) = stage()
             override fun removeUpdate(e: DocumentEvent?) = stage()
@@ -202,48 +381,33 @@ internal class Edition8ControlRow(
             "${control.id} ${control.name}",
             "Toggle ${control.name}. ${control.behavior}"
         )
-
-        val constraints = GridBagConstraints().apply {
-            gridx = 0
-            gridy = 0
-            weightx = 0.0
-            fill = GridBagConstraints.HORIZONTAL
-            anchor = GridBagConstraints.NORTHWEST
-            insets = Insets(0, 0, 0, Spacing.M)
-        }
-        add(left, constraints)
-        add(
-            center,
-            GridBagConstraints().apply {
-                gridx = 1
-                gridy = 0
-                weightx = 1.0
-                fill = GridBagConstraints.HORIZONTAL
-                anchor = GridBagConstraints.NORTHWEST
-            }
-        )
-        add(
-            probe,
-            GridBagConstraints().apply {
-                gridx = 2
-                gridy = 0
-                anchor = GridBagConstraints.NORTHEAST
-            }
-        )
         a11y("${control.id} ${control.name}", control.stateContract)
     }
 
     fun value(): String = toggle?.let { if (it.isSelected) "true" else "false" }
         ?: field?.text ?: ""
 
+    /** A descriptive catalog default is not a served value; leave it empty. */
+    private fun initialFieldValue(): String {
+        if (control.id == "X-06") return "https://example.com/"
+        val value = control.defaultValue.trim()
+        if (value.isEmpty() || value.equals("none", true)) return ""
+        if (value.equals("true", true) || value.equals("false", true)) return value
+        if (value.any { it.isDigit() } || value.startsWith("/") || value.startsWith("http") ||
+            value.startsWith("~") || value.contains("://")
+        ) return value
+        return ""
+    }
+
     fun setState(text: String, state: SemanticState) {
-        stateLabel.text = text
+        stateText = text
+        stateLabel.fullText = text
         stateLabel.foreground = semanticForeground(state)
         stateLabel.toolTipText = text
         stateLabel.accessibleContext?.accessibleDescription = text
     }
 
-    fun stateText(): String = stateLabel.text
+    fun stateText(): String = stateText
 
     private fun isToggle(control: Edition8Control): Boolean {
         val text = (control.control + " " + control.name + " " + control.behavior).lowercase()
@@ -254,7 +418,7 @@ internal class Edition8ControlRow(
 
 internal object Edition8Stated {
     fun initial(control: Edition8Control): String =
-        if (control.configKeys.isEmpty()) "Not read" else "Staged value: not saved"
+        if (control.configKeys.isEmpty()) "Not read" else "Not saved"
 
     fun sourceOf(control: Edition8Control): String =
         control.endpoints.firstOrNull { it.state == "exists" }?.actual
@@ -263,6 +427,13 @@ internal object Edition8Stated {
 }
 
 /** One real screen. All I/O is delegated to [Edition8Daemon] off the EDT. */
+private data class PermissionDisplayRow(
+    val id: String,
+    val session: String,
+    val capability: String,
+    val detail: String
+)
+
 internal class Edition8ScreenPanel(
     val screen: Edition8Screen,
     val host: Edition8Host
@@ -270,6 +441,11 @@ internal class Edition8ScreenPanel(
 
     val daemon: Edition8Daemon = host.daemon()
     val rows: List<Edition8ControlRow>
+    private val applyIsPrimary: Boolean = screen.id in APPLY_PRIMARY_SCREENS
+    private val keyRows = ArrayList<Edition8ControlRow>()
+    private val extraRows = ArrayList<Edition8ControlRow>()
+    private val advancedToggle: JButton = secondaryButton("Show more options")
+    private val advancedPanel = JPanel()
     private val status: JLabel = statusChip("Not read", SemanticState.DIM)
     private val detail = JTextArea(4, 40).apply {
         isEditable = false
@@ -280,71 +456,165 @@ internal class Edition8ScreenPanel(
         a11y("${screen.id} native snapshot", "Bounded daemon response for ${screen.title}.")
     }
     private val detailScroll = insetScroll(detail)
+    private val detailPanel = JPanel(BorderLayout())
+    private val detailToggle = secondaryButton("Show last response")
     private val receipts = pageColumn(gap = Spacing.XS, padding = 0)
-    private val primary: JButton = primaryButton(screen.primaryAction.removeSuffix(" · JetBrains: OK / Apply"))
-    private val apply: JButton = secondaryButton("Apply settings")
+    private val primary: JButton = primaryButton(
+        if (screen.id in APPLY_PRIMARY_SCREENS) Edition8Copy.applyLabel(screen) else Edition8Copy.primaryLabel(screen)
+    )
+    private val apply: JButton = if (applyIsPrimary) {
+        primaryButton(Edition8Copy.applyLabel(screen))
+    } else {
+        secondaryButton("Apply changes")
+    }
+    private val retry: JButton = secondaryButton("Retry")
     private val back: JButton = secondaryButton("Back")
-    private val progress = JLabel("")
+    private val hint: JLabel = wrappedMutedLabel("")
+    private val statusDetail: JLabel = wrappedMutedLabel("")
     private var closed = false
     private var loadingValues = false
+    private var fullStatus = "Not read"
 
     init {
         rows = Edition8Registry.controlsForScreen(screen.id).map { Edition8ControlRow(it, this) }
-        val header = buildHeader()
-        val body = JPanel(BorderLayout()).apply {
-            isOpaque = false
-            add(buildHero(), BorderLayout.NORTH)
-            add(buildForm(), BorderLayout.CENTER)
-        }
-        val scroll = pageScroll(body)
-        add(header, BorderLayout.NORTH)
-        add(scroll, BorderLayout.CENTER)
+        chooseVisibleRows()
+        buildScaffolding()
+        add(pageScroll(buildBody()), BorderLayout.CENTER)
         add(buildFooter(), BorderLayout.SOUTH)
-        primary.name = "edition8-primary-${screen.id}"
-        primary.a11y(
-            "${screen.id} ${screen.primaryAction}",
-            "Primary action for ${screen.title}. ${screen.states}"
-        )
-        primary.addActionListener { runPrimary() }
-        apply.name = "edition8-apply-${screen.id}"
-        apply.a11y(
-            "Apply ${screen.title} settings",
-            "Commits one atomic configuration patch and waits for the daemon acknowledgement."
-        )
-        apply.isVisible = rows.any {
-            (it.field != null && it.control.configKeys.isNotEmpty()) || it.toggle != null
-        }
-        apply.addActionListener { applySettings() }
-        back.a11y("Back from ${screen.title}", "Returns to the invoking screen with the draft intact.")
-        back.addActionListener { host.navigate?.invoke("S01") ?: setStatus("Back is a host navigation action", SemanticState.DIM) }
+        wireActions()
         installEscape()
         loadConfigIfNeeded()
         loadProofReceipts()
+        focusFirstAction()
+    }
+
+    private fun chooseVisibleRows() {
+        if (rows.size <= 4) {
+            keyRows.addAll(rows)
+            return
+        }
+        val editable = rows.filter { it.field != null || it.toggle != null }
+        for (row in editable.take(3)) keyRows.add(row)
+        for (row in rows) {
+            if (keyRows.size >= 3) break
+            if (row !in keyRows) keyRows.add(row)
+        }
+        for (row in rows) if (row !in keyRows) extraRows.add(row)
+    }
+
+    private fun buildScaffolding() {
+        advancedPanel.isOpaque = false
+        advancedPanel.layout = BoxLayout(advancedPanel, BoxLayout.Y_AXIS)
+        advancedPanel.isVisible = false
+        for (row in extraRows) advancedPanel.add(row)
+        detailPanel.isOpaque = false
+        detailPanel.add(detailScroll, BorderLayout.CENTER)
+        detailPanel.isVisible = false
+        detailScroll.preferredSize = Dimension(10, 150)
+        hint.isVisible = false
+        retry.isVisible = false
+        detailToggle.isVisible = false
+    }
+
+    private fun wireActions() {
+        primary.name = "edition8-primary-${screen.id}"
+        primary.a11y(
+            "${screen.id} ${primary.text}",
+            "Primary action for ${screen.title}. ${screen.states}"
+        )
+        primary.isVisible = !applyIsPrimary && Edition8Copy.hasPrimary(screen)
+        primary.addActionListener { runPrimary() }
+        apply.name = "edition8-apply-${screen.id}"
+        apply.addActionListener { applySettings() }
+        apply.isVisible = false
+        apply.isEnabled = false
+        refreshApply()
+        back.a11y("Back from ${screen.title}", "Returns to the invoking surface with the draft intact.")
+        back.addActionListener {
+            if (!host.goBack()) {
+                setStatus("Back is available from the host window", SemanticState.DIM)
+            }
+        }
+        retry.name = "edition8-retry-${screen.id}"
+        retry.a11y("Retry loading ${screen.title}", "Retries the same read; no value is invented.")
+        retry.addActionListener {
+            retry.isVisible = false
+            for (row in rows) {
+                if (row.field != null || row.toggle != null) row.setState("Not saved", SemanticState.DIM)
+            }
+            loadConfigIfNeeded()
+        }
+        advancedToggle.name = "edition8-more-${screen.id}"
+        advancedToggle.text = "Show ${extraRows.size} more options"
+        advancedToggle.a11y(
+            "Show more options for ${screen.title}",
+            "Reveals the remaining registry controls without leaving this screen."
+        )
+        advancedToggle.addActionListener {
+            advancedPanel.isVisible = !advancedPanel.isVisible
+            advancedToggle.text = if (advancedPanel.isVisible) {
+                "Hide extra options"
+            } else {
+                "Show ${extraRows.size} more options"
+            }
+            revalidate()
+            repaint()
+        }
+        detailToggle.name = "edition8-detail-toggle-${screen.id}"
+        detailToggle.a11y("Show last response for ${screen.title}", "Shows the bounded daemon response.")
+        detailToggle.addActionListener {
+            detailPanel.isVisible = !detailPanel.isVisible
+            detailToggle.text = if (detailPanel.isVisible) "Hide last response" else "Show last response"
+            revalidate()
+            repaint()
+        }
     }
 
     private fun buildHeader(): JComponent {
-        val title = JLabel("${screen.id} · ${screen.title}").apply {
-            font = sectionTitleFont()
+        val eyebrow = mutedLabel("${screen.id} · ${screen.group}")
+        val title = WrappedLabel(screen.title).apply {
+            font = uiPanelFont().deriveFont(java.awt.Font.BOLD, uiPanelFont().size2D + 5f)
+            foreground = textForeground()
+            name = "edition8-title-${screen.id}"
+            a11y(screen.title, "${screen.group} screen.")
         }
         status.name = "edition8-status-${screen.id}"
         status.a11y("Status: ${status.text}", "One status line for ${screen.title}.")
-        val meta = mutedLabel(
-            "${screen.group} · design p.${screen.designPage} · contract p.${screen.contractPage} · " +
-                screen.surface.name.lowercase().replace('_', ' ')
-        )
+        statusDetail.name = "edition8-status-detail-${screen.id}"
+        statusDetail.alignmentX = Component.LEFT_ALIGNMENT
+        val summary = wrappedMutedLabel(Edition8Copy.summary(screen))
+        summary.name = "edition8-summary-${screen.id}"
+        summary.alignmentX = Component.LEFT_ALIGNMENT
+        eyebrow.alignmentX = Component.LEFT_ALIGNMENT
+        status.alignmentX = Component.LEFT_ALIGNMENT
         val column = JPanel().apply {
             isOpaque = false
+            name = "edition8-header-${screen.id}"
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            add(title)
-            add(meta)
-            add(wrapRow(status, progress))
-        }
-        return JPanel(BorderLayout()).apply {
-            isOpaque = false
             border = BorderFactory.createEmptyBorder(Spacing.L, Spacing.L, Spacing.S, Spacing.L)
-            add(column, BorderLayout.WEST)
-            add(primary, BorderLayout.EAST)
+            alignmentX = Component.LEFT_ALIGNMENT
         }
+        column.add(eyebrow)
+        column.add(title)
+        column.add(vSpace(Spacing.XS))
+        column.add(status)
+        column.add(statusDetail)
+        column.add(vSpace(Spacing.XS))
+        column.add(summary)
+        column.alignmentX = Component.LEFT_ALIGNMENT
+        column.maximumSize = Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE)
+        return column
+    }
+
+    private fun buildBody(): JComponent {
+        // The header scrolls with the page. At 200% text a fixed header can
+        // consume the whole viewport; keeping it in the page leaves the
+        // keyboard-reachable primary fixed and lets every heading be read.
+        val body = pageColumn(gap = 0, padding = 0)
+        body.add(buildHeader())
+        body.add(buildHero())
+        body.add(buildForm())
+        return body
     }
 
     private fun buildHero(): JComponent {
@@ -353,10 +623,14 @@ internal class Edition8ScreenPanel(
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             border = BorderFactory.createEmptyBorder(0, Spacing.L, Spacing.S, Spacing.L)
         }
+        var hasContent = false
+        fun add(component: Component) {
+            hero.add(component)
+            hasContent = true
+        }
         when (screen.id) {
             "S34", "S35", "S57" -> {
-                hero.add(wrappedMutedLabel("Set up Faktor — the service, executable trust and shell isolation are separate facts."))
-                hero.add(wrapRow(
+                add(wrapRow(
                     checklist("Service executable", "Unselected"),
                     checklist("Model", "Not connected"),
                     checklist("Shell isolation", "Fail-closed")
@@ -367,47 +641,51 @@ internal class Edition8ScreenPanel(
                     lineWrap = true
                     wrapStyleWord = true
                     name = "edition8-goal"
+                    alignmentX = Component.LEFT_ALIGNMENT
+                    border = BorderFactory.createCompoundBorder(
+                        BorderFactory.createLineBorder(cardBorderColor()),
+                        BorderFactory.createEmptyBorder(Spacing.S, Spacing.S, Spacing.S, Spacing.S)
+                    )
                     a11y("Task goal", "One task. Cmd+Enter runs; the draft survives admission.")
                     bindCmdEnter { runPrimary() }
                 }
-                hero.add(goal)
-                hero.add(wrappedMutedLabel(
-                    "Captured at admission: intent, model, effort, authority, context, criteria, " +
-                        "finish level and run caps. Starting duplicate suppression stays on until the receipt."
+                val goalLabel = sectionHeader("Task goal").apply { alignmentX = Component.LEFT_ALIGNMENT }
+                add(goalLabel)
+                add(goal)
+                val admission = wrappedMutedLabel(
+                    "A goal, model, effort, authority and caps are captured at admission. " +
+                        "A chat claim never fills a proof boundary."
+                )
+                admission.alignmentX = Component.LEFT_ALIGNMENT
+                add(admission)
+            }
+            "S14" -> {
+                add(wrappedMutedLabel(
+                    "Allow once = this request only. A remember rule is optional and covers future " +
+                        "matching requests. Deny stops this request. Issued commands and network " +
+                        "calls cannot be undone."
                 ))
             }
-            "S41", "S42", "S45", "S46", "S47", "S48", "S32", "S65", "S24", "S43", "S44" -> {
-                hero.add(wrappedMutedLabel(
-                    "Four completion boundaries stay separate: required acceptance, claim evidence, " +
-                        "matching integration and requested finish. A chat claim never fills a boundary."
+            "S70" -> {
+                add(wrappedMutedLabel(
+                    "Stop run cancels queued work; stopping the response only ends output. Killing " +
+                        "the owned process is a separate operation. Issued commands and network calls " +
+                        "cannot be undone."
                 ))
             }
-            "S54", "S53", "S27" -> {
-                hero.add(wrappedMutedLabel(
-                    "Provider API spend, subscription quota, reservations and local operating cost are " +
-                        "separate categories. Unavailable is not zero and no verified change is not $0."
-                ))
+            "S54" -> {
+                add(wrappedMutedLabel("Read-only view. Usage has no editable value on this screen."))
             }
-            "S10", "S08", "S62", "S09" -> {
-                hero.add(wrappedMutedLabel(
-                    "Capacity and input usage come from the durable context manifest. A draft estimate " +
-                        "is labelled with its own basis; compaction is a durable operation with a minimum reduction."
-                ))
-            }
-            "S03", "S04", "S05", "S02", "S63" -> {
-                hero.add(wrappedMutedLabel(
-                    "A provider/model pair is captured only after the daemon acknowledges it. Secrets " +
-                        "are PasswordSafe references; no secret value is written to shared config."
-                ))
-            }
-            "S19", "S20" -> {
-                hero.add(wrappedMutedLabel(
-                    "Owned process and browser observations are bounded artifacts. Run cancellation, " +
-                        "terminal kill and session abort are separate operations."
-                ))
+            "S61" -> {
+                add(wrappedMutedLabel("No conversations yet. Start a task to create the first durable conversation."))
             }
         }
-        hero.add(detailScroll.apply { preferredSize = Dimension(10, 96) })
+        for (child in hero.components) {
+            (child as? javax.swing.JComponent)?.alignmentX = Component.LEFT_ALIGNMENT
+        }
+        if (!hasContent) {
+            hero.isVisible = false
+        }
         return hero
     }
 
@@ -420,13 +698,18 @@ internal class Edition8ScreenPanel(
         }
 
     private fun buildForm(): JComponent {
-        val column = pageColumn(gap = Spacing.XS, padding = Spacing.L)
-        column.add(sectionHeader("Controls (${rows.size})"))
-        for (row in rows) column.add(row)
-        column.add(wrappedMutedLabel(
-            "Every row names its apply timing and source. Read calls the exact served contract; " +
-                "a route absent from the daemon stays a typed contract gap, never a green state."
-        ))
+        val column = pageColumn(gap = Spacing.S, padding = Spacing.L)
+        column.add(sectionHeader(Edition8Copy.formTitle(screen, rows.any { it.field != null || it.toggle != null })))
+        for (row in keyRows) column.add(row)
+        if (extraRows.isNotEmpty()) {
+            column.add(vSpace(Spacing.XS))
+            column.add(wrapRow(advancedToggle))
+            column.add(advancedPanel)
+        }
+        column.add(vSpace(Spacing.XS))
+        column.add(wrapRow(detailToggle))
+        column.add(detailPanel)
+        column.add(wrapRow(retry))
         if (screen.id in PROOF_SCREENS) {
             column.add(vSpace(Spacing.M))
             column.add(sectionHeader("Served proof receipts"))
@@ -435,13 +718,71 @@ internal class Edition8ScreenPanel(
         return column
     }
 
-    private fun buildFooter(): JComponent =
-        JPanel(BorderLayout()).apply {
+    private fun buildFooter(): JComponent {
+        val actions = wrapRow(primary, apply, back)
+        val column = JPanel().apply {
             isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
             border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.L, Spacing.L, Spacing.L)
-            add(wrapRow(apply, back), BorderLayout.WEST)
-            add(mutedLabel("OK / Cancel / Apply: staging is local; Apply is atomic."), BorderLayout.EAST)
         }
+        column.add(actions)
+        column.add(hint)
+        return column
+    }
+
+    private fun refreshApply() {
+        val dirty = daemon.draft.changes().isNotEmpty()
+        if (applyIsPrimary) {
+            // The apply action IS this surface's primary. Keeping a second
+            // visible Apply button was the old competing-primary defect; the
+            // legacy apply control stays dispatchable for the control matrix.
+            apply.isVisible = false
+            apply.isEnabled = dirty
+            apply.text = Edition8Copy.applyLabel(screen)
+            primary.isVisible = true
+            primary.text = Edition8Copy.applyLabel(screen)
+            primary.isEnabled = true
+            primary.a11y(
+                "${screen.id} ${primary.text}",
+                "Commits the staged configuration as one atomic patch. Use Apply after editing a value."
+            )
+            apply.a11y(
+                "${screen.id} ${apply.text}",
+                "Commits the staged configuration as one atomic patch."
+            )
+        } else {
+            val configurable = rows.any { it.field != null || it.toggle != null }
+            apply.isVisible = configurable && dirty
+            apply.isEnabled = dirty
+            apply.text = "Apply changes"
+            apply.a11y(
+                "Apply staged ${screen.title} changes",
+                "Commits one atomic configuration patch and waits for the daemon acknowledgement."
+            )
+        }
+        hint.text = if (dirty) "Changes are staged locally; Apply commits one validated patch." else ""
+        hint.isVisible = dirty
+        revalidate()
+        repaint()
+    }
+
+    private fun setDetail(body: String, max: Int = 4000) {
+        detail.text = bound(body, max)
+        detailToggle.isVisible = true
+        detailToggle.text = "Show last response"
+        revalidate()
+        repaint()
+    }
+
+    private fun focusFirstAction() {
+        javax.swing.SwingUtilities.invokeLater {
+            val target = rows.firstOrNull { it.field?.isEnabled == true }?.field
+                ?: rows.firstOrNull { it.toggle?.isEnabled == true }?.toggle
+                ?: primary.takeIf { it.isVisible && it.isEnabled }
+                ?: apply.takeIf { it.isVisible && it.isEnabled }
+            target?.requestFocusInWindow()
+        }
+    }
 
     /** F260/F261: render the SERVED proof receipts, never a fabricated one. */
     private fun loadProofReceipts() {
@@ -487,9 +828,9 @@ internal class Edition8ScreenPanel(
                                 "Shows the served evidence/provenance for $key; no value is invented."
                             )
                             button.addActionListener {
-                                detail.text = bound(item.rawJson(), 4000)
+                                setDetail(item.rawJson(), 4000)
                                 setStatus("Receipt — $key · $verdict", SemanticState.POSITIVE)
-                                if (screen.id == "S45") host.navigate?.invoke("S46")
+                                if (screen.id == "S45") host.navigateTo("S46")
                             }
                             receipts.add(button)
                             rendered += 1
@@ -509,7 +850,7 @@ internal class Edition8ScreenPanel(
                                 "Shows the durable step row; a missing row stays missing."
                             )
                             button.addActionListener {
-                                detail.text = bound(step.rawJson(), 4000)
+                                setDetail(step.rawJson(), 4000)
                                 setStatus("Receipt — $name · $status", SemanticState.POSITIVE)
                             }
                             receipts.add(button)
@@ -568,26 +909,45 @@ internal class Edition8ScreenPanel(
                         daemon.draft.load(result.body)
                         for (row in rows) {
                             val key = row.control.configKeys.firstOrNull() ?: continue
-                            val field = row.field ?: continue
                             val value = daemon.draft.value(key)
-                            if (value.isNotEmpty()) field.text = value
+                            row.field?.text = value
+                            row.toggle?.isSelected = value.equals("true", true)
                             row.setState(
                                 if (daemon.draft.isLocked(key)) "Locked by organization — read-only"
-                                else "Effective revision ${daemon.draft.revision} — staged edits not saved",
+                                else "Loaded · revision ${daemon.draft.revision}",
                                 if (daemon.draft.isLocked(key)) SemanticState.DIM else SemanticState.POSITIVE
                             )
                         }
                         setStatus("Settings read — revision ${daemon.draft.revision}", SemanticState.POSITIVE)
+                        retry.isVisible = false
                     } catch (t: Throwable) {
-                        setStatus("Unavailable — ${Edition8Work.describe(t)}", SemanticState.NEGATIVE)
+                        setStatus("Unavailable — ${Edition8Work.describe(t)}; Retry reloads the same snapshot", SemanticState.NEGATIVE)
+                        retry.isVisible = true
                     } finally {
                         loadingValues = false
                     }
+                    refreshApply()
                 }
-                is Edition8Result.Failed -> setStatus("Unavailable — ${result.reason}", SemanticState.NEGATIVE)
-                is Edition8Result.Refused -> setStatus("Disabled — ${result.reason}", SemanticState.DIM)
+                is Edition8Result.Failed -> {
+                    setStatus("Unavailable — ${result.reason}; Retry reloads the same snapshot", SemanticState.NEGATIVE)
+                    markConfigUnavailable()
+                }
+                is Edition8Result.Refused -> {
+                    setStatus("Disabled — ${result.reason}", SemanticState.DIM)
+                    markConfigUnavailable()
+                }
             }
         }
+    }
+
+    private fun markConfigUnavailable() {
+        for (row in rows) {
+            if (row.field != null || row.toggle != null) {
+                row.setState("Not loaded — no value was invented", SemanticState.DIM)
+            }
+        }
+        retry.isVisible = true
+        refreshApply()
     }
 
     fun stage(row: Edition8ControlRow) {
@@ -599,12 +959,16 @@ internal class Edition8ScreenPanel(
         }
         val value = row.value()
         daemon.draft.stage(key, value)
-        row.setState("Staged — apply commits one atomic patch", SemanticState.WARNING)
+        row.setState(
+            if (daemon.draft.changes().containsKey(key)) "Staged — not applied" else "Unchanged · revision ${daemon.draft.revision}",
+            if (daemon.draft.changes().containsKey(key)) SemanticState.WARNING else SemanticState.POSITIVE
+        )
         setStatus(
             if (daemon.draft.changes().isEmpty()) "No unsaved changes (revision ${daemon.draft.revision})"
             else "Staged ${daemon.draft.changes().size} change(s) — not saved",
             SemanticState.WARNING
         )
+        refreshApply()
     }
 
     fun activate(row: Edition8ControlRow) {
@@ -621,7 +985,7 @@ internal class Edition8ScreenPanel(
             } catch (failure: Throwable) {
                 "contract-required: host action failed: ${failure.message ?: failure.javaClass.simpleName}"
             }
-            detail.text = bound(result, 4000)
+            setDetail(result, 4000)
             row.setState("Host — ${row.control.name}", SemanticState.POSITIVE)
             setStatus("Host action — $result", SemanticState.POSITIVE)
             return
@@ -639,7 +1003,7 @@ internal class Edition8ScreenPanel(
                 daemon.mcpCatalogs(id) { result ->
                     when (result) {
                         is Edition8Result.Ok -> {
-                            detail.text = bound(result.body, 4000)
+                            setDetail(result.body, 4000)
                             row.setState("Read — live MCP resources/prompts catalog", SemanticState.POSITIVE)
                             setStatus("Read — ${responseSummary(result.body)}", SemanticState.POSITIVE)
                         }
@@ -670,7 +1034,7 @@ internal class Edition8ScreenPanel(
                     daemon.browserScreenshot(browserId) { result ->
                         when (result) {
                             is Edition8Result.Ok -> {
-                                detail.text = bound(result.body, 4000)
+                                setDetail(result.body, 4000)
                                 row.setState("Captured — bounded daemon screenshot artifact", SemanticState.POSITIVE)
                                 setStatus("Captured — ${responseSummary(result.body)}", SemanticState.POSITIVE)
                             }
@@ -682,7 +1046,7 @@ internal class Edition8ScreenPanel(
                     daemon.browserObservations(browserId) { result ->
                         when (result) {
                             is Edition8Result.Ok -> {
-                                detail.text = bound(result.body, 4000)
+                                setDetail(result.body, 4000)
                                 row.setState("Read — live console/network observations", SemanticState.POSITIVE)
                                 setStatus("Read — ${responseSummary(result.body)}", SemanticState.POSITIVE)
                             }
@@ -706,7 +1070,7 @@ internal class Edition8ScreenPanel(
             daemon.connectBrowser(url) { result ->
                 when (result) {
                     is Edition8Result.Ok -> {
-                        detail.text = bound(result.body, 4000)
+                        setDetail(result.body, 4000)
                         row.setState("Connected — real browser session", SemanticState.POSITIVE)
                         setStatus("Connected — ${responseSummary(result.body)}", SemanticState.POSITIVE)
                     }
@@ -734,16 +1098,16 @@ internal class Edition8ScreenPanel(
             } catch (failure: Throwable) {
                 "contract-required: inline code action failed: ${failure.message ?: failure.javaClass.simpleName}"
             }
-            detail.text = bound(captured, 4000)
+            setDetail(captured, 4000)
             row.setState("Host — inline code actions", SemanticState.POSITIVE)
             setStatus("Inline code actions — $captured", SemanticState.POSITIVE)
             return
         }
         if (row.field != null || row.toggle != null) {
             stage(row)
-            val key = row.control.configKeys.firstOrNull()
-            if (key != null && row.field != null) {
-                daemon.draft.stage(key, row.field.text)
+            if (row.control.configKeys.isNotEmpty()) {
+                setStatus("Staged — use Apply to commit", SemanticState.WARNING)
+                return
             }
         }
         setStatus("Loading ${row.control.id}…", SemanticState.WARNING)
@@ -752,7 +1116,7 @@ internal class Edition8ScreenPanel(
             when (result) {
                 is Edition8Result.Ok -> {
                     val text = responseSummary(result.body)
-                    detail.text = bound(result.body, 4000)
+                    setDetail(result.body, 4000)
                     val source = daemon.endpointFor(row.control) ?: Edition8Stated.sourceOf(row.control)
                     row.setState("Read — $source", SemanticState.POSITIVE)
                     setStatus("Read ${row.control.id} — $text", SemanticState.POSITIVE)
@@ -796,28 +1160,44 @@ internal class Edition8ScreenPanel(
     }
 
     private fun applySettings() {
+        if (daemon.draft.changes().isEmpty()) {
+            setStatus("Nothing is staged — edit a value before Apply", SemanticState.DIM)
+            refreshApply()
+            return
+        }
         setStatus("Validating one atomic patch…", SemanticState.WARNING)
         daemon.applyConfig { result ->
             when (result) {
                 is Edition8Result.Ok -> {
                     val text = responseSummary(result.body)
-                    detail.text = bound(result.body, 4000)
-                    setStatus("Applied — $text", SemanticState.POSITIVE)
+                    setDetail(result.body, 4000)
+                    setStatus("Applied — revision ${daemon.draft.revision}", SemanticState.POSITIVE)
                     for (row in rows) {
                         if (row.field != null || row.toggle != null) {
-                            row.setState("Applied at revision ${daemon.draft.revision}", SemanticState.POSITIVE)
+                            row.setState("Applied · revision ${daemon.draft.revision}", SemanticState.POSITIVE)
                         }
                     }
+                    refreshApply()
                 }
-                is Edition8Result.Failed -> setStatus("Failed — ${result.reason}", SemanticState.NEGATIVE)
-                is Edition8Result.Refused -> setStatus("Refused — ${result.reason}", SemanticState.NEGATIVE)
+                is Edition8Result.Failed -> {
+                    setStatus("Failed — ${result.reason}; nothing was saved", SemanticState.NEGATIVE)
+                    refreshApply()
+                }
+                is Edition8Result.Refused -> {
+                    setStatus("Refused — ${result.reason}; nothing was saved", SemanticState.NEGATIVE)
+                    refreshApply()
+                }
             }
         }
     }
 
     private fun runPrimary() {
         if (closed) return
-        setStatus("Loading… (${screen.primaryAction})", SemanticState.WARNING)
+        if (applyIsPrimary) {
+            applySettings()
+            return
+        }
+        setStatus("Loading… (${primary.text})", SemanticState.WARNING)
         when (screen.id) {
             "S34" -> hostResult(host.startService, "contract-required: no start-service host action")
             "S35" -> {
@@ -825,8 +1205,7 @@ internal class Edition8ScreenPanel(
                 if (path.isBlank()) setStatus("Disabled — select the executable path before confirming trust", SemanticState.DIM)
                 else hostResult({ host.confirmTrust?.invoke(path) }, "contract-required: no trust host action")
             }
-            "S57" -> setStatus("Isolation remains fail-closed until the platform setup acknowledges it", SemanticState.DIM)
-            "S36", "S38", "S39", "S33", "S58" -> {
+            "S36", "S38", "S58" -> {
                 val goal = findTextArea(this, "edition8-goal")?.text.orEmpty()
                 if (goal.isBlank()) {
                     setStatus("Disabled — a task goal is required; the draft is preserved", SemanticState.DIM)
@@ -837,7 +1216,7 @@ internal class Edition8ScreenPanel(
                 }
             }
             "S14" -> {
-                setStatus("Loading pending approvals…", SemanticState.WARNING)
+                setStatus("Reading pending approvals…", SemanticState.WARNING)
                 daemon.call("GET", permissionPath(), null) { result ->
                     if (result !is Edition8Result.Ok) {
                         setStatus(statusFor(result), SemanticState.NEGATIVE)
@@ -847,30 +1226,125 @@ internal class Edition8ScreenPanel(
                     if (permission == null) {
                         setStatus("No pending approval — nothing was allowed or faked", SemanticState.DIM)
                     } else {
-                        hostResult(
-                            { host.replyApproval?.invoke(permission.first, permission.second, "allow") },
-                            "contract-required: no approval host action"
+                        // Review only: the decision stays on the per-request
+                        // Allow/Deny card. This action never approves an
+                        // unseen request or a different first row.
+                        val entry = NativePermissionEntry(
+                            permission.id,
+                            permission.session,
+                            permission.capability,
+                            permission.detail
                         )
+                        val review = "Review request #${entry.id}: " +
+                            "${bound(approvalHeadlineOf(entry), 240)} — no decision was sent; " +
+                            "use the approval card's Allow/Deny"
+                        val open = host.openApprovals
+                        if (open == null) {
+                            setStatus("$review (no approval-surface host action)", SemanticState.WARNING)
+                        } else {
+                            val ack = try {
+                                open()
+                            } catch (failure: Throwable) {
+                                "contract-required: approval surface failed: " +
+                                    (failure.message ?: failure.javaClass.simpleName)
+                            }
+                            setDetail(ack, 4000)
+                            if (ack.contains("contract-required", ignoreCase = true) ||
+                                ack.contains("failed", ignoreCase = true)
+                            ) {
+                                setStatus("Disabled — $ack; no decision was sent", SemanticState.DIM)
+                            } else {
+                                setStatus(review, SemanticState.WARNING)
+                            }
+                        }
                     }
                 }
             }
-            "S70" -> hostResult({ host.stopScope?.invoke("run") }, "contract-required: no scoped-stop host action")
-            "S24", "S43", "S44" -> hostResult({ host.openDiff?.invoke(screen.id) }, "contract-required: no native DiffManager host action")
-            "S19" -> hostResult(host.openTerminal, "contract-required: no console host action")
-            "S02", "S06", "S09", "S22", "S23", "S50", "S51", "S52", "S59" -> {
-                val target = when (screen.id) {
-                    "S02" -> "S05"
-                    "S06" -> "S07"
-                    "S09" -> "S08"
-                    "S22", "S50" -> "S14"
-                    "S51", "S52" -> "S23"
-                    else -> "S01"
+            "S70" -> {
+                if (confirmDestructive(
+                        "Stop run?",
+                        "Queued work is cancelled. The current response and owned process remain separate. " +
+                            "Issued commands and network calls cannot be undone."
+                    )
+                ) {
+                    hostResult({ host.stopScope?.invoke("run") }, "contract-required: no scoped-stop host action")
+                } else {
+                    setStatus("Cancelled — nothing was stopped", SemanticState.DIM)
                 }
-                host.navigate?.invoke(target) ?: setStatus("Navigation target $target is host-owned; draft preserved", SemanticState.DIM)
+            }
+            "S24", "S43", "S44" ->
+                hostResult({ host.openDiff?.invoke(screen.id) }, "contract-required: no native DiffManager host action")
+            "S19" -> hostResult(host.openTerminal, "contract-required: no console host action")
+            "S20" -> rows.firstOrNull { it.control.id == "X-08" }?.let { activate(it) }
+                ?: setStatus("Disabled — no browser capture control is bound", SemanticState.DIM)
+            "S02" -> navigateOr("S05")
+            "S06" -> navigateOr("S07")
+            "S07" -> navigateOr("S06")
+            "S09" -> navigateOr("S08")
+            "S22" -> navigateOr("S14")
+            "S51" -> navigateOr("S23")
+            "S41", "S42", "S32" -> navigateOr("S45")
+            "S45" -> navigateOr("S46")
+            "S65" -> navigateOr("S24")
+            "S27" -> navigateOr("S53")
+            "S53" -> navigateOr("S27")
+            "S67" -> navigateOr("S18")
+            "S31" -> navigateOr("S34")
+            "S37" -> navigateOr("S01")
+            "S61" -> {
+                if (!navigateOr("S01")) {
+                    setStatus("Disabled — open Work from the host to start the first task", SemanticState.DIM)
+                }
             }
             "S56" -> hostResult(host.restartService, "contract-required: no restart-service host action")
+            "S10" -> navigateOr("S08")
+            "S11" -> navigateOr("S13")
+            "S15" -> navigateOr("S16")
+            "S17" -> primaryRead()
+            "S23", "S50" -> primaryRead()
+            "S25" -> primaryRead()
+            "S26", "S71", "S72" -> primaryRead()
+            "S33", "S39", "S40", "S59" -> navigateOr("S01")
+            "S47", "S48" -> primaryRead()
+            "S49" -> setStatus("Disabled — no kept work is bound; nothing was restored", SemanticState.DIM)
+            "S52" -> primaryRead()
+            "S55", "S68" -> navigateOr("S29")
+            "S66" -> {
+                if (confirmDestructive(
+                        "Delete memory?",
+                        "Deletion removes the selected memory from this scope and cannot be undone. " +
+                            "No row is selected on this screen."
+                    )
+                ) {
+                    setStatus("Disabled — deletion needs a selected memory row; nothing was deleted", SemanticState.DIM)
+                } else {
+                    setStatus("Cancelled — nothing was deleted", SemanticState.DIM)
+                }
+            }
+            "S69" -> navigateOr("S11")
+            "S54" -> primaryRead()
             else -> primaryRead()
         }
+    }
+
+    private fun navigateOr(target: String): Boolean {
+        if (host.navigator == null && host.navigate == null) {
+            setStatus("Disabled — $target is host-owned; no navigation was made", SemanticState.DIM)
+            return false
+        }
+        host.navigateTo(target)
+        return true
+    }
+
+    private fun confirmDestructive(title: String, message: String): Boolean {
+        if (java.awt.GraphicsEnvironment.isHeadless()) return false
+        return javax.swing.JOptionPane.showConfirmDialog(
+            this,
+            message,
+            title,
+            javax.swing.JOptionPane.YES_NO_OPTION,
+            javax.swing.JOptionPane.WARNING_MESSAGE
+        ) == javax.swing.JOptionPane.YES_OPTION
     }
 
     private fun primaryRead() {
@@ -891,8 +1365,8 @@ internal class Edition8ScreenPanel(
         daemon.primaryRead(resolved) { result ->
             when (result) {
                 is Edition8Result.Ok -> {
-                    detail.text = bound(result.body, 4000)
-                    setStatus("Read — $resolved · ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                    setDetail(result.body, 4000)
+                    setStatus("Read — native response ready", SemanticState.POSITIVE)
                 }
                 is Edition8Result.Failed -> setStatus("Unavailable — ${result.reason}", SemanticState.NEGATIVE)
                 is Edition8Result.Refused -> setStatus("Disabled — ${result.reason}", SemanticState.DIM)
@@ -910,8 +1384,18 @@ internal class Edition8ScreenPanel(
         }) { result ->
             when (result) {
                 is Edition8Result.Ok -> {
-                    detail.text = bound(result.body, 4000)
-                    setStatus("Acknowledged — ${responseSummary(result.body)}", SemanticState.POSITIVE)
+                    val ack = result.body
+                    setDetail(ack, 4000)
+                    val lower = ack.lowercase()
+                    when {
+                        lower.contains("contract-required") || lower.contains("nothing") ||
+                            lower.contains("no owned") || lower.contains("refused") ||
+                            lower.contains("not available") ->
+                            setStatus("Disabled — $ack", SemanticState.DIM)
+                        lower.contains("awaiting") || lower.contains("requested") ->
+                            setStatus("Pending — $ack", SemanticState.WARNING)
+                        else -> setStatus("Acknowledged — $ack", SemanticState.POSITIVE)
+                    }
                 }
                 is Edition8Result.Failed -> setStatus("Failed — ${result.reason}", SemanticState.NEGATIVE)
                 is Edition8Result.Refused -> setStatus("Refused — ${result.reason}", SemanticState.NEGATIVE)
@@ -924,22 +1408,67 @@ internal class Edition8ScreenPanel(
         return if (sid == null) "/native/permissions" else "/native/permissions?session=$sid"
     }
 
-    private fun firstPermission(body: String): Pair<String, String>? {
+    private fun firstPermission(body: String): PermissionDisplayRow? {
         val permissions = runCatching {
-            JsonCodec.parse(body).view("permissions").optionalField("permissions")?.array().orEmpty()
+            JsonCodec.parse(body).view("GET /native/permissions").field("permissions").array()
         }.getOrNull().orEmpty()
         val first = permissions.firstOrNull() ?: return null
         val id = first.optionalField("id")?.string() ?: return null
         val session = first.optionalField("session_id")?.string() ?: host.sessionId() ?: return null
-        return id to session
+        val capability = first.optionalField("capability")?.string() ?: "unknown"
+        val detail = first.optionalField("detail")?.let { d ->
+            (d.value as? JsonValue.Str)?.value ?: d.rawJson()
+        } ?: ""
+        return PermissionDisplayRow(id, session, capability, detail)
     }
 
     fun setStatus(text: String, state: SemanticState) {
-        status.text = bound(text, 240)
+        val full = bound(text, 240)
+        fullStatus = full
+        val short = shortStatus(full)
+        status.text = short
         status.foreground = semanticForeground(state)
-        status.toolTipText = bound(text, 800)
-        status.accessibleContext?.accessibleName = "Status: ${bound(text, 240)}"
-        progress.text = ""
+        status.toolTipText = bound(full, 800)
+        status.accessibleContext?.accessibleName = "Status: $short"
+        val detail = when {
+            full.startsWith("Disabled — ") -> full.removePrefix("Disabled — ")
+            full.startsWith("Unavailable — ") -> full.removePrefix("Unavailable — ")
+            full.startsWith("Failed — ") -> full.removePrefix("Failed — ")
+            full.startsWith("Refused — ") -> full.removePrefix("Refused — ")
+            full.startsWith("Pending — ") -> full.removePrefix("Pending — ")
+            full.startsWith("Acknowledged — ") -> full.removePrefix("Acknowledged — ")
+            full.startsWith("Staged") -> full.substringAfter("— ", full)
+            full.startsWith("Loading settings") -> "Reading the configuration snapshot; no value is invented."
+            else -> full
+        }
+        statusDetail.text = if (detail == short || detail == full && short == full) "" else detail
+        statusDetail.isVisible = statusDetail.text.isNotEmpty()
+        revalidate()
+    }
+
+    private fun shortStatus(text: String): String = when {
+        text.startsWith("Loading settings") -> "Loading settings"
+        text.startsWith("Disabled") -> "Disabled"
+        text.startsWith("Unavailable") -> "Unavailable"
+        text.startsWith("Settings read") -> "Settings read"
+        text.startsWith("No unsaved") -> "No unsaved changes"
+        text.startsWith("Staged") -> {
+            val count = Regex("Staged (\\d+) change").find(text)?.groupValues?.getOrNull(1)
+            if (count == null) "Staged changes" else "Staged $count"
+        }
+        text.startsWith("Applied") -> "Applied"
+        text.startsWith("Acknowledged") -> "Acknowledged"
+        text.startsWith("Pending") -> "Pending"
+        text.startsWith("Failed") -> "Failed"
+        text.startsWith("Refused") -> "Refused"
+        text.startsWith("Host action") -> "Host action"
+        text.startsWith("Read") -> "Read"
+        text.startsWith("Captured") -> "Captured"
+        text.startsWith("Connected") -> "Connected"
+        text.startsWith("No pending") -> "No pending approval"
+        text.startsWith("Review request") -> "Review only"
+        text.startsWith("Validating") -> "Validating"
+        else -> bound(text, 28)
     }
 
     fun shutdown() {
@@ -949,14 +1478,14 @@ internal class Edition8ScreenPanel(
 
     internal fun rowsForTest(): List<Edition8ControlRow> = rows
 
-    internal fun statusForTest(): String = status.text
+    internal fun statusForTest(): String = fullStatus
 
-    internal fun applyVisibleForTest(): Boolean = apply.isVisible
+    internal fun applyVisibleForTest(): Boolean = apply.isVisible || (applyIsPrimary && apply.isEnabled)
 
     private fun statusFor(result: Edition8Result): String = when (result) {
         is Edition8Result.Ok -> "Read"
-        is Edition8Result.Failed -> result.reason
-        is Edition8Result.Refused -> result.reason
+        is Edition8Result.Failed -> "Unavailable — ${result.reason}"
+        is Edition8Result.Refused -> "Disabled — ${result.reason}"
     }
 
     private fun responseSummary(body: String): String {
@@ -1067,8 +1596,9 @@ internal class Edition8ShellPanel(private val host: Edition8Host) : JPanel(Borde
             clusterHosts[cluster] = chooserHosts
             tabs.addTab(cluster, content)
         }
-        tabs.a11y("Work Inspect History destinations", "Three content clusters; no settings center.")
+        tabs.a11y("Work Inspect History destinations", "Three content clusters; Settings opens from the toolbar.")
         tabs.addChangeListener {
+            if (opening) return@addChangeListener
             val title = tabs.getTitleAt(tabs.selectedIndex)
             val pair = clusterHosts[title] ?: return@addChangeListener
             val selected = pair.first.selectedItem?.toString()?.substringBefore(" ·") ?: return@addChangeListener
@@ -1095,9 +1625,9 @@ internal class Edition8ShellPanel(private val host: Edition8Host) : JPanel(Borde
         }
         val pair = clusterHosts[cluster] ?: return
         val index = tabs.indexOfTab(cluster)
-        if (tabs.selectedIndex != index) tabs.selectedIndex = index
         opening = true
         try {
+            if (tabs.selectedIndex != index) tabs.selectedIndex = index
             val wanted = "${screen.id} · ${screen.title}"
             for (i in 0 until pair.first.itemCount) {
                 if (pair.first.getItemAt(i) == wanted) pair.first.selectedIndex = i
@@ -1126,25 +1656,35 @@ internal class Edition8ScreenBrowser(private val host: Edition8Host) {
     fun show(parent: Component?, initialScreen: String? = null) {
         val dialog = JDialog(
             SwingUtilities.getWindowAncestor(parent),
-            "Faktor screens — Revision 8",
+            "Faktor",
             java.awt.Dialog.ModalityType.APPLICATION_MODAL
         )
         dialog.defaultCloseOperation = WindowConstants.DISPOSE_ON_CLOSE
         val shell = Edition8ShellPanel(host)
-        val list = JComboBox(
-            Edition8Registry.screens.map { "${it.group} · ${it.id} · ${it.title}" }.toTypedArray()
-        )
-        list.a11y("All Revision 8 screens", "72 screens; choosing one opens the native surface.")
-        list.addActionListener {
-            val id = list.selectedItem?.toString()?.split(" · ")?.getOrNull(1) ?: return@addActionListener
-            shell.open(id)
-        }
+        // The shell owns in-dialog navigation; Back closes this browser and
+        // returns to the workbench instead of opening a nested modal copy.
+        host.navigator = { id -> shell.open(id) }
+        host.backHandler = { dialog.dispose() }
+        val settings = secondaryButton("Settings")
+        settings.name = "edition8-browser-settings"
+        settings.a11y("Open Settings", "Opens General settings inside this browser.")
+        settings.addActionListener { shell.open("S29") }
+        val close = secondaryButton("Close")
+        close.a11y("Close Faktor screens", "Returns to the workbench; the draft is untouched.")
+        close.addActionListener { dialog.dispose() }
+        val toolbar = wrapRow(settings, close)
+        toolbar.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.S, Spacing.S, Spacing.S)
         val content = JPanel(BorderLayout())
-        content.add(list, BorderLayout.NORTH)
+        content.add(toolbar, BorderLayout.NORTH)
         content.add(shell, BorderLayout.CENTER)
         dialog.contentPane = content
         if (initialScreen != null) shell.open(initialScreen)
-        dialog.setSize(920, 720)
+        val escape = KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0)
+        dialog.rootPane.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(escape, "edition8.close")
+        dialog.rootPane.actionMap.put("edition8.close", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) = dialog.dispose()
+        })
+        dialog.setSize(960, 760)
         dialog.setLocationRelativeTo(parent)
         dialog.addWindowListener(object : java.awt.event.WindowAdapter() {
             override fun windowClosed(e: java.awt.event.WindowEvent?) {

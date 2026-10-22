@@ -144,10 +144,42 @@ export function normalizeControlPlaneEndpoint(endpoint: string): string {
   return endpoint.trim().replace(/\/+$/, '').toLowerCase();
 }
 
+/**
+ * True for one http(s) control-plane endpoint. Credentials, query strings,
+ * fragments and control characters are refused so a pasted
+ * `https://user:pass@host` can never be persisted in (or rendered from) the
+ * non-secret coordinate store or echoed in an error line.
+ */
+export function controlPlaneEndpointValid(endpoint: string): boolean {
+  const text = endpoint.trim();
+  if (text.length === 0 || text.length > 2048) return false;
+  if (
+    /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return false;
+  }
+  return (
+    (url.protocol === 'https:' || url.protocol === 'http:') &&
+    url.hostname.length > 0 &&
+    url.username === '' &&
+    url.password === '' &&
+    url.search === '' &&
+    url.hash === ''
+  );
+}
+
 export function controlPlaneScopeValid(scope: ControlPlaneScope | null): scope is ControlPlaneScope {
   return (
     scope !== null &&
-    normalizeControlPlaneEndpoint(scope.endpoint).length > 0 &&
+    controlPlaneEndpointValid(scope.endpoint) &&
     scope.organization.trim().length > 0
   );
 }

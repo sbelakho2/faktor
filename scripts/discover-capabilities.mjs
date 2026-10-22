@@ -63,10 +63,21 @@ export function discover(root = ROOT, { nativeRoutes = null, cliCommands = null 
   // 2. Builtin model tools actually registered by the daemon: every
   //    production CLI source, not one hand-picked builder file, so a tool
   //    registered from a new module is discovered too.
+  //
+  // The scanner is a CONSTRUCTOR scan, not a file allowlist: every
+  // `tools.register(…_tool())` / `registry.register_lazy(…_tool())` call in a
+  // production CLI module is discovered, including the coordination-board,
+  // supply/engineering-loop and approval tools that are registered with
+  // `register_lazy` from a different module. A tool factory that is not
+  // registered (`ordinary_tool`, `run_tool`) is a helper, not a model tool.
+  const TOOL_HELPERS = new Set(['ordinary', 'run']);
   for (const file of productionRustFiles(root, 'crates/cli/src')) {
     const text = read(root, file);
-    for (const match of text.matchAll(/tools(?:\.register|\.register_lazy)\(\s*([a-z_]+)::([a-z_]+)\(/g)) {
-      const name = match[2].replace(/_tool(_with_secrets)?$/, '');
+    for (const match of text.matchAll(
+      /(?:tools|registry)\.(?:register|register_lazy)\(\s*(?:[a-z_]+::)*([a-z_]+_tool(?:_with_secrets)?)\s*\(/g,
+    )) {
+      const name = match[1].replace(/_tool(_with_secrets)?$/, '');
+      if (TOOL_HELPERS.has(name) || name === 'tool') continue;
       add('builtin-tool', `tool.${name}`);
     }
   }
@@ -348,6 +359,17 @@ function selftest() {
   const discovered = discover(ROOT);
   check('native routes are discovered', discovered.ids.some((id) => id.startsWith('native.get.')));
   check('builtin tools are discovered', discovered.ids.includes('tool.run-command') || discovered.ids.includes('tool.run_command'));
+  for (const expected of [
+    'tool.board-post',
+    'tool.board-read',
+    'tool.supply-decision',
+    'tool.engineering-analyse',
+    'tool.engineering-verify',
+    'tool.approval-request',
+    'tool.approval-status',
+  ]) {
+    check(`lazy/registered tool ${expected} is discovered`, discovered.ids.includes(expected));
+  }
   check('CLI commands are discovered', discovered.ids.some((id) => id === 'cli.doctor'));
   check('VS Code commands are discovered', discovered.ids.includes('vscode.command.faktor.start-server'));
   check('JetBrains tool windows are discovered', discovered.ids.some((id) => id.startsWith('jetbrains.toolwindow.')));

@@ -64,6 +64,41 @@ object Edition8ControlExercise {
         var edtHttp = emptyList<String>()
         var maxEdtMs = 0.0
         try {
+            // Security regression: S14's primary action reviews the pending
+            // request and opens the approval card. It NEVER sends Allow for
+            // the first (possibly unseen) pending permission.
+            var approvalReplies = 0
+            var approvalSurfaces = 0
+            val reviewHost = Edition8Host(
+                client = { client },
+                sessionId = { "1" },
+                taskId = { "1" },
+                replyApproval = { _, _, _ -> approvalReplies++; "unexpected approval reply" },
+                openApprovals = { approvalSurfaces++; "opened the approval cards; no decision was sent" }
+            )
+            var reviewPanel: Edition8ScreenPanel? = null
+            SwingUtilities.invokeAndWait {
+                reviewPanel = Edition8ScreenRegistry.build("S14", reviewHost) as Edition8ScreenPanel
+            }
+            reviewHost.work.awaitIdle(15_000)
+            val primary = reviewPanel?.let { findButton(it, "edition8-primary-S14") }
+            if (primary == null) {
+                failures.add("S14 has no primary review action")
+            } else {
+                SwingUtilities.invokeAndWait { primary.doClick() }
+                reviewHost.work.awaitIdle(15_000)
+                if (approvalReplies != 0) {
+                    failures.add("S14 primary sent an approval decision without a per-request review")
+                }
+                if (approvalSurfaces != 1) {
+                    failures.add("S14 primary did not open the approval review surface")
+                }
+                val status = reviewPanel?.statusForTest().orEmpty()
+                if (!status.contains("no decision was sent")) {
+                    failures.add("S14 primary must state that no decision was sent: $status")
+                }
+            }
+            reviewHost.shutdown()
             for (screen in Edition8Registry.screens) {
                 var panel: Edition8ScreenPanel? = null
                 try {

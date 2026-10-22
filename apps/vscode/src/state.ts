@@ -421,13 +421,20 @@ export function permissionSummaries(
 ): PermissionSummary[] {
   return entries.slice(0, MAX_PERMISSION_SUMMARIES).map((entry) => ({
     id: entry.id,
-    sessionId: entry.sessionId,
-    capability: entry.capability.length > 256 ? `${entry.capability.slice(0, 256)}…` : entry.capability,
-    detail:
-      entry.detail.length > MAX_PERMISSION_DETAIL_CHARS
-        ? `${entry.detail.slice(0, MAX_PERMISSION_DETAIL_CHARS)}…`
-        : entry.detail,
+    sessionId: stripDisplayControls(entry.sessionId),
+    capability: boundedDisplay(entry.capability, 256),
+    detail: boundedDisplay(entry.detail, MAX_PERMISSION_DETAIL_CHARS),
   }));
+}
+
+/**
+ * Approval-card display text: controls and bidi overrides are stripped before
+ * truncation so agent-supplied capability/detail text cannot visually spoof
+ * the request a human is about to approve.
+ */
+function boundedDisplay(value: string, max: number): string {
+  const clean = stripDisplayControls(value);
+  return clean.length > max ? `${safeSlice(clean, max)}…` : clean;
 }
 
 export type DaemonStatus = 'stopped' | 'starting' | 'running' | 'error';

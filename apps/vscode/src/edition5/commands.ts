@@ -3,7 +3,7 @@
 // specific target. Missing selections are a typed error, never a guessed id.
 
 import type { E5CommandKind } from './bindings.ts';
-import type { E5Snapshot, Json } from './contract.ts';
+import type { E5ApprovalRequest, E5Snapshot, Json } from './contract.ts';
 
 export interface E5CommandCall {
   readonly method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
@@ -31,6 +31,20 @@ export function validateMcpPayload(payload: E5Payload, existingServers: number):
     if (bytes(arg) > 512) return `MCP arg ${index + 1} is ${bytes(arg)} UTF-8 bytes; the bound is 512.`;
   }
   return null;
+}
+
+/**
+ * The pending request a decision button was rendered from. The approval
+ * toolbar carries the EXACT request id of that render; a reply is refused
+ * when that id is no longer live rather than silently selecting a newer
+ * "first" request the human never saw.
+ */
+export function pendingApprovalById(
+  snapshot: E5Snapshot | null,
+  requestId: unknown,
+): E5ApprovalRequest | null {
+  if (typeof requestId !== 'string' || requestId.length === 0) return null;
+  return (snapshot?.approvals?.pending ?? []).find((request) => request.request_id === requestId) ?? null;
 }
 
 /** Steer accepts 1..500 characters; it is rejected, never truncated (A26). */
@@ -232,8 +246,13 @@ export function commandCall(command: E5CommandKind, payload: E5Payload): E5Comma
       };
     case 'policy.audit':
       return { method: 'GET', path: '/native/policy/audit', body: null };
-    case 'approval.reply':
+    case 'approval.reply': {
+      // The decision must name the exact request id and owning session the
+      // panel bound at render time; a missing selection is a typed error.
+      requireString(payload, 'request_id');
+      requireString(payload, 'session');
       return { method: 'POST', path: '/native/permission/reply', body: body(payload) };
+    }
     case 'approval.remember':
       return { method: 'POST', path: '/native/policy/rules', body: body(payload) };
     case 'mcp.create':
@@ -484,6 +503,9 @@ export function defaultPayload(command: E5CommandKind, snapshot: E5Snapshot | nu
     }
     case 'approval.reply':
     case 'approval.remember': {
+      // The command builder can name the served pending row for fixtures and
+      // direct SDK calls; the PANEL refuses a missing id from the webview and
+      // binds every real decision to the id rendered on its own button.
       const request = first(snapshot?.approvals?.pending ?? []);
       if (request !== null) {
         payload.request_id = request.request_id;
