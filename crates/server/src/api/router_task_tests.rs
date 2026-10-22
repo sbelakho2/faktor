@@ -1794,7 +1794,7 @@ async fn native_tasks_carry_progress_and_durable_budget() {
 #[tokio::test]
 async fn native_single_item_task_max_cost_micro_caps_the_real_drive() {
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider)]);
+    let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider::new())]);
     let token = deps.auth_token.clone();
     let manager = deps.session.clone();
     let tasks = deps.tasks.clone();

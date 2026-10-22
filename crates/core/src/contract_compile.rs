@@ -122,8 +122,6 @@ pub const MAX_FINDING_DIAGNOSTICS: usize = 8;
 const MAX_DIAGNOSTIC_BYTES: usize = 200;
 /// Longest goal excerpt embedded in a neutral question query.
 const MAX_QUESTION_GOAL_BYTES: usize = 160;
-/// Longest goal excerpt embedded in an uncertainty statement.
-const MAX_GOAL_EXCERPT: usize = 120;
 /// Lines scanned per file for test attributes / symbols.
 const MAX_SCAN_LINES: usize = 20_000;
 
@@ -1515,8 +1513,7 @@ impl<'a> NativeCompile<'a> {
                 StatementOrigin::Heuristic,
                 3_000,
                 format!(
-                    "no deterministic proof obligation could be derived from the repository for objective {:?}: {reason}",
-                    goal_excerpt(&self.request.goal)
+                    "no deterministic proof obligation could be derived from the repository: {reason}"
                 ),
                 format!(
                     "scanned {} file(s), detected build system(s) {}, discovered {} test selector(s), matched {} of them",
@@ -2659,10 +2656,6 @@ fn bounded(text: &str, max_bytes: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-fn goal_excerpt(goal: &str) -> String {
-    bounded(goal.trim(), MAX_GOAL_EXCERPT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2822,6 +2815,17 @@ fn replayed_refresh_token_fails() {}
         assert!(compiled.uncertainties.iter().any(|uncertainty| uncertainty
             .statement
             .contains("no deterministic proof obligation")));
+        // The derived statement names the objective conceptually; it must
+        // not repeat the goal text (the rendered contract already carries it
+        // once as GOAL, and the system head must never duplicate the prompt).
+        assert!(
+            !compiled
+                .uncertainties
+                .iter()
+                .any(|uncertainty| uncertainty.statement.contains(REFRESH_GOAL)),
+            "derived uncertainty must not echo the objective: {:?}",
+            compiled.uncertainties
+        );
         assert!(
             !compiled.uncertainties.iter().any(|uncertainty| uncertainty
                 .statement

@@ -828,7 +828,24 @@ pub(crate) fn seed_typed_task(
 /// The runtime settlement prices each line and folds the categories
 /// into the recorded input/output totals.
 #[derive(Clone)]
-pub(crate) struct CacheUsageProvider;
+pub(crate) struct CacheUsageProvider {
+    requests: Arc<std::sync::Mutex<Vec<faktor_provider::GenericAgentRequest>>>,
+}
+
+impl CacheUsageProvider {
+    pub(crate) fn new() -> Self {
+        Self {
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The exact wire request the provider received (the under-report guard
+    /// settles at that plan's input total, which varies with the bounded
+    /// repository/contract state — tests derive the amount, never pin it).
+    pub(crate) fn last_request(&self) -> Option<faktor_provider::GenericAgentRequest> {
+        self.requests.lock().unwrap().last().cloned()
+    }
+}
 
 impl faktor_provider::Provider for CacheUsageProvider {
     fn id(&self) -> &str {
@@ -847,10 +864,8 @@ impl faktor_provider::Provider for CacheUsageProvider {
         faktor_core::model::CapabilityResolution::known(self.capabilities(model))
     }
 
-    fn stream(
-        &self,
-        _req: faktor_provider::GenericAgentRequest,
-    ) -> faktor_provider::ProviderStream {
+    fn stream(&self, req: faktor_provider::GenericAgentRequest) -> faktor_provider::ProviderStream {
+        self.requests.lock().unwrap().push(req);
         let items: Vec<Result<faktor_provider::ProviderChunk, faktor_provider::ProviderError>> = vec![
             Ok(faktor_provider::ProviderChunk::Text {
                 text: "pong".into(),

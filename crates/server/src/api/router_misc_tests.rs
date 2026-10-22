@@ -1469,7 +1469,9 @@ async fn native_usage_real_turn_with_cache_and_reasoning_tokens() {
     // settlement persists the folded totals and the reservation rows;
     // /native/session/{id}/usage then reports EXACTLY the stored rows.
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider)]);
+    let usage_provider = CacheUsageProvider::new();
+    let recorded = usage_provider.clone();
+    let deps = test_deps_full(dir.path(), vec![Arc::new(usage_provider)]);
     let token = deps.auth_token.clone();
     let manager = deps.session.clone();
     let tasks = deps.tasks.clone();
@@ -1521,11 +1523,24 @@ async fn native_usage_real_turn_with_cache_and_reasoning_tokens() {
     let store = manager.store();
     let tokens = store.session_usage_tokens(s.id()).unwrap();
     // The frame reports only 9 input tokens (7 cache reads + 2 writes)
-    // against a ~98-token request; the runtime's under-report floor
-    // settles the planned input, so the folded total is 98 + 3 output.
+    // against a multi-hundred-token request; the runtime's under-report
+    // floor settles the planned input, so the folded total is that plan's
+    // input + 3 output. Derive the plan total from the exact request the
+    // provider received instead of pinning a fixture size.
+    let request = recorded
+        .last_request()
+        .expect("the provider received the turn's wire request");
+    let plan_input =
+        faktor_context::measure_wire_request(&request.system, &request.messages, &request.tools)
+            as u64;
+    assert!(
+        plan_input > 18,
+        "the 9-token frame must stay below half the plan: {plan_input}"
+    );
     assert_eq!(
-        tokens, 101,
-        "under-reported frame floors to planned input 98 + output 3"
+        tokens,
+        plan_input + 3,
+        "under-reported frame floors to planned input {plan_input} + output 3"
     );
     let prefix = store.provider_call_prefix_rows(s.id()).unwrap();
     assert_eq!(

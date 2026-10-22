@@ -435,9 +435,20 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
     // reservation row (the durable chain: route decision -> reservation
     // -> settlement).
     let costly = CostReportingProvider::new(vec![(Some(777), false)]);
+    // Capture the exact wire request the provider receives: the runtime's
+    // under-report guard settles at the PLAN's input floor, and the plan
+    // varies with the bounded repository state. Deriving the floor from the
+    // real request keeps this assertion exact instead of pinning a fixture
+    // size (a hardcoded 777 assumed a much larger plan).
+    let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let inspecting = InspectingProvider::new(costly.clone(), move |_n, req| {
+        cap.lock().unwrap().push(req.clone());
+        Ok(())
+    });
     let mut registry = ProviderRegistry::new();
-    let dyn_p: Arc<dyn faktor_provider::Provider> = costly.clone();
-    registry.try_register(dyn_p).unwrap();
+    registry.try_register(Arc::new(inspecting)).unwrap();
     let (mut adeps, _dir) = deps_with(costly.clone(), vec![]);
     adeps.providers = Arc::new(registry);
     let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
@@ -539,10 +550,30 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
         Some(777),
         "the provider-reported cost rides the reservation row"
     );
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 1, "one wire request for the turn");
+    let plan_input = faktor_context::measure_wire_request(
+        &requests[0].system,
+        &requests[0].messages,
+        &requests[0].tools,
+    ) as u64;
     assert!(
-        row.provider_cost_micro.is_some_and(|cost| cost >= 777),
-        "the locally calculated cost (the plan's input floor + 9 output at the frozen \
+        plan_input > 80,
+        "the fixture must keep the 40-token frame below half the plan: {plan_input}"
+    );
+    // The frame reports 40 uncached input tokens + 9 output. Below half the
+    // plan it is an under-report, so the LOCAL cost is the plan's input floor
+    // plus the 9 output tokens at the frozen 1 microUSD/token lines.
+    assert_eq!(
+        row.provider_cost_micro,
+        Some(plan_input + 9),
+        "the locally calculated cost (plan input floor + 9 output at the frozen \
          1 microUSD/token lines) is recorded too: {row:?}"
+    );
+    assert_eq!(
+        row.settled_cost_micro,
+        Some((plan_input + 9).max(777)),
+        "the folded amount is the higher of the local floor and the provider report"
     );
     assert_eq!(
         row.pricing_snapshot.as_ref().map(|s| s.authority),
