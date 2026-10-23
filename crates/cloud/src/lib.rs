@@ -55,20 +55,25 @@ pub mod value;
 pub mod vendor;
 
 pub use billing::{
-    fold_credits, fold_usage, Admission, AdmissionBoundary, AdmissionRequest, BillingAccount,
-    BillingConfig, CreditBalance, CreditEntry, CreditKind, CreditLedgerError, EntitlementExceeded,
-    EntitlementSnapshot, InFlightKind, InFlightTxn, ObservedUsage, PlanConfig, ReconciliationState,
-    SpendCategory, Subscription, SubscriptionStatus, TaskUsage, UsageEvent, UsageFold, UsageTotals,
-    UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED, CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN,
-    CAUSE_SUBSCRIPTION_ACTIVE, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS,
+    csv_field, fold_credits, fold_usage, Admission, AdmissionBoundary, AdmissionRequest,
+    BillingAccount, BillingCapabilityState, BillingCapabilityStatus, BillingConfig,
+    BillingOverview, BillingProration, BillingTrialView, CreditBalance, CreditEntry, CreditKind,
+    CreditLedgerError, EntitlementExceeded, EntitlementSnapshot, InFlightKind, InFlightTxn,
+    ObservedUsage, PlanConfig, ReconciliationState, SpendCategory, Subscription,
+    SubscriptionStatus, TaskUsage, UsageEvent, UsageFold, UsageTotals, UsageUnit, CAUSE_CREDITS,
+    CAUSE_CURRENCY_NOT_CONFIGURED, CAUSE_FEATURE_MANAGED, CAUSE_INVOICES_NOT_AVAILABLE,
+    CAUSE_LEDGER_OVERFLOW, CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED, CAUSE_PLAN,
+    CAUSE_PLAN_PRICES_NOT_CONFIGURED, CAUSE_SEAT_BILLING_NOT_MODELED, CAUSE_SUBSCRIPTION_ACTIVE,
+    CAUSE_TAX_NOT_CONFIGURED, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS,
     LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
     LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD,
     LIMIT_MIN_CREDIT_BALANCE_MICRO,
 };
 pub use billing_store::{
-    BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal, MemoryBillingStore,
-    ReportPeriodRow, ReportPeriodStatus, StoredCreditEntry, StoredUsageEvent, UsageAppend,
-    BILLING_REPORT_SCHEMA_V4, BILLING_SCHEMA_V2, MAX_REPORT_PERIODS_PER_ORG,
+    BillingMutationClaim, BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal,
+    MemoryBillingStore, ReportPeriodRow, ReportPeriodStatus, StoredCreditEntry, StoredUsageEvent,
+    UsageAppend, BILLING_REPORT_SCHEMA_V4, BILLING_ROLLUP_SCHEMA_V8, BILLING_SCHEMA_V2,
+    MAX_BILLING_MUTATIONS_PER_ORG, MAX_BILLING_MUTATION_BODY, MAX_REPORT_PERIODS_PER_ORG,
 };
 pub use enterprise::config_layer_digest;
 pub use enterprise::{
@@ -149,3 +154,7 @@ pub use vendor::{
 #[cfg(test)]
 #[path = "query_plan_tests.rs"]
 mod query_plan_tests;
+
+#[cfg(test)]
+#[path = "billing_rollup_tests.rs"]
+mod billing_rollup_tests;

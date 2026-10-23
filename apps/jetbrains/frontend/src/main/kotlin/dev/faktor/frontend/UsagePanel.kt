@@ -12,6 +12,7 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeBillingTaskUsage
+import dev.faktor.shared.NativeBillingOverview
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeCreditBalance
 import dev.faktor.shared.NativeEntitlementSnapshot
@@ -67,6 +68,9 @@ data class UsagePanelModel(
     val subscriptionStatus: String?,
     val subscriptionExpiresMs: Long?,
     val subscriptionActive: Boolean?,
+    val billing: NativeBillingOverview? = null,
+    val canManageBilling: Boolean = false,
+    val manageDisabledReason: String? = null,
     val totals: NativeUsageBuckets?,
     val tasks: List<NativeBillingTaskUsage>,
     val credits: NativeCreditBalance?,
@@ -86,6 +90,12 @@ data class UsagePanelModel(
     /** The grant affordance: visible for admin principals, disabled otherwise
      * (and disabled whenever the billing surface itself is not usable). */
     fun grantEnabled(): Boolean = canGrantCredits && state == "ok"
+
+    /** The owner-only plan/cancel affordances. */
+    fun manageEnabled(): Boolean = canManageBilling && state == "ok"
+
+    /** The usage download is available whenever the billing surface is. */
+    fun exportEnabled(): Boolean = state == "ok"
 
     /** The bounded display lines of the panel: formatted once per model. */
     private val cachedLines: List<String> by lazy { buildLines() }
@@ -124,6 +134,41 @@ data class UsagePanelModel(
                     "snapshot is inactive$expires — new tasks are denied"
             )
             else -> out.add("subscription unavailable (the snapshot serves no subscription)")
+        }
+        if (!canManageBilling && manageDisabledReason != null) {
+            out.add("plan change disabled — $manageDisabledReason")
+        }
+        if (billing != null) {
+            when (billing.trial.state) {
+                "active" -> out.add(
+                    "trial active — ends " +
+                        (billing.trial.endsMs?.let { utcSeconds(it) } ?: "unavailable")
+                )
+                "expired" -> out.add(
+                    "[TRIAL EXPIRED] trial ended " +
+                        (billing.trial.endsMs?.let { utcSeconds(it) } ?: "unavailable") +
+                        " — new tasks are denied"
+                )
+            }
+            for ((label, capability) in listOf(
+                "payment" to billing.payment,
+                "invoices" to billing.invoices,
+                "seats" to billing.seats,
+                "tax" to billing.tax,
+                "currency" to billing.currency
+            )) {
+                out.add(
+                    if (capability.state == "available") "$label available"
+                    else "$label unavailable — ${capability.cause ?: "unavailable"}"
+                )
+            }
+            out.add(
+                if (billing.usageExport.state == "available") {
+                    "usage export available (${billing.usageExportFormats.joinToString(", ")})"
+                } else {
+                    "usage export unavailable — ${billing.usageExport.cause ?: "unavailable"}"
+                }
+            )
         }
         if (totals != null) {
             out.add(
@@ -188,6 +233,25 @@ data class UsagePanelModel(
 /** Exact micro-unit display of one money value, memoized by exact value. */
 fun micro(value: BigInteger): String = FormattedValues.micro(value)
 
+/** Conventional money summary: exact cents keep two decimals, sub-cent keeps four. */
+internal fun summaryUsd(value: BigInteger): String {
+    val usd = FormattedValues.usd(value)
+    return "$" + if (usd.endsWith("00")) usd.dropLast(2) else usd
+}
+
+/** Locale grouping for exact counter values (visual 3.1: 120000 -> 120,000). */
+internal fun groupedDecimal(text: String): String {
+    val negative = text.startsWith('-')
+    val digits = if (negative) text.substring(1) else text
+    if (digits.isEmpty() || digits.any { it < '0' || it > '9' }) return text
+    val out = StringBuilder()
+    for ((index, char) in digits.withIndex()) {
+        if (index > 0 && (digits.length - index) % 3 == 0) out.append(',')
+        out.append(char)
+    }
+    return (if (negative) "-" else "") + out
+}
+
 private fun utcSeconds(ms: Long): String {
     val instant = java.time.Instant.ofEpochMilli(ms)
     return instant.toString().substringBefore('.') + "Z"
@@ -207,7 +271,8 @@ fun usagePanelModelOf(
     refusalCode: String?,
     refusalReason: String?,
     cursor: String?,
-    hasPrev: Boolean
+    hasPrev: Boolean,
+    overview: NativeBillingOverview? = null
 ): UsagePanelModel {
     val canGrant = identity != null && identity.effectiveActions.contains("credits_grant")
     val grantReason = when {
@@ -215,6 +280,13 @@ fun usagePanelModelOf(
         identity == null ->
             "the control plane did not serve an identity; the granting role is unknown"
         else -> "the ${identity.role} role carries no credits_grant capability (admin only)"
+    }
+    val canManage = identity != null && identity.effectiveActions.contains("billing_write")
+    val manageReason = when {
+        canManage -> null
+        identity == null ->
+            "the control plane did not serve an identity; the owner role is unknown"
+        else -> "the ${identity.role} role carries no billing_write capability (owner only)"
     }
     val (subscription, status, expires, active) = subscriptionOf(entitlements)
     val common = UsagePanelModel(
@@ -227,6 +299,9 @@ fun usagePanelModelOf(
         subscriptionStatus = status,
         subscriptionExpiresMs = expires,
         subscriptionActive = active,
+        billing = overview,
+        canManageBilling = canManage,
+        manageDisabledReason = manageReason,
         totals = null,
         tasks = emptyList(),
         credits = null,
@@ -331,6 +406,15 @@ class UsagePanel : JPanel(BorderLayout()) {
         fun onPreviousPage()
 
         fun onGrantCredits()
+
+        /** Owner-only plan change (default: no-op for legacy callers). */
+        fun onChangePlan() {}
+
+        /** Owner-only cancellation (default: no-op for legacy callers). */
+        fun onCancelSubscription() {}
+
+        /** Bounded usage download (default: no-op for legacy callers). */
+        fun onExportUsage() {}
     }
 
     private val statusLabel = WrappedLabel("usage: -")
@@ -366,6 +450,12 @@ class UsagePanel : JPanel(BorderLayout()) {
 
     private val grantButton = primaryButton("Grant credits…")
 
+    private val exportButton = secondaryButton("Download usage…")
+
+    private val changePlanButton = secondaryButton("Change plan…")
+
+    private val cancelButton = secondaryButton("Cancel subscription…")
+
     private var listener: Listener? = null
 
     private var model: UsagePanelModel? = null
@@ -397,6 +487,8 @@ class UsagePanel : JPanel(BorderLayout()) {
         body.add(card("Current period", periodBody))
         body.add(vSpace(Spacing.M))
         body.add(actionRow(previousButton, nextButton, grantButton))
+        body.add(vSpace(Spacing.S))
+        body.add(actionRow(exportButton, changePlanButton, cancelButton))
         body.add(vSpace(Spacing.M))
         body.add(advancedToggle)
         body.add(vSpace(Spacing.XS))
@@ -407,6 +499,9 @@ class UsagePanel : JPanel(BorderLayout()) {
         previousButton.addActionListener { listener?.onPreviousPage() }
         nextButton.addActionListener { listener?.onNextPage() }
         grantButton.addActionListener { listener?.onGrantCredits() }
+        exportButton.addActionListener { listener?.onExportUsage() }
+        changePlanButton.addActionListener { listener?.onChangePlan() }
+        cancelButton.addActionListener { listener?.onCancelSubscription() }
         apply(null)
     }
 
@@ -475,6 +570,18 @@ class UsagePanel : JPanel(BorderLayout()) {
         grantButton.doClick()
     }
 
+    internal fun clickExport() {
+        exportButton.doClick()
+    }
+
+    internal fun clickChangePlan() {
+        changePlanButton.doClick()
+    }
+
+    internal fun clickCancel() {
+        cancelButton.doClick()
+    }
+
     private fun apply(value: UsagePanelModel?) {
         if (applied && model == value) return
         applied = true
@@ -492,6 +599,9 @@ class UsagePanel : JPanel(BorderLayout()) {
         previousButton.isEnabled = value?.prevEnabled() == true
         nextButton.isEnabled = value?.nextEnabled() == true
         grantButton.isEnabled = value?.grantEnabled() == true
+        exportButton.isEnabled = value?.exportEnabled() == true
+        changePlanButton.isEnabled = value?.manageEnabled() == true
+        cancelButton.isEnabled = value?.manageEnabled() == true
         // Quota breach or a non-active subscription renders as an alert
         // state (the line markers `[EXCEEDED]`/`[EXPIRED]`/`[GRACE]` stay the
         // authoritative text cue).
@@ -528,10 +638,10 @@ class UsagePanel : JPanel(BorderLayout()) {
         tokenLabel.fullText = if (tokens == null) {
             "Tokens — not reported"
         } else if (tokenQuota?.observed != null && tokenQuota.value.signum() > 0) {
-            "Tokens — " + tokens.toString() + " of " + tokenQuota.value.toString() +
-                " used this period"
+            "Tokens — " + groupedDecimal(tokens.toString()) + " of " +
+                groupedDecimal(tokenQuota.value.toString()) + " used this period"
         } else {
-            "Tokens — " + tokens.toString() + " used this period"
+            "Tokens — " + groupedDecimal(tokens.toString()) + " used this period"
         }
         val percent = tokenProgressPercent()
         if (percent != null) {
@@ -546,16 +656,16 @@ class UsagePanel : JPanel(BorderLayout()) {
         spendLabel.fullText = if (managed == null) {
             "Managed spend — not reported"
         } else if (managedQuota != null && managedQuota.value.signum() > 0) {
-            "Managed spend — " + currency(managed) + " of " + currency(managedQuota.value) +
+            "Managed spend — " + summaryUsd(managed) + " of " + summaryUsd(managedQuota.value) +
                 " this period"
         } else {
-            "Managed spend — " + currency(managed) + " this period"
+            "Managed spend — " + summaryUsd(managed) + " this period"
         }
         val credits = value.credits
         creditsLabel.fullText = if (credits == null) {
             "Credits — not reported"
         } else {
-            "Credits — " + currency(credits.balanceMicro()) + " available"
+            "Credits — " + summaryUsd(credits.balanceMicro()) + " available"
         }
         planLabel.fullText = buildString {
             append("Plan — ").append(value.planId ?: "none")
@@ -563,8 +673,31 @@ class UsagePanel : JPanel(BorderLayout()) {
                 append(" (not defined in the billing configuration)")
             }
             append(" · ").append(value.organization ?: "no organization")
-            append(" · subscription ").append(value.subscription)
+            append('\n')
+            append("Subscription — ").append(
+                value.subscription.ifEmpty { "unavailable" }
+            )
         }
-        periodLabel.fullText = "Usage for the current billing period."
+        val breach = value.quotas.firstOrNull {
+            it.exceeded == true && it.limit in setOf(
+                USAGE_LIMIT_MAX_TOKENS,
+                USAGE_LIMIT_MANAGED_SPEND,
+                USAGE_LIMIT_MIN_CREDIT
+            )
+        }
+        periodLabel.fullText = when (breach?.limit) {
+            USAGE_LIMIT_MAX_TOKENS ->
+                "Token cap exceeded — new tasks are denied until the cap or plan is raised."
+            USAGE_LIMIT_MANAGED_SPEND ->
+                "Managed spend cap exceeded — new managed tasks are denied until the cap is raised."
+            USAGE_LIMIT_MIN_CREDIT ->
+                "Credit balance is below the plan floor — credit-funded tasks are denied."
+            else -> "Usage for the current billing period."
+        }
+        periodLabel.foreground = if (breach == null) {
+            mutedForeground()
+        } else {
+            semanticForeground(SemanticState.NEGATIVE)
+        }
     }
 }

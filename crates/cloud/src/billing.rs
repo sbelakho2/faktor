@@ -46,8 +46,10 @@ pub const MAX_USAGE_REASON: usize = 1024;
 pub const MAX_SOURCE_KEY_BYTES: usize = 256;
 /// Hard page cap for usage/credit listings.
 pub const MAX_USAGE_PAGE: usize = 200;
-/// Cap on the number of events one fold reads (bounded everything: a flood
-/// past this bound refuses loudly instead of silently folding a prefix).
+/// Retained historical cap on one CALLER-PAGED pure fold. The durable read
+/// paths no longer scan events at all (the v8 billing rollups serve totals
+/// and per-task buckets), so this is not a service/entitlement ceiling: an
+/// organization past it is still admitted and its aggregate stays exact.
 pub const MAX_FOLD_EVENTS: usize = 100_000;
 /// Bound on one plan's limit table.
 pub const MAX_PLAN_LIMITS: usize = 32;
@@ -55,6 +57,28 @@ pub const MAX_PLAN_LIMITS: usize = 32;
 pub const MAX_PLAN_FEATURES: usize = 32;
 /// Bound on the configured plan table.
 pub const MAX_PLANS: usize = 64;
+
+/// Escape one CSV field for the bounded usage download: neutralize a
+/// spreadsheet formula prefix (`=`, `+`, `-`, `@`, tab, CR) with a leading
+/// quote, then apply RFC 4180 quoting (comma, quote, newline, CR) and double
+/// embedded quotes. ONE implementation is shared by the HTTP route and the
+/// local CLI so the download cannot drift between surfaces.
+pub fn csv_field(value: &str) -> String {
+    let neutral = if value
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if neutral.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", neutral.replace('"', "\"\""))
+    } else {
+        neutral
+    }
+}
 
 // ------------------------------------------------------------- vocabulary
 
@@ -276,9 +300,9 @@ impl UsageEvent {
                         "a provider-cost event carries quantity 1".into(),
                     ));
                 }
-                if self.provider_cost_micro == 0 {
+                if self.provider_cost_micro == 0 && self.correction_of.is_none() {
                     return Err(ControlPlaneError::Malformed(
-                        "a provider-cost event must carry a non-zero cost".into(),
+                        "a non-correction provider-cost event must carry a non-zero cost".into(),
                     ));
                 }
                 if self.correction_of.is_none()
@@ -322,6 +346,30 @@ impl UsageEvent {
             ));
         }
         Ok(())
+    }
+
+    /// Whether two rows describe the SAME durable usage fact (the source
+    /// key identity): everything except the projected event id. A replay of
+    /// the same durable reservation row is idempotent even though the
+    /// projection mints a fresh `uev` id; the same source key carrying a
+    /// DIFFERENT fact is a collision, never silently dropped.
+    pub fn same_fact(&self, other: &UsageEvent) -> bool {
+        self.organization_id == other.organization_id
+            && self.billing_account_id == other.billing_account_id
+            && self.task_id == other.task_id
+            && self.run_id == other.run_id
+            && self.attempt_id == other.attempt_id
+            && self.provider == other.provider
+            && self.model == other.model
+            && self.unit == other.unit
+            && self.quantity == other.quantity
+            && self.provider_cost_micro == other.provider_cost_micro
+            && self.source_operation == other.source_operation
+            && self.occurred_at_ms == other.occurred_at_ms
+            && self.reconciliation_state == other.reconciliation_state
+            && self.correction_of == other.correction_of
+            && self.category == other.category
+            && self.source_key == other.source_key
     }
 
     /// The current durable state of a base event given every event of the
@@ -385,6 +433,9 @@ impl BillingAccount {
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
     Active,
+    /// A time-bounded trial. A trialing row MUST carry `expires_ms`: an
+    /// open-ended trial would be an unbounded entitlement, not a trial.
+    Trialing,
     Expired,
     Canceled,
 }
@@ -393,6 +444,7 @@ impl SubscriptionStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             SubscriptionStatus::Active => "active",
+            SubscriptionStatus::Trialing => "trialing",
             SubscriptionStatus::Expired => "expired",
             SubscriptionStatus::Canceled => "canceled",
         }
@@ -401,6 +453,7 @@ impl SubscriptionStatus {
     pub fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "active" => SubscriptionStatus::Active,
+            "trialing" => SubscriptionStatus::Trialing,
             "expired" => SubscriptionStatus::Expired,
             "canceled" => SubscriptionStatus::Canceled,
             _ => return None,
@@ -425,12 +478,37 @@ pub struct Subscription {
 
 impl Subscription {
     pub fn is_active_at(&self, now_ms: i64) -> bool {
-        self.status == SubscriptionStatus::Active
-            && self.expires_ms.map(|e| now_ms <= e).unwrap_or(true)
+        match self.status {
+            // An active row may be open-ended.
+            SubscriptionStatus::Active => self.expires_ms.map(|e| now_ms <= e).unwrap_or(true),
+            // A trial is bounded BY CONSTRUCTION: a legacy trialing row with
+            // no expiry is NOT active (an open-ended trial would be an
+            // unbounded entitlement).
+            SubscriptionStatus::Trialing => self.expires_ms.is_some_and(|e| now_ms <= e),
+            SubscriptionStatus::Expired | SubscriptionStatus::Canceled => false,
+        }
     }
 
     pub fn validate(&self) -> Result<(), ControlPlaneError> {
-        bounded("plan id", &self.plan_id, MAX_USAGE_TEXT)
+        bounded("plan id", &self.plan_id, MAX_USAGE_TEXT)?;
+        if let Some(expires_ms) = self.expires_ms {
+            if expires_ms < 0 {
+                return Err(ControlPlaneError::Malformed(
+                    "subscription expires_ms must be >= 0".into(),
+                ));
+            }
+        }
+        if self.status == SubscriptionStatus::Trialing && self.expires_ms.is_none() {
+            return Err(ControlPlaneError::Malformed(
+                "a trialing subscription requires expires_ms".into(),
+            ));
+        }
+        if self.started_ms < 0 || self.updated_ms < 0 {
+            return Err(ControlPlaneError::Malformed(
+                "subscription timestamps must be >= 0".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -779,6 +857,123 @@ impl EntitlementSnapshot {
     }
 }
 
+// ---------------------------------------------------- billing account overview
+
+/// The typed state of one commercial capability that has no in-tree provider
+/// (payment provider, invoice store, seat billing, tax or currency). The
+/// honest state is `unavailable` plus a stable cause: no fake paid, invoiced,
+/// seated or taxed state is ever derived from a local plan row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingCapabilityState {
+    Available,
+    Unavailable,
+}
+
+/// One capability status of the billing account overview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BillingCapabilityStatus {
+    pub state: BillingCapabilityState,
+    /// The stable refusal cause when `state = unavailable`.
+    pub cause: Option<&'static str>,
+}
+
+impl BillingCapabilityStatus {
+    pub const fn available() -> Self {
+        Self {
+            state: BillingCapabilityState::Available,
+            cause: None,
+        }
+    }
+
+    pub const fn unavailable(cause: &'static str) -> Self {
+        Self {
+            state: BillingCapabilityState::Unavailable,
+            cause: Some(cause),
+        }
+    }
+}
+
+/// Stable causes of unavailable commercial capabilities.
+pub const CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED: &str = "payment_provider_not_configured";
+pub const CAUSE_PLAN_PRICES_NOT_CONFIGURED: &str = "plan_prices_not_configured";
+pub const CAUSE_SEAT_BILLING_NOT_MODELED: &str = "seat_billing_not_modeled";
+pub const CAUSE_TAX_NOT_CONFIGURED: &str = "tax_not_configured";
+pub const CAUSE_CURRENCY_NOT_CONFIGURED: &str = "currency_not_configured";
+pub const CAUSE_INVOICES_NOT_AVAILABLE: &str = "invoices_not_available";
+
+/// The derived trial view of one subscription. `state` is `none`, `active`
+/// or `expired`; a trialing row whose `expires_ms` has passed is `expired`
+/// even though the durable status still says `trialing`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BillingTrialView {
+    pub state: &'static str,
+    pub ends_ms: Option<i64>,
+}
+
+impl BillingTrialView {
+    pub fn of(subscription: Option<&Subscription>, now_ms: i64) -> Self {
+        match subscription {
+            Some(subscription) if subscription.status == SubscriptionStatus::Trialing => Self {
+                state: if subscription.is_active_at(now_ms) {
+                    "active"
+                } else {
+                    "expired"
+                },
+                ends_ms: subscription.expires_ms,
+            },
+            _ => Self {
+                state: "none",
+                ends_ms: None,
+            },
+        }
+    }
+}
+
+/// The commercial account overview (`GET /native/billing/overview`): the
+/// durable account/subscription rows plus the HONEST availability of every
+/// capability this build does not implement (payment, invoices, seats, tax,
+/// currency). It never folds usage and never infers a paid state from a
+/// local plan row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BillingOverview {
+    pub organization_id: OrganizationId,
+    pub account: Option<BillingAccount>,
+    pub plan_id: Option<String>,
+    pub plan_found: bool,
+    pub subscription: Option<Subscription>,
+    pub subscription_active: bool,
+    pub trial: BillingTrialView,
+    pub payment: BillingCapabilityStatus,
+    pub invoices: BillingCapabilityStatus,
+    pub seats: BillingCapabilityStatus,
+    pub tax: BillingCapabilityStatus,
+    pub currency: BillingCapabilityStatus,
+    /// `GET /native/usage/export` is implemented; the formats are bounded.
+    pub usage_export: BillingCapabilityStatus,
+    pub usage_export_formats: [&'static str; 2],
+    pub now_ms: i64,
+}
+
+/// The typed proration result of one plan change. Proration needs plan
+/// prices, and the plan table carries NO price by design; the change still
+/// applies immediately, but the money delta is reported unavailable instead
+/// of being invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BillingProration {
+    pub state: BillingCapabilityState,
+    pub cause: &'static str,
+}
+
+impl BillingProration {
+    pub const fn unavailable_no_prices() -> Self {
+        Self {
+            state: BillingCapabilityState::Unavailable,
+            cause: CAUSE_PLAN_PRICES_NOT_CONFIGURED,
+        }
+    }
+}
+
 /// One admission boundary. Only the first three are GATED; the continuation
 /// boundaries always admit (an entitlement change never interrupts an
 /// in-flight integration/rollback/completion transaction).
@@ -1116,13 +1311,113 @@ impl CreditEntry {
 /// at every guard built on this balance).
 pub fn fold_credits(entries: &[CreditEntry]) -> Result<CreditBalance, CreditLedgerError> {
     let mut balance = CreditBalance::default();
+    // The credit balance is ONE organization's ledger: a mixed array (a bug
+    // or a hostile seam) must be refused, never silently attributed.
+    let mut ledger_organization: Option<&OrganizationId> = None;
+    for entry in entries {
+        match ledger_organization {
+            Some(organization) if entry.organization != *organization => {
+                return Err(CreditLedgerError::Corrupt {
+                    detail: format!(
+                        "credit entry {} belongs to organization {} but the ledger is {}",
+                        entry.id, entry.organization, organization
+                    ),
+                });
+            }
+            None => ledger_organization = Some(&entry.organization),
+            _ => {}
+        }
+    }
+    // The consume rows are the only legal settle/refund targets; the fold
+    // enforces that invariant rather than silently ignoring a dangling
+    // reference (the store already refuses one at append time).
+    let mut consumes: BTreeMap<&str, (u64, &BillingAccountId)> = BTreeMap::new();
+    for entry in entries {
+        if entry.kind == CreditKind::Consume {
+            consumes.insert(
+                entry.id.as_str(),
+                (entry.amount_micro, &entry.billing_account_id),
+            );
+        }
+    }
     // Settle amounts by consume id.
     let mut settled: BTreeMap<&str, u64> = BTreeMap::new();
+    // Refund totals by consume id (a full refund of a pending consume
+    // releases its hold; the consume then stops counting as pending).
+    let mut released: BTreeMap<&str, u64> = BTreeMap::new();
     for entry in entries {
-        if entry.kind == CreditKind::Settle {
-            if let Some(reference) = &entry.reference {
-                settled.insert(reference.as_str(), entry.amount_micro);
+        match entry.kind {
+            CreditKind::Settle => {
+                if let Some(reference) = &entry.reference {
+                    let Some((_, target_account)) = consumes.get(reference.as_str()) else {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!(
+                                "settle {} names {reference}, which is not a consume",
+                                entry.id
+                            ),
+                        });
+                    };
+                    if *target_account != &entry.billing_account_id {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!(
+                                "settle {} of account {} names consume {reference} of account {}; a settle never crosses account ledgers",
+                                entry.id, entry.billing_account_id, target_account
+                            ),
+                        });
+                    }
+                    if settled
+                        .insert(reference.as_str(), entry.amount_micro)
+                        .is_some()
+                    {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!("consume {reference} was settled more than once"),
+                        });
+                    }
+                }
             }
+            CreditKind::Refund => {
+                if let Some(reference) = &entry.reference {
+                    let Some((_, target_account)) = consumes.get(reference.as_str()) else {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!(
+                                "refund {} names {reference}, which is not a consume",
+                                entry.id
+                            ),
+                        });
+                    };
+                    if *target_account != &entry.billing_account_id {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!(
+                                "refund {} of account {} names consume {reference} of account {}; a refund never crosses account ledgers",
+                                entry.id, entry.billing_account_id, target_account
+                            ),
+                        });
+                    }
+                    let sum = released.get(reference.as_str()).copied().unwrap_or(0);
+                    released.insert(
+                        reference.as_str(),
+                        checked_ledger_sum("refunded_micro", sum, entry.amount_micro)?,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    // Refunds are bounded by what the consume actually spent: its settle
+    // amount when settled, otherwise its hold. A ledger over that bound is
+    // corrupt and refuses typed (never a balance inflated by an over-refund).
+    for (reference, refunded) in &released {
+        let hold = consumes
+            .get(reference)
+            .map(|(amount, _)| *amount)
+            .unwrap_or(0);
+        let spent = settled.get(reference).copied().unwrap_or(hold);
+        if *refunded > spent {
+            return Err(CreditLedgerError::Corrupt {
+                detail: format!(
+                    "consume {reference} has {refunded} microUSD refunded against {spent} microUSD spent"
+                ),
+            });
         }
     }
     for entry in entries {
@@ -1139,15 +1434,28 @@ pub fn fold_credits(entries: &[CreditEntry]) -> Result<CreditBalance, CreditLedg
                 balance.consumed_micro =
                     checked_ledger_sum("consumed_micro", balance.consumed_micro, effective)?;
                 if !settled.contains_key(entry.id.as_str()) {
-                    balance.held_micro =
-                        checked_ledger_sum("held_micro", balance.held_micro, entry.amount_micro)?;
-                    balance.pending_consumes = balance.pending_consumes.checked_add(1).ok_or(
-                        CreditLedgerError::Overflow {
-                            field: "pending_consumes",
-                            left: balance.pending_consumes,
-                            right: 1,
-                        },
-                    )?;
+                    let released_micro = released.get(entry.id.as_str()).copied().unwrap_or(0);
+                    if released_micro > entry.amount_micro {
+                        return Err(CreditLedgerError::Corrupt {
+                            detail: format!(
+                                "pending consume {} has {released_micro} microUSD released against \
+                                 its {} microUSD hold",
+                                entry.id, entry.amount_micro
+                            ),
+                        });
+                    }
+                    let still_held = entry.amount_micro - released_micro;
+                    if still_held > 0 {
+                        balance.held_micro =
+                            checked_ledger_sum("held_micro", balance.held_micro, still_held)?;
+                        balance.pending_consumes = balance.pending_consumes.checked_add(1).ok_or(
+                            CreditLedgerError::Overflow {
+                                field: "pending_consumes",
+                                left: balance.pending_consumes,
+                                right: 1,
+                            },
+                        )?;
+                    }
                 }
             }
             CreditKind::Settle => {}
@@ -1299,6 +1607,20 @@ pub fn fold_usage(
     organization: &OrganizationId,
     events: &[UsageEvent],
 ) -> Result<UsageFold, CreditLedgerError> {
+    // Tenant isolation is a fold invariant, not a caller convention: a
+    // mixed array (a bug or a hostile seam) must never attribute another
+    // organization's usage to this one. Durable reads are already
+    // organization-scoped; this refuses the pure fold injection too.
+    for event in events {
+        if event.organization_id != *organization {
+            return Err(CreditLedgerError::Corrupt {
+                detail: format!(
+                    "usage event {} belongs to organization {} but was folded as {}",
+                    event.id, event.organization_id, organization
+                ),
+            });
+        }
+    }
     // The winning correction of each base event id: latest by
     // (occurred_at_ms, id) — the SAME order [`UsageEvent::effective_state`]
     // uses, deterministic and stable across read order.

@@ -14,6 +14,7 @@ import {
   arrayAt,
   booleanAt,
   exactNumber,
+  microExact,
   moneyMicro,
   numberAt,
   objectAt,
@@ -310,7 +311,13 @@ export function controlView(
     binding.kind === 'missing'
       ? 'Unavailable'
       : config !== null
-        ? `${jsonText(config.value)} · ${config.source} · ${config.scope}`
+        ? control.id === 'B-02' &&
+          ((typeof config.value === 'string' && /^\d+$/.test(config.value)) ||
+            (typeof config.value === 'number' && Number.isSafeInteger(config.value) && config.value >= 0))
+          ? String(config.value) === '0'
+            ? `0.00 (no limit) · ${provenanceText(config.source, config.scope)}`
+            : `${moneyMicro(config.value)} · advanced ${microExact(config.value)} · ${provenanceText(config.source, config.scope)}`
+          : `${jsonText(config.value)} · ${config.source} · ${config.scope}`
         : binding.kind === 'host'
           ? 'Host-owned'
           : binding.input === 'readonly'
@@ -338,6 +345,10 @@ export function controlView(
 
 const MAX_ROW_VALUE_CHARS = 4096;
 const MAX_ROW_LABEL_CHARS = 256;
+
+function provenanceText(source: string, scope: string): string {
+  return source === scope ? source : `${source} · ${scope}`;
+}
 
 /**
  * One served row is display DATA. A hostile/oversized daemon result is
@@ -396,6 +407,32 @@ function sessionUsageText(snapshot: E8Snapshot): string | null {
   const parts: string[] = [];
   if (tokens !== null) parts.push(`${exactNumber(tokens)} tokens`);
   if (cost !== 'Unavailable') parts.push(cost);
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
+function routeSummary(snapshot: E8Snapshot, key: 'local' | 'hosted'): string | null {
+  const route = objectAt(snapshot.usage, key);
+  if (route === null) return null;
+  const tokens = numberAt(route, 'tokens') ?? numberAt(route, 'totalTokens');
+  const cost = moneyMicro(
+    objectAt(route, 'costMicro') ?? objectAt(route, 'spentMicro') ?? null,
+  );
+  const state = text(route, 'state', 'status');
+  const parts: string[] = [];
+  if (tokens !== null) parts.push(`${exactNumber(tokens)} tokens`);
+  if (cost !== 'Unavailable') parts.push(cost);
+  if (state !== null) parts.push(state);
+  return parts.length === 0 ? 'Served; no measured counters.' : parts.join(' · ');
+}
+
+function quotaSummary(snapshot: E8Snapshot): string | null {
+  const quota = text(snapshot.entitlements, 'quota');
+  const status = text(snapshot.entitlements, 'status');
+  const plan = text(snapshot.entitlements, 'plan_id', 'planId');
+  const parts: string[] = [];
+  if (plan !== null) parts.push(plan);
+  if (quota !== null) parts.push(quota);
+  if (status !== null) parts.push(status);
   return parts.length === 0 ? null : parts.join(' · ');
 }
 
@@ -731,28 +768,68 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
       return rows;
     case 'S53':
     case 'S27':
-    case 'S54':
-      cap('spend', 'Attempted spend', moneyMicro(objectAt(snapshot.usage, 'attemptedSpendMicro') ?? objectAt(snapshot.usage, 'attempted_micro') ?? null));
-      cap('verified', 'Verified landed changes', (() => { const value = numberAt(snapshot.outcomes, 'verifiedLandedChanges') ?? numberAt(snapshot.outcomes, 'verified_landed'); return value === null ? null : exactNumber(value); })());
-      cap('vcsc', 'Cost per verified change', text(snapshot.outcomes, 'vcsc', 'vcscMicro') ?? text(snapshot.usage, 'vcsc'));
-      cap('failed', 'Failed/cancelled attempts', (() => { const value = numberAt(snapshot.outcomes, 'failedAttempts') ?? numberAt(snapshot.outcomes, 'failed'); return value === null ? null : exactNumber(value); })());
-      cap('local', 'Local routes', text(snapshot.usage, 'local'));
-      cap('hosted', 'Hosted routes', text(snapshot.usage, 'hosted'));
-      cap('quota', 'Quota', text(snapshot.entitlements, 'quota', 'status') ?? 'Unavailable');
-      cap('account', 'Account', snapshot.identity === null ? 'No account required for local work.' : text(snapshot.identity, 'organization', 'user'));
-      cap(
-        'efficiency',
-        'Efficiency effects',
-        (() => {
-          const compactions = list(snapshot.efficiency, 'compaction');
-          const cache = text(objectAt(snapshot.efficiency, 'cache'), 'state');
-          if (compactions.length === 0 && cache === null) return sourceError(snapshot, 'efficiency') ?? 'No measured effect is served.';
-          const last = compactions[0];
-          return `${compactions.length} compaction effect(s)${last === undefined ? '' : ` · last reduction ${exactNumber(numberAt(last, 'reduction') ?? 0)}`} · cache ${cache ?? 'unavailable'}`;
-        })(),
+    case 'S54': {
+      const verified = (() => {
+        const value = numberAt(snapshot.outcomes, 'verifiedLandedChanges') ?? numberAt(snapshot.outcomes, 'verified_landed');
+        return value === null ? null : exactNumber(value);
+      })();
+      const failed = (() => {
+        const value = numberAt(snapshot.outcomes, 'failedAttempts') ?? numberAt(snapshot.outcomes, 'failed');
+        return value === null ? null : exactNumber(value);
+      })();
+      const vcsc = moneyMicro(
+        text(snapshot.outcomes, 'vcsc', 'vcscMicro') ?? text(snapshot.usage, 'vcsc'),
       );
-      cap('budget', 'Task budget', text(snapshot.budget, 'state') ?? 'Unavailable');
+      const spend = moneyMicro(
+        objectAt(snapshot.usage, 'attemptedSpendMicro') ??
+          objectAt(snapshot.usage, 'attempted_micro') ??
+          null,
+      );
+      const local = routeSummary(snapshot, 'local');
+      const hosted = routeSummary(snapshot, 'hosted');
+      const quota = quotaSummary(snapshot);
+      const account =
+        snapshot.identity === null
+          ? 'No account required for local work.'
+          : text(snapshot.identity, 'organization', 'user');
+      // S54 is read-only and its contract layout is usage categories, not an
+      // outcome ledger: categories first, then the two served commercial
+      // outcomes, then account state. S53 leads with the cohort cost; S27
+      // leads with the usage summary and the calculation basis.
+      if (screenId === 'S54') {
+        cap('local', 'Local inference', local ?? 'Unavailable (not zero)');
+        cap('hosted', 'Provider API', hosted ?? 'Unavailable (not zero)');
+        cap('quota', 'Subscription quota', quota);
+        cap('gpu', 'GPU cost', 'Unavailable (not measured; never assumed zero)', 'unavailable');
+        cap('spend', 'Attempted spend', spend);
+        cap('verified', 'Verified landed changes', verified, verified === null ? 'unavailable' : 'served', 'S53');
+        cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served', 'S53');
+        cap('account', 'Account', account);
+        return rows;
+      }
+      if (screenId === 'S53') {
+        cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served');
+        cap('failed', 'Failed/cancelled attempts', failed);
+        cap('spend', 'Attempted spend (eligible)', spend);
+        cap('local', 'Local inference', local ?? 'Unavailable (not zero)');
+        cap('hosted', 'Provider API', hosted ?? 'Unavailable (not zero)');
+        cap('verified', 'Verified landed changes', verified);
+        cap('quota', 'Subscription quota', quota);
+        cap('method', 'Calculation method', 'Total eligible spend ÷ money-settled verified changes; failed and cancelled attempts stay in the total spend.');
+        return rows;
+      }
+      cap('spend', 'Attempted spend', spend);
+      cap('verified', 'Verified landed changes', verified);
+      cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served', 'S53');
+      cap('failed', 'Failed/cancelled attempts', failed);
+      cap('local', 'Local inference', local ?? 'Unavailable (not zero)');
+      cap('hosted', 'Provider API', hosted ?? 'Unavailable (not zero)');
+      cap('quota', 'Subscription quota', quota);
+      cap('gpu', 'GPU cost', 'Unavailable (not measured; never assumed zero)', 'unavailable');
+      cap('method', 'How costs are calculated', 'Total attempted spend ÷ money-settled verified changes; local inference cost is an estimate, never a zero.');
+      cap('account', 'Account', account);
       return rows;
+    }
     case 'S02':
     case 'S63':
       for (const [index, model] of list(snapshot.models, '').slice(0, 40).entries()) {

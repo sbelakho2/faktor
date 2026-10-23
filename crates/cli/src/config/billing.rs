@@ -99,7 +99,7 @@ pub struct BillingCfg {
 pub struct BillingSubscriptionCfg {
     /// The plan id; it must name one of the `[billing.plans]` entries.
     pub plan_id: String,
-    /// `active` (default), `expired` or `canceled`.
+    /// `active` (default), `trialing`, `expired` or `canceled`.
     #[serde(default)]
     pub status: Option<String>,
     /// Optional derived expiry (milliseconds since the Unix epoch). An
@@ -112,10 +112,11 @@ impl BillingSubscriptionCfg {
     pub fn status(&self) -> Result<faktor_cloud::SubscriptionStatus, String> {
         match self.status.as_deref().unwrap_or("active") {
             "active" => Ok(faktor_cloud::SubscriptionStatus::Active),
+            "trialing" => Ok(faktor_cloud::SubscriptionStatus::Trialing),
             "expired" => Ok(faktor_cloud::SubscriptionStatus::Expired),
             "canceled" => Ok(faktor_cloud::SubscriptionStatus::Canceled),
             other => Err(format!(
-                "billing subscription: unknown status {other:?} (active|expired|canceled)"
+                "billing subscription: unknown status {other:?} (active|trialing|expired|canceled)"
             )),
         }
     }
@@ -133,11 +134,14 @@ impl BillingSubscriptionCfg {
                 self.plan_id
             ));
         }
-        let _ = self.status()?;
+        let status = self.status()?;
         if let Some(expires_ms) = self.expires_ms {
             if expires_ms < 0 {
                 return Err("billing subscription: expires_ms must be >= 0".into());
             }
+        }
+        if status == faktor_cloud::SubscriptionStatus::Trialing && self.expires_ms.is_none() {
+            return Err("billing subscription: a trialing status requires expires_ms".into());
         }
         Ok(())
     }
@@ -542,12 +546,29 @@ mod tests {
             .contains("is not in the plans table"));
 
         let bad_status = enabled(&format!(
-            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"trialing"}}}}"#
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"paused"}}}}"#
         ));
         assert!(bad_status
             .validate()
             .unwrap_err()
             .contains("unknown status"));
+
+        // A trialing row is bounded: an open-ended trial is refused.
+        let trial_without_expiry = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"trialing"}}}}"#
+        ));
+        assert!(trial_without_expiry
+            .validate()
+            .unwrap_err()
+            .contains("requires expires_ms"));
+        let bounded_trial = enabled(&format!(
+            r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","status":"trialing","expires_ms":1000}}}}"#
+        ));
+        bounded_trial.validate().unwrap();
+        assert_eq!(
+            bounded_trial.subscription.unwrap().status().unwrap(),
+            faktor_cloud::SubscriptionStatus::Trialing
+        );
 
         let negative_expiry = enabled(&format!(
             r#"{{"enabled":true,"organization":"org-live","default_plan":"p",{PLAN},"subscription":{{"plan_id":"p","expires_ms":-1}}}}"#

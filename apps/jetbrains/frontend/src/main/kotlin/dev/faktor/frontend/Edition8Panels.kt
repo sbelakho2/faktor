@@ -469,6 +469,9 @@ internal class Edition8ScreenPanel(
     }
     private val retry: JButton = secondaryButton("Retry")
     private val back: JButton = secondaryButton("Back")
+
+    /** Spec S54 navigation: Account Settings… opens S55 without inventing a control. */
+    private val accountSettings: JButton = secondaryButton("Account Settings…")
     private val hint: JLabel = wrappedMutedLabel("")
     private val statusDetail: JLabel = wrappedMutedLabel("")
     private var closed = false
@@ -529,6 +532,13 @@ internal class Edition8ScreenPanel(
         apply.isVisible = false
         apply.isEnabled = false
         refreshApply()
+        accountSettings.name = "edition8-account-settings-${screen.id}"
+        accountSettings.isVisible = screen.id == "S54"
+        accountSettings.a11y(
+            "Account Settings for ${screen.title}",
+            "Opens the optional control-plane account screen (S55)."
+        )
+        accountSettings.addActionListener { navigateOr("S55") }
         back.a11y("Back from ${screen.title}", "Returns to the invoking surface with the draft intact.")
         back.addActionListener {
             if (!host.goBack()) {
@@ -719,7 +729,7 @@ internal class Edition8ScreenPanel(
     }
 
     private fun buildFooter(): JComponent {
-        val actions = wrapRow(primary, apply, back)
+        val actions = wrapRow(primary, apply, accountSettings, back)
         val column = JPanel().apply {
             isOpaque = false
             layout = BoxLayout(this, BoxLayout.Y_AXIS)

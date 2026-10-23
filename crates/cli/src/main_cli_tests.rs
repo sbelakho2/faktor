@@ -1734,3 +1734,187 @@ fn malformed_cli_arguments_refuse_before_any_filesystem_effect() {
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
 }
+
+// ------------------------------------------------ local billing CLI parity
+
+fn billing_config_file(dir: &std::path::Path, enabled: bool) -> std::path::PathBuf {
+    let path = dir.join("faktor-plus.json");
+    let body = serde_json::json!({
+        "cloud": { "enabled": true },
+        "billing": {
+            "enabled": enabled,
+            "organization": "org-cli",
+            "account": "acct-cli",
+            "account_name": "CLI",
+            "default_plan": "pro",
+            "plans": {
+                "pro": { "plan_id": "pro", "features": ["credits"], "limits": {} }
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+    path
+}
+
+fn provision_cli_billing(dir: &std::path::Path) {
+    let store =
+        Arc::new(faktor_cloud::SqliteControlPlaneStore::open(&dir.join("billing.db")).unwrap());
+    let config = faktor_cloud::BillingConfig {
+        default_plan: Some("pro".into()),
+        plans: [(
+            "pro".to_string(),
+            faktor_cloud::PlanConfig {
+                plan_id: "pro".into(),
+                features: ["credits".to_string()].into_iter().collect(),
+                limits: Default::default(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        managed_providers: Default::default(),
+    };
+    let organization = faktor_cloud::OrganizationId::try_new("org-cli").unwrap();
+    let service = faktor_cloud::EntitlementService::new_for_organization(
+        store,
+        Arc::new(faktor_cloud::SystemClock),
+        config,
+        Some(organization.clone()),
+    )
+    .unwrap();
+    service
+        .ensure_account(
+            &organization,
+            &faktor_cloud::BillingAccountId::try_new("acct-cli").unwrap(),
+            "CLI",
+            true,
+        )
+        .unwrap();
+}
+
+#[test]
+fn local_billing_cli_reaches_the_same_service_effect() {
+    use billing_cli::{BillingAction, BillingCreditsAction, BillingSubscriptionAction};
+    let dir = tempfile::tempdir().unwrap();
+    let config = billing_config_file(dir.path(), true);
+    provision_cli_billing(dir.path());
+    let data_dir = dir.path().to_path_buf();
+
+    let overview =
+        billing_cli::render(BillingAction::Overview, &data_dir, Some(config.clone())).unwrap();
+    assert_eq!(overview["billing"]["organization_id"], "org-cli");
+    assert_eq!(overview["billing"]["payment"]["state"], "unavailable");
+    assert_eq!(overview["billing"]["invoices"]["state"], "unavailable");
+    assert_eq!(overview["billing"]["usage_export"]["state"], "available");
+
+    let usage = billing_cli::render(
+        BillingAction::Usage {
+            since: None,
+            limit: Some(10),
+            format: "json".into(),
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert_eq!(usage["items"].as_array().unwrap().len(), 0);
+    let csv = billing_cli::render(
+        BillingAction::Usage {
+            since: None,
+            limit: Some(10),
+            format: "csv".into(),
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert!(csv.as_str().unwrap().starts_with("cursor,event_id,"));
+
+    // A trial requires an expiry; the valid change is durable.
+    let invalid = billing_cli::render(
+        BillingAction::Subscription {
+            action: BillingSubscriptionAction::Change {
+                plan: "pro".into(),
+                status: "trialing".into(),
+                expires_ms: None,
+            },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap_err();
+    assert!(invalid.contains("expires_ms"), "{invalid}");
+    let expires_ms = faktor_cloud::Clock::now_ms(&faktor_cloud::SystemClock) + 60_000;
+    let changed = billing_cli::render(
+        BillingAction::Subscription {
+            action: BillingSubscriptionAction::Change {
+                plan: "pro".into(),
+                status: "trialing".into(),
+                expires_ms: Some(expires_ms),
+            },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert_eq!(changed["subscription"]["status"], "trialing");
+    assert_eq!(changed["proration"]["state"], "unavailable");
+    assert_eq!(changed["billing"]["trial"]["state"], "active");
+
+    // Credit grants append once per idempotency key (CLI parity with the
+    // admin route; the local operator is the owner).
+    let granted = billing_cli::render(
+        BillingAction::Credits {
+            action: BillingCreditsAction::Grant {
+                amount_micro: 1_000_000,
+                reason: "cli seed".into(),
+                idempotency_key: Some("cli-grant".into()),
+            },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert_eq!(granted["append"], "appended");
+    assert_eq!(granted["credits"]["granted_micro"], "1000000");
+    let replayed = billing_cli::render(
+        BillingAction::Credits {
+            action: BillingCreditsAction::Grant {
+                amount_micro: 1_000_000,
+                reason: "cli seed".into(),
+                idempotency_key: Some("cli-grant".into()),
+            },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert_eq!(replayed["append"], "duplicate");
+    assert_eq!(replayed["credits"]["granted_micro"], "1000000");
+
+    // Cancellation requires the explicit confirmation.
+    let refused = billing_cli::render(
+        BillingAction::Subscription {
+            action: BillingSubscriptionAction::Cancel { confirm: false },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap_err();
+    assert!(refused.contains("--confirm"), "{refused}");
+    let canceled = billing_cli::render(
+        BillingAction::Subscription {
+            action: BillingSubscriptionAction::Cancel { confirm: true },
+        },
+        &data_dir,
+        Some(config.clone()),
+    )
+    .unwrap();
+    assert_eq!(canceled["subscription"]["status"], "canceled");
+    assert_eq!(canceled["billing"]["subscription_active"], false);
+
+    // Disabled parity: the CLI refuses before opening a database.
+    let disabled = billing_config_file(dir.path(), false);
+    let refused =
+        billing_cli::render(BillingAction::Overview, &data_dir, Some(disabled)).unwrap_err();
+    assert!(refused.contains("disabled"), "{refused}");
+}

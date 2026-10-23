@@ -24,8 +24,11 @@ import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
+import dev.faktor.shared.NativeBillingOverview
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeSubscriptionChange
+import dev.faktor.shared.NativeUsageExport
 import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativeCreditGrant
 import dev.faktor.shared.NativeEntitlementSnapshot
@@ -701,6 +704,33 @@ class FaktorFrontendService(
         reason: String? = null
     ): NativeCreditGrant =
         clientOrThrow().grantCredits(amountMicro, idempotencyKey, reason)
+
+    /** The durable commercial account overview (typed unavailable states). */
+    fun billingOverview(): NativeBillingOverview = clientOrThrow().billingOverview()
+
+    /** Owner-only plan change/cancellation (the server is the guard). */
+    fun changeSubscription(
+        action: String,
+        planId: String? = null,
+        status: String? = null,
+        expiresMs: Long? = null,
+        confirm: Boolean? = null,
+        idempotencyKey: String
+    ): NativeSubscriptionChange = clientOrThrow().changeSubscription(
+        action = action,
+        planId = planId,
+        status = status,
+        expiresMs = expiresMs,
+        confirm = confirm,
+        idempotencyKey = idempotencyKey
+    )
+
+    /** One bounded JSON download of the organization's usage ledger. */
+    fun usageExport(
+        organization: String,
+        since: String? = null,
+        limit: Long? = null
+    ): NativeUsageExport = clientOrThrow().usageExport(organization, since, limit)
 
     fun verification(): NativeVerificationView =
         clientOrThrow().verification(requireSession())

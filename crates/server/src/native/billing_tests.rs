@@ -1098,3 +1098,935 @@ async fn outcomes_foreign_organization_is_404_before_billing_disabled() {
     assert_eq!(body["error"]["code"], "billing_disabled");
     let _ = handle.request_shutdown();
 }
+
+/// The commercial account overview and the bounded usage download: typed
+/// availability, tenant isolation, strict queries and attachment headers.
+#[tokio::test]
+async fn billing_overview_and_usage_export_are_typed_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    let account = provision_account(&billing, &organization);
+    let event = faktor_cloud::UsageEvent {
+        id: faktor_cloud::UsageEventId::try_new("uev_export_1").unwrap(),
+        organization_id: organization.clone(),
+        billing_account_id: account,
+        task_id: 7,
+        run_id: "1".into(),
+        attempt_id: "a".into(),
+        provider: "managed-provider".into(),
+        model: "m".into(),
+        unit: faktor_cloud::UsageUnit::InputTokens,
+        quantity: 12,
+        provider_cost_micro: 0,
+        source_operation: "session.cost_reservation.settled".into(),
+        occurred_at_ms: NOW_MS,
+        reconciliation_state: faktor_cloud::ReconciliationState::Reconciled,
+        correction_of: None,
+        category: faktor_cloud::SpendCategory::Managed,
+        source_key: "manual:export:1".into(),
+    };
+    billing.record_usage(&event).unwrap();
+    let mut second = event.clone();
+    second.id = faktor_cloud::UsageEventId::try_new("uev_export_2").unwrap();
+    second.source_key = "manual:export:2".into();
+    billing.record_usage(&second).unwrap();
+
+    let resp = client
+        .get(format!("{base}/native/billing/overview"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["billing"]["payment"]["state"], "unavailable");
+    assert_eq!(
+        body["billing"]["payment"]["cause"],
+        faktor_cloud::CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED
+    );
+    assert_eq!(body["billing"]["invoices"]["state"], "unavailable");
+    assert_eq!(body["billing"]["seats"]["state"], "unavailable");
+    assert_eq!(body["billing"]["tax"]["state"], "unavailable");
+    assert_eq!(body["billing"]["currency"]["state"], "unavailable");
+    assert_eq!(body["billing"]["usage_export"]["state"], "available");
+    assert_eq!(
+        body["billing"]["usage_export_formats"],
+        serde_json::json!(["csv", "json"])
+    );
+
+    let resp = client
+        .get(format!("{base}/native/usage/export?org={org}&format=csv"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/csv; charset=utf-8"
+    );
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("attachment"));
+    let csv = resp.text().await.unwrap();
+    assert!(csv.starts_with("cursor,event_id,"), "{csv}");
+    assert!(csv.contains("uev_export_1"), "{csv}");
+
+    let resp = client
+        .get(format!(
+            "{base}/native/usage/export?org={org}&format=json&limit=1"
+        ))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(body["truncated"], true);
+
+    // Strict query and tenant isolation.
+    for query in ["format=xml", "limit=0", "bogus=1", "limit=5001"] {
+        let resp = client
+            .get(format!("{base}/native/usage/export?org={org}&{query}"))
+            .bearer_auth(token.as_str())
+            .header("x-faktor-control-token", &owner_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "query {query}");
+    }
+    let resp = client
+        .get(format!("{base}/native/usage/export?org=org_foreign"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// Plan change/cancel is an owner-only durable effect: the entitlement
+/// snapshot changes immediately, replay is idempotent, and proration is
+/// reported typed unavailable (plans carry no price).
+#[tokio::test]
+async fn subscription_change_is_owner_only_idempotent_and_effective() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+    billing
+        .set_subscription(&Subscription {
+            id: faktor_cloud::SubscriptionId::try_new("sub_change").unwrap(),
+            organization: organization.clone(),
+            plan_id: "pro".into(),
+            status: SubscriptionStatus::Active,
+            started_ms: 0,
+            expires_ms: None,
+            updated_ms: NOW_MS,
+        })
+        .unwrap();
+    let owner_principal = control_plane.authenticate(&owner_token).unwrap();
+    let admin_token = control_plane
+        .create_service_account(
+            &owner_principal,
+            &organization,
+            "admin",
+            faktor_cloud::Role::Admin,
+            vec![faktor_cloud::Action::BillingWrite],
+        )
+        .unwrap()
+        .token
+        .expect("issued once")
+        .expose()
+        .to_string();
+
+    // Admin is not enough: the change is owner-only.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &admin_token)
+        .header("idempotency-key", "k-admin")
+        .json(&serde_json::json!({"action": "change", "plan_id": "pro"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Missing idempotency key and strict body.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .json(&serde_json::json!({"action": "change", "plan_id": "pro"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-strict")
+        .json(&serde_json::json!({"action": "change", "plan_id": "pro", "price": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // A trial requires an expiry; a valid trial applies immediately.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-trial-no-expiry")
+        .json(&serde_json::json!({"action": "change", "plan_id": "pro", "status": "trialing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let trial_body = serde_json::json!({
+        "action": "change",
+        "plan_id": "pro",
+        "status": "trialing",
+        "expires_ms": NOW_MS + 1_000,
+    });
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-trial")
+        .json(&trial_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["replayed"], false);
+    assert_eq!(body["subscription"]["status"], "trialing");
+    assert_eq!(body["proration"]["state"], "unavailable");
+    assert_eq!(
+        body["proration"]["cause"],
+        faktor_cloud::CAUSE_PLAN_PRICES_NOT_CONFIGURED
+    );
+    assert_eq!(body["billing"]["trial"]["state"], "active");
+    assert_eq!(body["billing"]["subscription_active"], true);
+
+    // The replay is idempotent.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-trial")
+        .json(&trial_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let replay_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(replay_body["replayed"], true, "{replay_body}");
+
+    // The derived snapshot reflects the trial immediately.
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["entitlements"]["subscription_status"], "trialing");
+    assert_eq!(body["entitlements"]["subscription_active"], true);
+
+    // Cancellation requires an explicit confirmation and is effective.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-cancel-no-confirm")
+        .json(&serde_json::json!({"action": "cancel"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-cancel")
+        .json(&serde_json::json!({"action": "cancel", "confirm": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["subscription"]["status"], "canceled");
+    assert_eq!(body["billing"]["subscription_active"], false);
+    assert_eq!(body["billing"]["trial"]["state"], "none");
+
+    // Unknown plans are refused typed.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-unknown-plan")
+        .json(&serde_json::json!({"action": "change", "plan_id": "absent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "malformed");
+}
+
+/// Adversarial: role authorization precedes BOTH request-shape validation and
+/// the billing feature state. An underprivileged principal gets 403 for a
+/// malformed body/query (never 400), never learns that billing is disabled
+/// (never 409), and triggers no ingestion.
+#[tokio::test]
+async fn commercial_authorization_precedes_request_shape_and_feature_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
+        Arc::new(faktor_cloud::MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let deps = test_deps(dir.path()).with_control_plane(control_plane.clone());
+    let token = deps.auth_token.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    let owner = control_plane.authenticate(&owner_token).unwrap();
+    let viewer = control_plane
+        .create_service_account(
+            &owner,
+            &organization,
+            "viewer",
+            faktor_cloud::Role::Viewer,
+            vec![faktor_cloud::Action::RepositoryRead],
+        )
+        .unwrap()
+        .token
+        .expect("issued once")
+        .expose()
+        .to_string();
+
+    // Malformed grant body: the viewer is refused on the ROLE, not the DTO.
+    let resp = client
+        .post(format!("{base}/native/credits/grant"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &viewer)
+        .header("idempotency-key", "viewer-grant")
+        .json(&serde_json::json!({"amount_micro": "not-money"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+        "permission_denied"
+    );
+    // Malformed subscription body: same role-first refusal.
+    let resp = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &viewer)
+        .header("idempotency-key", "viewer-sub")
+        .json(&serde_json::json!({"action": 42}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    // Malformed usage limit and export format: role-first, not 400.
+    for path in [
+        format!("/native/usage?org={org}&limit=0"),
+        format!("/native/usage/export?org={org}&format=bogus"),
+    ] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token.as_str())
+            .header("x-faktor-control-token", &viewer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path} must be refused on the role");
+    }
+    // Entitlements: 403, never the billing_disabled oracle.
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &viewer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    // Control: the owner (authorized) does learn that billing is disabled.
+    let resp = client
+        .post(format!("{base}/native/credits/grant"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "owner-grant")
+        .json(&serde_json::json!({"amount_micro": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+        "billing_disabled"
+    );
+}
+
+/// Adversarial: a commercial idempotency key is request-bound. Reusing it for
+/// a DIFFERENT change is a typed 409 with the durable state unchanged, and a
+/// malformed/undefined-plan request never burns a key (so the corrected retry
+/// is not falsely replayed).
+#[tokio::test]
+async fn subscription_idempotency_key_is_request_bound_and_never_burned_by_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+    let post = |key: &'static str, body: serde_json::Value| {
+        client
+            .post(format!("{base}/native/billing/subscription"))
+            .bearer_auth(token.as_str())
+            .header("x-faktor-control-token", &owner_token)
+            .header("idempotency-key", key)
+            .json(&body)
+    };
+    let resp = post(
+        "k-bound",
+        serde_json::json!({"action": "change", "plan_id": "pro"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Same key, different request: 409, nothing applied.
+    let resp = post(
+        "k-bound",
+        serde_json::json!({"action": "change", "plan_id": "pro", "status": "expired"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+        "idempotency_conflict"
+    );
+    assert_eq!(
+        billing
+            .entitlement_snapshot(&organization)
+            .unwrap()
+            .subscription_status,
+        Some(SubscriptionStatus::Active),
+        "the conflicting request never mutated the subscription"
+    );
+    // An undefined plan is validated BEFORE the key is claimed: the
+    // corrected retry under the same key is accepted, not replayed/conflicted.
+    let resp = post(
+        "k-retry",
+        serde_json::json!({"action": "change", "plan_id": "absent"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = post(
+        "k-retry",
+        serde_json::json!({"action": "change", "plan_id": "pro", "status": "expired"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the failed validation must not burn the key"
+    );
+    assert_eq!(
+        billing
+            .entitlement_snapshot(&organization)
+            .unwrap()
+            .subscription_status,
+        Some(SubscriptionStatus::Expired)
+    );
+}
+
+/// Adversarial: a usage export is a CSV download, so formula-shaped provider/
+/// model text must be neutralized (`'=` prefix), while RFC 4180 quoting still
+/// applies. A hostile model recorded in the durable ledger can never execute
+/// when the export is opened in a spreadsheet.
+#[tokio::test]
+async fn usage_export_neutralizes_spreadsheet_formula_injection() {
+    // Pure field rules first.
+    assert_eq!(super::csv_field("=1+1"), "'=1+1");
+    assert_eq!(super::csv_field("+SUM(A1)"), "'+SUM(A1)");
+    assert_eq!(super::csv_field("-1"), "'-1");
+    assert_eq!(super::csv_field("@cmd"), "'@cmd");
+    assert_eq!(super::csv_field("a,b"), "\"a,b\"");
+    assert_eq!(super::csv_field("\"q\""), "\"\"\"q\"\"\"");
+    assert_eq!(super::csv_field("plain"), "plain");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    let account = provision_account(&billing, &organization);
+    billing
+        .record_usage(&faktor_cloud::UsageEvent {
+            id: faktor_cloud::UsageEventId::try_new("uev_csv").unwrap(),
+            organization_id: organization,
+            billing_account_id: account,
+            task_id: 7,
+            run_id: "1".into(),
+            attempt_id: "a".into(),
+            provider: "managed-provider".into(),
+            model: "=1+1".into(),
+            unit: faktor_cloud::UsageUnit::InputTokens,
+            quantity: 1,
+            provider_cost_micro: 0,
+            source_operation: "manual".into(),
+            occurred_at_ms: NOW_MS,
+            reconciliation_state: faktor_cloud::ReconciliationState::Reconciled,
+            correction_of: None,
+            category: faktor_cloud::SpendCategory::Managed,
+            source_key: "manual:csv:1".into(),
+        })
+        .unwrap();
+    let resp = client
+        .get(format!("{base}/native/usage/export?org={org}&format=csv"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let csv = resp.text().await.unwrap();
+    assert!(csv.contains("'=1+1"), "formula neutralized: {csv}");
+    assert!(!csv.contains(",=1+1,"), "raw formula never emitted: {csv}");
+}
+
+/// Adversarial: read-through ingestion is scoped to the CONFIGURED billing
+/// organization. A second, fully provisioned tenant reading `/native/usage`
+/// never claims the daemon's local session spend (cross-tenant attribution),
+/// while the configured tenant still folds it exactly.
+#[tokio::test]
+async fn read_through_ingestion_never_attributes_local_sessions_to_a_foreign_org() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
+        Arc::new(faktor_cloud::MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let (org_a, token_a) = bootstrap(&control_plane, "A", "a@a.test");
+    let (org_b, token_b) = bootstrap(&control_plane, "B", "b@b.test");
+    let organization_a = OrganizationId::try_new(org_a.clone()).unwrap();
+    let organization_b = OrganizationId::try_new(org_b.clone()).unwrap();
+    let billing = EntitlementService::new_for_organization(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+        billing_config(),
+        Some(organization_a.clone()),
+    )
+    .unwrap();
+    provision_account(&billing, &organization_a);
+    billing
+        .ensure_account(
+            &organization_b,
+            &faktor_cloud::BillingAccountId::try_new("acct_b").unwrap(),
+            "b",
+            true,
+        )
+        .unwrap();
+    let deps = test_deps(dir.path())
+        .with_control_plane(control_plane)
+        .with_billing(billing.clone());
+    let token = deps.auth_token.clone();
+    let session = deps.session.clone();
+    // One settled local reservation = real spend the configured tenant owns.
+    let ws = session.create_workspace("/w").unwrap();
+    let sess = session
+        .create_session(ws, "t", "managed-provider", "m")
+        .unwrap();
+    let task = sess
+        .create_task(faktor_session::Task {
+            task_id: sess.task_id().unwrap(),
+            session_id: sess.id(),
+            goal: "metered".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Running,
+            created_ms: NOW_MS,
+            updated_ms: NOW_MS,
+        })
+        .unwrap();
+    let store = session.store();
+    let attempt = faktor_core::op::ModelCallAttempt::new(OpId::new(1), OpId::new(2), 1).unwrap();
+    let reservation = match store
+        .cost_reserve_attempt(
+            sess.id(),
+            task.task_id,
+            &attempt,
+            1_000,
+            NOW_MS,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
+        .unwrap()
+    {
+        faktor_store::CostReserveOutcome::Granted(id) => id,
+        other => panic!("reservation refused: {other:?}"),
+    };
+    assert!(matches!(
+        store.cost_mark_dispatched(reservation, NOW_MS).unwrap(),
+        faktor_store::CostReservationState::Applied
+    ));
+    store
+        .record_provider_call_attempt(
+            sess.id(),
+            &attempt,
+            Some(reservation),
+            "managed-provider",
+            "m",
+            "completed",
+            Some(10),
+            Some(20),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        store
+            .cost_settle_usage(reservation, 10, 0, 0, 20, Some(321), None, NOW_MS)
+            .unwrap(),
+        faktor_store::CostSettleOutcome::Applied { .. }
+    ));
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let usage = |org: &str, control: &str| {
+        client
+            .get(format!("{base}/native/usage?org={org}"))
+            .bearer_auth(token.as_str())
+            .header("x-faktor-control-token", control.to_string())
+    };
+    let resp = usage(&org_a, &token_a).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(money(&body["fold"]["totals"]["provider_cost_micro"]), 321);
+    let resp = usage(&org_b, &token_b).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["fold"]["totals"]["events"].as_u64(),
+        Some(0),
+        "the foreign tenant never ingests the configured tenant's sessions: {body}"
+    );
+    assert!(
+        billing
+            .store()
+            .usage_events(&organization_b, 0, 10)
+            .unwrap()
+            .is_empty(),
+        "no cross-tenant rows were written"
+    );
+    assert!(!billing
+        .store()
+        .usage_events(&organization_a, 0, 10)
+        .unwrap()
+        .is_empty());
+}
+
+/// Adversarial: an ingestion window past the bound is a typed refusal BEFORE
+/// any write; the ledger stays byte-identical (no silently under-reported
+/// commercial prefix).
+#[tokio::test]
+async fn usage_ingestion_bound_refusal_is_typed_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let billing = billing_service();
+    let deps = test_deps(dir.path()).with_billing(billing.clone());
+    let organization = OrganizationId::try_new("org_bound").unwrap();
+    provision_account(&billing, &organization);
+    let ws = deps.session.create_workspace("/w").unwrap();
+    let _sess = deps
+        .session
+        .create_session(ws, "t", "managed-provider", "m")
+        .unwrap();
+    let state = crate::api::AppState {
+        deps: Arc::new(deps),
+        auth: Arc::new(std::sync::RwLock::new(None)),
+        terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let err = super::ingest_local_spend_with_bounds(&state, &organization, 0, 500).unwrap_err();
+    assert_eq!(err.code, "usage_ingest_truncated");
+    assert_eq!(err.http_status, 409);
+    assert!(
+        billing
+            .store()
+            .usage_events(&organization, 0, 10)
+            .unwrap()
+            .is_empty(),
+        "a bounded-window refusal wrote nothing"
+    );
+    let (appended, scanned) =
+        super::ingest_local_spend_with_bounds(&state, &organization, 2_000, 500).unwrap();
+    assert_eq!(appended, 0);
+    assert_eq!(scanned, 1);
+}
+
+/// Adversarial: once the commercial plane is wired, the org-less legacy
+/// aliases would bypass tenant scope. They require `?org=`; the pre-billing
+/// shape stays frozen when billing is disabled.
+#[tokio::test]
+async fn legacy_usage_and_outcomes_require_org_when_billing_is_wired() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _control_plane, _billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    for path in ["/native/usage", "/native/outcomes"] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{path} must require ?org=");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "org_required");
+    }
+}
+
+/// A grant may name a NON-default account of the organization: the route
+/// must resolve that exact account (not redirect the money to the first
+/// one), and an unknown/foreign account is a typed 404 with no write.
+#[tokio::test]
+async fn credits_grant_targets_a_named_account_and_never_redirects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "named@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    let default_account = provision_account(&billing, &organization);
+    let second = faktor_cloud::BillingAccountId::try_new("acct_second").unwrap();
+    billing
+        .ensure_account(&organization, &second, "second", true)
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/native/credits/grant"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-named")
+        .json(&serde_json::json!({
+            "account_id": second.as_str(),
+            "amount_micro": 750,
+            "reason": "named"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the named account is grantable");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(money(&body["credits"]["granted_micro"]), 750);
+    let entries = billing.credit_entries_page(&organization, 0, 10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry.billing_account_id, second);
+    assert_ne!(entries[0].entry.billing_account_id, default_account);
+
+    let resp = client
+        .post(format!("{base}/native/credits/grant"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-missing")
+        .json(&serde_json::json!({
+            "account_id": "acct_absent",
+            "amount_micro": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        billing
+            .credit_entries_page(&organization, 0, 10)
+            .unwrap()
+            .len(),
+        1,
+        "the refused grant wrote nothing"
+    );
+}
+
+/// A missing billing account must not burn the idempotency key: the 404
+/// happens before the claim, so a later (even different) request under the
+/// same key is not falsely a conflict for an effect that never happened.
+#[tokio::test]
+async fn missing_account_does_not_burn_the_subscription_idempotency_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "noacct@a.test");
+    let organization = OrganizationId::try_new(org).unwrap();
+
+    let denied = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-before-provision")
+        .json(&serde_json::json!({"action": "cancel", "confirm": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 404);
+
+    // Provision the account, then reuse the SAME key with a different
+    // action: it must be a fresh mutation, not a conflict with the 404.
+    provision_account(&billing, &organization);
+    let applied = client
+        .post(format!("{base}/native/billing/subscription"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner_token)
+        .header("idempotency-key", "k-before-provision")
+        .json(&serde_json::json!({"action": "change", "plan_id": "pro"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), 200);
+    let body: serde_json::Value = applied.json().await.unwrap();
+    assert_eq!(body["subscription"]["plan_id"], "pro");
+    assert_eq!(body["replayed"], false);
+}
+
+/// The request-side cacheable-prefix observation is NOT cache-read usage:
+/// the durable settled row already folds cache reads/writes into its input
+/// total. Projecting the prefix size as `cache_read_tokens` would double
+/// count every cached call in the token quota and fabricate a cache line.
+#[tokio::test]
+async fn usage_ingestion_never_counts_the_request_prefix_as_cache_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, control_token) = bootstrap(&control_plane, "A", "prefix@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+
+    let ws = session.create_workspace("/w").unwrap();
+    let sess = session
+        .create_session(ws, "t", "managed-provider", "m")
+        .unwrap();
+    let task = sess
+        .create_task(faktor_session::Task {
+            task_id: sess.task_id().unwrap(),
+            session_id: sess.id(),
+            goal: "prefix".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Running,
+            created_ms: NOW_MS,
+            updated_ms: NOW_MS,
+        })
+        .unwrap();
+    let store = session.store();
+    let attempt = faktor_core::op::ModelCallAttempt::new(OpId::new(1), OpId::new(2), 1).unwrap();
+    let reservation = match store
+        .cost_reserve_attempt(
+            sess.id(),
+            task.task_id,
+            &attempt,
+            10_000,
+            NOW_MS,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
+        .unwrap()
+    {
+        faktor_store::CostReserveOutcome::Granted(id) => id,
+        other => panic!("reservation refused: {other:?}"),
+    };
+    assert!(matches!(
+        store.cost_mark_dispatched(reservation, NOW_MS).unwrap(),
+        faktor_store::CostReservationState::Applied
+    ));
+    // The completed call carries a 64-token CACHEABLE PREFIX. Its settled
+    // input total of 100 already includes whatever cache reads occurred.
+    store
+        .record_provider_call_with_prefix_segments(
+            sess.id(),
+            OpId::new(1),
+            "managed-provider",
+            "m",
+            "completed",
+            Some(100),
+            Some(20),
+            None,
+            Some([7u8; 32]),
+            Some(64),
+            Some(1.0),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        store
+            .cost_settle_usage(reservation, 100, 0, 0, 20, Some(500), None, NOW_MS)
+            .unwrap(),
+        faktor_store::CostSettleOutcome::Applied { actual_micro: 500 }
+    ));
+
+    let resp = client
+        .get(format!("{base}/native/usage?org={org}"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &control_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let totals = &body["fold"]["totals"];
+    assert_eq!(totals["input_tokens"].as_u64(), Some(100));
+    assert_eq!(totals["output_tokens"].as_u64(), Some(20));
+    assert_eq!(
+        totals["cache_read_tokens"].as_u64(),
+        Some(0),
+        "the prefix size is not a cache-read count"
+    );
+    assert_eq!(totals["cache_write_tokens"].as_u64(), Some(0));
+    let total_tokens = totals["input_tokens"].as_u64().unwrap()
+        + totals["output_tokens"].as_u64().unwrap()
+        + totals["cache_read_tokens"].as_u64().unwrap()
+        + totals["cache_write_tokens"].as_u64().unwrap()
+        + totals["reasoning_tokens"].as_u64().unwrap();
+    assert_eq!(total_tokens, 120, "no double count: {body}");
+    assert_eq!(totals["events"].as_u64(), Some(3));
+    assert_eq!(money(&totals["provider_cost_micro"]), 500);
+}

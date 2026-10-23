@@ -139,6 +139,26 @@ impl ProviderAttemptDebits for CloudAttemptDebits {
         actual_micro: u64,
     ) -> Result<(), DebitError> {
         let entry = self.entry_id(hold)?;
+        // A zero actual spend is a FULL RELEASE, never a zero-amount settle:
+        // the credit ledger refuses zero entries by domain, and a zero
+        // settle would otherwise leave the hold pending forever (or, with a
+        // later settle, let the released hold be charged again). The agent
+        // contract (`ProviderAttemptDebits::settle`) makes the authority
+        // decide this exact translation.
+        if actual_micro == 0 {
+            let reason = format!("{}:zero_actual", attempt.reason);
+            return self
+                .service
+                .refund_consume(
+                    &self.organization,
+                    &self.account,
+                    &entry,
+                    hold.amount_micro,
+                    &reason,
+                )
+                .map(|_| ())
+                .map_err(Self::transition_error);
+        }
         self.service
             .settle_consume(
                 &self.organization,
@@ -280,6 +300,56 @@ mod tests {
             "the debt is the ACTUAL, not the estimate"
         );
         assert_eq!(balance.balance_micro().unwrap(), 740);
+    }
+
+    #[test]
+    fn zero_actual_settles_as_a_full_release_and_never_double_charges() {
+        let (service, debits) = funded(&["managed-provider"], 1_000);
+        let organization = OrganizationId::try_new("org_test").unwrap();
+        let debit = attempt("46");
+        let DebitDecision::Hold(hold) = debits.begin(&debit).unwrap() else {
+            panic!("a managed attempt must hold");
+        };
+        // A provider frame with zero measured cost must RELEASE the hold:
+        // the credit domain refuses zero-amount entries, so the authority
+        // translates a zero actual into the full-hold refund.
+        debits.settle(&debit, &hold, 0).unwrap();
+        let balance = service.credit_balance(&organization).unwrap();
+        assert_eq!(balance.pending_consumes, 0, "the hold is closed");
+        assert_eq!(balance.held_micro, 0, "nothing remains held");
+        // The gross hold remains the effective debit; the full refund funds
+        // it back (the same law as `fold_credits`). The net balance is whole.
+        assert_eq!(balance.consumed_micro, 400);
+        assert_eq!(balance.refunded_micro, 400, "the full hold is released");
+        assert_eq!(balance.balance_micro().unwrap(), 1_000);
+        // The ledger carries grant + consume + refund; there is no zero
+        // settle row (a zero entry is outside the credit domain).
+        let entries = service.credit_entries_page(&organization, 0, 10).unwrap();
+        assert!(entries
+            .iter()
+            .all(|row| row.entry.kind != faktor_cloud::CreditKind::Settle));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|row| row.entry.kind == faktor_cloud::CreditKind::Refund)
+                .count(),
+            1
+        );
+        // A second zero settle is refused: the release is terminal and the
+        // refundable remainder is zero.
+        assert!(matches!(
+            debits.settle(&debit, &hold, 0),
+            Err(DebitError::InvalidState { .. })
+        ));
+        assert_eq!(
+            service
+                .credit_balance(&organization)
+                .unwrap()
+                .balance_micro()
+                .unwrap(),
+            1_000,
+            "the refused replay wrote nothing"
+        );
     }
 
     #[test]

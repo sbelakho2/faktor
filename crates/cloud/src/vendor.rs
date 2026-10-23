@@ -292,6 +292,7 @@ impl BillingVendorAdapter {
         // fold, computed HERE and never persisted by the adapter.
         let fold = self.service.fold(organization)?;
         let totals = fold.totals.clone();
+        let tasks_truncated = fold.per_task.len() > MAX_REPORT_TASKS;
         let tasks: Vec<serde_json::Value> = fold
             .per_task
             .iter()
@@ -310,6 +311,10 @@ impl BillingVendorAdapter {
             "cursor": cursor,
             "aggregate": totals,
             "tasks": tasks,
+            // The aggregate above is complete; the per-task attribution is
+            // bounded. Saying so explicitly prevents a vendor from
+            // reconciling a truncated task list against the full total.
+            "tasks_truncated": tasks_truncated,
             "ledger_next_cursor": fold.next_cursor,
         });
         let body = serde_json::to_vec(&body).map_err(|e| {

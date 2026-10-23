@@ -2216,12 +2216,12 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL"
-statement = "An organization-scope outcome-analytics read evaluates the paid value entitlement and refuses typed (403 value_entitlement_refused naming entitlement, hook and plan) when the plan does not map it - never short-circuiting into the fold - while the org-less local read is never gated."
+statement = "An organization-scope outcome-analytics read evaluates the paid value entitlement and refuses typed (403 value_entitlement_refused naming entitlement, hook and plan) when the plan does not map it - never short-circuiting into the fold - while the org-less local read never consults the value gate: without a billing authority it keeps the frozen local shape, and with billing wired it is refused org_required before any fold (the alias would bypass tenant scope)."
 owner = "crates/server native outcomes + crates/cloud entitlements"
 authority = "crates/server/src/native/outcomes.rs check_value_entitlement(OutcomeAnalytics)"
 script_check = ""
 unit_test = "organization_outcomes_read_refuses_unentitled_plan_typed"
-production_wiring = "entitled_organization_read_answers_and_local_read_is_never_gated"
+production_wiring = "entitled_organization_read_answers_and_orgless_alias_requires_scope"
 fault = ""
 mutation_witness = "organization_outcomes_read_refuses_unentitled_plan_typed"
 mutation_command = "node scripts/mutation-run.mjs INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL"

@@ -480,8 +480,7 @@ internal open class WrappedLabel(
                 var lastBreak = -1
                 var i = 0
                 while (i < hard.length) {
-                    val ch = hard[i]
-                    if (isBreakAfter(ch)) lastBreak = i + 1
+                    if (isBreakAfter(hard, i)) lastBreak = i + 1
                     val candidate = hard.substring(start, i + 1)
                     if (candidate.isNotEmpty() && widthOf(candidate) > maxWidth && lastBreak > start) {
                         lines.add(hard.substring(start, lastBreak).trimEnd())
@@ -497,9 +496,16 @@ internal open class WrappedLabel(
             return lines
         }
 
-        private fun isBreakAfter(ch: Char): Boolean = when (ch) {
-            ' ', '\u200B', '/', '\\', '.', '-', '_', ',', ';', ':', '|' -> true
-            else -> false
+        private fun isBreakAfter(text: String, index: Int): Boolean {
+            val ch = text[index]
+            val next = text.getOrNull(index + 1)
+            // Never split an exact number at its thousands or decimal
+            // separator (visual 3.1: 120,000 and 5.00 stay copyable).
+            if ((ch == ',' || ch == '.') && next != null && next.isDigit()) return false
+            return when (ch) {
+                ' ', '\u200B', '/', '\\', '.', '-', '_', ',', ';', ':', '|' -> true
+                else -> false
+            }
         }
     }
 }

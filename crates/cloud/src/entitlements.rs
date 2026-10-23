@@ -34,22 +34,27 @@
 use std::sync::Arc;
 
 use crate::billing::{
-    fold_usage, Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingConfig,
-    CreditBalance, CreditEntry, CreditKind, CreditLedgerError, EntitlementExceeded,
-    EntitlementSnapshot, InFlightKind, InFlightTxn, ReconciliationState, SpendCategory,
-    Subscription, UsageEvent, UsageFold, UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED,
-    CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE, FEATURE_MANAGED_PROVIDERS,
-    LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+    Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingCapabilityStatus,
+    BillingConfig, BillingOverview, BillingTrialView, CreditBalance, CreditEntry, CreditKind,
+    CreditLedgerError, EntitlementExceeded, EntitlementSnapshot, InFlightKind, InFlightTxn,
+    ReconciliationState, SpendCategory, Subscription, SubscriptionStatus, UsageEvent, UsageFold,
+    UsageUnit, CAUSE_CREDITS, CAUSE_CURRENCY_NOT_CONFIGURED, CAUSE_FEATURE_MANAGED,
+    CAUSE_INVOICES_NOT_AVAILABLE, CAUSE_LEDGER_OVERFLOW, CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED,
+    CAUSE_PLAN, CAUSE_SEAT_BILLING_NOT_MODELED, CAUSE_SUBSCRIPTION_ACTIVE,
+    CAUSE_TAX_NOT_CONFIGURED, FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS,
+    LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
     LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD,
-    LIMIT_MIN_CREDIT_BALANCE_MICRO, MAX_FOLD_EVENTS, MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT,
-    UNIT_CACHE_READ_TOKENS, UNIT_CACHE_WRITE_TOKENS, UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS,
-    UNIT_PROVIDER_COST, UNIT_REASONING_TOKENS,
+    LIMIT_MIN_CREDIT_BALANCE_MICRO, MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT, UNIT_CACHE_READ_TOKENS,
+    UNIT_CACHE_WRITE_TOKENS, UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS, UNIT_PROVIDER_COST,
+    UNIT_REASONING_TOKENS,
 };
 use crate::billing_store::{
     BillingStore, CreditAppend, StoredCreditEntry, StoredUsageEvent, UsageAppend,
 };
 use crate::error::ControlPlaneError;
-use crate::ids::{BillingAccountId, CreditEntryId, InFlightTxnId, OrganizationId, UsageEventId};
+use crate::ids::{
+    BillingAccountId, CreditEntryId, InFlightTxnId, OrganizationId, SubscriptionId, UsageEventId,
+};
 use crate::service::{Clock, SystemClock};
 
 /// One durable spend row projected from the session reservation/settlement
@@ -234,12 +239,13 @@ impl EntitlementService {
             .or(default_plan);
         let plan = plan_id.as_deref().and_then(|id| self.config.plan(id));
         let credits = self.store.credit_balance(organization)?;
-        let events = self.scan_events(organization)?;
-        // The fold is CHECKED: an aggregate that leaves u64 propagates as a
-        // typed ledger failure (see `ControlPlaneError::Ledger`) instead of
-        // saturating the snapshot's spend/token totals.
-        let fold = fold_usage(organization, &events)?;
-        let total_tokens = fold.totals.total_tokens()?;
+        // The durable rollup is CHECKED exactly like the pure fold: an
+        // aggregate that leaves u64 propagates as a typed ledger failure (see
+        // `ControlPlaneError::Ledger`) instead of saturating the snapshot's
+        // spend/token totals. Serving the rollup keeps this O(1) — the
+        // historical full-ledger scan made every admission O(events).
+        let totals = self.store.usage_totals(organization)?;
+        let total_tokens = totals.total_tokens()?;
         let in_flight = self
             .store
             .in_flight(organization)?
@@ -260,8 +266,8 @@ impl EntitlementService {
             features: plan.map(|p| p.features.clone()).unwrap_or_default(),
             limits: plan.map(|p| p.limits.clone()).unwrap_or_default(),
             credits,
-            managed_spend_micro: fold.totals.managed_cost_micro,
-            byok_spend_micro: fold.totals.byok_cost_micro,
+            managed_spend_micro: totals.managed_cost_micro,
+            byok_spend_micro: totals.byok_cost_micro,
             total_tokens,
             in_flight,
             now_ms: now,
@@ -520,7 +526,22 @@ impl EntitlementService {
         managed: bool,
     ) -> Result<BillingAccount, ControlPlaneError> {
         if let Some(existing) = self.store.billing_account(organization, account)? {
-            return Ok(existing);
+            // The config is authoritative for the managed/BYOK permission
+            // and the display name; a restart after changing
+            // `billing.managed` must actually change the durable row (the
+            // account row is the only place the permission lives). The
+            // operator's `disabled` state and `created_ms` are preserved.
+            if existing.name == name && existing.managed == managed {
+                return Ok(existing);
+            }
+            let updated = BillingAccount {
+                name: name.to_string(),
+                managed,
+                ..existing
+            };
+            updated.validate()?;
+            self.store.put_billing_account(&updated)?;
+            return Ok(updated);
         }
         let row = BillingAccount {
             id: account.clone(),
@@ -542,6 +563,129 @@ impl EntitlementService {
         subscription.validate()?;
         self.store.put_subscription(subscription)?;
         Ok(())
+    }
+
+    /// The account overview of one organization. O(1) over the durable
+    /// account/subscription rows: it never folds usage and never infers a
+    /// payment/invoice/seat/tax state that no provider recorded.
+    pub fn overview(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<BillingOverview, ControlPlaneError> {
+        let now = self.now_ms();
+        let account = self
+            .store
+            .billing_accounts(organization, None, 1)?
+            .into_iter()
+            .next();
+        let subscription = self.store.subscription(organization)?;
+        let plan_id = subscription
+            .as_ref()
+            .map(|s| s.plan_id.clone())
+            .or_else(|| self.default_plan_for(organization));
+        let plan_found = plan_id
+            .as_deref()
+            .map(|id| self.config.plan(id).is_some())
+            .unwrap_or(false);
+        let subscription_active = subscription
+            .as_ref()
+            .map(|s| s.is_active_at(now))
+            .unwrap_or(false);
+        Ok(BillingOverview {
+            organization_id: organization.clone(),
+            account,
+            plan_id,
+            plan_found,
+            trial: BillingTrialView::of(subscription.as_ref(), now),
+            subscription,
+            subscription_active,
+            payment: BillingCapabilityStatus::unavailable(CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED),
+            invoices: BillingCapabilityStatus::unavailable(CAUSE_INVOICES_NOT_AVAILABLE),
+            seats: BillingCapabilityStatus::unavailable(CAUSE_SEAT_BILLING_NOT_MODELED),
+            tax: BillingCapabilityStatus::unavailable(CAUSE_TAX_NOT_CONFIGURED),
+            currency: BillingCapabilityStatus::unavailable(CAUSE_CURRENCY_NOT_CONFIGURED),
+            usage_export: BillingCapabilityStatus::available(),
+            usage_export_formats: ["csv", "json"],
+            now_ms: now,
+        })
+    }
+
+    /// Change the organization's plan (upgrade or downgrade) with an explicit
+    /// status/expiry. The effect is IMMEDIATE at the next admission boundary
+    /// (the snapshot is derived, never cached); an in-flight transaction is
+    /// never interrupted. A request that resolves the same durable row is a
+    /// replay: it returns `replayed = true` without bumping `updated_ms`.
+    pub fn change_subscription(
+        &self,
+        organization: &OrganizationId,
+        plan_id: &str,
+        status: SubscriptionStatus,
+        expires_ms: Option<i64>,
+    ) -> Result<(Subscription, bool), ControlPlaneError> {
+        if self.config.plan(plan_id).is_none() {
+            return Err(ControlPlaneError::Malformed(format!(
+                "plan {plan_id:?} is not defined in the billing plan table"
+            )));
+        }
+        if status == SubscriptionStatus::Canceled {
+            return Err(ControlPlaneError::Malformed(
+                "use the cancel action to cancel a subscription".into(),
+            ));
+        }
+        let now = self.now_ms();
+        let current = self.store.subscription(organization)?;
+        let started_ms = current.as_ref().map(|s| s.started_ms).unwrap_or(now);
+        let id = match current.as_ref() {
+            Some(existing) => existing.id.clone(),
+            None => SubscriptionId::try_new(Self::new_id("sub"))?,
+        };
+        let mut desired = Subscription {
+            id,
+            organization: organization.clone(),
+            plan_id: plan_id.to_string(),
+            status,
+            started_ms,
+            expires_ms,
+            updated_ms: now,
+        };
+        desired.validate()?;
+        let replayed = current.as_ref().is_some_and(|existing| {
+            existing.id == desired.id
+                && existing.plan_id == desired.plan_id
+                && existing.status == desired.status
+                && existing.started_ms == desired.started_ms
+                && existing.expires_ms == desired.expires_ms
+        });
+        if replayed {
+            if let Some(existing) = current {
+                desired.updated_ms = existing.updated_ms;
+            }
+        } else {
+            self.store.put_subscription(&desired)?;
+        }
+        Ok((desired, replayed))
+    }
+
+    /// Cancel the organization's subscription. Cancellation denies NEW
+    /// admissions immediately (derived at read time), while every in-flight
+    /// transaction continues. Cancelling an already-canceled row is a replay.
+    pub fn cancel_subscription(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<(Subscription, bool), ControlPlaneError> {
+        let now = self.now_ms();
+        let current = self.store.subscription(organization)?.ok_or_else(|| {
+            ControlPlaneError::NotFound("the organization has no subscription to cancel".into())
+        })?;
+        if current.status == SubscriptionStatus::Canceled {
+            return Ok((current, true));
+        }
+        let mut desired = current;
+        desired.status = SubscriptionStatus::Canceled;
+        desired.updated_ms = now;
+        desired.validate()?;
+        self.store.put_subscription(&desired)?;
+        Ok((desired, false))
     }
 
     /// One stored usage event by id, organization-scoped (a foreign id
@@ -573,8 +717,27 @@ impl EntitlementService {
     /// Record one usage event. The category is ENFORCED on write against the
     /// account: a BYOK-only account refuses managed events; a disabled or
     /// unknown account refuses everything (nothing is written).
+    ///
+    /// A correction carries `correction_of` and MUST go through
+    /// [`Self::correct_usage`]: that path enforces base existence,
+    /// tenant/identity preservation, no forks and no correction-of-a-
+    /// correction. Recording one here would silently bypass every one of
+    /// those guards (the store append is deliberately lower-level).
     pub fn record_usage(&self, event: &UsageEvent) -> Result<UsageAppend, ControlPlaneError> {
         event.validate()?;
+        if event.correction_of.is_some() {
+            return Err(ControlPlaneError::Malformed(
+                "a correction must be recorded through correct_usage (the base/reference, identity and fork guards are not optional)"
+                    .into(),
+            ));
+        }
+        self.append_validated_usage(event)
+    }
+
+    /// Append one already-validated usage event under the account's
+    /// category permission. Shared by ordinary recording and the fully
+    /// guarded correction path.
+    fn append_validated_usage(&self, event: &UsageEvent) -> Result<UsageAppend, ControlPlaneError> {
         let account = self
             .store
             .billing_account(&event.organization_id, &event.billing_account_id)?
@@ -620,6 +783,39 @@ impl EntitlementService {
                 "a correction never corrects another correction".into(),
             ));
         }
+        // A correction may change the corrected AMOUNT/quantity, but it may
+        // never retag the underlying fact: switching the provider, model,
+        // unit, category or task/run/account would let a managed cost be
+        // laundered into BYOK (erasing managed-spend quota), or move one
+        // task's spend onto another identity. The base row stays the
+        // authority for identity; only its values are corrected.
+        let mismatched: Vec<&'static str> = [
+            (
+                "organization_id",
+                base.event.organization_id != correction.organization_id,
+            ),
+            (
+                "billing_account_id",
+                base.event.billing_account_id != correction.billing_account_id,
+            ),
+            ("task_id", base.event.task_id != correction.task_id),
+            ("run_id", base.event.run_id != correction.run_id),
+            ("attempt_id", base.event.attempt_id != correction.attempt_id),
+            ("provider", base.event.provider != correction.provider),
+            ("model", base.event.model != correction.model),
+            ("unit", base.event.unit != correction.unit),
+            ("category", base.event.category != correction.category),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect();
+        if !mismatched.is_empty() {
+            return Err(ControlPlaneError::Conflict(format!(
+                "correction of usage event {base_id} must preserve the base fact; mismatched \
+                 field(s): {} (a correction changes the amount, never the identity/category)",
+                mismatched.join(", ")
+            )));
+        }
         if self
             .store
             .correction_exists(&correction.organization_id, base_id.as_str())?
@@ -628,7 +824,7 @@ impl EntitlementService {
                 "usage event {base_id} was already corrected (corrections are append-only, not forks)"
             )));
         }
-        self.record_usage(correction)
+        self.append_validated_usage(correction)
     }
 
     /// Project one durable spend row into the usage ledger. Deterministic and
@@ -643,6 +839,13 @@ impl EntitlementService {
         row: &DurableSpendRow,
         provider_category: SpendCategory,
     ) -> Result<IngestReport, ControlPlaneError> {
+        if row.organization_id != organization.as_str() {
+            return Err(ControlPlaneError::Malformed(format!(
+                "durable spend row names organization {:?} but is being ingested into {:?} \
+                 (a row is never attributed to another tenant)",
+                row.organization_id, organization
+            )));
+        }
         if row.reservation_id <= 0 {
             return Err(ControlPlaneError::Malformed(
                 "a durable spend row must carry a positive reservation id".into(),
@@ -758,13 +961,12 @@ impl EntitlementService {
 
     /// Fold one organization's usage ledger: org totals plus per-task rows
     /// (inputs/outputs/cache/reasoning tokens, provider cost, managed vs
-    /// BYOK spend). The scan is bounded; a flood past the bound refuses
-    /// loudly instead of folding a prefix. Every aggregate is checked: a
-    /// total that leaves the `u64` domain propagates the typed
+    /// BYOK spend). Durable stores serve the maintained rollup (O(tasks),
+    /// never a full-ledger scan). Every aggregate is checked: a total that
+    /// leaves the `u64` domain propagates the typed
     /// [`ControlPlaneError::Ledger`] (never a saturated `u64::MAX`).
     pub fn fold(&self, organization: &OrganizationId) -> Result<UsageFold, ControlPlaneError> {
-        let events = self.scan_events(organization)?;
-        Ok(fold_usage(organization, &events)?)
+        Ok(self.store.usage_fold(organization)?)
     }
 
     /// The durable fold total of one organization: managed spend (used by
@@ -773,34 +975,7 @@ impl EntitlementService {
         &self,
         organization: &OrganizationId,
     ) -> Result<u64, ControlPlaneError> {
-        Ok(self.fold(organization)?.totals.managed_cost_micro)
-    }
-
-    fn scan_events(
-        &self,
-        organization: &OrganizationId,
-    ) -> Result<Vec<UsageEvent>, ControlPlaneError> {
-        let mut events = Vec::new();
-        let mut cursor = 0i64;
-        loop {
-            let page =
-                self.store
-                    .usage_events(organization, cursor, crate::billing::MAX_USAGE_PAGE)?;
-            if page.is_empty() {
-                break;
-            }
-            let last = page.last().map(|row| row.event_seq).unwrap_or(cursor);
-            for row in page {
-                events.push(row.event);
-            }
-            if events.len() > MAX_FOLD_EVENTS {
-                return Err(ControlPlaneError::Conflict(format!(
-                    "usage fold of organization {organization} exceeds the {MAX_FOLD_EVENTS}-event bound; refusing to fold a prefix"
-                )));
-            }
-            cursor = last;
-        }
-        Ok(events)
+        Ok(self.store.usage_totals(organization)?.managed_cost_micro)
     }
 
     // --------------------------------------------------------------- credits
@@ -933,6 +1108,38 @@ impl EntitlementService {
     ) -> Result<CreditAppend, ControlPlaneError> {
         if let Some(key) = idempotency_key {
             crate::service::ControlPlane::validate_idempotency_key(key)?;
+        }
+        // Every credit entry must name an account that REALLY belongs to
+        // this organization: a foreign/unknown account id would attach the
+        // entry to another tenant's ledger identity, and settling/refunding
+        // a reference across accounts would move money between accounts.
+        let account_row = self
+            .store
+            .billing_account(organization, account)?
+            .ok_or_else(|| {
+                ControlPlaneError::NotFound(format!(
+                    "billing account {account} of organization {organization}"
+                ))
+            })?;
+        // A disabled account may still close existing holds (settle/refund)
+        // but can never open new funding or spend.
+        if account_row.disabled && matches!(kind, CreditKind::Grant | CreditKind::Consume) {
+            return Err(ControlPlaneError::Conflict(format!(
+                "billing account {account} is disabled: refusing a new {} entry",
+                kind.as_str()
+            )));
+        }
+        // A managed pre-call hold is spend. A BYOK-only account
+        // (`managed = false`) is the durable statement that Faktor-managed
+        // spend is not permitted for it, so it can never open a hold — even
+        // when the provider is in the configured managed set. Without this
+        // check the hold debits credits and the call dispatches, while the
+        // later usage write is refused by `record_usage`: a paid call with no
+        // recorded usage and a stranded debit.
+        if kind == CreditKind::Consume && !account_row.permits(SpendCategory::Managed) {
+            return Err(ControlPlaneError::Conflict(format!(
+                "billing account {account} is BYOK-only (managed=false): refusing a managed credit hold"
+            )));
         }
         let entry = CreditEntry {
             id: CreditEntryId::try_new(Self::new_id("crd"))?,

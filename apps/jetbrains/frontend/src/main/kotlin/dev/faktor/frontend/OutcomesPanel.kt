@@ -21,6 +21,7 @@ import dev.faktor.shared.ProtocolOutcomesPage
 import dev.faktor.shared.ProtocolRunOutcome
 import dev.faktor.shared.ProtocolValueEntitlementsReport
 import java.awt.BorderLayout
+import java.awt.Font
 import java.math.BigInteger
 import javax.swing.BoxLayout
 import javax.swing.JPanel
@@ -514,8 +515,28 @@ private fun moneyGlyph(metrics: ProtocolOutcomeMetrics): BigInteger? {
 /** Exact micro-USD display: `$1234.5678 · 1234567890µ$` (never scientific). */
 internal fun moneyText(micro: String): String {
     val value = MicroMoney.parseDecimal(micro) ?: return OUTCOMES_NOT_MEASURED
-    return "$" + FormattedValues.usd(value) + " \u00b7 " + FormattedValues.micro(value)
+    val usd = FormattedValues.usd(value)
+    // Four-decimal USD underflows sub-100µ$ values to $0.0000; say so rather
+    // than presenting real spend as free. The exact micro value stays beside it.
+    val display = if (value.signum() > 0 && usd == "0.0000") "under $0.0001" else "\$$usd"
+    return display + " \u00b7 " + FormattedValues.micro(value)
 }
+
+/** Compact exact display of a ledger money value: $45.00 · 45,000,000µ$. */
+internal fun compactMoneyText(value: String): String {
+    val match = Regex("^\\$([0-9]+\\.[0-9]{2})00 \\u00b7 ([0-9]+)\\u00b5\\$$").find(value)
+        ?: return value
+    return "$" + match.groupValues[1] + " \u00b7 " +
+        groupedDecimal(match.groupValues[2]) + "\u00b5$"
+}
+
+/** Grouped count that never narrows a u64 counter to Int. */
+internal fun countText(value: Long, singular: String): String =
+    if (value > Int.MAX_VALUE) {
+        groupedDecimal(value.toString()) + " " + singular + "s"
+    } else {
+        plural(value.toInt(), singular)
+    }
 
 /**
  * Exact floor-ppm percent with four decimals (`333333` ppm -> `33.3333%`).
@@ -547,6 +568,9 @@ class OutcomesPanel : JPanel(BorderLayout()) {
      */
     private val entitlementsLabel = wrappedMutedLabel("")
 
+    /** S53 cohort header: verified denominator, run count, scan bound, window. */
+    private val cohortSummaryLabel = WrappedLabel("")
+
     private val truncatedLabel = WrappedLabel("")
 
     private val metricsColumn = ScrollableColumn()
@@ -560,6 +584,9 @@ class OutcomesPanel : JPanel(BorderLayout()) {
     private val explainToggle = secondaryButton("Explain metric")
 
     private val refreshButton = secondaryButton("Refresh")
+
+    /** The unavailable card needs its own Refresh: a Swing component has one parent. */
+    private val unavailableRefreshButton = secondaryButton("Refresh")
 
     private val olderButton = secondaryButton("Older runs")
 
@@ -597,12 +624,15 @@ class OutcomesPanel : JPanel(BorderLayout()) {
             repaint()
         }
         refreshButton.addActionListener { listener?.onRefresh() }
+        unavailableRefreshButton.addActionListener { listener?.onRefresh() }
         olderButton.addActionListener { listener?.onOlderPage() }
         viewDetailsButton.addActionListener { listener?.onViewDetails() }
         val metricsBody = pageColumn(gap = Spacing.XS, padding = 0)
+        metricsBody.add(cohortSummaryLabel)
+        // Refresh/explain stay reachable without scrolling past 15 ledger rows.
+        metricsBody.add(actionRow(explainToggle, refreshButton))
         metricsBody.add(truncatedLabel)
         metricsBody.add(metricsColumn)
-        metricsBody.add(actionRow(explainToggle, refreshButton))
         val cohortBody = pageColumn(gap = Spacing.XS, padding = 0)
         cohortBody.add(cohortColumn)
         val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
@@ -620,7 +650,7 @@ class OutcomesPanel : JPanel(BorderLayout()) {
         unavailableBody.add(unavailableCopy)
         unavailableBody.add(unavailableReason)
         unavailableBody.add(vSpace(Spacing.XS))
-        unavailableBody.add(actionRow(viewDetailsButton, refreshButton))
+        unavailableBody.add(actionRow(viewDetailsButton, unavailableRefreshButton))
         unavailableCard.isOpaque = false
         unavailableCard.add(unavailableBody, BorderLayout.NORTH)
         val contentScroll = pageScroll(content)
@@ -665,8 +695,11 @@ class OutcomesPanel : JPanel(BorderLayout()) {
         }
         statusLabel.text = when {
             value == null -> "outcomes: not read yet"
-            value.state == "ok" -> "outcomes: " + plural(value.metricRows.size, "metric") +
-                " · " + plural(value.runRows.size, "run") +
+            value.state == "ok" -> "outcomes: " +
+                (value.metrics?.let { countText(it.verifiedChanges, "verified change") + " · " }
+                    ?: "") +
+                plural(value.metricRows.size, "metric") +
+                " · " + plural(value.runRows.size, "run on this page") +
                 if (value.truncated) " · [TRUNCATED]" else ""
             value.state == "unavailable" -> "outcomes: cost unavailable" +
                 (value.refusalCode?.let { " [" + it + "]" } ?: "")
@@ -694,17 +727,40 @@ class OutcomesPanel : JPanel(BorderLayout()) {
                     "records are excluded from every metric"
             else -> "the fold scanned ${value.scanned} record(s) (no truncation)"
         }
+        val metrics = value?.metrics
+        cohortSummaryLabel.fullText = when {
+            value == null || value.state != "ok" -> ""
+            metrics == null -> "Cohort: no outcome metrics are served."
+            else ->
+                "Cohort: " + countText(metrics.verifiedChanges, "verified change") +
+                    " · " + groupedDecimal(metrics.verifiedChangesMoneyComplete.toString()) +
+                    " money-settled · " + countText(metrics.runs, "run") + " recorded" +
+                    " · " + groupedDecimal(value.scanned.toString()) + " scanned record(s)" +
+                    " · time window not served"
+        }
         for (row in value?.metricRows.orEmpty()) {
+            // Compact ledger rows: one name/value line plus one basis line.
+            // Fifteen padded cards pushed the actions and the cohort summary
+            // below the fold at 480px and repeated the same card chrome.
+            val nameLabel = WrappedLabel(row.name).apply {
+                font = uiPanelFont().deriveFont(Font.BOLD)
+                foreground = textForeground()
+            }
+            val shownValue = compactMoneyText(row.value)
+            val valueLabel = WrappedLabel(shownValue).apply {
+                font = uiPanelFont().deriveFont(Font.BOLD)
+                foreground = textForeground()
+            }
+            nameLabel.a11y("${row.name}: $shownValue", row.detail)
+            valueLabel.a11y("${row.name} value", shownValue)
             val body = pageColumn(gap = Spacing.XS, padding = 0)
-            body.add(sectionHeader(row.name, muted = false))
-            val valueLabel = WrappedLabel(row.value)
-            valueLabel.font = sectionTitleFont()
+            body.add(nameLabel)
             body.add(valueLabel)
             body.add(wrappedMutedLabel(row.detail))
             if (explainExpanded) {
                 body.add(wrappedMutedLabel(row.explanation))
             }
-            metricsColumn.add(card(null, body))
+            metricsColumn.add(body)
             metricsColumn.add(vSpace(Spacing.S))
         }
         metricsColumn.revalidate()

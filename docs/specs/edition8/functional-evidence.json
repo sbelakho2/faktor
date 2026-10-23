@@ -73,7 +73,7 @@
           "live": {
             "test_id": "control.exercise.M-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-01",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -81,7 +81,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -142,7 +142,7 @@
           "live": {
             "test_id": "control.exercise.M-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -150,7 +150,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -189,7 +189,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3942,
+            "line": 4137,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'M-03': {"
           },
@@ -211,7 +211,7 @@
           "live": {
             "test_id": "control.exercise.M-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-03",
-            "observed": "effective: Host — Favorites and recent models",
+            "observed": "effective: Host \u2014 Favorites and recent models",
             "passed": true
           }
         },
@@ -219,7 +219,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3942,
+            "line": 4137,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'M-03': {"
           },
@@ -280,7 +280,7 @@
           "live": {
             "test_id": "control.exercise.M-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-04",
-            "observed": "effective: Read — /native/capabilities",
+            "observed": "effective: Read \u2014 /native/capabilities",
             "passed": true
           }
         },
@@ -349,7 +349,7 @@
           "live": {
             "test_id": "control.exercise.M-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-05",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -357,7 +357,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1042,
+            "line": 1052,
             "note": "Daemon route POST /native/presets/:id/roles.",
             "line_text": "            \"/native/presets/{id}/roles\","
           },
@@ -418,7 +418,7 @@
           "live": {
             "test_id": "control.exercise.M-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-06",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -426,7 +426,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1046,
+            "line": 1056,
             "note": "Daemon route POST /native/presets/:id/fallback.",
             "line_text": "            \"/native/presets/{id}/fallback\","
           },
@@ -487,7 +487,7 @@
           "live": {
             "test_id": "control.exercise.M-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-07",
-            "observed": "effective: Read — /native/models",
+            "observed": "effective: Read \u2014 /native/models",
             "passed": true
           }
         },
@@ -556,7 +556,7 @@
           "live": {
             "test_id": "control.exercise.M-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-08",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -564,7 +564,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1051,
+            "line": 1061,
             "note": "Daemon route POST /native/catalog/probe.",
             "line_text": "            \"/native/catalog/probe\","
           },
@@ -625,7 +625,7 @@
           "live": {
             "test_id": "control.exercise.M-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-09",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -633,7 +633,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -694,7 +694,7 @@
           "live": {
             "test_id": "control.exercise.M-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-10",
-            "observed": "effective: Read — /native/capabilities",
+            "observed": "effective: Read \u2014 /native/capabilities",
             "passed": true
           }
         },
@@ -763,7 +763,7 @@
           "live": {
             "test_id": "control.exercise.M-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-11",
-            "observed": "effective: Read — /native/call-receipts?session=:session&limit=50",
+            "observed": "effective: Read \u2014 /native/call-receipts?session=:session&limit=50",
             "passed": true
           }
         },
@@ -771,7 +771,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 778,
+            "line": 776,
             "note": "Daemon route GET /native/call-receipts?session=:session&limit=50.",
             "line_text": "        .route("
           },
@@ -832,7 +832,7 @@
           "live": {
             "test_id": "control.exercise.M-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-12",
-            "observed": "effective: Read — /native/config/provenance?limit=500",
+            "observed": "effective: Read \u2014 /native/config/provenance?limit=500",
             "passed": true
           }
         },
@@ -840,7 +840,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1000,
+            "line": 1010,
             "note": "Daemon route GET /native/config/provenance?limit=500.",
             "line_text": "            \"/native/config/provenance\","
           },
@@ -901,7 +901,7 @@
           "live": {
             "test_id": "control.exercise.M-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-13",
-            "observed": "effective: Read — /native/usage",
+            "observed": "effective: Read \u2014 /native/usage",
             "passed": true
           }
         },
@@ -970,7 +970,7 @@
           "live": {
             "test_id": "control.exercise.M-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -978,7 +978,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1283,
+            "line": 1293,
             "note": "Daemon route POST /native/session/:session/tournament.",
             "line_text": "            \"/native/session/{id}/tournament\","
           },
@@ -1039,7 +1039,7 @@
           "live": {
             "test_id": "control.exercise.P-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-01",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1047,7 +1047,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1109,7 +1109,7 @@
           "live": {
             "test_id": "control.exercise.P-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-02",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1117,7 +1117,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1179,7 +1179,7 @@
           "live": {
             "test_id": "control.exercise.P-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-03",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1187,7 +1187,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1249,7 +1249,7 @@
           "live": {
             "test_id": "control.exercise.P-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-04",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1257,7 +1257,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1319,7 +1319,7 @@
           "live": {
             "test_id": "control.exercise.P-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-05",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1327,7 +1327,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1389,7 +1389,7 @@
           "live": {
             "test_id": "control.exercise.P-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-06",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1397,7 +1397,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1459,7 +1459,7 @@
           "live": {
             "test_id": "control.exercise.P-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-07",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1467,7 +1467,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1529,7 +1529,7 @@
           "live": {
             "test_id": "control.exercise.P-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-08",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -1537,7 +1537,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -1599,7 +1599,7 @@
           "live": {
             "test_id": "control.exercise.P-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-09",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -1607,7 +1607,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -1669,7 +1669,7 @@
           "live": {
             "test_id": "control.exercise.P-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-10",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1677,7 +1677,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 749,
+            "line": 750,
             "note": "Daemon route POST /native/providers/connections/:id/test.",
             "line_text": "        .route("
           },
@@ -1739,7 +1739,7 @@
           "live": {
             "test_id": "control.exercise.P-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-11",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1747,7 +1747,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1809,7 +1809,7 @@
           "live": {
             "test_id": "control.exercise.P-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-12",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1817,7 +1817,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -1879,7 +1879,7 @@
           "live": {
             "test_id": "control.exercise.P-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-13",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -1887,7 +1887,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1063,
+            "line": 1073,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -1949,7 +1949,7 @@
           "live": {
             "test_id": "control.exercise.P-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1957,7 +1957,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 762,
+            "line": 763,
             "note": "Daemon route POST /native/providers/credentials/rotate.",
             "line_text": "        .route("
           },
@@ -2019,7 +2019,7 @@
           "live": {
             "test_id": "control.exercise.P-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-15",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -2027,7 +2027,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 740,
+            "line": 738,
             "note": "Daemon route POST /native/providers/connections.",
             "line_text": "        .route("
           },
@@ -2089,7 +2089,7 @@
           "live": {
             "test_id": "control.exercise.G-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-01",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2097,7 +2097,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2156,7 +2156,7 @@
           "live": {
             "test_id": "control.exercise.G-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-02",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2164,7 +2164,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2223,7 +2223,7 @@
           "live": {
             "test_id": "control.exercise.G-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-03",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -2231,7 +2231,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2290,7 +2290,7 @@
           "live": {
             "test_id": "control.exercise.G-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-04",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -2298,7 +2298,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2357,7 +2357,7 @@
           "live": {
             "test_id": "control.exercise.G-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-05",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -2365,7 +2365,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -2424,7 +2424,7 @@
           "live": {
             "test_id": "control.exercise.G-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-06",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2432,7 +2432,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2491,7 +2491,7 @@
           "live": {
             "test_id": "control.exercise.G-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-07",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2499,7 +2499,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2558,7 +2558,7 @@
           "live": {
             "test_id": "control.exercise.G-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-08",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2566,7 +2566,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2625,7 +2625,7 @@
           "live": {
             "test_id": "control.exercise.G-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-09",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2633,7 +2633,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2692,7 +2692,7 @@
           "live": {
             "test_id": "control.exercise.G-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-10",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2700,7 +2700,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2759,7 +2759,7 @@
           "live": {
             "test_id": "control.exercise.G-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-11",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2767,7 +2767,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2826,7 +2826,7 @@
           "live": {
             "test_id": "control.exercise.G-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-12",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2834,7 +2834,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2893,7 +2893,7 @@
           "live": {
             "test_id": "control.exercise.G-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-13",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2901,7 +2901,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -2960,7 +2960,7 @@
           "live": {
             "test_id": "control.exercise.G-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-14",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2968,7 +2968,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 774,
+            "line": 772,
             "note": "Daemon route POST /native/model-parameters/compile.",
             "line_text": "        .route("
           },
@@ -3027,7 +3027,7 @@
           "live": {
             "test_id": "control.exercise.A-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-01",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3035,7 +3035,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "            \"/native/presets\","
           },
@@ -3095,7 +3095,7 @@
           "live": {
             "test_id": "control.exercise.A-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-02",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3103,7 +3103,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3163,7 +3163,7 @@
           "live": {
             "test_id": "control.exercise.A-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-03",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3171,7 +3171,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3231,7 +3231,7 @@
           "live": {
             "test_id": "control.exercise.A-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-04",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3239,7 +3239,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3299,7 +3299,7 @@
           "live": {
             "test_id": "control.exercise.A-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-05",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3307,7 +3307,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3367,7 +3367,7 @@
           "live": {
             "test_id": "control.exercise.A-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-06",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3375,7 +3375,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "            \"/native/presets\","
           },
@@ -3435,7 +3435,7 @@
           "live": {
             "test_id": "control.exercise.A-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-07",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3443,7 +3443,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3503,7 +3503,7 @@
           "live": {
             "test_id": "control.exercise.A-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-08",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3511,7 +3511,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route POST /native/presets.",
             "line_text": "            \"/native/presets\","
           },
@@ -3571,7 +3571,7 @@
           "live": {
             "test_id": "control.exercise.A-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-09",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3579,7 +3579,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 652,
+            "line": 651,
             "note": "Daemon route POST /native/agents/:child/budget.",
             "line_text": "        .route("
           },
@@ -3639,7 +3639,7 @@
           "live": {
             "test_id": "control.exercise.A-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-10",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3647,7 +3647,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 640,
+            "line": 650,
             "note": "Daemon route POST /native/agents/:child/pause.",
             "line_text": "        .route(\"/native/agents/{child_id}/pause\", post(native_agent_pause))"
           },
@@ -3707,7 +3707,7 @@
           "live": {
             "test_id": "control.exercise.A-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-11",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3715,7 +3715,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 639,
+            "line": 649,
             "note": "Daemon route GET /native/agents.",
             "line_text": "        .route(\"/native/agents\", get(native_agents))"
           },
@@ -3775,7 +3775,7 @@
           "live": {
             "test_id": "control.exercise.A-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-12",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3783,7 +3783,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1030,
+            "line": 1040,
             "note": "Daemon route GET /native/presets?limit=200.",
             "line_text": "            \"/native/presets\","
           },
@@ -3843,7 +3843,7 @@
           "live": {
             "test_id": "control.exercise.C-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-01",
-            "observed": "effective: Read — /native/context/manifests?session=:session",
+            "observed": "effective: Read \u2014 /native/context/manifests?session=:session",
             "passed": true
           }
         },
@@ -3851,7 +3851,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 794,
+            "line": 792,
             "note": "Daemon route GET /native/context/manifests?session=:session.",
             "line_text": "        .route("
           },
@@ -3908,7 +3908,7 @@
           "live": {
             "test_id": "control.exercise.C-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-02",
-            "observed": "effective: Read — /native/context/manifests?session=:session",
+            "observed": "effective: Read \u2014 /native/context/manifests?session=:session",
             "passed": true
           }
         },
@@ -3916,7 +3916,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 794,
+            "line": 792,
             "note": "Daemon route GET /native/context/manifests?session=:session.",
             "line_text": "        .route("
           },
@@ -3973,7 +3973,7 @@
           "live": {
             "test_id": "control.exercise.C-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-03",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -3981,7 +3981,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 782,
+            "line": 780,
             "note": "Daemon route POST /native/session/:session/context/preview.",
             "line_text": "        .route("
           },
@@ -4015,7 +4015,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3947,
+            "line": 4142,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'C-04': {"
           },
@@ -4037,7 +4037,7 @@
           "live": {
             "test_id": "control.exercise.C-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-04",
-            "observed": "effective: Host — Current editor context",
+            "observed": "effective: Host \u2014 Current editor context",
             "passed": true
           }
         },
@@ -4045,7 +4045,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3947,
+            "line": 4142,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'C-04': {"
           },
@@ -4101,7 +4101,7 @@
           "live": {
             "test_id": "control.exercise.C-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-05",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4109,7 +4109,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1259,
+            "line": 1269,
             "note": "Daemon route POST /native/session/:session/attachments.",
             "line_text": "            \"/native/session/{id}/attachments\","
           },
@@ -4166,7 +4166,7 @@
           "live": {
             "test_id": "control.exercise.C-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-06",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4174,7 +4174,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1259,
+            "line": 1269,
             "note": "Daemon route POST /native/session/:session/attachments.",
             "line_text": "            \"/native/session/{id}/attachments\","
           },
@@ -4230,7 +4230,7 @@
           "live": {
             "test_id": "control.exercise.C-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-07",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4238,7 +4238,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1095,
+            "line": 1105,
             "note": "Daemon route POST /native/session/:session/context/pins.",
             "line_text": "            \"/native/session/{id}/context/pins\","
           },
@@ -4300,7 +4300,7 @@
           "live": {
             "test_id": "control.exercise.C-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-08",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4308,7 +4308,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4370,7 +4370,7 @@
           "live": {
             "test_id": "control.exercise.C-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-09",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -4378,7 +4378,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4440,7 +4440,7 @@
           "live": {
             "test_id": "control.exercise.C-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-10",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -4448,7 +4448,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4510,7 +4510,7 @@
           "live": {
             "test_id": "control.exercise.C-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-11",
-            "observed": "effective: Read — /native/index/coverage?session=:session",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=:session",
             "passed": true
           }
         },
@@ -4518,7 +4518,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1320,
+            "line": 1330,
             "note": "Daemon route GET /native/index/coverage?session=:session.",
             "line_text": "        .route(\"/native/index/coverage\", get(native_index_coverage))"
           },
@@ -4580,7 +4580,7 @@
           "live": {
             "test_id": "control.exercise.C-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-12",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4588,7 +4588,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 782,
+            "line": 780,
             "note": "Daemon route POST /native/session/:session/context/preview.",
             "line_text": "        .route("
           },
@@ -4650,7 +4650,7 @@
           "live": {
             "test_id": "control.exercise.C-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-13",
-            "observed": "effective: Read — /native/context/manifest?session=:session",
+            "observed": "effective: Read \u2014 /native/context/manifest?session=:session",
             "passed": true
           }
         },
@@ -4658,7 +4658,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 790,
+            "line": 788,
             "note": "Daemon route GET /native/context/manifest?session=:session.",
             "line_text": "        .route("
           },
@@ -4720,7 +4720,7 @@
           "live": {
             "test_id": "control.exercise.C-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-14",
-            "observed": "effective: Read — /native/context/export?session=:session",
+            "observed": "effective: Read \u2014 /native/context/export?session=:session",
             "passed": true
           }
         },
@@ -4728,7 +4728,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1100,
+            "line": 1110,
             "note": "Daemon route GET /native/context/export?session=:session.",
             "line_text": "        .route(\"/native/context/export\", get(r8::native_context_export))"
           },
@@ -4790,7 +4790,7 @@
           "live": {
             "test_id": "control.exercise.K-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-01",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -4798,7 +4798,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -4858,7 +4858,7 @@
           "live": {
             "test_id": "control.exercise.K-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-02",
-            "observed": "effective: Read — /native/semantic/status",
+            "observed": "effective: Read \u2014 /native/semantic/status",
             "passed": true
           }
         },
@@ -4926,7 +4926,7 @@
           "live": {
             "test_id": "control.exercise.K-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-03",
-            "observed": "effective: Read — /native/semantic/status",
+            "observed": "effective: Read \u2014 /native/semantic/status",
             "passed": true
           }
         },
@@ -4990,7 +4990,7 @@
           "live": {
             "test_id": "control.exercise.K-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-04",
-            "observed": "effective: Read — /native/session/:session/context/compaction",
+            "observed": "effective: Read \u2014 /native/session/:session/context/compaction",
             "passed": true
           }
         },
@@ -5054,7 +5054,7 @@
           "live": {
             "test_id": "control.exercise.K-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-05",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5062,7 +5062,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5122,7 +5122,7 @@
           "live": {
             "test_id": "control.exercise.K-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-06",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5130,7 +5130,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5190,7 +5190,7 @@
           "live": {
             "test_id": "control.exercise.K-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-07",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5198,7 +5198,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5258,7 +5258,7 @@
           "live": {
             "test_id": "control.exercise.K-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-08",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5266,7 +5266,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5326,7 +5326,7 @@
           "live": {
             "test_id": "control.exercise.K-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-09",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5334,7 +5334,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5394,7 +5394,7 @@
           "live": {
             "test_id": "control.exercise.K-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-10",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5402,7 +5402,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -5458,7 +5458,7 @@
           "live": {
             "test_id": "control.exercise.K-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-11",
-            "observed": "effective: Read — /native/semantic/status",
+            "observed": "effective: Read \u2014 /native/semantic/status",
             "passed": true
           }
         },
@@ -5466,7 +5466,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 877,
+            "line": 879,
             "note": "Daemon route DELETE /native/memory/records/:record?session=:session&expectedVersion=:version.",
             "line_text": "        .route("
           },
@@ -5522,7 +5522,7 @@
           "live": {
             "test_id": "control.exercise.K-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-12",
-            "observed": "effective: Read — /native/session/:session/efficiency",
+            "observed": "effective: Read \u2014 /native/session/:session/efficiency",
             "passed": true
           }
         },
@@ -5530,7 +5530,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1104,
+            "line": 1114,
             "note": "Daemon route GET /native/session/:session/efficiency.",
             "line_text": "            \"/native/session/{id}/efficiency\","
           },
@@ -5590,7 +5590,7 @@
           "live": {
             "test_id": "control.exercise.I-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-01",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -5598,7 +5598,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5657,7 +5657,7 @@
           "live": {
             "test_id": "control.exercise.I-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-02",
-            "observed": "effective: Read — /native/instructions?session=1",
+            "observed": "effective: Read \u2014 /native/instructions?session=1",
             "passed": true
           }
         },
@@ -5665,7 +5665,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5724,7 +5724,7 @@
           "live": {
             "test_id": "control.exercise.I-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-03",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -5732,7 +5732,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5791,7 +5791,7 @@
           "live": {
             "test_id": "control.exercise.I-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-04",
-            "observed": "effective: Read — /native/instructions/records?limit=200",
+            "observed": "effective: Read \u2014 /native/instructions/records?limit=200",
             "passed": true
           }
         },
@@ -5799,7 +5799,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route GET /native/instructions/records?limit=200.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5858,7 +5858,7 @@
           "live": {
             "test_id": "control.exercise.I-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-05",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -5866,7 +5866,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5925,7 +5925,7 @@
           "live": {
             "test_id": "control.exercise.I-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-06",
-            "observed": "effective: Read — /native/instructions/records?kind=template&limit=200",
+            "observed": "effective: Read \u2014 /native/instructions/records?kind=template&limit=200",
             "passed": true
           }
         },
@@ -5933,7 +5933,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route GET /native/instructions/records?kind=template&limit=200.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -5992,7 +5992,7 @@
           "live": {
             "test_id": "control.exercise.I-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-07",
-            "observed": "effective: Read — /native/instructions/records/preview",
+            "observed": "effective: Read \u2014 /native/instructions/records/preview",
             "passed": true
           }
         },
@@ -6000,7 +6000,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1012,
+            "line": 1022,
             "note": "Daemon route GET /native/instructions/records/preview.",
             "line_text": "            \"/native/instructions/records/preview\","
           },
@@ -6059,7 +6059,7 @@
           "live": {
             "test_id": "control.exercise.I-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-08",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -6067,7 +6067,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1020,
+            "line": 1030,
             "note": "Daemon route POST /native/instructions/import.",
             "line_text": "            \"/native/instructions/import\","
           },
@@ -6126,7 +6126,7 @@
           "live": {
             "test_id": "control.exercise.I-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-09",
-            "observed": "effective: Read — /native/instructions/preview",
+            "observed": "effective: Read \u2014 /native/instructions/preview",
             "passed": true
           }
         },
@@ -6134,7 +6134,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 895,
+            "line": 896,
             "note": "Daemon route GET /native/instructions/preview.",
             "line_text": "        .route("
           },
@@ -6193,7 +6193,7 @@
           "live": {
             "test_id": "control.exercise.I-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-10",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -6201,7 +6201,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -6260,7 +6260,7 @@
           "live": {
             "test_id": "control.exercise.I-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-11",
-            "observed": "effective: Read — /native/instructions/bindings",
+            "observed": "effective: Read \u2014 /native/instructions/bindings",
             "passed": true
           }
         },
@@ -6268,7 +6268,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1024,
+            "line": 1034,
             "note": "Daemon route GET /native/instructions/bindings.",
             "line_text": "            \"/native/instructions/bindings\","
           },
@@ -6327,7 +6327,7 @@
           "live": {
             "test_id": "control.exercise.Q-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-01",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -6335,7 +6335,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6397,7 +6397,7 @@
           "live": {
             "test_id": "control.exercise.Q-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -6405,7 +6405,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6467,7 +6467,7 @@
           "live": {
             "test_id": "control.exercise.Q-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-03",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -6475,7 +6475,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6537,7 +6537,7 @@
           "live": {
             "test_id": "control.exercise.Q-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-04",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -6545,7 +6545,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6607,7 +6607,7 @@
           "live": {
             "test_id": "control.exercise.Q-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-05",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -6615,7 +6615,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -6677,7 +6677,7 @@
           "live": {
             "test_id": "control.exercise.Q-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-06",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6685,7 +6685,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 695,
+            "line": 705,
             "note": "Daemon route POST /native/permission/reply.",
             "line_text": "        .route(\"/native/permission/reply\", post(native_permission_reply))"
           },
@@ -6741,7 +6741,7 @@
           "live": {
             "test_id": "control.exercise.Q-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-07",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6749,7 +6749,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 820,
+            "line": 818,
             "note": "Daemon route POST /native/permissions/rules.",
             "line_text": "        .route("
           },
@@ -6805,7 +6805,7 @@
           "live": {
             "test_id": "control.exercise.Q-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-08",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6813,7 +6813,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 828,
+            "line": 826,
             "note": "Daemon route POST /native/permissions/preview.",
             "line_text": "        .route("
           },
@@ -6869,7 +6869,7 @@
           "live": {
             "test_id": "control.exercise.Q-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-09",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6877,7 +6877,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 824,
+            "line": 822,
             "note": "Daemon route DELETE /native/permissions/rules/:rule.",
             "line_text": "        .route("
           },
@@ -6934,7 +6934,7 @@
           "live": {
             "test_id": "control.exercise.Q-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-10",
-            "observed": "effective: Read — /native/permissions/policy",
+            "observed": "effective: Read \u2014 /native/permissions/policy",
             "passed": true
           }
         },
@@ -6942,7 +6942,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 816,
+            "line": 814,
             "note": "Daemon route GET /native/permissions/policy.",
             "line_text": "        .route("
           },
@@ -6982,7 +6982,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3908,
+            "line": 4103,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "          case 'Q-11':"
           },
@@ -7004,7 +7004,7 @@
           "live": {
             "test_id": "control.exercise.Q-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-11",
-            "observed": "effective: Host — Sandbox setup choice",
+            "observed": "effective: Host \u2014 Sandbox setup choice",
             "passed": true
           }
         },
@@ -7012,7 +7012,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3908,
+            "line": 4103,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "          case 'Q-11':"
           },
@@ -7074,7 +7074,7 @@
           "live": {
             "test_id": "control.exercise.Q-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-12",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -7082,7 +7082,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1441,
+            "line": 1451,
             "note": "Daemon route POST /native/enterprise/effective-config.",
             "line_text": "            \"/native/enterprise/effective-config\","
           },
@@ -7144,7 +7144,7 @@
           "live": {
             "test_id": "control.exercise.Q-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-13",
-            "observed": "effective: Read — /native/permissions/audit?limit=50",
+            "observed": "effective: Read \u2014 /native/permissions/audit?limit=50",
             "passed": true
           }
         },
@@ -7152,7 +7152,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 832,
+            "line": 830,
             "note": "Daemon route GET /native/permissions/audit?limit=50.",
             "line_text": "        .route("
           },
@@ -7214,7 +7214,7 @@
           "live": {
             "test_id": "control.exercise.Q-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-14",
-            "observed": "effective: Read — /native/permissions/policy",
+            "observed": "effective: Read \u2014 /native/permissions/policy",
             "passed": true
           }
         },
@@ -7222,7 +7222,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 816,
+            "line": 814,
             "note": "Daemon route GET /native/permissions/policy.",
             "line_text": "        .route("
           },
@@ -7284,7 +7284,7 @@
           "live": {
             "test_id": "control.exercise.T-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-01",
-            "observed": "effective: Read — /native/tools",
+            "observed": "effective: Read \u2014 /native/tools",
             "passed": true
           }
         },
@@ -7292,7 +7292,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 984,
+            "line": 994,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -7352,7 +7352,7 @@
           "live": {
             "test_id": "control.exercise.T-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -7360,7 +7360,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -7420,7 +7420,7 @@
           "live": {
             "test_id": "control.exercise.T-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-03",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -7428,7 +7428,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7484,7 +7484,7 @@
           "live": {
             "test_id": "control.exercise.T-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-04",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -7492,7 +7492,7 @@
           "status": "partial",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7548,7 +7548,7 @@
           "live": {
             "test_id": "control.exercise.T-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-05",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -7556,7 +7556,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7616,7 +7616,7 @@
           "live": {
             "test_id": "control.exercise.T-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-06",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -7624,7 +7624,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 939,
+            "line": 937,
             "note": "Daemon route POST /native/mcp/servers/:mcp/auth.",
             "line_text": "        .route("
           },
@@ -7680,7 +7680,7 @@
           "live": {
             "test_id": "control.exercise.T-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-07",
-            "observed": "effective: Read — /native/mcp/servers",
+            "observed": "effective: Read \u2014 /native/mcp/servers",
             "passed": true
           }
         },
@@ -7688,7 +7688,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route GET /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7748,7 +7748,7 @@
           "live": {
             "test_id": "control.exercise.T-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-08",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -7756,7 +7756,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -7816,7 +7816,7 @@
           "live": {
             "test_id": "control.exercise.T-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-09",
-            "observed": "effective: Read — /native/mcp/servers/:mcp/tools",
+            "observed": "effective: Read \u2014 /native/mcp/servers/:mcp/tools",
             "passed": true
           }
         },
@@ -7824,7 +7824,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 927,
+            "line": 925,
             "note": "Daemon route GET /native/mcp/servers/:mcp/tools.",
             "line_text": "        .route("
           },
@@ -7884,7 +7884,7 @@
           "live": {
             "test_id": "control.exercise.T-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-10",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -7892,7 +7892,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -7952,7 +7952,7 @@
           "live": {
             "test_id": "control.exercise.T-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-11",
-            "observed": "effective: Read — /native/tools",
+            "observed": "effective: Read \u2014 /native/tools",
             "passed": true
           }
         },
@@ -7960,7 +7960,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 984,
+            "line": 994,
             "note": "Daemon route GET /native/tools.",
             "line_text": "        .route(\"/native/tools\", get(foundation_ext::native_tools))"
           },
@@ -8020,7 +8020,7 @@
           "live": {
             "test_id": "control.exercise.T-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-12",
-            "observed": "unavailable: Disabled — no MCP server is configured",
+            "observed": "unavailable: Disabled \u2014 no MCP server is configured",
             "passed": true
           }
         },
@@ -8028,7 +8028,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 935,
+            "line": 933,
             "note": "Daemon route GET /native/mcp/servers/:mcp/resources.",
             "line_text": "        .route("
           },
@@ -8088,7 +8088,7 @@
           "live": {
             "test_id": "control.exercise.T-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-13",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -8096,7 +8096,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 919,
+            "line": 917,
             "note": "Daemon route POST /native/mcp/servers/:mcp/start.",
             "line_text": "        .route("
           },
@@ -8156,7 +8156,7 @@
           "live": {
             "test_id": "control.exercise.T-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -8164,7 +8164,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 911,
+            "line": 909,
             "note": "Daemon route POST /native/mcp/servers.",
             "line_text": "        .route("
           },
@@ -8224,7 +8224,7 @@
           "live": {
             "test_id": "control.exercise.T-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-15",
-            "observed": "effective: Read — /native/diagnostics/preview",
+            "observed": "effective: Read \u2014 /native/diagnostics/preview",
             "passed": true
           }
         },
@@ -8232,7 +8232,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 836,
+            "line": 834,
             "note": "Daemon route GET /native/diagnostics/preview.",
             "line_text": "        .route("
           },
@@ -8292,7 +8292,7 @@
           "live": {
             "test_id": "control.exercise.S-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-01",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8300,7 +8300,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 947,
+            "line": 957,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -8359,7 +8359,7 @@
           "live": {
             "test_id": "control.exercise.S-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-02",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8367,7 +8367,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 961,
+            "line": 971,
             "note": "Daemon route POST /native/skills/:id/invocation.",
             "line_text": "            \"/native/skills/{id}/invocation\","
           },
@@ -8426,7 +8426,7 @@
           "live": {
             "test_id": "control.exercise.S-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-03",
-            "observed": "effective: Read — /native/skills/:skill",
+            "observed": "effective: Read \u2014 /native/skills/:skill",
             "passed": true
           }
         },
@@ -8434,7 +8434,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 953,
+            "line": 963,
             "note": "Daemon route GET /native/skills/:skill.",
             "line_text": "            \"/native/skills/{id}\","
           },
@@ -8493,7 +8493,7 @@
           "live": {
             "test_id": "control.exercise.S-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-04",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8501,7 +8501,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 949,
+            "line": 959,
             "note": "Daemon route POST /native/skills/install.",
             "line_text": "            \"/native/skills/install\","
           },
@@ -8538,7 +8538,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3995,
+            "line": 4190,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'S-05':"
           },
@@ -8560,7 +8560,7 @@
           "live": {
             "test_id": "control.exercise.S-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-05",
-            "observed": "effective: Host — Slash-command palette",
+            "observed": "effective: Host \u2014 Slash-command palette",
             "passed": true
           }
         },
@@ -8568,7 +8568,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3995,
+            "line": 4190,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'S-05':"
           },
@@ -8627,7 +8627,7 @@
           "live": {
             "test_id": "control.exercise.S-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-06",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8635,7 +8635,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1008,
+            "line": 1018,
             "note": "Daemon route POST /native/instructions/records.",
             "line_text": "            \"/native/instructions/records\","
           },
@@ -8694,7 +8694,7 @@
           "live": {
             "test_id": "control.exercise.S-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-07",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8702,7 +8702,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -8758,7 +8758,7 @@
           "live": {
             "test_id": "control.exercise.S-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-08",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8766,7 +8766,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -8822,7 +8822,7 @@
           "live": {
             "test_id": "control.exercise.S-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-09",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8830,7 +8830,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -8889,7 +8889,7 @@
           "live": {
             "test_id": "control.exercise.S-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-10",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8897,7 +8897,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -8956,7 +8956,7 @@
           "live": {
             "test_id": "control.exercise.S-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-11",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8964,7 +8964,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -9023,7 +9023,7 @@
           "live": {
             "test_id": "control.exercise.S-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-12",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -9031,7 +9031,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 969,
+            "line": 979,
             "note": "Daemon route POST /native/hooks.",
             "line_text": "            \"/native/hooks\","
           },
@@ -9090,7 +9090,7 @@
           "live": {
             "test_id": "control.exercise.S-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-13",
-            "observed": "effective: Read — /native/hooks/audit",
+            "observed": "effective: Read \u2014 /native/hooks/audit",
             "passed": true
           }
         },
@@ -9098,7 +9098,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 981,
+            "line": 991,
             "note": "Daemon route POST /native/hooks/:hook/test.",
             "line_text": "            \"/native/hooks/{id}/test\","
           },
@@ -9154,7 +9154,7 @@
           "live": {
             "test_id": "control.exercise.S-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-14",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -9162,7 +9162,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 947,
+            "line": 957,
             "note": "Daemon route GET /native/skills.",
             "line_text": "        .route(\"/native/skills\", get(foundation_ext::native_skills))"
           },
@@ -9221,7 +9221,7 @@
           "live": {
             "test_id": "control.exercise.X-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-01",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9229,7 +9229,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 662,
+            "line": 672,
             "note": "Daemon route GET /native/terminals.",
             "line_text": "        .route(\"/native/terminals\", get(native_terminals))"
           },
@@ -9285,7 +9285,7 @@
           "live": {
             "test_id": "control.exercise.X-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -9293,7 +9293,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -9356,7 +9356,7 @@
           "live": {
             "test_id": "control.exercise.X-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-03",
-            "observed": "effective: Read — /native/session/:session/terminals/:terminal/output",
+            "observed": "effective: Read \u2014 /native/session/:session/terminals/:terminal/output",
             "passed": true
           }
         },
@@ -9364,7 +9364,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 687,
+            "line": 685,
             "note": "Daemon route GET /native/session/:session/terminals/:terminal/output.",
             "line_text": "        .route("
           },
@@ -9427,7 +9427,7 @@
           "live": {
             "test_id": "control.exercise.X-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-04",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9435,7 +9435,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 667,
+            "line": 677,
             "note": "Daemon route POST /native/session/:session/terminal.",
             "line_text": "        .route(\"/native/session/{id}/terminal\", post(native_terminal_spawn))"
           },
@@ -9498,7 +9498,7 @@
           "live": {
             "test_id": "control.exercise.X-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-05",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9506,7 +9506,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 679,
+            "line": 681,
             "note": "Daemon route POST /native/session/:session/terminals/:terminal/kill.",
             "line_text": "        .route("
           },
@@ -9562,7 +9562,7 @@
           "live": {
             "test_id": "control.exercise.X-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-06",
-            "observed": "effective: Connected — real browser session",
+            "observed": "effective: Connected \u2014 real browser session",
             "passed": true
           }
         },
@@ -9570,7 +9570,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1074,
+            "line": 1084,
             "note": "Daemon route POST /native/browser/sessions.",
             "line_text": "            \"/native/browser/sessions\","
           },
@@ -9633,7 +9633,7 @@
           "live": {
             "test_id": "control.exercise.X-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-07",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9641,7 +9641,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 990,
+            "line": 1000,
             "note": "Daemon route POST /native/browser/validate-url.",
             "line_text": "            \"/native/browser/validate-url\","
           },
@@ -9704,7 +9704,7 @@
           "live": {
             "test_id": "control.exercise.X-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-08",
-            "observed": "unavailable: Disabled — no live browser session is attached; connect it first",
+            "observed": "unavailable: Disabled \u2014 no live browser session is attached; connect it first",
             "passed": true
           }
         },
@@ -9712,7 +9712,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1082,
+            "line": 1092,
             "note": "Daemon route POST /native/browser/sessions/:browser/screenshot.",
             "line_text": "            \"/native/browser/sessions/{id}/screenshot\","
           },
@@ -9775,7 +9775,7 @@
           "live": {
             "test_id": "control.exercise.X-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-09",
-            "observed": "unavailable: Disabled — no live browser session is attached; connect it first",
+            "observed": "unavailable: Disabled \u2014 no live browser session is attached; connect it first",
             "passed": true
           }
         },
@@ -9783,7 +9783,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1078,
+            "line": 1088,
             "note": "Daemon route GET /native/browser/sessions/:browser/observations.",
             "line_text": "            \"/native/browser/sessions/{id}/observations\","
           },
@@ -9824,7 +9824,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3961,
+            "line": 4156,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-10': {"
           },
@@ -9846,7 +9846,7 @@
           "live": {
             "test_id": "control.exercise.X-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-10",
-            "observed": "effective: Host — Language-server diagnostics",
+            "observed": "effective: Host \u2014 Language-server diagnostics",
             "passed": true
           }
         },
@@ -9854,7 +9854,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3961,
+            "line": 4156,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-10': {"
           },
@@ -9895,7 +9895,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3975,
+            "line": 4170,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-11': {"
           },
@@ -9917,7 +9917,7 @@
           "live": {
             "test_id": "control.exercise.X-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-11",
-            "observed": "effective: Host — inline code actions",
+            "observed": "effective: Host \u2014 inline code actions",
             "passed": true
           }
         },
@@ -9925,7 +9925,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3975,
+            "line": 4170,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-11': {"
           },
@@ -9988,7 +9988,7 @@
           "live": {
             "test_id": "control.exercise.X-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-12",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -9996,7 +9996,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10059,7 +10059,7 @@
           "live": {
             "test_id": "control.exercise.X-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-13",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -10067,7 +10067,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1063,
+            "line": 1073,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -10130,7 +10130,7 @@
           "live": {
             "test_id": "control.exercise.B-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-01",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10138,7 +10138,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10194,7 +10194,7 @@
           "live": {
             "test_id": "control.exercise.B-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10202,7 +10202,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10258,7 +10258,7 @@
           "live": {
             "test_id": "control.exercise.B-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-03",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10266,7 +10266,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10323,7 +10323,7 @@
           "live": {
             "test_id": "control.exercise.B-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-04",
-            "observed": "effective: Read — /native/session/:session/usage",
+            "observed": "effective: Read \u2014 /native/session/:session/usage",
             "passed": true
           }
         },
@@ -10331,7 +10331,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1214,
+            "line": 1224,
             "note": "Daemon route GET /native/session/:session/usage.",
             "line_text": "        .route(\"/native/session/{id}/usage\", get(native_session_usage))"
           },
@@ -10394,7 +10394,7 @@
           "live": {
             "test_id": "control.exercise.B-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-05",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -10402,7 +10402,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1108,
+            "line": 1118,
             "note": "Daemon route PUT /native/session/:session/budget.",
             "line_text": "            \"/native/session/{id}/budget\","
           },
@@ -10465,7 +10465,7 @@
           "live": {
             "test_id": "control.exercise.B-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-06",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10473,7 +10473,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10536,7 +10536,7 @@
           "live": {
             "test_id": "control.exercise.B-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-07",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10544,7 +10544,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10607,7 +10607,7 @@
           "live": {
             "test_id": "control.exercise.B-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-08",
-            "observed": "effective: Read — /native/session/:session/efficiency",
+            "observed": "effective: Read \u2014 /native/session/:session/efficiency",
             "passed": true
           }
         },
@@ -10615,7 +10615,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1104,
+            "line": 1114,
             "note": "Daemon route GET /native/session/:session/efficiency.",
             "line_text": "            \"/native/session/{id}/efficiency\","
           },
@@ -10678,7 +10678,7 @@
           "live": {
             "test_id": "control.exercise.B-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-09",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -10686,7 +10686,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -10749,7 +10749,7 @@
           "live": {
             "test_id": "control.exercise.B-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-10",
-            "observed": "effective: Read — /native/config/descriptors",
+            "observed": "effective: Read \u2014 /native/config/descriptors",
             "passed": true
           }
         },
@@ -10757,7 +10757,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 704,
+            "line": 697,
             "note": "Daemon route GET /native/config/descriptors.",
             "line_text": "        .route("
           },
@@ -10820,7 +10820,7 @@
           "live": {
             "test_id": "control.exercise.B-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-11",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -10891,7 +10891,7 @@
           "live": {
             "test_id": "control.exercise.B-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-12",
-            "observed": "effective: Read — /native/outcomes?limit=50",
+            "observed": "effective: Read \u2014 /native/outcomes?limit=50",
             "passed": true
           }
         },
@@ -10956,7 +10956,7 @@
           "live": {
             "test_id": "control.exercise.V-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-01",
-            "observed": "effective: Read — /native/session/:session/verification",
+            "observed": "effective: Read \u2014 /native/session/:session/verification",
             "passed": true
           }
         },
@@ -10964,7 +10964,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 599,
+            "line": 601,
             "note": "Daemon route GET /native/session/:session/verification.",
             "line_text": "        .route("
           },
@@ -11027,7 +11027,7 @@
           "live": {
             "test_id": "control.exercise.V-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-02",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11035,7 +11035,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1138,
+            "line": 1148,
             "note": "Daemon route POST /native/session/:session/review/comments.",
             "line_text": "            \"/native/session/{id}/review/comments\","
           },
@@ -11098,7 +11098,7 @@
           "live": {
             "test_id": "control.exercise.V-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-03",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11106,7 +11106,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1152,
+            "line": 1162,
             "note": "Daemon route POST /native/session/:session/changes/accept.",
             "line_text": "            \"/native/session/{id}/changes/accept\","
           },
@@ -11169,7 +11169,7 @@
           "live": {
             "test_id": "control.exercise.V-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-04",
-            "observed": "effective: Read — /native/session/:session/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/:session/checkpoints",
             "passed": true
           }
         },
@@ -11177,7 +11177,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 591,
+            "line": 601,
             "note": "Daemon route GET /native/session/:session/checkpoints.",
             "line_text": "        .route("
           },
@@ -11233,7 +11233,7 @@
           "live": {
             "test_id": "control.exercise.V-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-05",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11241,7 +11241,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1133,
+            "line": 1143,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore/preview.",
             "line_text": "            \"/native/session/{id}/checkpoints/{sequence}/restore/preview\","
           },
@@ -11297,7 +11297,7 @@
           "live": {
             "test_id": "control.exercise.V-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-06",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11305,7 +11305,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1112,
+            "line": 1122,
             "note": "Daemon route POST /native/session/:session/fork.",
             "line_text": "            \"/native/session/{id}/fork\","
           },
@@ -11362,7 +11362,7 @@
           "live": {
             "test_id": "control.exercise.V-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-07",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11370,7 +11370,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1235,
+            "line": 1245,
             "note": "Daemon route POST /native/session/:session/task-runs.",
             "line_text": "            \"/native/session/{id}/task-runs\","
           },
@@ -11426,7 +11426,7 @@
           "live": {
             "test_id": "control.exercise.V-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-08",
-            "observed": "effective: Read — /native/session/:session/verification",
+            "observed": "effective: Read \u2014 /native/session/:session/verification",
             "passed": true
           }
         },
@@ -11434,7 +11434,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 599,
+            "line": 601,
             "note": "Daemon route GET /native/session/:session/verification.",
             "line_text": "        .route("
           },
@@ -11497,7 +11497,7 @@
           "live": {
             "test_id": "control.exercise.V-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-09",
-            "observed": "effective: Read — /native/tasks/:task/proof?session=:session",
+            "observed": "effective: Read \u2014 /native/tasks/:task/proof?session=:session",
             "passed": true
           }
         },
@@ -11505,7 +11505,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1224,
+            "line": 1234,
             "note": "Daemon route GET /native/tasks/:task/proof?session=:session.",
             "line_text": "        .route(\"/native/tasks/{id}/proof\", get(native_task_proof))"
           },
@@ -11562,7 +11562,7 @@
           "live": {
             "test_id": "control.exercise.V-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-10",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11570,7 +11570,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1235,
+            "line": 1245,
             "note": "Daemon route POST /native/session/:session/task-runs.",
             "line_text": "            \"/native/session/{id}/task-runs\","
           },
@@ -11626,7 +11626,7 @@
           "live": {
             "test_id": "control.exercise.V-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-11",
-            "observed": "effective: Read — /native/repositories",
+            "observed": "effective: Read \u2014 /native/repositories",
             "passed": true
           }
         },
@@ -11634,7 +11634,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1344,
+            "line": 1354,
             "note": "Daemon route GET /native/repositories.",
             "line_text": "        .route(\"/native/repositories\", get(native_repositories))"
           },
@@ -11697,7 +11697,7 @@
           "live": {
             "test_id": "control.exercise.V-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-12",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11705,7 +11705,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1129,
+            "line": 1139,
             "note": "Daemon route POST /native/session/:session/checkpoints/:sequence/restore.",
             "line_text": "            \"/native/session/{id}/checkpoints/{sequence}/restore\","
           },
@@ -11761,7 +11761,7 @@
           "live": {
             "test_id": "control.exercise.D-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-01",
-            "observed": "effective: Read — /native/sessions?limit=200",
+            "observed": "effective: Read \u2014 /native/sessions?limit=200",
             "passed": true
           }
         },
@@ -11769,7 +11769,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 585,
+            "line": 595,
             "note": "Daemon route GET /native/sessions?limit=200.",
             "line_text": "        .route(\"/native/sessions\", get(native_list_sessions))"
           },
@@ -11829,7 +11829,7 @@
           "live": {
             "test_id": "control.exercise.D-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-02",
-            "observed": "effective: Read — /native/sessions?query=:query&limit=200",
+            "observed": "effective: Read \u2014 /native/sessions?query=:query&limit=200",
             "passed": true
           }
         },
@@ -11837,7 +11837,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 585,
+            "line": 595,
             "note": "Daemon route GET /native/sessions?query=:query&limit=200.",
             "line_text": "        .route(\"/native/sessions\", get(native_list_sessions))"
           },
@@ -11897,7 +11897,7 @@
           "live": {
             "test_id": "control.exercise.D-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-03",
-            "observed": "effective: Read — /native/transcript/search?session=:session&q=:query&regex=false&case=false",
+            "observed": "effective: Read \u2014 /native/transcript/search?session=:session&q=:query&regex=false&case=false",
             "passed": true
           }
         },
@@ -11905,7 +11905,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 859,
+            "line": 860,
             "note": "Daemon route GET /native/transcript/search?session=:session&q=:query&regex=false&case=false.",
             "line_text": "        .route("
           },
@@ -11961,7 +11961,7 @@
           "live": {
             "test_id": "control.exercise.D-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-04",
-            "observed": "effective: Read — /native/sessions",
+            "observed": "effective: Read \u2014 /native/sessions",
             "passed": true
           }
         },
@@ -11969,7 +11969,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 854,
+            "line": 855,
             "note": "Daemon route POST /native/sessions/:session/meta.",
             "line_text": "        .route("
           },
@@ -12029,7 +12029,7 @@
           "live": {
             "test_id": "control.exercise.D-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-05",
-            "observed": "effective: Read — /native/sessions",
+            "observed": "effective: Read \u2014 /native/sessions",
             "passed": true
           }
         },
@@ -12037,7 +12037,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 586,
+            "line": 596,
             "note": "Daemon route POST /native/session/:session/prompt.",
             "line_text": "        .route(\"/native/session/{id}/prompt\", post(native_prompt))"
           },
@@ -12097,7 +12097,7 @@
           "live": {
             "test_id": "control.exercise.D-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-06",
-            "observed": "effective: Read — /native/sessions",
+            "observed": "effective: Read \u2014 /native/sessions",
             "passed": true
           }
         },
@@ -12105,7 +12105,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1198,
+            "line": 1208,
             "note": "Daemon route POST /native/session/:session/export.",
             "line_text": "            \"/native/session/{id}/export\","
           },
@@ -12165,7 +12165,7 @@
           "live": {
             "test_id": "control.exercise.D-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-07",
-            "observed": "effective: Read — /native/session/:session/events",
+            "observed": "effective: Read \u2014 /native/session/:session/events",
             "passed": true
           }
         },
@@ -12173,7 +12173,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 588,
+            "line": 598,
             "note": "Daemon route GET /native/session/:session/events.",
             "line_text": "        .route(\"/native/session/{id}/events\", get(native_session_events))"
           },
@@ -12211,7 +12211,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3998,
+            "line": 4193,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-08':"
           },
@@ -12233,7 +12233,7 @@
           "live": {
             "test_id": "control.exercise.D-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-08",
-            "observed": "effective: Host — Focus/verbose display",
+            "observed": "effective: Host \u2014 Focus/verbose display",
             "passed": true
           }
         },
@@ -12241,7 +12241,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 3998,
+            "line": 4193,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-08':"
           },
@@ -12279,7 +12279,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4000,
+            "line": 4195,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-09':"
           },
@@ -12301,7 +12301,7 @@
           "live": {
             "test_id": "control.exercise.D-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-09",
-            "observed": "effective: Host — Theme, zoom and density",
+            "observed": "effective: Host \u2014 Theme, zoom and density",
             "passed": true
           }
         },
@@ -12309,7 +12309,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4000,
+            "line": 4195,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-09':"
           },
@@ -12347,7 +12347,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4003,
+            "line": 4198,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-10':"
           },
@@ -12369,7 +12369,7 @@
           "live": {
             "test_id": "control.exercise.D-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-10",
-            "observed": "effective: Host — Composer send behavior",
+            "observed": "effective: Host \u2014 Composer send behavior",
             "passed": true
           }
         },
@@ -12377,7 +12377,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4003,
+            "line": 4198,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-10':"
           },
@@ -12415,7 +12415,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4006,
+            "line": 4201,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-11':"
           },
@@ -12437,7 +12437,7 @@
           "live": {
             "test_id": "control.exercise.D-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-11",
-            "observed": "effective: Host — Keymap/commands and discovery",
+            "observed": "effective: Host \u2014 Keymap/commands and discovery",
             "passed": true
           }
         },
@@ -12445,7 +12445,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4006,
+            "line": 4201,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-11':"
           },
@@ -12505,7 +12505,7 @@
           "live": {
             "test_id": "control.exercise.D-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-12",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -12513,7 +12513,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -12573,7 +12573,7 @@
           "live": {
             "test_id": "control.exercise.D-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-13",
-            "observed": "effective: Read — /native/session/:session/events",
+            "observed": "effective: Read \u2014 /native/session/:session/events",
             "passed": true
           }
         },
@@ -12581,7 +12581,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 588,
+            "line": 598,
             "note": "Daemon route GET /native/session/:session/events.",
             "line_text": "        .route(\"/native/session/{id}/events\", get(native_session_events))"
           },
@@ -12615,7 +12615,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4009,
+            "line": 4204,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-14':"
           },
@@ -12637,7 +12637,7 @@
           "live": {
             "test_id": "control.exercise.D-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-14",
-            "observed": "effective: Host — Accessibility and reduced motion",
+            "observed": "effective: Host \u2014 Accessibility and reduced motion",
             "passed": true
           }
         },
@@ -12645,7 +12645,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 4009,
+            "line": 4204,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-14':"
           },
@@ -12701,7 +12701,7 @@
           "live": {
             "test_id": "control.exercise.D-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-15",
-            "observed": "effective: Read — /native/sessions/parallel",
+            "observed": "effective: Read \u2014 /native/sessions/parallel",
             "passed": true
           }
         },
@@ -12769,7 +12769,7 @@
           "live": {
             "test_id": "control.exercise.O-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-01",
-            "observed": "effective: Read — /native/config/search?q=:query",
+            "observed": "effective: Read \u2014 /native/config/search?q=:query",
             "passed": true
           }
         },
@@ -12777,7 +12777,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 728,
+            "line": 726,
             "note": "Daemon route GET /native/config/search?q=:query.",
             "line_text": "        .route("
           },
@@ -12839,7 +12839,7 @@
           "live": {
             "test_id": "control.exercise.O-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-02",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -12847,7 +12847,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1063,
+            "line": 1073,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -12909,7 +12909,7 @@
           "live": {
             "test_id": "control.exercise.O-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-03",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -12917,7 +12917,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 840,
+            "line": 838,
             "note": "Daemon route POST /native/diagnostics/export.",
             "line_text": "        .route("
           },
@@ -12979,7 +12979,7 @@
           "live": {
             "test_id": "control.exercise.O-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-04",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -12987,7 +12987,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1063,
+            "line": 1073,
             "note": "Daemon route GET /native/runtime/status.",
             "line_text": "        .route(\"/native/runtime/status\", get(r8::native_runtime_status))"
           },
@@ -13049,7 +13049,7 @@
           "live": {
             "test_id": "control.exercise.O-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-05",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -13057,7 +13057,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1366,
+            "line": 1376,
             "note": "Daemon route POST /native/updater/check.",
             "line_text": "        .route(\"/native/updater/check\", post(native_updater_check))"
           },
@@ -13119,7 +13119,7 @@
           "live": {
             "test_id": "control.exercise.O-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-06",
-            "observed": "effective: Read — /native/usage",
+            "observed": "effective: Read \u2014 /native/usage",
             "passed": true
           }
         },
@@ -13189,7 +13189,7 @@
           "live": {
             "test_id": "control.exercise.O-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-07",
-            "observed": "effective: Read — /native/identity",
+            "observed": "effective: Read \u2014 /native/identity",
             "passed": true
           }
         },
@@ -13197,7 +13197,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1330,
+            "line": 1340,
             "note": "Daemon route GET /native/identity.",
             "line_text": "        .route(\"/native/identity\", get(native_identity))"
           },
@@ -13259,7 +13259,7 @@
           "live": {
             "test_id": "control.exercise.O-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-08",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -13267,7 +13267,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1441,
+            "line": 1451,
             "note": "Daemon route POST /native/enterprise/effective-config.",
             "line_text": "            \"/native/enterprise/effective-config\","
           },
@@ -13329,7 +13329,7 @@
           "live": {
             "test_id": "control.exercise.O-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-09",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -13399,7 +13399,7 @@
           "live": {
             "test_id": "control.exercise.O-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-10",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -13407,7 +13407,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 716,
+            "line": 714,
             "note": "Daemon route POST /native/config/commit.",
             "line_text": "        .route("
           },
@@ -13469,7 +13469,7 @@
           "live": {
             "test_id": "control.exercise.O-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-11",
-            "observed": "effective: Read — /native/workers",
+            "observed": "effective: Read \u2014 /native/workers",
             "passed": true
           }
         },
@@ -13477,7 +13477,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1377,
+            "line": 1387,
             "note": "Daemon route GET /native/workers.",
             "line_text": "        .route(\"/native/workers\", get(native_workers_list))"
           },
@@ -13539,7 +13539,7 @@
           "live": {
             "test_id": "control.exercise.O-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-12",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -13547,7 +13547,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 736,
+            "line": 734,
             "note": "Daemon route POST /native/config/import.",
             "line_text": "        .route("
           },
@@ -13609,7 +13609,7 @@
           "live": {
             "test_id": "control.exercise.O-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-13",
-            "observed": "effective: Read — /native/semantic/capabilities",
+            "observed": "effective: Read \u2014 /native/semantic/capabilities",
             "passed": true
           }
         },
@@ -13617,7 +13617,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1315,
+            "line": 1325,
             "note": "Daemon route GET /native/semantic/capabilities.",
             "line_text": "            \"/native/semantic/capabilities\","
           },

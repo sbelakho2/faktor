@@ -50,6 +50,7 @@ import {
 import {
   FetchLike,
   NativeApiError,
+  NativeBillingOverview,
   NativeBillingUsage,
   NativeClient,
   NativeCompletionContract,
@@ -118,6 +119,7 @@ import {
   microFromNumber,
   microText,
   microToString,
+  microUsdText,
   MICRO_I64_MAX,
   sumMicro,
   type MicroMoney,
@@ -253,6 +255,7 @@ interface ActiveSession {
   billingIdentity: NativeIdentity | null;
   billingEntitlements: NativeEntitlementSnapshot | null;
   billingUsage: NativeBillingUsage | null;
+  billingOverview: NativeBillingOverview | null;
   billingCursor: string | null;
   billingPrevCursors: string[];
 }
@@ -276,6 +279,7 @@ const active: ActiveSession = {
   billingIdentity: null,
   billingEntitlements: null,
   billingUsage: null,
+  billingOverview: null,
   billingCursor: null,
   billingPrevCursors: [],
 };
@@ -1310,6 +1314,7 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
   active.billingIdentity = null;
   active.billingEntitlements = null;
   active.billingUsage = null;
+  active.billingOverview = null;
   active.billingCursor = null;
   active.billingPrevCursors = [];
   taskStartGate.reset();
@@ -2098,19 +2103,22 @@ async function billingPanelFor(client: NativeClient): Promise<CockpitUsagePanel>
   try {
     const identityView = await client.identity();
     active.billingIdentity = identityView.identity;
-    const [entitlementsView, usage] = await Promise.all([
+    const [entitlementsView, usage, overview] = await Promise.all([
       client.entitlements(),
       client.billingUsage(identityView.identity.organization, {
         since: cursor,
         limit: BILLING_PAGE_LIMIT,
       }),
+      client.billingOverview(),
     ]);
     active.billingEntitlements = entitlementsView.entitlements;
     active.billingUsage = usage;
+    active.billingOverview = overview.billing;
     return buildUsagePanel({
       identity: identityView.identity,
       entitlements: entitlementsView.entitlements,
       usage,
+      billing: overview.billing,
       refusal: null,
       cursor,
       hasPrev,
@@ -2122,10 +2130,12 @@ async function billingPanelFor(client: NativeClient): Promise<CockpitUsagePanel>
         : { code: 'unavailable', reason: messageOf(error) };
     active.billingUsage = null;
     active.billingEntitlements = null;
+    active.billingOverview = null;
     return buildUsagePanel({
       identity: active.billingIdentity,
       entitlements: null,
       usage: null,
+      billing: null,
       refusal,
       cursor,
       hasPrev,
@@ -3048,6 +3058,168 @@ async function controlUsage(message: ChatMessage): Promise<void> {
     await grantCreditsFromCommand();
     return;
   }
+  if (action === 'usage-export') {
+    await exportUsageFromCommand();
+    return;
+  }
+  if (action === 'change-plan') {
+    await changePlanFromCommand();
+    return;
+  }
+  if (action === 'cancel-subscription') {
+    await cancelSubscriptionFromCommand();
+    return;
+  }
+}
+
+/** The bounded usage download: one JSON page set, saved through the host. */
+async function exportUsageFromCommand(): Promise<void> {
+  const client = active.client;
+  const organization = active.billingIdentity?.organization;
+  if (!client || organization === undefined) {
+    chatProvider?.postNotice('error', 'usage export requires a control-plane organization');
+    return;
+  }
+  const target = await vscode.window.showSaveDialog({
+    title: 'Faktor: download usage',
+    saveLabel: 'Download usage',
+    filters: { JSON: ['json'] },
+    defaultUri: vscode.Uri.file(`faktor-usage-${organization}.json`),
+  });
+  if (target === undefined) {
+    return;
+  }
+  try {
+    const page = await client.usageExport(organization);
+    const text = JSON.stringify(page, null, 2);
+    await vscode.workspace.fs.writeFile(target, Buffer.from(text, 'utf8'));
+    chatProvider?.postNotice(
+      'info',
+      `usage downloaded: ${page.items.length} row(s)${page.truncated ? ' (bounded export; narrow the window with since)' : ''}`,
+    );
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** Owner-only plan change (upgrade/downgrade); proration is typed unavailable. */
+async function changePlanFromCommand(): Promise<void> {
+  const client = active.client;
+  const panel = store.snapshot().usagePanel;
+  if (!client) {
+    return;
+  }
+  if (panel === null || !panel.canManageBilling) {
+    chatProvider?.postNotice(
+      'error',
+      panel?.manageDisabledReason ?? 'changing a plan requires an owner control-plane principal',
+    );
+    return;
+  }
+  const planId = await vscode.window.showInputBox({
+    prompt: 'Plan id (must exist in the [billing] plan table)',
+    placeHolder: 'pro',
+  });
+  if (planId === undefined) {
+    return;
+  }
+  const statusPick = await vscode.window.showQuickPick(
+    [
+      { label: 'active', description: 'Paid/active plan row' },
+      { label: 'trialing', description: 'Time-bounded trial (requires an expiry)' },
+    ],
+    { title: 'Faktor: plan status', placeHolder: 'active' },
+  );
+  if (statusPick === undefined) {
+    return;
+  }
+  let expiresMs: number | undefined;
+  if (statusPick.label === 'trialing') {
+    const raw = await vscode.window.showInputBox({
+      prompt: 'Trial end (milliseconds since the Unix epoch)',
+      placeHolder: '1800000000000',
+      validateInput: (value) =>
+        /^[0-9]+$/.test(value.trim()) ? undefined : 'enter a non-negative integer millisecond timestamp',
+    });
+    if (raw === undefined) {
+      return;
+    }
+    expiresMs = Number(raw.trim());
+    if (!Number.isSafeInteger(expiresMs)) {
+      void vscode.window.showErrorMessage('refused plan change: the trial end exceeds the safe integer range');
+      return;
+    }
+  }
+  const confirm = await vscode.window.showWarningMessage(
+    `Change the organization plan to ${planId.trim()} (${statusPick.label})? The change applies immediately; in-flight work is not interrupted.`,
+    { modal: true },
+    'Change plan',
+  );
+  if (confirm !== 'Change plan') {
+    return;
+  }
+  try {
+    const changed = await client.changeSubscription({
+      action: 'change',
+      planId: planId.trim(),
+      status: statusPick.label === 'trialing' ? 'trialing' : 'active',
+      expiresMs,
+      idempotencyKey: randomUUID(),
+    });
+    const proration =
+      changed.proration.state === 'available'
+        ? 'proration applied'
+        : `proration unavailable (${changed.proration.cause})`;
+    chatProvider?.postNotice(
+      'info',
+      changed.replayed
+        ? `plan change replayed (idempotent); ${changed.subscription.plan_id} is unchanged`
+        : `plan changed to ${changed.subscription.plan_id} (${changed.subscription.status}); ${proration}`,
+    );
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** Owner-only cancellation; the modal confirmation is the explicit effect. */
+async function cancelSubscriptionFromCommand(): Promise<void> {
+  const client = active.client;
+  const panel = store.snapshot().usagePanel;
+  if (!client) {
+    return;
+  }
+  if (panel === null || !panel.canManageBilling) {
+    chatProvider?.postNotice(
+      'error',
+      panel?.manageDisabledReason ?? 'cancelling a subscription requires an owner control-plane principal',
+    );
+    return;
+  }
+  const confirm = await vscode.window.showWarningMessage(
+    'Cancel the organization subscription? New admissions will be denied immediately; in-flight work is not interrupted.',
+    { modal: true },
+    'Cancel subscription',
+  );
+  if (confirm !== 'Cancel subscription') {
+    return;
+  }
+  try {
+    const changed = await client.changeSubscription({
+      action: 'cancel',
+      confirm: true,
+      idempotencyKey: randomUUID(),
+    });
+    chatProvider?.postNotice(
+      'info',
+      changed.replayed
+        ? 'cancellation replayed (idempotent); the subscription is already canceled'
+        : 'subscription canceled; new admissions are denied',
+    );
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
 }
 
 /** The operator credit grant: amount + reason prompts, idempotency-keyed. */
@@ -3065,8 +3237,8 @@ async function grantCreditsFromCommand(): Promise<void> {
     return;
   }
   const amountRaw = await vscode.window.showInputBox({
-    prompt: 'Credit grant amount in microUSD (integer, > 0, exact)',
-    placeHolder: '1000000',
+    prompt: 'Credit grant amount — $5.00 for dollars or 5000000µ$ for microUSD (exact)',
+    placeHolder: '$5.00',
     validateInput: (value) => {
       const parsed = parseGrantAmount(value);
       return parsed.ok ? undefined : parsed.reason;
@@ -3085,6 +3257,15 @@ async function grantCreditsFromCommand(): Promise<void> {
     placeHolder: 'operator grant',
   });
   if (reasonRaw === undefined) {
+    return;
+  }
+  const confirmed = await vscode.window.showWarningMessage(
+    `Grant $${microUsdText(amount.value)} (${microText(amount.value)}) to ` +
+      `${panel.organization ?? 'the organization'}? This is a financial action.`,
+    { modal: true },
+    'Grant credits',
+  );
+  if (confirmed !== 'Grant credits') {
     return;
   }
   try {
@@ -3120,13 +3301,27 @@ function parseGrantAmount(
   raw: string,
 ): { readonly ok: true; readonly value: MicroMoney } | { readonly ok: false; readonly reason: string } {
   const text = raw.trim();
-  if (!/^[0-9]+$/.test(text)) {
-    return { ok: false, reason: 'enter a positive integer amount in microUSD' };
+  // Explicit units only: a bare integer was previously microUSD and is now
+  // ambiguous. "$5.00" / "5.00" are dollars; "5000000µ$" is exact micro.
+  const microMatch = /^([0-9]+)\s*(?:\u00b5\$|micro|microusd)$/i.exec(text);
+  if (microMatch !== null) {
+    const value = BigInt(microMatch[1]);
+    if (value <= 0n) return { ok: false, reason: 'the grant amount must be greater than zero' };
+    if (value > MICRO_I64_MAX) {
+      return { ok: false, reason: `the grant amount exceeds the protocol maximum ${MICRO_I64_MAX}` };
+    }
+    return { ok: true, value };
   }
-  const value = BigInt(text);
-  if (value <= 0n) {
-    return { ok: false, reason: 'the grant amount must be greater than zero' };
+  const usdMatch = /^\$?([0-9]+)(?:\.([0-9]{1,6}))?$/.exec(text);
+  if (usdMatch === null) {
+    return { ok: false, reason: 'enter $5.00 for dollars or 5000000µ$ for microUSD' };
   }
+  if (usdMatch[2] === undefined && !text.startsWith('$')) {
+    return { ok: false, reason: 'add $ for dollars or µ$ for microunits (e.g. $5.00)' };
+  }
+  const fraction = (usdMatch[2] ?? '').padEnd(6, '0');
+  const value = BigInt(usdMatch[1]) * 1_000_000n + BigInt(fraction);
+  if (value <= 0n) return { ok: false, reason: 'the grant amount must be greater than zero' };
   if (value > MICRO_I64_MAX) {
     return { ok: false, reason: `the grant amount exceeds the protocol maximum ${MICRO_I64_MAX}` };
   }

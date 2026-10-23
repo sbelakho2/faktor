@@ -15,6 +15,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
 const registry = await import(resolve(ROOT, 'tests/programme/registry.mjs'));
 const wiring = await import(resolve(ROOT, 'tests/programme/checks/wiring.mjs'));
+const commercial = await import(resolve(ROOT, 'tests/programme/checks/commercial.mjs'));
 
 function wiringCheck({ release }) {
   const result = wiring.scan(ROOT);
@@ -23,14 +24,25 @@ function wiringCheck({ release }) {
   console.log(
     `wiring matrix: ${result.counts.commands ?? 0} commands, ${result.counts.settings ?? 0} settings, ${result.counts.routes ?? 0} routes, ${result.counts.configKeys ?? 0} config keys; ${result.problems.length} problems, ${result.warnings.length} warnings`,
   );
-  return result.problems.length === 0 && !(release && result.warnings.length > 0) ? 0 : 1;
+  const commercialResult = commercial.scan(ROOT);
+  for (const problem of commercialResult.problems) console.error(`problem: ${problem}`);
+  console.log(
+    `commercial matrix: ${commercialResult.counts.actions} actions, ${commercialResult.counts.settings} settings, ${commercialResult.counts.routes} routes; ${commercialResult.problems.length} problems`,
+  );
+  const clean =
+    result.problems.length === 0 &&
+    commercialResult.problems.length === 0 &&
+    !(release && result.warnings.length > 0);
+  return clean ? 0 : 1;
 }
 
 const args = process.argv.slice(2);
 if (args.includes('--selftest')) {
   const registryCode = registry.selftest();
   const wiringCode = wiring.selftest();
-  process.exitCode = registryCode === 0 && wiringCode === 0 ? 0 : 1;
+  const commercialCode = commercial.selftest();
+  process.exitCode =
+    registryCode === 0 && wiringCode === 0 && commercialCode === 0 ? 0 : 1;
 } else if (args.includes('--release')) {
   const registryCode = await registry.main();
   process.exitCode = registryCode === 0 ? wiringCheck({ release: true }) : registryCode;

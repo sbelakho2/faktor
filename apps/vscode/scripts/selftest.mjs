@@ -12448,7 +12448,25 @@ async function usagePanelTests() {
     assertEqual(section.key, 'usage');
     assertEqual(section.title, 'Usage / Credits');
     assertEqual(section.present, true);
-    assertEqual(section.actions.length, 3);
+    assertEqual(section.actions.length, 6);
+    const actionKeys = section.actions.map((action) => action.key);
+    for (const key of ['usage-export', 'change-plan', 'cancel-subscription']) {
+      assert(actionKeys.includes(key), JSON.stringify(actionKeys));
+    }
+    assertEqual(
+      section.actions.find((action) => action.key === 'usage-export').enabled,
+      true,
+    );
+    assertEqual(
+      section.actions.find((action) => action.key === 'change-plan').enabled,
+      false,
+      'an admin is not an owner: billing_write is owner-only',
+    );
+    assert(
+      panel.manageDisabledReason.includes('billing_write') &&
+        panel.manageDisabledReason.includes('owner'),
+      panel.manageDisabledReason,
+    );
   });
 
   await test('billing_disabled renders "billing disabled locally", never zeros', () => {

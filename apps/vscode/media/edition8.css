@@ -650,6 +650,11 @@ dd {
   cursor: pointer;
 }
 
+.e8-row[role='button'] .e8-row-value::after {
+  content: ' \203A';
+  color: var(--vscode-descriptionForeground, #a7a7a7);
+}
+
 .e8-row[role='button']:hover,
 .e8-row[role='button']:focus-visible {
   background: var(--vscode-list-activeSelectionBackground, rgba(128, 128, 128, 0.16));

@@ -33,6 +33,7 @@ use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
 mod approval;
+mod billing_cli;
 mod billing_debits;
 mod billing_report;
 mod bootstrap;
@@ -146,6 +147,20 @@ pub(crate) enum Command {
     Updater {
         #[command(subcommand)]
         action: UpdaterAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
+    /// Local commercial account plane (parity with the
+    /// `/native/billing/*` and `/native/usage/export` routes): overview,
+    /// bounded usage download and the owner-only subscription change/cancel
+    /// effect. The `[billing]` section must be enabled.
+    #[command(display_order = 95)]
+    Billing {
+        #[command(subcommand)]
+        action: billing_cli::BillingAction,
         /// The daemon data dir (default `~/.faktor`).
         #[arg(long, default_value = "~/.faktor", global = true)]
         data_dir: String,
@@ -604,6 +619,13 @@ pub(crate) async fn main() {
             config,
         } => {
             updater_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
+        }
+        Command::Billing {
+            action,
+            data_dir,
+            config,
+        } => {
+            billing_cli::command(action, expand(&data_dir), config.map(|c| expand(&c)));
         }
         Command::Enterprise {
             action,

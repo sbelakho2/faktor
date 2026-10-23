@@ -392,7 +392,7 @@ const CHECKS = {
   },
   A36: async () => {
     const row = rowsText('S54');
-    return { pass: /Verified landed changes: 4/.test(row) && /Cost per verified change: 312500|Cost per verified change: \$0\.31/.test(row), observations: [row.slice(0, 200)] };
+    return { pass: /Verified landed changes: 4/.test(row) && /Cost per verified change: \$0\.3125/.test(row), observations: [row.slice(0, 200)] };
   },
   A37: async () => {
     const backend = new RejectingBackend();

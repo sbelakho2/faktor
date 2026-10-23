@@ -10875,4 +10875,340 @@ fn derives_the_exact_owner_key() {
         );
         assert_no_offenders("mechanical joke tests", &offenders, files.len(), 700);
     }
+    // ------------------------------------------------------------------
+    // scan 11: commercial route authorization ordering + commercial config
+    //
+    //  * every commercial read/mutation handler must run its role check
+    //    (`faktor_cloud::authorize`) BEFORE touching `state.deps.billing`
+    //    (feature/plan state), and the legacy org-less aliases must require
+    //    `?org=` once billing is wired (`org_required`);
+    //  * the grant handler must name `CreditsGrant` and require an
+    //    idempotency key; the subscription mutation must name `BillingWrite`
+    //    and claim a durable request-bound key;
+    //  * commercial configuration structs carry no client-supplied money
+    //    (`price`/`amount`/`currency`/`tax`) and no secret VALUE field
+    //    (`*_token`/`secret`/`password`/`api_key`/`private_key*`); a secret
+    //    is referenced by its environment-variable NAME (`auth_env`).
+    // ------------------------------------------------------------------
+
+    /// The byte range of `fn NAME` / `struct NAME` including its brace body.
+    fn item_range(f: &File<'_>, keyword: &str, name: &str) -> Option<(usize, usize)> {
+        let marker = format!("{keyword} {name}");
+        let bytes = f.src.as_bytes();
+        let mut from = 0usize;
+        while let Some(found) = f.src[from..].find(&marker) {
+            let at = from + found;
+            let before_ok = at == 0 || {
+                let b = bytes[at - 1];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            let after = at + marker.len();
+            let after_ok = after >= bytes.len() || {
+                let b = bytes[after];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            if before_ok && after_ok && f.code.get(at).copied().unwrap_or(false) {
+                let mut i = after;
+                while i < bytes.len() && !(bytes[i] == b'{' && f.code[i]) {
+                    i += 1;
+                }
+                if i == bytes.len() {
+                    return None;
+                }
+                let mut depth = 0i32;
+                while i < bytes.len() {
+                    if f.code[i] {
+                        match bytes[i] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some((at, i + 1));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+                return None;
+            }
+            from = at + marker.len();
+        }
+        None
+    }
+
+    const COMMERCIAL_HANDLERS: &[(&str, &str, &str)] = &[
+        (
+            "crates/server/src/native/billing.rs",
+            "billing_usage",
+            "BillingRead",
+        ),
+        (
+            "crates/server/src/native/billing.rs",
+            "native_entitlements",
+            "BillingRead",
+        ),
+        (
+            "crates/server/src/native/billing.rs",
+            "native_credits_grant",
+            "CreditsGrant",
+        ),
+        (
+            "crates/server/src/native/billing.rs",
+            "native_billing_overview",
+            "BillingRead",
+        ),
+        (
+            "crates/server/src/native/billing.rs",
+            "native_billing_subscription",
+            "BillingWrite",
+        ),
+        (
+            "crates/server/src/native/billing.rs",
+            "native_usage_export",
+            "BillingRead",
+        ),
+        (
+            "crates/server/src/native/value.rs",
+            "native_value_entitlements",
+            "BillingRead",
+        ),
+    ];
+
+    fn commercial_authorization_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let mut offenders = Vec::new();
+        for (file, handler, action) in COMMERCIAL_HANDLERS {
+            if *file != rel {
+                continue;
+            }
+            let Some((start, end)) = item_range(f, "fn", handler) else {
+                offenders.push(format!("{rel}: commercial handler {handler} is missing"));
+                continue;
+            };
+            let body = &f.src[start..end];
+            let line = line_of(f.src, start);
+            let Some(auth_at) = body.find("faktor_cloud::authorize(") else {
+                offenders.push(format!(
+                    "{rel}:{line}: {handler} never calls faktor_cloud::authorize"
+                ));
+                continue;
+            };
+            if !body.contains(&format!("Action::{action}")) {
+                offenders.push(format!(
+                    "{rel}:{line}: {handler} does not authorize Action::{action}"
+                ));
+            }
+            if let Some(deps_at) = body.find("state.deps.billing") {
+                if auth_at > deps_at {
+                    offenders.push(format!(
+                        "{rel}:{line}: {handler} discloses/touches billing state before the \
+                         role authorization"
+                    ));
+                }
+            }
+            if *handler == "native_credits_grant" && !body.contains("require_idempotency_key") {
+                offenders.push(format!(
+                    "{rel}:{line}: the credit grant does not require an idempotency key"
+                ));
+            }
+            if *handler == "native_billing_subscription" && !body.contains("claim_billing_mutation")
+            {
+                offenders.push(format!(
+                    "{rel}:{line}: the subscription mutation never claims its durable \
+                     request-bound idempotency key"
+                ));
+            }
+        }
+        // The org-less legacy commercial aliases must gate on ?org= once
+        // billing is wired (otherwise whole-daemon data bypasses tenancy).
+        for (file, handler) in [
+            ("crates/server/src/native/usage.rs", "native_usage"),
+            ("crates/server/src/native/outcomes.rs", "native_outcomes"),
+        ] {
+            if file != rel {
+                continue;
+            }
+            let Some((start, end)) = item_range(f, "fn", handler) else {
+                offenders.push(format!("{rel}: legacy handler {handler} is missing"));
+                continue;
+            };
+            if !f.src[start..end].contains("org_required()") {
+                offenders.push(format!(
+                    "{rel}:{}: {handler} does not require ?org= once billing is wired",
+                    line_of(f.src, start)
+                ));
+            }
+        }
+        offenders
+    }
+
+    fn is_forbidden_commercial_config_field(name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        if n.ends_with("_env") {
+            return false;
+        }
+        let money = n == "price"
+            || n.ends_with("_price")
+            || n == "amount"
+            || n.ends_with("_amount")
+            || n == "amount_micro"
+            || n.ends_with("_amount_micro")
+            || n.ends_with("_micro")
+            || n == "currency"
+            || n.ends_with("_currency")
+            || n == "tax"
+            || n.ends_with("_tax")
+            || n == "tax_rate";
+        let secret = n == "secret"
+            || n.ends_with("_secret")
+            || n == "password"
+            || n.ends_with("_token")
+            || n == "api_key"
+            || n.starts_with("private_key");
+        money || secret
+    }
+
+    const COMMERCIAL_CONFIG_STRUCTS: &[(&str, &str)] = &[
+        ("crates/cli/src/config/billing.rs", "BillingCfg"),
+        ("crates/cli/src/config/billing.rs", "BillingSubscriptionCfg"),
+        ("crates/cli/src/config/billing.rs", "BillingReportCfg"),
+        ("crates/cloud/src/billing.rs", "BillingConfig"),
+        ("crates/cloud/src/billing.rs", "PlanConfig"),
+        ("crates/cloud/src/billing.rs", "Subscription"),
+        ("crates/cloud/src/billing.rs", "BillingAccount"),
+        ("crates/cloud/src/vendor.rs", "BillingVendorConfig"),
+    ];
+
+    fn commercial_config_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let mut offenders = Vec::new();
+        for (file, name) in COMMERCIAL_CONFIG_STRUCTS {
+            if *file != rel {
+                continue;
+            }
+            let Some((start, end)) = item_range(f, "struct", name) else {
+                offenders.push(format!("{rel}: commercial config struct {name} is missing"));
+                continue;
+            };
+            let body = &f.src[start..end];
+            let base_line = line_of(f.src, start);
+            for (offset, line) in body.lines().enumerate() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("pub ") else {
+                    continue;
+                };
+                let Some((field, _)) = rest.split_once(':') else {
+                    continue;
+                };
+                let field = field.trim();
+                if field.is_empty() || !field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if is_forbidden_commercial_config_field(field) {
+                    offenders.push(format!(
+                        "{rel}:{}: commercial config struct {name} declares the forbidden \
+                         money/secret VALUE field {field:?}; prices/currency/tax are not \
+                         modeled and secrets are referenced by an *_env NAME",
+                        base_line + offset,
+                    ));
+                }
+            }
+        }
+        offenders
+    }
+
+    /// The real-tree invariant: commercial authorization is role-first and
+    /// commercial config carries no price/currency/tax/secret value fields.
+    #[test]
+    fn commercial_routes_authorize_before_billing_and_config_carries_no_prices_or_secrets() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in [
+            "crates/server/src/native/billing.rs",
+            "crates/server/src/native/value.rs",
+            "crates/server/src/native/usage.rs",
+            "crates/server/src/native/outcomes.rs",
+            "crates/cli/src/config/billing.rs",
+            "crates/cloud/src/billing.rs",
+            "crates/cloud/src/vendor.rs",
+        ] {
+            let Some(f) = load(rel) else {
+                offenders.push(format!("{rel}: commercial source is missing"));
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(commercial_authorization_offenders(rel, &f));
+            offenders.extend(commercial_config_offenders(rel, &f));
+        }
+        assert_no_offenders(
+            "commercial authorization scan: every commercial handler must authorize the role \
+             before disclosing billing/plan state; grants/subscriptions must be idempotency \
+             keyed; the legacy aliases must require ?org=; commercial config must not carry \
+             price/amount/currency/tax or secret value fields",
+            &offenders,
+            scanned,
+            7,
+        );
+
+        // Planted proof: the scan is load-bearing.
+        let bad_handler = synthetic_file(
+            "crates/server/src/native/billing.rs",
+            "pub(crate) async fn native_entitlements() {\n    let s = state.deps.billing;\n    \
+             let _ = faktor_cloud::authorize(&p, &o, R, Action::BillingRead);\n}\n",
+        );
+        let offenders =
+            commercial_authorization_offenders("crates/server/src/native/billing.rs", &bad_handler);
+        assert!(
+            offenders
+                .iter()
+                .any(|offender| offender.contains("before the role authorization")),
+            "a billing-before-authorize handler must fire: {offenders:?}"
+        );
+        let bad_grant = synthetic_file(
+            "crates/server/src/native/billing.rs",
+            "async fn native_credits_grant() {\n    \
+             faktor_cloud::authorize(&p, &o, R, Action::BillingRead);\n}\n",
+        );
+        let offenders =
+            commercial_authorization_offenders("crates/server/src/native/billing.rs", &bad_grant);
+        assert!(
+            !offenders.is_empty(),
+            "a grant without CreditsGrant/idempotency must fire"
+        );
+        let bad_legacy = synthetic_file(
+            "crates/server/src/native/usage.rs",
+            "async fn native_usage() {\n    let _ = state.deps.billing;\n}\n",
+        );
+        assert!(
+            commercial_authorization_offenders("crates/server/src/native/usage.rs", &bad_legacy)
+                .iter()
+                .any(|offender| offender.contains("require ?org=")),
+            "an ungated legacy alias must fire"
+        );
+        let bad_config = synthetic_file(
+            "crates/cli/src/config/billing.rs",
+            "pub struct BillingCfg {\n    pub price_micro: u64,\n    pub vendor_token: String,\n}\n",
+        );
+        let offenders: Vec<String> =
+            commercial_config_offenders("crates/cli/src/config/billing.rs", &bad_config)
+                .into_iter()
+                .filter(|offender| offender.contains("forbidden"))
+                .collect();
+        assert_eq!(offenders.len(), 2, "{offenders:?}");
+        assert!(offenders[0].contains("price_micro"), "{offenders:?}");
+        assert!(offenders[1].contains("vendor_token"), "{offenders:?}");
+        let good_config = synthetic_file(
+            "crates/cli/src/config/billing.rs",
+            "pub struct BillingCfg {\n    pub vendor_auth_env: Option<String>,\n    \
+             pub default_plan: Option<String>,\n}\n",
+        );
+        assert!(
+            commercial_config_offenders("crates/cli/src/config/billing.rs", &good_config)
+                .iter()
+                .all(|offender| !offender.contains("forbidden"))
+        );
+    }
 }

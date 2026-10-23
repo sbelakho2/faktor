@@ -63,6 +63,13 @@ pub(crate) async fn native_usage(
     if let Some(org) = query.org {
         return billing_usage(state, headers, org, query.since, query.limit);
     }
+    // Once the commercial billing plane is wired, the org-less legacy alias
+    // would serve whole-daemon usage without the tenant/plan gate; require
+    // the explicit organization scope instead (the pre-billing daemon keeps
+    // its frozen shape byte-identically).
+    if state.deps.billing.is_some() {
+        return wire_status(org_required());
+    }
     const MAX_SESSIONS: usize = 10_000;
     let mut budget_total: i64 = 0;
     let mut spent_total: i64 = 0;
@@ -561,6 +568,7 @@ pub(crate) fn native_session_usage_view(
             "stdDev": a.std_dev,
         })
     });
+    let warn_at = warn_at_percent(state);
     let mut tasks: Vec<serde_json::Value> = Vec::new();
     let typed = handle.list_tasks()?;
     for task in typed.iter().take(MAX_NATIVE_LIST) {
@@ -576,7 +584,7 @@ pub(crate) fn native_session_usage_view(
         let committed = spent_micro
             .saturating_add(open_micro)
             .saturating_add(uncertain_micro);
-        let (percent, warning, exhausted) = cap_state(max_cost_micro, committed);
+        let (percent, warning, exhausted) = cap_state(max_cost_micro, committed, warn_at);
         tasks.push(serde_json::json!({
             "taskId": task.task_id.to_string(),
             "budget": {
@@ -609,21 +617,45 @@ pub(crate) fn native_session_usage_view(
     }))
 }
 
-/// The durable cap projection (F106): a warning is induced at >=80% of the
-/// committed cap, exhaustion at >=100%. `None` is unlimited (never a fake
-/// warning), and a zero cap is immediately exhausted.
-fn cap_state(max_cost_micro: Option<u64>, committed: u64) -> (u32, bool, bool) {
+/// The committed warning threshold (`faktor.budget.warnAtPercent`): the SAME
+/// foundation configuration snapshot the settings surface writes, clamped to
+/// 1..=100. Absent/foundation-less hosts keep the documented 80% default.
+fn warn_at_percent(state: &AppState) -> u64 {
+    warn_at_percent_from(state.deps.foundation.as_deref())
+}
+
+fn warn_at_percent_from(foundation: Option<&faktor_foundation::Foundation>) -> u64 {
+    foundation
+        .and_then(|foundation| {
+            foundation
+                .config
+                .u64_value("faktor.budget.warnAtPercent")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(80)
+        .clamp(1, 100)
+}
+
+/// The durable cap projection (F106): a warning is induced at
+/// `>= warn_at_percent` of the committed cap, exhaustion at >=100%. `None`
+/// is unlimited (never a fake warning), and a zero cap is immediately
+/// exhausted. The threshold is read from the committed configuration on every
+/// read, so a settings change takes effect at the next usage projection.
+fn cap_state(
+    max_cost_micro: Option<u64>,
+    committed: u64,
+    warn_at_percent: u64,
+) -> (u32, bool, bool) {
     match max_cost_micro {
         Some(cap) if cap > 0 => {
             let percent = u32::try_from(
                 (u128::from(committed).saturating_mul(100) / u128::from(cap)).min(999),
             )
             .unwrap_or(999);
-            (
-                percent,
-                committed.saturating_mul(5) >= cap.saturating_mul(4),
-                committed >= cap,
-            )
+            let warning = u128::from(committed).saturating_mul(100)
+                >= u128::from(cap).saturating_mul(u128::from(warn_at_percent.clamp(1, 100)));
+            (percent, warning, committed >= cap)
         }
         Some(_) => (0, false, true),
         None => (0, false, false),
@@ -654,16 +686,61 @@ pub(crate) async fn native_session_usage(
 
 #[cfg(test)]
 mod cap_state_tests {
-    use super::cap_state;
+    use super::{cap_state, warn_at_percent_from};
 
     #[test]
-    fn cap_warning_is_induced_at_eighty_percent_and_exhaustion_at_the_cap() {
-        assert_eq!(cap_state(None, u64::MAX), (0, false, false));
-        assert_eq!(cap_state(Some(0), 0), (0, false, true));
-        assert_eq!(cap_state(Some(1000), 799), (79, false, false));
-        assert_eq!(cap_state(Some(1000), 800), (80, true, false));
-        assert_eq!(cap_state(Some(1000), 999), (99, true, false));
-        assert_eq!(cap_state(Some(1000), 1000), (100, true, true));
-        assert_eq!(cap_state(Some(1000), 5000), (500, true, true));
+    fn cap_warning_uses_the_committed_threshold_and_exhaustion_at_the_cap() {
+        assert_eq!(cap_state(None, u64::MAX, 80), (0, false, false));
+        assert_eq!(cap_state(Some(0), 0, 80), (0, false, true));
+        assert_eq!(cap_state(Some(1000), 799, 80), (79, false, false));
+        assert_eq!(cap_state(Some(1000), 800, 80), (80, true, false));
+        assert_eq!(cap_state(Some(1000), 999, 80), (99, true, false));
+        assert_eq!(cap_state(Some(1000), 1000, 80), (100, true, true));
+        assert_eq!(cap_state(Some(1000), 5000, 80), (500, true, true));
+        // The committed setting is honored (and clamped): 50 warns earlier,
+        // 90 later; 0 cannot make every task warn.
+        assert_eq!(cap_state(Some(1000), 500, 50), (50, true, false));
+        assert_eq!(cap_state(Some(1000), 899, 90), (89, false, false));
+        assert_eq!(
+            cap_state(Some(1000), 10, 0),
+            (1, true, false),
+            "0 clamps to the 1% minimum"
+        );
+        // No overflow at the u64 ceiling.
+        assert_eq!(
+            cap_state(Some(u64::MAX), u64::MAX - 1, 80),
+            (99, true, false)
+        );
+    }
+
+    #[test]
+    fn warn_threshold_is_read_from_the_committed_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let foundation = faktor_foundation::Foundation::open(dir.path()).unwrap();
+        assert_eq!(warn_at_percent_from(Some(&foundation)), 80);
+        let snapshot = foundation.config.snapshot().unwrap();
+        let patch = faktor_foundation::config::Patch {
+            expected_revision: snapshot.revision,
+            changes: vec![faktor_foundation::config::Change {
+                key: "faktor.budget.warnAtPercent".into(),
+                scope: faktor_foundation::config::Scope::User,
+                value: Some(serde_json::json!(50)),
+            }],
+        };
+        foundation.config.commit(&patch).unwrap();
+        assert_eq!(warn_at_percent_from(Some(&foundation)), 50);
+        // A committed out-of-range value is refused by the descriptor, not
+        // silently clamped in the store.
+        let snapshot = foundation.config.snapshot().unwrap();
+        let invalid = faktor_foundation::config::Patch {
+            expected_revision: snapshot.revision,
+            changes: vec![faktor_foundation::config::Change {
+                key: "faktor.budget.warnAtPercent".into(),
+                scope: faktor_foundation::config::Scope::User,
+                value: Some(serde_json::json!(101)),
+            }],
+        };
+        assert!(foundation.config.commit(&invalid).is_err());
+        assert_eq!(warn_at_percent_from(Some(&foundation)), 50);
     }
 }

@@ -24,6 +24,7 @@ import {
   type RiskSeverityView,
 } from './contract.ts';
 import type {
+  NativeBillingOverview,
   NativeBillingUsage,
   NativeEntitlementSnapshot,
   NativeIdentity,
@@ -859,6 +860,10 @@ export interface CockpitUsagePanel {
     readonly expiresMs: number | null;
     readonly active: boolean | null;
   };
+  /** The durable account overview; null only when the read was refused. */
+  readonly billing: NativeBillingOverview | null;
+  readonly canManageBilling: boolean;
+  readonly manageDisabledReason: string | null;
   readonly period: CockpitUsagePeriodView | null;
   readonly credits: CockpitUsageCreditsView | null;
   readonly quotas: readonly CockpitUsageQuota[];
@@ -879,6 +884,7 @@ export interface CockpitUsageInput {
   readonly identity: NativeIdentity | null;
   readonly entitlements: NativeEntitlementSnapshot | null;
   readonly usage: NativeBillingUsage | null;
+  readonly billing?: NativeBillingOverview | null;
   /**
    * The explicit refusal of the last read (`NativeApiError` code + message,
    * or a validation failure). A `billing_disabled` refusal renders the
@@ -1015,6 +1021,7 @@ function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
  */
 export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
   const { identity, entitlements, usage, refusal, cursor, hasPrev } = input;
+  const billing = input.billing ?? null;
   const page: CockpitUsagePageView = {
     cursor,
     nextCursor: usage === null ? null : usage.nextCursor,
@@ -1026,6 +1033,15 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
     planId: entitlements?.plan_id ?? null,
     planFound: entitlements?.plan_found ?? false,
     subscription: subscriptionViewOf(entitlements),
+    billing,
+    canManageBilling:
+      identity !== null && identity.effective_actions.includes('billing_write'),
+    manageDisabledReason:
+      identity === null
+        ? 'the control plane did not serve an identity; the owner role is unknown'
+        : identity.effective_actions.includes('billing_write')
+          ? null
+          : `the ${identity.role} role carries no billing_write capability (owner only)`,
     inFlight:
       entitlements === null
         ? []
@@ -1050,9 +1066,25 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
     label: 'Grant credits…',
     enabled,
   });
-  const pageActions: CockpitAction[] = [
+  const actionRow = (billingEnabled: boolean, grantEnabled: boolean): CockpitAction[] => [
+    grantAction(grantEnabled),
+    { key: 'usage-export', label: 'Download usage…', enabled: billingEnabled },
+    {
+      key: 'change-plan',
+      label: 'Change plan…',
+      enabled: billingEnabled && base.canManageBilling,
+    },
+    {
+      key: 'cancel-subscription',
+      label: 'Cancel subscription…',
+      enabled: billingEnabled && base.canManageBilling,
+    },
     { key: 'usage-prev', label: 'Previous page', enabled: hasPrev },
-    { key: 'usage-next', label: 'Next page', enabled: usage !== null && usage.nextCursor !== null },
+    {
+      key: 'usage-next',
+      label: 'Next page',
+      enabled: usage !== null && usage.nextCursor !== null,
+    },
   ];
   if (refusal !== null) {
     const disabled = refusal.code === 'billing_disabled';
@@ -1067,7 +1099,7 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
       grantDisabledReason: canGrantCredits
         ? 'the billing surface is disabled or unavailable; a grant cannot be attempted'
         : grantDisabledReason,
-      actions: [grantAction(false), ...pageActions],
+      actions: actionRow(false, false),
     };
   }
   if (entitlements === null || usage === null) {
@@ -1082,7 +1114,7 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
       grantDisabledReason: canGrantCredits
         ? 'the control plane served no usage/entitlement payload; a grant cannot be attempted'
         : grantDisabledReason,
-      actions: [grantAction(false), ...pageActions],
+      actions: actionRow(false, false),
     };
   }
   const totals = usageBucketView(usage.fold.totals);
@@ -1119,7 +1151,7 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
     }),
     canGrantCredits,
     grantDisabledReason,
-    actions: [grantAction(canGrantCredits), ...pageActions],
+    actions: actionRow(true, canGrantCredits),
   };
 }
 
@@ -1181,6 +1213,39 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
     default:
       lines.push('subscription unavailable (the snapshot serves no subscription)');
       break;
+  }
+  if (!panel.canManageBilling && panel.manageDisabledReason !== null) {
+    lines.push(`plan change disabled — ${panel.manageDisabledReason}`);
+  }
+  if (panel.billing !== null) {
+    const trial = panel.billing.trial;
+    if (trial.state === 'active') {
+      lines.push(
+        `trial active — ends ${trial.ends_ms === null ? 'unavailable' : utcSeconds(trial.ends_ms) ?? 'unavailable'}`,
+      );
+    } else if (trial.state === 'expired') {
+      lines.push(
+        `[TRIAL EXPIRED] trial ended ${trial.ends_ms === null ? 'unavailable' : utcSeconds(trial.ends_ms) ?? 'unavailable'} — new tasks are denied`,
+      );
+    }
+    for (const [label, capability] of [
+      ['payment', panel.billing.payment],
+      ['invoices', panel.billing.invoices],
+      ['seats', panel.billing.seats],
+      ['tax', panel.billing.tax],
+      ['currency', panel.billing.currency],
+    ] as const) {
+      lines.push(
+        capability.state === 'available'
+          ? `${label} available`
+          : `${label} unavailable — ${capability.cause ?? 'unavailable'}`,
+      );
+    }
+    lines.push(
+      panel.billing.usage_export.state === 'available'
+        ? `usage export available (${panel.billing.usage_export_formats.join(', ')})`
+        : `usage export unavailable — ${panel.billing.usage_export.cause ?? 'unavailable'}`,
+    );
   }
   if (panel.period !== null) {
     lines.push(
@@ -1257,7 +1322,15 @@ export function usagePanelSections(panel: CockpitUsagePanel): CockpitSection[] {
 
 /** One state-gated control a cockpit section renders. */
 export interface CockpitAction {
-  readonly key: 'decide' | 'abort' | 'usage-prev' | 'usage-next' | 'grant-credits';
+  readonly key:
+    | 'decide'
+    | 'abort'
+    | 'usage-prev'
+    | 'usage-next'
+    | 'grant-credits'
+    | 'usage-export'
+    | 'change-plan'
+    | 'cancel-subscription';
   readonly label: string;
   readonly enabled: boolean;
 }

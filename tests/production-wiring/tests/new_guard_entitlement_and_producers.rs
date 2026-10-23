@@ -147,10 +147,13 @@ async fn organization_outcomes_read_refuses_unentitled_plan_typed() {
 }
 
 /// The same route with the entitlement mapped answers the organization read
-/// (the gate is a boundary, never a blanket refusal) and the org-less local
-/// read is never gated at all.
+/// (the gate is a boundary, never a blanket refusal). Once the commercial
+/// plane is wired, the org-less alias is refused typed (`org_required`)
+/// instead of serving whole-daemon metrics outside the tenant/plan gate;
+/// the truly local (no billing authority) alias stays ungated in
+/// `entitlement_seams.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn entitled_organization_read_answers_and_local_read_is_never_gated() {
+async fn entitled_organization_read_answers_and_orgless_alias_requires_scope() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_file(dir.path(), serde_json::json!({"model": "default"}));
     let graph = harness::build_production_graph(dir.path(), config).unwrap();
@@ -204,9 +207,11 @@ async fn entitled_organization_read_answers_and_local_read_is_never_gated() {
         .unwrap();
     assert_eq!(
         response.status().as_u16(),
-        200,
-        "the org-less local read is never gated"
+        400,
+        "a wired billing plane requires an explicit organization scope"
     );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "org_required");
     drop(handle);
 }
 

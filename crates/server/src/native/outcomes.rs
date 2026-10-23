@@ -353,6 +353,13 @@ pub(crate) async fn native_outcomes(
         Ok(query) => query,
         Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
     };
+    // With the commercial plane wired, the org-less local alias would serve
+    // whole-daemon outcome metrics without the tenant/plan gate; require the
+    // explicit organization scope (the pre-billing route keeps its frozen
+    // local shape).
+    if query.org.is_none() && state.deps.billing.is_some() {
+        return wire_status(org_required());
+    }
     // The org-scope read is the paid `outcome_analytics` boundary; the
     // org-less local read below is never gated.
     if let Some(raw_org) = query.org.as_deref() {

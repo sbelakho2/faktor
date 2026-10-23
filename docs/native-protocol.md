@@ -316,7 +316,52 @@ The create-session contract validates BOTH the provider and the model against th
   `uncertain`); a scan hitting its cap says `truncated: true` instead of
   pretending to be exact. With `?org=` the route serves the org-isolated
   Wave 3 billing fold (`since` and `limit` are its strict query
-  parameters; unknown query keys are a 400).
+  parameters; unknown query keys are a 400). With a `[billing]` authority
+  wired the org-less legacy alias is refused 400 `org_required`: it would
+  serve whole-daemon data without the tenant scope. Without billing it
+  keeps its frozen shape byte-identically.
+- `GET /native/usage/export` — a BOUNDED download of the same
+  organization-scoped usage ledger `/native/usage?org=` folds. Strict query
+  `org` (required), `since` (exclusive cursor), `limit` (1..=5000, default
+  5000) and `format` (`csv` | `json`, default `json`); unknown keys are a
+  400. It runs the same read-through ingestion first, then pages at most
+  5000 rows / 2 MiB and answers as an attachment
+  (`content-disposition: attachment`); a larger result is a typed 413
+  `export_too_large` that names the bound, never a silently truncated
+  download (`truncated` names a limit-bound page). CSV neutralizes
+  spreadsheet formula prefixes (`=`, `+`, `-`, `@`, tab, CR) with a leading
+  quote and quotes RFC 4180 fields. The route is `BillingRead`
+  (viewer+), tenant-scoped: a foreign `org` is the same typed 404 as a
+  missing one, and no `[billing]` authority is the shared 409
+  `billing_disabled`.
+- `GET /native/billing/overview` — the durable commercial account of the
+  caller organization: `account` (id/name/managed/disabled/created_ms),
+  `plan_id`/`plan_found`, `subscription` (id/plan/status/started_ms/
+  expires_ms/updated_ms), `subscription_active` (derived at read time),
+  derived `trial` (`state` = `none` | `active` | `expired`, `ends_ms`), and
+  the typed availability of every capability this build does not
+  implement: `payment`, `invoices`, `seats`, `tax` and `currency` are
+  `unavailable` with stable causes (`payment_provider_not_configured`,
+  `invoices_not_available`, `seat_billing_not_modeled`,
+  `tax_not_configured`, `currency_not_configured`); `usage_export` is
+  `available` with formats `[csv, json]`. It NEVER folds usage and NEVER
+  infers a paid state from a local plan row. `BillingRead` (viewer+).
+- `POST /native/billing/subscription` — the plan-change / cancellation
+  EFFECT (OWNER only, `BillingWrite`), durable and immediate at the next
+  admission boundary (in-flight transactions continue). Strict body:
+  `{"action":"change","plan_id":...,"status"?: "active"|"trialing"|
+  "expired","expires_ms"?: ...}` or
+  `{"action":"cancel","confirm":true}`; `cancel` carries no plan/status/
+  expiry, `change` cannot set `canceled`, a `trialing` row REQUIRES
+  `expires_ms` (an open-ended trial is not a trial), and an undefined plan
+  is a typed 400. `Idempotency-Key` is required and durable/request-bound:
+  the same canonical request replays the recorded response (`replayed:
+  true`), a different request under the same key is a 409
+  `idempotency_conflict` with nothing written. The response carries the new
+  `subscription`, the new `billing` overview, and `proration` — which is
+  `unavailable` with cause `plan_prices_not_configured` because the plan
+  table carries no price; no money delta is invented. A change to the same
+  durable row reports `replayed: true` without bumping `updated_ms`.
 - `GET /native/outcomes` — the Engineering Outcome Ledger (economic audit
   item 7): the durable completed-run metrics aggregate plus one bounded
   newest-first page of run records. `metrics` carries the first-class
@@ -384,8 +429,10 @@ The create-session contract validates BOTH the provider and the model against th
   `value_entitlement_refused` naming the entitlement, its `hook`
   (`outcome_ledger`), the `cause` and the resolved plan; with no
   `[billing]` authority wired the org-scope read answers the shared typed
-  409 `billing_disabled`. The org-less read keeps the frozen local shape
-  and never consults the gate. Money fields are decimal strings
+  409 `billing_disabled`. The org-less read never consults the value gate:
+  without a billing authority it keeps the frozen local shape, and with
+  billing wired it is refused 400 `org_required` before any fold (the alias
+  would bypass the tenant scope). Money fields are decimal strings
   (`*Micro`); rates are integer ppm. A corrupt or
   payload/projection-drifted ledger row is a typed 500, never a fabricated
   metric. See `docs/outcome-ledger.md`.

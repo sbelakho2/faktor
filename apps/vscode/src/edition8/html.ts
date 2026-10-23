@@ -15,6 +15,7 @@ import {
   type E8PanelState,
   type E8ScreenView,
 } from './view.ts';
+import { microUsdInput } from './contract.ts';
 
 export interface Edition8HtmlOptions {
   readonly nonce: string;
@@ -134,6 +135,23 @@ const ACTION_LABEL: Readonly<Record<string, string>> = {
 
 const OPEN_COMPOSER_SCREENS = new Set(['S01', 'S36', 'S38', 'S40', 'S58']);
 
+// Spec navigation that is a screen link rather than a control (S54
+// "Account Settings… opens S55"). Read-only screens keep no primary.
+const SECONDARY_SCREEN_LINKS: Readonly<
+  Record<string, { readonly label: string; readonly screen: string }>
+> = {
+  S54: { label: 'Account Settings…', screen: 'S55' },
+};
+
+// S27 "Inspect Runs opens S53" is spec navigation, but no control carries it
+// (M-13/K-12/O-06 are read-only sheets). Render the one specified primary as
+// a screen action rather than inventing an export/run endpoint.
+const PRIMARY_SCREEN_ACTIONS: Readonly<
+  Record<string, { readonly label: string; readonly screen: string }>
+> = {
+  S27: { label: 'Inspect Runs', screen: 'S53' },
+};
+
 const HOST_PRIMARY: Readonly<Record<string, { readonly command: string; readonly label: string }>> = {
   S34: { command: 'faktor.startServer', label: 'Start Faktor' },
   S35: { command: 'faktor.trustExecutable8', label: 'Confirm Path' },
@@ -215,8 +233,18 @@ function controlInput(control: E8Control, view: E8ControlView): string {
     }
     case 'number':
       return `<input type="number" inputmode="numeric" min="${binding.min ?? 0}" step="${binding.step ?? 1}" ${common} value="${view.configValue !== null && typeof view.configValue === 'number' ? String(view.configValue) : ''}" placeholder="Inherit (not configured)"${disabled} />`;
-    case 'money':
-      return `<input type="text" inputmode="decimal" ${common} value="${view.configValue !== null && typeof view.configValue === 'string' ? esc(view.configValue) : ''}" placeholder="Exact amount, e.g. 5.00"${disabled} />`;
+    case 'money': {
+      // B-02 is exact USD input with an advanced micro-USD readout. The
+      // served value is micro-USD, so the editable field must show dollars;
+      // pre-filling raw micro would stage a 1,000,000x larger cap.
+      const value =
+        control.id === 'B-02'
+          ? microUsdInput(view.configValue)
+          : view.configValue !== null && typeof view.configValue === 'string'
+            ? view.configValue
+            : '';
+      return `<input type="text" inputmode="decimal" ${common} value="${esc(value)}" placeholder="Exact amount, e.g. 5.00"${disabled} />`;
+    }
     case 'textarea':
       return `<textarea ${common} rows="3" placeholder="Inherit (not configured)"${disabled}>${view.configValue !== null && typeof view.configValue === 'string' ? esc(view.configValue) : ''}</textarea>`;
     case 'list':
@@ -394,10 +422,30 @@ function primaryMarkup(primary: PrimaryAction, screen: E8ScreenView, host: 'vsco
   return open;
 }
 
+function secondaryMarkup(screenId: string): string {
+  const link = SECONDARY_SCREEN_LINKS[screenId];
+  if (link === undefined) return '';
+  return `<button type="button" class="e8-secondary" data-open-screen="${esc(link.screen)}">${esc(link.label)}</button>`;
+}
+
+function primaryScreenLinkMarkup(screenId: string): string {
+  const link = PRIMARY_SCREEN_ACTIONS[screenId];
+  if (link === undefined) return '';
+  return `<button type="button" class="e8-primary" data-open-screen="${esc(link.screen)}">${esc(link.label)}</button>`;
+}
+
 function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | 'jetbrains'): string {
   const screenEntry = screen.screen;
   const primary = primaryActionFor(screen);
   const showControls = screen.controls.length > 0;
+  const rowsMarkup =
+    screen.rows.length === 0
+      ? ''
+      : `<h3 class="e8-section-title">Current state</h3><section class="e8-data" aria-label="Served ${esc(screenEntry.id)} state">${screen.rows.map(rowMarkup).join('\n')}</section>`;
+  // S54 is read-only: served usage categories lead, and the two read-only
+  // control cards follow as provenance instead of pushing every number
+  // below the 480px fold.
+  const rowsFirst = screenEntry.id === 'S53' || screenEntry.id === 'S27' || screenEntry.id === 'S54';
   return `<section class="e8-screen" id="e8-screen-${screenEntry.id}" data-screen="${screenEntry.id}" data-group="${esc(screenEntry.group)}" data-destination="${destinationOf(screenEntry)}" data-surface="${screenEntry.surface}" data-primary="${primary.kind}"${initial ? '' : ' hidden'} aria-labelledby="e8-screen-title-${screenEntry.id}">
     <header class="e8-screen-head">
       <div class="e8-kicker">${esc(screenEntry.group)}</div>
@@ -406,7 +454,7 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
         <span class="e8-status" data-level="${screen.statusLevel}" role="status" aria-live="polite"><span aria-hidden="true">${statusGlyph(screen.statusLevel)}</span> <span data-status-text>${esc(screen.status)}</span></span>
       </div>
       <p class="e8-purpose">${esc(GROUP_SUMMARY[screenEntry.group] ?? screenEntry.job)}</p>
-      <div class="e8-primary-row">${primaryMarkup(primary, screen, host)}</div>
+      <div class="e8-primary-row">${primaryMarkup(primary, screen, host)}${primaryScreenLinkMarkup(screenEntry.id)}${secondaryMarkup(screenEntry.id)}</div>
       <details class="e8-screen-details">
         <summary>Screen contract and traceability</summary>
         <dl class="e8-screen-contract">
@@ -425,8 +473,9 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
     </header>
     ${screen.staleText === null ? '' : `<div class="e8-banner e8-warn" role="alert">${esc(screen.staleText)}</div>`}
     ${screen.emptyText === null || screen.emptyText.startsWith('No served state yet') ? '' : `<div class="e8-banner e8-empty" role="status">${esc(screen.emptyText)}</div>`}
+    ${rowsFirst ? rowsMarkup : ''}
     ${showControls ? groupControls(screen.controls) : ''}
-    ${screen.rows.length === 0 ? '' : `<h3 class="e8-section-title">Current state</h3><section class="e8-data" aria-label="Served ${esc(screenEntry.id)} state">${screen.rows.map(rowMarkup).join('\n')}</section>`}
+    ${rowsFirst ? '' : rowsMarkup}
   </section>`;
 }
 

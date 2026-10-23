@@ -13,12 +13,14 @@ use faktor_cloud::billing::{
 };
 use faktor_cloud::{
     Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingAccountId,
-    BillingConfig, BillingStore, BillingStoreError, ControlPlaneError, CreditAppend,
-    CreditAppendRefusal, CreditEntry, CreditEntryId, CreditKind, DurableSpendRow,
+    BillingCapabilityState, BillingConfig, BillingStore, BillingStoreError, ControlPlaneError,
+    CreditAppend, CreditAppendRefusal, CreditEntry, CreditEntryId, CreditKind, DurableSpendRow,
     EntitlementExceeded, EntitlementService, InFlightKind, ManualClock, MemoryBillingStore,
     ObservedUsage, OrganizationId, PlanConfig, ReconciliationState, SpendCategory,
     SqliteControlPlaneStore, Subscription, SubscriptionId, SubscriptionStatus, UsageEvent,
-    UsageEventId, UsageUnit, CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE,
+    UsageEventId, UsageUnit, CAUSE_CURRENCY_NOT_CONFIGURED, CAUSE_INVOICES_NOT_AVAILABLE,
+    CAUSE_LEDGER_OVERFLOW, CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED, CAUSE_PLAN,
+    CAUSE_SEAT_BILLING_NOT_MODELED, CAUSE_SUBSCRIPTION_ACTIVE, CAUSE_TAX_NOT_CONFIGURED,
 };
 
 fn org(id: &str) -> OrganizationId {
@@ -1796,15 +1798,17 @@ fn credit_aggregate_overflow_and_hidden_debt_are_typed_never_saturated() {
         }
         other => panic!("expected typed hidden-debt corruption, got {other:?}"),
     }
-    // Refund-over-spend: 600 refunded against the 500 consume. The plain
-    // balance still folds, but the refund guard refuses typed instead of
-    // masking the excess to a zero refundable amount.
+    // Refund-over-spend: 600 refunded against a SETTLED 500 consume. The
+    // plain balance still folds, but the refund guard refuses typed instead
+    // of masking the excess to a zero refundable amount. (Over-releasing a
+    // still-PENDING hold is itself corruption and is refused on read.)
     let refund_path = dir.path().join("refund.db");
     plant(
         &refund_path,
         &[
             credit_entry("crd_rg", CreditKind::Grant, 1_000, None),
             credit_entry("crd_rc", CreditKind::Consume, 500, None),
+            credit_entry("crd_rs", CreditKind::Settle, 500, Some("crd_rc")),
             credit_entry("crd_rr", CreditKind::Refund, 600, Some("crd_rc")),
         ],
     );
@@ -1834,7 +1838,7 @@ fn credit_aggregate_overflow_and_hidden_debt_are_typed_never_saturated() {
     }
     assert_eq!(
         store.credit_entries(&organization, 0, 10).unwrap().len(),
-        3,
+        4,
         "the corrupt-ledger append wrote nothing"
     );
 }
@@ -2306,4 +2310,813 @@ fn the_configured_default_plan_is_scoped_to_the_configured_organization() {
     assert_eq!(snapshot.plan_id.as_deref(), Some("team"));
     assert!(snapshot.plan_found);
     assert_eq!(snapshot.limit(LIMIT_MAX_ACTIVE_TASKS), Some(9));
+}
+
+/// The account overview is derived from durable rows and reports every
+/// capability this build does not implement as a TYPED unavailable state: no
+/// fake paid/invoice/seat/tax/currency state is ever inferred from a plan.
+#[test]
+fn overview_is_typed_and_trials_are_bounded_and_derived() {
+    let root = tempfile::tempdir().unwrap();
+    let store: Arc<dyn BillingStore> =
+        Arc::new(SqliteControlPlaneStore::open(&root.path().join("billing.db")).unwrap());
+    let clock = Arc::new(ManualClock::new(1_000));
+    let service = EntitlementService::new_for_organization(
+        store,
+        clock.clone(),
+        configured(),
+        Some(org("org_overview")),
+    )
+    .unwrap();
+    let organization = org("org_overview");
+    service
+        .ensure_account(&organization, &account("acct"), "Local", true)
+        .unwrap();
+
+    let overview = service.overview(&organization).unwrap();
+    assert_eq!(
+        overview.account.as_ref().map(|a| a.id.clone()),
+        Some(account("acct"))
+    );
+    assert!(overview.plan_found);
+    assert!(!overview.subscription_active, "no subscription row yet");
+    assert_eq!(overview.trial.state, "none");
+    assert_eq!(overview.payment.state, BillingCapabilityState::Unavailable);
+    assert_eq!(
+        overview.payment.cause,
+        Some(CAUSE_PAYMENT_PROVIDER_NOT_CONFIGURED)
+    );
+    assert_eq!(overview.invoices.cause, Some(CAUSE_INVOICES_NOT_AVAILABLE));
+    assert_eq!(overview.seats.cause, Some(CAUSE_SEAT_BILLING_NOT_MODELED));
+    assert_eq!(overview.tax.cause, Some(CAUSE_TAX_NOT_CONFIGURED));
+    assert_eq!(overview.currency.cause, Some(CAUSE_CURRENCY_NOT_CONFIGURED));
+    assert_eq!(
+        overview.usage_export.state,
+        BillingCapabilityState::Available
+    );
+    assert_eq!(overview.usage_export_formats, ["csv", "json"]);
+
+    // A trial is time-bounded by expires_ms and derives active -> expired.
+    let (trial, replayed) = service
+        .change_subscription(
+            &organization,
+            "pro",
+            SubscriptionStatus::Trialing,
+            Some(1_500),
+        )
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(trial.status, SubscriptionStatus::Trialing);
+    assert_eq!(trial.started_ms, 1_000);
+    let overview = service.overview(&organization).unwrap();
+    assert_eq!(overview.trial.state, "active");
+    assert!(overview.subscription_active);
+    clock.advance(1_000);
+    let overview = service.overview(&organization).unwrap();
+    assert_eq!(overview.trial.state, "expired");
+    assert!(
+        !overview.subscription_active,
+        "a stale trialing row is inactive"
+    );
+    assert_eq!(overview.trial.ends_ms, Some(1_500));
+
+    // An open-ended trial is refused (it would be an unbounded entitlement).
+    let err = service
+        .change_subscription(&organization, "pro", SubscriptionStatus::Trialing, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("requires expires_ms"), "{err}");
+
+    // A legacy trialing row WITHOUT an expiry (possible only in an older
+    // payload) is never presented as active: an open-ended trial is not an
+    // entitlement. The store refuses it on write now; the DERIVATION still
+    // fails closed if such a row ever appears.
+    let legacy_trial = Subscription {
+        id: SubscriptionId::try_new("sub_legacy_trial").unwrap(),
+        organization: organization.clone(),
+        plan_id: "pro".into(),
+        status: SubscriptionStatus::Trialing,
+        started_ms: 1_000,
+        expires_ms: None,
+        updated_ms: 1_000,
+    };
+    assert!(!legacy_trial.is_active_at(1_000));
+    assert_eq!(
+        faktor_cloud::BillingTrialView::of(Some(&legacy_trial), 1_000).state,
+        "expired"
+    );
+}
+
+/// Plan changes are durable and immediate: a downgrade/upgrade rewrites the
+/// SAME row, replaying the same request never bumps `updated_ms`, and cancel
+/// denies the next admission without touching the plan row.
+#[test]
+fn plan_change_and_cancel_are_durable_idempotent_effects() {
+    let store: Arc<dyn BillingStore> = Arc::new(MemoryBillingStore::new());
+    let clock = Arc::new(ManualClock::new(10_000));
+    let mut config = configured();
+    config.plans.insert(
+        "team".into(),
+        PlanConfig {
+            plan_id: "team".into(),
+            features: [FEATURE_MANAGED_PROVIDERS.to_string()]
+                .into_iter()
+                .collect(),
+            limits: [(LIMIT_MAX_ACTIVE_TASKS.to_string(), 9)]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let service = EntitlementService::new_for_organization(
+        store,
+        clock.clone(),
+        config,
+        Some(org("org_change")),
+    )
+    .unwrap();
+    let organization = org("org_change");
+    service
+        .ensure_account(&organization, &account("acct"), "Local", true)
+        .unwrap();
+
+    let (upgraded, replayed) = service
+        .change_subscription(&organization, "team", SubscriptionStatus::Active, None)
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(upgraded.started_ms, 10_000);
+    assert_eq!(
+        service
+            .entitlement_snapshot(&organization)
+            .unwrap()
+            .plan_id
+            .as_deref(),
+        Some("team")
+    );
+
+    // The same request is a replay: no new row, no timestamp drift.
+    clock.advance(50);
+    let (same, replayed) = service
+        .change_subscription(&organization, "team", SubscriptionStatus::Active, None)
+        .unwrap();
+    assert!(replayed);
+    assert_eq!(same.updated_ms, upgraded.updated_ms);
+
+    // A real downgrade rewrites the row and is visible at the next read.
+    clock.advance(50);
+    let (downgraded, replayed) = service
+        .change_subscription(&organization, "pro", SubscriptionStatus::Active, None)
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(downgraded.id, upgraded.id, "the organization keeps one row");
+    assert_eq!(
+        service
+            .entitlement_snapshot(&organization)
+            .unwrap()
+            .plan_id
+            .as_deref(),
+        Some("pro")
+    );
+
+    // Cancellation is a durable effect; the next NEW admission is refused
+    // with the subscription cause, and the plan row remains for history.
+    let (canceled, replayed) = service.cancel_subscription(&organization).unwrap();
+    assert!(!replayed);
+    assert_eq!(canceled.status, SubscriptionStatus::Canceled);
+    let snapshot = service.entitlement_snapshot(&organization).unwrap();
+    assert!(!snapshot.subscription_active);
+    assert_eq!(snapshot.plan_id.as_deref(), Some("pro"));
+    let denied = service
+        .check_admission(
+            &organization,
+            &AdmissionRequest::boundary(AdmissionBoundary::NewTask),
+        )
+        .unwrap_err();
+    assert_eq!(denied.limit, CAUSE_SUBSCRIPTION_ACTIVE);
+    assert!(
+        service.cancel_subscription(&organization).unwrap().1,
+        "replay"
+    );
+
+    // Unknown plans are refused, and `change` cannot smuggle in `canceled`.
+    let err = service
+        .change_subscription(&organization, "absent", SubscriptionStatus::Active, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("not defined"), "{err}");
+    let err = service
+        .change_subscription(&organization, "pro", SubscriptionStatus::Canceled, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("cancel action"), "{err}");
+}
+
+/// Adversarial: refunding a PENDING hold must cancel it, and the cancelled
+/// consume can never then be settled. The old sequence (refund the hold,
+/// then settle the actual) returned the credits AND charged the spend — free
+/// managed usage. Both stores must refuse identically, write nothing, and
+/// the fold must report no phantom hold.
+#[test]
+fn a_refunded_pending_hold_is_cancelled_and_never_settled_on_both_backends() {
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let organization = org("org_a");
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_g", CreditKind::Grant, 1_000, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_h", CreditKind::Consume, 400, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        // A partial release of a pending hold is refused: it would leave a
+        // half-released hold a later settle could charge again.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_partial",
+                    CreditKind::Refund,
+                    100,
+                    Some("crd_h")
+                ))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::PendingHoldRefundNotFull {
+                reference: "crd_h".into(),
+                refundable: 400,
+                requested: 100,
+            })
+        );
+        assert_eq!(
+            store.credit_entries(&organization, 0, 10).unwrap().len(),
+            2,
+            "the partial refusal wrote nothing"
+        );
+        // Releasing the FULL hold is the documented pre-dispatch refund.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_full",
+                    CreditKind::Refund,
+                    400,
+                    Some("crd_h")
+                ))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.held_micro, 0, "the cancelled hold is released");
+        assert_eq!(balance.pending_consumes, 0);
+        assert_eq!(
+            balance.balance_micro().unwrap(),
+            1_000,
+            "a released hold returns the credits"
+        );
+        // The exploit: settle the SAME consume after its refund. Refused
+        // typed, nothing written, the balance unchanged.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_settle_after",
+                    CreditKind::Settle,
+                    400,
+                    Some("crd_h")
+                ))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::SettleAfterRefund {
+                reference: "crd_h".into(),
+            })
+        );
+        assert_eq!(
+            store.credit_entries(&organization, 0, 10).unwrap().len(),
+            3,
+            "the refused settle wrote nothing"
+        );
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.refunded_micro, 400);
+        assert_eq!(balance.consumed_micro, 400);
+        assert_eq!(balance.balance_micro().unwrap(), 1_000);
+    }
+}
+
+/// Adversarial: the same exploit through the service API (`consume_before_call`
+/// -> `refund_consume` -> `settle_consume`) is refused typed and leaves the
+/// append-only ledger byte-identical after the refusal.
+#[test]
+fn service_refund_then_settle_never_mints_credit() {
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    service
+        .grant_credits(&organization, &acct, 1_000, "seed", None)
+        .unwrap();
+    let consume = match service
+        .consume_before_call(&organization, &acct, 400, None, "attempt", Some("hold-1"))
+        .unwrap()
+    {
+        CreditAppend::Appended => service
+            .credit_entries_page(&organization, 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry.kind == CreditKind::Consume)
+            .map(|row| row.entry.id)
+            .unwrap(),
+        other => panic!("expected an appended consume, got {other:?}"),
+    };
+    service
+        .refund_consume(&organization, &acct, &consume, 400, "pre_dispatch")
+        .unwrap();
+    let before = service.credit_entries_page(&organization, 0, 100).unwrap();
+    let err = service
+        .settle_consume(&organization, &acct, &consume, 400, "late settle")
+        .unwrap_err();
+    assert!(
+        matches!(err, ControlPlaneError::Conflict(ref message) if message.contains("released hold")),
+        "the refusal names the released hold: {err:?}"
+    );
+    let after = service.credit_entries_page(&organization, 0, 100).unwrap();
+    assert_eq!(before, after, "a refused settle never mutates the ledger");
+    let balance = service.credit_balance(&organization).unwrap();
+    assert_eq!(balance.held_micro, 0);
+    assert_eq!(balance.pending_consumes, 0);
+    assert_eq!(balance.balance_micro().unwrap(), 1_000);
+}
+
+/// Adversarial: a correction changes the corrected VALUE, never the base
+/// fact. Retagging managed spend as BYOK, moving it to another task/run/
+/// account/provider/model, or changing its unit is refused typed with the
+/// field named, and the fold stays byte-identical after the refusal.
+#[test]
+fn corrections_cannot_retag_the_base_fact_or_launder_managed_spend() {
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    let other = account("acct_2");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    service
+        .ensure_account(&organization, &other, "other", true)
+        .unwrap();
+    let base = usage_event("uev_base");
+    service.record_usage(&base).unwrap();
+    let fold_before = service.fold(&organization).unwrap();
+
+    type Mutation = Box<dyn Fn(&mut UsageEvent)>;
+    let mut attempts: Vec<(&str, Mutation)> = vec![
+        (
+            "category",
+            Box::new(|event| event.category = SpendCategory::Byok),
+        ),
+        ("task_id", Box::new(|event| event.task_id = 8)),
+        ("run_id", Box::new(|event| event.run_id = "2".into())),
+        (
+            "attempt_id",
+            Box::new(|event| event.attempt_id = "other".into()),
+        ),
+        (
+            "provider",
+            Box::new(|event| event.provider = "anthropic".into()),
+        ),
+        ("model", Box::new(|event| event.model = "m2".into())),
+        (
+            "billing_account_id",
+            Box::new(|event| event.billing_account_id = account("acct_2")),
+        ),
+        (
+            "unit",
+            Box::new(|event| {
+                event.unit = UsageUnit::InputTokens;
+                event.quantity = 2;
+                event.provider_cost_micro = 0;
+            }),
+        ),
+    ];
+    for (field, mutate) in attempts.drain(..) {
+        let mut correction = usage_event(&format!("uev_fix_{field}"));
+        correction.correction_of = Some(base.id.clone());
+        correction.reconciliation_state = ReconciliationState::Reconciled;
+        mutate(&mut correction);
+        let err = service.correct_usage(&correction).unwrap_err();
+        assert!(
+            matches!(&err, ControlPlaneError::Conflict(message) if message.contains(field)),
+            "the {field} retag must be a typed conflict naming it: {err:?}"
+        );
+        assert_eq!(
+            service.fold(&organization).unwrap(),
+            fold_before,
+            "a refused correction never changes the managed/BYOK split ({field})"
+        );
+    }
+    // Control: a legitimate correction of the AMOUNT is still accepted and
+    // supersedes the base in the fold.
+    let mut correction = usage_event("uev_fix_amount");
+    correction.correction_of = Some(base.id.clone());
+    correction.provider_cost_micro = 125;
+    correction.reconciliation_state = ReconciliationState::Reconciled;
+    assert_eq!(
+        service.correct_usage(&correction).unwrap(),
+        faktor_cloud::UsageAppend::Appended
+    );
+    let fold = service.fold(&organization).unwrap();
+    assert_eq!(fold.totals.managed_cost_micro, 125);
+    assert_eq!(fold.totals.byok_cost_micro, 0);
+}
+
+/// Adversarial: credits can only ever be appended to an account that really
+/// belongs to the organization; a settle/refund can never cross accounts; a
+/// disabled account cannot open new funding/spend but can still close holds.
+#[test]
+fn credit_appends_are_account_bound_and_cross_account_references_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let mem = MemoryBillingStore::new();
+    let organization = org("org_a");
+    let foreign_org = org("org_b");
+    // An account id is globally unique: a second organization can never
+    // silently take over the row (which would alias its ledger identity).
+    let shared = BillingAccount {
+        id: account("acct_shared"),
+        organization: organization.clone(),
+        name: "shared".into(),
+        managed: true,
+        created_ms: 0,
+        disabled: false,
+    };
+    let mut foreign = shared.clone();
+    foreign.organization = foreign_org.clone();
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        store.put_billing_account(&shared).unwrap();
+        let err = store.put_billing_account(&foreign).unwrap_err();
+        assert!(
+            matches!(err, BillingStoreError::Malformed(ref message) if message.contains("already owned")),
+            "a cross-organization account takeover is refused typed: {err:?}"
+        );
+        assert_eq!(
+            store
+                .billing_account(&organization, &shared.id)
+                .unwrap()
+                .unwrap()
+                .organization,
+            organization
+        );
+    }
+
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let acct = account("acct_1");
+    let other = account("acct_2");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    service
+        .ensure_account(&organization, &other, "other", true)
+        .unwrap();
+    service
+        .ensure_account(&foreign_org, &account("acct_b"), "b", true)
+        .unwrap();
+    // Unknown account: refuses BEFORE any ledger append.
+    let missing = account("acct_missing");
+    assert!(matches!(
+        service
+            .grant_credits(&organization, &missing, 10, "ghost", None)
+            .unwrap_err(),
+        ControlPlaneError::NotFound(_)
+    ));
+    assert!(service
+        .credit_entries_page(&organization, 0, 10)
+        .unwrap()
+        .is_empty());
+    // A foreign organization's account is invisible (typed 404).
+    assert!(matches!(
+        service
+            .grant_credits(&organization, &account("acct_b"), 10, "foreign", None)
+            .unwrap_err(),
+        ControlPlaneError::NotFound(_)
+    ));
+    assert!(service
+        .credit_entries_page(&organization, 0, 10)
+        .unwrap()
+        .is_empty());
+    // A disabled account can neither be granted nor consume.
+    let disabled = account("acct_disabled");
+    service
+        .store()
+        .put_billing_account(&BillingAccount {
+            id: disabled.clone(),
+            organization: organization.clone(),
+            name: "disabled".into(),
+            managed: true,
+            created_ms: 0,
+            disabled: true,
+        })
+        .unwrap();
+    assert!(matches!(
+        service
+            .grant_credits(&organization, &disabled, 10, "disabled", None)
+            .unwrap_err(),
+        ControlPlaneError::Conflict(_)
+    ));
+    assert!(matches!(
+        service
+            .consume_before_call(&organization, &disabled, 10, None, "disabled", None)
+            .unwrap_err(),
+        ControlPlaneError::Conflict(_)
+    ));
+    // Fund acct_1, hold 400, then try to close the hold through acct_2.
+    service
+        .grant_credits(&organization, &acct, 1_000, "seed", None)
+        .unwrap();
+    let consume = match service
+        .consume_before_call(&organization, &acct, 400, None, "attempt", Some("hold-x"))
+        .unwrap()
+    {
+        CreditAppend::Appended => service
+            .credit_entries_page(&organization, 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry.kind == CreditKind::Consume)
+            .map(|row| row.entry.id)
+            .unwrap(),
+        other => panic!("expected an appended consume, got {other:?}"),
+    };
+    let before = service.credit_entries_page(&organization, 0, 100).unwrap();
+    let err = service
+        .settle_consume(&organization, &other, &consume, 400, "cross-account")
+        .unwrap_err();
+    assert!(
+        matches!(err, ControlPlaneError::Conflict(ref message) if message.contains("cross accounts")),
+        "cross-account settle is refused typed: {err:?}"
+    );
+    assert_eq!(
+        service.credit_entries_page(&organization, 0, 100).unwrap(),
+        before,
+        "the cross-account refusal wrote nothing"
+    );
+    // The account that owns the hold still closes it.
+    service
+        .settle_consume(&organization, &acct, &consume, 250, "actual")
+        .unwrap();
+    let balance = service.credit_balance(&organization).unwrap();
+    assert_eq!(balance.consumed_micro, 250);
+    assert_eq!(balance.balance_micro().unwrap(), 750);
+}
+
+/// Adversarial: a durable spend row is never attributed to another tenant.
+#[test]
+fn ingestion_refuses_a_row_naming_a_foreign_organization() {
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    let mut row = spend_row(1, 100, 1, 1, 0);
+    row.organization_id = "org_b".into();
+    let err = service
+        .ingest_spend_row(&organization, &acct, &row, SpendCategory::Managed)
+        .unwrap_err();
+    assert!(
+        matches!(err, ControlPlaneError::Malformed(ref message) if message.contains("another tenant")),
+        "a foreign row is refused typed: {err:?}"
+    );
+    assert!(service
+        .usage_page(&organization, None, 10)
+        .unwrap()
+        .items
+        .is_empty());
+}
+
+/// Adversarial concurrency: racing consumes can never jointly overdraw, and
+/// a racing settle/refund pair for one hold has exactly one winner (never
+/// both, which would both charge and release the same money).
+#[test]
+fn concurrent_consumes_and_settle_refund_races_are_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let organization = org("org_a");
+    store
+        .append_credit_entry(&credit_entry("crd_g", CreditKind::Grant, 1_000, None))
+        .unwrap();
+    let outcomes: Vec<BillingStoreError> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..8u32 {
+            let store = &store;
+            handles.push(scope.spawn(move || {
+                store
+                    .append_credit_entry(&credit_entry(
+                        &format!("crd_race_{index}"),
+                        CreditKind::Consume,
+                        400,
+                        None,
+                    ))
+                    .map(|_| ())
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().err())
+            .collect()
+    });
+    assert_eq!(outcomes.len(), 6, "exactly two 400-micro holds fit 1000");
+    for refusal in &outcomes {
+        assert!(
+            matches!(
+                refusal,
+                BillingStoreError::Credit(CreditAppendRefusal::InsufficientCredits { .. })
+            ),
+            "every losing consume is a typed insufficient-credit refusal: {refusal:?}"
+        );
+    }
+    let balance = store.credit_balance(&organization).unwrap();
+    assert_eq!(balance.held_micro, 800);
+    assert_eq!(balance.balance_micro().unwrap(), 200, "never overdrawn");
+    let held = store.credit_entries(&organization, 0, 100).unwrap();
+    assert_eq!(held.len(), 3);
+    let mut consume_ids: Vec<_> = held
+        .iter()
+        .filter(|row| row.entry.kind == CreditKind::Consume)
+        .map(|row| row.entry.id.clone())
+        .collect();
+    assert_eq!(consume_ids.len(), 2);
+    let settle_target = consume_ids.pop().unwrap();
+    let refund_target = consume_ids.pop().unwrap();
+
+    // Two settles of the SAME hold: exactly one wins; a double settle is
+    // refused typed (never charges the actual twice).
+    let settles: Vec<_> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..2u32 {
+            let store = &store;
+            let target = settle_target.as_str();
+            handles.push(scope.spawn(move || {
+                store.append_credit_entry(&credit_entry(
+                    &format!("crd_race_settle_{index}"),
+                    CreditKind::Settle,
+                    400,
+                    Some(target),
+                ))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        settles.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one settle wins: {settles:?}"
+    );
+
+    // Two FULL refunds of the OTHER pending hold: exactly one wins; the
+    // second is the typed `PendingHoldRefundNotFull` (a released hold cannot
+    // be released again).
+    let refunds: Vec<_> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..2u32 {
+            let store = &store;
+            let target = refund_target.as_str();
+            handles.push(scope.spawn(move || {
+                store.append_credit_entry(&credit_entry(
+                    &format!("crd_race_refund_{index}"),
+                    CreditKind::Refund,
+                    400,
+                    Some(target),
+                ))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        refunds.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one full release wins: {refunds:?}"
+    );
+    let balance = store.credit_balance(&organization).unwrap();
+    assert_eq!(balance.held_micro, 0, "no phantom holds after the races");
+    assert_eq!(balance.pending_consumes, 0);
+    assert_eq!(balance.consumed_micro, 800, "settled+released holds");
+    assert_eq!(balance.refunded_micro, 400);
+    assert_eq!(balance.balance_micro().unwrap(), 600, "never minted");
+    assert_eq!(
+        store.credit_entries(&organization, 0, 100).unwrap().len(),
+        5
+    );
+    // The cancelled hold can never be settled afterwards.
+    assert!(matches!(
+        store
+            .append_credit_entry(&credit_entry(
+                "crd_race_late_settle",
+                CreditKind::Settle,
+                400,
+                Some(refund_target.as_str()),
+            ))
+            .unwrap_err(),
+        BillingStoreError::Credit(CreditAppendRefusal::SettleAfterRefund { .. })
+    ));
+}
+
+/// A commercial mutation idempotency key is request-bound on BOTH stores:
+/// the same canonical request replays the recorded response, a different
+/// request conflicts without mutating, and the key is tenant-scoped.
+#[test]
+fn commercial_mutation_claim_replays_only_the_same_request() {
+    let org_a = org("org_mutation_a");
+    let org_b = org("org_mutation_b");
+    let store = MemoryBillingStore::new();
+    assert_eq!(
+        store
+            .claim_billing_mutation(&org_a, "k", "req-1", 0)
+            .unwrap(),
+        faktor_cloud::BillingMutationClaim::Fresh
+    );
+    store
+        .finish_billing_mutation(&org_a, "k", "resp-1")
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_billing_mutation(&org_a, "k", "req-1", 1)
+            .unwrap(),
+        faktor_cloud::BillingMutationClaim::Replay {
+            response: Some("resp-1".into())
+        }
+    );
+    assert!(matches!(
+        store
+            .claim_billing_mutation(&org_a, "k", "req-2", 2)
+            .unwrap(),
+        faktor_cloud::BillingMutationClaim::Conflict { .. }
+    ));
+    // Tenant-scoped: another organization's identical key is a fresh claim.
+    assert_eq!(
+        store
+            .claim_billing_mutation(&org_b, "k", "req-1", 3)
+            .unwrap(),
+        faktor_cloud::BillingMutationClaim::Fresh
+    );
+}
+
+/// Adversarial: caller-chosen commercial idempotency keys are BOUNDED per
+/// organization. The newest keys keep their replay record; the oldest are
+/// pruned (a fresh claim), so an owner cannot grow the durable table without
+/// bound. Both stores keep the newest key replayed.
+#[test]
+fn commercial_mutation_idempotency_keys_are_bounded_per_organization() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = MemoryBillingStore::new();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let organization = org("org_a");
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        for index in 0..(faktor_cloud::MAX_BILLING_MUTATIONS_PER_ORG + 5) {
+            assert_eq!(
+                store
+                    .claim_billing_mutation(
+                        &organization,
+                        &format!("key_{index}"),
+                        &format!("request_{index}"),
+                        index as i64,
+                    )
+                    .unwrap(),
+                faktor_cloud::BillingMutationClaim::Fresh
+            );
+        }
+        let newest = faktor_cloud::MAX_BILLING_MUTATIONS_PER_ORG + 4;
+        assert!(matches!(
+            store
+                .claim_billing_mutation(
+                    &organization,
+                    &format!("key_{newest}"),
+                    &format!("request_{newest}"),
+                    0,
+                )
+                .unwrap(),
+            faktor_cloud::BillingMutationClaim::Replay { response: None }
+        ));
+        // The oldest key was pruned by the bound: a fresh claim again.
+        assert_eq!(
+            store
+                .claim_billing_mutation(&organization, "key_0", "request_0", 0)
+                .unwrap(),
+            faktor_cloud::BillingMutationClaim::Fresh
+        );
+    }
 }

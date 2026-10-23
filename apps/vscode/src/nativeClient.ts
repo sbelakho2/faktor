@@ -1096,6 +1096,99 @@ export interface NativeEntitlements {
   readonly entitlements: NativeEntitlementSnapshot;
 }
 
+/** One typed commercial capability status (`available` | `unavailable`). */
+export interface NativeBillingCapability {
+  readonly state: string;
+  readonly cause: string | null;
+}
+
+/** The derived trial view of one subscription. */
+export interface NativeBillingTrial {
+  readonly state: string;
+  readonly ends_ms: number | null;
+}
+
+/** One durable billing account row (`GET /native/billing/overview`). */
+export interface NativeBillingAccount {
+  readonly id: string;
+  readonly organization: string;
+  readonly name: string;
+  readonly managed: boolean;
+  readonly created_ms: number;
+  readonly disabled: boolean;
+}
+
+/** One durable subscription row (`GET /native/billing/overview`). */
+export interface NativeBillingSubscription {
+  readonly id: string;
+  readonly organization: string;
+  readonly plan_id: string;
+  readonly status: string;
+  readonly started_ms: number;
+  readonly expires_ms: number | null;
+  readonly updated_ms: number;
+}
+
+/**
+ * `GET /native/billing/overview` — the durable commercial account plus the
+ * HONEST availability of every capability this build does not implement.
+ * Payment/invoice/seat/tax/currency states are typed `unavailable` with a
+ * cause; they are never inferred from a local plan row.
+ */
+export interface NativeBillingOverview {
+  readonly organization_id: string;
+  readonly account: NativeBillingAccount | null;
+  readonly plan_id: string | null;
+  readonly plan_found: boolean;
+  readonly subscription: NativeBillingSubscription | null;
+  readonly subscription_active: boolean;
+  readonly trial: NativeBillingTrial;
+  readonly payment: NativeBillingCapability;
+  readonly invoices: NativeBillingCapability;
+  readonly seats: NativeBillingCapability;
+  readonly tax: NativeBillingCapability;
+  readonly currency: NativeBillingCapability;
+  readonly usage_export: NativeBillingCapability;
+  readonly usage_export_formats: string[];
+  readonly now_ms: number;
+}
+
+/** `GET /native/billing/overview` — the wrapped overview. */
+export interface NativeBillingOverviewView {
+  readonly ok: boolean;
+  readonly billing: NativeBillingOverview;
+}
+
+/** The typed proration result of one plan change (never a fabricated delta). */
+export interface NativeBillingProration {
+  readonly state: string;
+  readonly cause: string;
+}
+
+/** `POST /native/billing/subscription` — the applied change and new account. */
+export interface NativeSubscriptionChange {
+  readonly ok: boolean;
+  readonly replayed: boolean;
+  readonly subscription: NativeBillingSubscription;
+  readonly proration: NativeBillingProration;
+  readonly billing: NativeBillingOverview;
+}
+
+/** One exported usage event of `GET /native/usage/export?format=json`. */
+export interface NativeUsageExportItem {
+  readonly cursor: string;
+  readonly event: Json;
+}
+
+/** `GET /native/usage/export?format=json` — the bounded download envelope. */
+export interface NativeUsageExport {
+  readonly ok: boolean;
+  readonly organization: string;
+  readonly items: NativeUsageExportItem[];
+  readonly next_cursor: string | null;
+  readonly truncated: boolean;
+}
+
 /**
  * `GET /native/value-entitlements` — the caller organization's DERIVED
  * value-entitlement report: the plan resolution, the plan-mapped
@@ -2981,6 +3074,166 @@ export function validateEntitlements(json: Json): NativeEntitlements {
   };
 }
 
+function validateBillingCapability(object: JsonObject, key: string, path: string): NativeBillingCapability {
+  const view = asObject(field(object, key, path), `${path}.${key}`);
+  checkResponseKeys(view, `${path}.${key}`, ['state', 'cause']);
+  return {
+    state: fString(view, 'state', `${path}.${key}`),
+    cause: fNullableString(view, 'cause', `${path}.${key}`),
+  };
+}
+
+function validateBillingAccount(object: JsonObject, path: string): NativeBillingAccount {
+  checkResponseKeys(object, path, [
+    'id',
+    'organization',
+    'name',
+    'managed',
+    'created_ms',
+    'disabled',
+  ]);
+  return {
+    id: fString(object, 'id', path),
+    organization: fString(object, 'organization', path),
+    name: fString(object, 'name', path),
+    managed: fBool(object, 'managed', path),
+    created_ms: fEpochMs(object, 'created_ms', path),
+    disabled: fBool(object, 'disabled', path),
+  };
+}
+
+function validateBillingSubscription(object: JsonObject, path: string): NativeBillingSubscription {
+  checkResponseKeys(object, path, [
+    'id',
+    'organization',
+    'plan_id',
+    'status',
+    'started_ms',
+    'expires_ms',
+    'updated_ms',
+  ]);
+  return {
+    id: fString(object, 'id', path),
+    organization: fString(object, 'organization', path),
+    plan_id: fString(object, 'plan_id', path),
+    status: fString(object, 'status', path),
+    started_ms: fEpochMs(object, 'started_ms', path),
+    expires_ms: fNullableEpochMs(object, 'expires_ms', path),
+    updated_ms: fEpochMs(object, 'updated_ms', path),
+  };
+}
+
+function validateBillingOverviewObject(view: JsonObject, path: string): NativeBillingOverview {
+  checkResponseKeys(view, path, [
+    'organization_id',
+    'account',
+    'plan_id',
+    'plan_found',
+    'subscription',
+    'subscription_active',
+    'trial',
+    'payment',
+    'invoices',
+    'seats',
+    'tax',
+    'currency',
+    'usage_export',
+    'usage_export_formats',
+    'now_ms',
+  ]);
+  const account = fNullableObject(view, 'account', path);
+  const subscription = fNullableObject(view, 'subscription', path);
+  const trial = asObject(field(view, 'trial', path), `${path}.trial`);
+  checkResponseKeys(trial, `${path}.trial`, ['state', 'ends_ms']);
+  const formats = fStringArray(view, 'usage_export_formats', path);
+  if (formats.length !== 2 || !formats.includes('csv') || !formats.includes('json')) {
+    throw new NativeProtocolError(path, 'usage_export_formats must be [csv, json]');
+  }
+  return {
+    organization_id: fString(view, 'organization_id', path),
+    account: account === null ? null : validateBillingAccount(account, `${path}.account`),
+    plan_id: fNullableString(view, 'plan_id', path),
+    plan_found: fBool(view, 'plan_found', path),
+    subscription:
+      subscription === null
+        ? null
+        : validateBillingSubscription(subscription, `${path}.subscription`),
+    subscription_active: fBool(view, 'subscription_active', path),
+    trial: {
+      state: fString(trial, 'state', `${path}.trial`),
+      ends_ms: fNullableEpochMs(trial, 'ends_ms', `${path}.trial`),
+    },
+    payment: validateBillingCapability(view, 'payment', path),
+    invoices: validateBillingCapability(view, 'invoices', path),
+    seats: validateBillingCapability(view, 'seats', path),
+    tax: validateBillingCapability(view, 'tax', path),
+    currency: validateBillingCapability(view, 'currency', path),
+    usage_export: validateBillingCapability(view, 'usage_export', path),
+    usage_export_formats: formats,
+    now_ms: fEpochMs(view, 'now_ms', path),
+  };
+}
+
+/** Strict parse of `GET /native/billing/overview`. */
+export function validateBillingOverview(json: Json): NativeBillingOverviewView {
+  const path = 'GET /native/billing/overview';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'billing']);
+  return {
+    ok: fBool(object, 'ok', path),
+    billing: validateBillingOverviewObject(
+      asObject(field(object, 'billing', path), `${path}.billing`),
+      `${path}.billing`,
+    ),
+  };
+}
+
+/** Strict parse of `POST /native/billing/subscription`. */
+export function validateSubscriptionChange(json: Json): NativeSubscriptionChange {
+  const path = 'POST /native/billing/subscription';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'replayed', 'subscription', 'proration', 'billing']);
+  const proration = asObject(field(object, 'proration', path), `${path}.proration`);
+  checkResponseKeys(proration, `${path}.proration`, ['state', 'cause']);
+  return {
+    ok: fBool(object, 'ok', path),
+    replayed: fBool(object, 'replayed', path),
+    subscription: validateBillingSubscription(
+      asObject(field(object, 'subscription', path), `${path}.subscription`),
+      `${path}.subscription`,
+    ),
+    proration: {
+      state: fString(proration, 'state', `${path}.proration`),
+      cause: fString(proration, 'cause', `${path}.proration`),
+    },
+    billing: validateBillingOverviewObject(
+      asObject(field(object, 'billing', path), `${path}.billing`),
+      `${path}.billing`,
+    ),
+  };
+}
+
+/** Strict parse of `GET /native/usage/export?format=json`. */
+export function validateUsageExport(json: Json): NativeUsageExport {
+  const path = 'GET /native/usage/export';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'organization', 'items', 'next_cursor', 'truncated']);
+  return {
+    ok: fBool(object, 'ok', path),
+    organization: fString(object, 'organization', path),
+    items: fObjectArray(object, 'items', path).map((entry, index) => {
+      const itemPath = `${path}.items[${index}]`;
+      checkResponseKeys(entry, itemPath, ['cursor', 'event']);
+      return {
+        cursor: fString(entry, 'cursor', itemPath),
+        event: fJson(entry, 'event', itemPath),
+      };
+    }),
+    next_cursor: fNullableString(object, 'next_cursor', path),
+    truncated: fBool(object, 'truncated', path),
+  };
+}
+
 /**
  * The strict parse of `GET /native/value-entitlements`: the wrapped
  * `{ok, value_entitlements}` envelope plus the generated report decoder
@@ -4480,6 +4733,63 @@ export class NativeClient {
         limit: page.limit,
       },
       validate: validateBillingUsage,
+    });
+  }
+
+  /** The durable commercial account overview (payment/invoice/seat/tax
+   * availability is typed `unavailable`, never invented). */
+  billingOverview(): Promise<NativeBillingOverviewView> {
+    return this.request('GET', '/native/billing/overview', {
+      validate: validateBillingOverview,
+    });
+  }
+
+  /**
+   * Change (upgrade/downgrade) or cancel the organization's subscription
+   * (owner role only; the server is the guard). The effect is durable and
+   * applies at the next admission boundary. Proration is reported typed
+   * unavailable because the plan table carries no price.
+   */
+  changeSubscription(request: {
+    action: 'change' | 'cancel';
+    planId?: string;
+    status?: 'active' | 'trialing' | 'expired';
+    expiresMs?: number;
+    confirm?: boolean;
+    idempotencyKey: string;
+  }): Promise<NativeSubscriptionChange> {
+    if (request.idempotencyKey.trim().length === 0) {
+      throw new NativeProtocolError(
+        'POST /native/billing/subscription',
+        'an idempotency key is required for a subscription change',
+      );
+    }
+    return this.request('POST', '/native/billing/subscription', {
+      headers: { 'idempotency-key': request.idempotencyKey },
+      body: {
+        action: request.action,
+        ...(request.planId === undefined ? {} : { plan_id: request.planId }),
+        ...(request.status === undefined ? {} : { status: request.status }),
+        ...(request.expiresMs === undefined ? {} : { expires_ms: request.expiresMs }),
+        ...(request.confirm === undefined ? {} : { confirm: request.confirm }),
+      },
+      validate: validateSubscriptionChange,
+    });
+  }
+
+  /** One bounded JSON download of the organization's usage ledger. */
+  usageExport(
+    org: string,
+    page: { since?: string | null; limit?: number } = {},
+  ): Promise<NativeUsageExport> {
+    return this.request('GET', '/native/usage/export', {
+      query: {
+        org,
+        since: page.since === undefined || page.since === null ? undefined : page.since,
+        limit: page.limit,
+        format: 'json',
+      },
+      validate: validateUsageExport,
     });
   }
 

@@ -90,6 +90,9 @@ pub fn runtime_consumer(key: &str) -> RuntimeConsumer {
             applied("crates/cli/src/daemon/serve.rs")
         }
         "faktor.sandbox.shell" => applied("crates/cli/src/daemon/serve.rs"),
+        // The session usage projection reads this threshold on every read,
+        // so a committed settings change takes effect at the next usage view.
+        "faktor.budget.warnAtPercent" => applied("crates/server/src/native/usage.rs"),
 
         // Read-only runtime facts (never writable, served for provenance).
         "faktor.runtime.binaryPath"
@@ -105,9 +108,6 @@ pub fn runtime_consumer(key: &str) -> RuntimeConsumer {
         | "faktor.generation.topP"
         | "faktor.generation.maxOutput" => stored(
             "model requests use the adapter/provider defaults; no runtime path reads these daemon settings yet",
-        ),
-        "faktor.budget.warnAtPercent" => stored(
-            "usage projections do not consume a warning threshold; only the cap keys are enforced",
         ),
         "faktor.retrieval.strategy" => stored(
             "retrieval strategy is fixed by the compiled index; no runtime selector reads this key",
@@ -164,7 +164,6 @@ mod tests {
         for key in [
             "faktor.agent.maxConsecutiveFailures",
             "faktor.generation.temperature",
-            "faktor.budget.warnAtPercent",
             "faktor.retrieval.strategy",
             "faktor.permissions.childRoles",
             "faktor.sandbox.network",

@@ -1264,6 +1264,14 @@ const CP_MIGRATIONS: &[&str] = &[
         ON ent_audit_event(organization_id, occurred_at_ms, seq);
      CREATE INDEX IF NOT EXISTS idx_billing_report_period_org_seen
         ON billing_report_period(organization_id, first_seen_ms DESC, period DESC);",
+    // v8 — durable billing aggregates (the money/token rollups). The billing
+    // domain owns this ladder slot: one usage-total row per organization, one
+    // usage bucket per (organization, task, run) and one credit balance row
+    // per organization, each carrying the ledger watermark it reflects. The
+    // append path updates the rollup in the SAME transaction as the ledger
+    // insert (and a read lazily catches up a v7/restored projection), so an
+    // entitlement check stays O(1) instead of folding up to 1M events.
+    crate::billing_store::BILLING_ROLLUP_SCHEMA_V8,
 ];
 
 impl SqliteControlPlaneStore {

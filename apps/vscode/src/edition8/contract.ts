@@ -193,9 +193,44 @@ export function moneyMicro(value: Json | null | undefined): string {
 function microString(raw: string): string {
   const negative = raw.startsWith('-');
   const digits = (negative ? raw.slice(1) : raw).padStart(7, '0');
-  const dollars = digits.slice(0, -6);
-  const cents = digits.slice(-6).padStart(6, '0').slice(0, 2);
-  return `${negative ? '-' : ''}$${new Intl.NumberFormat('en-US').format(Number(dollars))}.${cents}`;
+  // Exact integer arithmetic on the decimal string: no Number conversion of
+  // the dollar part (large u64 folds would lose precision above 2^53-1).
+  const whole = digits.slice(0, -6).replace(/^0+(?=\d)/, '');
+  const micro = digits.slice(-6);
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  if (micro === '000000') return `${negative ? '-' : ''}$${grouped}.00`;
+  // Trim only trailing zeros; keep at least two decimals so every micro-USD
+  // cent remains exact and copyable (visual 3.1). 312500 -> $0.3125,
+  // 5000000 -> $5.00, 1234567 -> $1.234567.
+  const trimmed = micro.replace(/0+$/, '').padEnd(2, '0');
+  return `${negative ? '-' : ''}$${grouped}.${trimmed}`;
+}
+
+/** Editable USD form of a micro-USD wire value (no symbol; 2..6 decimals). */
+export function microUsdInput(value: Json | null | undefined): string {
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const digits = value.padStart(7, '0');
+    const whole = digits.slice(0, -6).replace(/^0+(?=\d)/, '');
+    const micro = digits.slice(-6);
+    const trimmed = micro === '000000' ? '00' : micro.replace(/0+$/, '').padEnd(2, '0');
+    return `${whole}.${trimmed}`;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return microUsdInput(String(value));
+  }
+  return '';
+}
+
+/** Advanced exact micro-USD display with locale grouping (`5,000,000µ$`). */
+export function microExact(value: Json | null | undefined): string {
+  const raw =
+    typeof value === 'string'
+      ? value
+      : typeof value === 'number' && Number.isSafeInteger(value)
+        ? String(value)
+        : null;
+  if (raw === null || !/^\d+$/.test(raw)) return 'Unavailable';
+  return `${raw.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}\u00b5$`;
 }
 
 export function boolText(value: boolean | null): string {

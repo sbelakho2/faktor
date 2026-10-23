@@ -197,10 +197,6 @@
       "state": "unwired",
       "reason": "stored-only descriptor; read-only in this build"
     },
-    "faktor.budget.warnAtPercent": {
-      "state": "unwired",
-      "reason": "stored-only descriptor; read-only in this build"
-    },
     "faktor.retrieval.strategy": {
       "state": "unwired",
       "reason": "stored-only descriptor; read-only in this build"

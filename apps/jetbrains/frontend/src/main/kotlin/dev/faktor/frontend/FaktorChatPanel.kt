@@ -33,6 +33,7 @@ import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
 import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeSessionSummary
+import dev.faktor.shared.toJson
 import java.math.BigInteger
 import java.nio.file.Path
 import java.util.UUID
@@ -2258,20 +2259,50 @@ class FaktorChatPanel(
                 val amountRaw = onEdtValue {
                     JOptionPane.showInputDialog(
                         this@FaktorChatPanel,
-                        "Credit grant amount in microUSD (integer > 0, exact)",
-                        "1000000"
+                        "Credit grant amount — $5.00 for dollars or 5000000µ$ for microUSD (exact)",
+                        "$5.00"
                     )
                 } ?: return
-                // Exact money: a plain positive decimal within i64::MAX; a
-                // junk or out-of-range amount is refused loudly, never rounded.
-                val amount = MicroMoney.parseDecimal(amountRaw.trim())
-                if (amount == null || amount.signum() <= 0) {
+                // Explicit units only: a bare integer was previously
+                // microUSD and is now ambiguous. "$5.00"/"5.00" are dollars;
+                // "5000000µ$" is exact micro.
+                val text = amountRaw.trim()
+                val microMatch = Regex("^([0-9]+)\\s*(?:\u00b5\\$|micro|microusd)$", RegexOption.IGNORE_CASE)
+                    .matchEntire(text)
+                val usdMatch = Regex("^\\$?([0-9]+)(?:\\.([0-9]{1,6}))?$").matchEntire(text)
+                val amount = when {
+                    microMatch != null -> MicroMoney.parseDecimal(microMatch.groupValues[1])
+                    usdMatch != null -> {
+                        if (usdMatch.groupValues[2].isEmpty() && !text.startsWith("$")) {
+                            null
+                        } else {
+                            val fraction = usdMatch.groupValues[2].padEnd(6, '0')
+                            BigInteger(usdMatch.groupValues[1])
+                                .multiply(BigInteger.valueOf(1_000_000L))
+                                .add(BigInteger(fraction))
+                        }
+                    }
+                    else -> null
+                }
+                if (amount == null || amount.signum() <= 0 || amount > MicroMoney.I64_MAX) {
                     appendSystem(
-                        "grant refused: enter a positive decimal integer amount in microUSD " +
-                            "no larger than ${MicroMoney.I64_MAX}"
+                        "grant refused: enter $5.00 for dollars or 5000000µ$ for microUSD " +
+                            "(positive, exact, no larger than ${MicroMoney.I64_MAX}µ$)"
                     )
                     return
                 }
+                val organization = model.organization ?: "the organization"
+                val confirmed = onEdtValue {
+                    JOptionPane.showConfirmDialog(
+                        this@FaktorChatPanel,
+                        "Grant $${MicroMoney.usdText(amount)} (${MicroMoney.microText(amount)}) " +
+                            "to $organization? This is a financial action.",
+                        "Grant credits",
+                        JOptionPane.OK_CANCEL_OPTION,
+                        JOptionPane.WARNING_MESSAGE
+                    ) == JOptionPane.OK_OPTION
+                }
+                if (!confirmed) return
                 runAsync("grant credits") {
                     val ack = service.grantCredits(
                         amountMicro = amount,
@@ -2284,6 +2315,152 @@ class FaktorChatPanel(
                                 "credit grant replayed (idempotent); the recorded grant is unchanged"
                             } else {
                                 "credits granted; balance ${micro(ack.credits.balanceMicro())}"
+                            }
+                        )
+                    }
+                    refreshUsagePanelBlocking()
+                }
+            }
+
+            override fun onExportUsage() {
+                val organization = usagePanel.model()?.organization ?: return
+                val target = onEdtValue {
+                    val chooser = javax.swing.JFileChooser().apply {
+                        dialogTitle = "Download Faktor usage"
+                        selectedFile = java.io.File("faktor-usage-$organization.json")
+                    }
+                    if (chooser.showSaveDialog(this@FaktorChatPanel) ==
+                        javax.swing.JFileChooser.APPROVE_OPTION
+                    ) {
+                        chooser.selectedFile
+                    } else {
+                        null
+                    }
+                } ?: return
+                runAsync("download usage") {
+                    val page = service.usageExport(organization)
+                    onEdt {
+                        target.writeText(page.toJson())
+                        appendSystem(
+                            "usage downloaded: ${page.items.size} row(s)" +
+                                if (page.truncated) {
+                                    " (bounded export; narrow the window with since)"
+                                } else {
+                                    ""
+                                }
+                        )
+                    }
+                }
+            }
+
+            override fun onChangePlan() {
+                val model = usagePanel.model()
+                if (model == null || !model.manageEnabled()) {
+                    appendSystem(model?.manageDisabledReason ?: "changing a plan is not permitted")
+                    return
+                }
+                val planId = onEdtValue {
+                    JOptionPane.showInputDialog(
+                        this@FaktorChatPanel,
+                        "Plan id (must exist in the [billing] plan table)",
+                        "pro"
+                    )
+                } ?: return
+                val statuses = arrayOf("active", "trialing")
+                val status = onEdtValue {
+                    JOptionPane.showInputDialog(
+                        this@FaktorChatPanel,
+                        "Subscription status",
+                        "Plan status",
+                        JOptionPane.QUESTION_MESSAGE,
+                        null,
+                        statuses,
+                        statuses[0]
+                    ) as? String
+                } ?: return
+                val trialEndsMs = if (status == "trialing") {
+                    val raw = onEdtValue {
+                        JOptionPane.showInputDialog(
+                            this@FaktorChatPanel,
+                            "Trial end (milliseconds since the Unix epoch)",
+                            "1800000000000"
+                        )
+                    } ?: return
+                    raw.trim().toLongOrNull()?.takeIf { it >= 0 } ?: run {
+                        appendSystem("plan change refused: the trial end must be a non-negative integer")
+                        return
+                    }
+                } else {
+                    null
+                }
+                val confirmed = onEdtValue {
+                    JOptionPane.showConfirmDialog(
+                        this@FaktorChatPanel,
+                        "Change the organization plan to ${planId.trim()} ($status)? " +
+                            "The change applies immediately; in-flight work is not interrupted.",
+                        "Change plan",
+                        JOptionPane.OK_CANCEL_OPTION,
+                        JOptionPane.WARNING_MESSAGE
+                    ) == JOptionPane.OK_OPTION
+                }
+                if (!confirmed) return
+                runAsync("change plan") {
+                    val changed = service.changeSubscription(
+                        action = "change",
+                        planId = planId.trim(),
+                        status = status,
+                        expiresMs = trialEndsMs,
+                        idempotencyKey = java.util.UUID.randomUUID().toString()
+                    )
+                    onEdt {
+                        appendSystem(
+                            if (changed.replayed) {
+                                "plan change replayed (idempotent); " +
+                                    "${changed.subscription.planId} is unchanged"
+                            } else {
+                                "plan changed to ${changed.subscription.planId} " +
+                                    "(${changed.subscription.status}); " +
+                                    if (changed.proration.state == "available") {
+                                        "proration applied"
+                                    } else {
+                                        "proration unavailable (${changed.proration.cause})"
+                                    }
+                            }
+                        )
+                    }
+                    refreshUsagePanelBlocking()
+                }
+            }
+
+            override fun onCancelSubscription() {
+                val model = usagePanel.model()
+                if (model == null || !model.manageEnabled()) {
+                    appendSystem(model?.manageDisabledReason ?: "cancelling is not permitted")
+                    return
+                }
+                val confirmed = onEdtValue {
+                    JOptionPane.showConfirmDialog(
+                        this@FaktorChatPanel,
+                        "Cancel the organization subscription? New admissions will be denied " +
+                            "immediately; in-flight work is not interrupted.",
+                        "Cancel subscription",
+                        JOptionPane.OK_CANCEL_OPTION,
+                        JOptionPane.WARNING_MESSAGE
+                    ) == JOptionPane.OK_OPTION
+                }
+                if (!confirmed) return
+                runAsync("cancel subscription") {
+                    val changed = service.changeSubscription(
+                        action = "cancel",
+                        confirm = true,
+                        idempotencyKey = java.util.UUID.randomUUID().toString()
+                    )
+                    onEdt {
+                        appendSystem(
+                            if (changed.replayed) {
+                                "cancellation replayed (idempotent); the subscription is already canceled"
+                            } else {
+                                "subscription canceled; new admissions are denied"
                             }
                         )
                     }
@@ -3297,9 +3474,12 @@ class FaktorChatPanel(
             val identity = service.identity()
             val entitlements = service.entitlements()
             val usage = service.billingUsage(identity.organization, cursor, 50L)
+            val overview = service.billingOverview()
             onEdt {
                 usagePanel.setModel(
-                    usagePanelModelOf(identity, entitlements, usage, null, null, cursor, hasPrev)
+                    usagePanelModelOf(
+                        identity, entitlements, usage, null, null, cursor, hasPrev, overview
+                    )
                 )
                 usagePagingInFlight.set(false)
             }

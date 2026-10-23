@@ -232,7 +232,7 @@ fn v7_upgrade_recreates_indexes_from_the_previous_head() {
         head = conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap();
-        conn.execute_batch(&format!(
+        conn.execute_batch(
             "DROP INDEX IF EXISTS idx_cp_idempotency_created;
              DROP INDEX IF EXISTS idx_cp_approval_org_id;
              DROP INDEX IF EXISTS idx_ent_audit_org_occurred;
@@ -240,9 +240,8 @@ fn v7_upgrade_recreates_indexes_from_the_previous_head() {
              DROP INDEX IF EXISTS idx_billing_in_flight_org;
              CREATE INDEX idx_billing_in_flight_org
                 ON billing_in_flight(organization_id, ended_ms);
-             PRAGMA user_version = {};",
-            head - 1
-        ))
+             PRAGMA user_version = 6;",
+        )
         .unwrap();
     }
     let store = SqliteControlPlaneStore::open(&path).unwrap();

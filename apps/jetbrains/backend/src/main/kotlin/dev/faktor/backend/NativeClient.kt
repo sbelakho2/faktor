@@ -22,6 +22,7 @@ import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeAttachmentId
+import dev.faktor.shared.NativeBillingOverview
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
@@ -50,9 +51,11 @@ import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.NativeSessionCreated
 import dev.faktor.shared.NativeSessionSummary
 import dev.faktor.shared.NativeSessionUsage
+import dev.faktor.shared.NativeSubscriptionChange
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTaskCompletionSteps
 import dev.faktor.shared.NativeTaskProof
+import dev.faktor.shared.NativeUsageExport
 import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
@@ -96,12 +99,15 @@ import dev.faktor.shared.parseNativeProviders
 import dev.faktor.shared.parseNativeReady
 import dev.faktor.shared.parseNativeSessionCreated
 import dev.faktor.shared.parseNativeSessionList
+import dev.faktor.shared.parseNativeBillingOverview
 import dev.faktor.shared.parseNativeSessionUsage
 import dev.faktor.shared.parseNativeTaskRunCancelled
 import dev.faktor.shared.parseNativeTaskRunStarted
 import dev.faktor.shared.parseNativeTaskRuns
 import dev.faktor.shared.parseNativeTaskCompletionSteps
+import dev.faktor.shared.parseNativeSubscriptionChange
 import dev.faktor.shared.parseNativeTaskProof
+import dev.faktor.shared.parseNativeUsageExport
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTerminalEventPage
@@ -773,6 +779,48 @@ class NativeClient(
             NativeRequests.grantCredits(amountMicro, reason, accountId),
             maxBodyBytes,
             listOf(Pair("idempotency-key", idempotencyKey))
+        )
+    )
+
+    /** The durable commercial account overview. */
+    fun billingOverview(): NativeBillingOverview =
+        parseNativeBillingOverview(request("GET", "/native/billing/overview"))
+
+    /**
+     * Change (upgrade/downgrade) or cancel the organization's subscription.
+     * The daemon requires the `Idempotency-Key` header and the owner role;
+     * proration is returned typed unavailable because plans carry no price.
+     */
+    fun changeSubscription(
+        action: String,
+        planId: String? = null,
+        status: String? = null,
+        expiresMs: Long? = null,
+        confirm: Boolean? = null,
+        idempotencyKey: String
+    ): NativeSubscriptionChange = parseNativeSubscriptionChange(
+        request(
+            "POST", "/native/billing/subscription", null,
+            NativeRequests.changeSubscription(action, planId, status, expiresMs, confirm),
+            maxBodyBytes,
+            listOf(Pair("idempotency-key", idempotencyKey))
+        )
+    )
+
+    /** One bounded JSON download of the organization's usage ledger. */
+    fun usageExport(
+        organization: String,
+        since: String? = null,
+        limit: Long? = null
+    ): NativeUsageExport = parseNativeUsageExport(
+        request(
+            "GET", "/native/usage/export",
+            query(
+                "org" to organization,
+                "since" to since,
+                "limit" to limit?.toString(),
+                "format" to "json"
+            )
         )
     )
 

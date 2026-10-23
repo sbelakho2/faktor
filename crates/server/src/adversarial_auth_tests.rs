@@ -390,7 +390,10 @@ const ROUTE_CLASSES: &[(&str, &str)] = &[
     ("GET", "/native/health"),
     ("GET", "/native/ready"),
     ("GET", "/native/usage"),
+    ("GET", "/native/usage/export?org=org-local"),
     ("GET", "/native/entitlements"),
+    ("GET", "/native/billing/overview"),
+    ("POST", "/native/billing/subscription"),
     ("GET", "/native/sessions"),
     ("GET", "/native/session/1/turns"),
     ("GET", "/native/session/1/tasks"),
@@ -437,6 +440,9 @@ fn needs_control_principal(path: &str) -> bool {
     matches!(
         path,
         "/native/entitlements"
+            | "/native/billing/overview"
+            | "/native/billing/subscription"
+            | "/native/usage/export?org=org-local"
             | "/native/identity"
             | "/native/repositories"
             | "/native/updater/status"

@@ -1104,6 +1104,95 @@ data class NativeEntitlementSnapshot(
     val nowMs: Long
 )
 
+/** One typed commercial capability status. */
+data class NativeBillingCapability(val state: String, val cause: String?)
+
+/** The derived trial view of one subscription. */
+data class NativeBillingTrial(val state: String, val endsMs: Long?)
+
+/** One durable billing account row. */
+data class NativeBillingAccount(
+    val id: String,
+    val organization: String,
+    val name: String,
+    val managed: Boolean,
+    val createdMs: Long,
+    val disabled: Boolean
+)
+
+/** One durable subscription row. */
+data class NativeBillingSubscription(
+    val id: String,
+    val organization: String,
+    val planId: String,
+    val status: String,
+    val startedMs: Long,
+    val expiresMs: Long?,
+    val updatedMs: Long
+)
+
+/**
+ * The durable commercial account overview (`GET /native/billing/overview`):
+ * payment/invoice/seat/tax/currency states are typed `unavailable` with a
+ * cause, never inferred from a local plan row.
+ */
+data class NativeBillingOverview(
+    val organizationId: String,
+    val account: NativeBillingAccount?,
+    val planId: String?,
+    val planFound: Boolean,
+    val subscription: NativeBillingSubscription?,
+    val subscriptionActive: Boolean,
+    val trial: NativeBillingTrial,
+    val payment: NativeBillingCapability,
+    val invoices: NativeBillingCapability,
+    val seats: NativeBillingCapability,
+    val tax: NativeBillingCapability,
+    val currency: NativeBillingCapability,
+    val usageExport: NativeBillingCapability,
+    val usageExportFormats: List<String>,
+    val nowMs: Long
+)
+
+/** The typed proration result of one plan change (never a fabricated delta). */
+data class NativeBillingProration(val state: String, val cause: String)
+
+/** `POST /native/billing/subscription` — the applied change and new account. */
+data class NativeSubscriptionChange(
+    val replayed: Boolean,
+    val subscription: NativeBillingSubscription,
+    val proration: NativeBillingProration,
+    val billing: NativeBillingOverview
+)
+
+/** One exported usage event. */
+data class NativeUsageExportItem(val cursor: String, val event: JsonValue)
+
+/** `GET /native/usage/export?format=json` — the bounded download envelope. */
+data class NativeUsageExport(
+    val organization: String,
+    val items: List<NativeUsageExportItem>,
+    val nextCursor: String?,
+    val truncated: Boolean
+)
+
+/** The exact download body for saving the bounded export to disk. */
+fun NativeUsageExport.toJson(): String = JsonObjectBuilder()
+    .put("ok", true)
+    .put("organization", organization)
+    .put(
+        "items",
+        JsonValue.Arr(items.map { item ->
+            JsonObjectBuilder()
+                .put("cursor", item.cursor)
+                .put("event", item.event)
+                .build()
+        })
+    )
+    .put("next_cursor", nextCursor)
+    .put("truncated", truncated)
+    .toJson()
+
 /** The caller's control-plane identity (`GET /native/identity`). */
 data class NativeIdentity(
     val subjectKind: String,
@@ -2349,6 +2438,92 @@ fun parseNativeBillingUsage(json: String): NativeBillingUsage {
     )
 }
 
+private fun parseBillingCapability(v: JsonView, key: String): NativeBillingCapability {
+    val field = v.field(key)
+    return NativeBillingCapability(
+        state = field.field("state").string(),
+        cause = field.optionalField("cause")?.string()
+    )
+}
+
+private fun parseBillingAccount(v: JsonView): NativeBillingAccount = NativeBillingAccount(
+    id = v.field("id").string(),
+    organization = v.field("organization").string(),
+    name = v.field("name").string(),
+    managed = v.field("managed").bool(),
+    createdMs = v.field("created_ms").long(),
+    disabled = v.field("disabled").bool()
+)
+
+private fun parseBillingSubscription(v: JsonView): NativeBillingSubscription =
+    NativeBillingSubscription(
+        id = v.field("id").string(),
+        organization = v.field("organization").string(),
+        planId = v.field("plan_id").string(),
+        status = v.field("status").string(),
+        startedMs = v.field("started_ms").long(),
+        expiresMs = v.optionalField("expires_ms")?.long(),
+        updatedMs = v.field("updated_ms").long()
+    )
+
+private fun parseBillingOverview(v: JsonView): NativeBillingOverview {
+    val trial = v.field("trial")
+    return NativeBillingOverview(
+        organizationId = v.field("organization_id").string(),
+        account = v.optionalField("account")?.let { parseBillingAccount(it) },
+        planId = v.optionalField("plan_id")?.string(),
+        planFound = v.field("plan_found").bool(),
+        subscription = v.optionalField("subscription")?.let { parseBillingSubscription(it) },
+        subscriptionActive = v.field("subscription_active").bool(),
+        trial = NativeBillingTrial(
+            state = trial.field("state").string(),
+            endsMs = trial.optionalField("ends_ms")?.long()
+        ),
+        payment = parseBillingCapability(v, "payment"),
+        invoices = parseBillingCapability(v, "invoices"),
+        seats = parseBillingCapability(v, "seats"),
+        tax = parseBillingCapability(v, "tax"),
+        currency = parseBillingCapability(v, "currency"),
+        usageExport = parseBillingCapability(v, "usage_export"),
+        usageExportFormats = v.field("usage_export_formats").stringArray(),
+        nowMs = v.field("now_ms").long()
+    )
+}
+
+fun parseNativeBillingOverview(json: String): NativeBillingOverview {
+    val v = JsonCodec.parse(json).view("GET /native/billing/overview").field("billing")
+    return parseBillingOverview(v)
+}
+
+fun parseNativeSubscriptionChange(json: String): NativeSubscriptionChange {
+    val v = JsonCodec.parse(json).view("POST /native/billing/subscription")
+    val proration = v.field("proration")
+    return NativeSubscriptionChange(
+        replayed = v.field("replayed").bool(),
+        subscription = parseBillingSubscription(v.field("subscription")),
+        proration = NativeBillingProration(
+            state = proration.field("state").string(),
+            cause = proration.field("cause").string()
+        ),
+        billing = parseBillingOverview(v.field("billing"))
+    )
+}
+
+fun parseNativeUsageExport(json: String): NativeUsageExport {
+    val v = JsonCodec.parse(json).view("GET /native/usage/export")
+    return NativeUsageExport(
+        organization = v.field("organization").string(),
+        items = v.field("items").array().map {
+            NativeUsageExportItem(
+                cursor = it.field("cursor").string(),
+                event = it.field("event").value
+            )
+        },
+        nextCursor = v.optionalField("next_cursor")?.string(),
+        truncated = v.field("truncated").bool()
+    )
+}
+
 fun parseNativeEntitlements(json: String): NativeEntitlementSnapshot {
     val v = JsonCodec.parse(json).view("GET /native/entitlements").field("entitlements")
     return NativeEntitlementSnapshot(
@@ -3155,6 +3330,25 @@ object NativeRequests {
         .put("amount_micro", MicroMoney.wire(amountMicro))
         .put("reason", reason?.takeIf { it.isNotEmpty() })
         .put("account_id", accountId?.takeIf { it.isNotEmpty() })
+        .toJson()
+
+    /**
+     * The strict subscription body (`POST /native/billing/subscription`):
+     * `change` names a plan (and optional status/expiry); `cancel` names no
+     * plan and requires `confirm = true`.
+     */
+    fun changeSubscription(
+        action: String,
+        planId: String? = null,
+        status: String? = null,
+        expiresMs: Long? = null,
+        confirm: Boolean? = null
+    ): String = JsonObjectBuilder()
+        .put("action", action)
+        .put("plan_id", planId?.takeIf { it.isNotEmpty() })
+        .put("status", status)
+        .put("expires_ms", expiresMs)
+        .put("confirm", confirm)
         .toJson()
 
     fun evidenceSelectorRange(start: Long, end: Long): String =

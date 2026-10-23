@@ -573,6 +573,16 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
         // Without the `[billing]` section every one answers 409.
         .route("/native/entitlements", get(native_entitlements))
         .route("/native/credits/grant", post(native_credits_grant))
+        // The commercial account overview and the OWNER-only plan change /
+        // cancellation effect (additive): payment/invoice/seat/tax/currency
+        // availability is reported typed, never fabricated.
+        .route("/native/billing/overview", get(native_billing_overview))
+        .route(
+            "/native/billing/subscription",
+            post(native_billing_subscription),
+        )
+        // A BOUNDED download of the same usage ledger `/native/usage` folds.
+        .route("/native/usage/export", get(native_usage_export))
         // Value-centric paid entitlements (additive): the plan-mapped,
         // inference-independent value report (value features, governance
         // capability flags, one typed decision per entitlement). Without the
